@@ -1798,6 +1798,138 @@ echo \"CHANGED_END\"
         self._oraclefiles_sync_task = asyncio.create_task(_loop())
         print(f"[oraclefiles] periodic sync task started interval={cfg.get('interval_seconds')}s")
 
+    def _get_rsbots_push_config(self) -> Dict[str, Any]:
+        """Return RS bots push config for pushing to neo-rs/rsbots.
+        
+        Recommended config:
+        - config.json (non-secret):
+            "rsbots_push": {
+              "repo_url": "git@github.com:neo-rs/rsbots.git",
+              "branch": "main"
+            }
+        - config.secrets.json (server-only):
+            "rsbots_push": {
+              "deploy_key_path": "/home/rsadmin/.ssh/rsbots_deploy_key"
+            }
+        """
+        base = (self.config.get("rsbots_push") or {}) if isinstance(self.config, dict) else {}
+        try:
+            return {
+                "repo_url": str(base.get("repo_url") or "git@github.com:neo-rs/rsbots.git"),
+                "branch": str(base.get("branch") or "main"),
+                # NOTE: should be provided via config.secrets.json (merged by load_config_with_secrets).
+                "deploy_key_path": str(base.get("deploy_key_path") or ""),
+            }
+        except Exception:
+            return {
+                "repo_url": "git@github.com:neo-rs/rsbots.git",
+                "branch": "main",
+                "deploy_key_path": "",
+            }
+
+    def _rsbots_push_once(self) -> Tuple[bool, Dict[str, Any]]:
+        """Push changes from live mirror-world repo to neo-rs/rsbots GitHub repo."""
+        cfg = self._get_rsbots_push_config()
+        if not self._should_use_local_exec():
+            return False, {"error": "rsbots_push requires Ubuntu local-exec mode (RSAdminBot must run on the same host)."}
+
+        repo_url = str(cfg.get("repo_url") or "git@github.com:neo-rs/rsbots.git")
+        branch = str(cfg.get("branch") or "main")
+        deploy_key = str(cfg.get("deploy_key_path") or "").strip()
+
+        if not deploy_key:
+            return False, {"error": "rsbots_push.deploy_key_path missing (put it in RSAdminBot/config.secrets.json)."}
+
+        live_root = str(getattr(self, "remote_root", "") or "/home/rsadmin/bots/mirror-world")
+
+        cmd = f"""
+set -euo pipefail
+
+REPO_URL={shlex.quote(repo_url)}
+BRANCH={shlex.quote(branch)}
+LIVE_ROOT={shlex.quote(live_root)}
+DEPLOY_KEY={shlex.quote(deploy_key)}
+
+command -v git >/dev/null 2>&1 || {{ echo "ERR=git_missing"; exit 2; }}
+
+if [ ! -d "$LIVE_ROOT/.git" ]; then
+  echo "ERR=not_a_git_repo"
+  echo "DETAIL=$LIVE_ROOT/.git not found"
+  exit 2
+fi
+
+# Ensure GitHub SSH host key can be accepted non-interactively.
+SSH_DIR="${{HOME:-/home/rsadmin}}/.ssh"
+KNOWN_HOSTS="$SSH_DIR/known_hosts"
+mkdir -p "$SSH_DIR"
+chmod 700 "$SSH_DIR" || true
+touch "$KNOWN_HOSTS"
+chmod 600 "$KNOWN_HOSTS" || true
+
+export GIT_SSH_COMMAND="ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=accept-new"
+
+cd "$LIVE_ROOT"
+
+# Ensure origin is set (best effort - don't fail if already set)
+git remote set-url origin "$REPO_URL" 2>/dev/null || git remote add origin "$REPO_URL" 2>/dev/null || true
+
+# Ensure we're on the correct branch
+git branch -M "$BRANCH" 2>/dev/null || true
+
+# Stage all changes (only python files should be tracked per .gitignore)
+git add -A
+
+# Check if there are any staged changes
+if git diff --cached --quiet; then
+  echo "OK=1"
+  echo "NO_CHANGES=1"
+  echo "HEAD=$(git rev-parse HEAD 2>/dev/null || echo '')"
+  exit 0
+fi
+
+# Commit with timestamp
+TS=$(date +%Y%m%d_%H%M%S)
+git commit -m "rsbots py update: $TS" >/dev/null 2>&1 || {{ echo "ERR=commit_failed"; exit 3; }}
+
+# Push to origin
+git push origin "$BRANCH" >/dev/null 2>&1 || {{ echo "ERR=push_failed"; exit 4; }}
+
+echo "OK=1"
+echo "PUSHED=1"
+echo "HEAD=$(git rev-parse HEAD)"
+echo "OLD_HEAD=$(git rev-parse HEAD~1 2>/dev/null || echo '')"
+echo "CHANGED_BEGIN"
+git show --name-only --pretty=format: HEAD | sed '/^$/d' | head -n 100
+echo "CHANGED_END"
+"""
+
+        ok, stdout, stderr = self._execute_ssh_command(cmd, timeout=180)
+        out = (stdout or "").strip()
+        err = (stderr or "").strip()
+        if not ok:
+            return False, {"error": (err or out or "rsbots push failed")[:1600]}
+
+        stats: Dict[str, Any] = {"raw": out[-1600:]}
+        in_changed = False
+        changed: List[str] = []
+        for ln in out.splitlines():
+            ln = ln.strip()
+            if ln == "CHANGED_BEGIN":
+                in_changed = True
+                continue
+            if ln == "CHANGED_END":
+                in_changed = False
+                continue
+            if in_changed:
+                if ln:
+                    changed.append(ln)
+                continue
+            if "=" in ln:
+                k, v = ln.split("=", 1)
+                stats[k.strip().lower()] = v.strip()
+        stats["changed_sample"] = changed[:100]
+        return True, stats
+
     async def _post_or_edit_progress(self, progress_msg, text: str):
         """Best-effort: edit an existing progress message, else send a new one."""
         try:
@@ -3566,6 +3698,54 @@ echo "CHANGED_END"
                     progress_msg,
                     f"[oraclefiles] MANUAL OK\nPushed: {pushed}\nHead: {head}",
                 )
+
+        @self.bot.command(name="pushrsbots", aliases=["pushrsbotsupdate", "pushrsbotspush"])
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def pushrsbots(ctx):
+            """Push python-only changes from live Ubuntu repo to neo-rs/rsbots GitHub (admin only)."""
+            status_msg = await ctx.send("📤 **RS Bots Push**\n```\nStaging changes + git push...\n```")
+            should_post_progress = not (await self._is_progress_channel(ctx.channel))
+            progress_msg = None
+            if should_post_progress:
+                progress_msg = await self._post_or_edit_progress(
+                    None,
+                    f"[pushrsbots] START\nRequested by: {ctx.author} ({ctx.author.id})",
+                )
+
+            ok, stats = self._rsbots_push_once()
+            if not ok:
+                err = str(stats.get("error") or "unknown error")
+                await status_msg.edit(content=f"❌ RS Bots push failed:\n```{err[:1200]}```")
+                if should_post_progress:
+                    await self._post_or_edit_progress(progress_msg, f"[pushrsbots] FAILED\n{err[:1600]}")
+                return
+
+            head = str(stats.get("head") or "")[:12]
+            old_head = str(stats.get("old_head") or "")[:12]
+            pushed = "YES" if str(stats.get("pushed") or "").strip() else "NO"
+            no_changes = "YES" if str(stats.get("no_changes") or "").strip() else "NO"
+            sample = stats.get("changed_sample") or []
+
+            msg = (
+                "✅ **RS Bots push complete**\n"
+                "```"
+                f"\nPushed: {pushed}"
+                f"\nNo changes: {no_changes}"
+            )
+            if old_head and pushed == "YES":
+                msg += f"\nGit: {old_head} -> {head}"
+            elif head:
+                msg += f"\nHead: {head}"
+            msg += "```"
+            if sample:
+                msg += "\n**Changed files (sample):**\n```" + "\n".join(str(x) for x in sample[:40]) + "```"
+            await status_msg.edit(content=msg[:1900])
+            if should_post_progress:
+                await self._post_or_edit_progress(
+                    progress_msg,
+                    f"[pushrsbots] OK\nPushed: {pushed}\nHead: {head}",
+                )
+        self.registered_commands.append(("pushrsbots", "Push changes to neo-rs/rsbots GitHub", True))
 
         @self.bot.command(name="systemcheck")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
