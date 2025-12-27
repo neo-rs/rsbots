@@ -55,27 +55,24 @@ async def run(admin_bot):
                 print(f"{Colors.YELLOW}[Phase 2] [2.4] ⚠️  Bot ID initialization failed (non-critical): {bot_id_error}{Colors.RESET}")
                 print(f"{Colors.YELLOW}[Phase 2] [2.4] Bot movement tracking may be limited until IDs are initialized{Colors.RESET}")
             
-            # Auto-setup test server monitoring channels (non-blocking)
-            print(f"{Colors.CYAN}[Phase 2] [2.5] Setting up test server monitoring channels...{Colors.RESET}")
+            # Commands index channel only (no other auto-channel creation)
+            print(f"{Colors.CYAN}[Phase 2] [2.5] Ensuring Commands index channel...{Colors.RESET}")
             if admin_bot.test_server_organizer:
                 try:
                     setup_result = await admin_bot.test_server_organizer.setup_monitoring_channels()
-                    if "error" not in setup_result:
-                        channels_created = setup_result.get("channels", {})
-                        if channels_created:
-                            print(f"{Colors.CYAN}[Phase 2] [2.5] Created {len(channels_created)} monitoring channel(s){Colors.RESET}")
-                            for channel_name, channel_id in list(channels_created.items())[:5]:
-                                print(f"{Colors.CYAN}    • {channel_name}: {channel_id}{Colors.RESET}")
-                        print(f"{Colors.GREEN}[Phase 2] [2.5] ✓ Test server monitoring channels ready{Colors.RESET}")
+                    if "error" not in setup_result and not setup_result.get("skipped"):
+                        print(f"{Colors.GREEN}[Phase 2] [2.5] ✓ Commands channel ready{Colors.RESET}")
                         # Publish command index into the test server commands channel (idempotent).
                         try:
                             await admin_bot._publish_command_index_to_test_server()
                         except Exception:
                             pass
+                    elif setup_result.get("skipped"):
+                        print(f"{Colors.YELLOW}[Phase 2] [2.5] ⚠️  Commands index disabled by config{Colors.RESET}")
                     else:
-                        print(f"{Colors.YELLOW}[Phase 2] [2.5] ⚠️  Test server setup: {setup_result.get('error', 'Unknown error')}{Colors.RESET}")
+                        print(f"{Colors.YELLOW}[Phase 2] [2.5] ⚠️  Commands channel setup: {setup_result.get('error', 'Unknown error')}{Colors.RESET}")
                 except Exception as setup_error:
-                    print(f"{Colors.YELLOW}[Phase 2] [2.5] ⚠️  Test server setup failed (non-critical): {setup_error}{Colors.RESET}")
+                    print(f"{Colors.YELLOW}[Phase 2] [2.5] ⚠️  Commands channel setup failed (non-critical): {setup_error}{Colors.RESET}")
             else:
                 print(f"{Colors.YELLOW}[Phase 2] [2.5] ⚠️  TestServerOrganizer not available{Colors.RESET}")
         except Exception as e:

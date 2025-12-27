@@ -411,17 +411,19 @@ class ServiceManager:
 class BotSelectView(ui.View):
     """View with SelectMenu for bot selection"""
     
-    def __init__(self, admin_bot_instance, action: str, action_display: str):
+    def __init__(self, admin_bot_instance, action: str, action_display: str, action_kwargs: Optional[Dict[str, Any]] = None):
         """
         Args:
             admin_bot_instance: RSAdminBot instance
-            action: Action name ('start', 'stop', 'restart', 'restart_and_sync', 'status', 'update', 'info', 'config', 'movements', 'diagnose')
+            action: Action name ('start', 'stop', 'restart', 'status', 'update', 'details', 'logs', 'info', 'config', 'movements', 'diagnose')
             action_display: Display name for action ('Start', 'Stop', etc.)
+            action_kwargs: Optional extra params for handlers (e.g. logs lines)
         """
         super().__init__(timeout=300)  # 5 minute timeout
         self.admin_bot = admin_bot_instance
         self.action = action
         self.action_display = action_display
+        self.action_kwargs = action_kwargs or {}
         
         # Create SelectMenu with all bots + "All Bots" option for start/stop/restart actions
         options = [
@@ -434,7 +436,7 @@ class BotSelectView(ui.View):
         ]
         
         # Add "All Bots" option for service control actions
-        if self.action in ["start", "stop", "restart", "restart_and_sync"]:
+        if self.action in ["start", "stop", "restart"]:
             options.insert(0, discord.SelectOption(
                 label="🔄 All Bots",
                 value="all_bots",
@@ -466,14 +468,18 @@ class BotSelectView(ui.View):
             await self._handle_stop(interaction, bot_name)
         elif self.action == "restart":
             await self._handle_restart(interaction, bot_name)
-        elif self.action == "restart_and_sync":
-            await self._handle_restart_and_sync(interaction, bot_name)
         elif self.action == "status":
             bot_info = self.admin_bot.BOTS[bot_name]
             await self._handle_status(interaction, bot_name, bot_info)
         elif self.action == "update":
             bot_info = self.admin_bot.BOTS[bot_name]
             await self._handle_update(interaction, bot_name, bot_info)
+        elif self.action == "details":
+            bot_info = self.admin_bot.BOTS[bot_name]
+            await self._handle_details(interaction, bot_name, bot_info)
+        elif self.action == "logs":
+            bot_info = self.admin_bot.BOTS[bot_name]
+            await self._handle_logs(interaction, bot_name, bot_info)
         elif self.action == "info":
             bot_info = self.admin_bot.BOTS[bot_name]
             await self._handle_info(interaction, bot_name, bot_info)
@@ -751,138 +757,6 @@ class BotSelectView(ui.View):
             error_msg = stderr or stdout or "Unknown error"
             await interaction.followup.send(f"❌ Failed to restart {bot_info['name']}:\n```{error_msg[:500]}```")
     
-    async def _handle_restart_and_sync(self, interaction, bot_name):
-        """Handle bot restart with file sync (supports single bot or 'all_bots')"""
-        if not self.admin_bot.service_manager:
-            await interaction.followup.send("❌ ServiceManager not available")
-            return
-        
-        # Handle "all_bots" case
-        if bot_name == "all_bots":
-            total_bots = len(self.admin_bot.BOTS)
-            status_msg = await interaction.followup.send(f"📦🔄 **Syncing & Restarting all {total_bots} bot(s)...**\n```\nPreparing...\n```")
-            
-            results = []
-            for idx, (bot_key, bot_info) in enumerate(self.admin_bot.BOTS.items(), 1):
-                bot_folder = bot_info["folder"]
-                service_name = bot_info["service"]
-                script_pattern = bot_info.get("script", bot_key)
-                
-                await status_msg.edit(content=f"📦🔄 **Syncing & Restarting all {total_bots} bot(s)...**\n```\n[{idx}/{total_bots}] {bot_info['name']} - Syncing files...\n```")
-                
-                # Step 1: Sync files
-                success, stats = self.admin_bot._sync_bot_files(bot_folder, bot_info['name'], show_tree=False, delete_remote_only=True)
-                
-                if not success:
-                    error_msg = stats.get("error", "Unknown error")
-                    results.append(f"❌ **{bot_info['name']}**: Sync failed - {error_msg[:100]}")
-                    continue
-                
-                synced = stats.get('synced', 0)
-                failed = stats.get('failed', 0)
-                skipped = stats.get('skipped', 0)
-                python_total = stats.get('python_files_total', 0)
-                python_verified = stats.get('python_files_verified', 0)
-                python_percent = stats.get('python_sync_percent', 100)
-                
-                sync_info = f"Synced: {synced}, Skipped: {skipped}, Failed: {failed}"
-                if python_total > 0:
-                    if python_percent == 100:
-                        sync_info += f" | 🐍 Python: {python_verified}/{python_total} (100%) ✅"
-                    else:
-                        sync_info += f" | 🐍 Python: {python_verified}/{python_total} ({python_percent}%) ⚠️"
-                
-                # Step 2: Restart
-                await status_msg.edit(content=f"📦🔄 **Syncing & Restarting all {total_bots} bot(s)...**\n```\n[{idx}/{total_bots}] {bot_info['name']} - Restarting...\n```")
-                
-                restart_success, stdout, stderr = self.admin_bot.service_manager.restart(service_name, script_pattern=script_pattern, bot_name=bot_key)
-                
-                if restart_success:
-                    is_running, verify_error = self.admin_bot.service_manager.verify_started(service_name, bot_name=bot_key)
-                    if is_running:
-                        results.append(f"✅ **{bot_info['name']}**: Restarted | {sync_info}")
-                    else:
-                        error_msg = verify_error or stderr or stdout or "Unknown error"
-                        results.append(f"⚠️ **{bot_info['name']}**: Files synced, restart verification failed | {sync_info}")
-                else:
-                    error_msg = stderr or stdout or "Unknown error"
-                    results.append(f"⚠️ **{bot_info['name']}**: Files synced, restart failed | {sync_info}")
-            
-            summary = f"📦🔄 **Sync & Restart All Complete**\n\n" + "\n".join(results)
-            if len(summary) > 2000:
-                summary = summary[:1997] + "..."
-            await status_msg.edit(content=summary)
-            await self.admin_bot._log_to_discord(f"📦🔄 **All Bots Sync & Restart** completed\nRequested by: {interaction.user.mention}")
-            return
-        
-        # Handle single bot case
-        bot_info = self.admin_bot.BOTS[bot_name]
-        bot_folder = bot_info["folder"]
-        service_name = bot_info["service"]
-        script_pattern = bot_info.get("script", bot_name)
-        
-        # Step 1: Sync files first
-        await interaction.followup.send(f"📦 **Syncing {bot_info['name']} files...**\n```\nScanning and syncing files...\n```")
-        
-        success, stats = self.admin_bot._sync_bot_files(bot_folder, bot_info['name'], show_tree=False, delete_remote_only=True)
-        
-        if not success:
-            error_msg = stats.get("error", "Unknown error")
-            await interaction.followup.send(f"❌ **File sync failed** for {bot_info['name']}:\n```{error_msg[:500]}```\n\n⚠️ Skipping restart due to sync failure.")
-            return
-        
-        # Show sync results
-        synced = stats.get('synced', 0)
-        failed = stats.get('failed', 0)
-        skipped = stats.get('skipped', 0)
-        python_total = stats.get('python_files_total', 0)
-        python_verified = stats.get('python_files_verified', 0)
-        python_percent = stats.get('python_sync_percent', 100)
-        
-        sync_summary = f"✅ **Files synced**: {synced} synced, {skipped} skipped, {failed} failed"
-        if python_total > 0:
-            if python_percent == 100:
-                sync_summary += f" | 🐍 Python: {python_verified}/{python_total} (100%) ✅"
-            else:
-                sync_summary += f" | 🐍 Python: {python_verified}/{python_total} ({python_percent}%) ⚠️"
-        
-        # Step 2: Restart the bot
-        await interaction.followup.send(f"🔄 **Restarting {bot_info['name']}...**\n```\n{sync_summary}\n\nConnecting to server...\n```")
-
-        before_exists, before_state, _ = self.admin_bot.service_manager.get_status(service_name, bot_name=bot_name)
-        before_pid = self.admin_bot.service_manager.get_pid(service_name)
-
-        restart_success, stdout, stderr = self.admin_bot.service_manager.restart(service_name, script_pattern=script_pattern, bot_name=bot_name)
-        
-        if restart_success:
-            is_running, verify_error = self.admin_bot.service_manager.verify_started(service_name, bot_name=bot_name)
-            if is_running:
-                after_exists, after_state, _ = self.admin_bot.service_manager.get_status(service_name, bot_name=bot_name)
-                after_pid = self.admin_bot.service_manager.get_pid(service_name)
-                pid_note = ""
-                if before_pid and after_pid and before_pid != after_pid:
-                    pid_note = f" (pid {before_pid} -> {after_pid})"
-                elif before_pid and after_pid and before_pid == after_pid:
-                    pid_note = f" (pid unchanged: {after_pid})"
-                elif before_pid is None and after_pid:
-                    pid_note = f" (pid -> {after_pid})"
-                before_state_txt = before_state or "unknown"
-                after_state_txt = after_state or "unknown"
-                before_pid_txt = str(before_pid or 0)
-                after_pid_txt = str(after_pid or 0)
-                final_summary = (
-                    f"✅ **{bot_info['name']} restarted successfully!**{pid_note}\n"
-                    f"```\n{sync_summary}\n\nBefore: state={before_state_txt} pid={before_pid_txt}\nAfter:  state={after_state_txt} pid={after_pid_txt}\n```"
-                )
-                await interaction.followup.send(final_summary)
-                await self.admin_bot._log_to_discord(f"🔄 **{bot_info['name']}** restarted with file sync\n{sync_summary}\nRequested by: {interaction.user.mention}")
-            else:
-                error_msg = verify_error or stderr or stdout or "Unknown error"
-                await interaction.followup.send(f"⚠️ **Files synced but restart verification failed**\n```{error_msg[:500]}```\n\n{sync_summary}")
-        else:
-            error_msg = stderr or stdout or "Unknown error"
-            await interaction.followup.send(f"⚠️ **Files synced but restart failed**\n```{error_msg[:500]}```\n\n{sync_summary}")
-    
     async def _handle_status(self, interaction, bot_name, bot_info):
         """Handle bot status check"""
         service_name = bot_info["service"]
@@ -914,34 +788,60 @@ class BotSelectView(ui.View):
         await interaction.followup.send(embed=embed)
     
     async def _handle_update(self, interaction, bot_name, bot_info):
-        """Handle bot update"""
-        bot_folder = bot_info["folder"]
-        await interaction.followup.send(f"📦 **Syncing {bot_info['name']} files...**\n```\nScanning files...\n```")
-        
-        # Check if SSH is available
+        """Handle bot update (GitHub python-only) from the dropdown."""
+        # This matches the canonical update model: pull rsbots-code and overwrite live *.py.
         ssh_ok, error_msg = self.admin_bot._check_ssh_available()
         if not ssh_ok:
             await interaction.followup.send(f"❌ SSH not configured: {error_msg}")
             return
-        
-        # Use comprehensive sync with tree view
-        success, stats = self.admin_bot._sync_bot_files(bot_folder, bot_info['name'], show_tree=True, delete_remote_only=True)
-        
-        if success:
-            summary = f"✅ **{bot_info['name']} files synced successfully!**\n"
-            summary += f"```\n"
-            summary += f"Synced: {stats['synced']} file(s)\n"
-            if stats['failed'] > 0:
-                summary += f"Failed: {stats['failed']} file(s)\n"
-            if stats['deleted'] > 0:
-                summary += f"Deleted: {stats['deleted']} remote-only file(s)\n"
-            if stats['skipped'] > 0:
-                summary += f"Skipped: {stats['skipped']} file(s)\n"
-            summary += f"```"
-            await interaction.followup.send(summary)
+
+        bot_key = (bot_name or "").strip().lower()
+        if bot_key == "rsadminbot":
+            await interaction.followup.send("ℹ️ Use `!selfupdate` to update RSAdminBot.")
+            return
+
+        bot_folder = str(bot_info.get("folder") or "")
+        service_name = str(bot_info.get("service") or "")
+        await interaction.followup.send(
+            f"📦 **Updating {bot_info['name']} from GitHub (python-only)...**\n"
+            "```\nPulling + copying *.py from /home/rsadmin/bots/rsbots-code\n```"
+        )
+
+        success, stats = self.admin_bot._github_py_only_update(bot_folder)
+        if not success:
+            await interaction.followup.send(f"❌ Update failed:\n```{stats.get('error','unknown error')[:900]}```")
+            return
+
+        old = (stats.get("old") or "").strip()
+        new = (stats.get("new") or "").strip()
+        py_count = str(stats.get("py_count") or "0").strip()
+        changed_count = str(stats.get("changed_count") or "0").strip()
+        changed_sample = stats.get("changed_sample") or []
+
+        restart_ok = False
+        restart_err = ""
+        if self.admin_bot.service_manager and service_name:
+            ok_r, out_r, err_r = self.admin_bot.service_manager.restart(service_name, bot_name=bot_key)
+            if not ok_r:
+                restart_err = (err_r or out_r or "restart failed")[:800]
+            else:
+                running, verify_err = self.admin_bot.service_manager.verify_started(service_name, bot_name=bot_key)
+                restart_ok = bool(running)
+                if not restart_ok:
+                    restart_err = (verify_err or "service did not become active")[:800]
         else:
-            error_msg = stats.get("error", "Unknown error")
-            await interaction.followup.send(f"❌ Failed to sync {bot_info['name']} files:\n```{error_msg}```")
+            restart_err = "ServiceManager not available or missing service mapping"
+
+        summary = f"✅ **{bot_info['name']} updated from GitHub (python-only)**\n```"
+        summary += f"\nGit: {old[:12]} -> {new[:12]}"
+        summary += f"\nPython copied: {py_count} | Changed: {changed_count}"
+        summary += f"\nRestart: {'OK' if restart_ok else 'FAILED'}"
+        summary += "\n```"
+        if changed_sample:
+            summary += "\nChanged sample:\n```" + "\n".join(str(x) for x in changed_sample[:20]) + "```"
+        if not restart_ok and restart_err:
+            summary += "\nRestart error:\n```" + restart_err[:900] + "```"
+        await interaction.followup.send(summary[:1900])
     
     async def _handle_info(self, interaction, bot_name, bot_info):
         """Handle bot info"""
@@ -984,6 +884,28 @@ class BotSelectView(ui.View):
                 embed.add_field(name="Service Status", value="⚠️ Service not found", inline=False)
         
         await interaction.followup.send(embed=embed)
+
+    async def _handle_details(self, interaction, bot_name, bot_info):
+        """Show systemd details via botctl.sh (dropdown action)."""
+        if not self.admin_bot.is_admin(interaction.user):
+            await interaction.followup.send("❌ You don't have permission to use this command.")
+            return
+        svc = str(bot_info.get("service") or "")
+        await interaction.followup.send(f"🧾 **Details: {bot_info.get('name', bot_name)}**\nService: `{svc}`")
+        success, out, err = self.admin_bot._execute_sh_script("botctl.sh", "details", bot_name)
+        await interaction.followup.send(self.admin_bot._codeblock(out or err or ""))
+
+    async def _handle_logs(self, interaction, bot_name, bot_info):
+        """Show journalctl logs via botctl.sh (dropdown action)."""
+        if not self.admin_bot.is_admin(interaction.user):
+            await interaction.followup.send("❌ You don't have permission to use this command.")
+            return
+        svc = str(bot_info.get("service") or "")
+        lines = int(self.action_kwargs.get("lines") or 80)
+        lines = max(10, min(lines, 400))
+        await interaction.followup.send(f"📜 **Logs: {bot_info.get('name', bot_name)}**\nService: `{svc}`\nLines: `{lines}`")
+        success, out, err = self.admin_bot._execute_sh_script("botctl.sh", "logs", bot_name, str(lines))
+        await interaction.followup.send(self.admin_bot._codeblock(out or err or ""))
 
 
 class StartBotView(ui.View):
@@ -1045,219 +967,6 @@ class StartBotView(ui.View):
         
         # Update the message
         await interaction.edit_original_response(view=self)
-
-
-class BotSyncRestartPromptView(ui.View):
-    """View with buttons to prompt for bot sync and restart after botscan"""
-    
-    def __init__(self, admin_bot_instance, bot_keys: List[str], requester_id: int):
-        super().__init__(timeout=300)  # 5 minute timeout
-        self.admin_bot = admin_bot_instance
-        self.bot_keys = bot_keys
-        self.requester_id = requester_id
-    
-    @ui.button(label="📦 Sync Only", style=discord.ButtonStyle.primary, row=0)
-    async def sync_only_button(self, interaction: discord.Interaction, button: ui.Button):
-        """Sync files only, no restart"""
-        if not self.admin_bot.is_admin(interaction.user):
-            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
-            return
-        
-        if interaction.user.id != self.requester_id:
-            await interaction.response.send_message("❌ Only the person who ran `!botscan` can confirm updates.", ephemeral=True)
-            return
-        
-        await interaction.response.defer(ephemeral=False)
-        
-        # Disable buttons
-        button.disabled = True
-        self.sync_restart_button.disabled = True
-        self.cancel_button.disabled = True
-        await interaction.edit_original_response(view=self)
-        
-        # Sync each bot
-        update_status_msg = await interaction.followup.send(
-            f"📦 **Syncing {len(self.bot_keys)} bot(s)...**\n```\nPreparing to sync...\n```"
-        )
-        
-        results = []
-        for idx, bot_key in enumerate(self.bot_keys, 1):
-            bot_info = self.admin_bot.BOTS.get(bot_key)
-            if not bot_info:
-                results.append(f"❌ {bot_key}: Not found in BOTS dict")
-                continue
-            
-            bot_folder = bot_info["folder"]
-            bot_name = bot_info["name"]
-            
-            await update_status_msg.edit(
-                content=f"📦 **Syncing {len(self.bot_keys)} bot(s)...**\n```\n[{idx}/{len(self.bot_keys)}] Syncing {bot_name}...\n```"
-            )
-            
-            # Run sync (same as botupdate command)
-            success, stats = self.admin_bot._sync_bot_files(bot_folder, bot_name, show_tree=False, delete_remote_only=True)
-            
-            if success:
-                synced = stats.get('synced', 0)
-                failed = stats.get('failed', 0)
-                skipped = stats.get('skipped', 0)
-                python_total = stats.get('python_files_total', 0)
-                python_verified = stats.get('python_files_verified', 0)
-                python_percent = stats.get('python_sync_percent', 100)
-                
-                result_line = f"✅ **{bot_name}**: Synced {synced}, Skipped {skipped}, Failed {failed}"
-                if python_total > 0:
-                    if python_percent == 100:
-                        result_line += f" | 🐍 Python: {python_verified}/{python_total} (100%) ✅"
-                    else:
-                        result_line += f" | 🐍 Python: {python_verified}/{python_total} ({python_percent}%) ⚠️"
-                results.append(result_line)
-            else:
-                error_msg = stats.get("error", "Unknown error")
-                results.append(f"❌ **{bot_name}**: {error_msg[:100]}")
-        
-        # Send final summary
-        summary = f"📦 **Sync Complete**\n\n" + "\n".join(results)
-        if len(summary) > 2000:
-            summary = summary[:1997] + "..."
-        
-        await update_status_msg.edit(content=summary)
-        await self.admin_bot._log_to_discord(f"📦 **Bot Sync Completed**\nSynced {len(self.bot_keys)} bot(s)\nRequested by: {interaction.user.mention}")
-    
-    @ui.button(label="🔄 Sync & Restart All", style=discord.ButtonStyle.success, row=0)
-    async def sync_restart_button(self, interaction: discord.Interaction, button: ui.Button):
-        """Sync and restart all bots in proper sequence"""
-        if not self.admin_bot.is_admin(interaction.user):
-            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
-            return
-        
-        if interaction.user.id != self.requester_id:
-            await interaction.response.send_message("❌ Only the person who ran `!botscan` can confirm updates.", ephemeral=True)
-            return
-        
-        await interaction.response.defer(ephemeral=False)
-        
-        # Disable buttons
-        button.disabled = True
-        self.sync_only_button.disabled = True
-        self.cancel_button.disabled = True
-        await interaction.edit_original_response(view=self)
-        
-        # Step 1: Sync all bots
-        sync_status_msg = await interaction.followup.send(
-            f"📦 **Step 1: Syncing {len(self.bot_keys)} bot(s)...**\n```\nPreparing to sync...\n```"
-        )
-        
-        sync_results = []
-        for idx, bot_key in enumerate(self.bot_keys, 1):
-            bot_info = self.admin_bot.BOTS.get(bot_key)
-            if not bot_info:
-                sync_results.append(f"❌ {bot_key}: Not found in BOTS dict")
-                continue
-            
-            bot_folder = bot_info["folder"]
-            bot_name = bot_info["name"]
-            
-            await sync_status_msg.edit(
-                content=f"📦 **Step 1: Syncing {len(self.bot_keys)} bot(s)...**\n```\n[{idx}/{len(self.bot_keys)}] Syncing {bot_name}...\n```"
-            )
-            
-            # Run sync
-            success, stats = self.admin_bot._sync_bot_files(bot_folder, bot_name, show_tree=False, delete_remote_only=True)
-            
-            if success:
-                synced = stats.get('synced', 0)
-                python_total = stats.get('python_files_total', 0)
-                python_verified = stats.get('python_files_verified', 0)
-                python_percent = stats.get('python_sync_percent', 100)
-                
-                result_line = f"✅ **{bot_name}**: {synced} synced"
-                if python_total > 0 and python_percent == 100:
-                    result_line += f" | 🐍 Python: 100% ✅"
-                sync_results.append(result_line)
-            else:
-                error_msg = stats.get("error", "Unknown error")
-                sync_results.append(f"❌ **{bot_name}**: {error_msg[:100]}")
-        
-        # Step 2: Restart all bots (except RSAdminBot) using manage_bots.sh
-        await sync_status_msg.edit(
-            content=f"📦 **Step 1 Complete**\n```\n" + "\n".join(sync_results[:5]) + "\n```\n\n🔄 **Step 2: Restarting all bots (except RSAdminBot)...**\n```\nPreparing...\n```"
-        )
-        
-        # Filter out RSAdminBot from restart list
-        bots_to_restart = [k for k in self.bot_keys if k != "rsadminbot"]
-        restart_results = []
-        
-        ssh_ok, ssh_error = self.admin_bot._check_ssh_available()
-        if ssh_ok:
-            for idx, bot_key in enumerate(bots_to_restart, 1):
-                bot_info = self.admin_bot.BOTS.get(bot_key)
-                if not bot_info:
-                    continue
-                
-                await sync_status_msg.edit(
-                    content=f"🔄 **Step 2: Restarting all bots...**\n```\n[{idx}/{len(bots_to_restart)}] Restarting {bot_info['name']}...\n```"
-                )
-                
-                success, stdout, stderr = self.admin_bot._execute_sh_script("botctl.sh", "restart", bot_key)
-                if success:
-                    output = stdout or stderr or ""
-                    if "SUCCESS" in output or "active" in output.lower():
-                        restart_results.append(f"✅ **{bot_info['name']}**: Restarted")
-                    else:
-                        restart_results.append(f"⚠️ **{bot_info['name']}**: {output[:80]}")
-                else:
-                    error_msg = stderr or stdout or "Unknown error"
-                    restart_results.append(f"❌ **{bot_info['name']}**: {error_msg[:80]}")
-        else:
-            restart_results.append(f"❌ **SSH not configured**: {ssh_error[:80]}")
-        
-        # Step 3: Restart RSAdminBot if it was in the list
-        if "rsadminbot" in self.bot_keys:
-            await sync_status_msg.edit(
-                content=f"🔄 **Step 2 Complete**\n```\n" + "\n".join(restart_results[:5]) + "\n```\n\n🔄 **Step 3: Restarting RSAdminBot...**\n```\nPreparing...\n```"
-            )
-            
-            if ssh_ok:
-                success, stdout, stderr = self.admin_bot._execute_sh_script("botctl.sh", "restart", "rsadminbot")
-                if success:
-                    output = stdout or stderr or ""
-                    if "SUCCESS" in output or "active" in output.lower():
-                        restart_results.append(f"✅ **RSAdminBot**: Restarted")
-                    else:
-                        restart_results.append(f"⚠️ **RSAdminBot**: {output[:80]}")
-                else:
-                    error_msg = stderr or stdout or "Unknown error"
-                    restart_results.append(f"❌ **RSAdminBot**: {error_msg[:80]}")
-        
-        # Final summary
-        summary = f"🔄 **Sync & Restart Complete**\n\n"
-        summary += f"**Synced:** {len(sync_results)} bot(s)\n"
-        summary += f"**Restarted:** {len(restart_results)} bot(s)\n\n"
-        summary += "**Sync Results:**\n" + "\n".join(sync_results) + "\n\n"
-        summary += "**Restart Results:**\n" + "\n".join(restart_results)
-        
-        if len(summary) > 2000:
-            summary = summary[:1997] + "..."
-        
-        await sync_status_msg.edit(content=summary)
-        await self.admin_bot._log_to_discord(f"🔄 **Bot Sync & Restart Completed**\nSynced & Restarted {len(self.bot_keys)} bot(s)\nRequested by: {interaction.user.mention}")
-    
-    @ui.button(label="❌ Cancel", style=discord.ButtonStyle.danger, row=0)
-    async def cancel_button(self, interaction: discord.Interaction, button: ui.Button):
-        """Cancel sync/restart"""
-        if interaction.user.id != self.requester_id:
-            await interaction.response.send_message("❌ Only the person who ran `!botscan` can cancel.", ephemeral=True)
-            return
-        
-        # Disable buttons
-        button.disabled = True
-        self.sync_only_button.disabled = True
-        self.sync_restart_button.disabled = True
-        await interaction.response.edit_message(
-            content="❌ **Sync/Restart cancelled**\nNo files were synced.",
-            view=self
-        )
 
 
 class RSAdminBot:
@@ -1390,7 +1099,7 @@ class RSAdminBot:
                 # Convert to list format for compatibility
                 self.servers = [ssh_server_config]
                 self.current_server = ssh_server_config
-
+                
                 # Canonical remote repo root (also used for local-exec detection on Ubuntu)
                 remote_user = ssh_server_config.get("user", "rsadmin") or "rsadmin"
                 self.remote_root = str(Path(f"/home/{remote_user}/bots/mirror-world"))
@@ -1415,12 +1124,12 @@ class RSAdminBot:
                             self._fix_ssh_key_permissions(key_path)
                         ssh_server_config["key"] = str(key_path)
                         print(f"{Colors.GREEN}[SSH] Using SSH key: {key_path}{Colors.RESET}")
+                else:
+                    # On Ubuntu local-exec mode, a missing SSH key is expected (we don't need it).
+                    if self._should_use_local_exec():
+                        print(f"{Colors.GREEN}[Local Exec] SSH key not found (ok in local-exec): {key_name}{Colors.RESET}")
                     else:
-                        # On Ubuntu local-exec mode, a missing SSH key is expected (we don't need it).
-                        if self._should_use_local_exec():
-                            print(f"{Colors.GREEN}[Local Exec] SSH key not found (ok in local-exec): {key_name}{Colors.RESET}")
-                        else:
-                            print(f"{Colors.YELLOW}[SSH Warning] SSH key not found: {key_name}{Colors.RESET}")
+                        print(f"{Colors.YELLOW}[SSH Warning] SSH key not found: {key_name}{Colors.RESET}")
                 
                 print(f"{Colors.GREEN}[SSH] Loaded server config from config.json: {ssh_server_config.get('name', 'Unknown')}{Colors.RESET}")
                 print(f"{Colors.CYAN}[SSH] Host: {ssh_server_config.get('host', 'N/A')}, User: {ssh_server_config.get('user', 'N/A')}{Colors.RESET}")
@@ -1585,7 +1294,7 @@ class RSAdminBot:
             # If the configured repo root exists locally on this machine, we can run locally.
             repo_root = Path(getattr(self, "remote_root", "") or "")
             if repo_root.is_dir():
-                return True
+                    return True
         except Exception:
             return False
         return False
@@ -2071,6 +1780,20 @@ echo \"CHANGED_END\"
         except Exception:
             return None
 
+    @staticmethod
+    def _truncate_for_discord(text: str, limit: int = 1800) -> str:
+        """Truncate long outputs to fit Discord message limits, keeping the tail (usually most useful for logs)."""
+        s = (text or "").strip()
+        if not s:
+            return "(no output)"
+        if len(s) <= limit:
+            return s
+        return "…(truncated)…\n" + s[-limit:]
+
+    @classmethod
+    def _codeblock(cls, text: str, limit: int = 1800) -> str:
+        return "```" + cls._truncate_for_discord(text, limit=limit) + "```"
+
     async def _is_progress_channel(self, channel: Optional[discord.abc.Messageable]) -> bool:
         """Return True if the provided channel is the configured update_progress channel."""
         if channel is None:
@@ -2373,7 +2096,7 @@ echo \"CHANGED_END\"
                 return True
         
         return False
-
+    
     def _github_py_only_update(self, bot_folder: str) -> Tuple[bool, Dict[str, Any]]:
         """Pull python-only bot code from the server-side GitHub checkout and overwrite live *.py files.
 
@@ -2552,7 +2275,7 @@ echo "CHANGED_END"
         }
         
         print(f"{Colors.CYAN}[Sync] Syncing {bot_name} using sync_bot.sh...{Colors.RESET}")
-
+        
         # Optional: show an accurate sha-based tree diff BEFORE syncing (helps debug “why doesn’t it match?”)
         if show_tree:
             try:
@@ -2603,7 +2326,7 @@ echo "CHANGED_END"
                 key_path = self.base_path / ssh_key
             if not key_path.exists():
                 return False, {"error": f"SSH key not found: {key_path}"}
-
+        
         # Step 2.0: Create a remote backup tar.gz for this folder (always, before changes)
         # This is fast, deterministic, and gives you an “undo” without guessing.
         try:
@@ -2690,7 +2413,7 @@ echo "CHANGED_END"
             result = subprocess.run(tar_cmd, capture_output=True, text=True, timeout=60)
             if result.returncode != 0:
                 return False, {"error": f"Failed to create tar archive: {result.stderr}"}
-
+            
             # Record tar contents (high-signal proof of what would be applied)
             try:
                 t = subprocess.run(["tar", "-tf", tar_path], capture_output=True, text=True, timeout=10)
@@ -2707,13 +2430,13 @@ echo "CHANGED_END"
             remote_tar = f"/tmp/{bot_folder}.stage.tar" if bot_folder == "RSAdminBot" else f"/tmp/{bot_folder}.tar"
             if not local_exec:
                 scp_upload_cmd = ["scp", "-i", str(key_path)]
-                if port != 22:
-                    scp_upload_cmd.extend(["-P", str(port)])
+            if port != 22:
+                scp_upload_cmd.extend(["-P", str(port)])
                 scp_upload_cmd.extend([tar_path, f"{remote_user}@{remote_host}:{remote_tar}"])
-                result = subprocess.run(scp_upload_cmd, capture_output=True, text=True, timeout=120)
-                if result.returncode != 0:
-                    return False, {"error": f"Failed to upload tar: {result.stderr}"}
-
+            result = subprocess.run(scp_upload_cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode != 0:
+                return False, {"error": f"Failed to upload tar: {result.stderr}"}
+            
             # RSAdminBot two-phase self-update:
             # - Stage update into a staging dir
             # - Write pending file
@@ -2787,8 +2510,8 @@ echo "CHANGED_END"
             else:
                 extract_cmd = f"cd {shlex.quote(remote_base)} && tar -xf {shlex.quote(remote_tar)} --strip-components=1 && rm -f {shlex.quote(remote_tar)}"
                 success, stdout, stderr = self._execute_ssh_command(extract_cmd, timeout=180)
-                if not success:
-                    return False, {"error": f"Failed to extract on remote: {stderr or stdout}"}
+            if not success:
+                return False, {"error": f"Failed to extract on remote: {stderr or stdout}"}
             
             # Post-sync verification: sha256 manifests (accurate, not size-based)
             try:
@@ -2862,7 +2585,7 @@ echo "CHANGED_END"
             print(f"{Colors.RED}[Sync] ✗ Sync failed: {error_msg}{Colors.RESET}")
         
         return success
-
+    
     def _generate_local_manifest(
         self,
         bot_folders: List[str],
@@ -4078,6 +3801,55 @@ echo "CHANGED_END"
         self.registered_commands.append(("restart", "Restart RSAdminBot locally or remotely", True))
         
         # NOTE: !updatetokens removed (it encouraged storing plaintext tokens locally).
+
+        @self.bot.command(name="details")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def details(ctx, bot_name: str = None):
+            """Show systemd details for a bot (admin only)."""
+            if not bot_name:
+                view = BotSelectView(self, "details", "Details")
+                embed = discord.Embed(
+                    title="🧾 Select Bot for Details",
+                    description="Choose a bot from the dropdown menu below:",
+                    color=discord.Color.blurple(),
+                )
+                await ctx.send(embed=embed, view=view)
+                return
+            bot_key = (bot_name or "").strip().lower()
+            if bot_key not in self.BOTS:
+                await ctx.send(f"❌ Unknown bot: {bot_key}\nUse `!botlist`.")
+                return
+            info = self.BOTS[bot_key]
+            success, out, err = self._execute_sh_script("botctl.sh", "details", bot_key)
+            await ctx.send(f"🧾 **Details: {info.get('name', bot_key)}**\n{self._codeblock(out or err or '')}"[:1900])
+        self.registered_commands.append(("details", "Show systemctl status/details for a bot", True))
+
+        @self.bot.command(name="logs")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def logs(ctx, bot_name: str = None, lines: str = "80"):
+            """Show journal logs for a bot (admin only)."""
+            if not bot_name:
+                view = BotSelectView(self, "logs", "Logs", action_kwargs={"lines": 80})
+                embed = discord.Embed(
+                    title="📜 Select Bot for Logs",
+                    description="Choose a bot from the dropdown menu below:",
+                    color=discord.Color.blurple(),
+                )
+                await ctx.send(embed=embed, view=view)
+                return
+            bot_key = (bot_name or "").strip().lower()
+            if bot_key not in self.BOTS:
+                await ctx.send(f"❌ Unknown bot: {bot_key}\nUse `!botlist`.")
+                return
+            try:
+                n = int(str(lines).strip())
+            except Exception:
+                n = 80
+            n = max(10, min(n, 400))
+            info = self.BOTS[bot_key]
+            success, out, err = self._execute_sh_script("botctl.sh", "logs", bot_key, str(n))
+            await ctx.send(f"📜 **Logs: {info.get('name', bot_key)}** (last {n})\n{self._codeblock(out or err or '')}"[:1900])
+        self.registered_commands.append(("logs", "Show journalctl logs for a bot", True))
         
         @self.bot.command(name="botlist")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
@@ -4495,146 +4267,6 @@ echo "CHANGED_END"
                 await status_msg.edit(content=f"❌ Failed to restart {bot_info['name']}:\n```{error_msg[:500]}```")
                 await self._log_to_discord(f"❌ **{bot_info['name']}** failed to restart:\n```{error_msg[:500]}```")
         
-        @self.bot.command(name="botrestartsync")
-        @commands.check(lambda ctx: self.is_admin(ctx.author))
-        async def botrestartsync(ctx, bot_name: str = None):
-            """Restart a bot and sync all files (admin only)"""
-            ssh_ok, error_msg = self._check_ssh_available()
-            if not ssh_ok:
-                await ctx.send(f"❌ SSH not configured: {error_msg}")
-                return
-            
-            if not bot_name:
-                # Show interactive SelectMenu with restart_and_sync action
-                view = BotSelectView(self, "restart_and_sync", "Restart & Sync")
-                embed = discord.Embed(
-                    title="🔄📦 Select Bot to Restart & Sync",
-                    description=(
-                        "Choose a bot from the dropdown menu below.\n\n"
-                        "**This will:**\n"
-                        "1. Sync all files (Python, config, etc.)\n"
-                        "2. Restart the bot service\n\n"
-                        "**Files synced:**\n"
-                        "• All `.py` files\n"
-                        "• `config.json` and `messages.json`\n"
-                        "• Documentation files\n\n"
-                        "**Files NOT synced:**\n"
-                        "• Data files (`.db`, `.log`, etc.)"
-                    ),
-                    color=discord.Color.blue()
-                )
-                await ctx.send(embed=embed, view=view)
-                return
-
-            bot_name = bot_name.lower()
-            if bot_name not in self.BOTS:
-                await ctx.send(f"❌ Unknown bot: {bot_name}\nUse `!botlist` to see available bots")
-                return
-
-            bot_info = self.BOTS[bot_name]
-            bot_folder = bot_info["folder"]
-            service_name = bot_info["service"]
-
-            # Log to terminal and Discord
-            guild_name = ctx.guild.name if ctx.guild else "DM"
-            guild_id = ctx.guild.id if ctx.guild else 0
-            print(f"{Colors.CYAN}[Command] Restarting & Syncing {bot_info['name']} (Service: {service_name}){Colors.RESET}")
-            print(f"{Colors.CYAN}[Command] Server: {guild_name} (ID: {guild_id}){Colors.RESET}")
-            print(f"{Colors.CYAN}[Command] Requested by: {ctx.author} ({ctx.author.id}){Colors.RESET}")
-            await self._log_to_discord(
-                f"🔄📦 **Restarting & Syncing {bot_info['name']}**\nService: `{service_name}`\nRequested by: {ctx.author.mention}"
-            )
-
-            # Step 1: Sync files first
-            status_msg = await ctx.send(f"📦 **Syncing {bot_info['name']} files...**\n```\nScanning and syncing files...\n```")
-
-            success, stats = self._sync_bot_files(bot_folder, bot_info['name'], show_tree=False, delete_remote_only=True)
-
-            if not success:
-                error_msg = stats.get("error", "Unknown error")
-                print(f"{Colors.RED}[Error] File sync failed for {bot_info['name']}: {error_msg[:500]}{Colors.RESET}")
-                await status_msg.edit(
-                    content=f"❌ **File sync failed** for {bot_info['name']}:\n```{error_msg[:500]}```\n\n⚠️ Skipping restart due to sync failure."
-                )
-                await self._log_to_discord(f"❌ **{bot_info['name']}** sync failed, restart skipped:\n```{error_msg[:500]}```")
-                return
-
-            # Show sync results
-            synced = stats.get('synced', 0)
-            failed = stats.get('failed', 0)
-            skipped = stats.get('skipped', 0)
-            python_total = stats.get('python_files_total', 0)
-            python_verified = stats.get('python_files_verified', 0)
-            python_percent = stats.get('python_sync_percent', 100)
-
-            sync_summary = f"Synced: {synced}, Skipped: {skipped}, Failed: {failed}"
-            if python_total > 0:
-                if python_percent == 100:
-                    sync_summary += f" | 🐍 Python: {python_verified}/{python_total} (100%) ✅"
-                else:
-                    sync_summary += f" | 🐍 Python: {python_verified}/{python_total} ({python_percent}%) ⚠️"
-
-            # Step 2: Restart the bot
-            await status_msg.edit(content=f"🔄 **Restarting {bot_info['name']}...**\n```\n{sync_summary}\n\nConnecting to server...\n```")
-
-            if not self.service_manager:
-                await status_msg.edit(content=f"❌ ServiceManager not available\n\n✅ Files synced: {sync_summary}")
-                return
-
-            script_pattern = bot_info.get("script", bot_name)
-            bot_name_lower = bot_name.lower()
-
-            before_exists, before_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name_lower)
-            before_pid = self.service_manager.get_pid(service_name)
-
-            restart_success, stdout, stderr = self.service_manager.restart(service_name, script_pattern=script_pattern, bot_name=bot_name_lower)
-
-            if restart_success:
-                # Verify service actually started
-                is_running, verify_error = self.service_manager.verify_started(service_name, bot_name=bot_name_lower)
-                if is_running:
-                    after_exists, after_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name_lower)
-                    after_pid = self.service_manager.get_pid(service_name)
-                    pid_note = ""
-                    if before_pid and after_pid and before_pid != after_pid:
-                        pid_note = f" (pid {before_pid} -> {after_pid})"
-                    elif before_pid and after_pid and before_pid == after_pid:
-                        pid_note = f" (pid unchanged: {after_pid})"
-                    elif before_pid is None and after_pid:
-                        pid_note = f" (pid -> {after_pid})"
-                    before_state_txt = before_state or "unknown"
-                    after_state_txt = after_state or "unknown"
-                    before_pid_txt = str(before_pid or 0)
-                    after_pid_txt = str(after_pid or 0)
-
-                    print(f"{Colors.GREEN}[Success] {bot_info['name']} restarted successfully with file sync!{Colors.RESET}")
-                    final_summary = (
-                        f"✅ **{bot_info['name']} restarted successfully!**{pid_note}\n"
-                        f"```\n{sync_summary}\n\nBefore: state={before_state_txt} pid={before_pid_txt}\nAfter:  state={after_state_txt} pid={after_pid_txt}\n```"
-                    )
-                    await status_msg.edit(content=final_summary)
-                    await self._log_to_discord(
-                        f"✅ **{bot_info['name']}** restarted with file sync\n{sync_summary}\n"
-                        f"State: `{after_state or 'unknown'}` | PID: `{after_pid or 0}`\n"
-                        f"Before: `{before_state or 'unknown'}` | PID: `{before_pid or 0}`"
-                    )
-                else:
-                    error_msg = verify_error or stderr or stdout or "Unknown error"
-                    print(f"{Colors.YELLOW}[Warning] Files synced but restart verification failed for {bot_info['name']}: {error_msg[:500]}{Colors.RESET}")
-                    await status_msg.edit(content=f"⚠️ **Files synced but restart verification failed**\n```{error_msg[:500]}```\n\n✅ Files: {sync_summary}")
-                    await self._log_to_discord(f"⚠️ **{bot_info['name']}** files synced but restart verification failed\n{sync_summary}")
-            else:
-                error_msg = stderr or stdout or "Unknown error"
-                print(f"{Colors.YELLOW}[Warning] Files synced but restart failed for {bot_info['name']}: {error_msg[:500]}{Colors.RESET}")
-                await status_msg.edit(content=f"⚠️ **Files synced but restart failed**\n```{error_msg[:500]}```\n\n✅ Files: {sync_summary}")
-                await self._log_to_discord(f"⚠️ **{bot_info['name']}** files synced but restart failed\n{sync_summary}")
-        
-        @self.bot.command(name="sync")
-        @commands.check(lambda ctx: self.is_admin(ctx.author))
-        async def sync(ctx):
-            """Alias for !botupdate rsadminbot (admin only). Kept to avoid duplicate sync implementations."""
-            await ctx.invoke(self.bot.get_command("botupdate"), bot_name="rsadminbot")
-        
         @self.bot.command(name="botupdate")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
         async def botupdate(ctx, bot_name: str = None):
@@ -4654,7 +4286,7 @@ echo "CHANGED_END"
                 )
                 await ctx.send(embed=embed, view=view)
                 return
-            
+
             bot_name = bot_name.lower()
             if bot_name not in self.BOTS:
                 available_bots = ", ".join(self.BOTS.keys())
@@ -4662,7 +4294,7 @@ echo "CHANGED_END"
                 print(f"{Colors.YELLOW}[Command Error] Available bots: {available_bots}{Colors.RESET}")
                 await ctx.send(f"❌ Unknown bot: {bot_name}\nUse `!botlist` to see available bots")
                 return
-            
+
             bot_info = self.BOTS[bot_name]
             bot_folder = bot_info["folder"]
             service_name = bot_info.get("service", "")
@@ -4671,7 +4303,7 @@ echo "CHANGED_END"
             if bot_name == "rsadminbot":
                 await ctx.invoke(self.bot.get_command("selfupdate"))
                 return
-            
+
             # Log to terminal and Discord
             guild_name = ctx.guild.name if ctx.guild else "DM"
             guild_id = ctx.guild.id if ctx.guild else 0
@@ -4881,81 +4513,6 @@ echo "CHANGED_END"
                     f"[oraclefiles] MANUAL OK\nPushed: {pushed}\nHead: {head}",
                 )
 
-        @self.bot.command(name="updatetest")
-        @commands.check(lambda ctx: self.is_admin(ctx.author))
-        async def updatetest(ctx):
-            """Test sync pipeline using UpdateTest folder (admin only).
-
-            This runs the same tar+scp+extract flow as botupdate, but targets a dedicated test folder.
-            """
-            ssh_ok, error_msg = self._check_ssh_available()
-            if not ssh_ok:
-                await ctx.send(f"❌ SSH not configured: {error_msg}")
-                return
-
-            cfg = self.config.get("update_test") or {}
-            folder = (cfg.get("folder") or "UpdateTest").strip()
-            include_globs = cfg.get("include_globs") or ["*"]
-            exclude_globs = cfg.get("exclude_globs")  # optional
-
-            # Ensure local folder exists
-            local_path = (self.base_path.parent / folder).resolve()
-            local_path.mkdir(parents=True, exist_ok=True)
-            marker = local_path / "last_update_test.txt"
-            marker.write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
-
-            status_msg = await ctx.send(
-                f"🧪 **UpdateTest sync**\n"
-                f"Local folder: `{local_path}`\n"
-                "```\nSyncing...\n```"
-            )
-            should_post_progress = not (await self._is_progress_channel(ctx.channel))
-            progress_msg = None
-            if should_post_progress:
-                progress_msg = await self._post_or_edit_progress(
-                    None,
-                    f"[updatetest] START\nLocal: {local_path}\nRequested by: {ctx.author} ({ctx.author.id})",
-                )
-
-            success, stats = self._sync_bot_files(
-                folder,
-                "UpdateTest",
-                show_tree=True,
-                delete_remote_only=True,
-                manifest_include_globs=include_globs,
-                manifest_exclude_globs=exclude_globs,
-            )
-            if not success:
-                await status_msg.edit(content=f"❌ UpdateTest sync failed:\n```{stats.get('error','Unknown error')[:800]}```")
-                if should_post_progress:
-                    await self._post_or_edit_progress(
-                        progress_msg,
-                        f"[updatetest] FAILED\nError: {stats.get('error','Unknown error')[:500]}",
-                    )
-                return
-
-            backup_note = f"\nBackup: `{stats.get('remote_backup')}`" if stats.get("remote_backup") else ""
-            tar_note = f"\nTar entries: {stats.get('tar_entries_total')}" if stats.get("tar_entries_total") else ""
-            await status_msg.edit(
-                content=(
-                    "✅ **UpdateTest sync complete**\n"
-                    f"{backup_note}\n"
-                    f"{tar_note}\n"
-                    f"Local marker updated: `{marker.name}`\n"
-                    "Tip: edit/add files in the UpdateTest folder and rerun `!updatetest` to verify syncing."
-                )[:1900]
-            )
-            if stats.get("tar_entries_sample"):
-                sample = stats.get("tar_entries_sample") or []
-                await ctx.send(
-                    ("**Tar sample (first 10):**\n```" + "\n".join(str(x) for x in sample[:10]) + "```")[:1900]
-                )
-            if should_post_progress:
-                await self._post_or_edit_progress(
-                    progress_msg,
-                    f"[updatetest] COMPLETE\nBackup: {stats.get('remote_backup','')}\nRemote: /home/rsadmin/bots/mirror-world/{folder}",
-                )
-
         @self.bot.command(name="systemcheck")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
         async def systemcheck(ctx):
@@ -5093,7 +4650,7 @@ echo "CHANGED_END"
             if not ssh_ok:
                 await ctx.send(f"❌ SSH not configured: {error_msg}")
                 return
-
+            
             status_msg = await ctx.send("🧪 Running money-flow safety check on Ubuntu... (no restarts)")
 
             remote_root = getattr(self, "remote_root", "/home/rsadmin/bots/mirror-world")
@@ -5162,7 +4719,7 @@ if isinstance(cfg, dict):
 tickets, t_status = _load_json(onb_dir / tickets_name)
 if t_status.startswith("error") or t_status == "missing":
     _print(f"RSOnboarding/{tickets_name}", t_status)
-else:
+                    else:
     count = len(tickets) if isinstance(tickets, dict) else 0
     bad = 0
     if isinstance(tickets, dict):
@@ -5191,7 +4748,7 @@ for filename in ("queue.json", "registry.json", "invites.json"):
         # invites.json stores under {"invites": {...}}
         if filename == "invites.json" and isinstance(data.get("invites"), dict):
             entries = len(data.get("invites") or {})
-        else:
+            else:
             entries = len(data)
     _print(f"RSCheckerbot/{filename}", s, f"entries={entries}")
 PY
@@ -5488,9 +5045,9 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             except Exception as e:
                 await ctx.send(f"❌ whereami failed: {str(e)[:300]}")
         
-        @self.bot.command(name="botscan")
-        @commands.check(lambda ctx: self.is_admin(ctx.author))
-        async def botscan(ctx, scope: str = "all"):
+        # botscan removed: legacy scan/tree compare was replaced by OracleFiles snapshots + local SHA compare script.
+        # (We keep no command registration here so it doesn't appear in the command index.)
+        async def _legacy_botscan_removed(ctx, scope: str = "all"):
             """Scan and compare bots (local and remote) with file tree view (admin only)
             
             Usage:
@@ -5775,7 +5332,7 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                     # Write report file
                     with open(report_path, 'w', encoding='utf-8') as f:
                         f.write('\n'.join(report_lines))
-                    print(f"{Colors.GREEN}✓ File tree report saved: {report_path}{Colors.RESET}\n")
+                        print(f"{Colors.GREEN}✓ File tree report saved: {report_path}{Colors.RESET}\n")
                     
                     # Send report file (split into multiple files if too large for Discord)
                     try:
@@ -5832,39 +5389,7 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                                 if files_to_sync:
                                     bots_with_discrepancies.append(bot_key)
                             
-                            # Create sync/restart prompt if there are discrepancies
-                            if bots_with_discrepancies and scan_local and scan_remote:
-                                view = BotSyncRestartPromptView(self, bots_with_discrepancies, ctx.author.id)
-                                embed = discord.Embed(
-                                    title="📦 Sync & Restart Bots?",
-                                    description=(
-                                        f"Found discrepancies in {len(bots_with_discrepancies)} bot(s):\n"
-                                        f"`{', '.join(bots_with_discrepancies)}`\n\n"
-                                        "**What will be synced:**\n"
-                                        "• All `.py` files\n"
-                                        "• `config.json` and `messages.json`\n"
-                                        "• All documentation files (`.md`, `.txt`)\n"
-                                        "• Other non-data files\n\n"
-                                        "**What will NOT be synced:**\n"
-                                        "• Data files (`.db`, `.log`, `tickets.json`, `registry.json`, etc.)\n"
-                                        "• Runtime files\n\n"
-                                        "**Restart Sequence (if selected):**\n"
-                                        "1. Sync all bots\n"
-                                        "2. Restart all bots (except RSAdminBot)\n"
-                                        "3. Restart RSAdminBot (if needed)\n\n"
-                                        "Choose an option:"
-                                    ),
-                                    color=discord.Color.blue()
-                                )
-                                await ctx.send(
-                                    "📄 **Detailed File Tree Report Generated**\n"
-                                    f"Local path: `{report_path}`\n"
-                                    "This report shows detailed file tree comparison for each bot, matching the format shown during bot startup (Phase 4).\n"
-                                    "The file tree is also displayed in the terminal.",
-                                    file=report_file,
-                                    embed=embed,
-                                    view=view
-                                )
+                            # Legacy feature removed: no sync/restart prompts from scans.
                             else:
                                 await ctx.send(
                                     "📄 **Detailed File Tree Report Generated**\n"
@@ -5895,14 +5420,14 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                 return
             
             if not bot_name:
-                await ctx.send("❓ **Bot Name Required**\nPlease specify which bot to get information about.\nUse `!botscan` to see available bots or `!botlist` to see configured bots.")
+                await ctx.send("❓ **Bot Name Required**\nPlease specify which bot to get information about.\nUse `!botlist` to see configured bots.")
                 return
             
             try:
                 bot_info = self.inspector.get_bot_info(bot_name)
                 
                 if not bot_info:
-                    await ctx.send(f"❌ Bot not found: {bot_name}\nUse `!botscan` to see available bots")
+                    await ctx.send(f"❌ Bot not found: {bot_name}")
                     return
                 
                 embed = discord.Embed(
@@ -6054,7 +5579,7 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                 return
             
             if not bot_name:
-                await ctx.send("❓ **Bot Name Required**\nPlease specify which bot's config to view.\nUse `!botscan` to see available bots or `!botlist` to see configured bots.")
+                await ctx.send("❓ **Bot Name Required**\nPlease specify which bot's config to view.\nUse `!botlist` to see configured bots.")
                 return
             
             try:
@@ -6213,110 +5738,6 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             except Exception as e:
                 await ctx.send(f"❌ Error getting config: {str(e)[:500]}")
 
-        @self.bot.command(name="botmanifest")
-        @commands.check(lambda ctx: self.is_admin(ctx.author))
-        async def botmanifest(ctx):
-            """Generate a hashed file manifest for RS bots on the server (admin only).
-
-            This is designed for debugging "what files are on Ubuntu" without leaking secrets.
-            Pair it with the local command:
-              python scripts/rsbots_manifest.py --out local_manifest.json
-            Then upload your local manifest to Discord and run !botcompare with that attachment.
-            """
-            try:
-                import io
-                import json as _json
-                import sys as _sys
-                from pathlib import Path as _Path
-
-                repo_root = _Path(__file__).resolve().parents[1]
-                if str(repo_root) not in _sys.path:
-                    _sys.path.insert(0, str(repo_root))
-
-                from rsbots_manifest import generate_manifest  # type: ignore
-
-                manifest = generate_manifest(repo_root)
-                payload = _json.dumps(manifest, indent=2, ensure_ascii=False).encode("utf-8")
-                buf = io.BytesIO(payload)
-                buf.seek(0)
-
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                await ctx.send(
-                    content=f"✅ RS bots manifest generated (server) — `{ts}`",
-                    file=discord.File(buf, filename=f"rsbots_manifest_server_{ts}.json"),
-                )
-            except Exception as e:
-                await ctx.send(f"❌ Failed to generate manifest: {str(e)[:500]}")
-
-        @self.bot.command(name="botcompare")
-        @commands.check(lambda ctx: self.is_admin(ctx.author))
-        async def botcompare(ctx):
-            """Compare a user-uploaded local manifest against the server manifest (admin only).
-
-            Usage:
-              1) Locally: python scripts/rsbots_manifest.py --out local_manifest.json
-              2) Upload local_manifest.json in Discord
-              3) Run: !botcompare (in the same message thread / channel) with that attachment
-            """
-            try:
-                if not ctx.message.attachments:
-                    await ctx.send("❌ Attach your local manifest JSON (from scripts/rsbots_manifest.py) and run !botcompare again.")
-                    return
-
-                attachment = ctx.message.attachments[0]
-                if not attachment.filename.lower().endswith(".json"):
-                    await ctx.send("❌ Attachment must be a .json manifest file.")
-                    return
-
-                raw = await attachment.read()
-                local_manifest = json.loads(raw.decode("utf-8", errors="replace"))
-
-                import io
-                import json as _json
-                import sys as _sys
-                from pathlib import Path as _Path
-
-                repo_root = _Path(__file__).resolve().parents[1]
-                if str(repo_root) not in _sys.path:
-                    _sys.path.insert(0, str(repo_root))
-
-                from rsbots_manifest import compare_manifests, generate_manifest  # type: ignore
-
-                server_manifest = generate_manifest(repo_root)
-                diff = compare_manifests(local_manifest, server_manifest)
-
-                # Summarize counts
-                changed_total = 0
-                only_local_total = 0
-                only_remote_total = 0
-                for folder, data in (diff.get("folders") or {}).items():
-                    changed_total += len(data.get("changed") or [])
-                    only_local_total += len(data.get("only_local") or [])
-                    only_remote_total += len(data.get("only_remote") or [])
-
-                embed = discord.Embed(
-                    title="RS Bots Manifest Compare",
-                    description=(
-                        f"**Changed files:** {changed_total}\n"
-                        f"**Only in local manifest:** {only_local_total}\n"
-                        f"**Only on server:** {only_remote_total}\n\n"
-                        "Attach this diff JSON to investigate exact paths."
-                    ),
-                    color=discord.Color.blue(),
-                    timestamp=datetime.now(),
-                )
-
-                payload = _json.dumps(diff, indent=2, ensure_ascii=False).encode("utf-8")
-                buf = io.BytesIO(payload)
-                buf.seek(0)
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                await ctx.send(
-                    embed=embed,
-                    file=discord.File(buf, filename=f"rsbots_manifest_diff_{ts}.json"),
-                )
-            except Exception as e:
-                await ctx.send(f"❌ Manifest compare failed: {str(e)[:500]}")
-        
         # Whop tracking commands
         @self.bot.command(name="whopscan")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
@@ -6478,7 +5899,7 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                 error_embed = self._create_error_embed(
                     "Unknown Bot",
                     f"Bot '{bot_name}' not found in bot registry.",
-                    f"Use `!botlist` or `!botscan` to see available bots"
+                    f"Use `!botlist` to see available bots"
                 )
                 await self._send_response(ctx, embed=error_embed)
                 return
@@ -6781,30 +6202,7 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             await asyncio.sleep(1)  # Delay between phases
             
             # ============================================================
-            # PHASE 2: Bot Discovery & Inspection Commands
-            # ============================================================
-            phase += 1
-            print(f"\n{Colors.CYAN}[RunAllCommands] [Phase {phase}] Bot Discovery & Inspection Commands{Colors.RESET}")
-            
-            # 2.1 Run botscan (all scope)
-            print(f"{Colors.CYAN}[RunAllCommands] [2.1] Running !botscan (all scope)...{Colors.RESET}")
-            await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Discovery: !botscan all...\n```")
-            success, error = await invoke_command_direct("botscan", scope="all")
-            if success:
-                results["commands_executed"].append("botscan (all)")
-                results["success"].append("botscan")
-                print(f"{Colors.GREEN}[RunAllCommands] ✓ botscan completed{Colors.RESET}")
-            else:
-                results["failed"].append(f"botscan: {error[:100] if error else 'Unknown error'}")
-                print(f"{Colors.RED}[RunAllCommands] ✗ botscan failed: {error}{Colors.RESET}")
-            operation_count += 1
-            await asyncio.sleep(1)
-            
-            # 2.2 botscanremote removed (botscan scope=all already covers remote)
-            # Note: botscan(scope="all") already includes remote scanning, so a separate remote-only scan is redundant.
-            
-            # ============================================================
-            # PHASE 3: Whop Tracking Commands
+            # PHASE 2: Whop Tracking Commands
             # ============================================================
             phase += 1
             print(f"\n{Colors.CYAN}[RunAllCommands] [Phase {phase}] Whop Tracking Commands{Colors.RESET}")
@@ -6863,27 +6261,13 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             await asyncio.sleep(1)  # Delay between phases
             
             # ============================================================
-            # PHASE 5: Sync & Update Commands
+            # PHASE 4: Update Commands
             # ============================================================
             phase += 1
-            print(f"\n{Colors.CYAN}[RunAllCommands] [Phase {phase}] Sync & Update Commands{Colors.RESET}")
+            print(f"\n{Colors.CYAN}[RunAllCommands] [Phase {phase}] Update Commands{Colors.RESET}")
             
-            # 5.1 Run sync (sync RSAdminBot files)
-            print(f"{Colors.CYAN}[RunAllCommands] [5.1] Running !sync (sync RSAdminBot files)...{Colors.RESET}")
-            await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Sync: !sync (syncing RSAdminBot files)...\n```")
-            success, error = await invoke_command_direct("sync")
-            if success:
-                results["commands_executed"].append("sync")
-                results["success"].append("sync")
-                print(f"{Colors.GREEN}[RunAllCommands] ✓ sync completed{Colors.RESET}")
-            else:
-                results["failed"].append(f"sync: {error[:100] if error else 'Unknown error'}")
-                print(f"{Colors.RED}[RunAllCommands] ✗ sync failed: {error}{Colors.RESET}")
-            operation_count += 1
-            await asyncio.sleep(1)
-            
-            # 5.2 Run botupdate for each bot
-            print(f"{Colors.CYAN}[RunAllCommands] [5.2] Running !botupdate for each bot...{Colors.RESET}")
+            # 4.1 Run botupdate for each bot
+            print(f"{Colors.CYAN}[RunAllCommands] [4.1] Running !botupdate for each bot...{Colors.RESET}")
             for idx, bot_name in enumerate(bot_names, 1):
                 await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Sync: !botupdate {bot_name} ({idx}/{len(bot_names)})...\n```")
                 success, error = await invoke_command_direct("botupdate", bot_name=bot_name)
@@ -6919,10 +6303,10 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             # Summary by category
             initialization = [r for r in results["success"] if any(x in r for x in ["ping", "status", "reload", "botlist", "setupmonitoring"])]
             bot_mgmt = [r for r in results["success"] if any(x in r for x in ["botstatus", "botinfo", "botconfig"])]
-            discovery = [r for r in results["success"] if any(x in r for x in ["botscan"])]
+            discovery = []
             whop = [r for r in results["success"] if any(x in r for x in ["whopscan", "whopstats"])]
             movements = [r for r in results["success"] if "botmovements" in r]
-            sync_update = [r for r in results["success"] if any(x in r for x in ["sync", "botupdate"])]
+            sync_update = [r for r in results["success"] if "botupdate" in r]
             
             summary_text = f"✅ **Successful: {len(results['success'])}**\n"
             summary_text += f"  • Initialization: {len(initialization)}/6\n"

@@ -78,11 +78,21 @@ class TestServerOrganizer:
     
     async def setup_monitoring_channels(self) -> Dict:
         """
-        Setup monitoring categories and channels in test server.
+        Setup monitoring channels in test server.
+
+        Current policy (commands-only):
+        - Do NOT create categories
+        - Do NOT create per-bot channels
+        - Only ensure the Commands index channel exists (idempotent)
         
         Returns:
             Dictionary with created channel IDs
         """
+        # Config gate
+        cfg = self.config.get("commands_index") if isinstance(self.config, dict) else {}
+        if isinstance(cfg, dict) and cfg.get("enabled") is False:
+            return {"skipped": True, "reason": "commands_index.enabled=false"}
+
         guild = self.bot.get_guild(self.test_server_guild_id)
         if not guild:
             return {"error": f"Test server guild {self.test_server_guild_id} not found"}
@@ -91,89 +101,37 @@ class TestServerOrganizer:
             "category_id": None,
             "channels": {}
         }
-        
-        # Check if category already exists (by ID first, then by name to prevent duplicates)
-        category_id = self.channels_data.get("category_id")
-        category = None
-        
-        if category_id:
-            category = guild.get_channel(category_id)
-        
-        # If category not found by ID, check by name to prevent duplicates
-        if not category:
-            for existing_category in guild.categories:
-                if existing_category.name == "RS Bot Monitoring":
-                    category = existing_category
-                    # Update stored ID to match existing category
-                    self.channels_data["category_id"] = category.id
-                    result["category_id"] = category.id
-                    break
-        
-        # Create category if it doesn't exist
-        if not category:
+
+        # Only ensure commands channel
+        channel_key = "commands"
+        # Discord normalizes channel names (spaces -> hyphens, lowercase). We search both forms.
+        channel_display = "RSAdminBot Commands"
+        channel_slug = "rsadminbot-commands"
+
+        existing_channel_id = self.channels_data.get("channels", {}).get(channel_key)
+        if existing_channel_id:
+            existing = guild.get_channel(existing_channel_id)
+            if existing:
+                result["channels"][channel_key] = existing_channel_id
+                return result
+
+        # Search by name to avoid duplicates
+        found = None
+        for ch in guild.text_channels:
+            if ch.name in (channel_display, channel_slug):
+                found = ch
+                break
+
+        if found is None:
             try:
-                category = await guild.create_category("RS Bot Monitoring")
-                result["category_id"] = category.id
-                self.channels_data["category_id"] = category.id
+                found = await guild.create_text_channel(channel_slug)
             except discord.Forbidden:
-                return {"error": "Missing permissions to create category"}
+                return {"error": "Missing permissions to create commands channel"}
             except Exception as e:
-                return {"error": f"Failed to create category: {e}"}
-        
-        # Create main channels
-        main_channels = {
-            "whop_logs": "Whop Logs",
-            "bot_activities": "Bot Activities",
-            "commands": "RSAdminBot Commands"
-        }
-        
-        for channel_key, channel_name in main_channels.items():
-            # Check if channel already exists
-            existing_channel_id = self.channels_data.get("channels", {}).get(channel_key)
-            if existing_channel_id:
-                existing_channel = guild.get_channel(existing_channel_id)
-                if existing_channel:
-                    result["channels"][channel_key] = existing_channel_id
-                    continue
-            
-            # Create channel
-            try:
-                channel = await category.create_text_channel(channel_name)
-                result["channels"][channel_key] = channel.id
-                if "channels" not in self.channels_data:
-                    self.channels_data["channels"] = {}
-                self.channels_data["channels"][channel_key] = channel.id
-            except discord.Forbidden:
-                result["error"] = f"Missing permissions to create channel: {channel_name}"
-            except Exception as e:
-                result["error"] = f"Failed to create channel {channel_name}: {e}"
-        
-        # Create per-bot activity channels
-        for bot_key, bot_info in self.bots_dict.items():
-            bot_display_name = bot_info.get("name", bot_key)
-            channel_name = f"{bot_display_name} Activity"
-            
-            # Check if channel already exists
-            existing_channel_id = self.channels_data.get("channels", {}).get(f"{bot_key}_activity")
-            if existing_channel_id:
-                existing_channel = guild.get_channel(existing_channel_id)
-                if existing_channel:
-                    result["channels"][f"{bot_key}_activity"] = existing_channel_id
-                    continue
-            
-            # Create channel
-            try:
-                channel = await category.create_text_channel(channel_name)
-                result["channels"][f"{bot_key}_activity"] = channel.id
-                if "channels" not in self.channels_data:
-                    self.channels_data["channels"] = {}
-                self.channels_data["channels"][f"{bot_key}_activity"] = channel.id
-            except discord.Forbidden:
-                if "error" not in result:
-                    result["error"] = f"Missing permissions to create bot channels"
-            except Exception as e:
-                if "error" not in result:
-                    result["error"] = f"Failed to create bot channels: {e}"
+                return {"error": f"Failed to create commands channel: {e}"}
+
+        result["channels"][channel_key] = found.id
+        self.channels_data.setdefault("channels", {})[channel_key] = found.id
         
         # Save channels data
         self._save_channels_data()

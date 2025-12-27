@@ -13,12 +13,10 @@ from admin_bot import Colors
 
 
 async def run(admin_bot):
-    """Run Phase 4: Check and sync files"""
-    print(f"\n{Colors.CYAN}[Phase 4] Checking file sync status...{Colors.RESET}")
-    try:
-        await admin_bot._check_and_sync_files()
-    except Exception as e:
-        print(f"{Colors.YELLOW}[Phase 4] Sync check error: {e}{Colors.RESET}")
-        import traceback
-        print(f"{Colors.RED}[Phase 4] Traceback: {traceback.format_exc()[:200]}{Colors.RESET}")
+    """Run Phase 4: (removed) legacy file sync / tree-compare / auto-sync."""
+    # The canonical update model is now:
+    # - GitHub python-only updates via !selfupdate / !botupdate
+    # - Full deploy via botctl.sh deploy_apply / !deploy for scripts/systemd/venv
+    print(f"\n{Colors.CYAN}[Phase 4] Legacy file sync removed - skipping{Colors.RESET}")
+    return
 
