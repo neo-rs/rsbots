@@ -382,12 +382,13 @@ class RSOnboardingBot:
                     value=f"{ticket_channel.mention}\nID: `{ticket_channel.id}`",
                     inline=True
                 )
-                # Add jump link
-                embed.add_field(
-                    name="Channel Link",
-                    value=f"[Jump to Channel]({ticket_channel.jump_url})",
-                    inline=True
-                )
+                # Add jump link (defensive check - ticket_channel should exist but be safe)
+                if hasattr(ticket_channel, 'jump_url') and ticket_channel.jump_url:
+                    embed.add_field(
+                        name="Channel Link",
+                        value=f"[Jump to Channel]({ticket_channel.jump_url})",
+                        inline=True
+                    )
             
             # Add source if provided
             if source:
@@ -753,10 +754,10 @@ class RSOnboardingBot:
         return "".join(ch if ch.isalnum() or ch in "-_🔥" else "-" for ch in base)[:95]
     
     async def open_onboarding_ticket(self, member: discord.Member):
-        """Open onboarding ticket for member - simplified to match original"""
+        """Open onboarding ticket for member - unified lock prevents race conditions"""
         guild = member.guild
         
-        # Use lock to prevent concurrent ticket creation for same user
+        # Single lock block for entire flow (prevents race conditions)
         async with self._open_locks[member.id]:
             # Check if ticket already exists in storage
             if str(member.id) in self.ticket_data:
@@ -786,26 +787,13 @@ class RSOnboardingBot:
                 if category and hasattr(category, "channels"):
                     for channel in category.channels:
                         if isinstance(channel, discord.TextChannel) and channel.name == expected_channel_name:
-                            # Channel with same name exists - check if it's for this user
-                            # Store it in ticket_data to prevent duplicates
+                            # Channel with same name exists - store it to prevent duplicates
                             self.ticket_data[str(member.id)] = {"channel_id": channel.id, "opened_at": time.time()}
                             self.save_tickets()
                             print(f"{Colors.YELLOW}[Ticket] Skipped - channel {channel.name} already exists for {member.name} ({member.id}){Colors.RESET}")
                             return
-        
-        # Re-acquire lock for the actual creation
-        async with self._open_locks[member.id]:
-            # Double-check after acquiring lock (another call might have created it)
-            if str(member.id) in self.ticket_data:
-                ticket_data = self.ticket_data.get(str(member.id), {})
-                channel_id = ticket_data.get("channel_id")
-                if channel_id:
-                    existing_channel = guild.get_channel(channel_id)
-                    if existing_channel:
-                        print(f"{Colors.YELLOW}[Ticket] Skipped - ticket created by concurrent call for {member.name} ({member.id}){Colors.RESET}")
-                        return
             
-            # Mark as creating immediately to prevent race conditions
+            # Mark as creating immediately to prevent race conditions (still in lock)
             self.ticket_data[str(member.id)] = {"channel_id": 0, "opened_at": time.time()}
             self.save_tickets()
             
