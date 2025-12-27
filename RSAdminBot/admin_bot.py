@@ -2344,7 +2344,9 @@ git pull --ff-only origin main
 NEW="$(git rev-parse HEAD)"
 
 CHANGED="$(git diff --name-only "$OLD" "$NEW" -- "$BOT_FOLDER" 2>/dev/null | grep -E \"\\\\.py$\" || true)"
-CHANGED_COUNT="$(echo \"$CHANGED\" | grep -v \"^$\" | wc -l | tr -d \" \")"
+# NOTE: grep returns exit code 1 on empty input, which would abort under `set -e`.
+# Use sed to drop empty lines (always exit 0), then count.
+CHANGED_COUNT="$(echo \"$CHANGED\" | sed '/^$/d' | wc -l | tr -d \" \")"
 
 TMP_LIST="/tmp/mw_pyonly_${{BOT_FOLDER}}.txt"
 git ls-files "$BOT_FOLDER" 2>/dev/null | grep -E \"\\\\.py$\" > "$TMP_LIST" || true
