@@ -1867,6 +1867,17 @@ TRIGGER={shlex.quote(trigger_txt)}
 
 command -v git >/dev/null 2>&1 || {{ echo \"ERR=git_missing\"; exit 2; }}
 
+# Ensure GitHub SSH host key can be accepted non-interactively.
+# Use a dedicated known_hosts file and `accept-new` so the first connection pins the key.
+SSH_DIR=\"${{HOME:-/home/rsadmin}}/.ssh\"
+KNOWN_HOSTS=\"$SSH_DIR/known_hosts\"
+mkdir -p \"$SSH_DIR\"
+chmod 700 \"$SSH_DIR\" || true
+touch \"$KNOWN_HOSTS\"
+chmod 600 \"$KNOWN_HOSTS\" || true
+
+export GIT_SSH_COMMAND=\"ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=accept-new\"
+
 mkdir -p \"$REPO_DIR\"
 if [ ! -d \"$REPO_DIR/.git\" ]; then
   rm -rf \"$REPO_DIR\"
@@ -1907,7 +1918,6 @@ fi
 TS=$(date +%Y%m%d_%H%M%S)
 git commit -m \"oraclefiles py_snapshot: $TS trigger=$TRIGGER\" >/dev/null
 
-export GIT_SSH_COMMAND=\"ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=no\"
 git push origin \"$BRANCH\" >/dev/null
 
 echo \"OK=1\"
