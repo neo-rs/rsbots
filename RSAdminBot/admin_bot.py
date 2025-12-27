@@ -2101,6 +2101,110 @@ class RSAdminBot:
                 return True
         
         return False
+
+    def _github_py_only_update(self, bot_folder: str) -> Tuple[bool, Dict[str, Any]]:
+        """Pull python-only bot code from the server-side GitHub checkout and overwrite live *.py files.
+
+        This is the canonical update path for `!selfupdate` and `!botupdate` when using GitHub as source of truth.
+
+        Server expectations:
+        - Git repo exists at: /home/rsadmin/bots/rsbots-code
+        - Live bot tree exists at: self.remote_root (typically /home/rsadmin/bots/mirror-world)
+        - GitHub repo contains only *.py under the RS bot folders
+
+        Safety:
+        - Never deletes first; overwrite-in-place only
+        - Only copies files tracked by git and ending in .py under the target folder
+        """
+        try:
+            folder = (bot_folder or "").strip()
+            if not folder:
+                return False, {"error": "bot_folder required"}
+
+            code_root = "/home/rsadmin/bots/rsbots-code"
+            live_root = str(getattr(self, "remote_root", "") or "/home/rsadmin/bots/mirror-world")
+
+            cmd = f"""
+set -euo pipefail
+
+CODE_ROOT={shlex.quote(code_root)}
+LIVE_ROOT={shlex.quote(live_root)}
+BOT_FOLDER={shlex.quote(folder)}
+
+if [ ! -d "$CODE_ROOT/.git" ]; then
+  echo "ERR=missing_code_root"
+  echo "DETAIL=$CODE_ROOT/.git not found"
+  exit 2
+fi
+if [ ! -d "$LIVE_ROOT" ]; then
+  echo "ERR=missing_live_root"
+  echo "DETAIL=$LIVE_ROOT not found"
+  exit 2
+fi
+
+cd "$CODE_ROOT"
+OLD="$(git rev-parse HEAD 2>/dev/null || echo '')"
+git fetch origin
+git pull --ff-only origin main
+NEW="$(git rev-parse HEAD)"
+
+CHANGED="$(git diff --name-only "$OLD" "$NEW" -- "$BOT_FOLDER" 2>/dev/null | grep -E \"\\\\.py$\" || true)"
+CHANGED_COUNT="$(echo \"$CHANGED\" | grep -v \"^$\" | wc -l | tr -d \" \")"
+
+TMP_LIST="/tmp/mw_pyonly_${{BOT_FOLDER}}.txt"
+git ls-files "$BOT_FOLDER" 2>/dev/null | grep -E \"\\\\.py$\" > "$TMP_LIST" || true
+PY_COUNT="$(wc -l < "$TMP_LIST" | tr -d \" \")"
+if [ "$PY_COUNT" = "" ]; then PY_COUNT="0"; fi
+if [ "$PY_COUNT" = "0" ]; then
+  echo "ERR=no_python_files"
+  echo "DETAIL=no tracked *.py under $BOT_FOLDER in $CODE_ROOT"
+  exit 3
+fi
+
+tar -cf - -T "$TMP_LIST" | (cd "$LIVE_ROOT" && tar -xf -)
+
+echo "OK=1"
+echo "OLD=$OLD"
+echo "NEW=$NEW"
+echo "PY_COUNT=$PY_COUNT"
+echo "CHANGED_COUNT=$CHANGED_COUNT"
+echo "CHANGED_BEGIN"
+echo "$CHANGED" | grep -v "^$" | head -n 30 || true
+echo "CHANGED_END"
+"""
+
+            ok, stdout, stderr = self._execute_ssh_command(cmd, timeout=180)
+            out = (stdout or "").strip()
+            err = (stderr or "").strip()
+            if not ok:
+                msg = err or out or "unknown error"
+                return False, {"error": msg[:1200]}
+
+            stats: Dict[str, Any] = {"raw": out[-1600:]}
+            lines = [ln.rstrip("\r") for ln in out.splitlines()]
+            in_changed = False
+            changed_lines: List[str] = []
+            for ln in lines:
+                if ln == "CHANGED_BEGIN":
+                    in_changed = True
+                    continue
+                if ln == "CHANGED_END":
+                    in_changed = False
+                    continue
+                if in_changed:
+                    if ln.strip():
+                        changed_lines.append(ln.strip())
+                    continue
+                if "=" in ln:
+                    k, v = ln.split("=", 1)
+                    k = k.strip().lower()
+                    v = v.strip()
+                    if k:
+                        stats[k] = v
+            stats["changed_sample"] = changed_lines[:30]
+            return True, stats
+        except Exception as e:
+            return False, {"error": f"github py-only update failed: {str(e)[:300]}"}
     
     def _sync_bot_files(
         self,
@@ -4254,7 +4358,7 @@ class RSAdminBot:
         @self.bot.command(name="botupdate")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
         async def botupdate(ctx, bot_name: str = None):
-            """Update a bot by syncing files with tree view (admin only)"""
+            """Update a bot by pulling python-only code from GitHub and restarting it (admin only)."""
             ssh_ok, error_msg = self._check_ssh_available()
             if not ssh_ok:
                 await ctx.send(f"❌ SSH not configured: {error_msg}")
@@ -4282,6 +4386,11 @@ class RSAdminBot:
             bot_info = self.BOTS[bot_name]
             bot_folder = bot_info["folder"]
             service_name = bot_info.get("service", "")
+
+            # RSAdminBot must update itself via !selfupdate (it restarts the current process).
+            if bot_name == "rsadminbot":
+                await ctx.invoke(self.bot.get_command("selfupdate"))
+                return
             
             # Log to terminal and Discord
             guild_name = ctx.guild.name if ctx.guild else "DM"
@@ -4289,10 +4398,15 @@ class RSAdminBot:
             print(f"{Colors.CYAN}[Command] Updating {bot_info['name']} (Folder: {bot_folder}){Colors.RESET}")
             print(f"{Colors.CYAN}[Command] Server: {guild_name} (ID: {guild_id}){Colors.RESET}")
             print(f"{Colors.CYAN}[Command] Requested by: {ctx.author} ({ctx.author.id}){Colors.RESET}")
-            await self._log_to_discord(f"📦 **Updating {bot_info['name']}**\nSyncing folder: `{bot_folder}`\nRequested by: {ctx.author.mention}")
-            
-            status_msg = await ctx.send(f"📦 **Syncing {bot_info['name']} files...**\n```\nScanning files...\n```")
-            print(f"{Colors.YELLOW}[Sync] Starting file sync for {bot_folder}...{Colors.RESET}")
+            await self._log_to_discord(
+                f"📦 **Updating {bot_info['name']} (GitHub python-only)**\nFolder: `{bot_folder}`\nRequested by: {ctx.author.mention}"
+            )
+
+            status_msg = await ctx.send(
+                f"📦 **Updating {bot_info['name']} from GitHub (python-only)...**\n"
+                "```\nPulling + copying *.py from /home/rsadmin/bots/rsbots-code\n```"
+            )
+            print(f"{Colors.YELLOW}[Update] Starting GitHub py-only update for {bot_folder}...{Colors.RESET}")
 
             # Update-progress channel (test server): live systemd state around the sync.
             progress_msg = None
@@ -4309,162 +4423,16 @@ class RSAdminBot:
                     ),
                 )
             
-            # Use comprehensive sync with tree view for all bots
-            success, stats = self._sync_bot_files(bot_folder, bot_info['name'], show_tree=True, delete_remote_only=True)
-            
-            if success:
-                if stats.get("staged") and stats.get("pending_restart") and bot_name == "rsadminbot":
-                    backup_note = f"\nBackup: `{stats.get('remote_backup')}`" if stats.get("remote_backup") else ""
-                    tar_note = ""
-                    if stats.get("tar_entries_total"):
-                        tar_note = f"\nTar entries: {stats.get('tar_entries_total')}"
-                    await status_msg.edit(
-                        content=(
-                            "✅ **RSAdminBot update STAGED** (two-phase self-update)\n"
-                            f"{backup_note}\n"
-                            f"{tar_note}\n"
-                            "Next: restart `mirror-world-rsadminbot.service` to apply.\n"
-                            "If you want RSAdminBot to restart itself after staging, use `!selfupdate`."
-                        )[:1900]
-                    )
-                    if should_post_progress and self.service_manager and service_name:
-                        after_exists, after_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name)
-                        after_pid = self.service_manager.get_pid(service_name)
-                        progress_msg = await self._post_or_edit_progress(
-                            progress_msg,
-                            (
-                                f"[botupdate] {bot_info['name']} ({bot_name}) STAGED\n"
-                                f"Backup: {stats.get('remote_backup','')}\n"
-                                f"After:  {self._format_service_state(after_exists, after_state, after_pid)}\n"
-                                "Note: restart required to apply staged update."
-                            ),
-                        )
-                    return
-
-                python_total = stats.get('python_files_total', 0)
-                python_verified = stats.get('python_files_verified', 0)
-                python_percent = stats.get('python_sync_percent', 100)
-
-                # Optional: restart the service after a successful sync (non-rsadminbot).
-                restart_cfg = self.config.get("botupdate_restart") or {}
-                do_restart = bool(restart_cfg.get("enabled")) and bot_name != "rsadminbot"
-                restart_note = ""
-                restart_ok = None
-                restart_err = ""
-                if do_restart and self.service_manager and service_name:
-                    progress_msg = await self._post_or_edit_progress(
-                        progress_msg,
-                        f"[botupdate] {bot_info['name']} ({bot_name}) RESTARTING\nBackup: {stats.get('remote_backup','')}",
-                    )
-                    ok_r, out_r, err_r = self.service_manager.restart(service_name, bot_name=bot_name)
-                    if not ok_r:
-                        restart_ok = False
-                        restart_err = (err_r or out_r or "restart failed")[:500]
-                    else:
-                        max_wait = int(restart_cfg.get("max_wait_seconds") or 15)
-                        poll = float(restart_cfg.get("poll_interval_seconds") or 1)
-                        poll = max(0.25, min(poll, 5.0))
-
-                        # Live state reporting while we wait (RSAdminBot stays online for non-rsadminbot restarts).
-                        start_t = datetime.now()
-                        last_state = None
-                        while (datetime.now() - start_t).total_seconds() < max_wait:
-                            exists_now, state_now, _ = self.service_manager.get_status(service_name, bot_name=bot_name)
-                            pid_now = self.service_manager.get_pid(service_name)
-                            cur = self._format_service_state(exists_now, state_now, pid_now)
-                            if cur != last_state:
-                                last_state = cur
-                                progress_msg = await self._post_or_edit_progress(
-                                    progress_msg,
-                                    (
-                                        f"[botupdate] {bot_info['name']} ({bot_name}) RESTARTING\n"
-                                        f"State: {cur}\n"
-                                        f"Backup: {stats.get('remote_backup','')}"
-                                    ),
-                                )
-                            if exists_now and state_now == "active":
-                                restart_ok = True
-                                break
-                            if exists_now and state_now == "failed":
-                                restart_ok = False
-                                break
-                            await asyncio.sleep(poll)
-
-                        if restart_ok is None:
-                            # Fallback to existing verifier message (includes logs on failure).
-                            running, verify_err = self.service_manager.verify_started(service_name, max_wait=0, bot_name=bot_name)
-                            restart_ok = bool(running)
-                            if not restart_ok:
-                                restart_err = (verify_err or "service did not become active")[:800]
-
-                        if restart_ok is False:
-                            # Attach last logs for quick diagnosis.
-                            lines = int(restart_cfg.get("failure_log_lines") or 30)
-                            logs = self.service_manager.get_failure_logs(service_name, lines=lines) or ""
-                            if logs:
-                                restart_err = (restart_err + "\n\nRecent logs:\n" + logs[-1200:])[:1600]
-                    if restart_ok:
-                        restart_note = "\nRestart: OK"
-                    else:
-                        restart_note = "\nRestart: FAILED"
-                
-                summary = f"✅ **{bot_info['name']} files synced successfully!**\n"
-                summary += f"```\n"
-                summary += f"Synced: {stats['synced']} file(s)\n"
-                if stats['failed'] > 0:
-                    summary += f"Failed: {stats['failed']} file(s)\n"
-                if stats['deleted'] > 0:
-                    summary += f"Deleted: {stats['deleted']} remote-only file(s)\n"
-                if stats['skipped'] > 0:
-                    summary += f"Skipped: {stats['skipped']} file(s)\n"
-                if python_total > 0:
-                    if python_percent == 100:
-                        summary += f"🐍 Python Files: {python_verified}/{python_total} verified (100%) ✅\n"
-                    else:
-                        summary += f"🐍 Python Files: {python_verified}/{python_total} verified ({python_percent}%) ⚠️\n"
-                if stats.get("tar_entries_total"):
-                    summary += f"Tar entries: {stats.get('tar_entries_total')}\n"
-                if do_restart and restart_ok is not None:
-                    summary += f"Restart: {'OK' if restart_ok else 'FAILED'}\n"
-                summary += f"```"
-
-                if stats.get("tar_entries_sample"):
-                    sample = stats.get("tar_entries_sample") or []
-                    summary += "\n**Tar sample (first 10):**\n```"
-                    summary += "\n".join(str(x) for x in sample[:10])
-                    summary += "```"
-                
-                print(f"{Colors.GREEN}[Success] {bot_info['name']} files synced successfully!{Colors.RESET}")
-                await status_msg.edit(content=summary)
-                await self._log_to_discord(f"✅ **{bot_info['name']}** files synced successfully!")
-                if should_post_progress and self.service_manager and service_name:
-                    after_exists, after_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name)
-                    after_pid = self.service_manager.get_pid(service_name)
-                    backup = stats.get("remote_backup") or ""
-                    progress_msg = await self._post_or_edit_progress(
-                        progress_msg,
-                        (
-                            f"[botupdate] {bot_info['name']} ({bot_name}) COMPLETE\n"
-                            f"Backup: {backup}\n"
-                            f"After:  {self._format_service_state(after_exists, after_state, after_pid)}\n"
-                            f"Python verified: {python_verified}/{python_total} ({python_percent}%)"
-                        ),
-                    )
-                    if do_restart and restart_ok is False and restart_err and should_post_progress:
-                        # Add a short error follow-up (avoid flooding the channel).
-                        await self._post_or_edit_progress(
-                            None,
-                            f"[botupdate] {bot_info['name']} ({bot_name}) RESTART FAILED\n{restart_err[:1600]}",
-                        )
-            else:
+            success, stats = self._github_py_only_update(bot_folder)
+            if not success:
                 error_msg = stats.get("error", "Unknown error")
-                print(f"{Colors.RED}[Error] Failed to sync {bot_info['name']} files: {error_msg}{Colors.RESET}")
-                await status_msg.edit(content=f"❌ Failed to sync {bot_info['name']} files:\n```{error_msg}```")
-                await self._log_to_discord(f"❌ **{bot_info['name']}** sync failed: {error_msg}")
+                print(f"{Colors.RED}[Error] GitHub py-only update failed for {bot_info['name']}: {error_msg[:500]}{Colors.RESET}")
+                await status_msg.edit(content=f"❌ GitHub py-only update failed for {bot_info['name']}:\n```{error_msg[:800]}```")
+                await self._log_to_discord(f"❌ **{bot_info['name']}** update failed:\n```{error_msg[:800]}```")
                 if should_post_progress and self.service_manager and service_name:
                     after_exists, after_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name)
                     after_pid = self.service_manager.get_pid(service_name)
-                    progress_msg = await self._post_or_edit_progress(
+                    await self._post_or_edit_progress(
                         progress_msg,
                         (
                             f"[botupdate] {bot_info['name']} ({bot_name}) FAILED\n"
@@ -4472,50 +4440,114 @@ class RSAdminBot:
                             f"After: {self._format_service_state(after_exists, after_state, after_pid)}"
                         ),
                     )
+                return
+
+            old = (stats.get("old") or "").strip()
+            new = (stats.get("new") or "").strip()
+            py_count = str(stats.get("py_count") or "0").strip()
+            changed_count = str(stats.get("changed_count") or "0").strip()
+            changed_sample = stats.get("changed_sample") or []
+
+            # Restart (required to pick up new code)
+            restart_ok = False
+            restart_err = ""
+            if not self.service_manager:
+                restart_err = "ServiceManager not available"
+            elif not service_name:
+                restart_err = "Missing service mapping"
+            else:
+                ok_r, out_r, err_r = self.service_manager.restart(service_name, bot_name=bot_name)
+                if not ok_r:
+                    restart_err = (err_r or out_r or "restart failed")[:800]
+                else:
+                    running, verify_err = self.service_manager.verify_started(service_name, bot_name=bot_name)
+                    restart_ok = bool(running)
+                    if not restart_ok:
+                        restart_err = (verify_err or "service did not become active")[:800]
+
+            summary = f"✅ **{bot_info['name']} updated from GitHub (python-only)**\n"
+            summary += "```"
+            summary += f"\nGit: {old[:12]} -> {new[:12]}"
+            summary += f"\nPython copied: {py_count}"
+            summary += f"\nChanged .py in folder: {changed_count}"
+            summary += f"\nRestart: {'OK' if restart_ok else 'FAILED'}"
+            summary += "```"
+            if changed_sample:
+                summary += "\n**Changed sample (first 30):**\n```"
+                summary += "\n".join(str(x) for x in changed_sample[:30])
+                summary += "```"
+            if not restart_ok and restart_err:
+                summary += "\n**Restart error:**\n```"
+                summary += restart_err[:1200]
+                summary += "```"
+
+            await status_msg.edit(content=summary[:1900])
+            await self._log_to_discord(f"✅ **{bot_info['name']}** updated from GitHub (python-only)")
+
+            if should_post_progress and self.service_manager and service_name:
+                after_exists, after_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name)
+                after_pid = self.service_manager.get_pid(service_name)
+                await self._post_or_edit_progress(
+                    progress_msg,
+                    (
+                        f"[botupdate] {bot_info['name']} ({bot_name}) COMPLETE\n"
+                        f"Git: {old[:7]} -> {new[:7]}\n"
+                        f"After:  {self._format_service_state(after_exists, after_state, after_pid)}\n"
+                        f"Python copied: {py_count} | Changed: {changed_count} | Restart: {'OK' if restart_ok else 'FAILED'}"
+                    ),
+                )
 
         @self.bot.command(name="selfupdate")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
         async def selfupdate(ctx):
-            """Two-phase RSAdminBot self-update: stage update, then restart RSAdminBot to apply (admin only)."""
+            """Update RSAdminBot from GitHub (python-only) then restart rsadminbot (admin only)."""
             ssh_ok, error_msg = self._check_ssh_available()
             if not ssh_ok:
                 await ctx.send(f"❌ SSH not configured: {error_msg}")
                 return
 
-            # Stage update (this will not replace the running RSAdminBot folder)
-            status_msg = await ctx.send("📦 **Staging RSAdminBot update...**\n```\nBuilding archive + uploading to server...\n```")
+            status_msg = await ctx.send(
+                "📦 **Updating RSAdminBot from GitHub (python-only)...**\n"
+                "```\nPulling + copying RSAdminBot/*.py from /home/rsadmin/bots/rsbots-code\n```"
+            )
             should_post_progress = not (await self._is_progress_channel(ctx.channel))
             progress_msg = None
             if should_post_progress:
                 progress_msg = await self._post_or_edit_progress(
                     None,
-                    f"[selfupdate] RSAdminBot stage START\nRequested by: {ctx.author} ({ctx.author.id})",
+                    f"[selfupdate] START\nRequested by: {ctx.author} ({ctx.author.id})",
                 )
-            success, stats = self._sync_bot_files("RSAdminBot", "RSAdminBot", show_tree=False, delete_remote_only=True)
+            success, stats = self._github_py_only_update("RSAdminBot")
             if not success:
-                await status_msg.edit(content=f"❌ Failed to stage RSAdminBot update:\n```{stats.get('error','Unknown error')[:800]}```")
+                await status_msg.edit(content=f"❌ Failed to update RSAdminBot from GitHub:\n```{stats.get('error','Unknown error')[:800]}```")
                 if should_post_progress:
                     await self._post_or_edit_progress(
                         progress_msg,
-                        f"[selfupdate] RSAdminBot stage FAILED\nError: {stats.get('error','Unknown error')[:500]}",
+                        f"[selfupdate] FAILED\nError: {stats.get('error','Unknown error')[:500]}",
                     )
                 return
 
-            backup_note = f"\nBackup: `{stats.get('remote_backup')}`" if stats.get("remote_backup") else ""
+            old = (stats.get("old") or "").strip()
+            new = (stats.get("new") or "").strip()
+            py_count = str(stats.get("py_count") or "0").strip()
+            changed_count = str(stats.get("changed_count") or "0").strip()
+            changed_sample = stats.get("changed_sample") or []
+            changed_block = "\n".join(str(x) for x in changed_sample[:15]) if changed_sample else "(none)"
             await status_msg.edit(
                 content=(
-                    "✅ **RSAdminBot update staged.**\n"
-                    f"{backup_note}\n"
+                    "✅ **RSAdminBot updated from GitHub (python-only).**\n"
+                    f"Git: `{old[:12]} -> {new[:12]}`\n"
+                    f"Python copied: `{py_count}` | Changed: `{changed_count}`\n"
                     "Restarting RSAdminBot now to apply...\n"
                     "```"
-                    f"\nStaging dir: {stats.get('staging_dir','')}"
+                    f"\nChanged sample:\n{changed_block}"
                     "\n```"
                 )[:1900]
             )
             if should_post_progress:
                 await self._post_or_edit_progress(
                     progress_msg,
-                    f"[selfupdate] RSAdminBot staged\nBackup: {stats.get('remote_backup','')}\nRestarting service to apply.",
+                    f"[selfupdate] UPDATED\nGit: {old[:7]} -> {new[:7]}\nRestarting service to apply.",
                 )
 
             # Restart after sending the message. This will terminate the current process.
