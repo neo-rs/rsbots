@@ -28,7 +28,17 @@ class TestServerOrganizer:
         self.bot = bot
         self.config = config
         self.bots_dict = bots_dict
-        self.test_server_guild_id = config.get("test_server_guild_id", 1451275225512546497)
+
+        # Avoid hardcoded guild IDs. Require explicit config.
+        gid = None
+        try:
+            if isinstance(config, dict):
+                raw = config.get("test_server_guild_id")
+                if raw is not None and str(raw).strip():
+                    gid = int(raw)
+        except Exception:
+            gid = None
+        self.test_server_guild_id = gid
         
         # Data directory
         self.data_dir = Path(__file__).parent / "whop_data"
@@ -92,6 +102,9 @@ class TestServerOrganizer:
         cfg = self.config.get("commands_index") if isinstance(self.config, dict) else {}
         if isinstance(cfg, dict) and cfg.get("enabled") is False:
             return {"skipped": True, "reason": "commands_index.enabled=false"}
+
+        if not self.test_server_guild_id:
+            return {"skipped": True, "reason": "missing test_server_guild_id"}
 
         guild = self.bot.get_guild(self.test_server_guild_id)
         if not guild:

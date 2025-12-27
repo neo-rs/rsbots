@@ -11,11 +11,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from admin_bot import Colors, TRACKER_AVAILABLE
 
-if TRACKER_AVAILABLE:
-    from whop_tracker import WhopTracker
-    from bot_movement_tracker import BotMovementTracker
-    from test_server_organizer import TestServerOrganizer
-
 
 async def run(admin_bot):
     """Run Phase 2: Initialize tracking modules"""
@@ -23,6 +18,11 @@ async def run(admin_bot):
     
     if TRACKER_AVAILABLE:
         try:
+            # Lazy imports: avoid import-time side effects.
+            from whop_tracker import WhopTracker
+            from bot_movement_tracker import BotMovementTracker
+            from test_server_organizer import TestServerOrganizer
+
             print(f"{Colors.CYAN}[Phase 2] [2.1] Initializing WhopTracker...{Colors.RESET}")
             admin_bot.whop_tracker = WhopTracker(admin_bot.bot, admin_bot.config)
             print(f"{Colors.GREEN}[Phase 2] [2.1] ✓ WhopTracker initialized{Colors.RESET}")

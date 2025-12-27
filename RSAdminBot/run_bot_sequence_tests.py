@@ -36,7 +36,8 @@ class BotSequenceTester:
         
         self.bot_token = self.config.get("bot_token")
         self.guild_id = self.config.get("guild_id")
-        self.test_server_guild_id = self.config.get("test_server_guild_id", 1451275225512546497)
+        # Avoid hardcoded guild IDs. Require explicit config to prevent accidental channel creation in the wrong server.
+        self.test_server_guild_id = self.config.get("test_server_guild_id")
         
         # Test configuration
         self.test_duration_days = 3
