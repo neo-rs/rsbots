@@ -2602,79 +2602,90 @@ echo "CHANGED_END"
                 print(f"{Colors.GREEN}[Reconnect] ✓ Bot latency: {round(self.bot.latency * 1000)}ms{Colors.RESET}\n")
                 return
             
-            # Mark startup as in progress
+            # Mark startup as in progress - commands are already registered, so mark complete even if sequences fail
             self._startup_complete = True
-
-            # Best-effort runtime shims (Ubuntu local-exec only)
-            try:
-                await self._ensure_botctl_symlink()
-            except Exception:
-                pass
             
-            # Import and run startup sequences
+            # Wrap entire startup sequence in try/except to ensure on_ready always completes
             try:
-                from startup_sequences import (
-                    sequence_1_initialization,
-                    sequence_2_tracking,
-                    sequence_3_server_status,
-                    sequence_4_file_sync,
-                    sequence_5_channels,
-                    sequence_6_background
-                )
-                
-                # Run all sequences
-                await sequence_1_initialization.run(self)
-                await sequence_2_tracking.run(self)
-                await sequence_3_server_status.run(self)
-                await sequence_4_file_sync.run(self)
-                await sequence_5_channels.run(self)
-                await sequence_6_background.run(self)
-
-                # If a self-update was applied during restart, report it to the update-progress channel now.
+                # Best-effort runtime shims (Ubuntu local-exec only)
                 try:
-                    marker = self.base_path / ".last_selfupdate_applied.json"
-                    if marker.exists():
-                        data = json.loads(marker.read_text(encoding="utf-8") or "{}")
-                        backup = str(data.get("backup") or "")
-                        ts = str(data.get("timestamp") or "")
-                        changes = data.get("changes") or {}
-                        sample = changes.get("sample") or []
-                        py_sample = changes.get("py_sample") or []
-                        total = changes.get("total")
-                        py_total = changes.get("py_total")
-                        # Fetch some recent journal lines for context.
-                        ok_j, out_j, _ = self._execute_ssh_command("journalctl -u mirror-world-rsadminbot.service -n 40 --no-pager | tail -n 40", timeout=20)
-                        tail = (out_j or "").strip()
-                        msg = (
-                            "[selfupdate] APPLIED\n"
-                            f"Timestamp: {ts}\n"
-                            f"Backup: {backup}\n"
-                        )
-                        if isinstance(total, int) and isinstance(py_total, int):
-                            msg += f"Files changed: {total} (py: {py_total})\n"
-                        if py_sample:
-                            msg += "\nChanged .py (sample):\n" + "\n".join(str(p) for p in py_sample[:20]) + "\n"
-                        elif sample:
-                            msg += "\nChanged files (sample):\n" + "\n".join(str(p) for p in sample[:20]) + "\n"
-                        if ok_j and tail:
-                            msg += "\nRecent service logs:\n" + tail[-1400:]
-                        await self._post_or_edit_progress(None, msg)
-                        try:
-                            marker.unlink()
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                    await self._ensure_botctl_symlink()
+                except Exception as e:
+                    print(f"{Colors.YELLOW}[Startup] botctl symlink setup failed (non-critical): {e}{Colors.RESET}")
                 
-            except ImportError as e:
-                print(f"{Colors.RED}[Startup] Failed to import startup sequences: {e}{Colors.RESET}")
-                print(f"{Colors.YELLOW}[Startup] Startup sequences not available{Colors.RESET}")
-                return
+                # Import and run startup sequences
+                try:
+                    from startup_sequences import (
+                        sequence_1_initialization,
+                        sequence_2_tracking,
+                        sequence_3_server_status,
+                        sequence_4_file_sync,
+                        sequence_5_channels,
+                        sequence_6_background
+                    )
+                    
+                    # Run all sequences
+                    await sequence_1_initialization.run(self)
+                    await sequence_2_tracking.run(self)
+                    await sequence_3_server_status.run(self)
+                    await sequence_4_file_sync.run(self)
+                    await sequence_5_channels.run(self)
+                    await sequence_6_background.run(self)
+
+                    # If a self-update was applied during restart, report it to the update-progress channel now.
+                    try:
+                        marker = self.base_path / ".last_selfupdate_applied.json"
+                        if marker.exists():
+                            data = json.loads(marker.read_text(encoding="utf-8") or "{}")
+                            backup = str(data.get("backup") or "")
+                            ts = str(data.get("timestamp") or "")
+                            changes = data.get("changes") or {}
+                            sample = changes.get("sample") or []
+                            py_sample = changes.get("py_sample") or []
+                            total = changes.get("total")
+                            py_total = changes.get("py_total")
+                            # Fetch some recent journal lines for context.
+                            ok_j, out_j, _ = self._execute_ssh_command("journalctl -u mirror-world-rsadminbot.service -n 40 --no-pager | tail -n 40", timeout=20)
+                            tail = (out_j or "").strip()
+                            msg = (
+                                "[selfupdate] APPLIED\n"
+                                f"Timestamp: {ts}\n"
+                                f"Backup: {backup}\n"
+                            )
+                            if isinstance(total, int) and isinstance(py_total, int):
+                                msg += f"Files changed: {total} (py: {py_total})\n"
+                            if py_sample:
+                                msg += "\nChanged .py (sample):\n" + "\n".join(str(p) for p in py_sample[:20]) + "\n"
+                            elif sample:
+                                msg += "\nChanged files (sample):\n" + "\n".join(str(p) for p in sample[:20]) + "\n"
+                            if ok_j and tail:
+                                msg += "\nRecent service logs:\n" + tail[-1400:]
+                            await self._post_or_edit_progress(None, msg)
+                            try:
+                                marker.unlink()
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        print(f"{Colors.YELLOW}[Startup] Self-update marker processing failed (non-critical): {e}{Colors.RESET}")
+                    
+                except ImportError as e:
+                    print(f"{Colors.YELLOW}[Startup] Startup sequences not available (non-critical): {e}{Colors.RESET}")
+                    import traceback
+                    print(f"{Colors.DIM}[Startup] Import traceback: {traceback.format_exc()[:300]}{Colors.RESET}")
+                except Exception as e:
+                    print(f"{Colors.YELLOW}[Startup] Startup sequences error (non-critical): {e}{Colors.RESET}")
+                    import traceback
+                    print(f"{Colors.DIM}[Startup] Sequence traceback: {traceback.format_exc()[:500]}{Colors.RESET}")
+                
             except Exception as e:
-                print(f"{Colors.RED}[Startup] Error in startup sequences: {e}{Colors.RESET}")
+                # Critical error - log but don't prevent bot from running
+                print(f"{Colors.RED}[Startup] Critical error in on_ready (continuing anyway): {e}{Colors.RESET}")
                 import traceback
-                print(f"{Colors.RED}[Startup] Traceback: {traceback.format_exc()[:500]}{Colors.RESET}")
-                return
+                print(f"{Colors.RED}[Startup] Full traceback: {traceback.format_exc()}{Colors.RESET}")
+            
+            # Always log completion
+            print(f"{Colors.GREEN}[Startup] ✓ on_ready completed successfully{Colors.RESET}")
+            print(f"{Colors.GREEN}[Startup] ✓ Bot is ready and accepting commands{Colors.RESET}\n")
         
         # Bot movement tracking event listeners
         @self.bot.event
@@ -5397,6 +5408,24 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                 )
             
             await status_msg.edit(content="", embed=embed)
+        
+        # Log command registration after all commands are set up
+        prefix = self.bot.command_prefix
+        if isinstance(prefix, str):
+            prefix_str = prefix
+        elif callable(prefix):
+            prefix_str = "callable"
+        else:
+            prefix_str = str(prefix)
+        
+        command_names = sorted([cmd.name for cmd in self.bot.commands if hasattr(cmd, 'name')])
+        command_count = len(command_names)
+        command_list_str = ", ".join(command_names[:30])  # Show first 30
+        if command_count > 30:
+            command_list_str += f", ... (+{command_count - 30} more)"
+        
+        print(f"{Colors.GREEN}[Startup] Command prefix: {prefix_str}{Colors.RESET}")
+        print(f"{Colors.GREEN}[Startup] Registered {command_count} commands: {command_list_str}{Colors.RESET}")
     
     def _start_whop_scanning_task(self):
         """Start periodic whop scanning task"""
