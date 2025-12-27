@@ -4,6 +4,9 @@
 # Allow this ignore file itself
 !/.gitignore
 
+# Allow helper scripts at repo root
+!/push_rsbots_py_only.bat
+
 # Only allow python from the RS bot folders
 !RSAdminBot/
 !RSAdminBot/**/
