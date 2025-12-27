@@ -133,27 +133,64 @@ class RSOnboardingBot:
             print(f"{Colors.RED}[Messages] Failed to save messages: {e}{Colors.RESET}")
     
     def load_tickets(self):
-        """Load ticket data from file (for active tickets only)"""
+        """Load ticket data from file (for active tickets only) with corruption handling"""
         tickets_file = self.base_path / self.config.get("tickets_file", "tickets.json")
         if tickets_file.exists():
             try:
                 with open(tickets_file, 'r', encoding='utf-8') as f:
                     self.ticket_data = json.load(f)
+                print(f"{Colors.GREEN}[Tickets] Loaded {len(self.ticket_data)} active tickets{Colors.RESET}")
+            except json.JSONDecodeError as e:
+                print(f"{Colors.RED}[Tickets] JSON corruption detected in {tickets_file}: {e}{Colors.RESET}")
+                print(f"{Colors.YELLOW}[Tickets] Attempting to load backup or falling back to empty state{Colors.RESET}")
+                # Try to load backup if it exists
+                backup_file = tickets_file.with_suffix('.json.bak')
+                if backup_file.exists():
+                    try:
+                        with open(backup_file, 'r', encoding='utf-8') as f:
+                            self.ticket_data = json.load(f)
+                        print(f"{Colors.GREEN}[Tickets] Restored from backup{Colors.RESET}")
+                    except Exception:
+                        self.ticket_data = {}
+                else:
+                    self.ticket_data = {}
             except Exception as e:
-                print(f"{Colors.YELLOW}[Tickets] Failed to load tickets: {e}{Colors.RESET}")
+                print(f"{Colors.RED}[Tickets] Failed to load tickets: {repr(e)}{Colors.RESET}")
                 self.ticket_data = {}
         else:
             self.ticket_data = {}
     
     def save_tickets(self):
-        """Save ticket data to file (active tickets only)"""
+        """Save ticket data to file (active tickets only) with atomic writes"""
         tickets_file = self.base_path / self.config.get("tickets_file", "tickets.json")
+        temp_file = tickets_file.with_suffix('.json.tmp')
+        backup_file = tickets_file.with_suffix('.json.bak')
+        
         try:
             os.makedirs(tickets_file.parent, exist_ok=True)
-            with open(tickets_file, 'w', encoding='utf-8') as f:
+            
+            # Write to temp file first
+            with open(temp_file, 'w', encoding='utf-8') as f:
                 json.dump(self.ticket_data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())  # Force write to disk (Ubuntu-safe)
+            
+            # Create backup of existing file if it exists
+            if tickets_file.exists():
+                import shutil
+                shutil.copy2(tickets_file, backup_file)
+            
+            # Atomic rename (Ubuntu: rename is atomic on same filesystem)
+            os.replace(temp_file, tickets_file)
+            
         except Exception as e:
-            print(f"{Colors.RED}[Tickets] Failed to save tickets: {e}{Colors.RESET}")
+            print(f"{Colors.RED}[Tickets] Failed to save tickets: {repr(e)}{Colors.RESET}")
+            # Clean up temp file on error
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except Exception:
+                    pass
     
     def _migrate_ticket_schema_if_needed(self):
         """Migrate old schema {user_id: channel_id} -> {user_id: {channel_id, opened_at}} (match original)"""
@@ -370,8 +407,9 @@ class RSOnboardingBot:
             # Fallback to plain text if embed fails
             try:
                 await log_channel.send(f"📋 {message}")
-            except Exception:
-                pass
+            except Exception as fallback_error:
+                # Log to console if both embed and fallback fail (critical path)
+                print(f"{Colors.RED}[Log] Failed to send log message to channel {log_channel_id}: {repr(e)} (fallback also failed: {repr(fallback_error)}){Colors.RESET}")
     
     async def log_error(self, guild: discord.Guild, error: str, context: str = None):
         """Log error to log channel with embed (similar to RSForwarder style)"""
@@ -454,6 +492,94 @@ class RSOnboardingBot:
                 f"Bot lacks Manage Roles and/or Manage Channels. Fix role positions/category perms.",
                 context=context
             )
+    
+    async def validate_config(self, guild: discord.Guild) -> bool:
+        """Validate bot configuration and permissions on startup. Returns True if valid."""
+        errors = []
+        warnings = []
+        
+        me = guild.me
+        if not me:
+            errors.append("Bot member object not available")
+            return False
+        
+        # Check core permissions
+        perms = me.guild_permissions
+        if not perms.manage_roles:
+            errors.append("Bot lacks 'Manage Roles' permission")
+        if not perms.manage_channels:
+            errors.append("Bot lacks 'Manage Channels' permission")
+        
+        # Check ticket category exists and bot can create channels
+        ticket_category_id = self.config.get("ticket_category_id")
+        if ticket_category_id:
+            category = guild.get_channel(ticket_category_id)
+            if not category:
+                errors.append(f"Ticket category not found (ID: {ticket_category_id})")
+            elif not isinstance(category, discord.CategoryChannel):
+                errors.append(f"Ticket category ID points to non-category channel (ID: {ticket_category_id})")
+            else:
+                # Check bot can create channels in this category
+                overwrite = category.overwrites_for(me)
+                if overwrite.create_instant_invite is False or (overwrite.manage_channels is False and not perms.administrator):
+                    warnings.append(f"Bot may not be able to create channels in ticket category '{category.name}' (check category permissions)")
+        else:
+            warnings.append("No ticket_category_id configured")
+        
+        # Check overflow category if configured
+        overflow_category_id = self.config.get("overflow_category_id")
+        if overflow_category_id:
+            overflow = guild.get_channel(overflow_category_id)
+            if not overflow:
+                warnings.append(f"Overflow category not found (ID: {overflow_category_id})")
+            elif not isinstance(overflow, discord.CategoryChannel):
+                warnings.append(f"Overflow category ID points to non-category channel (ID: {overflow_category_id})")
+        
+        # Check log channel exists and bot can send messages
+        log_channel_id = self.config.get("log_channel_id")
+        if log_channel_id:
+            log_channel = guild.get_channel(log_channel_id)
+            if not log_channel:
+                warnings.append(f"Log channel not found (ID: {log_channel_id})")
+            elif isinstance(log_channel, discord.TextChannel):
+                overwrite = log_channel.overwrites_for(me)
+                if overwrite.send_messages is False and not perms.administrator:
+                    warnings.append(f"Bot may not be able to send messages in log channel '{log_channel.name}' (check channel permissions)")
+        
+        # Check role hierarchy (bot role must be above Welcome/Member roles)
+        welcome_role_id = self.config.get("welcome_role_id")
+        member_role_id = self.config.get("member_role_id")
+        
+        if welcome_role_id:
+            welcome_role = guild.get_role(welcome_role_id)
+            if not welcome_role:
+                errors.append(f"Welcome role not found (ID: {welcome_role_id})")
+            elif me.top_role <= welcome_role:
+                errors.append(f"Bot role '{me.top_role.name}' must be above Welcome role '{welcome_role.name}' (role hierarchy)")
+        
+        if member_role_id:
+            member_role = guild.get_role(member_role_id)
+            if not member_role:
+                errors.append(f"Member role not found (ID: {member_role_id})")
+            elif me.top_role <= member_role:
+                errors.append(f"Bot role '{me.top_role.name}' must be above Member role '{member_role.name}' (role hierarchy)")
+        
+        # Print validation results
+        if errors:
+            print(f"{Colors.RED}[Config Validation] ERRORS:{Colors.RESET}")
+            for error in errors:
+                print(f"  {Colors.RED}❌ {error}{Colors.RESET}")
+            await self.log_error(guild, f"Config validation failed:\n" + "\n".join(f"- {e}" for e in errors), context="validate_config")
+        
+        if warnings:
+            print(f"{Colors.YELLOW}[Config Validation] WARNINGS:{Colors.RESET}")
+            for warning in warnings:
+                print(f"  {Colors.YELLOW}⚠️  {warning}{Colors.RESET}")
+        
+        if not errors and not warnings:
+            print(f"{Colors.GREEN}[Config Validation] ✅ All checks passed{Colors.RESET}")
+        
+        return len(errors) == 0
     
     async def remove_cleanup_roles(self, member: discord.Member, reason: str = "Cleanup"):
         """Remove cleanup roles any time user gains Welcome or Member"""
@@ -595,10 +721,15 @@ class RSOnboardingBot:
         if member is None:
             try:
                 member = await guild.fetch_member(member_id)
-            except Exception:
-                # Member not resolvable—clean up storage
+            except discord.NotFound:
+                # Member truly doesn't exist - safe to clean up
+                print(f"{Colors.YELLOW}[Auto-Close] Member {member_id} not found in guild, cleaning up storage{Colors.RESET}")
                 self.ticket_data.pop(str(member_id), None)
                 self.save_tickets()
+                return
+            except Exception as e:
+                # Transient API failure - don't delete, will retry on next restart
+                print(f"{Colors.YELLOW}[Auto-Close] Failed to fetch member {member_id} (transient error): {repr(e)} - will retry later{Colors.RESET}")
                 return
 
         # If they already have Member, close immediately
@@ -1245,6 +1376,8 @@ class RSOnboardingBot:
                 if guild:
                     print(f"{Colors.GREEN}[Bot] Connected to: {guild.name}{Colors.RESET}")
                     await self._assert_core_perms_or_log(guild, "on_ready")
+                    # Validate configuration
+                    await self.validate_config(guild)
             
             # Display config information
             print(f"\n{Colors.CYAN}[Config] Configuration Information:{Colors.RESET}")
@@ -2160,31 +2293,68 @@ class PersistentAccessView(ui.View):
     async def finish(self, interaction: discord.Interaction, button: ui.Button):
         try:
             if interaction.user and isinstance(interaction.user, discord.Member):
+                channel = interaction.message.channel if interaction.message else None
                 await self.bot_instance.grant_member_and_close(
-                    interaction.user, None, source="button_persistent"
+                    interaction.user, channel, source="button_persistent_finish"
                 )
-            try:
-                full_access_msg = self.bot_instance.config.get("full_access_message", "✅ You now have full access!")
-                await interaction.response.send_message(full_access_msg, ephemeral=True)
-            except Exception:
-                pass
+                try:
+                    full_access_msg = self.bot_instance.config.get("full_access_message", "✅ You now have full access!")
+                    await interaction.response.send_message(full_access_msg, ephemeral=True)
+                except discord.NotFound:
+                    # Channel already deleted, ignore
+                    pass
+            else:
+                await interaction.response.send_message("Error: Could not identify user.", ephemeral=True)
         except Exception as e:
             if interaction.guild:
-                await self.bot_instance.log_error(interaction.guild, f"Error granting access (persistent): {e}")
+                await self.bot_instance.log_error(
+                    interaction.guild, 
+                    f"Error granting access (persistent): {repr(e)}",
+                    context="PersistentAccessView.finish"
+                )
+            try:
+                await interaction.response.send_message(
+                    "Something went wrong. Please contact support.", 
+                    ephemeral=True
+                )
+            except Exception:
+                pass
     
     @ui.button(label="Close Ticket", style=discord.ButtonStyle.danger, custom_id="onb:close")
     async def close(self, interaction: discord.Interaction, button: ui.Button):
+        """Unified close path - routes through grant_member_and_close()"""
         try:
-            if interaction.user:
-                self.bot_instance.ticket_data.pop(str(interaction.user.id), None)
-                self.bot_instance.save_tickets()
+            if not interaction.user or not isinstance(interaction.user, discord.Member):
+                await interaction.response.send_message("Error: Could not identify user.", ephemeral=True)
+                return
+            
+            # Route through unified close logic (handles locks, storage, role updates)
+            channel = interaction.message.channel if interaction.message else None
+            await self.bot_instance.grant_member_and_close(
+                interaction.user, 
+                channel, 
+                source="button_persistent_close"
+            )
+            
             try:
-                await interaction.message.channel.delete()
+                await interaction.response.send_message("Ticket closed.", ephemeral=True)
             except discord.NotFound:
+                # Channel already deleted, ignore
                 pass
         except Exception as e:
             if interaction.guild:
-                await self.bot_instance.log_error(interaction.guild, f"CloseButton (persistent) delete error: {e}")
+                await self.bot_instance.log_error(
+                    interaction.guild, 
+                    f"CloseButton (persistent) error: {repr(e)}",
+                    context="PersistentAccessView.close"
+                )
+            try:
+                await interaction.response.send_message(
+                    "Something went wrong closing the ticket. Please contact support.", 
+                    ephemeral=True
+                )
+            except Exception:
+                pass
 
 
 # Onboarding View (Stepper)
@@ -2251,7 +2421,20 @@ class OnboardingView(ui.View):
         async def callback(self, interaction: discord.Interaction):
             view: "OnboardingView" = self.view
             try:
-                await view.bot_instance.grant_member_and_close(view.member, None, source="button_stepper")
+                # Validate interaction user matches view member
+                if interaction.user.id != view.member.id:
+                    await interaction.response.send_message(
+                        "This ticket belongs to another user.", 
+                        ephemeral=True
+                    )
+                    return
+                
+                channel = interaction.message.channel if interaction.message else None
+                await view.bot_instance.grant_member_and_close(
+                    view.member, 
+                    channel, 
+                    source="button_stepper_finish"
+                )
                 full_access_msg = view.bot_instance.config.get("full_access_message", "✅ You now have full access!")
                 try:
                     await interaction.response.send_message(full_access_msg, ephemeral=True)
@@ -2261,7 +2444,11 @@ class OnboardingView(ui.View):
                     except Exception:
                         pass
             except Exception as e:
-                await view.bot_instance.log_error(interaction.guild, f"Error granting access (stepper): {e}")
+                await view.bot_instance.log_error(
+                    interaction.guild, 
+                    f"Error granting access (stepper): {repr(e)}",
+                    context="OnboardingView.FinishButton"
+                )
                 try:
                     await interaction.response.send_message(
                         "Something went wrong. Please contact support.", ephemeral=True
@@ -2274,15 +2461,43 @@ class OnboardingView(ui.View):
             super().__init__(label=label, style=discord.ButtonStyle.danger)
         
         async def callback(self, interaction: discord.Interaction):
+            """Unified close path - routes through grant_member_and_close()"""
             view: "OnboardingView" = self.view
-            view.bot_instance.ticket_data.pop(str(view.member.id), None)
-            view.bot_instance.save_tickets()
             try:
-                await interaction.message.channel.delete()
-            except discord.NotFound:
-                pass
+                # Validate interaction user matches view member
+                if interaction.user.id != view.member.id:
+                    await interaction.response.send_message(
+                        "This ticket belongs to another user.", 
+                        ephemeral=True
+                    )
+                    return
+                
+                # Route through unified close logic (handles locks, storage, role updates)
+                channel = interaction.message.channel if interaction.message else None
+                await view.bot_instance.grant_member_and_close(
+                    view.member, 
+                    channel, 
+                    source="button_stepper_close"
+                )
+                
+                try:
+                    await interaction.response.send_message("Ticket closed.", ephemeral=True)
+                except discord.NotFound:
+                    # Channel already deleted, ignore
+                    pass
             except Exception as e:
-                await view.bot_instance.log_error(interaction.guild, f"CloseButton delete error (stepper): {e}")
+                await view.bot_instance.log_error(
+                    interaction.guild, 
+                    f"CloseButton (stepper) error: {repr(e)}",
+                    context="OnboardingView.CloseButton"
+                )
+                try:
+                    await interaction.response.send_message(
+                        "Something went wrong closing the ticket. Please contact support.", 
+                        ephemeral=True
+                    )
+                except Exception:
+                    pass
 
 
 def main():

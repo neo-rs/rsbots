@@ -23,6 +23,7 @@ import shlex
 import importlib.util
 import platform
 import requests
+import time
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
@@ -1405,15 +1406,21 @@ echo "TARGET=$TARGET"
                 "enabled": bool(cfg.get("enabled", True)),
                 "interval_seconds": int(cfg.get("interval_seconds") or 30),
                 "post_on_startup": bool(cfg.get("post_on_startup", True)),
+                "post_heartbeat": bool(cfg.get("post_heartbeat", False)),  # Default: no periodic heartbeats
+                "post_on_change": bool(cfg.get("post_on_change", True)),  # Default: post on state/pid changes
+                "post_on_failure": bool(cfg.get("post_on_failure", True)),  # Default: post when not active
                 "failure_log_lines": int(cfg.get("failure_log_lines") or 25),
                 "min_seconds_between_posts": int(cfg.get("min_seconds_between_posts") or 120),
-                "heartbeat_seconds": int(cfg.get("heartbeat_seconds") or 0),
+                "heartbeat_seconds": int(cfg.get("heartbeat_seconds") or 0),  # Legacy: kept for backward compat
             }
         except Exception:
             return {
                 "enabled": True,
                 "interval_seconds": 30,
                 "post_on_startup": True,
+                "post_heartbeat": False,  # Quiet by default
+                "post_on_change": True,
+                "post_on_failure": True,
                 "failure_log_lines": 25,
                 "min_seconds_between_posts": 120,
                 "heartbeat_seconds": 0,
@@ -1433,14 +1440,21 @@ echo "TARGET=$TARGET"
             interval = max(10, min(int(cfg.get("interval_seconds") or 30), 3600))
             min_gap = max(0, min(int(cfg.get("min_seconds_between_posts") or 120), 3600))
             lines = max(5, min(int(cfg.get("failure_log_lines") or 25), 200))
+            post_heartbeat = cfg.get("post_heartbeat", False)  # Default: quiet (no periodic heartbeats)
+            post_on_change = cfg.get("post_on_change", True)  # Default: post on state/pid changes
+            post_on_failure = cfg.get("post_on_failure", True)  # Default: post when not active
+            # Legacy heartbeat_seconds (backward compat - only used if post_heartbeat is True)
             heartbeat = int(cfg.get("heartbeat_seconds") or 0)
             heartbeat = 0 if heartbeat < 30 else min(heartbeat, 6 * 3600)
+            if not post_heartbeat:
+                heartbeat = 0  # Disable heartbeat if post_heartbeat is False
 
             # Only monitor RS bots (including rsadminbot)
             bot_groups = self.config.get("bot_groups") or {}
             rs_keys = ["rsadminbot"] + list(bot_groups.get("rs_bots") or [])
 
-            last_state: Dict[str, str] = {}
+            # Keep snapshot dict: {bot: (state, pid)} - state includes exists info
+            last_snapshot: Dict[str, Tuple[str, int]] = {}
             last_post_ts: Dict[str, float] = {}
             last_heartbeat = 0.0
 
@@ -1456,9 +1470,10 @@ echo "TARGET=$TARGET"
                 if self.test_server_organizer:
                     await self.test_server_organizer.send_to_channel(f"{bot_key}_activity", content=text[:1900])
 
-            # Always announce the monitor is running
+            # Always announce the monitor is running (one-time)
             try:
-                await self._post_or_edit_progress(None, f"[monitor] started\ninterval={interval}s heartbeat={heartbeat}s")
+                heartbeat_str = f"heartbeat={heartbeat}s" if post_heartbeat and heartbeat > 0 else "heartbeat=disabled"
+                await self._post_or_edit_progress(None, f"[monitor] started\ninterval={interval}s {heartbeat_str}")
             except Exception:
                 pass
 
@@ -1474,7 +1489,9 @@ echo "TARGET=$TARGET"
                         exists, state, _ = self.service_manager.get_status(svc, bot_name=key)
                         pid = self.service_manager.get_pid(svc) or 0
                         lines_out.append(f"{key}: {self._format_service_state(exists, state, pid)}")
-                        last_state[key] = f"{exists}:{state}:{pid}"
+                        # Store as (state, pid) - normalize None state to "not_found"
+                        snapshot_state = state if state else ("not_found" if not exists else "unknown")
+                        last_snapshot[key] = (snapshot_state, pid)
                     lines_out.append("```")
                     await self._post_or_edit_progress(None, "\n".join(lines_out)[:1900])
                 except Exception:
@@ -1482,8 +1499,8 @@ echo "TARGET=$TARGET"
 
             while True:
                 try:
-                    # Optional heartbeat even when healthy (to prove it is alive).
-                    if heartbeat and (time.time() - last_heartbeat) >= heartbeat:
+                    # Optional periodic heartbeat (only if post_heartbeat is True)
+                    if post_heartbeat and heartbeat and (time.time() - last_heartbeat) >= heartbeat:
                         last_heartbeat = time.time()
                         try:
                             lines_out = ["[monitor] heartbeat", "```"]
@@ -1500,6 +1517,8 @@ echo "TARGET=$TARGET"
                         except Exception:
                             pass
 
+                    # Build current snapshot
+                    current_snapshot: Dict[str, Tuple[str, int]] = {}
                     for key in rs_keys:
                         info = self.BOTS.get(key) or {}
                         svc = info.get("service", "")
@@ -1507,25 +1526,58 @@ echo "TARGET=$TARGET"
                             continue
                         exists, state, _ = self.service_manager.get_status(svc, bot_name=key)
                         pid = self.service_manager.get_pid(svc) or 0
-                        cur = f"{exists}:{state}:{pid}"
-                        prev = last_state.get(key)
-                        if prev != cur:
-                            last_state[key] = cur
-                            # Post on non-active states or failed/activating transitions
-                            if (not exists) or (state != "active"):
-                                logs = self.service_manager.get_failure_logs(svc, lines=lines) or ""
-                                msg = (
-                                    f"[monitor] {info.get('name', key)} ({key})\n"
-                                    f"State: {self._format_service_state(exists, state, pid)}\n"
-                                )
-                                if logs:
-                                    msg += "\nRecent logs:\n" + logs[-1200:]
-                                await post(key, msg[:1900])
+                        # Store as (state, pid) - normalize None state to "not_found"
+                        snapshot_state = state if state else ("not_found" if not exists else "unknown")
+                        current_snapshot[key] = (snapshot_state, pid)
+
+                    # Compare snapshots - only post when something changes
+                    for key in rs_keys:
+                        if key not in current_snapshot:
+                            continue
+                        
+                        cur_state, cur_pid = current_snapshot[key]
+                        prev = last_snapshot.get(key)
+                        
+                        # If snapshot hasn't changed, don't post (even if time passed)
+                        if prev == (cur_state, cur_pid):
+                            continue
+                        
+                        # Snapshot changed - update and post
+                        last_snapshot[key] = (cur_state, cur_pid)
+                        
+                        # Get full details for the change
+                        info = self.BOTS.get(key) or {}
+                        svc = info.get("service", "")
+                        exists, state, _ = self.service_manager.get_status(svc, bot_name=key)
+                        pid = self.service_manager.get_pid(svc) or 0
+                        
+                        # Build message with state info
+                        msg_lines = [
+                            f"[monitor] {info.get('name', key)} ({key}) - state changed",
+                            f"State: {self._format_service_state(exists, state, pid)}"
+                        ]
+                        
+                        # If bot is not active, include !details and !logs output
+                        if (not exists) or (state != "active"):
+                            # Get detailed status (like !details command)
+                            details_success, details_out, _ = self.service_manager.get_detailed_status(svc)
+                            if details_success and details_out:
+                                msg_lines.append("\nDetails:")
+                                msg_lines.append(details_out[:800])  # Truncate details
+                            
+                            # Get logs (like !logs command)
+                            logs = self.service_manager.get_failure_logs(svc, lines=lines) or ""
+                            if logs:
+                                msg_lines.append("\nRecent logs:")
+                                msg_lines.append(logs[-1200:])  # Last 1200 chars
+                        
+                        msg = "\n".join(msg_lines)
+                        await post(key, msg[:1900])
+                        
                 except Exception:
                     pass
                 await asyncio.sleep(interval)
 
-        import time
         self._service_monitor_task = asyncio.create_task(_loop())
 
     def _get_oraclefiles_sync_config(self) -> Dict[str, Any]:
@@ -1556,7 +1608,8 @@ echo "TARGET=$TARGET"
             if not include:
                 include = ["RSAdminBot", "RSForwarder", "RSCheckerbot", "RSMentionPinger", "RSOnboarding", "RSuccessBot"]
             return {
-                "enabled": bool(base.get("enabled", False)),
+                "enabled": bool(base.get("enabled", False)),  # Default: disabled (manual only)
+                "periodic_enabled": bool(base.get("periodic_enabled", False)),  # Default: no periodic sync
                 "interval_seconds": int(base.get("interval_seconds") or 4 * 3600),
                 "repo_dir": str(base.get("repo_dir") or "/home/rsadmin/bots/oraclefiles"),
                 "repo_url": str(base.get("repo_url") or "git@github.com:neo-rs/oraclefiles.git"),
@@ -1701,11 +1754,14 @@ echo \"CHANGED_END\"
         return True, stats
 
     def _start_oraclefiles_sync_task(self) -> None:
-        """Start periodic OracleFiles sync (default every 4 hours)."""
+        """Start periodic OracleFiles sync (only if periodic_enabled is True)."""
         if getattr(self, "_oraclefiles_sync_task", None):
             return
         cfg = self._get_oraclefiles_sync_config()
         if not cfg.get("enabled"):
+            return
+        if not cfg.get("periodic_enabled", False):  # Default: disabled (manual only)
+            print(f"[oraclefiles] periodic sync disabled (use !oraclefilesupdate for manual sync)")
             return
         if not self._should_use_local_exec():
             return
@@ -1713,25 +1769,34 @@ echo \"CHANGED_END\"
         async def _loop():
             interval = max(300, min(int(cfg.get("interval_seconds") or 4 * 3600), 7 * 24 * 3600))
             await asyncio.sleep(15)
+            consecutive_failures = 0
             while True:
                 ok, stats = self._oraclefiles_sync_once(trigger="periodic")
                 try:
                     if ok:
+                        consecutive_failures = 0  # Reset failure counter on success
                         head = str(stats.get("head") or "")[:12]
                         pushed = "1" if str(stats.get("pushed") or "").strip() else "0"
-                        msg = f"[oraclefiles] periodic OK\\nPushed: {pushed}\\nHead: {head}"
-                        sample = stats.get("changed_sample") or []
-                        if pushed == "1" and sample:
-                            msg += "\nChanged sample:\n" + "\n".join(str(x) for x in sample[:30])
-                        await self._post_or_edit_progress(None, msg[:1900])
+                        # Only post if something was actually pushed
+                        if pushed == "1":
+                            msg = f"[oraclefiles] periodic OK\nPushed: {pushed}\nHead: {head}"
+                            sample = stats.get("changed_sample") or []
+                            if sample:
+                                msg += "\nChanged sample:\n" + "\n".join(str(x) for x in sample[:30])
+                            await self._post_or_edit_progress(None, msg[:1900])
+                        # If nothing changed, don't post (quiet success)
                     else:
-                        await self._post_or_edit_progress(None, f"[oraclefiles] periodic FAILED\n{str(stats.get('error',''))[:1600]}")
-                except Exception:
-                    pass
+                        consecutive_failures += 1
+                        error_msg = str(stats.get('error', '') or '')[:1600]
+                        # Only post failures (to notify of issues)
+                        await self._post_or_edit_progress(None, f"[oraclefiles] periodic FAILED\n{error_msg}")
+                except Exception as e:
+                    consecutive_failures += 1
+                    await self._post_or_edit_progress(None, f"[oraclefiles] periodic ERROR\n{str(e)[:1600]}")
                 await asyncio.sleep(interval)
 
         self._oraclefiles_sync_task = asyncio.create_task(_loop())
-        print(f"[oraclefiles] sync task started interval={cfg.get('interval_seconds')}s")
+        print(f"[oraclefiles] periodic sync task started interval={cfg.get('interval_seconds')}s")
 
     async def _post_or_edit_progress(self, progress_msg, text: str):
         """Best-effort: edit an existing progress message, else send a new one."""
@@ -3576,6 +3641,24 @@ echo "CHANGED_END"
             py_count = str(stats.get("py_count") or "0").strip()
             changed_count = str(stats.get("changed_count") or "0").strip()
             changed_sample = stats.get("changed_sample") or []
+            
+            # Check if actually updated (old != new)
+            if old and new and old == new:
+                # No changes - skip restart
+                await status_msg.edit(
+                    content=(
+                        f"✅ **Up to date** (commit `{old[:12]}`).\n"
+                        f"No changes detected. No restart needed."
+                    )[:1900]
+                )
+                if should_post_progress:
+                    await self._post_or_edit_progress(
+                        progress_msg,
+                        f"[selfupdate] UP_TO_DATE\nGit: {old[:7]}\nNo changes, no restart needed.",
+                    )
+                return
+            
+            # Has changes - proceed with update message and restart
             changed_block = "\n".join(str(x) for x in changed_sample[:15]) if changed_sample else "(none)"
             await status_msg.edit(
                 content=(
