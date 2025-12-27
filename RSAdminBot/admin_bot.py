@@ -1,0 +1,6926 @@
+#!/usr/bin/env python3
+"""
+RS Admin Bot
+------------
+Admin bot for server management. Runs invisible/offline.
+Configuration is split across:
+- config.json (non-secret settings)
+- config.secrets.json (server-only secrets, not committed)
+
+Features:
+- SSH command execution for bot management
+- Start/stop/restart bots via systemd using .sh scripts
+- Sync bot files using sync_bot.sh
+- Status logging to Discord channel
+"""
+
+import os
+import sys
+import json
+import asyncio
+import subprocess
+import shlex
+import importlib.util
+import platform
+import requests
+from pathlib import Path
+from typing import Dict, Any, Optional, List, Tuple
+from datetime import datetime
+
+# Ensure repo root is importable when executed as a script (matches Ubuntu run_bot.sh PYTHONPATH).
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from mirror_world_config import load_config_with_secrets
+from mirror_world_config import is_placeholder_secret, mask_secret
+
+from rsbots_manifest import compare_manifests as rs_compare_manifests
+from rsbots_manifest import generate_manifest as rs_generate_manifest
+from rsbots_manifest import DEFAULT_EXCLUDE_GLOBS as RS_DEFAULT_EXCLUDE_GLOBS
+
+import discord
+from discord.ext import commands
+from discord import ui
+
+# Colors for terminal
+class Colors:
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    CYAN = '\033[96m'
+    BLUE = '\033[94m'
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+    WHITE = '\033[97m'
+    RESET = '\033[0m'
+
+
+# Standardized Discord message helper
+class MessageHelper:
+    """Helper class for creating consistent Discord messages across all commands."""
+    
+    @staticmethod
+    def create_status_embed(title: str, description: str = "", color: discord.Color = discord.Color.blue(), 
+                           fields: List[Dict] = None, footer: str = None) -> discord.Embed:
+        """Create a standardized status embed.
+        
+        Args:
+            title: Embed title
+            description: Embed description
+            color: Embed color (default: blue)
+            fields: List of field dicts with 'name', 'value', 'inline' keys
+            footer: Footer text
+            
+        Returns:
+            discord.Embed
+        """
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            color=color,
+            timestamp=datetime.now()
+        )
+        
+        if fields:
+            for field in fields:
+                embed.add_field(
+                    name=field.get('name', ''),
+                    value=field.get('value', ''),
+                    inline=field.get('inline', False)
+                )
+        
+        if footer:
+            embed.set_footer(text=footer)
+        
+        return embed
+    
+    @staticmethod
+    def create_success_embed(title: str, message: str, details: str = None) -> discord.Embed:
+        """Create a success embed with consistent formatting."""
+        embed = MessageHelper.create_status_embed(
+            title=f"✅ {title}",
+            description=message,
+            color=discord.Color.green()
+        )
+        if details:
+            embed.add_field(name="Details", value=f"```{details[:1000]}```", inline=False)
+        return embed
+    
+    @staticmethod
+    def create_error_embed(title: str, message: str, error_details: str = None) -> discord.Embed:
+        """Create an error embed with consistent formatting."""
+        embed = MessageHelper.create_status_embed(
+            title=f"❌ {title}",
+            description=message,
+            color=discord.Color.red()
+        )
+        if error_details:
+            embed.add_field(name="Error", value=f"```{error_details[:1000]}```", inline=False)
+        return embed
+    
+    @staticmethod
+    def create_warning_embed(title: str, message: str, details: str = None) -> discord.Embed:
+        """Create a warning embed with consistent formatting."""
+        embed = MessageHelper.create_status_embed(
+            title=f"⚠️ {title}",
+            description=message,
+            color=discord.Color.orange()
+        )
+        if details:
+            embed.add_field(name="Details", value=f"```{details[:1000]}```", inline=False)
+        return embed
+    
+    @staticmethod
+    def create_info_embed(title: str, message: str, fields: List[Dict] = None) -> discord.Embed:
+        """Create an info embed with consistent formatting."""
+        return MessageHelper.create_status_embed(
+            title=title,
+            description=message,
+            color=discord.Color.blue(),
+            fields=fields
+        )
+
+# RSAdminBot is self-contained - no external dependencies
+# All functionality is within RSAdminBot folder
+
+# Import bot inspector
+try:
+    from bot_inspector import BotInspector
+    INSPECTOR_AVAILABLE = True
+except ImportError:
+    INSPECTOR_AVAILABLE = False
+
+# Import whop tracker and bot movement tracker
+try:
+    from whop_tracker import WhopTracker
+    from bot_movement_tracker import BotMovementTracker
+    from test_server_organizer import TestServerOrganizer
+    TRACKER_AVAILABLE = True
+except ImportError as e:
+    print(f"{Colors.YELLOW}[Warning] Failed to import tracking modules: {e}{Colors.RESET}")
+    TRACKER_AVAILABLE = False
+
+
+class ServiceManager:
+    """Centralized service management using .sh scripts.
+    
+    Canonical owner for all bot management operations.
+    Uses .sh scripts as single source of truth.
+    """
+    
+    def __init__(self, script_executor, bot_group_getter):
+        """Initialize ServiceManager with script executor functions.
+        
+        Args:
+            script_executor: Function to execute .sh scripts (script_name, action, bot_name, *args) -> (success, stdout, stderr)
+            bot_group_getter: Function to get bot group (bot_name) -> group_name
+        """
+        self._execute_script = script_executor
+        self._get_bot_group = bot_group_getter
+    
+    def get_status(self, service_name: str, bot_name: str) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Get service status using .sh script.
+        
+        Args:
+            service_name: Systemd service name (unused, kept for compatibility)
+            bot_name: Bot name (e.g., "rsforwarder") - REQUIRED
+        
+        Returns:
+            (exists, state, error_msg)
+            - exists: True if service exists
+            - state: 'active', 'inactive', 'failed', 'not_found', or None if error
+            - error_msg: Error message if status check failed
+        """
+        if not bot_name:
+            return False, None, "bot_name is required"
+        
+        bot_group = self._get_bot_group(bot_name)
+        if not bot_group:
+            return False, None, f"Unknown bot group for {bot_name}"
+        
+        script_map = {
+            "rsadminbot": "manage_rsadminbot.sh",
+            "rs_bots": "manage_rs_bots.sh",
+            "mirror_bots": "manage_mirror_bots.sh"
+        }
+        script_name = script_map.get(bot_group, "manage_bots.sh")
+        success, stdout, stderr = self._execute_script(script_name, "status", bot_name)
+        
+        if success:
+            state = (stdout or "").strip().lower()
+            if state == "not_found":
+                return False, None, None
+            return True, state, None
+        else:
+            return True, None, stderr or "Status check failed"
+    
+    
+    def get_detailed_status(self, service_name: str) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Get detailed service status output.
+        
+        Returns:
+            (success, output, error_msg)
+        """
+        # Use canonical .sh scripts (single source of truth) instead of direct SSH/systemctl here.
+        bot_name = None
+        if service_name:
+            # Attempt to infer bot name from service name for compatibility
+            svc = service_name
+            if svc.endswith(".service"):
+                svc = svc[:-8]
+            if svc.startswith("mirror-world-"):
+                bot_name = svc[len("mirror-world-"):]
+        if not bot_name:
+            return False, None, "Could not infer bot_name from service name"
+        return self._execute_script("botctl.sh", "details", bot_name)
+    
+    def get_pid(self, service_name: str) -> Optional[int]:
+        """Get service PID if running.
+        
+        Returns:
+            PID as int, or None if not running or error
+        """
+        bot_name = None
+        if service_name:
+            svc = service_name
+            if svc.endswith(".service"):
+                svc = svc[:-8]
+            if svc.startswith("mirror-world-"):
+                bot_name = svc[len("mirror-world-"):]
+        if not bot_name:
+            return None
+        success, stdout, _ = self._execute_script("botctl.sh", "pid", bot_name)
+        if not success:
+            return None
+        pid_str = (stdout or "").strip()
+        if pid_str.isdigit():
+            try:
+                return int(pid_str)
+            except ValueError:
+                return None
+        return None
+    
+    def start(self, service_name: str, unmask: bool = True, bot_name: str = None) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Start a service using .sh script.
+        
+        Args:
+            service_name: Systemd service name (unused, kept for compatibility)
+            unmask: Ignored (script handles unmask/enable)
+            bot_name: Bot name (e.g., "rsforwarder") - REQUIRED
+        
+        Returns:
+            (success, stdout, stderr)
+        """
+        if not bot_name:
+            return False, None, "bot_name is required"
+        
+        bot_group = self._get_bot_group(bot_name)
+        if not bot_group:
+            return False, None, f"Unknown bot group for {bot_name}"
+        
+        script_map = {
+            "rsadminbot": "manage_rsadminbot.sh",
+            "rs_bots": "manage_rs_bots.sh",
+            "mirror_bots": "manage_mirror_bots.sh"
+        }
+        script_name = script_map.get(bot_group, "manage_bots.sh")
+        return self._execute_script(script_name, "start", bot_name)
+    
+    def stop(self, service_name: str, script_pattern: Optional[str] = None, bot_name: str = None) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Stop a service using .sh script.
+        
+        Args:
+            service_name: Systemd service name (unused, kept for compatibility)
+            script_pattern: Ignored (script handles this)
+            bot_name: Bot name (e.g., "rsforwarder") - REQUIRED
+        
+        Returns:
+            (success, stdout, stderr)
+        """
+        if not bot_name:
+            return False, None, "bot_name is required"
+        
+        bot_group = self._get_bot_group(bot_name)
+        if not bot_group:
+            return False, None, f"Unknown bot group for {bot_name}"
+        
+        script_map = {
+            "rsadminbot": "manage_rsadminbot.sh",
+            "rs_bots": "manage_rs_bots.sh",
+            "mirror_bots": "manage_mirror_bots.sh"
+        }
+        script_name = script_map.get(bot_group, "manage_bots.sh")
+        return self._execute_script(script_name, "stop", bot_name)
+    
+    def restart(self, service_name: str, script_pattern: Optional[str] = None, bot_name: str = None) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Restart a service using .sh script.
+        
+        Args:
+            service_name: Systemd service name (unused, kept for compatibility)
+            script_pattern: Ignored (script handles this)
+            bot_name: Bot name (e.g., "rsforwarder") - REQUIRED
+        
+        Returns:
+            (success, stdout, stderr)
+        """
+        if not bot_name:
+            return False, None, "bot_name is required"
+        
+        bot_group = self._get_bot_group(bot_name)
+        if not bot_group:
+            return False, None, f"Unknown bot group for {bot_name}"
+        
+        script_map = {
+            "rsadminbot": "manage_rsadminbot.sh",
+            "rs_bots": "manage_rs_bots.sh",
+            "mirror_bots": "manage_mirror_bots.sh"
+        }
+        script_name = script_map.get(bot_group, "manage_bots.sh")
+        return self._execute_script(script_name, "restart", bot_name)
+    
+    def get_failure_logs(self, service_name: str, lines: int = 50) -> Optional[str]:
+        """Get recent journalctl logs for service failures.
+        
+        Args:
+            service_name: Systemd service name
+            lines: Number of log lines to retrieve
+        
+        Returns:
+            Log output or None if error
+        """
+        bot_name = None
+        if service_name:
+            svc = service_name
+            if svc.endswith(".service"):
+                svc = svc[:-8]
+            if svc.startswith("mirror-world-"):
+                bot_name = svc[len("mirror-world-"):]
+        if not bot_name:
+            return None
+        success, stdout, _ = self._execute_script("botctl.sh", "logs", bot_name, str(lines))
+        if success and stdout:
+            return stdout
+        return None
+    
+    def verify_started(self, service_name: str, max_wait: int = 10, bot_name: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+        """Verify service started successfully with retry logic.
+        
+        Args:
+            service_name: Systemd service name
+            max_wait: Maximum seconds to wait
+            bot_name: Bot name (e.g., "rsforwarder") - if provided, uses .sh script
+        
+        Returns:
+            (is_running, error_msg)
+        """
+        import time
+        start_time = time.time()
+        
+        while time.time() - start_time < max_wait:
+            exists, state, error = self.get_status(service_name, bot_name=bot_name)
+            
+            if not exists:
+                return False, "Service does not exist"
+            
+            if state == "active":
+                return True, None
+            
+            if state == "failed":
+                logs = self.get_failure_logs(service_name, lines=20)
+                error_msg = "Service failed to start"
+                if logs:
+                    error_msg += f"\n\nRecent logs:\n{logs[-500:]}"
+                return False, error_msg
+            
+            # Wait before retry
+            time.sleep(1)
+        
+        # Timeout
+        exists, state, error = self.get_status(service_name, bot_name=bot_name)
+        if exists:
+            logs = self.get_failure_logs(service_name, lines=20)
+            error_msg = f"Service did not become active (state: {state})"
+            if logs:
+                error_msg += f"\n\nRecent logs:\n{logs[-500:]}"
+            return False, error_msg
+        
+        return False, "Service does not exist"
+
+
+class BotSelectView(ui.View):
+    """View with SelectMenu for bot selection"""
+    
+    def __init__(self, admin_bot_instance, action: str, action_display: str):
+        """
+        Args:
+            admin_bot_instance: RSAdminBot instance
+            action: Action name ('start', 'stop', 'restart', 'restart_and_sync', 'status', 'update', 'info', 'config', 'movements', 'diagnose')
+            action_display: Display name for action ('Start', 'Stop', etc.)
+        """
+        super().__init__(timeout=300)  # 5 minute timeout
+        self.admin_bot = admin_bot_instance
+        self.action = action
+        self.action_display = action_display
+        
+        # Create SelectMenu with all bots + "All Bots" option for start/stop/restart actions
+        options = [
+            discord.SelectOption(
+                label=bot_info['name'],
+                value=bot_key,
+                description=f"{action_display} {bot_info['name']}"
+            )
+            for bot_key, bot_info in admin_bot_instance.BOTS.items()
+        ]
+        
+        # Add "All Bots" option for service control actions
+        if self.action in ["start", "stop", "restart", "restart_and_sync"]:
+            options.insert(0, discord.SelectOption(
+                label="🔄 All Bots",
+                value="all_bots",
+                description=f"{action_display} all bots"
+            ))
+        
+        select = ui.Select(
+            placeholder=f"Select bot to {action_display.lower()}...",
+            options=options
+        )
+        select.callback = self.on_select
+        self.add_item(select)
+    
+    async def on_select(self, interaction: discord.Interaction):
+        """Handle bot selection"""
+        if not self.admin_bot.is_admin(interaction.user):
+            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+            return
+        
+        bot_name = interaction.data['values'][0]
+        
+        # Defer to prevent timeout
+        await interaction.response.defer(ephemeral=False)
+        
+        # Route to appropriate command handler (supports single bot or "all_bots")
+        if self.action == "start":
+            await self._handle_start(interaction, bot_name)
+        elif self.action == "stop":
+            await self._handle_stop(interaction, bot_name)
+        elif self.action == "restart":
+            await self._handle_restart(interaction, bot_name)
+        elif self.action == "restart_and_sync":
+            await self._handle_restart_and_sync(interaction, bot_name)
+        elif self.action == "status":
+            bot_info = self.admin_bot.BOTS[bot_name]
+            await self._handle_status(interaction, bot_name, bot_info)
+        elif self.action == "update":
+            bot_info = self.admin_bot.BOTS[bot_name]
+            await self._handle_update(interaction, bot_name, bot_info)
+        elif self.action == "info":
+            bot_info = self.admin_bot.BOTS[bot_name]
+            await self._handle_info(interaction, bot_name, bot_info)
+        elif self.action == "config":
+            bot_info = self.admin_bot.BOTS[bot_name]
+            await self._handle_config(interaction, bot_name, bot_info)
+        elif self.action == "movements":
+            bot_info = self.admin_bot.BOTS[bot_name]
+            await self._handle_movements(interaction, bot_name, bot_info)
+        elif self.action == "diagnose":
+            bot_info = self.admin_bot.BOTS[bot_name]
+            await self._handle_diagnose(interaction, bot_name, bot_info)
+    
+    async def _handle_start(self, interaction, bot_name):
+        """Handle bot start (supports single bot or 'all_bots')"""
+        if not self.admin_bot.service_manager:
+            await interaction.followup.send("❌ ServiceManager not available")
+            return
+        
+        # Handle "all_bots" case - use group-specific scripts for efficiency
+        if bot_name == "all_bots":
+            status_msg = await interaction.followup.send(f"🔄 **Starting all bots using group-specific scripts...**\n```\nCalling manage_rsadminbot.sh, manage_rs_bots.sh, and manage_mirror_bots.sh...\n```")
+            
+            results = []
+            
+            # Start RSAdminBot
+            try:
+                success_rsadmin, stdout_rsadmin, stderr_rsadmin = self.admin_bot._execute_sh_script("manage_rsadminbot.sh", "start", "rsadminbot")
+                if success_rsadmin:
+                    results.append("✅ **RSAdminBot**: Started successfully")
+                else:
+                    error_msg = stderr_rsadmin or stdout_rsadmin or "Unknown error"
+                    results.append(f"❌ **RSAdminBot**: {error_msg[:100]}")
+            except Exception as e:
+                results.append(f"❌ **RSAdminBot**: {str(e)[:100]}")
+            
+            # Start all RS bots
+            try:
+                success_rs, stdout_rs, stderr_rs = self.admin_bot._execute_sh_script("manage_rs_bots.sh", "start", "all")
+                if success_rs:
+                    results.append("✅ **RS Bots** (rsforwarder, rsonboarding, rsmentionpinger, rscheckerbot, rssuccessbot): Started successfully")
+                else:
+                    error_msg = stderr_rs or stdout_rs or "Unknown error"
+                    results.append(f"⚠️ **RS Bots**: {error_msg[:150]}")
+            except Exception as e:
+                results.append(f"❌ **RS Bots**: {str(e)[:100]}")
+            
+            # Start all mirror-world bots
+            try:
+                success_mirror, stdout_mirror, stderr_mirror = self.admin_bot._execute_sh_script("manage_mirror_bots.sh", "start", "all")
+                if success_mirror:
+                    results.append("✅ **Mirror-World Bots** (datamanagerbot, pingbot, discumbot): Started successfully")
+                else:
+                    error_msg = stderr_mirror or stdout_mirror or "Unknown error"
+                    results.append(f"⚠️ **Mirror-World Bots**: {error_msg[:150]}")
+            except Exception as e:
+                results.append(f"❌ **Mirror-World Bots**: {str(e)[:100]}")
+            
+            summary = f"🔄 **Start All Complete**\n\n" + "\n".join(results)
+            if len(summary) > 2000:
+                summary = summary[:1997] + "..."
+            await status_msg.edit(content=summary)
+            await self.admin_bot._log_to_discord(f"🔄 **All Bots Start** completed\nRequested by: {interaction.user.mention}")
+            return
+        
+        # Handle single bot case
+        bot_info = self.admin_bot.BOTS[bot_name]
+        service_name = bot_info["service"]
+        await interaction.followup.send(f"🔄 **Starting {bot_info['name']}...**\n```\nConnecting to server...\n```")
+        before_exists, before_state, _ = self.admin_bot.service_manager.get_status(service_name, bot_name=bot_name)
+        before_pid = self.admin_bot.service_manager.get_pid(service_name)
+
+        success, stdout, stderr = self.admin_bot.service_manager.start(service_name, unmask=True, bot_name=bot_name)
+        
+        if success:
+            is_running, verify_error = self.admin_bot.service_manager.verify_started(service_name, bot_name=bot_name)
+            if is_running:
+                after_exists, after_state, _ = self.admin_bot.service_manager.get_status(service_name, bot_name=bot_name)
+                after_pid = self.admin_bot.service_manager.get_pid(service_name)
+                pid_note = ""
+                if before_pid and after_pid and before_pid != after_pid:
+                    pid_note = f" (pid {before_pid} -> {after_pid})"
+                elif before_pid is None and after_pid:
+                    pid_note = f" (pid -> {after_pid})"
+                before_state_txt = before_state or "unknown"
+                after_state_txt = after_state or "unknown"
+                before_pid_txt = str(before_pid or 0)
+                after_pid_txt = str(after_pid or 0)
+                await interaction.followup.send(
+                    f"✅ **{bot_info['name']}** started successfully!{pid_note}\n"
+                    f"```\nBefore: state={before_state_txt} pid={before_pid_txt}\nAfter:  state={after_state_txt} pid={after_pid_txt}\n```"
+                )
+                await self.admin_bot._log_to_discord(
+                    f"✅ **{bot_info['name']}** started\nState: `{after_state or 'unknown'}` | PID: `{after_pid or 0}`\nBefore: `{before_state or 'unknown'}` | PID: `{before_pid or 0}`\nRequested by: {interaction.user.mention}"
+                )
+            else:
+                error_msg = verify_error or stderr or stdout or "Unknown error"
+                await interaction.followup.send(f"❌ Failed to start {bot_info['name']}:\n```{error_msg[:500]}```")
+        else:
+            error_msg = stderr or stdout or "Unknown error"
+            await interaction.followup.send(f"❌ Failed to start {bot_info['name']}:\n```{error_msg[:500]}```")
+    
+    async def _handle_stop(self, interaction, bot_name):
+        """Handle bot stop (supports single bot or 'all_bots')"""
+        if not self.admin_bot.service_manager:
+            await interaction.followup.send("❌ ServiceManager not available")
+            return
+        
+        # Handle "all_bots" case - use group-specific scripts for efficiency
+        if bot_name == "all_bots":
+            status_msg = await interaction.followup.send(f"🔄 **Stopping all bots using group-specific scripts...**\n```\nCalling manage_rsadminbot.sh, manage_rs_bots.sh, and manage_mirror_bots.sh...\n```")
+            
+            results = []
+            
+            # Stop RSAdminBot
+            try:
+                success_rsadmin, stdout_rsadmin, stderr_rsadmin = self.admin_bot._execute_sh_script("manage_rsadminbot.sh", "stop", "rsadminbot")
+                if success_rsadmin:
+                    results.append("✅ **RSAdminBot**: Stopped successfully")
+                else:
+                    error_msg = stderr_rsadmin or stdout_rsadmin or "Unknown error"
+                    results.append(f"❌ **RSAdminBot**: {error_msg[:100]}")
+            except Exception as e:
+                results.append(f"❌ **RSAdminBot**: {str(e)[:100]}")
+            
+            # Stop all RS bots
+            try:
+                success_rs, stdout_rs, stderr_rs = self.admin_bot._execute_sh_script("manage_rs_bots.sh", "stop", "all")
+                if success_rs:
+                    results.append("✅ **RS Bots** (rsforwarder, rsonboarding, rsmentionpinger, rscheckerbot, rssuccessbot): Stopped successfully")
+                else:
+                    error_msg = stderr_rs or stdout_rs or "Unknown error"
+                    results.append(f"⚠️ **RS Bots**: {error_msg[:150]}")
+            except Exception as e:
+                results.append(f"❌ **RS Bots**: {str(e)[:100]}")
+            
+            # Stop all mirror-world bots
+            try:
+                success_mirror, stdout_mirror, stderr_mirror = self.admin_bot._execute_sh_script("manage_mirror_bots.sh", "stop", "all")
+                if success_mirror:
+                    results.append("✅ **Mirror-World Bots** (datamanagerbot, pingbot, discumbot): Stopped successfully")
+                else:
+                    error_msg = stderr_mirror or stdout_mirror or "Unknown error"
+                    results.append(f"⚠️ **Mirror-World Bots**: {error_msg[:150]}")
+            except Exception as e:
+                results.append(f"❌ **Mirror-World Bots**: {str(e)[:100]}")
+            
+            summary = f"🔄 **Stop All Complete**\n\n" + "\n".join(results)
+            if len(summary) > 2000:
+                summary = summary[:1997] + "..."
+            await status_msg.edit(content=summary)
+            await self.admin_bot._log_to_discord(f"🔄 **All Bots Stop** completed\nRequested by: {interaction.user.mention}")
+            return
+        
+        # Handle single bot case
+        bot_info = self.admin_bot.BOTS[bot_name]
+        service_name = bot_info["service"]
+        script_pattern = bot_info.get("script", bot_name)
+        await interaction.followup.send(f"🔄 **Stopping {bot_info['name']}...**\n```\nConnecting to server...\n```")
+        before_exists, before_state, _ = self.admin_bot.service_manager.get_status(service_name, bot_name=bot_name)
+        before_pid = self.admin_bot.service_manager.get_pid(service_name)
+
+        success, stdout, stderr = self.admin_bot.service_manager.stop(service_name, script_pattern=script_pattern, bot_name=bot_name)
+        
+        if success:
+            after_exists, after_state, _ = self.admin_bot.service_manager.get_status(service_name, bot_name=bot_name)
+            after_pid = self.admin_bot.service_manager.get_pid(service_name)
+            pid_note = ""
+            if before_pid and not after_pid:
+                pid_note = f" (pid {before_pid} -> 0)"
+            before_state_txt = before_state or "unknown"
+            after_state_txt = after_state or "unknown"
+            before_pid_txt = str(before_pid or 0)
+            after_pid_txt = str(after_pid or 0)
+            await interaction.followup.send(
+                f"✅ **{bot_info['name']}** stopped successfully!{pid_note}\n"
+                f"```\nBefore: state={before_state_txt} pid={before_pid_txt}\nAfter:  state={after_state_txt} pid={after_pid_txt}\n```"
+            )
+            await self.admin_bot._log_to_discord(
+                f"✅ **{bot_info['name']}** stopped\nState: `{after_state or 'unknown'}` | PID: `{after_pid or 0}`\nBefore: `{before_state or 'unknown'}` | PID: `{before_pid or 0}`\nRequested by: {interaction.user.mention}"
+            )
+        else:
+            error_msg = stderr or stdout or "Unknown error"
+            await interaction.followup.send(f"❌ Failed to stop {bot_info['name']}:\n```{error_msg[:500]}```")
+    
+    async def _handle_restart(self, interaction, bot_name):
+        """Handle bot restart (supports single bot or 'all_bots')"""
+        if not self.admin_bot.service_manager:
+            await interaction.followup.send("❌ ServiceManager not available")
+            return
+        
+        # Handle "all_bots" case - use group-specific scripts for efficiency
+        if bot_name == "all_bots":
+            status_msg = await interaction.followup.send(f"🔄 **Restarting all bots using group-specific scripts...**\n```\nCalling manage_rsadminbot.sh, manage_rs_bots.sh, and manage_mirror_bots.sh...\n```")
+            
+            results = []
+            
+            # Restart RSAdminBot
+            try:
+                success_rsadmin, stdout_rsadmin, stderr_rsadmin = self.admin_bot._execute_sh_script("manage_rsadminbot.sh", "restart", "rsadminbot")
+                if success_rsadmin:
+                    results.append("✅ **RSAdminBot**: Restarted successfully")
+                else:
+                    error_msg = stderr_rsadmin or stdout_rsadmin or "Unknown error"
+                    results.append(f"❌ **RSAdminBot**: {error_msg[:100]}")
+            except Exception as e:
+                results.append(f"❌ **RSAdminBot**: {str(e)[:100]}")
+            
+            # Restart all RS bots
+            try:
+                success_rs, stdout_rs, stderr_rs = self.admin_bot._execute_sh_script("manage_rs_bots.sh", "restart", "all")
+                if success_rs:
+                    results.append("✅ **RS Bots** (rsforwarder, rsonboarding, rsmentionpinger, rscheckerbot, rssuccessbot): Restarted successfully")
+                else:
+                    error_msg = stderr_rs or stdout_rs or "Unknown error"
+                    results.append(f"⚠️ **RS Bots**: {error_msg[:150]}")
+            except Exception as e:
+                results.append(f"❌ **RS Bots**: {str(e)[:100]}")
+            
+            # Restart all mirror-world bots
+            try:
+                success_mirror, stdout_mirror, stderr_mirror = self.admin_bot._execute_sh_script("manage_mirror_bots.sh", "restart", "all")
+                if success_mirror:
+                    results.append("✅ **Mirror-World Bots** (datamanagerbot, pingbot, discumbot): Restarted successfully")
+                else:
+                    error_msg = stderr_mirror or stdout_mirror or "Unknown error"
+                    results.append(f"⚠️ **Mirror-World Bots**: {error_msg[:150]}")
+            except Exception as e:
+                results.append(f"❌ **Mirror-World Bots**: {str(e)[:100]}")
+            
+            summary = f"🔄 **Restart All Complete**\n\n" + "\n".join(results)
+            if len(summary) > 2000:
+                summary = summary[:1997] + "..."
+            await status_msg.edit(content=summary)
+            await self.admin_bot._log_to_discord(f"🔄 **All Bots Restart** completed\nRequested by: {interaction.user.mention}")
+            return
+        
+        # Handle single bot case
+        bot_info = self.admin_bot.BOTS[bot_name]
+        service_name = bot_info["service"]
+        script_pattern = bot_info.get("script", bot_name)
+        await interaction.followup.send(f"🔄 **Restarting {bot_info['name']}...**\n```\nConnecting to server...\n```")
+        before_exists, before_state, _ = self.admin_bot.service_manager.get_status(service_name, bot_name=bot_name)
+        before_pid = self.admin_bot.service_manager.get_pid(service_name)
+
+        success, stdout, stderr = self.admin_bot.service_manager.restart(service_name, script_pattern=script_pattern, bot_name=bot_name)
+        
+        if success:
+            is_running, verify_error = self.admin_bot.service_manager.verify_started(service_name, bot_name=bot_name)
+            if is_running:
+                after_exists, after_state, _ = self.admin_bot.service_manager.get_status(service_name, bot_name=bot_name)
+                after_pid = self.admin_bot.service_manager.get_pid(service_name)
+                pid_note = ""
+                if before_pid and after_pid and before_pid != after_pid:
+                    pid_note = f" (pid {before_pid} -> {after_pid})"
+                elif before_pid and after_pid and before_pid == after_pid:
+                    pid_note = f" (pid unchanged: {after_pid})"
+                elif before_pid is None and after_pid:
+                    pid_note = f" (pid -> {after_pid})"
+                before_state_txt = before_state or "unknown"
+                after_state_txt = after_state or "unknown"
+                before_pid_txt = str(before_pid or 0)
+                after_pid_txt = str(after_pid or 0)
+                await interaction.followup.send(
+                    f"✅ **{bot_info['name']}** restarted successfully!{pid_note}\n"
+                    f"```\nBefore: state={before_state_txt} pid={before_pid_txt}\nAfter:  state={after_state_txt} pid={after_pid_txt}\n```"
+                )
+                await self.admin_bot._log_to_discord(
+                    f"✅ **{bot_info['name']}** restarted{pid_note}\nState: `{after_state or 'unknown'}` | PID: `{after_pid or 0}`\nBefore: `{before_state or 'unknown'}` | PID: `{before_pid or 0}`\nRequested by: {interaction.user.mention}"
+                )
+            else:
+                error_msg = verify_error or stderr or stdout or "Unknown error"
+                await interaction.followup.send(f"❌ Failed to restart {bot_info['name']}:\n```{error_msg[:500]}```")
+        else:
+            error_msg = stderr or stdout or "Unknown error"
+            await interaction.followup.send(f"❌ Failed to restart {bot_info['name']}:\n```{error_msg[:500]}```")
+    
+    async def _handle_restart_and_sync(self, interaction, bot_name):
+        """Handle bot restart with file sync (supports single bot or 'all_bots')"""
+        if not self.admin_bot.service_manager:
+            await interaction.followup.send("❌ ServiceManager not available")
+            return
+        
+        # Handle "all_bots" case
+        if bot_name == "all_bots":
+            total_bots = len(self.admin_bot.BOTS)
+            status_msg = await interaction.followup.send(f"📦🔄 **Syncing & Restarting all {total_bots} bot(s)...**\n```\nPreparing...\n```")
+            
+            results = []
+            for idx, (bot_key, bot_info) in enumerate(self.admin_bot.BOTS.items(), 1):
+                bot_folder = bot_info["folder"]
+                service_name = bot_info["service"]
+                script_pattern = bot_info.get("script", bot_key)
+                
+                await status_msg.edit(content=f"📦🔄 **Syncing & Restarting all {total_bots} bot(s)...**\n```\n[{idx}/{total_bots}] {bot_info['name']} - Syncing files...\n```")
+                
+                # Step 1: Sync files
+                success, stats = self.admin_bot._sync_bot_files(bot_folder, bot_info['name'], show_tree=False, delete_remote_only=True)
+                
+                if not success:
+                    error_msg = stats.get("error", "Unknown error")
+                    results.append(f"❌ **{bot_info['name']}**: Sync failed - {error_msg[:100]}")
+                    continue
+                
+                synced = stats.get('synced', 0)
+                failed = stats.get('failed', 0)
+                skipped = stats.get('skipped', 0)
+                python_total = stats.get('python_files_total', 0)
+                python_verified = stats.get('python_files_verified', 0)
+                python_percent = stats.get('python_sync_percent', 100)
+                
+                sync_info = f"Synced: {synced}, Skipped: {skipped}, Failed: {failed}"
+                if python_total > 0:
+                    if python_percent == 100:
+                        sync_info += f" | 🐍 Python: {python_verified}/{python_total} (100%) ✅"
+                    else:
+                        sync_info += f" | 🐍 Python: {python_verified}/{python_total} ({python_percent}%) ⚠️"
+                
+                # Step 2: Restart
+                await status_msg.edit(content=f"📦🔄 **Syncing & Restarting all {total_bots} bot(s)...**\n```\n[{idx}/{total_bots}] {bot_info['name']} - Restarting...\n```")
+                
+                restart_success, stdout, stderr = self.admin_bot.service_manager.restart(service_name, script_pattern=script_pattern, bot_name=bot_key)
+                
+                if restart_success:
+                    is_running, verify_error = self.admin_bot.service_manager.verify_started(service_name, bot_name=bot_key)
+                    if is_running:
+                        results.append(f"✅ **{bot_info['name']}**: Restarted | {sync_info}")
+                    else:
+                        error_msg = verify_error or stderr or stdout or "Unknown error"
+                        results.append(f"⚠️ **{bot_info['name']}**: Files synced, restart verification failed | {sync_info}")
+                else:
+                    error_msg = stderr or stdout or "Unknown error"
+                    results.append(f"⚠️ **{bot_info['name']}**: Files synced, restart failed | {sync_info}")
+            
+            summary = f"📦🔄 **Sync & Restart All Complete**\n\n" + "\n".join(results)
+            if len(summary) > 2000:
+                summary = summary[:1997] + "..."
+            await status_msg.edit(content=summary)
+            await self.admin_bot._log_to_discord(f"📦🔄 **All Bots Sync & Restart** completed\nRequested by: {interaction.user.mention}")
+            return
+        
+        # Handle single bot case
+        bot_info = self.admin_bot.BOTS[bot_name]
+        bot_folder = bot_info["folder"]
+        service_name = bot_info["service"]
+        script_pattern = bot_info.get("script", bot_name)
+        
+        # Step 1: Sync files first
+        await interaction.followup.send(f"📦 **Syncing {bot_info['name']} files...**\n```\nScanning and syncing files...\n```")
+        
+        success, stats = self.admin_bot._sync_bot_files(bot_folder, bot_info['name'], show_tree=False, delete_remote_only=True)
+        
+        if not success:
+            error_msg = stats.get("error", "Unknown error")
+            await interaction.followup.send(f"❌ **File sync failed** for {bot_info['name']}:\n```{error_msg[:500]}```\n\n⚠️ Skipping restart due to sync failure.")
+            return
+        
+        # Show sync results
+        synced = stats.get('synced', 0)
+        failed = stats.get('failed', 0)
+        skipped = stats.get('skipped', 0)
+        python_total = stats.get('python_files_total', 0)
+        python_verified = stats.get('python_files_verified', 0)
+        python_percent = stats.get('python_sync_percent', 100)
+        
+        sync_summary = f"✅ **Files synced**: {synced} synced, {skipped} skipped, {failed} failed"
+        if python_total > 0:
+            if python_percent == 100:
+                sync_summary += f" | 🐍 Python: {python_verified}/{python_total} (100%) ✅"
+            else:
+                sync_summary += f" | 🐍 Python: {python_verified}/{python_total} ({python_percent}%) ⚠️"
+        
+        # Step 2: Restart the bot
+        await interaction.followup.send(f"🔄 **Restarting {bot_info['name']}...**\n```\n{sync_summary}\n\nConnecting to server...\n```")
+
+        before_exists, before_state, _ = self.admin_bot.service_manager.get_status(service_name, bot_name=bot_name)
+        before_pid = self.admin_bot.service_manager.get_pid(service_name)
+
+        restart_success, stdout, stderr = self.admin_bot.service_manager.restart(service_name, script_pattern=script_pattern, bot_name=bot_name)
+        
+        if restart_success:
+            is_running, verify_error = self.admin_bot.service_manager.verify_started(service_name, bot_name=bot_name)
+            if is_running:
+                after_exists, after_state, _ = self.admin_bot.service_manager.get_status(service_name, bot_name=bot_name)
+                after_pid = self.admin_bot.service_manager.get_pid(service_name)
+                pid_note = ""
+                if before_pid and after_pid and before_pid != after_pid:
+                    pid_note = f" (pid {before_pid} -> {after_pid})"
+                elif before_pid and after_pid and before_pid == after_pid:
+                    pid_note = f" (pid unchanged: {after_pid})"
+                elif before_pid is None and after_pid:
+                    pid_note = f" (pid -> {after_pid})"
+                before_state_txt = before_state or "unknown"
+                after_state_txt = after_state or "unknown"
+                before_pid_txt = str(before_pid or 0)
+                after_pid_txt = str(after_pid or 0)
+                final_summary = (
+                    f"✅ **{bot_info['name']} restarted successfully!**{pid_note}\n"
+                    f"```\n{sync_summary}\n\nBefore: state={before_state_txt} pid={before_pid_txt}\nAfter:  state={after_state_txt} pid={after_pid_txt}\n```"
+                )
+                await interaction.followup.send(final_summary)
+                await self.admin_bot._log_to_discord(f"🔄 **{bot_info['name']}** restarted with file sync\n{sync_summary}\nRequested by: {interaction.user.mention}")
+            else:
+                error_msg = verify_error or stderr or stdout or "Unknown error"
+                await interaction.followup.send(f"⚠️ **Files synced but restart verification failed**\n```{error_msg[:500]}```\n\n{sync_summary}")
+        else:
+            error_msg = stderr or stdout or "Unknown error"
+            await interaction.followup.send(f"⚠️ **Files synced but restart failed**\n```{error_msg[:500]}```\n\n{sync_summary}")
+    
+    async def _handle_status(self, interaction, bot_name, bot_info):
+        """Handle bot status check"""
+        service_name = bot_info["service"]
+        check_exists_cmd = f"systemctl list-unit-files {service_name} 2>/dev/null | grep -q {service_name} && echo 'exists' || echo 'not_found'"
+        exists_success, exists_output, _ = self.admin_bot._execute_ssh_command(check_exists_cmd, timeout=10)
+        service_exists = exists_success and "exists" in (exists_output or "").lower()
+        
+        embed = discord.Embed(
+            title=f"📊 {bot_info['name']} Status",
+            color=discord.Color.blue(),
+            timestamp=datetime.now()
+        )
+        
+        if not service_exists:
+            embed.add_field(name="Status", value="⚠️ Service not found", inline=False)
+        else:
+            exists, state, error = self.admin_bot.service_manager.get_status(service_name, bot_name=bot_name)
+            if exists and state:
+                is_active = state == "active"
+                status_icon = "✅" if is_active else "❌"
+                embed.add_field(name="Status", value=f"{status_icon} {'Running' if is_active else 'Stopped'}", inline=True)
+                if is_active:
+                    pid = self.admin_bot.service_manager.get_pid(service_name)
+                    if pid:
+                        embed.add_field(name="PID", value=str(pid), inline=True)
+            else:
+                embed.add_field(name="Error", value=f"```{error or 'Status check failed'}```", inline=False)
+        
+        await interaction.followup.send(embed=embed)
+    
+    async def _handle_update(self, interaction, bot_name, bot_info):
+        """Handle bot update"""
+        bot_folder = bot_info["folder"]
+        await interaction.followup.send(f"📦 **Syncing {bot_info['name']} files...**\n```\nScanning files...\n```")
+        
+        # Check if SSH is available
+        ssh_ok, error_msg = self.admin_bot._check_ssh_available()
+        if not ssh_ok:
+            await interaction.followup.send(f"❌ SSH not configured: {error_msg}")
+            return
+        
+        # Use comprehensive sync with tree view
+        success, stats = self.admin_bot._sync_bot_files(bot_folder, bot_info['name'], show_tree=True, delete_remote_only=True)
+        
+        if success:
+            summary = f"✅ **{bot_info['name']} files synced successfully!**\n"
+            summary += f"```\n"
+            summary += f"Synced: {stats['synced']} file(s)\n"
+            if stats['failed'] > 0:
+                summary += f"Failed: {stats['failed']} file(s)\n"
+            if stats['deleted'] > 0:
+                summary += f"Deleted: {stats['deleted']} remote-only file(s)\n"
+            if stats['skipped'] > 0:
+                summary += f"Skipped: {stats['skipped']} file(s)\n"
+            summary += f"```"
+            await interaction.followup.send(summary)
+        else:
+            error_msg = stats.get("error", "Unknown error")
+            await interaction.followup.send(f"❌ Failed to sync {bot_info['name']} files:\n```{error_msg}```")
+    
+    async def _handle_info(self, interaction, bot_name, bot_info):
+        """Handle bot info"""
+        await interaction.followup.send("ℹ️ Use `!botinfo <botname>` for detailed information.")
+    
+    async def _handle_config(self, interaction, bot_name, bot_info):
+        """Handle bot config"""
+        await interaction.followup.send("ℹ️ Use `!botconfig <botname>` to view config.")
+    
+    async def _handle_movements(self, interaction, bot_name, bot_info):
+        """Handle bot movements"""
+        await interaction.followup.send("ℹ️ Use `!botmovements <botname>` to view activity logs.")
+    
+    async def _handle_diagnose(self, interaction, bot_name, bot_info):
+        """Handle bot diagnose"""
+        # Use the same logic as botdiagnose command
+        service_name = bot_info["service"]
+        embed = discord.Embed(
+            title=f"🔍 {bot_info['name']} Diagnostics",
+            color=discord.Color.orange(),
+            timestamp=datetime.now()
+        )
+        
+        if self.admin_bot.service_manager:
+            exists, state, error = self.admin_bot.service_manager.get_status(service_name, bot_name=bot_name)
+            if exists:
+                status_icon = "✅" if state == "active" else "❌"
+                embed.add_field(name="Service Status", value=f"{status_icon} {state.capitalize()}", inline=True)
+                
+                if state != "active":
+                    logs = self.admin_bot.service_manager.get_failure_logs(service_name, lines=30)
+                    if logs:
+                        error_lines = [line for line in logs.split('\n') if any(kw in line.lower() for kw in ['error', 'failed', 'exception'])]
+                        if error_lines:
+                            error_text = "\n".join(error_lines[-15:])
+                            if len(error_text) > 1000:
+                                error_text = error_text[:1000] + "..."
+                            embed.add_field(name="Recent Errors", value=f"```\n{error_text}\n```", inline=False)
+            else:
+                embed.add_field(name="Service Status", value="⚠️ Service not found", inline=False)
+        
+        await interaction.followup.send(embed=embed)
+
+
+class StartBotView(ui.View):
+    """View with button to start a stopped bot"""
+    
+    def __init__(self, admin_bot_instance, bot_name: str, bot_display_name: str):
+        super().__init__(timeout=300)  # 5 minute timeout
+        self.admin_bot = admin_bot_instance
+        self.bot_name = bot_name
+        self.bot_display_name = bot_display_name
+    
+    @ui.button(label="🟢 Start Bot", style=discord.ButtonStyle.success)
+    async def start_bot(self, interaction: discord.Interaction, button: ui.Button):
+        """Start the bot when button is clicked"""
+        # Check if user is admin
+        if not self.admin_bot.is_admin(interaction.user):
+            await interaction.response.send_message("❌ You don't have permission to start bots.", ephemeral=True)
+            return
+        
+        # Disable button to prevent multiple clicks
+        button.disabled = True
+        button.label = "⏳ Starting..."
+        await interaction.response.edit_message(view=self)
+        
+        # Start the bot
+        bot_info = self.admin_bot.BOTS[self.bot_name]
+        service_name = bot_info["service"]
+        
+        # Log to Discord
+        await self.admin_bot._log_to_discord(f"🟢 **Starting {bot_info['name']}**\nService: `{service_name}`\nRequested by: {interaction.user.mention} (via button)")
+        
+        # Start service using ServiceManager
+        if not self.admin_bot.service_manager:
+            await interaction.followup.send("❌ SSH not available", ephemeral=False)
+            return
+        
+        success, stdout, stderr = self.admin_bot.service_manager.start(service_name, unmask=True, bot_name=self.bot_name)
+        
+        if success:
+            # Verify service actually started
+            is_running, verify_error = self.admin_bot.service_manager.verify_started(service_name, bot_name=self.bot_name)
+            if is_running:
+                button.label = "✅ Started"
+                button.style = discord.ButtonStyle.success
+                await interaction.followup.send(f"✅ **{bot_info['name']}** started successfully!", ephemeral=False)
+                await self.admin_bot._log_to_discord(f"✅ **{bot_info['name']}** started successfully!")
+            else:
+                button.label = "❌ Failed"
+                button.style = discord.ButtonStyle.danger
+                error_msg = verify_error or stderr or stdout or "Unknown error"
+                await interaction.followup.send(f"❌ Failed to start {bot_info['name']}:\n```{error_msg[:500]}```", ephemeral=False)
+                await self.admin_bot._log_to_discord(f"❌ **{bot_info['name']}** failed to start:\n```{error_msg[:500]}```")
+        else:
+            button.label = "❌ Failed"
+            button.style = discord.ButtonStyle.danger
+            error_msg = stderr or stdout or "Unknown error"
+            await interaction.followup.send(f"❌ Failed to start {bot_info['name']}:\n```{error_msg[:500]}```", ephemeral=False)
+            await self.admin_bot._log_to_discord(f"❌ **{bot_info['name']}** failed to start:\n```{error_msg[:500]}```")
+        
+        # Update the message
+        await interaction.edit_original_response(view=self)
+
+
+class BotSyncRestartPromptView(ui.View):
+    """View with buttons to prompt for bot sync and restart after botscan"""
+    
+    def __init__(self, admin_bot_instance, bot_keys: List[str], requester_id: int):
+        super().__init__(timeout=300)  # 5 minute timeout
+        self.admin_bot = admin_bot_instance
+        self.bot_keys = bot_keys
+        self.requester_id = requester_id
+    
+    @ui.button(label="📦 Sync Only", style=discord.ButtonStyle.primary, row=0)
+    async def sync_only_button(self, interaction: discord.Interaction, button: ui.Button):
+        """Sync files only, no restart"""
+        if not self.admin_bot.is_admin(interaction.user):
+            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+            return
+        
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("❌ Only the person who ran `!botscan` can confirm updates.", ephemeral=True)
+            return
+        
+        await interaction.response.defer(ephemeral=False)
+        
+        # Disable buttons
+        button.disabled = True
+        self.sync_restart_button.disabled = True
+        self.cancel_button.disabled = True
+        await interaction.edit_original_response(view=self)
+        
+        # Sync each bot
+        update_status_msg = await interaction.followup.send(
+            f"📦 **Syncing {len(self.bot_keys)} bot(s)...**\n```\nPreparing to sync...\n```"
+        )
+        
+        results = []
+        for idx, bot_key in enumerate(self.bot_keys, 1):
+            bot_info = self.admin_bot.BOTS.get(bot_key)
+            if not bot_info:
+                results.append(f"❌ {bot_key}: Not found in BOTS dict")
+                continue
+            
+            bot_folder = bot_info["folder"]
+            bot_name = bot_info["name"]
+            
+            await update_status_msg.edit(
+                content=f"📦 **Syncing {len(self.bot_keys)} bot(s)...**\n```\n[{idx}/{len(self.bot_keys)}] Syncing {bot_name}...\n```"
+            )
+            
+            # Run sync (same as botupdate command)
+            success, stats = self.admin_bot._sync_bot_files(bot_folder, bot_name, show_tree=False, delete_remote_only=True)
+            
+            if success:
+                synced = stats.get('synced', 0)
+                failed = stats.get('failed', 0)
+                skipped = stats.get('skipped', 0)
+                python_total = stats.get('python_files_total', 0)
+                python_verified = stats.get('python_files_verified', 0)
+                python_percent = stats.get('python_sync_percent', 100)
+                
+                result_line = f"✅ **{bot_name}**: Synced {synced}, Skipped {skipped}, Failed {failed}"
+                if python_total > 0:
+                    if python_percent == 100:
+                        result_line += f" | 🐍 Python: {python_verified}/{python_total} (100%) ✅"
+                    else:
+                        result_line += f" | 🐍 Python: {python_verified}/{python_total} ({python_percent}%) ⚠️"
+                results.append(result_line)
+            else:
+                error_msg = stats.get("error", "Unknown error")
+                results.append(f"❌ **{bot_name}**: {error_msg[:100]}")
+        
+        # Send final summary
+        summary = f"📦 **Sync Complete**\n\n" + "\n".join(results)
+        if len(summary) > 2000:
+            summary = summary[:1997] + "..."
+        
+        await update_status_msg.edit(content=summary)
+        await self.admin_bot._log_to_discord(f"📦 **Bot Sync Completed**\nSynced {len(self.bot_keys)} bot(s)\nRequested by: {interaction.user.mention}")
+    
+    @ui.button(label="🔄 Sync & Restart All", style=discord.ButtonStyle.success, row=0)
+    async def sync_restart_button(self, interaction: discord.Interaction, button: ui.Button):
+        """Sync and restart all bots in proper sequence"""
+        if not self.admin_bot.is_admin(interaction.user):
+            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+            return
+        
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("❌ Only the person who ran `!botscan` can confirm updates.", ephemeral=True)
+            return
+        
+        await interaction.response.defer(ephemeral=False)
+        
+        # Disable buttons
+        button.disabled = True
+        self.sync_only_button.disabled = True
+        self.cancel_button.disabled = True
+        await interaction.edit_original_response(view=self)
+        
+        # Step 1: Sync all bots
+        sync_status_msg = await interaction.followup.send(
+            f"📦 **Step 1: Syncing {len(self.bot_keys)} bot(s)...**\n```\nPreparing to sync...\n```"
+        )
+        
+        sync_results = []
+        for idx, bot_key in enumerate(self.bot_keys, 1):
+            bot_info = self.admin_bot.BOTS.get(bot_key)
+            if not bot_info:
+                sync_results.append(f"❌ {bot_key}: Not found in BOTS dict")
+                continue
+            
+            bot_folder = bot_info["folder"]
+            bot_name = bot_info["name"]
+            
+            await sync_status_msg.edit(
+                content=f"📦 **Step 1: Syncing {len(self.bot_keys)} bot(s)...**\n```\n[{idx}/{len(self.bot_keys)}] Syncing {bot_name}...\n```"
+            )
+            
+            # Run sync
+            success, stats = self.admin_bot._sync_bot_files(bot_folder, bot_name, show_tree=False, delete_remote_only=True)
+            
+            if success:
+                synced = stats.get('synced', 0)
+                python_total = stats.get('python_files_total', 0)
+                python_verified = stats.get('python_files_verified', 0)
+                python_percent = stats.get('python_sync_percent', 100)
+                
+                result_line = f"✅ **{bot_name}**: {synced} synced"
+                if python_total > 0 and python_percent == 100:
+                    result_line += f" | 🐍 Python: 100% ✅"
+                sync_results.append(result_line)
+            else:
+                error_msg = stats.get("error", "Unknown error")
+                sync_results.append(f"❌ **{bot_name}**: {error_msg[:100]}")
+        
+        # Step 2: Restart all bots (except RSAdminBot) using manage_bots.sh
+        await sync_status_msg.edit(
+            content=f"📦 **Step 1 Complete**\n```\n" + "\n".join(sync_results[:5]) + "\n```\n\n🔄 **Step 2: Restarting all bots (except RSAdminBot)...**\n```\nPreparing...\n```"
+        )
+        
+        # Filter out RSAdminBot from restart list
+        bots_to_restart = [k for k in self.bot_keys if k != "rsadminbot"]
+        restart_results = []
+        
+        ssh_ok, ssh_error = self.admin_bot._check_ssh_available()
+        if ssh_ok:
+            for idx, bot_key in enumerate(bots_to_restart, 1):
+                bot_info = self.admin_bot.BOTS.get(bot_key)
+                if not bot_info:
+                    continue
+                
+                await sync_status_msg.edit(
+                    content=f"🔄 **Step 2: Restarting all bots...**\n```\n[{idx}/{len(bots_to_restart)}] Restarting {bot_info['name']}...\n```"
+                )
+                
+                success, stdout, stderr = self.admin_bot._execute_sh_script("botctl.sh", "restart", bot_key)
+                if success:
+                    output = stdout or stderr or ""
+                    if "SUCCESS" in output or "active" in output.lower():
+                        restart_results.append(f"✅ **{bot_info['name']}**: Restarted")
+                    else:
+                        restart_results.append(f"⚠️ **{bot_info['name']}**: {output[:80]}")
+                else:
+                    error_msg = stderr or stdout or "Unknown error"
+                    restart_results.append(f"❌ **{bot_info['name']}**: {error_msg[:80]}")
+        else:
+            restart_results.append(f"❌ **SSH not configured**: {ssh_error[:80]}")
+        
+        # Step 3: Restart RSAdminBot if it was in the list
+        if "rsadminbot" in self.bot_keys:
+            await sync_status_msg.edit(
+                content=f"🔄 **Step 2 Complete**\n```\n" + "\n".join(restart_results[:5]) + "\n```\n\n🔄 **Step 3: Restarting RSAdminBot...**\n```\nPreparing...\n```"
+            )
+            
+            if ssh_ok:
+                success, stdout, stderr = self.admin_bot._execute_sh_script("botctl.sh", "restart", "rsadminbot")
+                if success:
+                    output = stdout or stderr or ""
+                    if "SUCCESS" in output or "active" in output.lower():
+                        restart_results.append(f"✅ **RSAdminBot**: Restarted")
+                    else:
+                        restart_results.append(f"⚠️ **RSAdminBot**: {output[:80]}")
+                else:
+                    error_msg = stderr or stdout or "Unknown error"
+                    restart_results.append(f"❌ **RSAdminBot**: {error_msg[:80]}")
+        
+        # Final summary
+        summary = f"🔄 **Sync & Restart Complete**\n\n"
+        summary += f"**Synced:** {len(sync_results)} bot(s)\n"
+        summary += f"**Restarted:** {len(restart_results)} bot(s)\n\n"
+        summary += "**Sync Results:**\n" + "\n".join(sync_results) + "\n\n"
+        summary += "**Restart Results:**\n" + "\n".join(restart_results)
+        
+        if len(summary) > 2000:
+            summary = summary[:1997] + "..."
+        
+        await sync_status_msg.edit(content=summary)
+        await self.admin_bot._log_to_discord(f"🔄 **Bot Sync & Restart Completed**\nSynced & Restarted {len(self.bot_keys)} bot(s)\nRequested by: {interaction.user.mention}")
+    
+    @ui.button(label="❌ Cancel", style=discord.ButtonStyle.danger, row=0)
+    async def cancel_button(self, interaction: discord.Interaction, button: ui.Button):
+        """Cancel sync/restart"""
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("❌ Only the person who ran `!botscan` can cancel.", ephemeral=True)
+            return
+        
+        # Disable buttons
+        button.disabled = True
+        self.sync_only_button.disabled = True
+        self.sync_restart_button.disabled = True
+        await interaction.response.edit_message(
+            content="❌ **Sync/Restart cancelled**\nNo files were synced.",
+            view=self
+        )
+
+
+class RSAdminBot:
+    """Main admin bot class"""
+    
+    # Bot definitions - Matched with BOT_SSH_COMMANDS_COMPLETE.md
+    BOTS = {
+        "datamanagerbot": {
+            "name": "DataManager Bot",
+            "service": "mirror-world-datamanagerbot.service",
+            "folder": "neonxt/bots",
+            "script": "datamanagerbot.py"  # For pkill command
+        },
+        "discumbot": {
+            "name": "Discum Bot",
+            "service": "mirror-world-discumbot.service",
+            "folder": "neonxt/bots",
+            "script": "discumbot.py"  # For pkill command
+        },
+        "pingbot": {
+            "name": "Ping Bot",
+            "service": "mirror-world-pingbot.service",
+            "folder": "neonxt/bots",
+            "script": "pingbot.py"  # For pkill command
+        },
+        "rsforwarder": {
+            "name": "RS Forwarder",
+            "service": "mirror-world-rsforwarder.service",
+            "folder": "RSForwarder",
+            "script": "rs_forwarder_bot.py"  # For pkill command
+        },
+        "rsonboarding": {
+            "name": "RS Onboarding",
+            "service": "mirror-world-rsonboarding.service",
+            "folder": "RSOnboarding",
+            "script": "rs_onboarding_bot.py"  # For pkill command
+        },
+        "rsmentionpinger": {
+            "name": "RS Mention Pinger",
+            "service": "mirror-world-rsmentionpinger.service",
+            "folder": "RSMentionPinger",
+            "script": "rs_mention_pinger.py"  # For pkill command
+        },
+        "rscheckerbot": {
+            "name": "RS Checker Bot",
+            "service": "mirror-world-rscheckerbot.service",
+            "folder": "RSCheckerbot",
+            "script": "main.py"  # For pkill command
+        },
+        "rssuccessbot": {
+            "name": "RS Success Bot",
+            "service": "mirror-world-rssuccessbot.service",  # Note: double 's' in service name
+            "folder": "RSuccessBot",
+            "script": "bot_runner.py"  # For pkill command - from reference doc
+        },
+        "rsadminbot": {
+            "name": "RSAdminBot",
+            "service": "mirror-world-rsadminbot.service",
+            "folder": "RSAdminBot",
+            "script": "admin_bot.py"  # For pkill command
+        }
+    }
+    
+    def __init__(self):
+        self.base_path = Path(__file__).parent
+        self.config_path = self.base_path / "config.json"
+        self.config: Dict[str, Any] = {}
+        
+        self.load_config()
+        
+        # Validate required config
+        if not self.config.get("bot_token"):
+            print(f"{Colors.RED}[Config] ERROR: 'bot_token' is required in config.secrets.json (server-only){Colors.RESET}")
+            sys.exit(1)
+        
+        # Load SSH server config (self-contained - only from config.json)
+        self.servers: List[Dict[str, Any]] = []
+        self.current_server: Optional[Dict[str, Any]] = None
+        self._load_ssh_config()
+        
+        # Initialize ServiceManager (canonical owner for bot management operations)
+        self.service_manager: Optional[ServiceManager] = None
+        if self.current_server:
+            # Pass script executor and bot group getter to ServiceManager
+            self.service_manager = ServiceManager(
+                self._execute_sh_script,
+                self._get_bot_group
+            )
+        
+        # Initialize bot inspector (pass BOTS dict as canonical source)
+        # Use parent directory of RSAdminBot as project root (self-contained)
+        self.inspector: Optional[BotInspector] = None
+        if INSPECTOR_AVAILABLE:
+            try:
+                project_root = self.base_path.parent  # Parent of RSAdminBot folder
+                self.inspector = BotInspector(project_root, bots_dict=self.BOTS)
+                self.inspector.discover_bots()
+                print(f"{Colors.GREEN}[Inspector] Discovered {len(self.inspector.bots)} bot(s){Colors.RESET}")
+            except Exception as e:
+                print(f"{Colors.YELLOW}[Inspector] Failed to initialize: {e}{Colors.RESET}")
+        
+        # Trackers will be initialized in on_ready (after bot is created)
+        self.whop_tracker: Optional[WhopTracker] = None
+        self.bot_movement_tracker: Optional[BotMovementTracker] = None
+        self.test_server_organizer: Optional[TestServerOrganizer] = None
+        
+        # Setup bot with required intents
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.guilds = True
+        intents.members = True  # For admin commands
+        
+        # Use prefix commands only (no slash commands for privacy)
+        self.bot = commands.Bot(command_prefix='!', intents=intents)
+        
+        self._setup_events()
+        self._setup_commands()
+    
+    def _load_ssh_config(self):
+        """Load SSH server configuration from config.json (self-contained).
+        
+        RSAdminBot is self-contained - all config comes from its own config.json.
+        When RSAdminBot is running on the Ubuntu host it manages, it should prefer local execution
+        (no SSH key needed). When running off-box (e.g. Windows), it will use SSH + key.
+        """
+        try:
+            # First, try loading from config.json (self-contained)
+            ssh_server_config = self.config.get("ssh_server")
+            if ssh_server_config:
+                # Convert to list format for compatibility
+                self.servers = [ssh_server_config]
+                self.current_server = ssh_server_config
+
+                # Canonical remote repo root (also used for local-exec detection on Ubuntu)
+                remote_user = ssh_server_config.get("user", "rsadmin") or "rsadmin"
+                self.remote_root = str(Path(f"/home/{remote_user}/bots/mirror-world"))
+                
+                # Resolve SSH key path. Canonical location is repo root `oraclekeys/`.
+                # Fallback to RSAdminBot folder for legacy setups.
+                key_name = ssh_server_config.get("key")
+                if key_name:
+                    key_path = Path(key_name)
+                    if not key_path.is_absolute():
+                        candidates = [
+                            self.base_path.parent / "oraclekeys" / key_name,
+                            self.base_path / key_name,
+                        ]
+                        for c in candidates:
+                            if c.exists():
+                                key_path = c
+                                break
+                    if key_path.is_absolute() and key_path.exists():
+                        # Fix SSH key permissions on Windows (required for SSH to work)
+                        if platform.system() == "Windows":
+                            self._fix_ssh_key_permissions(key_path)
+                        ssh_server_config["key"] = str(key_path)
+                        print(f"{Colors.GREEN}[SSH] Using SSH key: {key_path}{Colors.RESET}")
+                    else:
+                        # On Ubuntu local-exec mode, a missing SSH key is expected (we don't need it).
+                        if self._should_use_local_exec():
+                            print(f"{Colors.GREEN}[Local Exec] SSH key not found (ok in local-exec): {key_name}{Colors.RESET}")
+                        else:
+                            print(f"{Colors.YELLOW}[SSH Warning] SSH key not found: {key_name}{Colors.RESET}")
+                
+                print(f"{Colors.GREEN}[SSH] Loaded server config from config.json: {ssh_server_config.get('name', 'Unknown')}{Colors.RESET}")
+                print(f"{Colors.CYAN}[SSH] Host: {ssh_server_config.get('host', 'N/A')}, User: {ssh_server_config.get('user', 'N/A')}{Colors.RESET}")
+                if self._should_use_local_exec():
+                    print(f"{Colors.GREEN}[Local Exec] Enabled: running management commands locally on this host{Colors.RESET}")
+                
+                return
+            
+            # No server config found - RSAdminBot is self-contained, only uses config.json
+            print(f"{Colors.YELLOW}[SSH] No SSH server configured in config.json{Colors.RESET}")
+            print(f"{Colors.YELLOW}[SSH] Add 'ssh_server' section to config.json to enable SSH functionality{Colors.RESET}")
+            print(f"{Colors.YELLOW}[SSH] RSAdminBot is self-contained - all config must be in config.json{Colors.RESET}")
+            
+        except Exception as e:
+            print(f"{Colors.RED}[SSH] Failed to load SSH config: {e}{Colors.RESET}")
+            import traceback
+            print(f"{Colors.RED}[SSH] Traceback: {traceback.format_exc()[:200]}{Colors.RESET}")
+    
+    def _build_ssh_base(self, server_config: Dict[str, Any]) -> List[str]:
+        """Build SSH base command list (self-contained, no external dependencies).
+        
+        Args:
+            server_config: Server config dict with 'host', 'user', 'key', 'ssh_options'
+        
+        Returns:
+            List of command parts for subprocess (shell=False)
+        """
+        cmd = ['ssh']
+        
+        # Add SSH options from config
+        ssh_options = server_config.get('ssh_options', '')
+        if ssh_options:
+            # Parse options string into list
+            options = shlex.split(ssh_options)
+            cmd.extend(options)
+        
+        # Add key file (path should already be resolved in _load_ssh_config)
+        if server_config.get('key'):
+            key_path = str(server_config['key'])
+            cmd.extend(['-i', key_path])
+        
+        # Add connection string
+        user = server_config.get('user', 'ubuntu')
+        host = server_config.get('host', '')
+        if not host:
+            return []
+        
+        port = server_config.get('port', 22)
+        if port != 22:
+            cmd.extend(['-p', str(port)])
+        
+        cmd.append(f"{user}@{host}")
+        
+        return cmd
+    
+    def _fix_ssh_key_permissions(self, key_path: Path):
+        """Fix SSH key file permissions on Windows (required for SSH to work).
+        
+        SSH requires private keys to have restricted permissions (only readable by owner).
+        On Windows, we need to remove permissions for BUILTIN\\Users group.
+        
+        Args:
+            key_path: Path to SSH private key file
+        """
+        if platform.system() != "Windows":
+            return  # Only needed on Windows
+        
+        try:
+            import win32security
+            import ntsecuritycon as con
+            
+            # Get current file security descriptor
+            sd = win32security.GetFileSecurity(str(key_path), win32security.DACL_SECURITY_INFORMATION)
+            dacl = sd.GetSecurityDescriptorDacl()
+            
+            # Remove BUILTIN\\Users group permissions
+            users_sid = win32security.LookupAccountName("", "BUILTIN\\Users")[0]
+            
+            # Check if Users group has permissions
+            has_users_perms = False
+            for i in range(dacl.GetAceCount()):
+                ace = dacl.GetAce(i)
+                if ace[2] == users_sid:
+                    has_users_perms = True
+                    break
+            
+            if has_users_perms:
+                # Create new DACL without Users group
+                new_dacl = win32security.ACL()
+                
+                # Add owner full control
+                owner_sid = win32security.LookupAccountName("", os.environ.get("USERNAME", ""))[0]
+                new_dacl.AddAccessAllowedAce(win32security.ACL_REVISION, con.FILE_ALL_ACCESS, owner_sid)
+                
+                # Add SYSTEM full control
+                system_sid = win32security.LookupAccountName("", "NT AUTHORITY\\SYSTEM")[0]
+                new_dacl.AddAccessAllowedAce(win32security.ACL_REVISION, con.FILE_ALL_ACCESS, system_sid)
+                
+                # Set new DACL
+                sd.SetSecurityDescriptorDacl(1, new_dacl, 0)
+                win32security.SetFileSecurity(str(key_path), win32security.DACL_SECURITY_INFORMATION, sd)
+                print(f"{Colors.GREEN}[SSH] Fixed SSH key permissions (removed BUILTIN\\Users access){Colors.RESET}")
+        except ImportError:
+            # pywin32 not available - try using icacls command instead
+            try:
+                # Remove Users group permissions using icacls
+                result = subprocess.run(
+                    ["icacls", str(key_path), "/remove", "BUILTIN\\Users"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    print(f"{Colors.GREEN}[SSH] Fixed SSH key permissions using icacls{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}[SSH Warning] Could not fix key permissions automatically{Colors.RESET}")
+                    print(f"{Colors.YELLOW}[SSH Warning] Run manually: icacls \"{key_path}\" /remove BUILTIN\\Users{Colors.RESET}")
+            except Exception as e:
+                print(f"{Colors.YELLOW}[SSH Warning] Could not fix key permissions: {e}{Colors.RESET}")
+                print(f"{Colors.YELLOW}[SSH Warning] Run manually: icacls \"{key_path}\" /remove BUILTIN\\Users{Colors.RESET}")
+        except Exception as e:
+            print(f"{Colors.YELLOW}[SSH Warning] Could not fix key permissions: {e}{Colors.RESET}")
+            print(f"{Colors.YELLOW}[SSH Warning] Run manually: icacls \"{key_path}\" /remove BUILTIN\\Users{Colors.RESET}")
+    
+    def _check_ssh_available(self) -> Tuple[bool, str]:
+        """Check if SSH is available and configured. Returns (is_available, error_message)"""
+        if not self.current_server:
+            error_msg = "No SSH server configured in config.json"
+            print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
+            print(f"{Colors.RED}[SSH Error] Add 'ssh_server' section to config.json{Colors.RESET}")
+            return False, error_msg
+
+        # If we're running on Linux and the repo root exists locally, prefer local execution when
+        # the SSH key is not present. This keeps RSAdminBot functional on the Ubuntu host without
+        # storing private keys on the server.
+        if self._should_use_local_exec():
+            return True, ""
+        
+        # Check SSH key (should already be resolved to absolute path in _load_ssh_config)
+        ssh_key = self.current_server.get("key")
+        if ssh_key:
+            key_path = Path(ssh_key)
+            if not key_path.exists():
+                error_msg = f"SSH key file not found: {key_path}"
+                print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
+                print(f"{Colors.YELLOW}[SSH Error] Expected SSH key in RSAdminBot folder{Colors.RESET}")
+                return False, error_msg
+        
+        return True, ""
+
+    def _should_use_local_exec(self) -> bool:
+        """Return True when we should execute management commands locally (no SSH).
+
+        This is intended for the Ubuntu deployment where RSAdminBot runs on the same host it manages.
+        We avoid relying on SSH keys on the server (security) and still keep all commands functional.
+        """
+        try:
+            if os.name == "nt":
+                return False
+            if not (self.config.get("local_exec") or {}).get("enabled", True):
+                return False
+            # If the configured repo root exists locally on this machine, we can run locally.
+            repo_root = Path(getattr(self, "remote_root", "") or "")
+            if repo_root.is_dir():
+                return True
+        except Exception:
+            return False
+        return False
+    
+    async def _log_to_discord(self, message: str, embed: Optional[discord.Embed] = None):
+        """Log message to Discord status channel"""
+        log_channel_id = self.config.get("log_channel_id")
+        if not log_channel_id:
+            return
+        
+        try:
+            channel = self.bot.get_channel(int(log_channel_id))
+            if channel:
+                if embed:
+                    await channel.send(embed=embed)
+                else:
+                    await channel.send(message)
+        except Exception as e:
+            print(f"{Colors.RED}[Discord Log] Failed to send message: {e}{Colors.RESET}")
+
+    async def _get_update_progress_channel(self) -> Optional[discord.abc.Messageable]:
+        """Return the configured update-progress channel, if enabled."""
+        cfg = self.config.get("update_progress") or {}
+        if not cfg.get("enabled"):
+            return None
+        chan_id_raw = cfg.get("channel_id")
+        if not chan_id_raw:
+            return None
+        try:
+            chan_id = int(str(chan_id_raw).strip())
+        except Exception:
+            return None
+
+        # Prefer cache
+        channel = self.bot.get_channel(chan_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(chan_id)  # type: ignore[attr-defined]
+            except Exception:
+                return None
+
+        # Optional guild guard (helps prevent sending to the wrong server)
+        guild_id = cfg.get("guild_id")
+        try:
+            guild_id_int = int(guild_id) if guild_id is not None else None
+        except Exception:
+            guild_id_int = None
+        if guild_id_int is not None and hasattr(channel, "guild") and getattr(channel, "guild", None):
+            if int(getattr(channel.guild, "id", 0)) != guild_id_int:
+                return None
+
+        return channel
+
+    def _format_service_state(self, exists: bool, state: Optional[str], pid: Optional[int]) -> str:
+        state_txt = state or "unknown"
+        pid_txt = str(pid or 0)
+        exists_txt = "exists" if exists else "missing"
+        return f"exists={exists_txt} state={state_txt} pid={pid_txt}"
+
+    def _get_backup_keep_count(self) -> int:
+        try:
+            cfg = self.config.get("backup_retention") or {}
+            keep = int(cfg.get("keep_per_folder") or 10)
+            return max(1, min(keep, 100))
+        except Exception:
+            return 10
+
+    def _get_service_monitor_config(self) -> Dict[str, Any]:
+        cfg = self.config.get("service_monitor") or {}
+        try:
+            return {
+                "enabled": bool(cfg.get("enabled", True)),
+                "interval_seconds": int(cfg.get("interval_seconds") or 30),
+                "post_on_startup": bool(cfg.get("post_on_startup", True)),
+                "failure_log_lines": int(cfg.get("failure_log_lines") or 25),
+                "min_seconds_between_posts": int(cfg.get("min_seconds_between_posts") or 120),
+                "heartbeat_seconds": int(cfg.get("heartbeat_seconds") or 0),
+            }
+        except Exception:
+            return {
+                "enabled": True,
+                "interval_seconds": 30,
+                "post_on_startup": True,
+                "failure_log_lines": 25,
+                "min_seconds_between_posts": 120,
+                "heartbeat_seconds": 0,
+            }
+
+    def _start_service_monitor_task(self) -> None:
+        """Start background monitoring of RS bot systemd state (posts only on changes/failures)."""
+        if getattr(self, "_service_monitor_task", None):
+            return
+        cfg = self._get_service_monitor_config()
+        if not cfg.get("enabled"):
+            return
+        if not self.service_manager:
+            return
+
+        async def _loop():
+            interval = max(10, min(int(cfg.get("interval_seconds") or 30), 3600))
+            min_gap = max(0, min(int(cfg.get("min_seconds_between_posts") or 120), 3600))
+            lines = max(5, min(int(cfg.get("failure_log_lines") or 25), 200))
+            heartbeat = int(cfg.get("heartbeat_seconds") or 0)
+            heartbeat = 0 if heartbeat < 30 else min(heartbeat, 6 * 3600)
+
+            # Only monitor RS bots (including rsadminbot)
+            bot_groups = self.config.get("bot_groups") or {}
+            rs_keys = ["rsadminbot"] + list(bot_groups.get("rs_bots") or [])
+
+            last_state: Dict[str, str] = {}
+            last_post_ts: Dict[str, float] = {}
+            last_heartbeat = 0.0
+
+            async def post(bot_key: str, text: str):
+                now = time.time()
+                last = last_post_ts.get(bot_key, 0.0)
+                if min_gap and (now - last) < min_gap:
+                    return
+                last_post_ts[bot_key] = now
+                # Progress channel
+                await self._post_or_edit_progress(None, text)
+                # Per-bot monitoring channel in test server (if organizer exists)
+                if self.test_server_organizer:
+                    await self.test_server_organizer.send_to_channel(f"{bot_key}_activity", content=text[:1900])
+
+            # Always announce the monitor is running
+            try:
+                await self._post_or_edit_progress(None, f"[monitor] started\ninterval={interval}s heartbeat={heartbeat}s")
+            except Exception:
+                pass
+
+            # Optional initial snapshot
+            if cfg.get("post_on_startup"):
+                try:
+                    lines_out = ["[monitor] RS service snapshot", "```"]
+                    for key in rs_keys:
+                        info = self.BOTS.get(key) or {}
+                        svc = info.get("service", "")
+                        if not svc:
+                            continue
+                        exists, state, _ = self.service_manager.get_status(svc, bot_name=key)
+                        pid = self.service_manager.get_pid(svc) or 0
+                        lines_out.append(f"{key}: {self._format_service_state(exists, state, pid)}")
+                        last_state[key] = f"{exists}:{state}:{pid}"
+                    lines_out.append("```")
+                    await self._post_or_edit_progress(None, "\n".join(lines_out)[:1900])
+                except Exception:
+                    pass
+
+            while True:
+                try:
+                    # Optional heartbeat even when healthy (to prove it is alive).
+                    if heartbeat and (time.time() - last_heartbeat) >= heartbeat:
+                        last_heartbeat = time.time()
+                        try:
+                            lines_out = ["[monitor] heartbeat", "```"]
+                            for key in rs_keys:
+                                info = self.BOTS.get(key) or {}
+                                svc = info.get("service", "")
+                                if not svc:
+                                    continue
+                                exists, state, _ = self.service_manager.get_status(svc, bot_name=key)
+                                pid = self.service_manager.get_pid(svc) or 0
+                                lines_out.append(f"{key}: {self._format_service_state(exists, state, pid)}")
+                            lines_out.append("```")
+                            await self._post_or_edit_progress(None, "\n".join(lines_out)[:1900])
+                        except Exception:
+                            pass
+
+                    for key in rs_keys:
+                        info = self.BOTS.get(key) or {}
+                        svc = info.get("service", "")
+                        if not svc:
+                            continue
+                        exists, state, _ = self.service_manager.get_status(svc, bot_name=key)
+                        pid = self.service_manager.get_pid(svc) or 0
+                        cur = f"{exists}:{state}:{pid}"
+                        prev = last_state.get(key)
+                        if prev != cur:
+                            last_state[key] = cur
+                            # Post on non-active states or failed/activating transitions
+                            if (not exists) or (state != "active"):
+                                logs = self.service_manager.get_failure_logs(svc, lines=lines) or ""
+                                msg = (
+                                    f"[monitor] {info.get('name', key)} ({key})\n"
+                                    f"State: {self._format_service_state(exists, state, pid)}\n"
+                                )
+                                if logs:
+                                    msg += "\nRecent logs:\n" + logs[-1200:]
+                                await post(key, msg[:1900])
+                except Exception:
+                    pass
+                await asyncio.sleep(interval)
+
+        import time
+        self._service_monitor_task = asyncio.create_task(_loop())
+
+    async def _post_or_edit_progress(self, progress_msg, text: str):
+        """Best-effort: edit an existing progress message, else send a new one."""
+        try:
+            if progress_msg is not None:
+                await progress_msg.edit(content=text[:1900])
+                return progress_msg
+        except Exception:
+            progress_msg = None
+        try:
+            ch = await self._get_update_progress_channel()
+            if ch is None:
+                return None
+            return await ch.send(text[:1900])
+        except Exception:
+            return None
+
+    async def _is_progress_channel(self, channel: Optional[discord.abc.Messageable]) -> bool:
+        """Return True if the provided channel is the configured update_progress channel."""
+        if channel is None:
+            return False
+        try:
+            prog = await self._get_update_progress_channel()
+            if prog is None:
+                return False
+            if hasattr(channel, "id") and hasattr(prog, "id"):
+                return int(getattr(channel, "id")) == int(getattr(prog, "id"))
+        except Exception:
+            return False
+        return False
+    
+    def _get_response_channel(self, ctx) -> Optional[discord.TextChannel]:
+        """Get the appropriate channel for command responses.
+        
+        Commands triggered in test server should also send to RS Server if configured.
+        Returns the channel where the command was triggered (for immediate response).
+        """
+        return ctx.channel
+    
+    async def _send_response(self, ctx, content: str = None, embed: discord.Embed = None, 
+                            also_send_to_rs_server: bool = False):
+        """Send standardized command response.
+        
+        Args:
+            ctx: Command context
+            content: Text content (optional)
+            embed: Embed (optional)
+            also_send_to_rs_server: If True, also send to RS Server log channel
+        """
+        # Send to command channel (immediate response)
+        try:
+            if embed:
+                await ctx.send(embed=embed)
+            elif content:
+                await ctx.send(content)
+        except Exception as e:
+            print(f"{Colors.RED}[Command Response] Failed to send: {e}{Colors.RESET}")
+        
+        # Optionally send to RS Server log channel
+        if also_send_to_rs_server:
+            rs_server_guild_id = self.config.get("rs_server_guild_id")
+            if rs_server_guild_id and ctx.guild and ctx.guild.id != rs_server_guild_id:
+                # Command was triggered in test server, also send to RS Server
+                log_channel_id = self.config.get("log_channel_id")
+                if log_channel_id:
+                    try:
+                        log_channel = self.bot.get_channel(int(log_channel_id))
+                        if log_channel:
+                            if embed:
+                                # Clone embed and add context
+                                rs_embed = discord.Embed(
+                                    title=f"{embed.title} (from Test Server)" if embed.title else None,
+                                    description=embed.description,
+                                    color=embed.color,
+                                    timestamp=embed.timestamp
+                                )
+                                for field in embed.fields:
+                                    rs_embed.add_field(name=field.name, value=field.value, inline=field.inline)
+                                rs_embed.set_footer(text=f"{embed.footer.text if embed.footer else ''} | Triggered by {ctx.author} in Test Server")
+                                await log_channel.send(embed=rs_embed)
+                            elif content:
+                                await log_channel.send(f"**From Test Server** ({ctx.author}):\n{content}")
+                    except Exception as e:
+                        print(f"{Colors.YELLOW}[Command Response] Failed to send to RS Server: {e}{Colors.RESET}")
+    
+    def _create_error_embed(self, title: str, error_msg: str, suggestion: str = None) -> discord.Embed:
+        """Create standardized error embed."""
+        embed = discord.Embed(
+            title=f"❌ {title}",
+            description=error_msg,
+            color=discord.Color.red(),
+            timestamp=datetime.now()
+        )
+        if suggestion:
+            embed.add_field(name="💡 Suggestion", value=suggestion, inline=False)
+        return embed
+    
+    def _create_success_embed(self, title: str, description: str = None) -> discord.Embed:
+        """Create standardized success embed."""
+        embed = discord.Embed(
+            title=f"✅ {title}",
+            description=description,
+            color=discord.Color.green(),
+            timestamp=datetime.now()
+        )
+        return embed
+    
+    def _create_info_embed(self, title: str, description: str = None, color: discord.Color = None) -> discord.Embed:
+        """Create standardized info embed."""
+        if color is None:
+            color = discord.Color.blue()
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            color=color,
+            timestamp=datetime.now()
+        )
+        return embed
+    
+    def _build_expected_ssh_commands_content(self) -> str:
+        """Build the expected .sh script commands content as a single string for comparison"""
+        content_parts = []
+        
+        # Group bots by their script groups
+        bot_groups = self.config.get("bot_groups", {})
+        
+        # RSAdminBot group
+        if bot_groups.get("rsadminbot"):
+            content_parts.append("**RSAdminBot**")
+            content_parts.append("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh status rsadminbot\n```")
+            content_parts.append("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh start rsadminbot\n```")
+            content_parts.append("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh stop rsadminbot\n```")
+            content_parts.append("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh restart rsadminbot\n```")
+            content_parts.append("---")
+        
+        # RS Bots group
+        rs_bots = bot_groups.get("rs_bots", [])
+        if rs_bots:
+            content_parts.append("**RS Bots** (rsforwarder, rsonboarding, rsmentionpinger, rscheckerbot, rssuccessbot)")
+            content_parts.append("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh status all\n```")
+            content_parts.append("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh start all\n```")
+            content_parts.append("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh stop all\n```")
+            content_parts.append("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh restart all\n```")
+            content_parts.append("---")
+        
+        # Mirror-World Bots group
+        mirror_bots = bot_groups.get("mirror_bots", [])
+        if mirror_bots:
+            content_parts.append("**Mirror-World Bots** (datamanagerbot, pingbot, discumbot)")
+            content_parts.append("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh status all\n```")
+            content_parts.append("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh start all\n```")
+            content_parts.append("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh stop all\n```")
+            content_parts.append("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh restart all\n```")
+            content_parts.append("---")
+        
+        return "\n".join(content_parts)
+    
+    async def _check_channel_has_ssh_commands(self, channel) -> bool:
+        """Check if channel already contains the expected SSH commands"""
+        try:
+            # Build expected content
+            expected_content = self._build_expected_ssh_commands_content()
+            
+            # Fetch recent messages (check last 200 messages to find SSH commands)
+            messages = []
+            async for message in channel.history(limit=200):
+                if message.author == self.bot.user and message.content:
+                    messages.append(message.content)
+            
+            # Combine all messages from the bot into a single string
+            existing_content = "\n".join(messages)
+            
+            # Normalize both strings for comparison (remove extra whitespace)
+            expected_normalized = "\n".join(line.strip() for line in expected_content.split("\n") if line.strip())
+            existing_normalized = "\n".join(line.strip() for line in existing_content.split("\n") if line.strip())
+            
+            # Check if expected content exists in channel (allowing for some variation)
+            # We'll check if all script groups and key commands are present
+            bot_groups = self.config.get("bot_groups", {})
+            
+            # Check for script group headers
+            has_rsadminbot = "**RSAdminBot**" in existing_content or "botctl.sh" in existing_content
+            has_rs_bots = "**RS Bots**" in existing_content or "botctl.sh" in existing_content
+            has_mirror_bots = "**Mirror-World Bots**" in existing_content or "botctl.sh" in existing_content
+            
+            # Check if we have a reasonable match (all script groups present)
+            groups_present = sum([has_rsadminbot, has_rs_bots, has_mirror_bots])
+            expected_groups = len([g for g in bot_groups.keys() if bot_groups.get(g)])
+            
+            if groups_present >= expected_groups * 0.8:  # At least 80% of expected groups
+                # Also check for script commands (status, start, stop, restart)
+                has_status = "status" in existing_content
+                has_start = "start" in existing_content
+                has_stop = "stop" in existing_content
+                has_restart = "restart" in existing_content
+                
+                if has_status and has_start and has_stop and has_restart:
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            print(f"{Colors.YELLOW}[Startup] Error checking channel history: {e}{Colors.RESET}")
+            # On error, assume content doesn't exist (will send to be safe)
+            return False
+    
+    def _should_exclude_file(self, file_path: Path, exclude_data_files: bool = True, bot_folder: str = None) -> bool:
+        """Check if a file should be excluded from sync.
+        
+        Args:
+            file_path: Path to the file
+            exclude_data_files: If True, exclude .json, .db, and other data files
+            bot_folder: Bot folder name (e.g., "RSOnboarding") to allow bot-specific config files
+        
+        Returns:
+            True if file should be excluded, False otherwise
+        """
+        # NEVER exclude Python files - they are critical core files
+        if file_path.suffix.lower() == '.py':
+            return False
+        
+        # Always exclude hidden files and cache directories
+        if file_path.name.startswith('.') or file_path.name in ['__pycache__', '.git']:
+            return True
+        
+        # Bot-specific runtime data files that should NEVER be synced (updated live)
+        bot_specific_exclusions = {
+            "RSOnboarding": [
+                "tickets.json",  # Runtime ticket data
+                "tickets.db",  # Database
+                "ticket_history_report.json",  # Generated reports
+            ],
+            "RSuccessBot": [
+                "success_points.db",  # Runtime database
+                "vouches.db",  # Runtime database
+            ],
+            "RSCheckerbot": [
+                "invites.db",  # Runtime database
+                "registry.json",  # Runtime registry
+                "queue.json",  # Runtime queue
+                "missed_onboarding_report.json",  # Generated reports
+            ],
+            "RSAdminBot": [
+                # whop_data is already excluded via data_dirs
+            ],
+        }
+        
+        # Check bot-specific exclusions
+        if bot_folder and bot_folder in bot_specific_exclusions:
+            file_name = file_path.name
+            if file_name in bot_specific_exclusions[bot_folder]:
+                return True
+        
+        # Exclude data files if requested (but allow config.json and bot-specific config files)
+        if exclude_data_files:
+            data_extensions = ['.db', '.sqlite', '.sqlite3', '.log', '.lock']
+            if file_path.suffix.lower() in data_extensions:
+                return True
+            
+            # Exclude .json files EXCEPT:
+            # - config.json (needed for bot configuration)
+            # - messages.json (needed for RSOnboarding, RSuccessBot, RSCheckerbot)
+            if file_path.suffix.lower() == '.json':
+                allowed_json_files = ['config.json', 'messages.json']
+                if file_path.name in allowed_json_files:
+                    return False
+                # Exclude all other .json files (data files like tickets.json, registry.json, etc.)
+                return True
+            
+            # Exclude data directories (check full path, not just filename)
+            data_dirs = ['whop_data', '__pycache__', '.git', 'node_modules', '.venv', 'venv', 'env', 'logs']
+            # Check if any part of the path contains a data directory
+            path_parts = [part.lower() for part in file_path.parts]
+            if any(data_dir.lower() in path_parts for data_dir in data_dirs):
+                return True
+        
+        return False
+    
+    def _is_unimportant_remote_file(self, file_path_str: str) -> bool:
+        """Check if a remote-only file is unimportant (documentation, IDE files, etc.).
+        
+        These files don't affect bot functionality and can be safely ignored.
+        
+        Args:
+            file_path_str: Relative file path as string
+        
+        Returns:
+            True if file is unimportant, False otherwise
+        """
+        file_path = Path(file_path_str)
+        file_name = file_path.name.lower()
+        file_ext = file_path.suffix.lower()
+        
+        # Documentation files (not needed on server)
+        if file_ext == '.md':
+            return True
+        
+        # IDE/Editor files
+        if file_name in ['.replit', '.cursorignore', '.gitignore']:
+            return True
+        
+        # Replit agent state files (not needed)
+        if '.agent_state' in file_name or file_name in ['.latest.json', 'repl_state.bin', 'filesystem_state.json']:
+            return True
+        
+        # Semgrep config (not needed)
+        if 'semgrep' in file_path_str.lower():
+            return True
+        
+        # Hidden directories that are IDE/editor specific
+        if any(part.startswith('.') and part in ['.config', '.local', '.replit'] for part in file_path.parts):
+            return True
+        
+        # Test/documentation files
+        if any(part in ['test', 'tests', 'docs', 'documentation'] for part in file_path.parts):
+            if file_ext in ['.md', '.txt']:
+                return True
+        
+        return False
+    
+    def _sync_bot_files(
+        self,
+        bot_folder: str,
+        bot_name: str = None,
+        show_tree: bool = True,
+        delete_remote_only: bool = True,
+        remote_tree_cache: Dict = None,
+        manifest_include_globs: Optional[List[str]] = None,
+        manifest_exclude_globs: Optional[List[str]] = None,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """File sync for any bot folder using sync_bot.sh and SCP.
+        
+        Canonical behavior:
+        - Ensure the remote folder exists (non-destructive).
+        - Upload a tar archive (code + safe config) and extract it on the remote.
+        - Do NOT sync runtime data files (db/json logs) and do NOT sync secrets.
+          Those are expected to already exist on the server and must not be overwritten.
+        
+        Important safety note:
+        - This sync method intentionally avoids destructive remote deletes because that can wipe
+          runtime data + server-only secrets. If you need a full clean deploy, use the
+          server-side deploy path (botctl.sh deploy_apply) instead of SSH self-sync.
+        
+        Args:
+            bot_folder: Bot folder name (e.g., "RSAdminBot", "RSOnboarding")
+            bot_name: Display name for the bot (defaults to bot_folder)
+            show_tree: Ignored (kept for compatibility)
+            delete_remote_only: Ignored (kept for compatibility, handled by sync_bot.sh)
+            remote_tree_cache: Ignored (kept for compatibility)
+        
+        Returns:
+            Tuple of (success: bool, stats: dict)
+        """
+        if not self.current_server:
+            return False, {"error": "No server configured"}
+        
+        if bot_name is None:
+            bot_name = bot_folder
+        
+        remote_user = self.current_server.get("user", "rsadmin")
+        remote_host = self.current_server.get("host", "")
+        ssh_key = self.current_server.get("key")
+        local_exec = self._should_use_local_exec()
+        
+        if not remote_host or not ssh_key:
+            return False, {"error": "Server host or SSH key not configured"}
+        
+        # Determine local and remote paths
+        if bot_folder == "RSAdminBot":
+            local_base = self.base_path
+            remote_base = f"/home/{remote_user}/bots/mirror-world/RSAdminBot"
+        else:
+            # For other bots, use project root
+            local_base = self.base_path.parent / bot_folder
+            remote_base = f"/home/{remote_user}/bots/mirror-world/{bot_folder}"
+        
+        if not local_base.exists():
+            return False, {"error": f"Local folder not found: {local_base}"}
+        
+        stats = {
+            "synced": 0,
+            "failed": 0,
+            "deleted": 0,
+            "skipped": 0,
+            "total_local": 0,
+            "total_remote": 0,
+            "python_files_total": 0,
+            "python_files_verified": 0,
+            "python_sync_percent": 100
+        }
+        
+        print(f"{Colors.CYAN}[Sync] Syncing {bot_name} using sync_bot.sh...{Colors.RESET}")
+
+        # Optional: show an accurate sha-based tree diff BEFORE syncing (helps debug “why doesn’t it match?”)
+        if show_tree:
+            try:
+                local_manifest_before = self._generate_local_manifest([bot_folder], include_globs=manifest_include_globs, exclude_globs=manifest_exclude_globs)
+                remote_manifest_before = self._generate_remote_manifest([bot_folder], include_globs=manifest_include_globs, exclude_globs=manifest_exclude_globs)
+                print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
+                print(f"{Colors.BOLD}{Colors.CYAN}📊 Pre-sync Tree (sha256) — {bot_folder}{Colors.RESET}")
+                print(f"{Colors.CYAN}{'='*60}{Colors.RESET}\n")
+                self._print_manifest_tree(bot_folder, local_manifest_before, remote_manifest_before)
+                print()
+            except Exception as e:
+                print(f"{Colors.YELLOW}[Sync] Pre-sync tree unavailable: {str(e)[:200]}{Colors.RESET}")
+        
+        # Step 1: Prepare/validate remote path
+        script_path = f"/home/{remote_user}/bots/mirror-world/RSAdminBot/sync_bot.sh"
+        # Local-exec mode (Ubuntu): never run destructive "prepare" on the same filesystem.
+        if local_exec:
+            prep_cmd = f"bash {script_path} {bot_folder} validate"
+            print(f"{Colors.CYAN}[Sync] Local-exec: validating folder (no destructive prepare)...{Colors.RESET}")
+        else:
+            # RSAdminBot is special: avoid destructive rebuilds of its own folder while running.
+            # For other bots, use preserve-and-rebuild so runtime + secrets are protected.
+            if bot_folder == "RSAdminBot":
+                prep_cmd = f"bash {script_path} {bot_folder} validate"
+                print(f"{Colors.CYAN}[Sync] Validating remote folder...{Colors.RESET}")
+            else:
+                prep_cmd = f"bash {script_path} {bot_folder} prepare"
+                print(f"{Colors.CYAN}[Sync] Preparing remote folder (preserve runtime + secrets)...{Colors.RESET}")
+
+        success, stdout, stderr = self._execute_ssh_command(prep_cmd, timeout=60)
+        
+        if not success:
+            error_msg = stderr or stdout or "Unknown error"
+            print(f"{Colors.RED}[Sync] Failed to prepare remote folder: {error_msg}{Colors.RESET}")
+            return False, {"error": f"Failed to prepare remote: {error_msg}"}
+        
+        print(f"{Colors.GREEN}[Sync] ✓ Remote folder ready{Colors.RESET}")
+        
+        # Step 2: Apply update (local-exec on Ubuntu, scp on off-box)
+        port = self.current_server.get("port", 22)
+        if local_exec:
+            print(f"{Colors.CYAN}[Sync] Local-exec mode: applying update locally (no SSH key required){Colors.RESET}")
+            key_path = None
+        else:
+            print(f"{Colors.CYAN}[Sync] Uploading files using scp...{Colors.RESET}")
+            key_path = Path(ssh_key)
+            if not key_path.is_absolute():
+                key_path = self.base_path / ssh_key
+            if not key_path.exists():
+                return False, {"error": f"SSH key not found: {key_path}"}
+
+        # Step 2.0: Create a remote backup tar.gz for this folder (always, before changes)
+        # This is fast, deterministic, and gives you an “undo” without guessing.
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            repo_root_remote = f"/home/{remote_user}/bots/mirror-world"
+            backup_dir = "/tmp/mw_backups"
+            backup_path = f"{backup_dir}/{bot_folder}_{ts}.tar.gz"
+            backup_cmd = (
+                f"mkdir -p {shlex.quote(backup_dir)} && "
+                f"tar -czf {shlex.quote(backup_path)} -C {shlex.quote(repo_root_remote)} {shlex.quote(bot_folder)}"
+            )
+            ok_b, out_b, err_b = self._execute_ssh_command(backup_cmd, timeout=120)
+            if ok_b:
+                stats["remote_backup"] = backup_path
+                # Retention: keep only the most recent N backups per folder.
+                keep = self._get_backup_keep_count()
+                prune_cmd = (
+                    f"ls -1t {shlex.quote(backup_dir)}/{shlex.quote(bot_folder)}_*.tar.gz 2>/dev/null | "
+                    f"tail -n +{keep + 1} | "
+                    f"xargs -r rm -f"
+                )
+                ok_p, out_p, err_p = self._execute_ssh_command(prune_cmd, timeout=60)
+                if not ok_p:
+                    stats["remote_backup_prune_warning"] = (err_p or out_p or "backup prune failed")[:200]
+            else:
+                stats["remote_backup_warning"] = (err_b or out_b or "backup failed")[:200]
+        except Exception as e:
+            stats["remote_backup_warning"] = str(e)[:200]
+        
+        # Exclude runtime data + secrets by default so sync can't wipe server state.
+        # Keep this aligned with the manifest rules (sha-based compare) so "sync" and "compare" agree.
+        exclude_patterns = [
+            "__pycache__",
+            ".git",
+            ".venv",
+            "venv",
+            "node_modules",
+            "whop_data",
+            # Secrets/keys
+            "config.secrets.json",
+            "*.key",
+            "*.pem",
+            "*.ppk",
+            "rs-bot-tokens.txt",
+            # Runtime/data
+            "*.db",
+            "*.sqlite",
+            "*.sqlite3",
+            "*.log",
+            "*.pyc",
+            ".rs_onboarding_bot.lock",
+            "tickets.json",
+            "success_points.json",
+            "vouches.json",
+            "points_history.txt",
+            "queue.json",
+            "registry.json",
+            "invites.json",
+            "missed_onboarding_report.json",
+            "ticket_history_report.json",
+        ]
+        
+        # Use tar with exclusions and pipe to ssh for better control
+        # This is more reliable than scp for exclusions
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.tar', delete=False) as tar_file:
+            tar_path = tar_file.name
+        
+        try:
+            # Create tar archive with exclusions.
+            # IMPORTANT: use relative paths to avoid embedding Windows absolute paths in the tar
+            # (this was the root cause of "Jacobing/Desktop/..." artifacts on the server).
+            tar_cmd = ["tar", "-cf", tar_path, "-C", str(local_base.parent)]
+            for pattern in exclude_patterns:
+                tar_cmd.extend(["--exclude", pattern])
+            # Also exclude secrets/keys and local token scratchpads
+            tar_cmd.extend(["--exclude", "config.secrets.json"])
+            tar_cmd.extend(["--exclude", "*.key"])
+            tar_cmd.extend(["--exclude", "*.pem"])
+            tar_cmd.extend(["--exclude", "*.ppk"])
+            tar_cmd.extend(["--exclude", "rs-bot-tokens.txt"])
+            tar_cmd.append(str(local_base.name))
+            
+            result = subprocess.run(tar_cmd, capture_output=True, text=True, timeout=60)
+            if result.returncode != 0:
+                return False, {"error": f"Failed to create tar archive: {result.stderr}"}
+
+            # Record tar contents (high-signal proof of what would be applied)
+            try:
+                t = subprocess.run(["tar", "-tf", tar_path], capture_output=True, text=True, timeout=10)
+                if t.returncode == 0:
+                    items = [ln.strip() for ln in (t.stdout or "").splitlines() if ln.strip()]
+                    stats["tar_entries_total"] = len(items)
+                    stats["tar_entries_sample"] = items[:30]
+            except Exception as e:
+                stats["tar_entries_warning"] = str(e)[:120]
+            
+            # Apply update:
+            # - Local-exec mode (Ubuntu): extract locally, no SSH key.
+            # - Off-box mode: scp tar to remote and extract.
+            remote_tar = f"/tmp/{bot_folder}.stage.tar" if bot_folder == "RSAdminBot" else f"/tmp/{bot_folder}.tar"
+            if not local_exec:
+                scp_upload_cmd = ["scp", "-i", str(key_path)]
+                if port != 22:
+                    scp_upload_cmd.extend(["-P", str(port)])
+                scp_upload_cmd.extend([tar_path, f"{remote_user}@{remote_host}:{remote_tar}"])
+                result = subprocess.run(scp_upload_cmd, capture_output=True, text=True, timeout=120)
+                if result.returncode != 0:
+                    return False, {"error": f"Failed to upload tar: {result.stderr}"}
+
+            # RSAdminBot two-phase self-update:
+            # - Stage update into a staging dir
+            # - Write pending file
+            # - Applied on restart by RSAdminBot/run_bot.sh
+            if bot_folder == "RSAdminBot":
+                ts2 = datetime.now().strftime("%Y%m%d_%H%M%S")
+                repo_root_remote = f"/home/{remote_user}/bots/mirror-world"
+                staging_dir = f"{repo_root_remote}/.staging-rsadminbot-{ts2}"
+                pending_json = f"{repo_root_remote}/RSAdminBot/.pending_update.json"
+                payload = {
+                    "staging_dir": staging_dir,
+                    "remote_tar": remote_tar if not local_exec else "",
+                    "remote_backup": stats.get("remote_backup", ""),
+                    "timestamp": ts2,
+                }
+                try:
+                    if local_exec:
+                        Path(staging_dir).mkdir(parents=True, exist_ok=True)
+                        r = subprocess.run(["tar", "-xf", tar_path, "-C", staging_dir], capture_output=True, text=True, timeout=180)
+                        if r.returncode != 0:
+                            return False, {"error": f"Failed to stage RSAdminBot update: {(r.stderr or r.stdout)[:400]}"}
+                        # Compute a sha256 diff between current RSAdminBot folder and staged RSAdminBot folder.
+                        try:
+                            current_manifest = rs_generate_manifest(self.base_path.parent.resolve(), bot_folders=["RSAdminBot"])
+                            staged_manifest = rs_generate_manifest(Path(staging_dir).resolve(), bot_folders=["RSAdminBot"])
+                            diff = rs_compare_manifests(current_manifest, staged_manifest)
+                            fd = (diff.get("folders") or {}).get("RSAdminBot") or {}
+                            changed = list(fd.get("changed") or [])
+                            added = list(fd.get("only_remote") or [])
+                            removed = list(fd.get("only_local") or [])
+                            all_changed = sorted(set(changed + added + removed))
+                            py_changed = [p for p in all_changed if str(p).endswith(".py")]
+                            payload["changes"] = {
+                                "changed": changed,
+                                "added": added,
+                                "removed": removed,
+                                "total": len(all_changed),
+                                "py_total": len(py_changed),
+                                "sample": all_changed[:40],
+                                "py_sample": py_changed[:40],
+                            }
+                        except Exception as e:
+                            payload["changes_error"] = str(e)[:200]
+                        Path(pending_json).write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+                    else:
+                        py_write_json = "import json,sys; p=sys.argv[1]; d=json.loads(sys.argv[2]); open(p,'w',encoding='utf-8').write(json.dumps(d,indent=2))"
+                        stage_cmd = (
+                            f"mkdir -p {shlex.quote(staging_dir)} && "
+                            f"tar -xf {shlex.quote(remote_tar)} -C {shlex.quote(staging_dir)} && "
+                            f"python3 -c {shlex.quote(py_write_json)} {shlex.quote(pending_json)} {shlex.quote(json.dumps(payload))}"
+                        )
+                        ok_s, out_s, err_s = self._execute_ssh_command(stage_cmd, timeout=180)
+                        if not ok_s:
+                            return False, {"error": f"Failed to stage RSAdminBot update: {(err_s or out_s)[:400]}"}
+                except Exception as e:
+                    return False, {"error": f"Failed to stage RSAdminBot update: {str(e)[:300]}"}
+
+                stats["staged"] = True
+                stats["staging_dir"] = staging_dir
+                stats["pending_restart"] = True
+                stats["note"] = "RSAdminBot update staged. Restart mirror-world-rsadminbot.service to apply."
+                print(f"{Colors.GREEN}[Sync] ✓ RSAdminBot update staged; restart required to apply{Colors.RESET}")
+                return True, stats
+
+            # Normal bots: extract/apply
+            if local_exec:
+                Path(remote_base).mkdir(parents=True, exist_ok=True)
+                r = subprocess.run(["tar", "-xf", tar_path, "-C", remote_base, "--strip-components=1"], capture_output=True, text=True, timeout=180)
+                if r.returncode != 0:
+                    return False, {"error": f"Failed to extract locally: {(r.stderr or r.stdout)[:400]}"}
+            else:
+                extract_cmd = f"cd {shlex.quote(remote_base)} && tar -xf {shlex.quote(remote_tar)} --strip-components=1 && rm -f {shlex.quote(remote_tar)}"
+                success, stdout, stderr = self._execute_ssh_command(extract_cmd, timeout=180)
+                if not success:
+                    return False, {"error": f"Failed to extract on remote: {stderr or stdout}"}
+            
+            # Post-sync verification: sha256 manifests (accurate, not size-based)
+            try:
+                local_manifest_after = self._generate_local_manifest([bot_folder], include_globs=manifest_include_globs, exclude_globs=manifest_exclude_globs)
+                remote_manifest_after = self._generate_remote_manifest([bot_folder], include_globs=manifest_include_globs, exclude_globs=manifest_exclude_globs)
+
+                lf = ((local_manifest_after.get("files") or {}).get(bot_folder) or {})
+                rf = ((remote_manifest_after.get("files") or {}).get(bot_folder) or {})
+
+                total_files = len([k for k in lf.keys() if not k.startswith("__")])
+                py_files = [k for k in lf.keys() if k.endswith(".py")]
+                py_verified = sum(1 for rel in py_files if rel in rf and rf.get(rel) == lf.get(rel))
+                py_total = len(py_files)
+                py_percent = int((py_verified / py_total) * 100) if py_total > 0 else 100
+
+                stats["total_local"] = total_files
+                stats["synced"] = total_files
+                stats["python_files_total"] = py_total
+                stats["python_files_verified"] = py_verified
+                stats["python_sync_percent"] = py_percent
+
+                # Optional: show an accurate sha-based tree diff AFTER syncing
+                if show_tree:
+                    print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
+                    print(f"{Colors.BOLD}{Colors.CYAN}📊 Post-sync Tree (sha256) — {bot_folder}{Colors.RESET}")
+                    print(f"{Colors.CYAN}{'='*60}{Colors.RESET}\n")
+                    self._print_manifest_tree(bot_folder, local_manifest_after, remote_manifest_after)
+                    print()
+            except Exception as e:
+                stats["warning"] = f"Post-sync verification failed: {str(e)[:200]}"
+            
+            print(f"{Colors.GREEN}[Sync] ✓ Files synced successfully{Colors.RESET}")
+            return True, stats
+            
+        except Exception as e:
+            return False, {"error": f"Sync failed: {str(e)}"}
+        finally:
+            # Clean up temp tar file
+            try:
+                Path(tar_path).unlink()
+            except:
+                pass
+        # Legacy file-by-file sync implementation removed.
+        # This function uses a single deterministic sync method:
+        # - prepare remote folder via sync_bot.sh
+        # - upload tar archive
+        # - extract remotely
+        # - count files synced
+    
+    def _sync_rsadminbot_files(self, remote_tree_cache: Dict = None) -> bool:
+        """Self-contained file sync using SCP (no external dependencies).
+        
+        Syncs RSAdminBot folder files to remote server using SCP commands.
+        Returns True if sync succeeded, False otherwise.
+        
+        Args:
+            remote_tree_cache: Optional cached remote tree to avoid redundant scanning
+        """
+        # Use the comprehensive sync function which handles all the details
+        # Don't show tree during sync (will show after), but ensure all files are synced
+        success, stats = self._sync_bot_files("RSAdminBot", "RSAdminBot", show_tree=False, delete_remote_only=True, remote_tree_cache=remote_tree_cache)
+        
+        if success:
+            synced = stats.get("synced", 0)
+            failed = stats.get("failed", 0)
+            skipped = stats.get("skipped", 0)
+            total = synced + skipped + failed
+            print(f"{Colors.GREEN}[Sync] ✓ Synced {synced} file(s), skipped {skipped} unchanged, {failed} failed (total: {total}){Colors.RESET}")
+        else:
+            error_msg = stats.get("error", "Unknown error")
+            print(f"{Colors.RED}[Sync] ✗ Sync failed: {error_msg}{Colors.RESET}")
+        
+        return success
+
+    def _generate_local_manifest(
+        self,
+        bot_folders: List[str],
+        include_globs: Optional[List[str]] = None,
+        exclude_globs: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Generate a sha256 manifest for the given folders on the local filesystem."""
+        repo_root = self.base_path.parent.resolve()
+        return rs_generate_manifest(repo_root, bot_folders=bot_folders, include_globs=include_globs, exclude_globs=exclude_globs)
+
+    def _generate_remote_manifest(
+        self,
+        bot_folders: List[str],
+        include_globs: Optional[List[str]] = None,
+        exclude_globs: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Generate a sha256 manifest for the given folders on the remote host via SSH.
+
+        Note: In local-exec mode, _execute_ssh_command runs locally in bash, so this still works.
+        """
+        remote_user = (self.current_server or {}).get("user", "rsadmin")
+        repo_root = f"/home/{remote_user}/bots/mirror-world"
+        payload = {"repo_root": repo_root, "bot_folders": bot_folders, "include_globs": include_globs, "exclude_globs": exclude_globs}
+        py = (
+            "import json,sys;"
+            "from pathlib import Path;"
+            "p=json.loads(sys.argv[1]);"
+            "repo=Path(p['repo_root']).resolve();"
+            "sys.path.insert(0,str(repo)) if str(repo) not in sys.path else None;"
+            "from rsbots_manifest import generate_manifest;"
+            "m=generate_manifest(repo, bot_folders=p['bot_folders'], include_globs=p.get('include_globs') or None, exclude_globs=p.get('exclude_globs') or None);"
+            "print(json.dumps(m, ensure_ascii=True))"
+        )
+        cmd = f"python3 -c {shlex.quote(py)} {shlex.quote(json.dumps(payload))}"
+        ok, stdout, stderr = self._execute_ssh_command(cmd, timeout=180)
+        if not ok:
+            raise RuntimeError(stderr or stdout or "remote manifest failed")
+        return json.loads(stdout or "{}")
+
+    def _manifest_files_to_tree(self, file_map: Dict[str, str]) -> Dict[str, Any]:
+        """Convert a flat relpath->sha mapping into a nested tree for _render_tree_comparison()."""
+        tree: Dict[str, Any] = {}
+        for rel, sha in sorted(file_map.items()):
+            if rel.startswith("__"):
+                continue
+            parts = rel.split("/")
+            cur = tree
+            for i, part in enumerate(parts):
+                is_last = i == len(parts) - 1
+                if is_last:
+                    cur[part] = {"sha": sha, "path": rel}
+                else:
+                    k = f"{part}/"
+                    if k not in cur:
+                        cur[k] = {}
+                    cur = cur[k]
+        return tree
+
+    def _print_manifest_tree(self, bot_folder: str, local_manifest: Dict[str, Any], remote_manifest: Dict[str, Any], header: str = "") -> None:
+        lf = ((local_manifest.get("files") or {}).get(bot_folder) or {})
+        rf = ((remote_manifest.get("files") or {}).get(bot_folder) or {})
+        local_tree = self._manifest_files_to_tree(lf)
+        remote_tree = self._manifest_files_to_tree(rf)
+        if header:
+            print(f"{Colors.CYAN}{header}{Colors.RESET}")
+        tree_lines = self._render_tree_comparison(local_tree, remote_tree)
+        max_lines = 200
+        for line in tree_lines[:max_lines]:
+            print(line)
+        if len(tree_lines) > max_lines:
+            print(f"{Colors.DIM}... and {len(tree_lines) - max_lines} more items{Colors.RESET}")
+    
+    def _build_file_tree(self, base_path: Path, relative_path: Path = None) -> Dict[str, Any]:
+        """Build a sha256-based tree structure for a bot folder.
+        
+        This uses the same include/exclude rules as `rsbots_manifest.py`, so the tree view reflects
+        what sync/update actually cares about (code/config/docs), not runtime/secrets.
+        """
+        try:
+            base_path = base_path.resolve()
+        except (OSError, RuntimeError):
+            return {}
+        folder = base_path.name
+        manifest = self._generate_local_manifest([folder])
+        files = (manifest.get("files") or {}).get(folder) or {}
+        return self._manifest_files_to_tree(files)
+    
+    def _build_remote_file_tree(self, remote_base: str) -> Dict[str, Any]:
+        """Build a sha256-based tree structure of remote files via SSH.
+        
+        This uses the same include/exclude rules as `rsbots_manifest.py`, so comparisons are accurate.
+        """
+        folder = Path(remote_base.rstrip("/")).name
+        manifest = self._generate_remote_manifest([folder])
+        files = (manifest.get("files") or {}).get(folder) or {}
+        return self._manifest_files_to_tree(files)
+    
+    def _render_tree_comparison(self, local_tree: Dict, remote_tree: Dict, prefix: str = "", is_last: bool = True) -> List[str]:
+        """Render tree comparison showing local vs remote differences.
+        
+        Args:
+            local_tree: Local file tree
+            remote_tree: Remote file tree
+            prefix: Current indentation prefix
+            is_last: Whether this is the last item
+        
+        Returns:
+            List of formatted lines
+        """
+        output = []
+        
+        # Get all keys from both trees
+        all_keys = set(local_tree.keys()) | set(remote_tree.keys())
+        sorted_keys = sorted(all_keys, key=lambda x: (x.endswith('/'), x.lower()))
+        
+        for i, key in enumerate(sorted_keys):
+            is_last_item = (i == len(sorted_keys) - 1)
+            connector = "└── " if is_last_item else "├── "
+            extension = "    " if is_last_item else "│   "
+            
+            local_exists = key in local_tree
+            remote_exists = key in remote_tree
+            
+            # Determine status
+            if key.endswith('/'):
+                # Directory
+                local_subtree = local_tree.get(key, {})
+                remote_subtree = remote_tree.get(key, {})
+                
+                if local_exists and remote_exists:
+                    status_icon = f"{Colors.CYAN}📁{Colors.RESET}"
+                    status_text = ""
+                elif local_exists:
+                    status_icon = f"{Colors.YELLOW}📁{Colors.RESET}"
+                    status_text = f" {Colors.YELLOW}[LOCAL ONLY]{Colors.RESET}"
+                else:
+                    status_icon = f"{Colors.RED}📁{Colors.RESET}"
+                    status_text = f" {Colors.RED}[REMOTE ONLY]{Colors.RESET}"
+                
+                output.append(f"{prefix}{connector}{status_icon} {Colors.CYAN}{key}{Colors.RESET}{status_text}")
+                
+                # Recursively render subtree
+                subtree_output = self._render_tree_comparison(local_subtree, remote_subtree, prefix + extension, is_last_item)
+                output.extend(subtree_output)
+            else:
+                # File
+                local_info = local_tree.get(key, {})
+                remote_info = remote_tree.get(key, {})
+                # Prefer sha256 comparison (new tree format); fall back to size comparison for legacy.
+                local_sha = local_info.get("sha") if isinstance(local_info, dict) else None
+                remote_sha = remote_info.get("sha") if isinstance(remote_info, dict) else None
+                local_size = local_info.get('size', 0) if isinstance(local_info, dict) else 0
+                remote_size = remote_info.get('size', 0) if isinstance(remote_info, dict) else 0
+                
+                if local_exists and remote_exists:
+                    if local_sha is not None and remote_sha is not None:
+                        if local_sha == remote_sha:
+                            status_icon = f"{Colors.GREEN}✓{Colors.RESET}"
+                            status_text = f" {Colors.GREEN}[SYNC]{Colors.RESET}"
+                        else:
+                            status_icon = f"{Colors.YELLOW}⚠{Colors.RESET}"
+                            status_text = f" {Colors.YELLOW}[SHA MISMATCH]{Colors.RESET}"
+                    elif local_size == remote_size:
+                        status_icon = f"{Colors.GREEN}✓{Colors.RESET}"
+                        status_text = f" {Colors.GREEN}[SYNC]{Colors.RESET}"
+                    else:
+                        status_icon = f"{Colors.YELLOW}⚠{Colors.RESET}"
+                        status_text = f" {Colors.YELLOW}[SIZE: {local_size} vs {remote_size}]{Colors.RESET}"
+                elif local_exists:
+                    status_icon = f"{Colors.YELLOW}✗{Colors.RESET}"
+                    status_text = f" {Colors.YELLOW}[MISSING REMOTE]{Colors.RESET}"
+                else:
+                    status_icon = f"{Colors.RED}✗{Colors.RESET}"
+                    status_text = f" {Colors.RED}[MISSING LOCAL]{Colors.RESET}"
+                
+                size_str = f" ({local_size:,} bytes)" if local_size > 0 and local_sha is None else ""
+                output.append(f"{prefix}{connector}{status_icon} {Colors.WHITE}{key}{Colors.RESET}{size_str}{status_text}")
+        
+        return output
+    
+    async def _check_and_sync_files(self):
+        """Check if local RSAdminBot files match remote and auto-sync if needed (self-contained)
+        
+        Enhanced with tree view and progress indicators.
+        """
+        if not self.current_server:
+            print(f"{Colors.YELLOW}[Phase 4] No server configured - skipping sync check{Colors.RESET}")
+            return
+
+        # If we're running on the Ubuntu host and using local execution mode, skip Phase 4 entirely.
+        # The canonical update path is botctl.sh deploy_apply (deploy_unpack + venv + systemd), not SSH self-sync.
+        if self._should_use_local_exec():
+            print(f"{Colors.CYAN}[Phase 4] Local execution mode detected - skipping SSH file sync check{Colors.RESET}")
+            return
+
+        # If SSH is not available, skip rather than producing misleading comparisons.
+        ssh_ok, err = self._check_ssh_available()
+        if not ssh_ok:
+            print(f"{Colors.YELLOW}[Phase 4] SSH not available - skipping sync check: {err}{Colors.RESET}")
+            return
+        
+        try:
+            remote_user = self.current_server.get("user", "rsadmin")
+            remote_host = self.current_server.get("host", "")
+            
+            if not remote_host:
+                print(f"{Colors.YELLOW}[Phase 4] Server host not configured - skipping sync check{Colors.RESET}")
+                return
+            
+            remote_base = f"/home/{remote_user}/bots/mirror-world/RSAdminBot"
+            
+            print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
+            print(f"{Colors.BOLD}{Colors.CYAN}📁 RSAdminBot File Sync Check{Colors.RESET}")
+            print(f"{Colors.CYAN}{'='*60}{Colors.RESET}\n")
+            
+            # Build local file tree with progress
+            print(f"{Colors.CYAN}[Phase 4] Scanning local files...{Colors.RESET}")
+            local_tree = self._build_file_tree(self.base_path)
+            local_file_count = sum(1 for k, v in self._count_files_recursive(local_tree).items() if not k.endswith('/'))
+            print(f"{Colors.GREEN}[Phase 4] ✓ Found {local_file_count} local file(s){Colors.RESET}\n")
+            
+            # Build remote file tree with progress
+            print(f"{Colors.CYAN}[Phase 4] Scanning remote files...{Colors.RESET}")
+            print(f"{Colors.DIM}[Phase 4] Connecting to {remote_host}...{Colors.RESET}")
+            
+            # Show progress bar while scanning
+            import time
+            start_time = time.time()
+            spinner_chars = ['|', '/', '-', '\\']
+            spinner_idx = 0
+            
+            # Start remote scan in background (simulated with progress updates)
+            print(f"{Colors.CYAN}[Phase 4] ", end='', flush=True)
+            remote_tree = {}
+            last_update = start_time
+            
+            # Actually scan remote files
+            remote_tree = self._build_remote_file_tree(remote_base)
+            
+            elapsed = time.time() - start_time
+            remote_file_count = sum(1 for k, v in self._count_files_recursive(remote_tree).items() if not k.endswith('/'))
+            print(f"\r{Colors.GREEN}[Phase 4] ✓ Found {remote_file_count} remote file(s) ({elapsed:.1f}s){Colors.RESET}\n")
+            
+            # Render tree comparison
+            print(f"{Colors.BOLD}{Colors.CYAN}📊 File Tree Comparison (Local vs Remote){Colors.RESET}\n")
+            tree_lines = self._render_tree_comparison(local_tree, remote_tree)
+            
+            # Print tree (limit to reasonable size)
+            max_tree_lines = 100
+            for line in tree_lines[:max_tree_lines]:
+                print(line)
+            if len(tree_lines) > max_tree_lines:
+                print(f"{Colors.DIM}... and {len(tree_lines) - max_tree_lines} more items{Colors.RESET}")
+            
+            print()
+            
+            # Analyze differences - improved detection with file details
+            needs_sync = False
+            mismatch_files = []
+            missing_remote_files = []
+            missing_local_files = []
+            
+            def analyze_tree(local: Dict, remote: Dict, path_prefix: str = ""):
+                """Recursively analyze tree differences"""
+                nonlocal needs_sync, mismatch_files, missing_remote_files, missing_local_files
+                
+                all_keys = set(local.keys()) | set(remote.keys())
+                for key in all_keys:
+                    local_exists = key in local
+                    remote_exists = key in remote
+                    current_path = f"{path_prefix}/{key}" if path_prefix else key
+                    
+                    if key.endswith('/'):
+                        # Directory - recurse
+                        analyze_tree(local.get(key, {}), remote.get(key, {}), current_path.rstrip('/'))
+                    else:
+                        # File
+                        if local_exists and remote_exists:
+                            local_sha = local[key].get("sha") if isinstance(local[key], dict) else None
+                            remote_sha = remote[key].get("sha") if isinstance(remote[key], dict) else None
+                            local_size = local[key].get('size', 0) if isinstance(local[key], dict) else 0
+                            remote_size = remote[key].get('size', 0) if isinstance(remote[key], dict) else 0
+                            if local_sha is not None and remote_sha is not None:
+                                if local_sha != remote_sha:
+                                    needs_sync = True
+                                    mismatch_files.append((current_path, local_sha[:12], remote_sha[:12]))
+                            else:
+                                if local_size != remote_size:
+                                    needs_sync = True
+                                    mismatch_files.append((current_path, local_size, remote_size))
+                        elif local_exists:
+                            needs_sync = True
+                            local_size = local[key].get('size', 0) if isinstance(local[key], dict) else 0
+                            missing_remote_files.append((current_path, local_size))
+                        else:
+                            remote_size = remote[key].get('size', 0) if isinstance(remote[key], dict) else 0
+                            missing_local_files.append((current_path, remote_size))
+            
+            analyze_tree(local_tree, remote_tree)
+            
+            # Show detailed difference summary
+            print(f"{Colors.CYAN}{'─'*60}{Colors.RESET}")
+            print(f"{Colors.CYAN}📊 Difference Summary:{Colors.RESET}")
+            total_differences = len(mismatch_files) + len(missing_remote_files)
+            
+            if mismatch_files:
+                print(f"  {Colors.YELLOW}⚠ Mismatches:{Colors.RESET} {len(mismatch_files)} file(s)")
+                # Show first 5 mismatches
+                for file_path, local_size, remote_size in mismatch_files[:5]:
+                    print(f"    • {file_path}: local={local_size}, remote={remote_size}")
+                if len(mismatch_files) > 5:
+                    print(f"    ... and {len(mismatch_files) - 5} more")
+            
+            if missing_remote_files:
+                print(f"  {Colors.YELLOW}⚠ Missing remotely:{Colors.RESET} {len(missing_remote_files)} file(s)")
+                # Show first 5 missing files
+                for file_path, size in missing_remote_files[:5]:
+                    print(f"    • {file_path} ({size}B)")
+                if len(missing_remote_files) > 5:
+                    print(f"    ... and {len(missing_remote_files) - 5} more")
+            
+            if missing_local_files:
+                print(f"  {Colors.CYAN}ℹ Remote-only files (OK):{Colors.RESET} {len(missing_local_files)} file(s)")
+                # Show first 3 remote-only files
+                for file_path, size in missing_local_files[:3]:
+                    print(f"    • {file_path} ({size}B)")
+                if len(missing_local_files) > 3:
+                    print(f"    ... and {len(missing_local_files) - 3} more")
+            
+            print(f"{Colors.CYAN}{'─'*60}{Colors.RESET}\n")
+            
+            if needs_sync:
+                files_to_sync = len(mismatch_files) + len(missing_remote_files)
+                print(f"{Colors.CYAN}[Phase 4] Files need syncing ({files_to_sync} file(s)) - starting auto-sync...{Colors.RESET}\n")
+                
+                # Use self-contained sync function (pass remote_tree to avoid redundant scanning)
+                success = self._sync_rsadminbot_files(remote_tree_cache=remote_tree)
+                
+                if success:
+                    print(f"\n{Colors.CYAN}[Phase 4] Verifying sync completed...{Colors.RESET}\n")
+                    
+                    # Re-scan remote files to verify sync
+                    print(f"{Colors.CYAN}[Phase 4] Re-scanning remote files to verify sync...{Colors.RESET}")
+                    import time as time_module
+                    start_verify = time_module.time()
+                    remote_tree_after = self._build_remote_file_tree(remote_base)
+                    elapsed_verify = time_module.time() - start_verify
+                    remote_file_count_after = sum(1 for k, v in self._count_files_recursive(remote_tree_after).items() if not k.endswith('/'))
+                    print(f"{Colors.GREEN}[Phase 4] ✓ Found {remote_file_count_after} remote file(s) after sync ({elapsed_verify:.1f}s){Colors.RESET}\n")
+                    
+                    # Re-analyze differences after sync
+                    mismatch_files_after = []
+                    missing_remote_files_after = []
+                    missing_local_files_after = []
+                    
+                    def analyze_tree_after(local: Dict, remote: Dict, path_prefix: str = ""):
+                        """Recursively analyze tree differences after sync"""
+                        nonlocal mismatch_files_after, missing_remote_files_after, missing_local_files_after
+                        
+                        all_keys = set(local.keys()) | set(remote.keys())
+                        for key in all_keys:
+                            local_exists = key in local
+                            remote_exists = key in remote
+                            current_path = f"{path_prefix}/{key}" if path_prefix else key
+                            
+                            if key.endswith('/'):
+                                # Directory - recurse
+                                analyze_tree_after(local.get(key, {}), remote.get(key, {}), current_path.rstrip('/'))
+                            else:
+                                # File
+                                if local_exists and remote_exists:
+                                    local_sha = local[key].get("sha") if isinstance(local[key], dict) else None
+                                    remote_sha = remote[key].get("sha") if isinstance(remote[key], dict) else None
+                                    local_size = local[key].get('size', 0) if isinstance(local[key], dict) else 0
+                                    remote_size = remote[key].get('size', 0) if isinstance(remote[key], dict) else 0
+                                    if local_sha is not None and remote_sha is not None:
+                                        if local_sha != remote_sha:
+                                            mismatch_files_after.append((current_path, local_sha[:12], remote_sha[:12]))
+                                    else:
+                                        if local_size != remote_size:
+                                            mismatch_files_after.append((current_path, local_size, remote_size))
+                                elif local_exists:
+                                    local_size = local[key].get('size', 0) if isinstance(local[key], dict) else 0
+                                    missing_remote_files_after.append((current_path, local_size))
+                                else:
+                                    remote_size = remote[key].get('size', 0) if isinstance(remote[key], dict) else 0
+                                    missing_local_files_after.append((current_path, remote_size))
+                    
+                    analyze_tree_after(local_tree, remote_tree_after)
+                    
+                    # Show final tree comparison
+                    print(f"{Colors.BOLD}{Colors.CYAN}📊 Final File Tree Comparison (After Sync){Colors.RESET}\n")
+                    tree_lines_final = self._render_tree_comparison(local_tree, remote_tree_after)
+                    
+                    # Show tree (limit to reasonable size but show more for final verification)
+                    max_tree_lines = 200
+                    for line in tree_lines_final[:max_tree_lines]:
+                        print(line)
+                    if len(tree_lines_final) > max_tree_lines:
+                        print(f"{Colors.DIM}... and {len(tree_lines_final) - max_tree_lines} more items{Colors.RESET}")
+                    
+                    print()
+                    print(f"{Colors.CYAN}{'─'*60}{Colors.RESET}")
+                    print(f"{Colors.CYAN}📊 Final Sync Status:{Colors.RESET}")
+                    
+                    # Count important files (excluding unimportant remote-only files)
+                    total_important_local = sum(1 for k, v in self._count_files_recursive(local_tree).items() if not k.endswith('/'))
+                    matches_after = total_important_local - len(mismatch_files_after) - len(missing_remote_files_after)
+                    
+                    print(f"  {Colors.GREEN}✓ Matched files:{Colors.RESET} {matches_after}")
+                    if len(mismatch_files_after) > 0:
+                        print(f"  {Colors.YELLOW}⚠ Size mismatches:{Colors.RESET} {len(mismatch_files_after)}")
+                    if len(missing_remote_files_after) > 0:
+                        print(f"  {Colors.YELLOW}⚠ Missing on remote:{Colors.RESET} {len(missing_remote_files_after)}")
+                    
+                    # Count important vs unimportant remote-only files
+                    missing_local_important = 0
+                    missing_local_unimportant = 0
+                    for file_path, _ in missing_local_files_after:
+                        if self._is_unimportant_remote_file(file_path):
+                            missing_local_unimportant += 1
+                        else:
+                            missing_local_important += 1
+                    
+                    if missing_local_important > 0:
+                        print(f"  {Colors.YELLOW}⚠ Important remote-only files:{Colors.RESET} {missing_local_important}")
+                    if missing_local_unimportant > 0:
+                        print(f"  {Colors.DIM}ℹ Unimportant remote-only files (ignored):{Colors.RESET} {missing_local_unimportant}")
+                    
+                    # Calculate match percentage based on important files only
+                    total_issues = len(mismatch_files_after) + len(missing_remote_files_after) + missing_local_important
+                    if total_important_local > 0:
+                        match_percentage = int((matches_after / total_important_local) * 100)
+                    else:
+                        match_percentage = 100 if total_issues == 0 else 0
+                    
+                    # Only show "100% matched" if no important differences
+                    if total_issues == 0:
+                        print(f"  {Colors.GREEN}✓ All important files matched! {match_percentage}% sync complete{Colors.RESET}")
+                    else:
+                        issues_list = []
+                        if len(mismatch_files_after) > 0:
+                            issues_list.append(f"{len(mismatch_files_after)} size mismatch(es)")
+                        if len(missing_remote_files_after) > 0:
+                            issues_list.append(f"{len(missing_remote_files_after)} missing remote file(s)")
+                        if missing_local_important > 0:
+                            issues_list.append(f"{missing_local_important} important remote-only file(s)")
+                        print(f"  {Colors.YELLOW}⚠ Remaining differences ({match_percentage}% match):{Colors.RESET} {', '.join(issues_list)}")
+                    print(f"{Colors.CYAN}{'─'*60}{Colors.RESET}\n")
+                    
+                    if total_issues == 0:
+                        print(f"{Colors.GREEN}[Phase 4] ✓ All files synced and verified - {match_percentage}% matched{Colors.RESET}\n")
+                    else:
+                        print(f"{Colors.YELLOW}[Phase 4] ⚠️  Sync completed but {total_issues} important difference(s) remain ({match_percentage}% match){Colors.RESET}\n")
+                else:
+                    print(f"\n{Colors.RED}[Phase 4] ✗ Sync failed - check logs above{Colors.RESET}\n")
+            else:
+                if total_differences == 0:
+                    print(f"{Colors.GREEN}[Phase 4] ✓ All files are in sync (no differences found){Colors.RESET}\n")
+                else:
+                    print(f"{Colors.GREEN}[Phase 4] ✓ Files match (only remote-only files exist, which is OK){Colors.RESET}\n")
+                
+        except Exception as e:
+            print(f"{Colors.YELLOW}[Phase 4] Sync check failed: {e}{Colors.RESET}")
+            import traceback
+            print(f"{Colors.RED}[Phase 4] Traceback: {traceback.format_exc()[:200]}{Colors.RESET}")
+    
+    def _count_files_recursive(self, tree: Dict) -> Dict[str, int]:
+        """Count files recursively in tree structure."""
+        count = {}
+        for key, value in tree.items():
+            if key.endswith('/'):
+                # Directory
+                count[key] = len([k for k in value.keys() if not k.endswith('/')])
+                # Recurse
+                subcount = self._count_files_recursive(value)
+                count.update(subcount)
+            else:
+                count[key] = 1
+        return count
+    
+    # NOTE: Previously we supported rs-bot-tokens.txt + a command that scraped tokens from configs.
+    # That approach is intentionally removed for safety: secrets now live in config.secrets.json (server-only),
+    # and bot IDs for tracking are discovered from the RS Server guild at runtime.
+    
+    async def _send_ssh_commands_to_channel(self):
+        """Send all .sh script commands used by the bot to the SSH commands channel"""
+        ssh_commands_channel_id = self.config.get("ssh_commands_channel_id")
+        if not ssh_commands_channel_id:
+            print(f"{Colors.YELLOW}[Startup] SSH commands channel ID not configured, skipping{Colors.RESET}")
+            return
+        
+        try:
+            channel = self.bot.get_channel(int(ssh_commands_channel_id))
+            if not channel:
+                print(f"{Colors.YELLOW}[Startup] SSH commands channel not found (ID: {ssh_commands_channel_id}){Colors.RESET}")
+                return
+            
+            print(f"{Colors.CYAN}[Startup] Checking SSH commands channel: {channel.name}{Colors.RESET}")
+            
+            # Check if channel already has the SSH commands
+            if await self._check_channel_has_ssh_commands(channel):
+                print(f"{Colors.GREEN}[Startup] SSH commands already exist in channel, skipping{Colors.RESET}")
+                return
+            
+            print(f"{Colors.CYAN}[Startup] Sending .sh script commands to channel: {channel.name}{Colors.RESET}")
+            
+            bot_groups = self.config.get("bot_groups", {})
+            
+            # RSAdminBot group
+            if bot_groups.get("rsadminbot"):
+                await channel.send("**RSAdminBot**")
+                await channel.send("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh status rsadminbot\n```")
+                await channel.send("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh start rsadminbot\n```")
+                await channel.send("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh stop rsadminbot\n```")
+                await channel.send("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh restart rsadminbot\n```")
+                await channel.send("---")
+            
+            # RS Bots group
+            rs_bots = bot_groups.get("rs_bots", [])
+            if rs_bots:
+                await channel.send("**RS Bots** (rsforwarder, rsonboarding, rsmentionpinger, rscheckerbot, rssuccessbot)")
+                await channel.send("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh status all\n```")
+                await channel.send("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh start all\n```")
+                await channel.send("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh stop all\n```")
+                await channel.send("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh restart all\n```")
+                await channel.send("---")
+            
+            # Mirror-World Bots group
+            mirror_bots = bot_groups.get("mirror_bots", [])
+            if mirror_bots:
+                await channel.send("**Mirror-World Bots** (datamanagerbot, pingbot, discumbot)")
+                await channel.send("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh status all\n```")
+                await channel.send("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh start all\n```")
+                await channel.send("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh stop all\n```")
+                await channel.send("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh restart all\n```")
+                await channel.send("---")
+            
+            print(f"{Colors.GREEN}[Startup] .sh script commands sent to channel successfully{Colors.RESET}")
+            
+        except Exception as e:
+            print(f"{Colors.RED}[Startup] Failed to send SSH commands to channel: {e}{Colors.RESET}")
+            import traceback
+            print(f"{Colors.RED}[Startup] Traceback: {traceback.format_exc()[:300]}{Colors.RESET}")
+
+    def _build_command_index_text(self) -> str:
+        """Build a compact command index for Discord (no secrets)."""
+        # Prefer registered_commands for admin flags, but also include every command name.
+        reg = list(getattr(self, "registered_commands", []) or [])
+        reg_map = {name: (desc, is_admin) for (name, desc, is_admin) in reg if name}
+
+        cmds = []
+        for c in list(self.bot.commands):
+            name = getattr(c, "name", "")
+            if not name:
+                continue
+            if name == "help":
+                continue
+            desc = ""
+            is_admin = None
+            if name in reg_map:
+                desc, is_admin = reg_map[name]
+            else:
+                desc = (getattr(c, "help", "") or "").strip().splitlines()[0:1]
+                desc = desc[0] if desc else ""
+            cmds.append((name, desc, is_admin))
+
+        cmds.sort(key=lambda x: x[0])
+        lines = []
+        lines.append("RSAdminBot Command Index")
+        lines.append("Prefix: !")
+        lines.append("")
+        for name, desc, is_admin in cmds:
+            admin_tag = " [ADMIN]" if is_admin else ""
+            if desc:
+                lines.append(f"!{name}{admin_tag} - {desc}")
+            else:
+                lines.append(f"!{name}{admin_tag}")
+        return "\n".join(lines).strip()
+
+    async def _publish_command_index_to_test_server(self) -> None:
+        """Post or update the command index in the test server monitoring channel."""
+        if not self.test_server_organizer:
+            return
+
+        # Ensure channels exist (creates commands channel if missing).
+        try:
+            await self.test_server_organizer.setup_monitoring_channels()
+        except Exception:
+            return
+
+        channel_id = self.test_server_organizer.get_channel_id("commands")
+        if not channel_id:
+            return
+
+        channel = self.bot.get_channel(int(channel_id))
+        if not channel:
+            try:
+                channel = await self.bot.fetch_channel(int(channel_id))  # type: ignore[attr-defined]
+            except Exception:
+                return
+
+        text = self._build_command_index_text()
+        content = f"```{text[:1900]}```"
+        content_hash = self.test_server_organizer._sha256_text(text)  # stable hash
+        prev_hash = self.test_server_organizer.get_meta("commands_hash", "")
+        msg_id = self.test_server_organizer.get_meta("commands_message_id", None)
+
+        # If unchanged and we have a message id, do nothing.
+        if prev_hash == content_hash and msg_id:
+            return
+
+        try:
+            if msg_id:
+                try:
+                    msg = await channel.fetch_message(int(msg_id))  # type: ignore[attr-defined]
+                    await msg.edit(content=content)
+                    self.test_server_organizer.set_meta("commands_hash", content_hash)
+                    return
+                except Exception:
+                    # fallthrough: create a new message
+                    pass
+
+            msg = await channel.send(content)
+            self.test_server_organizer.set_meta("commands_hash", content_hash)
+            self.test_server_organizer.set_meta("commands_message_id", int(msg.id))
+        except Exception:
+            return
+    
+    
+    def _execute_ssh_command(self, command: str, timeout: int = 30) -> Tuple[bool, str, str]:
+        """Execute SSH command and return (success, stdout, stderr)
+        
+        Uses shell=False to prevent PowerShell parsing on Windows.
+        Commands are executed inside remote bash shell.
+        """
+        # Check if server is configured (self-contained - uses config.json)
+        if not self.current_server:
+            error_msg = "No SSH server configured in config.json"
+            print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
+            return False, "", error_msg
+
+        # Local execution mode (Ubuntu host): run commands directly in bash without SSH.
+        if self._should_use_local_exec():
+            try:
+                result = subprocess.run(
+                    ["bash", "-lc", command],
+                    shell=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                stdout_clean = (result.stdout or "").strip()
+                stderr_clean = (result.stderr or "").strip()
+                if result.returncode != 0:
+                    print(f"{Colors.RED}[Local Exec Error] Command failed: {command[:100]}{Colors.RESET}")
+                    if stderr_clean:
+                        print(f"{Colors.RED}[Local Exec Error] {stderr_clean[:200]}{Colors.RESET}")
+                return result.returncode == 0, stdout_clean, stderr_clean
+            except subprocess.TimeoutExpired:
+                error_msg = f"Command timed out after {timeout}s"
+                print(f"{Colors.RED}[Local Exec Error] {error_msg}{Colors.RESET}")
+                return False, "", error_msg
+            except Exception as e:
+                error_msg = f"Unexpected error executing local command: {str(e)}"
+                print(f"{Colors.RED}[Local Exec Error] {error_msg}{Colors.RESET}")
+                return False, "", error_msg
+        
+        # Build SSH command locally (self-contained)
+        # Check if SSH key exists (already resolved in _load_ssh_config)
+        ssh_key = self.current_server.get("key")
+        if ssh_key:
+            key_path = Path(ssh_key)
+            if not key_path.exists():
+                error_msg = f"SSH key file not found: {key_path}"
+                print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
+                print(f"{Colors.YELLOW}[SSH Error] Expected key at: {key_path}{Colors.RESET}")
+                return False, "", error_msg
+        
+        try:
+            # Build SSH base command locally (self-contained)
+            base = self._build_ssh_base(self.current_server)
+            if not base:
+                error_msg = "Failed to build SSH base command (check server config)"
+                print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
+                return False, "", error_msg
+            
+            # Escape command for bash -c
+            escaped_cmd = shlex.quote(command)
+            
+            # Build command as list (no shell parsing on Windows)
+            cmd = base + ["-t", "-o", "ConnectTimeout=10", "bash", "-lc", escaped_cmd]
+            
+            # Suppress verbose output - only log errors
+            is_validation = command.strip() == "sudo -n true"
+            
+            result = subprocess.run(
+                cmd,
+                shell=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                encoding='utf-8',
+                errors='replace'
+            )
+            
+            # Clean output (strip whitespace)
+            stdout_clean = (result.stdout or "").strip()
+            stderr_clean = (result.stderr or "").strip()
+            
+            # Only log errors, not every command execution
+            if result.returncode != 0:
+                if not is_validation:
+                    print(f"{Colors.RED}[SSH Error] Command failed: {command[:100]}{Colors.RESET}")
+                    if stderr_clean:
+                        print(f"{Colors.RED}[SSH Error] {stderr_clean[:200]}{Colors.RESET}")
+                    if stdout_clean:
+                        print(f"{Colors.YELLOW}[SSH Error] {stdout_clean[:200]}{Colors.RESET}")
+            
+            return result.returncode == 0, stdout_clean, stderr_clean
+        except subprocess.TimeoutExpired:
+            error_msg = f"Command timed out after {timeout}s"
+            print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
+            print(f"{Colors.RED}[SSH Error] Command: {command[:200]}{Colors.RESET}")
+            return False, "", error_msg
+        except FileNotFoundError as e:
+            error_msg = f"SSH executable not found: {e}"
+            print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
+            print(f"{Colors.YELLOW}[SSH Error] Make sure SSH is installed and in PATH{Colors.RESET}")
+            return False, "", error_msg
+        except Exception as e:
+            error_msg = f"Unexpected error executing SSH command: {str(e)}"
+            print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
+            print(f"{Colors.RED}[SSH Error] Command: {command[:200]}{Colors.RESET}")
+            import traceback
+            print(f"{Colors.RED}[SSH Error] Traceback: {traceback.format_exc()[:500]}{Colors.RESET}")
+            return False, "", error_msg
+    
+    def _service_name_to_bot_name(self, service_name: str) -> Optional[str]:
+        """Map service name to bot name.
+        
+        Args:
+            service_name: Systemd service name (e.g., "mirror-world-rsforwarder.service")
+            
+        Returns:
+            Bot name (e.g., "rsforwarder") or None if not found
+        """
+        # Remove .service suffix and mirror-world- prefix
+        if service_name.endswith(".service"):
+            service_name = service_name[:-8]
+        if service_name.startswith("mirror-world-"):
+            bot_name = service_name[13:]  # Remove "mirror-world-" prefix
+            # Check if bot exists in BOTS dict
+            if bot_name in self.BOTS:
+                return bot_name
+        return None
+    
+    def _get_bot_group(self, bot_name: str) -> Optional[str]:
+        """Get bot group for a given bot name.
+        
+        Args:
+            bot_name: Bot name (e.g., "rsforwarder", "datamanagerbot")
+            
+        Returns:
+            "rsadminbot", "rs_bots", "mirror_bots", or None if not found
+        """
+        bot_groups = self.config.get("bot_groups", {})
+        
+        if bot_name == "rsadminbot":
+            return "rsadminbot"
+        
+        for group_name, bots in bot_groups.items():
+            if isinstance(bots, list) and bot_name in bots:
+                return group_name
+        
+        return None
+    
+    def _get_script_name(self, bot_group: str) -> str:
+        """Get script name for a bot group.
+        
+        Args:
+            bot_group: Bot group name ("rsadminbot", "rs_bots", "mirror_bots")
+            
+        Returns:
+            Script name (e.g., "manage_rsadminbot.sh")
+        """
+        script_map = {
+            "rsadminbot": "manage_rsadminbot.sh",
+            "rs_bots": "manage_rs_bots.sh",
+            "mirror_bots": "manage_mirror_bots.sh"
+        }
+        return script_map.get(bot_group, "manage_bots.sh")
+    
+    def _execute_sh_script(self, script_name: str, action: str, bot_name: str, *args) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Execute a .sh script via SSH.
+        
+        Args:
+            script_name: Script name (e.g., "manage_rs_bots.sh")
+            action: Action (start, stop, restart, status)
+            bot_name: Bot name
+            *args: Additional arguments
+            
+        Returns:
+            (success, stdout, stderr)
+        """
+        # Canonical entrypoint: always call botctl.sh on the remote server.
+        # Keep signature for compatibility, but do not execute per-group scripts directly.
+        botctl_path = "/home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh"
+        cmd_parts = [action, bot_name] + list(args)
+        cmd = f"bash {botctl_path} {' '.join(shlex.quote(str(arg)) for arg in cmd_parts)}"
+        
+        return self._execute_ssh_command(cmd, timeout=120)
+    
+    def load_config(self):
+        """Load configuration from JSON file"""
+        default_config = {
+            "guild_id": 0,
+            "admin_role_ids": [],
+            "admin_user_ids": [],
+            "log_channel_id": ""
+        }
+        
+        if self.config_path.exists():
+            try:
+                # Load config.json and merge config.secrets.json (server-only) on top
+                self.config, _, secrets_path = load_config_with_secrets(self.base_path)
+                # Merge with defaults for missing keys
+                for key, value in default_config.items():
+                    if key not in self.config:
+                        self.config[key] = value
+                if not secrets_path.exists():
+                    print(f"{Colors.YELLOW}[Config] Missing config.secrets.json (server-only): {secrets_path}{Colors.RESET}")
+                    print(f"{Colors.YELLOW}[Config] Create it to provide required secrets like bot_token{Colors.RESET}")
+                print(f"{Colors.GREEN}[Config] Loaded configuration{Colors.RESET}")
+            except Exception as e:
+                print(f"{Colors.RED}[Config] Failed to load config: {e}{Colors.RESET}")
+                self.config = default_config
+        else:
+            self.config = default_config
+            self.save_config()
+            print(f"{Colors.YELLOW}[Config] Created default config.json - please configure it{Colors.RESET}")
+    
+    def save_config(self):
+        """Save configuration to JSON file"""
+        try:
+            # Never write secrets back into config.json
+            config_to_save = dict(self.config or {})
+            config_to_save.pop("bot_token", None)
+            with open(self.config_path, 'w', encoding='utf-8') as f:
+                json.dump(config_to_save, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"{Colors.RED}[Config] Failed to save config: {e}{Colors.RESET}")
+    
+    def is_admin(self, user: discord.Member) -> bool:
+        """Check if user is an admin"""
+        admin_role_ids = self.config.get("admin_role_ids", [])
+        admin_user_ids = self.config.get("admin_user_ids", [])
+        
+        # Check user ID
+        if str(user.id) in [str(uid) for uid in admin_user_ids]:
+            return True
+        
+        # Check roles
+        user_role_ids = [str(r.id) for r in user.roles]
+        for admin_role_id in admin_role_ids:
+            if str(admin_role_id) in user_role_ids:
+                return True
+        
+        # Check if user has administrator permission
+        if user.guild_permissions.administrator:
+            return True
+        
+        return False
+    
+    def _setup_events(self):
+        """Setup Discord event handlers"""
+        
+        @self.bot.event
+        async def on_ready():
+            """Bot startup sequence - organized into clear phases using sequence modules"""
+            
+            # Prevent multiple on_ready triggers (discord.py can fire this multiple times)
+            if not hasattr(self, '_startup_complete'):
+                self._startup_complete = False
+            
+            if self._startup_complete:
+                # Already completed startup - this is likely a reconnection
+                print(f"{Colors.YELLOW}[Reconnect] Bot reconnected - skipping full startup sequence{Colors.RESET}")
+                print(f"{Colors.GREEN}[Reconnect] ✓ Bot connected as: {self.bot.user}{Colors.RESET}")
+                print(f"{Colors.GREEN}[Reconnect] ✓ Bot ID: {self.bot.user.id}{Colors.RESET}")
+                print(f"{Colors.GREEN}[Reconnect] ✓ Bot latency: {round(self.bot.latency * 1000)}ms{Colors.RESET}\n")
+                return
+            
+            # Mark startup as in progress
+            self._startup_complete = True
+            
+            # Import and run startup sequences
+            try:
+                from startup_sequences import (
+                    sequence_1_initialization,
+                    sequence_2_tracking,
+                    sequence_3_server_status,
+                    sequence_4_file_sync,
+                    sequence_5_channels,
+                    sequence_6_background
+                )
+                
+                # Run all sequences
+                await sequence_1_initialization.run(self)
+                await sequence_2_tracking.run(self)
+                await sequence_3_server_status.run(self)
+                await sequence_4_file_sync.run(self)
+                await sequence_5_channels.run(self)
+                await sequence_6_background.run(self)
+
+                # If a self-update was applied during restart, report it to the update-progress channel now.
+                try:
+                    marker = self.base_path / ".last_selfupdate_applied.json"
+                    if marker.exists():
+                        data = json.loads(marker.read_text(encoding="utf-8") or "{}")
+                        backup = str(data.get("backup") or "")
+                        ts = str(data.get("timestamp") or "")
+                        changes = data.get("changes") or {}
+                        sample = changes.get("sample") or []
+                        py_sample = changes.get("py_sample") or []
+                        total = changes.get("total")
+                        py_total = changes.get("py_total")
+                        # Fetch some recent journal lines for context.
+                        ok_j, out_j, _ = self._execute_ssh_command("journalctl -u mirror-world-rsadminbot.service -n 40 --no-pager | tail -n 40", timeout=20)
+                        tail = (out_j or "").strip()
+                        msg = (
+                            "[selfupdate] APPLIED\n"
+                            f"Timestamp: {ts}\n"
+                            f"Backup: {backup}\n"
+                        )
+                        if isinstance(total, int) and isinstance(py_total, int):
+                            msg += f"Files changed: {total} (py: {py_total})\n"
+                        if py_sample:
+                            msg += "\nChanged .py (sample):\n" + "\n".join(str(p) for p in py_sample[:20]) + "\n"
+                        elif sample:
+                            msg += "\nChanged files (sample):\n" + "\n".join(str(p) for p in sample[:20]) + "\n"
+                        if ok_j and tail:
+                            msg += "\nRecent service logs:\n" + tail[-1400:]
+                        await self._post_or_edit_progress(None, msg)
+                        try:
+                            marker.unlink()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                
+            except ImportError as e:
+                print(f"{Colors.RED}[Startup] Failed to import startup sequences: {e}{Colors.RESET}")
+                print(f"{Colors.YELLOW}[Startup] Startup sequences not available{Colors.RESET}")
+                return
+            except Exception as e:
+                print(f"{Colors.RED}[Startup] Error in startup sequences: {e}{Colors.RESET}")
+                import traceback
+                print(f"{Colors.RED}[Startup] Traceback: {traceback.format_exc()[:500]}{Colors.RESET}")
+                return
+        
+        # Bot movement tracking event listeners
+        @self.bot.event
+        async def on_message(message: discord.Message):
+            """Track bot write operations"""
+            # Skip bot's own messages to prevent loops
+            if message.author == self.bot.user:
+                return
+            
+            # Process commands first (required for bot commands to work)
+            await self.bot.process_commands(message)
+            
+            # Then track bot movements
+            if self.bot_movement_tracker:
+                await self.bot_movement_tracker.track_message(message)
+        
+        @self.bot.event
+        async def on_message_edit(before: discord.Message, after: discord.Message):
+            """Track bot message edits"""
+            if self.bot_movement_tracker:
+                await self.bot_movement_tracker.track_message_edit(before, after)
+        
+        @self.bot.event
+        async def on_message_delete(message: discord.Message):
+            """Track bot message deletes"""
+            if self.bot_movement_tracker:
+                await self.bot_movement_tracker.track_message_delete(message)
+        
+        @self.bot.event
+        async def on_command_error(ctx, error):
+            """Handle command errors"""
+            if isinstance(error, commands.CommandNotFound):
+                return  # Ignore unknown commands
+            elif isinstance(error, commands.MissingPermissions):
+                print(f"{Colors.YELLOW}[Command Error] Missing permissions: {ctx.author} tried to use {ctx.command}{Colors.RESET}")
+                await ctx.send("❌ **Error:** You don't have permission to use this command.")
+            elif isinstance(error, commands.CommandOnCooldown):
+                print(f"{Colors.YELLOW}[Command Error] Cooldown: {ctx.author} tried to use {ctx.command} too soon{Colors.RESET}")
+                await ctx.send(f"❌ **Cooldown:** Please wait {error.retry_after:.1f} seconds.")
+            else:
+                error_msg = str(error)
+                print(f"{Colors.RED}[Command Error] {error_msg}{Colors.RESET}")
+                print(f"{Colors.RED}[Command Error] Command: {ctx.command}, User: {ctx.author}, Channel: {ctx.channel}{Colors.RESET}")
+                import traceback
+                print(f"{Colors.RED}[Command Error] Traceback:{Colors.RESET}")
+                for line in traceback.format_exc().split('\n')[:10]:
+                    if line.strip():
+                        print(f"{Colors.RED}[Command Error]   {line}{Colors.RESET}")
+                await ctx.send("❌ **Error:** An error occurred while executing the command.")
+    
+    def _setup_commands(self):
+        """Setup prefix commands"""
+        # Track registered commands for initialization logging
+        self.registered_commands = []
+        
+        @self.bot.command(name="ping")
+        async def ping(ctx):
+            """Check bot latency"""
+            latency = round(self.bot.latency * 1000)
+            await ctx.send(f"🏓 Pong! Latency: {latency}ms")
+        self.registered_commands.append(("ping", "Check bot latency", False))
+        
+        @self.bot.command(name="status")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def status(ctx):
+            """Show bot status and readiness (admin only)"""
+            embed = discord.Embed(
+                title="🤖 RS Admin Bot Status",
+                description="**Bot is ready and operational** ✅",
+                color=discord.Color.green(),
+                timestamp=datetime.now()
+            )
+            
+            # Bot connection status
+            status_value = f"✅ **Online** (Invisible)\n"
+            status_value += f"User: {self.bot.user}\n"
+            status_value += f"ID: {self.bot.user.id}\n"
+            status_value += f"Latency: {round(self.bot.latency * 1000)}ms"
+            embed.add_field(
+                name="🔌 Connection",
+                value=status_value,
+                inline=False
+            )
+            
+            # Guilds
+            guild_names = [g.name for g in self.bot.guilds]
+            embed.add_field(
+                name="📡 Servers",
+                value=f"{len(self.bot.guilds)}\n" + "\n".join(f"• {name}" for name in guild_names[:5]),
+                inline=True
+            )
+            
+            # SSH Server status
+            if self.current_server:
+                ssh_status = f"✅ **Connected**\n"
+                ssh_status += f"Server: {self.current_server.get('name', 'Unknown')}\n"
+                ssh_status += f"Host: {self.current_server.get('host', 'N/A')}"
+            else:
+                ssh_status = "❌ **Not configured**\nAdd `ssh_server` to config.json"
+            embed.add_field(
+                name="🖥️ SSH Server",
+                value=ssh_status,
+                inline=True
+            )
+            
+            # Module status
+            modules_status = []
+            modules_status.append("✅ Service Manager" if self.service_manager else "❌ Service Manager")
+            modules_status.append("✅ Whop Tracker" if self.whop_tracker else "❌ Whop Tracker")
+            modules_status.append("✅ Movement Tracker" if self.bot_movement_tracker else "❌ Movement Tracker")
+            modules_status.append("✅ Bot Inspector" if self.inspector else "❌ Bot Inspector")
+            
+            embed.add_field(
+                name="🔧 Modules",
+                value="\n".join(modules_status),
+                inline=False
+            )
+            
+            # Quick commands reminder
+            embed.add_field(
+                name="💡 Quick Commands",
+                value="`!botlist` - List all bots\n`!botstatus <bot>` - Check bot status\n`!botstart <bot>` - Start a bot\n`!botstop <bot>` - Stop a bot",
+                    inline=False
+            )
+            
+            await ctx.send(embed=embed)
+        
+        @self.bot.command(name="reload")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def reload(ctx):
+            """Reload configuration (admin only)"""
+            self.load_config()
+            self._load_ssh_config()  # Self-contained - always reload from config.json
+            await ctx.send("✅ Configuration reloaded!")
+        
+        @self.bot.command(name="restart")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def restart(ctx):
+            """Restart RSAdminBot locally or remotely (admin only)"""
+            # Reuse the same RestartView from restartadminbot
+            class RestartView(ui.View):
+                def __init__(self, admin_bot_instance):
+                    super().__init__(timeout=60)
+                    self.admin_bot = admin_bot_instance
+                
+                @ui.button(label="🖥️ Restart Locally", style=discord.ButtonStyle.primary)
+                async def restart_local(self, interaction: discord.Interaction, button: ui.Button):
+                    """Restart the bot locally (exit and let systemd restart)"""
+                    await interaction.response.send_message("🔄 **Restarting RSAdminBot locally...**\nThe bot will exit and systemd will restart it automatically.", ephemeral=True)
+                    
+                    print(f"{Colors.YELLOW}[Restart] Local restart requested by {interaction.user} ({interaction.user.id}){Colors.RESET}")
+                    print(f"{Colors.YELLOW}[Restart] Exiting bot to allow systemd restart...{Colors.RESET}")
+                    
+                    # Store restart info for followup message after restart
+                    restart_info = {
+                        "user_id": interaction.user.id,
+                        "user_name": str(interaction.user),
+                        "channel_id": interaction.channel.id if interaction.channel else None,
+                        "guild_id": interaction.guild.id if interaction.guild else None,
+                        "timestamp": datetime.now().isoformat(),
+                        "restart_type": "local"
+                    }
+                    restart_info_file = self.admin_bot.base_path / "pending_restart_followup.json"
+                    try:
+                        with open(restart_info_file, 'w', encoding='utf-8') as f:
+                            json.dump(restart_info, f, indent=2)
+                        print(f"{Colors.CYAN}[Restart] Stored restart info for followup: {restart_info_file}{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.YELLOW}[Restart] ⚠️  Failed to store restart info: {e}{Colors.RESET}")
+                    
+                    # Log to Discord before exit
+                    await self.admin_bot._log_to_discord(f"🔄 **Local Restart Initiated**\nRequested by: {interaction.user}")
+                    
+                    # Close the bot gracefully
+                    await self.admin_bot.bot.close()
+                    
+                    # Exit the process (systemd will restart it)
+                    import sys
+                    sys.exit(0)
+                
+                @ui.button(label="🌐 Restart Remotely", style=discord.ButtonStyle.secondary)
+                async def restart_remote(self, interaction: discord.Interaction, button: ui.Button):
+                    """Restart the bot on remote server via SSH"""
+                    ssh_ok, error_msg = self.admin_bot._check_ssh_available()
+                    if not ssh_ok:
+                        await interaction.response.send_message(f"❌ **SSH not configured**: {error_msg}", ephemeral=True)
+                        return
+                    
+                    await interaction.response.send_message("🔄 **Restarting RSAdminBot on remote server...**\nThis may take a few moments.", ephemeral=True)
+                    
+                    bot_info = self.admin_bot.BOTS["rsadminbot"]
+                    service_name = bot_info["service"]
+                    
+                    print(f"{Colors.CYAN}[Restart] Remote restart requested by {interaction.user} ({interaction.user.id}){Colors.RESET}")
+                    print(f"{Colors.CYAN}[Restart] Restarting service: {service_name}{Colors.RESET}")
+                    
+                    # Use ServiceManager to restart
+                    if self.admin_bot.service_manager:
+                        success, stdout, stderr = self.admin_bot.service_manager.restart(
+                            service_name, 
+                            script_pattern=bot_info.get("script"),
+                            bot_name="rsadminbot"
+                        )
+                        
+                        if success:
+                            # Verify it started
+                            await asyncio.sleep(2)
+                            exists, state, error = self.admin_bot.service_manager.get_status(service_name, bot_name="rsadminbot")
+                            
+                            if exists and state == "active":
+                                await interaction.followup.send("✅ **RSAdminBot restarted successfully on remote server!**\nThe bot will sync files on next startup.", ephemeral=True)
+                                await self.admin_bot._log_to_discord(f"✅ **Remote Restart Successful**\nService: {service_name}\nRequested by: {interaction.user}")
+                                print(f"{Colors.GREEN}[Restart] Remote restart successful{Colors.RESET}")
+                            else:
+                                await interaction.followup.send(f"⚠️ **Restart initiated but status unclear**\nState: {state if exists else 'Service not found'}", ephemeral=True)
+                                await self.admin_bot._log_to_discord(f"⚠️ **Remote Restart Status Unclear**\nState: {state if exists else 'Service not found'}\nRequested by: {interaction.user}")
+                        else:
+                            error_msg = stderr or stdout or "Unknown error"
+                            await interaction.followup.send(f"❌ **Restart failed**: {error_msg[:500]}", ephemeral=True)
+                            await self.admin_bot._log_to_discord(f"❌ **Remote Restart Failed**\nError: {error_msg[:500]}\nRequested by: {interaction.user}")
+                            print(f"{Colors.RED}[Restart] Remote restart failed: {error_msg}{Colors.RESET}")
+                    else:
+                        await interaction.followup.send("❌ **ServiceManager not available**", ephemeral=True)
+            
+            embed = discord.Embed(
+                title="🔄 Restart RSAdminBot",
+                description="Choose how to restart the bot:\n\n**After restart, the bot will automatically sync files on startup.**",
+                color=discord.Color.orange(),
+                timestamp=datetime.now()
+            )
+            embed.add_field(
+                name="🖥️ Local Restart",
+                value="Exits the bot and lets systemd restart it automatically.\n*Use this if running on the same machine.*",
+                inline=False
+            )
+            embed.add_field(
+                name="🌐 Remote Restart",
+                value="Restarts the bot service on the remote Ubuntu server via SSH.\n*Use this if the bot runs on a remote server.*",
+                inline=False
+            )
+            embed.set_footer(text="Select an option below (expires in 60 seconds)")
+            
+            view = RestartView(self)
+            await ctx.send(embed=embed, view=view)
+        self.registered_commands.append(("restart", "Restart RSAdminBot locally or remotely", True))
+        
+        # NOTE: !updatetokens removed (it encouraged storing plaintext tokens locally).
+        
+        @self.bot.command(name="botlist")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def botlist(ctx):
+            """List all available bots (admin only)"""
+            embed = discord.Embed(
+                title="📋 Available Bots",
+                color=discord.Color.blue(),
+                timestamp=datetime.now()
+            )
+            
+            bot_list = "\n".join([f"• `{key}` - {info['name']}" for key, info in self.BOTS.items()])
+            embed.description = bot_list
+            embed.set_footer(text="Use !botstatus <botname> to check status")
+            
+            await ctx.send(embed=embed)
+        
+        @self.bot.command(name="botstatus")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def botstatus(ctx, bot_name: str = None):
+            """Check status of a bot or all bots (admin only)"""
+            ssh_ok, error_msg = self._check_ssh_available()
+            if not ssh_ok:
+                await ctx.send(f"❌ SSH not configured: {error_msg}")
+                return
+            
+            if bot_name:
+                bot_name = bot_name.lower()
+                if bot_name not in self.BOTS:
+                    available_bots = ", ".join(self.BOTS.keys())
+                    print(f"{Colors.RED}[Command Error] Unknown bot: '{bot_name}'{Colors.RESET}")
+                    print(f"{Colors.YELLOW}[Command Error] Available bots: {available_bots}{Colors.RESET}")
+                    await ctx.send(f"❌ Unknown bot: {bot_name}\nUse `!botlist` to see available bots")
+                    return
+                
+                bot_info = self.BOTS[bot_name]
+                service_name = bot_info["service"]
+                
+                # Log to terminal
+                guild_name = ctx.guild.name if ctx.guild else "DM"
+                guild_id = ctx.guild.id if ctx.guild else 0
+                print(f"{Colors.CYAN}[Command] Checking status of {bot_info['name']} (Service: {service_name}){Colors.RESET}")
+                print(f"{Colors.CYAN}[Command] Server: {guild_name} (ID: {guild_id}){Colors.RESET}")
+                print(f"{Colors.CYAN}[Command] Requested by: {ctx.author} ({ctx.author.id}){Colors.RESET}")
+                
+                # First check if service exists
+                check_exists_cmd = f"systemctl list-unit-files {service_name} 2>/dev/null | grep -q {service_name} && echo 'exists' || echo 'not_found'"
+                exists_success, exists_output, _ = self._execute_ssh_command(check_exists_cmd, timeout=10)
+                service_exists = exists_success and "exists" in (exists_output or "").lower()
+                
+                embed = discord.Embed(
+                    title=f"📊 {bot_info['name']} Status",
+                    color=discord.Color.blue(),
+                    timestamp=datetime.now()
+                )
+                
+                if not service_exists:
+                    embed.add_field(
+                        name="Status",
+                        value="⚠️ Service not found on remote server",
+                        inline=False
+                    )
+                    embed.add_field(
+                        name="Service Name",
+                        value=f"`{service_name}`",
+                        inline=False
+                    )
+                    embed.description = "The service file does not exist on the remote server. The bot may need to be set up first."
+                    is_active = False
+                else:
+                    # Use ServiceManager for reliable status check
+                    if self.service_manager:
+                        exists, state, error = self.service_manager.get_status(service_name, bot_name=bot_name)
+                        if exists and state:
+                            is_active = state == "active"
+                        status_icon = "✅" if is_active else "❌"
+                        embed.add_field(
+                            name="Status",
+                            value=f"{status_icon} {'Running' if is_active else 'Stopped'}",
+                            inline=True
+                        )
+                        
+                        # Get PID if running
+                        if is_active:
+                            pid = self.service_manager.get_pid(service_name)
+                            if pid:
+                                embed.add_field(name="PID", value=str(pid), inline=True)
+                        
+                        # Get detailed status
+                        detail_success, detail_output, detail_stderr = self.service_manager.get_detailed_status(service_name)
+                        if detail_success and detail_output:
+                            status_lines = detail_output.split('\n')[-5:]
+                            status_text = '\n'.join(status_lines)
+                            if len(status_text) > 1000:
+                                status_text = status_text[:1000] + "..."
+                            embed.add_field(name="Details", value=f"```{status_text}```", inline=False)
+                        else:
+                            embed.add_field(name="Error", value=f"```{error or 'Status check failed'}```", inline=False)
+                            is_active = False
+                    else:
+                        embed.add_field(name="Error", value="ServiceManager not available", inline=False)
+                        is_active = False
+                
+                # Add "Start Bot" button if bot is not running
+                view = None
+                if not is_active:
+                    view = StartBotView(self, bot_name, bot_info['name'])
+                
+                # Edit the status message we created earlier
+                try:
+                    await status_msg.edit(content="", embed=embed, view=view)
+                except:
+                    await ctx.send(embed=embed, view=view)
+            else:
+                # Check all bots - send immediate acknowledgment
+                status_msg = await ctx.send("🔄 **Checking status of all bots...**\n```\nConnecting to server...\n```")
+                
+                guild_name = ctx.guild.name if ctx.guild else "DM"
+                guild_id = ctx.guild.id if ctx.guild else 0
+                print(f"{Colors.CYAN}[Command] Checking status of all bots{Colors.RESET}")
+                print(f"{Colors.CYAN}[Command] Server: {guild_name} (ID: {guild_id}){Colors.RESET}")
+                print(f"{Colors.CYAN}[Command] Requested by: {ctx.author} ({ctx.author.id}){Colors.RESET}")
+                
+                embed = discord.Embed(
+                    title="📊 All Bots Status",
+                    color=discord.Color.blue(),
+                    timestamp=datetime.now()
+                )
+                
+                status_lines = []
+                if self.service_manager:
+                    for key, bot_info in self.BOTS.items():
+                        service_name = bot_info["service"]
+                        exists, state, error = self.service_manager.get_status(service_name, bot_name=key)
+                        
+                        if exists and state:
+                            is_active = state == "active"
+                            status_icon = "✅" if is_active else "❌"
+                            status_text = "Running" if is_active else "Stopped"
+                            status_lines.append(f"{status_icon} **{bot_info['name']}** - {status_text}")
+                            print(f"{Colors.CYAN}[Status] {bot_info['name']}: {status_text}{Colors.RESET}")
+                        else:
+                            status_icon = "⚠️"
+                            status_lines.append(f"{status_icon} **{bot_info['name']}** - Service not found")
+                            print(f"{Colors.YELLOW}[Status] {bot_info['name']}: Service not found on remote server{Colors.RESET}")
+                else:
+                    status_lines.append("⚠️ ServiceManager not available")
+                
+                embed.description = "\n".join(status_lines)
+                # Edit the status message we created earlier
+                try:
+                    await status_msg.edit(content="", embed=embed)
+                except:
+                    await ctx.send(embed=embed)
+        
+        @self.bot.command(name="botstart")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def botstart(ctx, bot_name: str = None):
+            """Start a bot (admin only)"""
+            ssh_ok, error_msg = self._check_ssh_available()
+            if not ssh_ok:
+                await ctx.send(f"❌ SSH not configured: {error_msg}")
+                return
+            
+            if not bot_name:
+                # Show interactive SelectMenu instead of text list
+                view = BotSelectView(self, "start", "Start")
+                embed = discord.Embed(
+                    title="🤖 Select Bot to Start",
+                    description="Choose a bot from the dropdown menu below:",
+                    color=discord.Color.blue()
+                )
+                await ctx.send(embed=embed, view=view)
+                return
+            
+            bot_name = bot_name.lower()
+            if bot_name not in self.BOTS:
+                available_bots = ", ".join(self.BOTS.keys())
+                print(f"{Colors.RED}[Command Error] Unknown bot: '{bot_name}'{Colors.RESET}")
+                print(f"{Colors.YELLOW}[Command Error] Available bots: {available_bots}{Colors.RESET}")
+                await ctx.send(f"❌ Unknown bot: {bot_name}\nUse `!botlist` to see available bots")
+                return
+            
+            bot_name_lower = bot_name.lower()
+            bot_info = self.BOTS[bot_name_lower]
+            service_name = bot_info["service"]
+            
+            # Log to terminal and Discord
+            guild_name = ctx.guild.name if ctx.guild else "DM"
+            guild_id = ctx.guild.id if ctx.guild else 0
+            print(f"{Colors.CYAN}[Command] Starting {bot_info['name']} (Service: {service_name}){Colors.RESET}")
+            print(f"{Colors.CYAN}[Command] Server: {guild_name} (ID: {guild_id}){Colors.RESET}")
+            print(f"{Colors.CYAN}[Command] Requested by: {ctx.author} ({ctx.author.id}){Colors.RESET}")
+            await self._log_to_discord(f"🟢 **Starting {bot_info['name']}**\nService: `{service_name}`\nRequested by: {ctx.author.mention}")
+            
+            # Send immediate acknowledgment
+            status_msg = await ctx.send(f"🔄 **Starting {bot_info['name']}...**\n```\nConnecting to server...\n```")
+            
+            # Start service using ServiceManager
+            if not self.service_manager:
+                await ctx.send("❌ ServiceManager not available")
+                return
+
+            # Snapshot before action (so we can confirm PID/state changes)
+            before_exists, before_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name_lower)
+            before_pid = self.service_manager.get_pid(service_name)
+            
+            success, stdout, stderr = self.service_manager.start(service_name, unmask=True, bot_name=bot_name_lower)
+            
+            if success:
+                # Verify service actually started
+                is_running, verify_error = self.service_manager.verify_started(service_name, bot_name=bot_name_lower)
+                if is_running:
+                    after_exists, after_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name_lower)
+                    after_pid = self.service_manager.get_pid(service_name)
+                    pid_note = ""
+                    if before_pid and after_pid and before_pid != after_pid:
+                        pid_note = f" (pid {before_pid} -> {after_pid})"
+                    elif before_pid is None and after_pid:
+                        pid_note = f" (pid -> {after_pid})"
+                    print(f"{Colors.GREEN}[Success] {bot_info['name']} started successfully!{Colors.RESET}")
+                    before_state_txt = before_state or "unknown"
+                    after_state_txt = after_state or "unknown"
+                    before_pid_txt = str(before_pid or 0)
+                    after_pid_txt = str(after_pid or 0)
+                    await status_msg.edit(
+                        content=(
+                            f"✅ **{bot_info['name']}** started successfully!{pid_note}\n"
+                            f"```\nBefore: state={before_state_txt} pid={before_pid_txt}\nAfter:  state={after_state_txt} pid={after_pid_txt}\n```"
+                        )
+                    )
+                    await self._log_to_discord(
+                        f"✅ **{bot_info['name']}** started\nState: `{after_state or 'unknown'}` | PID: `{after_pid or 0}`\nBefore: `{before_state or 'unknown'}` | PID: `{before_pid or 0}`"
+                    )
+                else:
+                    error_msg = verify_error or stderr or stdout or "Unknown error"
+                    print(f"{Colors.RED}[Error] Failed to start {bot_info['name']}: {error_msg[:500]}{Colors.RESET}")
+                    await status_msg.edit(content=f"❌ Failed to start {bot_info['name']}:\n```{error_msg[:500]}```")
+                    await self._log_to_discord(f"❌ **{bot_info['name']}** failed to start:\n```{error_msg[:500]}```")
+            else:
+                error_msg = stderr or stdout or "Unknown error"
+                print(f"{Colors.RED}[Error] Failed to start {bot_info['name']}: {error_msg[:500]}{Colors.RESET}")
+                await status_msg.edit(content=f"❌ Failed to start {bot_info['name']}:\n```{error_msg[:500]}```")
+                await self._log_to_discord(f"❌ **{bot_info['name']}** failed to start:\n```{error_msg[:500]}```")
+        
+        @self.bot.command(name="botstop")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def botstop(ctx, bot_name: str = None):
+            """Stop a bot (admin only)"""
+            ssh_ok, error_msg = self._check_ssh_available()
+            if not ssh_ok:
+                await ctx.send(f"❌ SSH not configured: {error_msg}")
+                return
+            
+            if not bot_name:
+                # Show interactive SelectMenu
+                view = BotSelectView(self, "stop", "Stop")
+                embed = discord.Embed(
+                    title="🛑 Select Bot to Stop",
+                    description="Choose a bot from the dropdown menu below:",
+                    color=discord.Color.red()
+                )
+                await ctx.send(embed=embed, view=view)
+                return
+            
+            bot_name = bot_name.lower()
+            if bot_name not in self.BOTS:
+                available_bots = ", ".join(self.BOTS.keys())
+                print(f"{Colors.RED}[Command Error] Unknown bot: '{bot_name}'{Colors.RESET}")
+                print(f"{Colors.YELLOW}[Command Error] Available bots: {available_bots}{Colors.RESET}")
+                await ctx.send(f"❌ Unknown bot: {bot_name}\nUse `!botlist` to see available bots")
+                return
+            
+            bot_name_lower = bot_name.lower()
+            bot_info = self.BOTS[bot_name_lower]
+            service_name = bot_info["service"]
+            script_pattern = bot_info.get("script", bot_name_lower)
+            
+            # Log to terminal and Discord
+            guild_name = ctx.guild.name if ctx.guild else "DM"
+            guild_id = ctx.guild.id if ctx.guild else 0
+            print(f"{Colors.CYAN}[Command] Stopping {bot_info['name']} (Service: {service_name}){Colors.RESET}")
+            print(f"{Colors.CYAN}[Command] Server: {guild_name} (ID: {guild_id}){Colors.RESET}")
+            print(f"{Colors.CYAN}[Command] Requested by: {ctx.author} ({ctx.author.id}){Colors.RESET}")
+            await self._log_to_discord(f"🔴 **Stopping {bot_info['name']}**\nService: `{service_name}`\nRequested by: {ctx.author.mention}")
+            
+            # Send immediate acknowledgment
+            status_msg = await ctx.send(f"🔄 **Stopping {bot_info['name']}...**\n```\nConnecting to server...\n```")
+            
+            # Stop service using ServiceManager
+            if not self.service_manager:
+                await ctx.send("❌ ServiceManager not available")
+                return
+
+            before_exists, before_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name_lower)
+            before_pid = self.service_manager.get_pid(service_name)
+            
+            success, stdout, stderr = self.service_manager.stop(service_name, script_pattern=script_pattern, bot_name=bot_name_lower)
+            
+            if success:
+                after_exists, after_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name_lower)
+                after_pid = self.service_manager.get_pid(service_name)
+                pid_note = ""
+                if before_pid and not after_pid:
+                    pid_note = f" (pid {before_pid} -> 0)"
+                print(f"{Colors.GREEN}[Success] {bot_info['name']} stopped successfully!{Colors.RESET}")
+                before_state_txt = before_state or "unknown"
+                after_state_txt = after_state or "unknown"
+                before_pid_txt = str(before_pid or 0)
+                after_pid_txt = str(after_pid or 0)
+                await status_msg.edit(
+                    content=(
+                        f"✅ **{bot_info['name']}** stopped successfully!{pid_note}\n"
+                        f"```\nBefore: state={before_state_txt} pid={before_pid_txt}\nAfter:  state={after_state_txt} pid={after_pid_txt}\n```"
+                    )
+                )
+                await self._log_to_discord(
+                    f"✅ **{bot_info['name']}** stopped\nState: `{after_state or 'unknown'}` | PID: `{after_pid or 0}`\nBefore: `{before_state or 'unknown'}` | PID: `{before_pid or 0}`"
+                )
+            else:
+                error_msg = stderr or stdout or "Unknown error"
+                print(f"{Colors.RED}[Error] Failed to stop {bot_info['name']}: {error_msg[:500]}{Colors.RESET}")
+                await status_msg.edit(content=f"❌ Failed to stop {bot_info['name']}:\n```{error_msg[:500]}```")
+                await self._log_to_discord(f"❌ **{bot_info['name']}** failed to stop:\n```{error_msg[:500]}```")
+        
+        @self.bot.command(name="botrestart")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def botrestart(ctx, bot_name: str = None):
+            """Restart a bot (admin only)"""
+            ssh_ok, error_msg = self._check_ssh_available()
+            if not ssh_ok:
+                await ctx.send(f"❌ SSH not configured: {error_msg}")
+                return
+            
+            if not bot_name:
+                # Show interactive SelectMenu
+                view = BotSelectView(self, "restart", "Restart")
+                embed = discord.Embed(
+                    title="🔄 Select Bot to Restart",
+                    description="Choose a bot from the dropdown menu below:",
+                    color=discord.Color.orange()
+                )
+                await ctx.send(embed=embed, view=view)
+                return
+            
+            bot_name = bot_name.lower()
+            if bot_name not in self.BOTS:
+                available_bots = ", ".join(self.BOTS.keys())
+                print(f"{Colors.RED}[Command Error] Unknown bot: '{bot_name}'{Colors.RESET}")
+                print(f"{Colors.YELLOW}[Command Error] Available bots: {available_bots}{Colors.RESET}")
+                await ctx.send(f"❌ Unknown bot: {bot_name}\nUse `!botlist` to see available bots")
+                return
+            
+            bot_name_lower = bot_name.lower()
+            bot_info = self.BOTS[bot_name_lower]
+            service_name = bot_info["service"]
+            script_pattern = bot_info.get("script", bot_name_lower)
+            
+            # Log to terminal and Discord
+            guild_name = ctx.guild.name if ctx.guild else "DM"
+            guild_id = ctx.guild.id if ctx.guild else 0
+            print(f"{Colors.CYAN}[Command] Restarting {bot_info['name']} (Service: {service_name}){Colors.RESET}")
+            print(f"{Colors.CYAN}[Command] Server: {guild_name} (ID: {guild_id}){Colors.RESET}")
+            print(f"{Colors.CYAN}[Command] Requested by: {ctx.author} ({ctx.author.id}){Colors.RESET}")
+            await self._log_to_discord(f"🔄 **Restarting {bot_info['name']}**\nService: `{service_name}`\nRequested by: {ctx.author.mention}")
+            
+            # Send immediate acknowledgment
+            status_msg = await ctx.send(f"🔄 **Restarting {bot_info['name']}...**\n```\nConnecting to server...\n```")
+            
+            # Restart service using ServiceManager
+            if not self.service_manager:
+                await ctx.send("❌ ServiceManager not available")
+                return
+
+            before_exists, before_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name_lower)
+            before_pid = self.service_manager.get_pid(service_name)
+            
+            success, stdout, stderr = self.service_manager.restart(service_name, script_pattern=script_pattern, bot_name=bot_name_lower)
+            
+            if success:
+                # Verify service actually started
+                is_running, verify_error = self.service_manager.verify_started(service_name, bot_name=bot_name_lower)
+                if is_running:
+                    after_exists, after_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name_lower)
+                    after_pid = self.service_manager.get_pid(service_name)
+                    pid_note = ""
+                    if before_pid and after_pid and before_pid != after_pid:
+                        pid_note = f" (pid {before_pid} -> {after_pid})"
+                    elif before_pid and after_pid and before_pid == after_pid:
+                        pid_note = f" (pid unchanged: {after_pid})"
+                    elif before_pid is None and after_pid:
+                        pid_note = f" (pid -> {after_pid})"
+                    print(f"{Colors.GREEN}[Success] {bot_info['name']} restarted successfully!{Colors.RESET}")
+                    before_state_txt = before_state or "unknown"
+                    after_state_txt = after_state or "unknown"
+                    before_pid_txt = str(before_pid or 0)
+                    after_pid_txt = str(after_pid or 0)
+                    await status_msg.edit(
+                        content=(
+                            f"✅ **{bot_info['name']}** restarted successfully!{pid_note}\n"
+                            f"```\nBefore: state={before_state_txt} pid={before_pid_txt}\nAfter:  state={after_state_txt} pid={after_pid_txt}\n```"
+                        )
+                    )
+                    await self._log_to_discord(
+                        f"✅ **{bot_info['name']}** restarted{pid_note}\nState: `{after_state or 'unknown'}` | PID: `{after_pid or 0}`\nBefore: `{before_state or 'unknown'}` | PID: `{before_pid or 0}`"
+                    )
+                else:
+                    error_msg = verify_error or stderr or stdout or "Unknown error"
+                    print(f"{Colors.YELLOW}[Warning] Restart completed but verification failed for {bot_info['name']}: {error_msg[:500]}{Colors.RESET}")
+                    await status_msg.edit(content=f"⚠️ Restart completed but verification failed for {bot_info['name']}:\n```{error_msg[:500]}```")
+                    await self._log_to_discord(f"⚠️ **{bot_info['name']}** restart completed but verification failed:\n```{error_msg[:500]}```")
+            else:
+                error_msg = stderr or stdout or "Unknown error"
+                print(f"{Colors.RED}[Error] Failed to restart {bot_info['name']}: {error_msg[:500]}{Colors.RESET}")
+                await status_msg.edit(content=f"❌ Failed to restart {bot_info['name']}:\n```{error_msg[:500]}```")
+                await self._log_to_discord(f"❌ **{bot_info['name']}** failed to restart:\n```{error_msg[:500]}```")
+        
+        @self.bot.command(name="botrestartsync")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def botrestartsync(ctx, bot_name: str = None):
+            """Restart a bot and sync all files (admin only)"""
+            ssh_ok, error_msg = self._check_ssh_available()
+            if not ssh_ok:
+                await ctx.send(f"❌ SSH not configured: {error_msg}")
+                return
+            
+            if not bot_name:
+                # Show interactive SelectMenu with restart_and_sync action
+                view = BotSelectView(self, "restart_and_sync", "Restart & Sync")
+                embed = discord.Embed(
+                    title="🔄📦 Select Bot to Restart & Sync",
+                    description=(
+                        "Choose a bot from the dropdown menu below.\n\n"
+                        "**This will:**\n"
+                        "1. Sync all files (Python, config, etc.)\n"
+                        "2. Restart the bot service\n\n"
+                        "**Files synced:**\n"
+                        "• All `.py` files\n"
+                        "• `config.json` and `messages.json`\n"
+                        "• Documentation files\n\n"
+                        "**Files NOT synced:**\n"
+                        "• Data files (`.db`, `.log`, etc.)"
+                    ),
+                    color=discord.Color.blue()
+                )
+                await ctx.send(embed=embed, view=view)
+                return
+
+            bot_name = bot_name.lower()
+            if bot_name not in self.BOTS:
+                await ctx.send(f"❌ Unknown bot: {bot_name}\nUse `!botlist` to see available bots")
+                return
+
+            bot_info = self.BOTS[bot_name]
+            bot_folder = bot_info["folder"]
+            service_name = bot_info["service"]
+
+            # Log to terminal and Discord
+            guild_name = ctx.guild.name if ctx.guild else "DM"
+            guild_id = ctx.guild.id if ctx.guild else 0
+            print(f"{Colors.CYAN}[Command] Restarting & Syncing {bot_info['name']} (Service: {service_name}){Colors.RESET}")
+            print(f"{Colors.CYAN}[Command] Server: {guild_name} (ID: {guild_id}){Colors.RESET}")
+            print(f"{Colors.CYAN}[Command] Requested by: {ctx.author} ({ctx.author.id}){Colors.RESET}")
+            await self._log_to_discord(
+                f"🔄📦 **Restarting & Syncing {bot_info['name']}**\nService: `{service_name}`\nRequested by: {ctx.author.mention}"
+            )
+
+            # Step 1: Sync files first
+            status_msg = await ctx.send(f"📦 **Syncing {bot_info['name']} files...**\n```\nScanning and syncing files...\n```")
+
+            success, stats = self._sync_bot_files(bot_folder, bot_info['name'], show_tree=False, delete_remote_only=True)
+
+            if not success:
+                error_msg = stats.get("error", "Unknown error")
+                print(f"{Colors.RED}[Error] File sync failed for {bot_info['name']}: {error_msg[:500]}{Colors.RESET}")
+                await status_msg.edit(
+                    content=f"❌ **File sync failed** for {bot_info['name']}:\n```{error_msg[:500]}```\n\n⚠️ Skipping restart due to sync failure."
+                )
+                await self._log_to_discord(f"❌ **{bot_info['name']}** sync failed, restart skipped:\n```{error_msg[:500]}```")
+                return
+
+            # Show sync results
+            synced = stats.get('synced', 0)
+            failed = stats.get('failed', 0)
+            skipped = stats.get('skipped', 0)
+            python_total = stats.get('python_files_total', 0)
+            python_verified = stats.get('python_files_verified', 0)
+            python_percent = stats.get('python_sync_percent', 100)
+
+            sync_summary = f"Synced: {synced}, Skipped: {skipped}, Failed: {failed}"
+            if python_total > 0:
+                if python_percent == 100:
+                    sync_summary += f" | 🐍 Python: {python_verified}/{python_total} (100%) ✅"
+                else:
+                    sync_summary += f" | 🐍 Python: {python_verified}/{python_total} ({python_percent}%) ⚠️"
+
+            # Step 2: Restart the bot
+            await status_msg.edit(content=f"🔄 **Restarting {bot_info['name']}...**\n```\n{sync_summary}\n\nConnecting to server...\n```")
+
+            if not self.service_manager:
+                await status_msg.edit(content=f"❌ ServiceManager not available\n\n✅ Files synced: {sync_summary}")
+                return
+
+            script_pattern = bot_info.get("script", bot_name)
+            bot_name_lower = bot_name.lower()
+
+            before_exists, before_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name_lower)
+            before_pid = self.service_manager.get_pid(service_name)
+
+            restart_success, stdout, stderr = self.service_manager.restart(service_name, script_pattern=script_pattern, bot_name=bot_name_lower)
+
+            if restart_success:
+                # Verify service actually started
+                is_running, verify_error = self.service_manager.verify_started(service_name, bot_name=bot_name_lower)
+                if is_running:
+                    after_exists, after_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name_lower)
+                    after_pid = self.service_manager.get_pid(service_name)
+                    pid_note = ""
+                    if before_pid and after_pid and before_pid != after_pid:
+                        pid_note = f" (pid {before_pid} -> {after_pid})"
+                    elif before_pid and after_pid and before_pid == after_pid:
+                        pid_note = f" (pid unchanged: {after_pid})"
+                    elif before_pid is None and after_pid:
+                        pid_note = f" (pid -> {after_pid})"
+                    before_state_txt = before_state or "unknown"
+                    after_state_txt = after_state or "unknown"
+                    before_pid_txt = str(before_pid or 0)
+                    after_pid_txt = str(after_pid or 0)
+
+                    print(f"{Colors.GREEN}[Success] {bot_info['name']} restarted successfully with file sync!{Colors.RESET}")
+                    final_summary = (
+                        f"✅ **{bot_info['name']} restarted successfully!**{pid_note}\n"
+                        f"```\n{sync_summary}\n\nBefore: state={before_state_txt} pid={before_pid_txt}\nAfter:  state={after_state_txt} pid={after_pid_txt}\n```"
+                    )
+                    await status_msg.edit(content=final_summary)
+                    await self._log_to_discord(
+                        f"✅ **{bot_info['name']}** restarted with file sync\n{sync_summary}\n"
+                        f"State: `{after_state or 'unknown'}` | PID: `{after_pid or 0}`\n"
+                        f"Before: `{before_state or 'unknown'}` | PID: `{before_pid or 0}`"
+                    )
+                else:
+                    error_msg = verify_error or stderr or stdout or "Unknown error"
+                    print(f"{Colors.YELLOW}[Warning] Files synced but restart verification failed for {bot_info['name']}: {error_msg[:500]}{Colors.RESET}")
+                    await status_msg.edit(content=f"⚠️ **Files synced but restart verification failed**\n```{error_msg[:500]}```\n\n✅ Files: {sync_summary}")
+                    await self._log_to_discord(f"⚠️ **{bot_info['name']}** files synced but restart verification failed\n{sync_summary}")
+            else:
+                error_msg = stderr or stdout or "Unknown error"
+                print(f"{Colors.YELLOW}[Warning] Files synced but restart failed for {bot_info['name']}: {error_msg[:500]}{Colors.RESET}")
+                await status_msg.edit(content=f"⚠️ **Files synced but restart failed**\n```{error_msg[:500]}```\n\n✅ Files: {sync_summary}")
+                await self._log_to_discord(f"⚠️ **{bot_info['name']}** files synced but restart failed\n{sync_summary}")
+        
+        @self.bot.command(name="sync")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def sync(ctx):
+            """Alias for !botupdate rsadminbot (admin only). Kept to avoid duplicate sync implementations."""
+            await ctx.invoke(self.bot.get_command("botupdate"), bot_name="rsadminbot")
+        
+        @self.bot.command(name="botupdate")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def botupdate(ctx, bot_name: str = None):
+            """Update a bot by syncing files with tree view (admin only)"""
+            ssh_ok, error_msg = self._check_ssh_available()
+            if not ssh_ok:
+                await ctx.send(f"❌ SSH not configured: {error_msg}")
+                return
+            
+            if not bot_name:
+                # Show interactive SelectMenu
+                view = BotSelectView(self, "update", "Update")
+                embed = discord.Embed(
+                    title="📦 Select Bot to Update",
+                    description="Choose a bot from the dropdown menu below:",
+                    color=discord.Color.blue()
+                )
+                await ctx.send(embed=embed, view=view)
+                return
+            
+            bot_name = bot_name.lower()
+            if bot_name not in self.BOTS:
+                available_bots = ", ".join(self.BOTS.keys())
+                print(f"{Colors.RED}[Command Error] Unknown bot: '{bot_name}'{Colors.RESET}")
+                print(f"{Colors.YELLOW}[Command Error] Available bots: {available_bots}{Colors.RESET}")
+                await ctx.send(f"❌ Unknown bot: {bot_name}\nUse `!botlist` to see available bots")
+                return
+            
+            bot_info = self.BOTS[bot_name]
+            bot_folder = bot_info["folder"]
+            service_name = bot_info.get("service", "")
+            
+            # Log to terminal and Discord
+            guild_name = ctx.guild.name if ctx.guild else "DM"
+            guild_id = ctx.guild.id if ctx.guild else 0
+            print(f"{Colors.CYAN}[Command] Updating {bot_info['name']} (Folder: {bot_folder}){Colors.RESET}")
+            print(f"{Colors.CYAN}[Command] Server: {guild_name} (ID: {guild_id}){Colors.RESET}")
+            print(f"{Colors.CYAN}[Command] Requested by: {ctx.author} ({ctx.author.id}){Colors.RESET}")
+            await self._log_to_discord(f"📦 **Updating {bot_info['name']}**\nSyncing folder: `{bot_folder}`\nRequested by: {ctx.author.mention}")
+            
+            status_msg = await ctx.send(f"📦 **Syncing {bot_info['name']} files...**\n```\nScanning files...\n```")
+            print(f"{Colors.YELLOW}[Sync] Starting file sync for {bot_folder}...{Colors.RESET}")
+
+            # Update-progress channel (test server): live systemd state around the sync.
+            progress_msg = None
+            should_post_progress = not (await self._is_progress_channel(ctx.channel))
+            if should_post_progress and self.service_manager and service_name:
+                before_exists, before_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name)
+                before_pid = self.service_manager.get_pid(service_name)
+                progress_msg = await self._post_or_edit_progress(
+                    progress_msg,
+                    (
+                        f"[botupdate] {bot_info['name']} ({bot_name}) START\n"
+                        f"Before: {self._format_service_state(before_exists, before_state, before_pid)}\n"
+                        f"Requested by: {ctx.author} ({ctx.author.id})"
+                    ),
+                )
+            
+            # Use comprehensive sync with tree view for all bots
+            success, stats = self._sync_bot_files(bot_folder, bot_info['name'], show_tree=True, delete_remote_only=True)
+            
+            if success:
+                if stats.get("staged") and stats.get("pending_restart") and bot_name == "rsadminbot":
+                    backup_note = f"\nBackup: `{stats.get('remote_backup')}`" if stats.get("remote_backup") else ""
+                    tar_note = ""
+                    if stats.get("tar_entries_total"):
+                        tar_note = f"\nTar entries: {stats.get('tar_entries_total')}"
+                    await status_msg.edit(
+                        content=(
+                            "✅ **RSAdminBot update STAGED** (two-phase self-update)\n"
+                            f"{backup_note}\n"
+                            f"{tar_note}\n"
+                            "Next: restart `mirror-world-rsadminbot.service` to apply.\n"
+                            "If you want RSAdminBot to restart itself after staging, use `!selfupdate`."
+                        )[:1900]
+                    )
+                    if should_post_progress and self.service_manager and service_name:
+                        after_exists, after_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name)
+                        after_pid = self.service_manager.get_pid(service_name)
+                        progress_msg = await self._post_or_edit_progress(
+                            progress_msg,
+                            (
+                                f"[botupdate] {bot_info['name']} ({bot_name}) STAGED\n"
+                                f"Backup: {stats.get('remote_backup','')}\n"
+                                f"After:  {self._format_service_state(after_exists, after_state, after_pid)}\n"
+                                "Note: restart required to apply staged update."
+                            ),
+                        )
+                    return
+
+                python_total = stats.get('python_files_total', 0)
+                python_verified = stats.get('python_files_verified', 0)
+                python_percent = stats.get('python_sync_percent', 100)
+
+                # Optional: restart the service after a successful sync (non-rsadminbot).
+                restart_cfg = self.config.get("botupdate_restart") or {}
+                do_restart = bool(restart_cfg.get("enabled")) and bot_name != "rsadminbot"
+                restart_note = ""
+                restart_ok = None
+                restart_err = ""
+                if do_restart and self.service_manager and service_name:
+                    progress_msg = await self._post_or_edit_progress(
+                        progress_msg,
+                        f"[botupdate] {bot_info['name']} ({bot_name}) RESTARTING\nBackup: {stats.get('remote_backup','')}",
+                    )
+                    ok_r, out_r, err_r = self.service_manager.restart(service_name, bot_name=bot_name)
+                    if not ok_r:
+                        restart_ok = False
+                        restart_err = (err_r or out_r or "restart failed")[:500]
+                    else:
+                        max_wait = int(restart_cfg.get("max_wait_seconds") or 15)
+                        poll = float(restart_cfg.get("poll_interval_seconds") or 1)
+                        poll = max(0.25, min(poll, 5.0))
+
+                        # Live state reporting while we wait (RSAdminBot stays online for non-rsadminbot restarts).
+                        start_t = datetime.now()
+                        last_state = None
+                        while (datetime.now() - start_t).total_seconds() < max_wait:
+                            exists_now, state_now, _ = self.service_manager.get_status(service_name, bot_name=bot_name)
+                            pid_now = self.service_manager.get_pid(service_name)
+                            cur = self._format_service_state(exists_now, state_now, pid_now)
+                            if cur != last_state:
+                                last_state = cur
+                                progress_msg = await self._post_or_edit_progress(
+                                    progress_msg,
+                                    (
+                                        f"[botupdate] {bot_info['name']} ({bot_name}) RESTARTING\n"
+                                        f"State: {cur}\n"
+                                        f"Backup: {stats.get('remote_backup','')}"
+                                    ),
+                                )
+                            if exists_now and state_now == "active":
+                                restart_ok = True
+                                break
+                            if exists_now and state_now == "failed":
+                                restart_ok = False
+                                break
+                            await asyncio.sleep(poll)
+
+                        if restart_ok is None:
+                            # Fallback to existing verifier message (includes logs on failure).
+                            running, verify_err = self.service_manager.verify_started(service_name, max_wait=0, bot_name=bot_name)
+                            restart_ok = bool(running)
+                            if not restart_ok:
+                                restart_err = (verify_err or "service did not become active")[:800]
+
+                        if restart_ok is False:
+                            # Attach last logs for quick diagnosis.
+                            lines = int(restart_cfg.get("failure_log_lines") or 30)
+                            logs = self.service_manager.get_failure_logs(service_name, lines=lines) or ""
+                            if logs:
+                                restart_err = (restart_err + "\n\nRecent logs:\n" + logs[-1200:])[:1600]
+                    if restart_ok:
+                        restart_note = "\nRestart: OK"
+                    else:
+                        restart_note = "\nRestart: FAILED"
+                
+                summary = f"✅ **{bot_info['name']} files synced successfully!**\n"
+                summary += f"```\n"
+                summary += f"Synced: {stats['synced']} file(s)\n"
+                if stats['failed'] > 0:
+                    summary += f"Failed: {stats['failed']} file(s)\n"
+                if stats['deleted'] > 0:
+                    summary += f"Deleted: {stats['deleted']} remote-only file(s)\n"
+                if stats['skipped'] > 0:
+                    summary += f"Skipped: {stats['skipped']} file(s)\n"
+                if python_total > 0:
+                    if python_percent == 100:
+                        summary += f"🐍 Python Files: {python_verified}/{python_total} verified (100%) ✅\n"
+                    else:
+                        summary += f"🐍 Python Files: {python_verified}/{python_total} verified ({python_percent}%) ⚠️\n"
+                if stats.get("tar_entries_total"):
+                    summary += f"Tar entries: {stats.get('tar_entries_total')}\n"
+                if do_restart and restart_ok is not None:
+                    summary += f"Restart: {'OK' if restart_ok else 'FAILED'}\n"
+                summary += f"```"
+
+                if stats.get("tar_entries_sample"):
+                    sample = stats.get("tar_entries_sample") or []
+                    summary += "\n**Tar sample (first 10):**\n```"
+                    summary += "\n".join(str(x) for x in sample[:10])
+                    summary += "```"
+                
+                print(f"{Colors.GREEN}[Success] {bot_info['name']} files synced successfully!{Colors.RESET}")
+                await status_msg.edit(content=summary)
+                await self._log_to_discord(f"✅ **{bot_info['name']}** files synced successfully!")
+                if should_post_progress and self.service_manager and service_name:
+                    after_exists, after_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name)
+                    after_pid = self.service_manager.get_pid(service_name)
+                    backup = stats.get("remote_backup") or ""
+                    progress_msg = await self._post_or_edit_progress(
+                        progress_msg,
+                        (
+                            f"[botupdate] {bot_info['name']} ({bot_name}) COMPLETE\n"
+                            f"Backup: {backup}\n"
+                            f"After:  {self._format_service_state(after_exists, after_state, after_pid)}\n"
+                            f"Python verified: {python_verified}/{python_total} ({python_percent}%)"
+                        ),
+                    )
+                    if do_restart and restart_ok is False and restart_err and should_post_progress:
+                        # Add a short error follow-up (avoid flooding the channel).
+                        await self._post_or_edit_progress(
+                            None,
+                            f"[botupdate] {bot_info['name']} ({bot_name}) RESTART FAILED\n{restart_err[:1600]}",
+                        )
+            else:
+                error_msg = stats.get("error", "Unknown error")
+                print(f"{Colors.RED}[Error] Failed to sync {bot_info['name']} files: {error_msg}{Colors.RESET}")
+                await status_msg.edit(content=f"❌ Failed to sync {bot_info['name']} files:\n```{error_msg}```")
+                await self._log_to_discord(f"❌ **{bot_info['name']}** sync failed: {error_msg}")
+                if should_post_progress and self.service_manager and service_name:
+                    after_exists, after_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name)
+                    after_pid = self.service_manager.get_pid(service_name)
+                    progress_msg = await self._post_or_edit_progress(
+                        progress_msg,
+                        (
+                            f"[botupdate] {bot_info['name']} ({bot_name}) FAILED\n"
+                            f"Error: {error_msg[:500]}\n"
+                            f"After: {self._format_service_state(after_exists, after_state, after_pid)}"
+                        ),
+                    )
+
+        @self.bot.command(name="selfupdate")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def selfupdate(ctx):
+            """Two-phase RSAdminBot self-update: stage update, then restart RSAdminBot to apply (admin only)."""
+            ssh_ok, error_msg = self._check_ssh_available()
+            if not ssh_ok:
+                await ctx.send(f"❌ SSH not configured: {error_msg}")
+                return
+
+            # Stage update (this will not replace the running RSAdminBot folder)
+            status_msg = await ctx.send("📦 **Staging RSAdminBot update...**\n```\nBuilding archive + uploading to server...\n```")
+            should_post_progress = not (await self._is_progress_channel(ctx.channel))
+            progress_msg = None
+            if should_post_progress:
+                progress_msg = await self._post_or_edit_progress(
+                    None,
+                    f"[selfupdate] RSAdminBot stage START\nRequested by: {ctx.author} ({ctx.author.id})",
+                )
+            success, stats = self._sync_bot_files("RSAdminBot", "RSAdminBot", show_tree=False, delete_remote_only=True)
+            if not success:
+                await status_msg.edit(content=f"❌ Failed to stage RSAdminBot update:\n```{stats.get('error','Unknown error')[:800]}```")
+                if should_post_progress:
+                    await self._post_or_edit_progress(
+                        progress_msg,
+                        f"[selfupdate] RSAdminBot stage FAILED\nError: {stats.get('error','Unknown error')[:500]}",
+                    )
+                return
+
+            backup_note = f"\nBackup: `{stats.get('remote_backup')}`" if stats.get("remote_backup") else ""
+            await status_msg.edit(
+                content=(
+                    "✅ **RSAdminBot update staged.**\n"
+                    f"{backup_note}\n"
+                    "Restarting RSAdminBot now to apply...\n"
+                    "```"
+                    f"\nStaging dir: {stats.get('staging_dir','')}"
+                    "\n```"
+                )[:1900]
+            )
+            if should_post_progress:
+                await self._post_or_edit_progress(
+                    progress_msg,
+                    f"[selfupdate] RSAdminBot staged\nBackup: {stats.get('remote_backup','')}\nRestarting service to apply.",
+                )
+
+            # Restart after sending the message. This will terminate the current process.
+            try:
+                subprocess.run(["sudo", "systemctl", "restart", "mirror-world-rsadminbot.service"], timeout=10)
+            except Exception:
+                # If restart fails, we can't reliably report it here because the process may already be terminating.
+                pass
+            return
+
+        @self.bot.command(name="updatetest")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def updatetest(ctx):
+            """Test sync pipeline using UpdateTest folder (admin only).
+
+            This runs the same tar+scp+extract flow as botupdate, but targets a dedicated test folder.
+            """
+            ssh_ok, error_msg = self._check_ssh_available()
+            if not ssh_ok:
+                await ctx.send(f"❌ SSH not configured: {error_msg}")
+                return
+
+            cfg = self.config.get("update_test") or {}
+            folder = (cfg.get("folder") or "UpdateTest").strip()
+            include_globs = cfg.get("include_globs") or ["*"]
+            exclude_globs = cfg.get("exclude_globs")  # optional
+
+            # Ensure local folder exists
+            local_path = (self.base_path.parent / folder).resolve()
+            local_path.mkdir(parents=True, exist_ok=True)
+            marker = local_path / "last_update_test.txt"
+            marker.write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+
+            status_msg = await ctx.send(
+                f"🧪 **UpdateTest sync**\n"
+                f"Local folder: `{local_path}`\n"
+                "```\nSyncing...\n```"
+            )
+            should_post_progress = not (await self._is_progress_channel(ctx.channel))
+            progress_msg = None
+            if should_post_progress:
+                progress_msg = await self._post_or_edit_progress(
+                    None,
+                    f"[updatetest] START\nLocal: {local_path}\nRequested by: {ctx.author} ({ctx.author.id})",
+                )
+
+            success, stats = self._sync_bot_files(
+                folder,
+                "UpdateTest",
+                show_tree=True,
+                delete_remote_only=True,
+                manifest_include_globs=include_globs,
+                manifest_exclude_globs=exclude_globs,
+            )
+            if not success:
+                await status_msg.edit(content=f"❌ UpdateTest sync failed:\n```{stats.get('error','Unknown error')[:800]}```")
+                if should_post_progress:
+                    await self._post_or_edit_progress(
+                        progress_msg,
+                        f"[updatetest] FAILED\nError: {stats.get('error','Unknown error')[:500]}",
+                    )
+                return
+
+            backup_note = f"\nBackup: `{stats.get('remote_backup')}`" if stats.get("remote_backup") else ""
+            tar_note = f"\nTar entries: {stats.get('tar_entries_total')}" if stats.get("tar_entries_total") else ""
+            await status_msg.edit(
+                content=(
+                    "✅ **UpdateTest sync complete**\n"
+                    f"{backup_note}\n"
+                    f"{tar_note}\n"
+                    f"Local marker updated: `{marker.name}`\n"
+                    "Tip: edit/add files in the UpdateTest folder and rerun `!updatetest` to verify syncing."
+                )[:1900]
+            )
+            if stats.get("tar_entries_sample"):
+                sample = stats.get("tar_entries_sample") or []
+                await ctx.send(
+                    ("**Tar sample (first 10):**\n```" + "\n".join(str(x) for x in sample[:10]) + "```")[:1900]
+                )
+            if should_post_progress:
+                await self._post_or_edit_progress(
+                    progress_msg,
+                    f"[updatetest] COMPLETE\nBackup: {stats.get('remote_backup','')}\nRemote: /home/rsadmin/bots/mirror-world/{folder}",
+                )
+
+        @self.bot.command(name="systemcheck")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def systemcheck(ctx):
+            """Report where RSAdminBot is running and what execution mode it will use (admin only)."""
+            try:
+                os_name = os.name
+                plat = platform.platform()
+                cwd = os.getcwd()
+                remote_root = getattr(self, "remote_root", "")
+                remote_root_exists = bool(remote_root) and Path(remote_root).is_dir()
+                local_exec_cfg = (self.config.get("local_exec") or {}).get("enabled", True)
+                local_exec = self._should_use_local_exec()
+                server = self.current_server or {}
+                host = server.get("host", "")
+                user = server.get("user", "")
+                key = server.get("key", "")
+                key_exists = bool(key) and Path(str(key)).exists()
+
+                lines = [
+                    "🧭 **RSAdminBot System Check**",
+                    "```",
+                    f"os.name: {os_name}",
+                    f"platform: {plat}",
+                    f"cwd: {cwd}",
+                    f"remote_root: {remote_root or '(unset)'}",
+                    f"remote_root_exists: {remote_root_exists}",
+                    f"local_exec.config.enabled: {local_exec_cfg}",
+                    f"local_exec.active: {local_exec}",
+                    f"ssh.target: {user}@{host}" if host else "ssh.target: (none)",
+                    f"ssh.key: {key or '(none)'}",
+                    f"ssh.key.exists: {key_exists}",
+                    "```",
+                    "",
+                    "Decision:",
+                    f"- **Mode**: {'Ubuntu local-exec (no SSH key needed)' if local_exec else 'SSH mode (key required if not local)'}",
+                ]
+                await ctx.send("\n".join(lines)[:1900])
+            except Exception as e:
+                await ctx.send(f"❌ systemcheck failed: `{str(e)[:400]}`")
+
+        @self.bot.command(name="secretsstatus")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def secretsstatus(ctx, bot_name: str = None):
+            """Show which RS bots are missing config.secrets.json or required keys (admin only)."""
+            repo_root = self.base_path.parent.resolve()
+            bot_groups = self.config.get("bot_groups") or {}
+            rs_keys = ["rsadminbot"] + list(bot_groups.get("rs_bots") or [])
+            if bot_name:
+                key = bot_name.strip().lower()
+                if key not in rs_keys:
+                    await ctx.send(f"❌ Unknown/unsupported bot for secretsstatus: `{key}`")
+                    return
+                rs_keys = [key]
+
+            lines = ["🔐 **Secrets status (server-only files)**", "```"]
+            for key in rs_keys:
+                info = self.BOTS.get(key) or {}
+                folder = info.get("folder", key)
+                secrets_path = repo_root / folder / "config.secrets.json"
+                if not secrets_path.exists():
+                    lines.append(f"{key}: MISSING config.secrets.json")
+                    continue
+                try:
+                    data = json.loads(secrets_path.read_text(encoding="utf-8") or "{}")
+                except Exception as e:
+                    lines.append(f"{key}: INVALID JSON ({str(e)[:60]})")
+                    continue
+                missing = []
+                tok = (data.get("bot_token") or "").strip()
+                if (not tok) or is_placeholder_secret(tok):
+                    missing.append("bot_token")
+                # Bot-specific checks
+                if key == "rscheckerbot":
+                    inv = data.get("invite_tracking") or {}
+                    if not isinstance(inv, dict) or not (inv.get("ghl_api_key") or "").strip():
+                        missing.append("invite_tracking.ghl_api_key")
+                if missing:
+                    lines.append(f"{key}: MISSING {', '.join(missing)}")
+                else:
+                    lines.append(f"{key}: OK")
+            lines.append("```")
+            await ctx.send("\n".join(lines)[:1900])
+
+        @self.bot.command(name="rspids")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def rspids(ctx):
+            """Print RS bot service state + PID list (admin only)."""
+            if not self.service_manager:
+                await ctx.send("❌ Service manager not available.")
+                return
+
+            bot_groups = self.config.get("bot_groups") or {}
+            rs_keys = ["rsadminbot"] + list(bot_groups.get("rs_bots") or [])
+            lines = ["🧾 **RS Bots: state + PID**", "```"]
+            for key in rs_keys:
+                info = self.BOTS.get(key) or {}
+                svc = info.get("service", "")
+                name = info.get("name", key)
+                if not svc:
+                    lines.append(f"{key}: missing service mapping")
+                    continue
+                exists, state, _ = self.service_manager.get_status(svc, bot_name=key)
+                pid = self.service_manager.get_pid(svc) or 0
+                state_txt = state or "unknown"
+                prefix = "OK" if exists and state == "active" else "NO"
+                lines.append(f"{prefix} {name} ({key}) state={state_txt} pid={pid}")
+            lines.append("```")
+
+            msg = "\n".join(lines)[:1900]
+            await ctx.send(msg)
+            # Also mirror to the test-server progress channel if configured,
+            # but avoid double-posting if the command was run in that same channel.
+            try:
+                prog = await self._get_update_progress_channel()
+                if prog is None:
+                    return
+                if hasattr(prog, "id") and hasattr(ctx.channel, "id"):
+                    if int(getattr(prog, "id")) == int(getattr(ctx.channel, "id")):
+                        return
+                await prog.send(msg[:1900])
+            except Exception:
+                return
+
+        @self.bot.command(name="moneyflowcheck", aliases=["moneyflow", "mfc"])
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def moneyflowcheck(ctx):
+            """Run a production-safe health check for the money-flow bots (RSOnboarding + RSCheckerbot).
+
+            - No restarts
+            - Validates bot configs/secrets
+            - Validates runtime JSON files exist + are parseable + basic schema checks
+            - Prints service states
+            """
+            ssh_ok, error_msg = self._check_ssh_available()
+            if not ssh_ok:
+                await ctx.send(f"❌ SSH not configured: {error_msg}")
+                return
+
+            status_msg = await ctx.send("🧪 Running money-flow safety check on Ubuntu... (no restarts)")
+
+            remote_root = getattr(self, "remote_root", "/home/rsadmin/bots/mirror-world")
+            cmd = """
+set +e
+cd __REMOTE_ROOT__
+echo "=== moneyflowcheck ==="
+echo "cwd=$(pwd)"
+echo
+
+echo "[1/4] systemd status"
+systemctl is-active mirror-world-rsonboarding.service 2>/dev/null || true
+systemctl is-active mirror-world-rscheckerbot.service 2>/dev/null || true
+echo
+
+echo "[2/4] venv + discord.py sanity"
+if [ -x .venv/bin/python ]; then
+  echo "venv_python=OK"
+else
+  echo "venv_python=MISSING"
+fi
+cat > /tmp/mw_check_discord.py <<'PY'
+import discord
+print("discord_version", getattr(discord, "__version__", "<none>"))
+print("has_Color", hasattr(discord, "Color"))
+print("discord_file", getattr(discord, "__file__", None))
+PY
+.venv/bin/python /tmp/mw_check_discord.py 2>&1 | tail -n 20
+echo
+
+echo "[3/4] bot config checks"
+.venv/bin/python RSOnboarding/rs_onboarding_bot.py --check-config 2>&1 | tail -n 30
+.venv/bin/python RSCheckerbot/main.py --check-config 2>&1 | tail -n 30
+echo
+
+echo "[4/4] runtime JSON sanity"
+cat > /tmp/mw_check_runtime_json.py <<'PY'
+import json
+from pathlib import Path
+
+root = Path("/home/rsadmin/bots/mirror-world")
+
+def _load_json(path: Path):
+    try:
+        if not path.exists():
+            return None, "missing"
+        if path.stat().st_size == 0:
+            return {}, "empty"
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f), "ok"
+    except Exception as e:
+        return None, f"error:{type(e).__name__}:{e}"
+
+def _print(name: str, status: str, extra: str = ""):
+    line = f"{name}: {status}"
+    if extra:
+        line += f" | {extra}"
+    print(line)
+
+# RSOnboarding tickets.json
+onb_dir = root / "RSOnboarding"
+cfg, cfg_status = _load_json(onb_dir / "config.json")
+tickets_name = "tickets.json"
+if isinstance(cfg, dict):
+    tickets_name = str(cfg.get("tickets_file") or "tickets.json")
+tickets, t_status = _load_json(onb_dir / tickets_name)
+if t_status.startswith("error") or t_status == "missing":
+    _print(f"RSOnboarding/{tickets_name}", t_status)
+else:
+    count = len(tickets) if isinstance(tickets, dict) else 0
+    bad = 0
+    if isinstance(tickets, dict):
+        for k, v in list(tickets.items())[:2000]:
+            if not isinstance(k, str):
+                bad += 1
+                continue
+            if not isinstance(v, dict):
+                bad += 1
+                continue
+            if not isinstance(v.get("channel_id"), int):
+                bad += 1
+            if not isinstance(v.get("opened_at"), (int, float)):
+                bad += 1
+    _print(f"RSOnboarding/{tickets_name}", t_status, f"entries={count}, schema_bad={bad}")
+
+# RSCheckerbot queue/registry/invites
+chk_dir = root / "RSCheckerbot"
+for filename in ("queue.json", "registry.json", "invites.json"):
+    data, s = _load_json(chk_dir / filename)
+    if s.startswith("error") or s == "missing":
+        _print(f"RSCheckerbot/{filename}", s)
+        continue
+    entries = 0
+    if isinstance(data, dict):
+        # invites.json stores under {"invites": {...}}
+        if filename == "invites.json" and isinstance(data.get("invites"), dict):
+            entries = len(data.get("invites") or {})
+        else:
+            entries = len(data)
+    _print(f"RSCheckerbot/{filename}", s, f"entries={entries}")
+PY
+.venv/bin/python /tmp/mw_check_runtime_json.py 2>&1 | tail -n 50
+"""
+            cmd = cmd.replace("__REMOTE_ROOT__", shlex.quote(remote_root))
+            ok, stdout, stderr = self._execute_ssh_command(cmd, timeout=60)
+            output = (stdout or stderr or "").strip()
+            if not output:
+                output = "(no output)"
+            if len(output) > 1800:
+                output = output[-1800:]
+                output = "…(truncated)…\n" + output
+
+            header = "✅ moneyflowcheck complete" if ok else "⚠️ moneyflowcheck completed with warnings/errors"
+            await status_msg.edit(content=f"{header}\n```{output}```")
+        self.registered_commands.append(("moneyflowcheck", "Money-flow safety check (RSOnboarding + RSCheckerbot)", True))
+
+        @self.bot.command(name="codehash")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def codehash(ctx, bot_name: str = ""):
+            """Show sha256 hashes of key bot files on Ubuntu for quick 'what code is running' proof."""
+            ssh_ok, error_msg = self._check_ssh_available()
+            if not ssh_ok:
+                await ctx.send(f"❌ SSH not configured: {error_msg}")
+                return
+
+            bot_key = (bot_name or "").strip().lower()
+            if bot_key not in ("rsonboarding", "rscheckerbot", "all"):
+                await ctx.send("Usage: `!codehash rsonboarding` | `!codehash rscheckerbot` | `!codehash all`")
+                return
+
+            remote_root = getattr(self, "remote_root", "/home/rsadmin/bots/mirror-world")
+            targets = []
+            if bot_key in ("rsonboarding", "all"):
+                targets.extend([
+                    "RSOnboarding/rs_onboarding_bot.py",
+                    "RSOnboarding/config.json",
+                    "RSOnboarding/messages.json",
+                ])
+            if bot_key in ("rscheckerbot", "all"):
+                targets.extend([
+                    "RSCheckerbot/main.py",
+                    "RSCheckerbot/config.json",
+                    "RSCheckerbot/messages.json",
+                ])
+
+            quoted_files = " ".join(shlex.quote(p) for p in targets)
+            cmd = f"""
+set +e
+cd {shlex.quote(remote_root)}
+echo "=== codehash ({bot_key}) ==="
+sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
+"""
+            ok, stdout, stderr = self._execute_ssh_command(cmd, timeout=30)
+            output = (stdout or stderr or "").strip() or "(no output)"
+            if len(output) > 1800:
+                output = output[-1800:]
+                output = "…(truncated)…\n" + output
+            await ctx.send(f"```{output}```")
+        self.registered_commands.append(("codehash", "Show sha256 hashes of bot files on Ubuntu", True))
+
+        @self.bot.command(name="fileview")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def fileview(ctx, bot_name: str = "", mode: str = ""):
+            """Show size + last-modified time for .py and config/message json files (admin only).
+
+            Usage:
+              !fileview rsadminbot
+              !fileview rscheckerbot
+              !fileview UpdateTest
+              !fileview rscheckerbot alljson
+            """
+            target = (bot_name or "").strip()
+            if not target:
+                await ctx.send("Usage: `!fileview rsadminbot` | `!fileview rscheckerbot` | `!fileview UpdateTest` | `!fileview rscheckerbot alljson`")
+                return
+
+            key = target.strip().lower()
+            folder = None
+            if key in self.BOTS:
+                folder = (self.BOTS.get(key) or {}).get("folder")
+            elif key in ("updatetest", "update_test"):
+                folder = "UpdateTest"
+            else:
+                folder = target  # allow raw folder name
+
+            repo_root = self.base_path.parent.resolve()
+            base = (repo_root / folder).resolve()
+            if not base.exists():
+                await ctx.send(f"❌ Folder not found on disk: `{base}`")
+                return
+
+            include_globs = ["*.py", "config.json", "messages.json", "vouch_config.json"]
+            if (mode or "").strip().lower() == "alljson":
+                include_globs.append("*.json")
+
+            try:
+                mf = rs_generate_manifest(repo_root, bot_folders=[folder], include_globs=include_globs, exclude_globs=list(RS_DEFAULT_EXCLUDE_GLOBS))
+            except Exception as e:
+                await ctx.send(f"❌ Failed to generate file list: `{str(e)[:200]}`")
+                return
+
+            files_map = ((mf.get("files") or {}).get(folder) or {})
+            rels = [r for r in files_map.keys() if not str(r).startswith("__")]
+            rels.sort()
+            if not rels:
+                await ctx.send(f"⚠️ No matching files in `{folder}` for include={include_globs}")
+                return
+
+            from datetime import timezone
+            rows = []
+            for rel in rels:
+                p = base / rel
+                try:
+                    st = p.stat()
+                    m = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+                    rows.append((rel, st.st_size, m))
+                except Exception:
+                    rows.append((rel, -1, "stat_error"))
+
+            header = f"=== fileview ({folder}) include={','.join(include_globs)} ==="
+            lines = [header, "relpath | bytes | mtime_utc", "-" * 72]
+            for rel, size, m in rows:
+                s = "?" if size < 0 else str(size)
+                lines.append(f"{rel} | {s} | {m}")
+
+            out = "\n".join(lines)
+            if len(out) > 1850:
+                # Truncate but keep tail so newest filenames still show
+                out = "…(truncated)…\n" + out[-1850:]
+            await ctx.send(f"```{out}```")
+        self.registered_commands.append(("fileview", "Show file sizes + mtimes for bot code/config files", True))
+
+        @self.bot.command(name="deploy")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def deploy(ctx, archive_path: str = None):
+            """Deploy a server-side uploaded archive, refresh venv + systemd units, and restart bots (admin only).
+            
+            Usage:
+              !deploy /tmp/mirror-world.tar.gz
+            """
+            ssh_ok, error_msg = self._check_ssh_available()
+            if not ssh_ok:
+                await ctx.send(f"❌ SSH not configured: {error_msg}")
+                return
+            
+            if not archive_path:
+                await ctx.send("❌ Please provide the archive path on the Ubuntu server.\nExample: `!deploy /tmp/mirror-world.tar.gz`")
+                return
+            
+            status_msg = await ctx.send(f"📦 **Deploying archive...**\n```\nChecking: {archive_path}\n```")
+            
+            # Validate archive exists on remote
+            check_cmd = f"test -f {shlex.quote(archive_path)} && echo OK || echo MISSING"
+            ok, stdout, stderr = self._execute_ssh_command(check_cmd, timeout=10)
+            if not ok or "OK" not in (stdout or ""):
+                await status_msg.edit(content=f"❌ Archive not found on server:\n```{archive_path}```")
+                return
+            
+            # Canonical deploy path: deploy_apply (deploy_unpack + venv + systemd).
+            # This avoids "messed up" states where code updates land but the shared venv is missing dependencies.
+            await status_msg.edit(content="📦 **Deploying archive...**\n```\nApplying deploy (code + venv + systemd)...\n```")
+            success, out, err = self._execute_sh_script("botctl.sh", "deploy_apply", archive_path)
+            if not success:
+                error_text = (err or out or "Unknown error")[:800]
+                await status_msg.edit(content=f"❌ Deploy failed:\n```{error_text}```")
+                return
+            
+            # Restart all bots except RSAdminBot (restarting rsadminbot from within itself is disruptive)
+            await status_msg.edit(content="📦 **Deploying archive...**\n```\nRestarting bots (excluding rsadminbot)...\n```")
+            restarted = []
+            failed = []
+            if not self.service_manager:
+                await status_msg.edit(content="⚠️ Deploy applied, but ServiceManager is not available to restart bots. Use `bash botctl.sh restart all` on the server.")
+                return
+            
+            for bot_key, bot_info in self.BOTS.items():
+                if bot_key == "rsadminbot":
+                    continue
+                service_name = bot_info.get("service", "")
+                ok_restart, stdout_r, stderr_r = self.service_manager.restart(service_name, bot_name=bot_key)
+                if ok_restart:
+                    restarted.append(bot_key)
+                else:
+                    failed.append(f"{bot_key}: {(stderr_r or stdout_r or 'Unknown error')[:80]}")
+            
+            summary_lines = []
+            summary_lines.append(f"✅ Deploy applied: {archive_path}")
+            summary_lines.append(f"✅ Restarted: {', '.join(restarted) if restarted else 'none'}")
+            if failed:
+                summary_lines.append("⚠️ Restart failures:")
+                summary_lines.extend(f"- {line}" for line in failed[:10])
+            summary_lines.append("")
+            summary_lines.append("Next: run `!restart` if you want to restart RSAdminBot too.")
+            await status_msg.edit(content="\n".join(summary_lines)[:1900])
+        
+        @self.bot.command(name="ssh")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def ssh_cmd(ctx, *, command: str):
+            """Execute SSH command (admin only)"""
+            ssh_ok, error_msg = self._check_ssh_available()
+            if not ssh_ok:
+                await ctx.send(f"❌ SSH not configured: {error_msg}")
+                return
+            
+            # Log to terminal
+            guild_name = ctx.guild.name if ctx.guild else "DM"
+            guild_id = ctx.guild.id if ctx.guild else 0
+            print(f"{Colors.CYAN}[Command] SSH command requested by: {ctx.author} ({ctx.author.id}){Colors.RESET}")
+            print(f"{Colors.CYAN}[Command] Server: {guild_name} (ID: {guild_id}){Colors.RESET}")
+            print(f"{Colors.YELLOW}[SSH] Executing: {command}{Colors.RESET}")
+            await ctx.send(f"🔄 Executing command...")
+            
+            success, stdout, stderr = self._execute_ssh_command(command, timeout=60)
+            
+            # Log output to terminal
+            if stdout:
+                print(f"{Colors.CYAN}[SSH Output] {stdout[:500]}{Colors.RESET}")
+            if stderr:
+                print(f"{Colors.YELLOW}[SSH Error] {stderr[:500]}{Colors.RESET}")
+            print(f"{Colors.GREEN if success else Colors.RED}[SSH] Command {'succeeded' if success else 'failed'}{Colors.RESET}")
+            
+            embed = discord.Embed(
+                title="🔧 SSH Command Result",
+                color=discord.Color.green() if success else discord.Color.red(),
+                timestamp=datetime.now()
+            )
+            
+            embed.add_field(name="Command", value=f"```{command[:200]}```", inline=False)
+            
+            output = stdout or stderr or "No output"
+            if len(output) > 1000:
+                output = output[:1000] + "..."
+            embed.add_field(name="Output", value=f"```{output}```", inline=False)
+            
+            await ctx.send(embed=embed)
+        
+        @self.bot.command(name="botscan")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def botscan(ctx, scope: str = "all"):
+            """Scan and compare bots (local and remote) with file tree view (admin only)
+            
+            Usage:
+                !botscan          - Scan both local and remote with detailed file tree
+                !botscan local    - Scan local only
+                !botscan remote   - Scan remote only
+            """
+            status_msg = await ctx.send("🔍 **Scanning bots...**\n```\nInitializing scan...\n```")
+            
+            try:
+                # Determine scan scope
+                scan_local = scope.lower() in ["all", "local", ""]
+                scan_remote = scope.lower() in ["all", "remote"]
+                
+                local_bots = {}
+                remote_bots = {}
+                file_tree_data = {}  # Store file trees for detailed report
+                
+                # Scan local bots
+                if scan_local:
+                    if not INSPECTOR_AVAILABLE or not self.inspector:
+                        await status_msg.edit(content="❌ Bot inspector not available for local scan")
+                        return
+                    
+                    await status_msg.edit(content="🔍 **Scanning bots...**\n```\nScanning local bots and building file trees...\n```")
+                    self.inspector.discover_bots()
+                    local_bots_list = self.inspector.get_all_bots_summary()
+                    local_bots = {bot['key']: bot for bot in local_bots_list}
+                
+                # Scan remote bots
+                if scan_remote:
+                    ssh_ok, error_msg = self._check_ssh_available()
+                    if not ssh_ok:
+                        await status_msg.edit(content=f"❌ SSH not configured: {error_msg}")
+                        return
+                    
+                    await status_msg.edit(content="🔍 **Scanning bots...**\n```\nScanning remote bots and building file trees...\n```")
+                    remote_user = self.current_server.get("user", "rsadmin")
+                    remote_base = f"/home/{remote_user}/bots/mirror-world"
+                    
+                    # Scan for bot folders
+                    scan_cmd = f"cd {remote_base} && find . -maxdepth 1 -type d -name 'RS*' -exec basename {{}} \\; | sort"
+                    success, stdout, stderr = self._execute_ssh_command(scan_cmd)
+                    
+                    if success:
+                        bot_folders = [line.strip() for line in stdout.strip().split('\n') if line.strip()]
+                        
+                        for folder in bot_folders:
+                            # Map folder to bot key
+                            bot_key = folder.lower().replace("rs", "rs").replace("bot", "bot")
+                            # Try to match with BOTS dict
+                            matched_key = None
+                            for key, info in self.BOTS.items():
+                                if info.get("folder", "").lower() == folder.lower():
+                                    matched_key = key
+                                    break
+                            
+                            if not matched_key:
+                                matched_key = bot_key
+                            
+                            # Get folder size
+                            size_cmd = f"du -sh {remote_base}/{folder} 2>/dev/null | cut -f1"
+                            success_size, size_output, _ = self._execute_ssh_command(size_cmd)
+                            size = size_output.strip() if success_size else "Unknown"
+                            
+                            # Check service status
+                            service_name = f"mirror-world-{matched_key}.service"
+                            check_cmd = f"systemctl list-unit-files {service_name} 2>/dev/null | grep -q {service_name} && echo 'exists' || echo 'missing'"
+                            success_svc, output_svc, _ = self._execute_ssh_command(check_cmd)
+                            service_status = "✅" if "exists" in output_svc else "❌"
+                            
+                            remote_bots[matched_key] = {
+                                "key": matched_key,
+                                "name": folder,
+                                "folder": folder,
+                                "size": size,
+                                "service_status": service_status,
+                                "exists": True
+                            }
+                
+                # Build detailed file trees for each bot (like Phase 4 does)
+                await status_msg.edit(content="🔍 **Scanning bots...**\n```\nBuilding detailed file tree comparisons...\n```")
+                all_bot_keys = set(local_bots.keys()) | set(remote_bots.keys())
+                
+                if scan_local and scan_remote:
+                    remote_user = self.current_server.get("user", "rsadmin")
+                    remote_base = f"/home/{remote_user}/bots/mirror-world"
+                    
+                    for bot_key in sorted(all_bot_keys):
+                        local_bot = local_bots.get(bot_key)
+                        remote_bot = remote_bots.get(bot_key)
+                        
+                        local_tree = {}
+                        remote_tree = {}
+                        
+                        # Build local file tree if bot exists locally
+                        # Use BOTS dict to get correct folder path (canonical source)
+                        if local_bot:
+                            # Get folder from BOTS dict (canonical source) instead of inspector path
+                            bot_info_canonical = self.BOTS.get(bot_key)
+                            if bot_info_canonical:
+                                folder_name = bot_info_canonical.get("folder", "")
+                                if folder_name:
+                                    # Resolve path correctly: project_root / folder_name
+                                    if bot_key == "rsadminbot" or folder_name == "RSAdminBot":
+                                        bot_path = self.base_path  # RSAdminBot is self-contained
+                                    else:
+                                        bot_path = self.base_path.parent / folder_name
+                                    
+                                    # Validate path - ensure it's the correct bot folder
+                                    bot_path = bot_path.resolve()
+                                    expected_folder_name = bot_path.name
+                                    if expected_folder_name != folder_name:
+                                        print(f"{Colors.YELLOW}[BotScan] Warning: Path mismatch for {bot_key}: expected {folder_name}, got {expected_folder_name}{Colors.RESET}")
+                                        continue
+                                    
+                                    if bot_path.exists() and bot_path.is_dir():
+                                        print(f"{Colors.CYAN}[BotScan] Scanning local: {bot_path}{Colors.RESET}")
+                                        local_tree = self._build_file_tree(bot_path)
+                        
+                        # Build remote file tree if bot exists remotely
+                        if remote_bot and scan_remote:
+                            bot_remote_path = f"{remote_base}/{remote_bot.get('folder', '')}"
+                            remote_tree = self._build_remote_file_tree(bot_remote_path)
+                        
+                        # Store tree data for report
+                        if local_tree or remote_tree:
+                            file_tree_data[bot_key] = {
+                                "local_tree": local_tree,
+                                "remote_tree": remote_tree,
+                                "local_bot": local_bot,
+                                "remote_bot": remote_bot
+                            }
+                
+                # Build comparison embed (summary)
+                embed = self._create_info_embed(
+                    title="🔍 Bot Scan Results",
+                    description="Local and Remote Bot Comparison"
+                )
+                
+                if not all_bot_keys:
+                    embed.description = "No bots found"
+                    await status_msg.edit(content="", embed=embed)
+                    return
+                
+                # Build comparison list
+                comparison_lines = []
+                for bot_key in sorted(all_bot_keys):
+                    local_bot = local_bots.get(bot_key)
+                    remote_bot = remote_bots.get(bot_key)
+                    
+                    # Determine status indicators
+                    local_status = "✅" if local_bot else "❌"
+                    remote_status = "✅" if remote_bot else "❌"
+                    
+                    # Get bot name
+                    bot_name = local_bot.get('name') if local_bot else (remote_bot.get('name') if remote_bot else bot_key)
+                    
+                    # Build info line
+                    info_parts = [f"{local_status}/{remote_status} **{bot_name}** (`{bot_key}`)"]
+                    
+                    if local_bot:
+                        health_status = local_bot.get('health_status', 'unknown')
+                        health_emoji = {'excellent': '🟢', 'good': '🟡', 'fair': '🟠', 'poor': '🔴'}.get(health_status, '⚪')
+                        config_icon = "✅" if local_bot.get("has_config") else "⚠️"
+                        script_icon = "✅" if local_bot.get("script_exists") else "❌"
+                        info_parts.append(f"   Local: {health_emoji} {script_icon} Script | {config_icon} Config | 📁 {local_bot.get('size', 'Unknown')} | 📄 {local_bot.get('file_count', 0)} files")
+                    
+                    if remote_bot:
+                        svc_status = remote_bot.get('service_status', '❓')
+                        # Count remote files if we have tree data
+                        remote_file_count = 0
+                        if bot_key in file_tree_data:
+                            remote_tree = file_tree_data[bot_key].get("remote_tree", {})
+                            remote_file_count = sum(1 for k, v in self._count_files_recursive(remote_tree).items() if not k.endswith('/'))
+                        info_parts.append(f"   Remote: {svc_status} Service | 📁 {remote_bot.get('size', 'Unknown')}" + (f" | 📄 {remote_file_count} files" if remote_file_count > 0 else ""))
+                    
+                    comparison_lines.append("\n".join(info_parts))
+                
+                embed.description = "\n\n".join(comparison_lines)
+                
+                # Add summary footer
+                local_count = len(local_bots)
+                remote_count = len(remote_bots)
+                footer_text = f"Local: {local_count} | Remote: {remote_count}"
+                if scan_local and scan_remote:
+                    footer_text += " | 🟢=Excellent 🟡=Good 🟠=Fair 🔴=Poor"
+                embed.set_footer(text=footer_text)
+                
+                await status_msg.edit(content="", embed=embed)
+                
+                # Generate detailed file tree report and show in terminal (like Phase 4)
+                if file_tree_data and scan_local and scan_remote:
+                    await status_msg.edit(content="📄 **Generating detailed file tree report...**\n```\nBuilding comprehensive file tree comparison...\n```")
+                    
+                    # Print to terminal (same format as Phase 4)
+                    print(f"\n{Colors.CYAN}{'='*80}{Colors.RESET}")
+                    print(f"{Colors.BOLD}{Colors.CYAN}📁 Bot Scan - File Tree Comparison{Colors.RESET}")
+                    print(f"{Colors.CYAN}{'='*80}{Colors.RESET}\n")
+                    
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    report_filename = f"botscan_filetree_{timestamp}.txt"
+                    report_path = self.base_path / report_filename
+                    
+                    report_lines = []
+                    report_lines.append("="*80)
+                    report_lines.append("Bot Scan - Detailed File Tree Comparison")
+                    report_lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                    report_lines.append(f"Requested by: {ctx.author} ({ctx.author.id})")
+                    report_lines.append("="*80)
+                    report_lines.append("")
+                    
+                    import re
+                    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+                    
+                    for bot_key in sorted(file_tree_data.keys()):
+                        tree_info = file_tree_data[bot_key]
+                        local_bot = tree_info.get("local_bot")
+                        remote_bot = tree_info.get("remote_bot")
+                        local_tree = tree_info.get("local_tree", {})
+                        remote_tree = tree_info.get("remote_tree", {})
+                        
+                        bot_name = local_bot.get('name') if local_bot else (remote_bot.get('name') if remote_bot else bot_key)
+                        
+                        # Count files
+                        local_file_count = sum(1 for k, v in self._count_files_recursive(local_tree).items() if not k.endswith('/'))
+                        remote_file_count = sum(1 for k, v in self._count_files_recursive(remote_tree).items() if not k.endswith('/'))
+                        
+                        # Print to terminal
+                        print(f"{Colors.CYAN}{'='*80}{Colors.RESET}")
+                        print(f"{Colors.BOLD}{Colors.CYAN}Bot: {bot_name} ({bot_key}){Colors.RESET}")
+                        print(f"{Colors.CYAN}{'='*80}{Colors.RESET}")
+                        print(f"{Colors.GREEN}Local files: {local_file_count} | Remote files: {remote_file_count}{Colors.RESET}\n")
+                        
+                        # Render tree comparison (same as Phase 4)
+                        tree_lines = self._render_tree_comparison(local_tree, remote_tree)
+                        
+                        # Print tree to terminal (with colors)
+                        print(f"{Colors.BOLD}{Colors.CYAN}📊 File Tree Comparison (Local vs Remote){Colors.RESET}\n")
+                        for line in tree_lines:
+                            print(line)
+                        print()  # Blank line after tree
+                        
+                        # For report file - check if combined tree is too large, split if needed
+                        report_lines.append("")
+                        report_lines.append("="*80)
+                        report_lines.append(f"Bot: {bot_name} ({bot_key})")
+                        report_lines.append("="*80)
+                        report_lines.append("")
+                        report_lines.append(f"Local files: {local_file_count} | Remote files: {remote_file_count}")
+                        report_lines.append("")
+                        
+                        # Check if combined tree is too large (estimate ~100 chars per line)
+                        combined_tree_size = len('\n'.join(tree_lines))
+                        MAX_COMBINED_SIZE = 50000  # Split if larger than ~50KB (safe for file, but split for readability)
+                        
+                        if combined_tree_size > MAX_COMBINED_SIZE and local_tree and remote_tree:
+                            # Split into local and remote sections for better readability
+                            report_lines.append("File Tree - LOCAL:")
+                            report_lines.append("")
+                            local_only_lines = self._render_tree_comparison(local_tree, {})
+                            for line in local_only_lines:
+                                clean_line = ansi_escape.sub('', line)
+                                report_lines.append(clean_line)
+                            
+                            report_lines.append("")
+                            report_lines.append("")
+                            report_lines.append("File Tree - REMOTE:")
+                            report_lines.append("")
+                            remote_only_lines = self._render_tree_comparison({}, remote_tree)
+                            for line in remote_only_lines:
+                                clean_line = ansi_escape.sub('', line)
+                                report_lines.append(clean_line)
+                        else:
+                            # Combined view fits, use it
+                            report_lines.append("File Tree Comparison (Local vs Remote):")
+                            report_lines.append("")
+                            for line in tree_lines:
+                                clean_line = ansi_escape.sub('', line)
+                                report_lines.append(clean_line)
+                    
+                    # Write report file
+                    with open(report_path, 'w', encoding='utf-8') as f:
+                        f.write('\n'.join(report_lines))
+                    print(f"{Colors.GREEN}✓ File tree report saved: {report_path}{Colors.RESET}\n")
+                    
+                    # Send report file (split into multiple files if too large for Discord)
+                    try:
+                        # Discord file size limit is 25MB, but text files are usually much smaller
+                        # However, Discord message character limit is 2000, so we just send the file
+                        with open(report_path, 'rb') as f:
+                            report_file = discord.File(f, filename=report_filename)
+                            
+                            # Check if there are discrepancies that need updating
+                            bots_with_discrepancies = []
+                            for bot_key, tree_info in file_tree_data.items():
+                                local_tree = tree_info.get("local_tree", {})
+                                remote_tree = tree_info.get("remote_tree", {})
+                                
+                                # Use same logic as _sync_bot_files to detect discrepancies
+                                files_to_sync = []
+                                
+                                def collect_sync_files(local: Dict, remote: Dict, rel_path: str = ""):
+                                    """Recursively collect files that need syncing"""
+                                    all_keys = set(local.keys()) | set(remote.keys())
+                                    for key in all_keys:
+                                        current_path = f"{rel_path}/{key}" if rel_path else key
+                                        
+                                        if key.endswith('/'):
+                                            # Directory - recurse
+                                            collect_sync_files(local.get(key, {}), remote.get(key, {}), current_path.rstrip('/'))
+                                        else:
+                                            # File
+                                            local_exists = key in local
+                                            remote_exists = key in remote
+                                            
+                                            if local_exists:
+                                                local_info = local[key]
+                                                local_sha = local_info.get("sha") if isinstance(local_info, dict) else None
+                                                local_size = local_info.get('size', 0) if isinstance(local_info, dict) else 0
+                                                
+                                                if not remote_exists:
+                                                    # Missing on remote - needs sync
+                                                    files_to_sync.append(current_path)
+                                                else:
+                                                    # Exists on both - prefer sha compare
+                                                    remote_info = remote[key]
+                                                    remote_sha = remote_info.get("sha") if isinstance(remote_info, dict) else None
+                                                    remote_size = remote_info.get('size', 0) if isinstance(remote_info, dict) else 0
+                                                    if local_sha is not None and remote_sha is not None:
+                                                        if local_sha != remote_sha:
+                                                            files_to_sync.append(current_path)
+                                                    else:
+                                                        if local_size != remote_size:
+                                                            files_to_sync.append(current_path)
+                                
+                                collect_sync_files(local_tree, remote_tree)
+                                
+                                if files_to_sync:
+                                    bots_with_discrepancies.append(bot_key)
+                            
+                            # Create sync/restart prompt if there are discrepancies
+                            if bots_with_discrepancies and scan_local and scan_remote:
+                                view = BotSyncRestartPromptView(self, bots_with_discrepancies, ctx.author.id)
+                                embed = discord.Embed(
+                                    title="📦 Sync & Restart Bots?",
+                                    description=(
+                                        f"Found discrepancies in {len(bots_with_discrepancies)} bot(s):\n"
+                                        f"`{', '.join(bots_with_discrepancies)}`\n\n"
+                                        "**What will be synced:**\n"
+                                        "• All `.py` files\n"
+                                        "• `config.json` and `messages.json`\n"
+                                        "• All documentation files (`.md`, `.txt`)\n"
+                                        "• Other non-data files\n\n"
+                                        "**What will NOT be synced:**\n"
+                                        "• Data files (`.db`, `.log`, `tickets.json`, `registry.json`, etc.)\n"
+                                        "• Runtime files\n\n"
+                                        "**Restart Sequence (if selected):**\n"
+                                        "1. Sync all bots\n"
+                                        "2. Restart all bots (except RSAdminBot)\n"
+                                        "3. Restart RSAdminBot (if needed)\n\n"
+                                        "Choose an option:"
+                                    ),
+                                    color=discord.Color.blue()
+                                )
+                                await ctx.send(
+                                    "📄 **Detailed File Tree Report Generated**\n"
+                                    f"Local path: `{report_path}`\n"
+                                    "This report shows detailed file tree comparison for each bot, matching the format shown during bot startup (Phase 4).\n"
+                                    "The file tree is also displayed in the terminal.",
+                                    file=report_file,
+                                    embed=embed,
+                                    view=view
+                                )
+                            else:
+                                await ctx.send(
+                                    "📄 **Detailed File Tree Report Generated**\n"
+                                    f"Local path: `{report_path}`\n"
+                                    "This report shows detailed file tree comparison for each bot, matching the format shown during bot startup (Phase 4).\n"
+                                    "The file tree is also displayed in the terminal.",
+                                    file=report_file
+                                )
+                    except Exception as e:
+                        print(f"{Colors.YELLOW}[BotScan] ⚠️  Error sending file tree report: {str(e)[:200]}{Colors.RESET}")
+                
+            except Exception as e:
+                error_embed = self._create_error_embed(
+                    "Scan Error",
+                    str(e)[:500],
+                    "Check bot inspector and SSH configuration"
+                )
+                await status_msg.edit(content="", embed=error_embed)
+                import traceback
+                print(f"{Colors.RED}[BotScan] Error: {traceback.format_exc()[:500]}{Colors.RESET}")
+        
+        @self.bot.command(name="botinfo")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def botinfo(ctx, bot_name: str = None):
+            """Get detailed information about a bot (admin only)"""
+            if not INSPECTOR_AVAILABLE or not self.inspector:
+                await ctx.send("❌ Bot inspector not available")
+                return
+            
+            if not bot_name:
+                await ctx.send("❓ **Bot Name Required**\nPlease specify which bot to get information about.\nUse `!botscan` to see available bots or `!botlist` to see configured bots.")
+                return
+            
+            try:
+                bot_info = self.inspector.get_bot_info(bot_name)
+                
+                if not bot_info:
+                    await ctx.send(f"❌ Bot not found: {bot_name}\nUse `!botscan` to see available bots")
+                    return
+                
+                embed = discord.Embed(
+                    title=f"📊 {bot_info.get('name', 'Unknown')} Information",
+                    color=discord.Color.blue(),
+                    timestamp=datetime.now()
+                )
+                
+                # Basic info
+                size_bytes, size_formatted = self.inspector.get_bot_size(bot_name)
+                health = bot_info.get('health', {})
+                health_score = health.get('score', 0)
+                health_status = health.get('status', 'unknown')
+                
+                # Health status emoji
+                health_emoji = {
+                    'excellent': '🟢',
+                    'good': '🟡',
+                    'fair': '🟠',
+                    'poor': '🔴'
+                }.get(health_status, '⚪')
+                
+                embed.add_field(
+                    name="📁 Folder",
+                    value=f"`{bot_info.get('folder', 'Unknown')}`\n`{bot_info.get('path', 'Unknown')}`",
+                    inline=False
+                )
+                
+                # Script info (enhanced)
+                script_info = f"`{bot_info.get('script', 'Unknown')}`"
+                if bot_info.get('script_exists'):
+                    script_info += " ✅"
+                else:
+                    script_info += " ❌"
+                embed.add_field(
+                    name="📝 Script",
+                    value=script_info,
+                    inline=True
+                )
+                
+                embed.add_field(
+                    name="⚙️ Service",
+                    value=f"`{bot_info.get('service', 'Unknown')}`",
+                    inline=True
+                )
+                
+                embed.add_field(
+                    name="💾 Size",
+                    value=size_formatted,
+                    inline=True
+                )
+                
+                # Enhanced file info
+                file_info = f"📄 {bot_info.get('file_count', 0)} files"
+                python_count = bot_info.get('python_file_count', 0)
+                if python_count > 0:
+                    file_info += f"\n🐍 {python_count} Python files"
+                embed.add_field(
+                    name="📊 Files",
+                    value=file_info,
+                    inline=True
+                )
+                
+                # Health score
+                embed.add_field(
+                    name=f"{health_emoji} Health",
+                    value=f"**{health_score}/100** ({health_status})",
+                    inline=True
+                )
+                
+                # Last modified (enhanced)
+                last_mod = bot_info.get('last_modified', 'Unknown')
+                if last_mod and last_mod != 'Unknown':
+                    try:
+                        mod_time = datetime.fromisoformat(last_mod.replace('Z', '+00:00'))
+                        days_ago = (datetime.now() - mod_time.replace(tzinfo=None)).days
+                        last_mod_display = f"{mod_time.strftime('%Y-%m-%d')} ({days_ago}d ago)"
+                    except:
+                        last_mod_display = last_mod[:19] if len(last_mod) > 19 else last_mod
+                else:
+                    last_mod_display = 'Unknown'
+                
+                most_recent_file = bot_info.get('last_modified_file')
+                if most_recent_file:
+                    last_mod_display += f"\n📝 {most_recent_file['file']}"
+                
+                embed.add_field(
+                    name="🕒 Last Modified",
+                    value=last_mod_display,
+                    inline=True
+                )
+                
+                # Dependencies info
+                deps_info = []
+                if bot_info.get('has_requirements'):
+                    req_count = bot_info.get('requirements_count', 0)
+                    deps_info.append(f"✅ requirements.txt ({req_count} deps)")
+                else:
+                    deps_info.append("❌ No requirements.txt")
+                
+                if bot_info.get('has_readme'):
+                    deps_info.append("✅ README.md")
+                else:
+                    deps_info.append("❌ No README")
+                
+                embed.add_field(
+                    name="📦 Dependencies",
+                    value="\n".join(deps_info),
+                    inline=False
+                )
+                
+                # Config info (enhanced)
+                config = bot_info.get('config', {})
+                config_status = []
+                if bot_info.get('config_valid'):
+                    config_status.append("✅ Config valid")
+                    if bot_info.get('has_bot_token'):
+                        config_status.append("✅ Has bot token")
+                    else:
+                        config_status.append("⚠️ Missing bot token")
+                    
+                    config_keys = list(config.keys())[:5]
+                    config_preview = ", ".join(config_keys)
+                    if len(config.keys()) > 5:
+                        config_preview += f" (+{len(config.keys()) - 5} more)"
+                    config_status.append(f"Keys: `{config_preview}`")
+                else:
+                    config_status.append("❌ Config invalid or missing")
+                    if bot_info.get('config_error'):
+                        config_status.append(f"Error: {bot_info['config_error'][:50]}")
+                
+                    embed.add_field(
+                        name="⚙️ Config",
+                    value="\n".join(config_status),
+                        inline=False
+                    )
+                
+                await ctx.send(embed=embed)
+                
+            except Exception as e:
+                await ctx.send(f"❌ Error getting bot info: {str(e)[:500]}")
+        
+        @self.bot.command(name="botconfig")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def botconfig(ctx, bot_name: str = None):
+            """Get config.json for a bot in user-friendly format (admin only)"""
+            if not INSPECTOR_AVAILABLE or not self.inspector:
+                await ctx.send("❌ Bot inspector not available")
+                return
+            
+            if not bot_name:
+                await ctx.send("❓ **Bot Name Required**\nPlease specify which bot's config to view.\nUse `!botscan` to see available bots or `!botlist` to see configured bots.")
+                return
+            
+            try:
+                config = self.inspector.get_bot_config(bot_name)
+                
+                if not config:
+                    await ctx.send(f"❌ Bot not found or no config: {bot_name}")
+                    return
+                
+                # Get bot display name
+                bot_display_name = bot_name
+                if bot_name.lower() in self.BOTS:
+                    bot_display_name = self.BOTS[bot_name.lower()]["name"]
+                
+                embed = discord.Embed(
+                    title=f"⚙️ {bot_display_name} Configuration",
+                    color=discord.Color.blue(),
+                    timestamp=datetime.now()
+                )
+                
+                # Format config in user-friendly way
+                description_parts = []
+                
+                # Basic settings
+                if "bot_token" in config:
+                    embed.add_field(
+                        name="🔐 Authentication",
+                        value="✅ Token configured (hidden)",
+                        inline=False
+                    )
+                
+                if "guild_id" in config:
+                    guild_id = config["guild_id"]
+                    embed.add_field(
+                        name="🏠 Server ID",
+                        value=f"`{guild_id}`",
+                        inline=True
+                    )
+                
+                # Brand/Name
+                if "brand_name" in config:
+                    embed.add_field(
+                        name="🏷️ Brand Name",
+                        value=config["brand_name"],
+                        inline=True
+                    )
+                
+                # Channel IDs
+                channel_fields = []
+                if "log_channel_id" in config:
+                    channel_fields.append(f"📝 Log Channel: `{config['log_channel_id']}`")
+                if "forwarding_logs_channel_id" in config:
+                    channel_fields.append(f"📤 Forwarding Logs: `{config['forwarding_logs_channel_id']}`")
+                if "whop_logs_channel_id" in config:
+                    channel_fields.append(f"💳 Whop Logs: `{config['whop_logs_channel_id']}`")
+                if "ssh_commands_channel_id" in config:
+                    channel_fields.append(f"🖥️ SSH Commands: `{config['ssh_commands_channel_id']}`")
+                
+                if channel_fields:
+                    embed.add_field(
+                        name="📡 Channels",
+                        value="\n".join(channel_fields),
+                        inline=False
+                    )
+                
+                # Channels array (for forwarder, etc.)
+                if "channels" in config and isinstance(config["channels"], list):
+                    channels_info = []
+                    for i, channel in enumerate(config["channels"][:5], 1):  # Limit to 5
+                        source_name = channel.get("source_channel_name", "Unknown")
+                        source_id = channel.get("source_channel_id", "N/A")
+                        role_id = channel.get("role_mention", {}).get("role_id", "None")
+                        channels_info.append(f"**{i}. {source_name}**\n   Source: `{source_id}`\n   Role: `{role_id}`")
+                    
+                    if len(config["channels"]) > 5:
+                        channels_info.append(f"\n*... and {len(config['channels']) - 5} more channel(s)*")
+                    
+                    embed.add_field(
+                        name="🔄 Forwarding Channels",
+                        value="\n".join(channels_info),
+                        inline=False
+                    )
+                
+                # Invite tracking (for checker bot)
+                if "invite_tracking" in config:
+                    invite = config["invite_tracking"]
+                    invite_info = []
+                    if "invite_channel_id" in invite:
+                        invite_info.append(f"📨 Invite Channel: `{invite['invite_channel_id']}`")
+                    if "fallback_invite" in invite:
+                        invite_info.append(f"🔗 Fallback: `{invite['fallback_invite'][:50]}...`")
+                    if invite_info:
+                        embed.add_field(
+                            name="📨 Invite Tracking",
+                            value="\n".join(invite_info),
+                            inline=False
+                        )
+                
+                # DM Sequence (for checker bot)
+                if "dm_sequence" in config:
+                    dm = config["dm_sequence"]
+                    dm_info = []
+                    if "send_spacing_seconds" in dm:
+                        dm_info.append(f"⏱️ Spacing: {dm['send_spacing_seconds']}s")
+                    if "day_gap_hours" in dm:
+                        dm_info.append(f"📅 Day Gap: {dm['day_gap_hours']}h")
+                    if dm_info:
+                        embed.add_field(
+                            name="💬 DM Sequence",
+                            value="\n".join(dm_info),
+                            inline=True
+                        )
+                
+                # Tickets (for onboarding)
+                if "ticket_category_id" in config:
+                    embed.add_field(
+                        name="🎫 Tickets",
+                        value=f"Category: `{config['ticket_category_id']}`",
+                        inline=True
+                    )
+                
+                # Success channels (for success bot)
+                if "success_channel_ids" in config:
+                    count = len(config["success_channel_ids"]) if isinstance(config["success_channel_ids"], list) else 1
+                    embed.add_field(
+                        name="🏆 Success Channels",
+                        value=f"{count} channel(s) configured",
+                        inline=True
+                    )
+                
+                # Other important fields
+                other_fields = []
+                for key, value in config.items():
+                    if key not in ["bot_token", "guild_id", "brand_name", "log_channel_id", 
+                                  "forwarding_logs_channel_id", "whop_logs_channel_id",
+                                  "ssh_commands_channel_id", "channels", "invite_tracking",
+                                  "dm_sequence", "ticket_category_id", "success_channel_ids"]:
+                        if isinstance(value, (str, int, float, bool)):
+                            if len(str(value)) < 100:  # Only show short values
+                                other_fields.append(f"**{key.replace('_', ' ').title()}**: `{value}`")
+                
+                if other_fields:
+                    other_text = "\n".join(other_fields[:10])  # Limit to 10
+                    if len(other_fields) > 10:
+                        other_text += f"\n*... and {len(other_fields) - 10} more field(s)*"
+                    embed.add_field(
+                        name="⚙️ Other Settings",
+                        value=other_text,
+                        inline=False
+                    )
+                
+                embed.set_footer(text="Use !botconfig <bot> to view full config")
+                
+                await ctx.send(embed=embed)
+                
+            except Exception as e:
+                await ctx.send(f"❌ Error getting config: {str(e)[:500]}")
+
+        @self.bot.command(name="botmanifest")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def botmanifest(ctx):
+            """Generate a hashed file manifest for RS bots on the server (admin only).
+
+            This is designed for debugging "what files are on Ubuntu" without leaking secrets.
+            Pair it with the local command:
+              python scripts/rsbots_manifest.py --out local_manifest.json
+            Then upload your local manifest to Discord and run !botcompare with that attachment.
+            """
+            try:
+                import io
+                import json as _json
+                import sys as _sys
+                from pathlib import Path as _Path
+
+                repo_root = _Path(__file__).resolve().parents[1]
+                if str(repo_root) not in _sys.path:
+                    _sys.path.insert(0, str(repo_root))
+
+                from rsbots_manifest import generate_manifest  # type: ignore
+
+                manifest = generate_manifest(repo_root)
+                payload = _json.dumps(manifest, indent=2, ensure_ascii=False).encode("utf-8")
+                buf = io.BytesIO(payload)
+                buf.seek(0)
+
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                await ctx.send(
+                    content=f"✅ RS bots manifest generated (server) — `{ts}`",
+                    file=discord.File(buf, filename=f"rsbots_manifest_server_{ts}.json"),
+                )
+            except Exception as e:
+                await ctx.send(f"❌ Failed to generate manifest: {str(e)[:500]}")
+
+        @self.bot.command(name="botcompare")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def botcompare(ctx):
+            """Compare a user-uploaded local manifest against the server manifest (admin only).
+
+            Usage:
+              1) Locally: python scripts/rsbots_manifest.py --out local_manifest.json
+              2) Upload local_manifest.json in Discord
+              3) Run: !botcompare (in the same message thread / channel) with that attachment
+            """
+            try:
+                if not ctx.message.attachments:
+                    await ctx.send("❌ Attach your local manifest JSON (from scripts/rsbots_manifest.py) and run !botcompare again.")
+                    return
+
+                attachment = ctx.message.attachments[0]
+                if not attachment.filename.lower().endswith(".json"):
+                    await ctx.send("❌ Attachment must be a .json manifest file.")
+                    return
+
+                raw = await attachment.read()
+                local_manifest = json.loads(raw.decode("utf-8", errors="replace"))
+
+                import io
+                import json as _json
+                import sys as _sys
+                from pathlib import Path as _Path
+
+                repo_root = _Path(__file__).resolve().parents[1]
+                if str(repo_root) not in _sys.path:
+                    _sys.path.insert(0, str(repo_root))
+
+                from rsbots_manifest import compare_manifests, generate_manifest  # type: ignore
+
+                server_manifest = generate_manifest(repo_root)
+                diff = compare_manifests(local_manifest, server_manifest)
+
+                # Summarize counts
+                changed_total = 0
+                only_local_total = 0
+                only_remote_total = 0
+                for folder, data in (diff.get("folders") or {}).items():
+                    changed_total += len(data.get("changed") or [])
+                    only_local_total += len(data.get("only_local") or [])
+                    only_remote_total += len(data.get("only_remote") or [])
+
+                embed = discord.Embed(
+                    title="RS Bots Manifest Compare",
+                    description=(
+                        f"**Changed files:** {changed_total}\n"
+                        f"**Only in local manifest:** {only_local_total}\n"
+                        f"**Only on server:** {only_remote_total}\n\n"
+                        "Attach this diff JSON to investigate exact paths."
+                    ),
+                    color=discord.Color.blue(),
+                    timestamp=datetime.now(),
+                )
+
+                payload = _json.dumps(diff, indent=2, ensure_ascii=False).encode("utf-8")
+                buf = io.BytesIO(payload)
+                buf.seek(0)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                await ctx.send(
+                    embed=embed,
+                    file=discord.File(buf, filename=f"rsbots_manifest_diff_{ts}.json"),
+                )
+            except Exception as e:
+                await ctx.send(f"❌ Manifest compare failed: {str(e)[:500]}")
+        
+        # Whop tracking commands
+        @self.bot.command(name="whopscan")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def whopscan(ctx, limit: int = 2000, days: int = 30):
+            """Scan whop logs channel for membership events (admin only)"""
+            if not self.whop_tracker:
+                await ctx.send("❌ Whop tracker not available")
+                return
+            
+            # Send initial acknowledgment
+            status_msg = await ctx.send("🔍 **Scanning whop logs...**\n```\nInitializing scan...\n```")
+            
+            # Progress callback for real-time updates
+            async def progress_update(progress_dict):
+                """Update progress message"""
+                bar = progress_dict.get("bar", "")
+                pct = progress_dict.get("progress_pct", 0)
+                scanned = progress_dict.get("messages_scanned", 0)
+                total = progress_dict.get("limit", 0)
+                events = progress_dict.get("events_found", 0)
+                eta = progress_dict.get("eta_seconds", 0)
+                rate = progress_dict.get("rate", 0)
+                
+                eta_str = f"ETA: {eta}s" if eta > 0 else ""
+                rate_str = f"({rate:.1f} msg/s)" if rate > 0 else ""
+                
+                progress_text = f"🔍 **Scanning whop logs...**\n```\n[{bar}] {pct}% ({scanned}/{total}) {eta_str} {rate_str}\nEvents found: {events}\n```"
+                
+                try:
+                    await status_msg.edit(content=progress_text)
+                except:
+                    pass  # Ignore edit errors
+            
+            # Log to terminal
+            print(f"{Colors.CYAN}[Command] Starting whop scan (limit: {limit}, days: {days}){Colors.RESET}")
+            print(f"{Colors.CYAN}[Command] Requested by: {ctx.author} ({ctx.author.id}){Colors.RESET}")
+            
+            result = await self.whop_tracker.scan_whop_logs(limit=limit, lookback_days=days, progress_callback=progress_update)
+            
+            if "error" in result:
+                await status_msg.edit(content=f"❌ **Error:** {result['error']}")
+                return
+            
+            # Final result embed
+            embed = discord.Embed(title="✅ Whop Logs Scan Complete", color=0x5865F2)
+            embed.add_field(name="Messages Scanned", value=result.get("messages_scanned", 0), inline=True)
+            embed.add_field(name="Events Found", value=result.get("events_found", 0), inline=True)
+            embed.add_field(name="Scan Date", value=result.get("scan_date", "N/A")[:19], inline=False)
+            embed.add_field(name="Limit", value=result.get("limit", 0), inline=True)
+            embed.add_field(name="Lookback Days", value=result.get("lookback_days", 0), inline=True)
+            
+            # Terminal output
+            print(f"{Colors.GREEN}[WhopScan] Complete: {result.get('messages_scanned', 0)} messages, {result.get('events_found', 0)} events{Colors.RESET}")
+            
+            await status_msg.edit(content="", embed=embed)
+        
+        @self.bot.command(name="whopstats")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def whopstats(ctx):
+            """Get membership statistics (admin only)"""
+            if not self.whop_tracker:
+                await ctx.send("❌ Whop tracker not available")
+                return
+            
+            stats = self.whop_tracker.get_membership_stats()
+            
+            embed = discord.Embed(title="Membership Statistics", color=0x5865F2)
+            embed.add_field(name="Total Members", value=stats.get("total_members", 0))
+            embed.add_field(name="New Members", value=stats.get("new_members", 0))
+            embed.add_field(name="Renewals", value=stats.get("renewals", 0))
+            embed.add_field(name="Cancellations", value=stats.get("cancellations", 0))
+            embed.add_field(name="Active Memberships", value=stats.get("active_memberships", 0))
+            
+            if stats.get("avg_duration_days"):
+                embed.add_field(name="Avg Duration (days)", value=stats["avg_duration_days"])
+            
+            # Add note if database is empty
+            if stats.get("total_members", 0) == 0:
+                embed.add_field(
+                    name="ℹ️ Note",
+                    value="**Database is empty.** Run `!whopscan` first to scan the whop-logs channel and populate membership data.",
+                    inline=False
+                )
+            
+            embed.set_footer(text="Data source: whop_history.db | Run !whopscan to update")
+            await ctx.send(embed=embed)
+        
+        @self.bot.command(name="whophistory")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def whophistory(ctx, discord_id: str = None):
+            """Get user's membership history (admin only)"""
+            if not self.whop_tracker:
+                await ctx.send("❌ Whop tracker not available")
+                return
+            
+            if not discord_id:
+                await ctx.send("❓ Please provide a Discord ID: `!whophistory <discord_id>`")
+                return
+            
+            history = self.whop_tracker.get_user_history(discord_id)
+            
+            if not history.get("events"):
+                await ctx.send(f"❌ No membership history found for Discord ID: {discord_id}")
+                return
+            
+            embed = discord.Embed(
+                title=f"Membership History - {discord_id}",
+                color=0x5865F2
+            )
+            
+            embed.add_field(name="Total Events", value=history.get("total_events", 0))
+            embed.add_field(name="Total Periods", value=history.get("total_periods", 0))
+            
+            # Show recent events
+            recent_events = history.get("events", [])[-5:]
+            if recent_events:
+                events_text = "\n".join([
+                    f"**{e.get('event_type', 'unknown')}** - {e.get('timestamp', 'N/A')[:10]}"
+                    for e in recent_events
+                ])
+                embed.add_field(name="Recent Events", value=events_text, inline=False)
+            
+            # Show timeline
+            timeline = history.get("timeline", [])
+            if timeline:
+                timeline_text = "\n".join([
+                    f"**{t.get('status', 'unknown')}** - {t.get('duration_days', 'N/A')} days"
+                    for t in timeline[:3]
+                ])
+                embed.add_field(name="Timeline", value=timeline_text, inline=False)
+            
+            await ctx.send(embed=embed)
+        
+        # Bot movement tracking commands
+        @self.bot.command(name="botmovements")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def botmovements(ctx, bot_name: str = None, limit: int = 50):
+            """Show bot's activity log (admin only)"""
+            if not self.bot_movement_tracker:
+                error_embed = self._create_error_embed(
+                    "Bot Movement Tracker Not Available",
+                    "The bot movement tracker module is not loaded or initialized.",
+                    "Check bot startup logs for tracker initialization errors"
+                )
+                await self._send_response(ctx, embed=error_embed)
+                return
+            
+            if not bot_name:
+                error_embed = self._create_error_embed(
+                    "Bot Name Required",
+                    "Please specify which bot's activity to view.",
+                    f"Usage: `!botmovements <bot_name> [limit]`\nUse `!botlist` to see available bots"
+                )
+                await self._send_response(ctx, embed=error_embed)
+                return
+            
+            bot_name = bot_name.lower()
+            if bot_name not in self.BOTS:
+                error_embed = self._create_error_embed(
+                    "Unknown Bot",
+                    f"Bot '{bot_name}' not found in bot registry.",
+                    f"Use `!botlist` or `!botscan` to see available bots"
+                )
+                await self._send_response(ctx, embed=error_embed)
+                return
+            
+            try:
+                movements = self.bot_movement_tracker.get_bot_movements(bot_name, limit=limit)
+                stats = self.bot_movement_tracker.get_bot_stats(bot_name)
+                
+                embed = self._create_info_embed(
+                    title=f"{self.BOTS[bot_name]['name']} Activity",
+                    description=f"Activity tracking for {self.BOTS[bot_name]['name']}"
+                )
+                
+                total_movements = stats.get("total_movements", 0)
+                embed.add_field(
+                    name="Total Movements",
+                    value=str(total_movements),
+                    inline=True
+                )
+                
+                by_action = stats.get("by_action", {})
+                if by_action:
+                    action_text = "\n".join([f"**{k}**: {v}" for k, v in sorted(by_action.items(), key=lambda x: x[1], reverse=True)])
+                    embed.add_field(name="By Action", value=action_text, inline=False)
+                
+                by_channel = stats.get("by_channel", {})
+                if by_channel:
+                    channel_text = "\n".join([f"**{k}**: {v}" for k, v in sorted(by_channel.items(), key=lambda x: x[1], reverse=True)[:10]])
+                    embed.add_field(name="By Channel", value=channel_text[:1024], inline=False)
+                
+                if movements:
+                    recent = movements[-10:]
+                    recent_text = "\n".join([
+                        f"**{m.get('action', 'unknown')}** - `{m.get('channel_name', 'unknown')}` - {m.get('timestamp', 'N/A')[:10]}"
+                        for m in recent
+                    ])
+                    embed.add_field(name="Recent Activity", value=recent_text[:1024], inline=False)
+                elif total_movements == 0:
+                    embed.add_field(
+                        name="⚠️ No Activity Recorded",
+                        value="No movements have been tracked for this bot yet. Make sure:\n"
+                              "• Bot movement tracking is enabled in config\n"
+                              "• Bot is posting messages in RS Server\n"
+                              "• Bot ID was matched during initialization",
+                        inline=False
+                    )
+                
+                last_activity = stats.get("last_activity")
+                if last_activity:
+                    embed.add_field(name="Last Activity", value=last_activity[:19], inline=True)
+                
+                await self._send_response(ctx, embed=embed, also_send_to_rs_server=True)
+                
+            except Exception as e:
+                error_embed = self._create_error_embed(
+                    "Error Getting Bot Movements",
+                    str(e)[:500],
+                    "Check bot movement tracker logs for details"
+                )
+                await self._send_response(ctx, embed=error_embed)
+        
+        # Test server organization command
+        @self.bot.command(name="setupmonitoring")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def setupmonitoring(ctx):
+            """Initialize test server categories/channels for monitoring (admin only)"""
+            if not self.test_server_organizer:
+                await ctx.send("❌ Test server organizer not available")
+                return
+            
+            await ctx.send("🔧 Setting up monitoring channels...")
+            result = await self.test_server_organizer.setup_monitoring_channels()
+            
+            if "error" in result:
+                await ctx.send(f"❌ Error: {result['error']}")
+                return
+            
+            embed = discord.Embed(
+                title="Monitoring Channels Setup",
+                color=0x5865F2
+            )
+            
+            embed.add_field(name="Category ID", value=result.get("category_id", "N/A"))
+            
+            channels = result.get("channels", {})
+            if channels:
+                channels_text = "\n".join([f"**{k}**: {v}" for k, v in channels.items()])
+                embed.add_field(name="Channels Created", value=channels_text[:1024], inline=False)
+            
+            await ctx.send(embed=embed)
+        
+        # Run all commands for all bots
+        @self.bot.command(name="runallcommands")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def runallcommands(ctx):
+            """Run all commands for all bots (admin only)
+            
+            This command will run essential commands from:
+            - Bot Management Commands (botstatus, botinfo, botconfig for each bot)
+            - Bot Discovery & Inspection Commands (botscan)
+            - Whop Tracking Commands (whopscan, whopstats)
+            - Bot Movement Tracking Commands (botmovements for each bot)
+            - Sync & Update Commands (sync, botupdate for each bot)
+            - Show progress in terminal and Discord
+            """
+            print(f"\n{Colors.CYAN}{'='*70}{Colors.RESET}")
+            print(f"{Colors.BOLD}{Colors.CYAN}[RunAllCommands] Starting comprehensive command execution{Colors.RESET}")
+            print(f"{Colors.CYAN}{'='*70}{Colors.RESET}")
+            print(f"{Colors.CYAN}[RunAllCommands] Requested by: {ctx.author} ({ctx.author.id}){Colors.RESET}")
+            print(f"{Colors.CYAN}[RunAllCommands] Server: {ctx.guild.name if ctx.guild else 'DM'} (ID: {ctx.guild.id if ctx.guild else 0}){Colors.RESET}\n")
+            
+            # Send initial status
+            status_msg = await ctx.send("🔄 **Running ALL commands...**\n```\nInitializing comprehensive test...\n```")
+            
+            results = {
+                "commands_executed": [],
+                "success": [],
+                "failed": [],
+                "skipped": []
+            }
+            
+            # Get all bot names
+            bot_names = list(self.BOTS.keys())
+            # Calculate total operations:
+            # INITIALIZATION (Phase 0):
+            # - ping (1)
+            # - status (1)
+            # - reload (1)
+            # - botlist (1)
+            # - setupmonitoring (1)
+            # BOT MANAGEMENT (Phase 1):
+            # - botstatus (1)
+            # - botinfo for each bot (len(bot_names))
+            # - botconfig for each bot (len(bot_names))
+            # DISCOVERY (Phase 2):
+            # - botscan (1)  (covers local+remote when scope=all)
+            # WHOP TRACKING (Phase 3):
+            # - whopscan (1)
+            # - whopstats (1)
+            # MOVEMENTS (Phase 4):
+            # - botmovements for each bot (len(bot_names))
+            # SYNC & UPDATE (Phase 5):
+            # - sync (1)
+            # - botupdate for each bot (len(bot_names))
+            total_operations = 5 + 1 + (len(bot_names) * 2) + 1 + 2 + len(bot_names) + 1 + len(bot_names)
+            
+            print(f"{Colors.CYAN}[RunAllCommands] Will execute {total_operations} operations across {len(bot_names)} bot(s){Colors.RESET}\n")
+            
+            operation_count = 0
+            phase = 0
+            
+            # Helper to invoke command directly using the original context
+            async def invoke_command_direct(cmd_name, *args, **kwargs):
+                """Invoke a command directly by getting it and calling its callback"""
+                cmd = self.bot.get_command(cmd_name)
+                if not cmd:
+                    return False, f"Command {cmd_name} not found"
+                try:
+                    # Create a context from the original message
+                    ctx_copy = await self.bot.get_context(ctx.message)
+                    if not ctx_copy:
+                        return False, "Could not create context"
+                    
+                    # Set the command on the context
+                    ctx_copy.command = cmd
+                    
+                    # Invoke the command using ctx.invoke() which properly handles arguments
+                    # ctx.invoke(cmd, *args, **kwargs) is the correct way to invoke commands with arguments
+                    await ctx_copy.invoke(cmd, *args, **kwargs)
+                    return True, None
+                except Exception as e:
+                    return False, str(e)
+            
+            # ============================================================
+            # PHASE 0: Initialization Commands (Run First!)
+            # ============================================================
+            phase += 1
+            print(f"\n{Colors.CYAN}[RunAllCommands] [Phase {phase}] Initialization Commands{Colors.RESET}")
+            
+            # 0.1 Run ping (check bot latency)
+            print(f"{Colors.CYAN}[RunAllCommands] [0.1] Running !ping (check bot latency)...{Colors.RESET}")
+            await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Initialization: !ping (checking bot latency)...\n```")
+            success, error = await invoke_command_direct("ping")
+            if success:
+                results["commands_executed"].append("ping")
+                results["success"].append("ping")
+                print(f"{Colors.GREEN}[RunAllCommands] ✓ ping completed{Colors.RESET}")
+            else:
+                results["failed"].append(f"ping: {error[:100] if error else 'Unknown error'}")
+                print(f"{Colors.RED}[RunAllCommands] ✗ ping failed: {error}{Colors.RESET}")
+            operation_count += 1
+            await asyncio.sleep(1)
+            
+            # 0.2 Run status (check bot readiness)
+            print(f"{Colors.CYAN}[RunAllCommands] [0.2] Running !status (check bot readiness)...{Colors.RESET}")
+            await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Initialization: !status (checking bot readiness)...\n```")
+            success, error = await invoke_command_direct("status")
+            if success:
+                results["commands_executed"].append("status")
+                results["success"].append("status")
+                print(f"{Colors.GREEN}[RunAllCommands] ✓ status completed{Colors.RESET}")
+            else:
+                results["failed"].append(f"status: {error[:100] if error else 'Unknown error'}")
+                print(f"{Colors.RED}[RunAllCommands] ✗ status failed: {error}{Colors.RESET}")
+            operation_count += 1
+            await asyncio.sleep(1)
+            
+            # 0.3 Run reload (reload configuration)
+            print(f"{Colors.CYAN}[RunAllCommands] [0.3] Running !reload (reload configuration)...{Colors.RESET}")
+            await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Initialization: !reload (reloading configuration)...\n```")
+            success, error = await invoke_command_direct("reload")
+            if success:
+                results["commands_executed"].append("reload")
+                results["success"].append("reload")
+                print(f"{Colors.GREEN}[RunAllCommands] ✓ reload completed{Colors.RESET}")
+            else:
+                results["failed"].append(f"reload: {error[:100] if error else 'Unknown error'}")
+                print(f"{Colors.RED}[RunAllCommands] ✗ reload failed: {error}{Colors.RESET}")
+            operation_count += 1
+            await asyncio.sleep(1)
+            
+            # 0.4 Run botlist (list all available bots)
+            print(f"{Colors.CYAN}[RunAllCommands] [0.5] Running !botlist (list all bots)...{Colors.RESET}")
+            await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Initialization: !botlist (listing all bots)...\n```")
+            success, error = await invoke_command_direct("botlist")
+            if success:
+                results["commands_executed"].append("botlist")
+                results["success"].append("botlist")
+                print(f"{Colors.GREEN}[RunAllCommands] ✓ botlist completed{Colors.RESET}")
+            else:
+                results["failed"].append(f"botlist: {error[:100] if error else 'Unknown error'}")
+                print(f"{Colors.RED}[RunAllCommands] ✗ botlist failed: {error}{Colors.RESET}")
+            operation_count += 1
+            await asyncio.sleep(1)
+            
+            # 0.6 Run setupmonitoring (setup test server monitoring channels)
+            print(f"{Colors.CYAN}[RunAllCommands] [0.6] Running !setupmonitoring (setup monitoring channels)...{Colors.RESET}")
+            await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Initialization: !setupmonitoring (setting up monitoring channels)...\n```")
+            success, error = await invoke_command_direct("setupmonitoring")
+            if success:
+                results["commands_executed"].append("setupmonitoring")
+                results["success"].append("setupmonitoring")
+                print(f"{Colors.GREEN}[RunAllCommands] ✓ setupmonitoring completed{Colors.RESET}")
+            else:
+                results["failed"].append(f"setupmonitoring: {error[:100] if error else 'Unknown error'}")
+                print(f"{Colors.RED}[RunAllCommands] ✗ setupmonitoring failed: {error}{Colors.RESET}")
+            operation_count += 1
+            await asyncio.sleep(1)
+            
+            # ============================================================
+            # PHASE 1: Bot Management Commands
+            # ============================================================
+            phase += 1
+            print(f"\n{Colors.CYAN}[RunAllCommands] [Phase {phase}] Bot Management Commands{Colors.RESET}")
+            
+            # 1.1 Run botstatus for all bots
+            print(f"{Colors.CYAN}[RunAllCommands] [1.1] Running !botstatus (all bots)...{Colors.RESET}")
+            await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Bot Management: !botstatus (all bots)...\n```")
+            success, error = await invoke_command_direct("botstatus")
+            if success:
+                results["commands_executed"].append("botstatus (all)")
+                results["success"].append("botstatus")
+                print(f"{Colors.GREEN}[RunAllCommands] ✓ botstatus completed{Colors.RESET}")
+            else:
+                results["failed"].append(f"botstatus: {error[:100] if error else 'Unknown error'}")
+                print(f"{Colors.RED}[RunAllCommands] ✗ botstatus failed: {error}{Colors.RESET}")
+            operation_count += 1
+            await asyncio.sleep(1)
+            
+            # 1.2 Run botinfo for each bot
+            print(f"{Colors.CYAN}[RunAllCommands] [1.2] Running !botinfo for each bot...{Colors.RESET}")
+            for idx, bot_name in enumerate(bot_names, 1):
+                await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Bot Management: !botinfo {bot_name} ({idx}/{len(bot_names)})...\n```")
+                success, error = await invoke_command_direct("botinfo", bot_name=bot_name)
+                if success:
+                    results["commands_executed"].append(f"botinfo ({bot_name})")
+                    results["success"].append(f"botinfo-{bot_name}")
+                    print(f"{Colors.GREEN}[RunAllCommands] ✓ botinfo {bot_name} completed{Colors.RESET}")
+                else:
+                    results["failed"].append(f"botinfo-{bot_name}: {error[:100] if error else 'Unknown error'}")
+                    print(f"{Colors.RED}[RunAllCommands] ✗ botinfo {bot_name} failed: {error}{Colors.RESET}")
+                operation_count += 1
+                await asyncio.sleep(0.5)
+            
+            # 1.3 Run botconfig for each bot
+            print(f"{Colors.CYAN}[RunAllCommands] [1.3] Running !botconfig for each bot...{Colors.RESET}")
+            for idx, bot_name in enumerate(bot_names, 1):
+                await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Bot Management: !botconfig {bot_name} ({idx}/{len(bot_names)})...\n```")
+                success, error = await invoke_command_direct("botconfig", bot_name=bot_name)
+                if success:
+                    results["commands_executed"].append(f"botconfig ({bot_name})")
+                    results["success"].append(f"botconfig-{bot_name}")
+                    print(f"{Colors.GREEN}[RunAllCommands] ✓ botconfig {bot_name} completed{Colors.RESET}")
+                else:
+                    results["failed"].append(f"botconfig-{bot_name}: {error[:100] if error else 'Unknown error'}")
+                    print(f"{Colors.RED}[RunAllCommands] ✗ botconfig {bot_name} failed: {error}{Colors.RESET}")
+                operation_count += 1
+                await asyncio.sleep(0.5)
+            
+            await asyncio.sleep(1)  # Delay between phases
+            
+            # ============================================================
+            # PHASE 2: Bot Discovery & Inspection Commands
+            # ============================================================
+            phase += 1
+            print(f"\n{Colors.CYAN}[RunAllCommands] [Phase {phase}] Bot Discovery & Inspection Commands{Colors.RESET}")
+            
+            # 2.1 Run botscan (all scope)
+            print(f"{Colors.CYAN}[RunAllCommands] [2.1] Running !botscan (all scope)...{Colors.RESET}")
+            await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Discovery: !botscan all...\n```")
+            success, error = await invoke_command_direct("botscan", scope="all")
+            if success:
+                results["commands_executed"].append("botscan (all)")
+                results["success"].append("botscan")
+                print(f"{Colors.GREEN}[RunAllCommands] ✓ botscan completed{Colors.RESET}")
+            else:
+                results["failed"].append(f"botscan: {error[:100] if error else 'Unknown error'}")
+                print(f"{Colors.RED}[RunAllCommands] ✗ botscan failed: {error}{Colors.RESET}")
+            operation_count += 1
+            await asyncio.sleep(1)
+            
+            # 2.2 botscanremote removed (botscan scope=all already covers remote)
+            # Note: botscan(scope="all") already includes remote scanning, so a separate remote-only scan is redundant.
+            
+            # ============================================================
+            # PHASE 3: Whop Tracking Commands
+            # ============================================================
+            phase += 1
+            print(f"\n{Colors.CYAN}[RunAllCommands] [Phase {phase}] Whop Tracking Commands{Colors.RESET}")
+            
+            # 3.1 Run whopscan (default: 2000 messages, 30 days)
+            print(f"{Colors.CYAN}[RunAllCommands] [3.1] Running !whopscan (2000, 30)...{Colors.RESET}")
+            await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Whop: !whopscan (2000 messages, 30 days)...\n```")
+            success, error = await invoke_command_direct("whopscan", limit=2000, days=30)
+            if success:
+                results["commands_executed"].append("whopscan (2000, 30)")
+                results["success"].append("whopscan")
+                print(f"{Colors.GREEN}[RunAllCommands] ✓ whopscan completed{Colors.RESET}")
+            else:
+                results["failed"].append(f"whopscan: {error[:100] if error else 'Unknown error'}")
+                print(f"{Colors.RED}[RunAllCommands] ✗ whopscan failed: {error}{Colors.RESET}")
+            operation_count += 1
+            await asyncio.sleep(1)
+            
+            # 3.2 Run whopstats
+            print(f"{Colors.CYAN}[RunAllCommands] [3.2] Running !whopstats...{Colors.RESET}")
+            await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Whop: !whopstats...\n```")
+            success, error = await invoke_command_direct("whopstats")
+            if success:
+                results["commands_executed"].append("whopstats")
+                results["success"].append("whopstats")
+                print(f"{Colors.GREEN}[RunAllCommands] ✓ whopstats completed{Colors.RESET}")
+            else:
+                results["failed"].append(f"whopstats: {error[:100] if error else 'Unknown error'}")
+                print(f"{Colors.RED}[RunAllCommands] ✗ whopstats failed: {error}{Colors.RESET}")
+            operation_count += 1
+            await asyncio.sleep(1)
+            
+            # Note: whophistory requires a discord_id, so we skip it
+            
+            # ============================================================
+            # PHASE 4: Bot Movement Tracking Commands
+            # ============================================================
+            phase += 1
+            print(f"\n{Colors.CYAN}[RunAllCommands] [Phase {phase}] Bot Movement Tracking Commands{Colors.RESET}")
+            
+            # 4.1 Run botmovements for each bot
+            print(f"{Colors.CYAN}[RunAllCommands] [4.1] Running !botmovements for each bot...{Colors.RESET}")
+            for idx, bot_name in enumerate(bot_names, 1):
+                await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Movements: !botmovements {bot_name} ({idx}/{len(bot_names)})...\n```")
+                success, error = await invoke_command_direct("botmovements", bot_name=bot_name, limit=50)
+                if success:
+                    results["commands_executed"].append(f"botmovements ({bot_name})")
+                    results["success"].append(f"botmovements-{bot_name}")
+                    print(f"{Colors.GREEN}[RunAllCommands] ✓ botmovements {bot_name} completed{Colors.RESET}")
+                else:
+                    results["skipped"].append(f"botmovements-{bot_name}: {error[:100] if error else 'Unknown error'}")
+                    print(f"{Colors.YELLOW}[RunAllCommands] ⚠ botmovements {bot_name} skipped: {error}{Colors.RESET}")
+                operation_count += 1
+                await asyncio.sleep(0.5)
+            
+            await asyncio.sleep(1)  # Delay between phases
+            
+            # ============================================================
+            # PHASE 5: Sync & Update Commands
+            # ============================================================
+            phase += 1
+            print(f"\n{Colors.CYAN}[RunAllCommands] [Phase {phase}] Sync & Update Commands{Colors.RESET}")
+            
+            # 5.1 Run sync (sync RSAdminBot files)
+            print(f"{Colors.CYAN}[RunAllCommands] [5.1] Running !sync (sync RSAdminBot files)...{Colors.RESET}")
+            await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Sync: !sync (syncing RSAdminBot files)...\n```")
+            success, error = await invoke_command_direct("sync")
+            if success:
+                results["commands_executed"].append("sync")
+                results["success"].append("sync")
+                print(f"{Colors.GREEN}[RunAllCommands] ✓ sync completed{Colors.RESET}")
+            else:
+                results["failed"].append(f"sync: {error[:100] if error else 'Unknown error'}")
+                print(f"{Colors.RED}[RunAllCommands] ✗ sync failed: {error}{Colors.RESET}")
+            operation_count += 1
+            await asyncio.sleep(1)
+            
+            # 5.2 Run botupdate for each bot
+            print(f"{Colors.CYAN}[RunAllCommands] [5.2] Running !botupdate for each bot...{Colors.RESET}")
+            for idx, bot_name in enumerate(bot_names, 1):
+                await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Sync: !botupdate {bot_name} ({idx}/{len(bot_names)})...\n```")
+                success, error = await invoke_command_direct("botupdate", bot_name=bot_name)
+                if success:
+                    results["commands_executed"].append(f"botupdate ({bot_name})")
+                    results["success"].append(f"botupdate-{bot_name}")
+                    print(f"{Colors.GREEN}[RunAllCommands] ✓ botupdate {bot_name} completed{Colors.RESET}")
+                else:
+                    results["failed"].append(f"botupdate-{bot_name}: {error[:100] if error else 'Unknown error'}")
+                    print(f"{Colors.RED}[RunAllCommands] ✗ botupdate {bot_name} failed: {error}{Colors.RESET}")
+                operation_count += 1
+                await asyncio.sleep(0.5)
+            
+            # Final summary
+            print(f"\n{Colors.CYAN}{'='*70}{Colors.RESET}")
+            print(f"{Colors.BOLD}{Colors.CYAN}[RunAllCommands] Execution Complete{Colors.RESET}")
+            print(f"{Colors.CYAN}{'='*70}{Colors.RESET}")
+            print(f"{Colors.GREEN}✓ Successful: {len(results['success'])} command(s){Colors.RESET}")
+            if results["failed"]:
+                print(f"{Colors.RED}✗ Failed: {len(results['failed'])} command(s){Colors.RESET}")
+            if results["skipped"]:
+                print(f"{Colors.YELLOW}⚠ Skipped: {len(results['skipped'])} command(s){Colors.RESET}")
+            print(f"{Colors.CYAN}Total operations: {operation_count}/{total_operations}{Colors.RESET}\n")
+            
+            # Send final summary embed
+            embed = discord.Embed(
+                title="✅ All Commands Execution Complete",
+                description=f"Comprehensive test of all bot management, discovery, and tracking commands",
+                color=discord.Color.green(),
+                timestamp=datetime.now()
+            )
+            
+            # Summary by category
+            initialization = [r for r in results["success"] if any(x in r for x in ["ping", "status", "reload", "botlist", "setupmonitoring"])]
+            bot_mgmt = [r for r in results["success"] if any(x in r for x in ["botstatus", "botinfo", "botconfig"])]
+            discovery = [r for r in results["success"] if any(x in r for x in ["botscan"])]
+            whop = [r for r in results["success"] if any(x in r for x in ["whopscan", "whopstats"])]
+            movements = [r for r in results["success"] if "botmovements" in r]
+            sync_update = [r for r in results["success"] if any(x in r for x in ["sync", "botupdate"])]
+            
+            summary_text = f"✅ **Successful: {len(results['success'])}**\n"
+            summary_text += f"  • Initialization: {len(initialization)}/6\n"
+            summary_text += f"  • Bot Management: {len(bot_mgmt)}\n"
+            summary_text += f"  • Discovery & Inspection: {len(discovery)}\n"
+            summary_text += f"  • Whop Tracking: {len(whop)}\n"
+            summary_text += f"  • Bot Movements: {len(movements)}\n"
+            summary_text += f"  • Sync & Update: {len(sync_update)}\n"
+            if results["failed"]:
+                summary_text += f"\n❌ **Failed: {len(results['failed'])}**"
+            if results["skipped"]:
+                summary_text += f"\n⚠️ **Skipped: {len(results['skipped'])}**"
+            
+            embed.add_field(
+                name="📊 Summary by Category",
+                value=summary_text,
+                inline=False
+            )
+            
+            if results["commands_executed"]:
+                commands_list = "\n".join(results["commands_executed"][:25])
+                if len(results["commands_executed"]) > 25:
+                    commands_list += f"\n... and {len(results['commands_executed']) - 25} more"
+                embed.add_field(
+                    name="✅ Commands Executed",
+                    value=f"```{commands_list}```",
+                    inline=False
+                )
+            
+            if results["failed"]:
+                failed_list = "\n".join(results["failed"][:10])
+                if len(results["failed"]) > 10:
+                    failed_list += f"\n... and {len(results['failed']) - 10} more"
+                embed.add_field(
+                    name="❌ Failed Commands",
+                    value=f"```{failed_list}```",
+                    inline=False
+                )
+            
+            embed.set_footer(text=f"Total operations: {operation_count}/{total_operations} | Phases: {phase}")
+            
+            await status_msg.edit(content="", embed=embed)
+            
+            # Generate and upload report
+            print(f"{Colors.CYAN}[RunAllCommands] Generating comprehensive report...{Colors.RESET}")
+            await self._generate_and_upload_report(ctx, results, operation_count, total_operations, phase, bot_names)
+        
+        # Bot diagnostics command
+        # Note: !restartadminbot was removed - use !restart instead (canonical command)
+    
+    async def _generate_and_upload_report(self, ctx, results: Dict, operation_count: int, total_operations: int, phase: int, bot_names: List[str]):
+        """Generate comprehensive .md report and upload locally and remotely."""
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            report_filename = f"runallcommands_report_{timestamp}.md"
+            local_report_path = self.base_path / report_filename
+            
+            # Generate report content
+            report_lines = []
+            report_lines.append("# RunAllCommands Comprehensive Report")
+            report_lines.append(f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            report_lines.append(f"**Requested by**: {ctx.author} ({ctx.author.id})")
+            report_lines.append(f"**Server**: {ctx.guild.name if ctx.guild else 'DM'} (ID: {ctx.guild.id if ctx.guild else 0})")
+            report_lines.append("")
+            report_lines.append("---")
+            report_lines.append("")
+            
+            # Summary
+            report_lines.append("## Summary")
+            report_lines.append(f"- **Total Operations**: {operation_count}/{total_operations}")
+            report_lines.append(f"- **Phases Completed**: {phase}")
+            report_lines.append(f"- **Successful Commands**: {len(results['success'])}")
+            report_lines.append(f"- **Failed Commands**: {len(results['failed'])}")
+            report_lines.append(f"- **Skipped Commands**: {len(results['skipped'])}")
+            report_lines.append("")
+            
+            # Commands executed
+            if results["commands_executed"]:
+                report_lines.append("## Commands Executed")
+                for cmd in results["commands_executed"]:
+                    report_lines.append(f"- `{cmd}`")
+                report_lines.append("")
+            
+            # Successful commands
+            if results["success"]:
+                report_lines.append("## ✅ Successful Commands")
+                for cmd in results["success"]:
+                    report_lines.append(f"- `{cmd}`")
+                report_lines.append("")
+            
+            # Failed commands
+            if results["failed"]:
+                report_lines.append("## ❌ Failed Commands")
+                for cmd in results["failed"]:
+                    report_lines.append(f"- `{cmd}`")
+                report_lines.append("")
+            
+            # Skipped commands
+            if results["skipped"]:
+                report_lines.append("## ⚠️ Skipped Commands")
+                for cmd in results["skipped"]:
+                    report_lines.append(f"- `{cmd}`")
+                report_lines.append("")
+            
+            # Bot movements summary
+            if self.bot_movement_tracker:
+                # Clear cache to force reload from files (ensures fresh data)
+                self.bot_movement_tracker.movements_cache = {}
+                report_lines.append("## Bot Activity Summary")
+                for bot_name in bot_names:
+                    try:
+                        stats = self.bot_movement_tracker.get_bot_stats(bot_name)
+                        total = stats.get("total_movements", 0)
+                        by_action = stats.get("by_action", {})
+                        last_activity = stats.get("last_activity", "Never")
+                        
+                        report_lines.append(f"### {self.BOTS[bot_name]['name']} ({bot_name})")
+                        report_lines.append(f"- **Total Movements**: {total}")
+                        if by_action:
+                            report_lines.append("- **By Action**:")
+                            for action, count in sorted(by_action.items(), key=lambda x: x[1], reverse=True):
+                                report_lines.append(f"  - {action}: {count}")
+                        report_lines.append(f"- **Last Activity**: {last_activity[:19] if last_activity != 'Never' else 'Never'}")
+                        report_lines.append("")
+                    except Exception as e:
+                        report_lines.append(f"### {self.BOTS[bot_name]['name']} ({bot_name})")
+                        report_lines.append(f"- **Error**: {str(e)[:200]}")
+                        report_lines.append("")
+            
+            # Whop stats
+            if self.whop_tracker:
+                try:
+                    whop_stats = self.whop_tracker.get_membership_stats()
+                    report_lines.append("## Whop Membership Statistics")
+                    report_lines.append(f"- **Total Members**: {whop_stats.get('total_members', 0)}")
+                    report_lines.append(f"- **New Members**: {whop_stats.get('new_members', 0)}")
+                    report_lines.append(f"- **Renewals**: {whop_stats.get('renewals', 0)}")
+                    report_lines.append(f"- **Cancellations**: {whop_stats.get('cancellations', 0)}")
+                    report_lines.append(f"- **Active Memberships**: {whop_stats.get('active_memberships', 0)}")
+                    if whop_stats.get('avg_duration_days'):
+                        report_lines.append(f"- **Avg Duration**: {whop_stats['avg_duration_days']} days")
+                    report_lines.append("")
+                except Exception as e:
+                    report_lines.append("## Whop Membership Statistics")
+                    report_lines.append(f"- **Error**: {str(e)[:200]}")
+                    report_lines.append("")
+            
+            # Write local file
+            with open(local_report_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(report_lines))
+            
+            print(f"{Colors.GREEN}[RunAllCommands] ✓ Report generated: {report_filename}{Colors.RESET}")
+            
+            # Upload to remote server
+            remote_path = None
+            ssh_ok, _ = self._check_ssh_available()
+            if ssh_ok and self.current_server:
+                try:
+                    remote_path = f"/home/{self.current_server.get('user', 'rsadmin')}/mirror-world/RSAdminBot/{report_filename}"
+                    
+                    # Use SCP to upload
+                    ssh_key_path = self.base_path / self.current_server.get("key", "ssh-key-2025-12-15.key")
+                    scp_cmd = [
+                        "scp",
+                        "-i", str(ssh_key_path),
+                        "-o", "StrictHostKeyChecking=no",
+                        "-P", str(self.current_server.get("port", 22)),
+                        str(local_report_path),
+                        f"{self.current_server.get('user', 'rsadmin')}@{self.current_server.get('host')}:{remote_path}"
+                    ]
+                    
+                    result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=30)
+                    if result.returncode == 0:
+                        print(f"{Colors.GREEN}[RunAllCommands] ✓ Report uploaded to remote: {remote_path}{Colors.RESET}")
+                    else:
+                        print(f"{Colors.YELLOW}[RunAllCommands] ⚠️  Failed to upload report to remote: {result.stderr[:200]}{Colors.RESET}")
+                except Exception as e:
+                    print(f"{Colors.YELLOW}[RunAllCommands] ⚠️  Error uploading report to remote: {str(e)[:200]}{Colors.RESET}")
+            
+            # Send report file to Discord
+            try:
+                with open(local_report_path, 'rb') as f:
+                    report_file = discord.File(f, filename=report_filename)
+                    await ctx.send(
+                        f"📄 **Comprehensive Report Generated**\n"
+                        f"Local: `{local_report_path}`\n"
+                        f"{'Remote: `' + remote_path + '`' if remote_path else 'Remote: Not uploaded (SSH not available)'}",
+                        file=report_file
+                    )
+            except Exception as e:
+                print(f"{Colors.YELLOW}[RunAllCommands] ⚠️  Error sending report to Discord: {str(e)[:200]}{Colors.RESET}")
+                await ctx.send(f"📄 **Report Generated**\nLocal path: `{local_report_path}`\n(Error sending file: {str(e)[:100]})")
+            
+        except Exception as e:
+            print(f"{Colors.RED}[RunAllCommands] ✗ Error generating report: {str(e)[:500]}{Colors.RESET}")
+            await ctx.send(f"⚠️ **Report generation failed**: {str(e)[:500]}")
+        
+        @self.bot.command(name="botdiagnose")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def botdiagnose(ctx, bot_name: str = None):
+            """Diagnose bot startup issues (admin only)"""
+            ssh_ok, error_msg = self._check_ssh_available()
+            if not ssh_ok:
+                await ctx.send(f"❌ SSH not configured: {error_msg}")
+                return
+            
+            if not bot_name:
+                # Show interactive SelectMenu
+                view = BotSelectView(self, "diagnose", "Diagnose")
+                embed = discord.Embed(
+                    title="🔍 Select Bot to Diagnose",
+                    description="Choose a bot from the dropdown menu below:",
+                    color=discord.Color.orange()
+                )
+                await ctx.send(embed=embed, view=view)
+                return
+            
+            bot_name = bot_name.lower()
+            if bot_name not in self.BOTS:
+                await ctx.send(f"❌ Unknown bot: {bot_name}\nUse `!botlist` to see available bots")
+                return
+            
+            bot_info = self.BOTS[bot_name]
+            service_name = bot_info["service"]
+            
+            # Send immediate acknowledgment
+            status_msg = await ctx.send(f"🔍 **Diagnosing {bot_info['name']}...**\n```\nChecking service status...\n```")
+            
+            # Log to terminal
+            print(f"{Colors.CYAN}[Command] Diagnosing {bot_info['name']} (Service: {service_name}){Colors.RESET}")
+            print(f"{Colors.CYAN}[Command] Requested by: {ctx.author} ({ctx.author.id}){Colors.RESET}")
+            
+            embed = discord.Embed(
+                title=f"🔍 {bot_info['name']} Diagnostics",
+                color=discord.Color.orange(),
+                timestamp=datetime.now()
+            )
+            
+            # Check service status
+            if self.service_manager:
+                exists, state, error = self.service_manager.get_status(service_name, bot_name=bot_name)
+                if exists:
+                    status_icon = "✅" if state == "active" else "❌"
+                    embed.add_field(
+                        name="Service Status",
+                        value=f"{status_icon} {state.capitalize()}",
+                        inline=True
+                    )
+                    
+                    # Get PID if running
+                    if state == "active":
+                        pid = self.service_manager.get_pid(service_name)
+                        if pid:
+                            embed.add_field(name="PID", value=str(pid), inline=True)
+                    
+                    # Get detailed status
+                    detail_success, detail_output, detail_stderr = self.service_manager.get_detailed_status(service_name)
+                    if detail_success and detail_output:
+                        # Extract key info from status
+                        status_lines = detail_output.split('\n')
+                        key_info = []
+                        for line in status_lines:
+                            if any(keyword in line.lower() for keyword in ['active', 'loaded', 'main pid', 'status', 'error']):
+                                key_info.append(line.strip())
+                        
+                        if key_info:
+                            embed.add_field(
+                                name="Service Details",
+                                value=f"```\n" + "\n".join(key_info[:10]) + "\n```",
+                                inline=False
+                            )
+                    
+                    # Get failure logs if stopped
+                    if state != "active":
+                        logs = self.service_manager.get_failure_logs(service_name, lines=30)
+                        if logs:
+                            # Extract error lines
+                            error_lines = [line for line in logs.split('\n') if any(keyword in line.lower() for keyword in ['error', 'failed', 'exception', 'traceback', 'failed to'])]
+                            if error_lines:
+                                error_text = "\n".join(error_lines[-15:])  # Last 15 error lines
+                                if len(error_text) > 1000:
+                                    error_text = error_text[:1000] + "..."
+                                embed.add_field(
+                                    name="Recent Errors",
+                                    value=f"```\n{error_text}\n```",
+                                    inline=False
+                                )
+                else:
+                    embed.add_field(
+                        name="Service Status",
+                        value="⚠️ Service not found",
+                        inline=False
+                    )
+                    embed.add_field(
+                        name="Service Name",
+                        value=f"`{service_name}`",
+                        inline=False
+                    )
+                    embed.description = "The service file does not exist. Check if the service was created properly."
+            else:
+                embed.add_field(name="Error", value="ServiceManager not available", inline=False)
+            
+            # Check bot folder and script
+            bot_folder = bot_info.get("folder", "")
+            script_name = bot_info.get("script", "")
+            if bot_folder and script_name:
+                remote_user = self.current_server.get("user", "rsadmin")
+                remote_base = f"/home/{remote_user}/bots/mirror-world"
+                script_path = f"{remote_base}/{bot_folder}/{script_name}"
+                
+                # Check if script exists
+                check_script_cmd = f"test -f {script_path} && echo 'exists' || echo 'missing'"
+                script_exists_success, script_exists_output, _ = self._execute_ssh_command(check_script_cmd, timeout=10)
+                script_exists = script_exists_success and "exists" in (script_exists_output or "").lower()
+                
+                embed.add_field(
+                    name="Script File",
+                    value=f"{'✅' if script_exists else '❌'} `{script_path}`",
+                    inline=False
+                )
+                
+                # Check folder
+                check_folder_cmd = f"test -d {remote_base}/{bot_folder} && echo 'exists' || echo 'missing'"
+                folder_exists_success, folder_exists_output, _ = self._execute_ssh_command(check_folder_cmd, timeout=10)
+                folder_exists = folder_exists_success and "exists" in (folder_exists_output or "").lower()
+                
+                embed.add_field(
+                    name="Bot Folder",
+                    value=f"{'✅' if folder_exists else '❌'} `{remote_base}/{bot_folder}`",
+                    inline=False
+                )
+            
+            await status_msg.edit(content="", embed=embed)
+    
+    def _start_whop_scanning_task(self):
+        """Start periodic whop scanning task"""
+        from discord.ext import tasks
+        
+        @tasks.loop(hours=self.config.get("whop_scan_interval_hours", 24))
+        async def periodic_whop_scan():
+            if self.whop_tracker:
+                try:
+                    print(f"{Colors.CYAN}[WhopTracker] Starting periodic scan...{Colors.RESET}")
+                    result = await self.whop_tracker.scan_whop_logs(limit=2000, lookback_days=1)
+                    print(f"{Colors.GREEN}[WhopTracker] Scan complete: {result.get('events_found', 0)} events found{Colors.RESET}")
+                except Exception as e:
+                    print(f"{Colors.RED}[WhopTracker] Periodic scan error: {e}{Colors.RESET}")
+        
+        periodic_whop_scan.start()
+        print(f"{Colors.GREEN}[WhopTracker] Periodic scanning task started (every {self.config.get('whop_scan_interval_hours', 24)} hours){Colors.RESET}")
+    
+    async def start(self):
+        """Start the bot"""
+        bot_token = self.config.get("bot_token", "").strip()
+        if not bot_token:
+            print(f"{Colors.RED}[Bot] ERROR: bot_token is required in config.secrets.json (server-only){Colors.RESET}")
+            return
+        
+        try:
+            await self.bot.start(bot_token)
+        except KeyboardInterrupt:
+            print(f"\n{Colors.YELLOW}[Bot] Shutting down...{Colors.RESET}")
+            await self.bot.close()
+
+
+def main():
+    """Main entry point"""
+    import argparse
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--check-config", action="store_true", help="Validate config + secrets and exit (no Discord connection).")
+    args = parser.parse_args()
+
+    if args.check_config:
+        base = Path(__file__).parent
+        cfg, config_path, secrets_path = load_config_with_secrets(base)
+        token = (cfg.get("bot_token") or "").strip()
+        errors: List[str] = []
+        if not secrets_path.exists():
+            errors.append(f"Missing secrets file: {secrets_path}")
+        if is_placeholder_secret(token):
+            errors.append("bot_token missing/placeholder in config.secrets.json")
+
+        ssh = cfg.get("ssh_server") or {}
+        if ssh:
+            for k in ("host", "user", "key"):
+                if not (ssh.get(k) or "").strip():
+                    errors.append(f"ssh_server.{k} missing in config.json")
+
+        if errors:
+            print(f"{Colors.RED}[ConfigCheck] FAILED{Colors.RESET}")
+            for e in errors:
+                print(f"- {e}")
+            return
+
+        print(f"{Colors.GREEN}[ConfigCheck] OK{Colors.RESET}")
+        print(f"- config: {config_path}")
+        print(f"- secrets: {secrets_path}")
+        print(f"- bot_token: {mask_secret(token)}")
+        if ssh:
+            print(f"- ssh_server.host: {ssh.get('host')}")
+            print(f"- ssh_server.user: {ssh.get('user')}")
+            print(f"- ssh_server.key: {ssh.get('key')}")
+        return
+
+    bot = RSAdminBot()
+    try:
+        asyncio.run(bot.start())
+    except KeyboardInterrupt:
+        print(f"\n{Colors.YELLOW}[Bot] Stopped{Colors.RESET}")
+
+
+if __name__ == '__main__':
+    main()
+

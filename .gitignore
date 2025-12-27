@@ -1,0 +1,70 @@
+# Ignore everything by default (python-only RS bots repo)
+*
+
+# Allow this ignore file itself
+!/.gitignore
+
+# Only allow python from the RS bot folders
+!RSAdminBot/
+!RSAdminBot/**/
+!RSAdminBot/*.py
+!RSAdminBot/**/*.py
+
+!RSCheckerbot/
+!RSCheckerbot/**/
+!RSCheckerbot/*.py
+!RSCheckerbot/**/*.py
+
+!RSForwarder/
+!RSForwarder/**/
+!RSForwarder/*.py
+!RSForwarder/**/*.py
+
+!RSMentionPinger/
+!RSMentionPinger/**/
+!RSMentionPinger/*.py
+!RSMentionPinger/**/*.py
+
+!RSOnboarding/
+!RSOnboarding/**/
+!RSOnboarding/*.py
+!RSOnboarding/**/*.py
+
+!RSuccessBot/
+!RSuccessBot/**/
+!RSuccessBot/*.py
+!RSuccessBot/**/*.py
+
+# Explicitly keep legacy/original sources out of GitHub
+RSAdminBot/original_files/**
+
+# Never include local server snapshots
+Oraclserver-files/**
+
+# Secrets / local-only scratchpads (do not commit)
+rs-bot-tokens.txt
+.tmp/
+**/__pycache__/
+**/*.pyc
+
+# Virtualenvs
+.venv/
+venv/
+
+# Server-only secrets (never commit)
+**/config.secrets.json
+
+# SSH private keys
+**/*.key
+**/*.pem
+**/*.ppk
+
+# Local token scratchpads (never commit / never deploy)
+**/rs-bot-tokens.txt
+
+# Runtime DB/data files (server-owned)
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+
+
