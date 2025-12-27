@@ -565,6 +565,13 @@ class RSOnboardingBot:
             elif me.top_role <= member_role:
                 errors.append(f"Bot role '{me.top_role.name}' must be above Member role '{member_role.name}' (role hierarchy)")
         
+        # Check required intents (bot relies on members and message_content)
+        intents = self.bot.intents
+        if not intents.members:
+            warnings.append("Members intent is disabled - bot may not receive member updates correctly")
+        if not intents.message_content:
+            warnings.append("Message content intent is disabled - bot may not process messages correctly")
+        
         # Print validation results
         if errors:
             print(f"{Colors.RED}[Config Validation] ERRORS:{Colors.RESET}")

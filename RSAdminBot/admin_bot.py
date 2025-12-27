@@ -133,11 +133,20 @@ class MessageHelper:
         return embed
     
     @staticmethod
-    def create_info_embed(title: str, message: str, fields: List[Dict] = None) -> discord.Embed:
-        """Create an info embed with consistent formatting."""
+    def create_info_embed(title: str, message: str = "", fields: List[Dict] = None, *, description: str = None) -> discord.Embed:
+        """Create an info embed with consistent formatting.
+        
+        Args:
+            title: Embed title
+            message: Main message/description (can be empty)
+            fields: Optional fields list
+            description: Alias for message parameter (for compatibility)
+        """
+        # Support both message and description for compatibility
+        desc = description if description is not None else message
         return MessageHelper.create_status_embed(
             title=title,
-            description=message,
+            description=desc,
             color=discord.Color.blue(),
             fields=fields
         )
@@ -511,7 +520,7 @@ class BotSelectView(ui.View):
             if len(summary) > 2000:
                 summary = summary[:1997] + "..."
             await status_msg.edit(content=summary)
-            await self.admin_bot._log_to_discord(f"🔄 **All Bots Start** completed\nRequested by: {interaction.user.mention}")
+            await self.admin_bot._log_to_discord(f"🔄 **All Bots Start** completed")
             return
         
         # Handle single bot case
@@ -542,7 +551,7 @@ class BotSelectView(ui.View):
                     f"```\nBefore: state={before_state_txt} pid={before_pid_txt}\nAfter:  state={after_state_txt} pid={after_pid_txt}\n```"
                 )
                 await self.admin_bot._log_to_discord(
-                    f"✅ **{bot_info['name']}** started\nState: `{after_state or 'unknown'}` | PID: `{after_pid or 0}`\nBefore: `{before_state or 'unknown'}` | PID: `{before_pid or 0}`\nRequested by: {interaction.user.mention}"
+                    f"✅ **{bot_info['name']}** started\nState: `{after_state or 'unknown'}` | PID: `{after_pid or 0}`\nBefore: `{before_state or 'unknown'}` | PID: `{before_pid or 0}`"
                 )
             else:
                 error_msg = verify_error or stderr or stdout or "Unknown error"
@@ -600,7 +609,7 @@ class BotSelectView(ui.View):
             if len(summary) > 2000:
                 summary = summary[:1997] + "..."
             await status_msg.edit(content=summary)
-            await self.admin_bot._log_to_discord(f"🔄 **All Bots Stop** completed\nRequested by: {interaction.user.mention}")
+            await self.admin_bot._log_to_discord(f"🔄 **All Bots Stop** completed")
             return
         
         # Handle single bot case
@@ -628,7 +637,7 @@ class BotSelectView(ui.View):
                 f"```\nBefore: state={before_state_txt} pid={before_pid_txt}\nAfter:  state={after_state_txt} pid={after_pid_txt}\n```"
             )
             await self.admin_bot._log_to_discord(
-                f"✅ **{bot_info['name']}** stopped\nState: `{after_state or 'unknown'}` | PID: `{after_pid or 0}`\nBefore: `{before_state or 'unknown'}` | PID: `{before_pid or 0}`\nRequested by: {interaction.user.mention}"
+                f"✅ **{bot_info['name']}** stopped\nState: `{after_state or 'unknown'}` | PID: `{after_pid or 0}`\nBefore: `{before_state or 'unknown'}` | PID: `{before_pid or 0}`"
             )
         else:
             error_msg = stderr or stdout or "Unknown error"
@@ -683,7 +692,7 @@ class BotSelectView(ui.View):
             if len(summary) > 2000:
                 summary = summary[:1997] + "..."
             await status_msg.edit(content=summary)
-            await self.admin_bot._log_to_discord(f"🔄 **All Bots Restart** completed\nRequested by: {interaction.user.mention}")
+            await self.admin_bot._log_to_discord(f"🔄 **All Bots Restart** completed")
             return
         
         # Handle single bot case
@@ -717,7 +726,7 @@ class BotSelectView(ui.View):
                     f"```\nBefore: state={before_state_txt} pid={before_pid_txt}\nAfter:  state={after_state_txt} pid={after_pid_txt}\n```"
                 )
                 await self.admin_bot._log_to_discord(
-                    f"✅ **{bot_info['name']}** restarted{pid_note}\nState: `{after_state or 'unknown'}` | PID: `{after_pid or 0}`\nBefore: `{before_state or 'unknown'}` | PID: `{before_pid or 0}`\nRequested by: {interaction.user.mention}"
+                    f"✅ **{bot_info['name']}** restarted{pid_note}\nState: `{after_state or 'unknown'}` | PID: `{after_pid or 0}`\nBefore: `{before_state or 'unknown'}` | PID: `{before_pid or 0}`"
                 )
             else:
                 error_msg = verify_error or stderr or stdout or "Unknown error"
@@ -904,7 +913,7 @@ class StartBotView(ui.View):
         service_name = bot_info["service"]
         
         # Log to Discord
-        await self.admin_bot._log_to_discord(f"🟢 **Starting {bot_info['name']}**\nService: `{service_name}`\nRequested by: {interaction.user.mention} (via button)")
+        await self.admin_bot._log_to_discord(f"🟢 **Starting {bot_info['name']}**\nService: `{service_name}`")
         
         # Start service using ServiceManager
         if not self.admin_bot.service_manager:
@@ -1824,7 +1833,7 @@ echo \"CHANGED_END\"
             return {
                 "repo_url": "git@github.com:neo-rs/rsbots.git",
                 "branch": "main",
-                "deploy_key_path": "",
+                "deploy_key_path": "/home/rsadmin/.ssh/rsbots_deploy_key",
             }
 
     def _rsbots_push_once(self) -> Tuple[bool, Dict[str, Any]]:
@@ -1837,8 +1846,15 @@ echo \"CHANGED_END\"
         branch = str(cfg.get("branch") or "main")
         deploy_key = str(cfg.get("deploy_key_path") or "").strip()
 
-        if not deploy_key:
-            return False, {"error": "rsbots_push.deploy_key_path missing (put it in RSAdminBot/config.secrets.json)."}
+        # Default deploy key path if not specified
+        if not deploy_key or deploy_key == "":
+            deploy_key = "/home/rsadmin/.ssh/rsbots_deploy_key"
+        
+        # Check if key file exists
+        check_cmd = f"test -f {shlex.quote(deploy_key)} && echo 'EXISTS' || echo 'MISSING'"
+        check_ok, check_out, _ = self._execute_ssh_command(check_cmd, timeout=5)
+        if not check_ok or "EXISTS" not in (check_out or ""):
+            return False, {"error": f"rsbots_push deploy key not found at: {deploy_key}\nAdd deploy_key_path to RSAdminBot/config.secrets.json or ensure key exists at default path."}
 
         live_root = str(getattr(self, "remote_root", "") or "/home/rsadmin/bots/mirror-world")
 
@@ -2502,6 +2518,18 @@ echo "CHANGED_END"
                 return bot_name
         return None
     
+    def _is_rs_bot(self, bot_name: str) -> bool:
+        """Check if a bot is an RS bot (excludes mirror_bots like datamanagerbot, discumbot, pingbot).
+        
+        Args:
+            bot_name: Bot name (e.g., "rsforwarder", "datamanagerbot")
+            
+        Returns:
+            True if bot is an RS bot (rsadminbot or rs_bots group), False otherwise
+        """
+        bot_group = self._get_bot_group(bot_name)
+        return bot_group in ("rsadminbot", "rs_bots")
+    
     def _get_bot_group(self, bot_name: str) -> Optional[str]:
         """Get bot group for a given bot name.
         
@@ -2893,7 +2921,7 @@ echo "CHANGED_END"
                         print(f"{Colors.YELLOW}[Restart] ⚠️  Failed to store restart info: {e}{Colors.RESET}")
                     
                     # Log to Discord before exit
-                    await self.admin_bot._log_to_discord(f"🔄 **Local Restart Initiated**\nRequested by: {interaction.user}")
+                    await self.admin_bot._log_to_discord(f"🔄 **Local Restart Initiated**")
                     
                     # Close the bot gracefully
                     await self.admin_bot.bot.close()
@@ -2933,15 +2961,15 @@ echo "CHANGED_END"
                             
                             if exists and state == "active":
                                 await interaction.followup.send("✅ **RSAdminBot restarted successfully on remote server!**\nThe bot will sync files on next startup.", ephemeral=True)
-                                await self.admin_bot._log_to_discord(f"✅ **Remote Restart Successful**\nService: {service_name}\nRequested by: {interaction.user}")
+                                await self.admin_bot._log_to_discord(f"✅ **Remote Restart Successful**\nService: {service_name}")
                                 print(f"{Colors.GREEN}[Restart] Remote restart successful{Colors.RESET}")
                             else:
                                 await interaction.followup.send(f"⚠️ **Restart initiated but status unclear**\nState: {state if exists else 'Service not found'}", ephemeral=True)
-                                await self.admin_bot._log_to_discord(f"⚠️ **Remote Restart Status Unclear**\nState: {state if exists else 'Service not found'}\nRequested by: {interaction.user}")
+                                await self.admin_bot._log_to_discord(f"⚠️ **Remote Restart Status Unclear**\nState: {state if exists else 'Service not found'}")
                         else:
                             error_msg = stderr or stdout or "Unknown error"
                             await interaction.followup.send(f"❌ **Restart failed**: {error_msg[:500]}", ephemeral=True)
-                            await self.admin_bot._log_to_discord(f"❌ **Remote Restart Failed**\nError: {error_msg[:500]}\nRequested by: {interaction.user}")
+                            await self.admin_bot._log_to_discord(f"❌ **Remote Restart Failed**\nError: {error_msg[:500]}")
                             print(f"{Colors.RED}[Restart] Remote restart failed: {error_msg}{Colors.RESET}")
                     else:
                         await interaction.followup.send("❌ **ServiceManager not available**", ephemeral=True)
@@ -3479,7 +3507,7 @@ echo "CHANGED_END"
             print(f"{Colors.CYAN}[Command] Server: {guild_name} (ID: {guild_id}){Colors.RESET}")
             print(f"{Colors.CYAN}[Command] Requested by: {ctx.author} ({ctx.author.id}){Colors.RESET}")
             await self._log_to_discord(
-                f"📦 **Updating {bot_info['name']} (GitHub python-only)**\nFolder: `{bot_folder}`\nRequested by: {ctx.author.mention}"
+                f"📦 **Updating {bot_info['name']} (GitHub python-only)**\nFolder: `{bot_folder}`"
             )
 
             status_msg = await ctx.send(
@@ -3666,7 +3694,7 @@ echo "CHANGED_END"
             if should_post_progress:
                 progress_msg = await self._post_or_edit_progress(
                     None,
-                    f"[oraclefiles] MANUAL START\nRequested by: {ctx.author} ({ctx.author.id})",
+                    f"[oraclefiles] MANUAL START",
                 )
 
             ok, stats = self._oraclefiles_sync_once(trigger="manual")
@@ -3709,7 +3737,7 @@ echo "CHANGED_END"
             if should_post_progress:
                 progress_msg = await self._post_or_edit_progress(
                     None,
-                    f"[pushrsbots] START\nRequested by: {ctx.author} ({ctx.author.id})",
+                    f"[pushrsbots] START",
                 )
 
             ok, stats = self._rsbots_push_once()
