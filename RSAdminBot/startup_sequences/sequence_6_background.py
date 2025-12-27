@@ -44,6 +44,13 @@ async def run(admin_bot):
         print(f"{Colors.GREEN}[Phase 6] [6.3] ✓ RS service monitor task started{Colors.RESET}")
     except Exception as e:
         print(f"{Colors.YELLOW}[Phase 6] [6.3] ⚠️  Failed to start service monitor (non-critical): {e}{Colors.RESET}")
+
+    print(f"{Colors.CYAN}[Phase 6] [6.4] Starting OracleFiles snapshot sync task...{Colors.RESET}")
+    try:
+        admin_bot._start_oraclefiles_sync_task()
+        print(f"{Colors.GREEN}[Phase 6] [6.4] ✓ OracleFiles snapshot sync task started{Colors.RESET}")
+    except Exception as e:
+        print(f"{Colors.YELLOW}[Phase 6] [6.4] ⚠️  Failed to start OracleFiles sync (non-critical): {e}{Colors.RESET}")
     
     # Phase 6 completion
     print(f"\n{Colors.GREEN}[Phase 6] ✓ Background tasks initialized{Colors.RESET}\n")

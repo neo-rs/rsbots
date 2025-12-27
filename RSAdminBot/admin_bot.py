@@ -1783,6 +1783,201 @@ class RSAdminBot:
         import time
         self._service_monitor_task = asyncio.create_task(_loop())
 
+    def _get_oraclefiles_sync_config(self) -> Dict[str, Any]:
+        """Return OracleFiles snapshot sync config.
+
+        This feature publishes a python-only snapshot of the live Ubuntu bot code to:
+          https://github.com/neo-rs/oraclefiles  (repo should exist)
+
+        Recommended config:
+        - config.json (non-secret):
+            "oraclefiles_sync": {
+              "enabled": true,
+              "interval_seconds": 14400,
+              "repo_dir": "/home/rsadmin/bots/oraclefiles",
+              "repo_url": "git@github.com:neo-rs/oraclefiles.git",
+              "branch": "main",
+              "include_folders": ["RSAdminBot","RSForwarder","RSCheckerbot","RSMentionPinger","RSOnboarding","RSuccessBot"]
+            }
+        - config.secrets.json (server-only):
+            "oraclefiles_sync": {
+              "deploy_key_path": "/home/rsadmin/.ssh/oraclefiles_deploy_key"
+            }
+        """
+        base = (self.config.get("oraclefiles_sync") or {}) if isinstance(self.config, dict) else {}
+        try:
+            include = list(base.get("include_folders") or [])
+            include = [str(x).strip() for x in include if str(x).strip()]
+            if not include:
+                include = ["RSAdminBot", "RSForwarder", "RSCheckerbot", "RSMentionPinger", "RSOnboarding", "RSuccessBot"]
+            return {
+                "enabled": bool(base.get("enabled", False)),
+                "interval_seconds": int(base.get("interval_seconds") or 4 * 3600),
+                "repo_dir": str(base.get("repo_dir") or "/home/rsadmin/bots/oraclefiles"),
+                "repo_url": str(base.get("repo_url") or "git@github.com:neo-rs/oraclefiles.git"),
+                "branch": str(base.get("branch") or "main"),
+                # NOTE: should be provided via config.secrets.json (merged by load_config_with_secrets).
+                "deploy_key_path": str(base.get("deploy_key_path") or ""),
+                "include_folders": include,
+            }
+        except Exception:
+            return {
+                "enabled": False,
+                "interval_seconds": 4 * 3600,
+                "repo_dir": "/home/rsadmin/bots/oraclefiles",
+                "repo_url": "git@github.com:neo-rs/oraclefiles.git",
+                "branch": "main",
+                "deploy_key_path": "",
+                "include_folders": ["RSAdminBot", "RSForwarder", "RSCheckerbot", "RSMentionPinger", "RSOnboarding", "RSuccessBot"],
+            }
+
+    def _oraclefiles_sync_once(self, trigger: str = "manual") -> Tuple[bool, Dict[str, Any]]:
+        """Create/update oraclefiles repo and push a python-only snapshot (live Ubuntu -> GitHub)."""
+        cfg = self._get_oraclefiles_sync_config()
+        if not cfg.get("enabled"):
+            return False, {"error": "oraclefiles_sync is disabled (enable it in RSAdminBot/config.json)."}
+        if not self._should_use_local_exec():
+            return False, {"error": "oraclefiles_sync requires Ubuntu local-exec mode (RSAdminBot must run on the same host)."}
+
+        repo_dir = str(cfg.get("repo_dir") or "/home/rsadmin/bots/oraclefiles")
+        repo_url = str(cfg.get("repo_url") or "git@github.com:neo-rs/oraclefiles.git")
+        branch = str(cfg.get("branch") or "main")
+        deploy_key = str(cfg.get("deploy_key_path") or "").strip()
+        include = cfg.get("include_folders") or []
+        include = [str(x).strip() for x in include if str(x).strip()]
+        if not include:
+            include = ["RSAdminBot", "RSForwarder", "RSCheckerbot", "RSMentionPinger", "RSOnboarding", "RSuccessBot"]
+
+        if not deploy_key:
+            return False, {"error": "oraclefiles_sync.deploy_key_path missing (put it in RSAdminBot/config.secrets.json)."}
+
+        live_root = str(getattr(self, "remote_root", "") or "/home/rsadmin/bots/mirror-world")
+        trigger_txt = (trigger or "manual").strip().lower()
+
+        folders = " ".join(shlex.quote(x) for x in include)
+        cmd = f"""
+set -euo pipefail
+
+REPO_DIR={shlex.quote(repo_dir)}
+REPO_URL={shlex.quote(repo_url)}
+BRANCH={shlex.quote(branch)}
+LIVE_ROOT={shlex.quote(live_root)}
+DEPLOY_KEY={shlex.quote(deploy_key)}
+TRIGGER={shlex.quote(trigger_txt)}
+
+command -v git >/dev/null 2>&1 || {{ echo \"ERR=git_missing\"; exit 2; }}
+
+mkdir -p \"$REPO_DIR\"
+if [ ! -d \"$REPO_DIR/.git\" ]; then
+  rm -rf \"$REPO_DIR\"
+  git clone \"$REPO_URL\" \"$REPO_DIR\"
+fi
+
+cd \"$REPO_DIR\"
+git config user.name \"RSAdminBot\"
+git config user.email \"rsadminbot@users.noreply.github.com\"
+git fetch origin || true
+
+if git show-ref --verify --quiet \"refs/remotes/origin/$BRANCH\"; then
+  git checkout -B \"$BRANCH\" \"origin/$BRANCH\"
+  git reset --hard \"origin/$BRANCH\"
+else
+  git checkout -B \"$BRANCH\"
+fi
+
+rm -rf py_snapshot
+mkdir -p py_snapshot
+
+cd \"$LIVE_ROOT\"
+TMP0=/tmp/mw_oraclefiles_py_list.bin
+rm -f \"$TMP0\"
+find {folders} -type f -name \"*.py\" ! -path \"RSAdminBot/original_files/*\" -print0 > \"$TMP0\"
+tar --null -T \"$TMP0\" -cf - | (cd \"$REPO_DIR/py_snapshot\" && tar -xf -)
+
+cd \"$REPO_DIR\"
+git add -A
+
+if git diff --cached --quiet; then
+  echo \"OK=1\"
+  echo \"NO_CHANGES=1\"
+  echo \"HEAD=$(git rev-parse HEAD 2>/dev/null || echo '')\"
+  exit 0
+fi
+
+TS=$(date +%Y%m%d_%H%M%S)
+git commit -m \"oraclefiles py_snapshot: $TS trigger=$TRIGGER\" >/dev/null
+
+export GIT_SSH_COMMAND=\"ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=no\"
+git push origin \"$BRANCH\" >/dev/null
+
+echo \"OK=1\"
+echo \"PUSHED=1\"
+echo \"HEAD=$(git rev-parse HEAD)\"
+echo \"CHANGED_BEGIN\"
+git show --name-only --pretty=format: HEAD | sed '/^$/d' | head -n 120
+echo \"CHANGED_END\"
+"""
+
+        ok, stdout, stderr = self._execute_ssh_command(cmd, timeout=300)
+        out = (stdout or "").strip()
+        err = (stderr or "").strip()
+        if not ok:
+            return False, {"error": (err or out or "oraclefiles sync failed")[:1600]}
+
+        stats: Dict[str, Any] = {"raw": out[-1600:]}
+        in_changed = False
+        changed: List[str] = []
+        for ln in out.splitlines():
+            ln = ln.strip()
+            if ln == "CHANGED_BEGIN":
+                in_changed = True
+                continue
+            if ln == "CHANGED_END":
+                in_changed = False
+                continue
+            if in_changed:
+                if ln:
+                    changed.append(ln)
+                continue
+            if "=" in ln:
+                k, v = ln.split("=", 1)
+                stats[k.strip().lower()] = v.strip()
+        stats["changed_sample"] = changed[:120]
+        return True, stats
+
+    def _start_oraclefiles_sync_task(self) -> None:
+        """Start periodic OracleFiles sync (default every 4 hours)."""
+        if getattr(self, "_oraclefiles_sync_task", None):
+            return
+        cfg = self._get_oraclefiles_sync_config()
+        if not cfg.get("enabled"):
+            return
+        if not self._should_use_local_exec():
+            return
+
+        async def _loop():
+            interval = max(300, min(int(cfg.get("interval_seconds") or 4 * 3600), 7 * 24 * 3600))
+            await asyncio.sleep(15)
+            while True:
+                ok, stats = self._oraclefiles_sync_once(trigger="periodic")
+                try:
+                    if ok:
+                        head = str(stats.get("head") or "")[:12]
+                        pushed = "1" if str(stats.get("pushed") or "").strip() else "0"
+                        msg = f"[oraclefiles] periodic OK\\nPushed: {pushed}\\nHead: {head}"
+                        sample = stats.get("changed_sample") or []
+                        if pushed == "1" and sample:
+                            msg += \"\\nChanged sample:\\n\" + \"\\n\".join(str(x) for x in sample[:30])
+                        await self._post_or_edit_progress(None, msg[:1900])
+                    else:
+                        await self._post_or_edit_progress(None, f\"[oraclefiles] periodic FAILED\\n{str(stats.get('error',''))[:1600]}\")
+                except Exception:
+                    pass
+                await asyncio.sleep(interval)
+
+        self._oraclefiles_sync_task = asyncio.create_task(_loop())
+        print(f"[oraclefiles] sync task started interval={cfg.get('interval_seconds')}s")
+
     async def _post_or_edit_progress(self, progress_msg, text: str):
         """Best-effort: edit an existing progress message, else send a new one."""
         try:
@@ -4557,6 +4752,49 @@ echo "CHANGED_END"
                 # If restart fails, we can't reliably report it here because the process may already be terminating.
                 pass
             return
+
+        @self.bot.command(name="oraclefilesupdate", aliases=["oraclefilespush", "oraclepush"])
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def oraclefilesupdate(ctx):
+            """Push a python-only snapshot of the live Ubuntu RS bot folders to neo-rs/oraclefiles (admin only)."""
+            status_msg = await ctx.send("📦 **OracleFiles sync**\n```\nRunning snapshot export + git push...\n```")
+            should_post_progress = not (await self._is_progress_channel(ctx.channel))
+            progress_msg = None
+            if should_post_progress:
+                progress_msg = await self._post_or_edit_progress(
+                    None,
+                    f"[oraclefiles] MANUAL START\nRequested by: {ctx.author} ({ctx.author.id})",
+                )
+
+            ok, stats = self._oraclefiles_sync_once(trigger="manual")
+            if not ok:
+                err = str(stats.get("error") or "unknown error")
+                await status_msg.edit(content=f"❌ OracleFiles sync failed:\n```{err[:1200]}```")
+                if should_post_progress:
+                    await self._post_or_edit_progress(progress_msg, f"[oraclefiles] MANUAL FAILED\n{err[:1600]}")
+                return
+
+            head = str(stats.get("head") or "")[:12]
+            pushed = "YES" if str(stats.get("pushed") or "").strip() else "NO"
+            no_changes = "YES" if str(stats.get("no_changes") or "").strip() else "NO"
+            sample = stats.get("changed_sample") or []
+
+            msg = (
+                "✅ **OracleFiles sync complete**\n"
+                "```"
+                f"\nPushed: {pushed}"
+                f"\nNo changes: {no_changes}"
+                f"\nHead: {head}"
+                "```"
+            )
+            if sample:
+                msg += "\n**Changed files (sample):**\n```" + "\n".join(str(x) for x in sample[:40]) + "```"
+            await status_msg.edit(content=msg[:1900])
+            if should_post_progress:
+                await self._post_or_edit_progress(
+                    progress_msg,
+                    f"[oraclefiles] MANUAL OK\nPushed: {pushed}\nHead: {head}",
+                )
 
         @self.bot.command(name="updatetest")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
