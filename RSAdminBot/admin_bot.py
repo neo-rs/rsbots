@@ -1896,40 +1896,6 @@ echo \"CHANGED_END\"
                     except Exception as e:
                         print(f"{Colors.YELLOW}[Command Response] Failed to send to RS Server: {e}{Colors.RESET}")
     
-    def _create_error_embed(self, title: str, error_msg: str, suggestion: str = None) -> discord.Embed:
-        """Create standardized error embed."""
-        embed = discord.Embed(
-            title=f"❌ {title}",
-            description=error_msg,
-            color=discord.Color.red(),
-            timestamp=datetime.now()
-        )
-        if suggestion:
-            embed.add_field(name="💡 Suggestion", value=suggestion, inline=False)
-        return embed
-    
-    def _create_success_embed(self, title: str, description: str = None) -> discord.Embed:
-        """Create standardized success embed."""
-        embed = discord.Embed(
-            title=f"✅ {title}",
-            description=description,
-            color=discord.Color.green(),
-            timestamp=datetime.now()
-        )
-        return embed
-    
-    def _create_info_embed(self, title: str, description: str = None, color: discord.Color = None) -> discord.Embed:
-        """Create standardized info embed."""
-        if color is None:
-            color = discord.Color.blue()
-        embed = discord.Embed(
-            title=title,
-            description=description,
-            color=color,
-            timestamp=datetime.now()
-        )
-        return embed
-    
     def _build_expected_ssh_commands_content(self) -> str:
         """Build the expected .sh script commands content as a single string for comparison"""
         content_parts = []
@@ -2016,120 +1982,6 @@ echo \"CHANGED_END\"
             print(f"{Colors.YELLOW}[Startup] Error checking channel history: {e}{Colors.RESET}")
             # On error, assume content doesn't exist (will send to be safe)
             return False
-    
-    def _should_exclude_file(self, file_path: Path, exclude_data_files: bool = True, bot_folder: str = None) -> bool:
-        """Check if a file should be excluded from sync.
-        
-        Args:
-            file_path: Path to the file
-            exclude_data_files: If True, exclude .json, .db, and other data files
-            bot_folder: Bot folder name (e.g., "RSOnboarding") to allow bot-specific config files
-        
-        Returns:
-            True if file should be excluded, False otherwise
-        """
-        # NEVER exclude Python files - they are critical core files
-        if file_path.suffix.lower() == '.py':
-            return False
-        
-        # Always exclude hidden files and cache directories
-        if file_path.name.startswith('.') or file_path.name in ['__pycache__', '.git']:
-            return True
-        
-        # Bot-specific runtime data files that should NEVER be synced (updated live)
-        bot_specific_exclusions = {
-            "RSOnboarding": [
-                "tickets.json",  # Runtime ticket data
-                "tickets.db",  # Database
-                "ticket_history_report.json",  # Generated reports
-            ],
-            "RSuccessBot": [
-                "success_points.db",  # Runtime database
-                "vouches.db",  # Runtime database
-            ],
-            "RSCheckerbot": [
-                "invites.db",  # Runtime database
-                "registry.json",  # Runtime registry
-                "queue.json",  # Runtime queue
-                "missed_onboarding_report.json",  # Generated reports
-            ],
-            "RSAdminBot": [
-                # whop_data is already excluded via data_dirs
-            ],
-        }
-        
-        # Check bot-specific exclusions
-        if bot_folder and bot_folder in bot_specific_exclusions:
-            file_name = file_path.name
-            if file_name in bot_specific_exclusions[bot_folder]:
-                return True
-        
-        # Exclude data files if requested (but allow config.json and bot-specific config files)
-        if exclude_data_files:
-            data_extensions = ['.db', '.sqlite', '.sqlite3', '.log', '.lock']
-            if file_path.suffix.lower() in data_extensions:
-                return True
-            
-            # Exclude .json files EXCEPT:
-            # - config.json (needed for bot configuration)
-            # - messages.json (needed for RSOnboarding, RSuccessBot, RSCheckerbot)
-            if file_path.suffix.lower() == '.json':
-                allowed_json_files = ['config.json', 'messages.json']
-                if file_path.name in allowed_json_files:
-                    return False
-                # Exclude all other .json files (data files like tickets.json, registry.json, etc.)
-                return True
-            
-            # Exclude data directories (check full path, not just filename)
-            data_dirs = ['whop_data', '__pycache__', '.git', 'node_modules', '.venv', 'venv', 'env', 'logs']
-            # Check if any part of the path contains a data directory
-            path_parts = [part.lower() for part in file_path.parts]
-            if any(data_dir.lower() in path_parts for data_dir in data_dirs):
-                return True
-        
-        return False
-    
-    def _is_unimportant_remote_file(self, file_path_str: str) -> bool:
-        """Check if a remote-only file is unimportant (documentation, IDE files, etc.).
-        
-        These files don't affect bot functionality and can be safely ignored.
-        
-        Args:
-            file_path_str: Relative file path as string
-        
-        Returns:
-            True if file is unimportant, False otherwise
-        """
-        file_path = Path(file_path_str)
-        file_name = file_path.name.lower()
-        file_ext = file_path.suffix.lower()
-        
-        # Documentation files (not needed on server)
-        if file_ext == '.md':
-            return True
-        
-        # IDE/Editor files
-        if file_name in ['.replit', '.cursorignore', '.gitignore']:
-            return True
-        
-        # Replit agent state files (not needed)
-        if '.agent_state' in file_name or file_name in ['.latest.json', 'repl_state.bin', 'filesystem_state.json']:
-            return True
-        
-        # Semgrep config (not needed)
-        if 'semgrep' in file_path_str.lower():
-            return True
-        
-        # Hidden directories that are IDE/editor specific
-        if any(part.startswith('.') and part in ['.config', '.local', '.replit'] for part in file_path.parts):
-            return True
-        
-        # Test/documentation files
-        if any(part in ['test', 'tests', 'docs', 'documentation'] for part in file_path.parts):
-            if file_ext in ['.md', '.txt']:
-                return True
-        
-        return False
     
     def _github_py_only_update(self, bot_folder: str) -> Tuple[bool, Dict[str, Any]]:
         """Pull python-only bot code from the server-side GitHub checkout and overwrite live *.py files.
@@ -2238,20 +2090,7 @@ echo "CHANGED_END"
             return False, {"error": f"github py-only update failed: {str(e)[:300]}"}
     
     # Legacy Phase 4 file sync / tree compare / auto-sync removed.
-    
-    def _count_files_recursive(self, tree: Dict) -> Dict[str, int]:
-        """Count files recursively in tree structure."""
-        count = {}
-        for key, value in tree.items():
-            if key.endswith('/'):
-                # Directory
-                count[key] = len([k for k in value.keys() if not k.endswith('/')])
-                # Recurse
-                subcount = self._count_files_recursive(value)
-                count.update(subcount)
-            else:
-                count[key] = 1
-        return count
+    # Legacy helper functions (_should_exclude_file, _is_unimportant_remote_file, _count_files_recursive) removed.
     
     # NOTE: Previously we supported rs-bot-tokens.txt + a command that scraped tokens from configs.
     # That approach is intentionally removed for safety: secrets now live in config.secrets.json (server-only),
@@ -4728,7 +4567,7 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
         async def botmovements(ctx, bot_name: str = None, limit: int = 50):
             """Show bot's activity log (admin only)"""
             if not self.bot_movement_tracker:
-                error_embed = self._create_error_embed(
+                error_embed = MessageHelper.create_error_embed(
                     "Bot Movement Tracker Not Available",
                     "The bot movement tracker module is not loaded or initialized.",
                     "Check bot startup logs for tracker initialization errors"
@@ -4737,20 +4576,20 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                 return
             
             if not bot_name:
-                error_embed = self._create_error_embed(
+                error_embed = MessageHelper.create_error_embed(
                     "Bot Name Required",
                     "Please specify which bot's activity to view.",
-                    f"Usage: `!botmovements <bot_name> [limit]`\nUse `!botlist` to see available bots"
+                    error_details=f"Usage: `!botmovements <bot_name> [limit]`\nUse `!botlist` to see available bots"
                 )
                 await self._send_response(ctx, embed=error_embed)
                 return
             
             bot_name = bot_name.lower()
             if bot_name not in self.BOTS:
-                error_embed = self._create_error_embed(
+                error_embed = MessageHelper.create_error_embed(
                     "Unknown Bot",
                     f"Bot '{bot_name}' not found in bot registry.",
-                    f"Use `!botlist` to see available bots"
+                    error_details=f"Use `!botlist` to see available bots"
                 )
                 await self._send_response(ctx, embed=error_embed)
                 return
@@ -4759,7 +4598,7 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                 movements = self.bot_movement_tracker.get_bot_movements(bot_name, limit=limit)
                 stats = self.bot_movement_tracker.get_bot_stats(bot_name)
                 
-                embed = self._create_info_embed(
+                embed = MessageHelper.create_info_embed(
                     title=f"{self.BOTS[bot_name]['name']} Activity",
                     description=f"Activity tracking for {self.BOTS[bot_name]['name']}"
                 )
@@ -4805,10 +4644,10 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                 await self._send_response(ctx, embed=embed, also_send_to_rs_server=True)
                 
             except Exception as e:
-                error_embed = self._create_error_embed(
+                error_embed = MessageHelper.create_error_embed(
                     "Error Getting Bot Movements",
                     str(e)[:500],
-                    "Check bot movement tracker logs for details"
+                    error_details="Check bot movement tracker logs for details"
                 )
                 await self._send_response(ctx, embed=error_embed)
         
