@@ -1589,6 +1589,73 @@ class RSAdminBot:
         except Exception:
             return False
         return False
+
+    async def _ensure_botctl_symlink(self) -> None:
+        """Best-effort: ensure /home/rsadmin/bots/botctl.sh exists as a symlink to the canonical botctl.sh.
+
+        Why:
+        - Some older docs/tools expect /home/rsadmin/bots/botctl.sh
+        - Canonical location is inside the live tree: /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh
+
+        Safety:
+        - Only runs in Ubuntu local-exec mode
+        - If the link path exists and is NOT a symlink, we do not modify it
+        - Never fails startup; it only logs/report status
+        """
+        try:
+            if not self._should_use_local_exec():
+                return
+
+            link_path = "/home/rsadmin/bots/botctl.sh"
+            target_path = "/home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh"
+
+            cmd = f"""
+set -euo pipefail
+LINK={shlex.quote(link_path)}
+TARGET={shlex.quote(target_path)}
+
+if [ ! -e "$TARGET" ]; then
+  echo "STATUS=missing_target"
+  echo "TARGET=$TARGET"
+  exit 0
+fi
+
+mkdir -p "$(dirname "$LINK")"
+
+if [ -e "$LINK" ] && [ ! -L "$LINK" ]; then
+  echo "STATUS=exists_not_symlink"
+  ls -l "$LINK" || true
+  exit 0
+fi
+
+if [ -L "$LINK" ]; then
+  CUR="$(readlink "$LINK" 2>/dev/null || true)"
+  echo "STATUS=already_symlink"
+  echo "CUR=$CUR"
+  exit 0
+fi
+
+ln -s "$TARGET" "$LINK"
+chmod +x "$TARGET" >/dev/null 2>&1 || true
+echo "STATUS=created"
+echo "LINK=$LINK"
+echo "TARGET=$TARGET"
+"""
+            ok, out, err = self._execute_ssh_command(cmd, timeout=10)
+            msg = (out or err or "").strip()
+            if not msg:
+                msg = "STATUS=unknown"
+
+            print(f"[shim] botctl_symlink {msg[:400]}")
+            try:
+                await self._post_or_edit_progress(None, f"[shim] botctl_symlink\n{msg}"[:1900])
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                print(f"[shim] botctl_symlink error: {str(e)[:200]}")
+            except Exception:
+                pass
     
     async def _log_to_discord(self, message: str, embed: Optional[discord.Embed] = None):
         """Log message to Discord status channel"""
@@ -3693,6 +3760,12 @@ echo "CHANGED_END"
             
             # Mark startup as in progress
             self._startup_complete = True
+
+            # Best-effort runtime shims (Ubuntu local-exec only)
+            try:
+                await self._ensure_botctl_symlink()
+            except Exception:
+                pass
             
             # Import and run startup sequences
             try:
@@ -5356,6 +5429,64 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             embed.add_field(name="Output", value=f"```{output}```", inline=False)
             
             await ctx.send(embed=embed)
+
+        @self.bot.command(name="whereami")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def whereami(ctx):
+            """Print runtime environment details (admin only).
+
+            Use this when debugging: it proves which file is executing and what repo/commit is live.
+            """
+            try:
+                import platform
+                import sys as _sys
+
+                cwd = os.getcwd()
+                file_path = str(Path(__file__).resolve())
+                py_exec = _sys.executable
+                py_ver = _sys.version.split()[0]
+                local_exec = "yes" if self._should_use_local_exec() else "no"
+                live_root = str(getattr(self, "remote_root", "") or "")
+
+                code_repo = "/home/rsadmin/bots/rsbots-code"
+                live_repo = live_root if live_root else "/home/rsadmin/bots/mirror-world"
+
+                def _git_head(path: str) -> str:
+                    try:
+                        if not Path(path).is_dir():
+                            return "missing"
+                        if not (Path(path) / ".git").exists():
+                            return "no_git"
+                        res = subprocess.run(
+                            ["git", "-C", path, "rev-parse", "HEAD"],
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                        )
+                        if res.returncode != 0:
+                            return "error"
+                        return (res.stdout or "").strip()[:40] or "error"
+                    except Exception:
+                        return "error"
+
+                head_code = _git_head(code_repo)
+                head_live = _git_head(live_repo)
+
+                lines = [
+                    "WHEREAMI",
+                    f"cwd={cwd}",
+                    f"file={file_path}",
+                    f"os={platform.system()} {platform.release()}",
+                    f"python={py_exec}",
+                    f"python_version={py_ver}",
+                    f"local_exec={local_exec}",
+                    f"live_root={live_repo}",
+                    f"rsbots_code_head={head_code}",
+                    f"live_tree_head={head_live}",
+                ]
+                await ctx.send("```text\n" + "\n".join(lines)[:1900] + "\n```")
+            except Exception as e:
+                await ctx.send(f"❌ whereami failed: {str(e)[:300]}")
         
         @self.bot.command(name="botscan")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
