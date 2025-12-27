@@ -1967,10 +1967,10 @@ echo \"CHANGED_END\"
                         msg = f"[oraclefiles] periodic OK\\nPushed: {pushed}\\nHead: {head}"
                         sample = stats.get("changed_sample") or []
                         if pushed == "1" and sample:
-                            msg += \"\\nChanged sample:\\n\" + \"\\n\".join(str(x) for x in sample[:30])
+                            msg += "\nChanged sample:\n" + "\n".join(str(x) for x in sample[:30])
                         await self._post_or_edit_progress(None, msg[:1900])
                     else:
-                        await self._post_or_edit_progress(None, f\"[oraclefiles] periodic FAILED\\n{str(stats.get('error',''))[:1600]}\")
+                        await self._post_or_edit_progress(None, f"[oraclefiles] periodic FAILED\n{str(stats.get('error',''))[:1600]}")
                 except Exception:
                     pass
                 await asyncio.sleep(interval)
