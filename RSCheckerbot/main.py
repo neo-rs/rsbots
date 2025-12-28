@@ -31,6 +31,15 @@ from whop_webhook_handler import (
 )
 
 # -----------------------------
+# RSCheckerbot Rules
+# -----------------------------
+# - No role mentions ever (<@&...> is forbidden)
+# - Only mention users (@user) and channels (#channel)
+# - Commands must only trigger with .checker or bot mention
+# - DM sequence must be toggleable via commands
+# -----------------------------
+
+# -----------------------------
 # Load Configuration
 # -----------------------------
 def load_config():
@@ -140,7 +149,7 @@ intents.members = True
 intents.guilds = True
 intents.invites = True
 
-bot = commands.Bot(command_prefix=".", intents=intents)
+bot = commands.Bot(command_prefix=commands.when_mentioned_or(".checker "), intents=intents)
 
 # Make bot instance accessible for message editor
 class RSCheckerBot:
@@ -259,6 +268,18 @@ def _fmt_role_list(role_ids: set, guild: discord.Guild) -> str:
         else:
             roles.append(f"`{rid}`")
     return ", ".join(roles) if roles else "none"
+
+def m_user(member: discord.Member) -> str:
+    """Format member as mentionable user (@user)"""
+    return member.mention
+
+def m_channel(channel: discord.abc.GuildChannel) -> str:
+    """Format channel as mentionable (#channel)"""
+    return channel.mention
+
+def t_role(role_id: int, guild: discord.Guild) -> str:
+    """Format role as plain text (no mention) - alias for _fmt_role for clarity"""
+    return _fmt_role(role_id, guild)
 
 async def log_first(msg: str):
     ch = bot.get_channel(LOG_FIRST_CHANNEL_ID)
@@ -1452,7 +1473,7 @@ def cleanup_old_invites():
 # -----------------------------
 # Admin commands
 # -----------------------------
-@bot.command(name="editmessages", aliases=["edit", "emsg"])
+@bot.command(name="editmessages", aliases=["checker-edit", "cedit", "checker-messages"])
 @commands.has_permissions(administrator=True)
 async def edit_messages(ctx):
     """Edit DM messages via embedded interface"""
@@ -1472,7 +1493,7 @@ async def edit_messages(ctx):
     except Exception as e:
         await ctx.send(f"❌ Error: {e}", delete_after=10)
 
-@bot.command(name="reloadmessages", aliases=["reload"])
+@bot.command(name="reloadmessages", aliases=["checker-reload", "creload"])
 @commands.has_permissions(administrator=True)
 async def reload_messages(ctx):
     """Reload messages from JSON file"""
@@ -1510,7 +1531,7 @@ async def start_sequence(ctx, member: discord.Member):
         await ctx.reply("User already had sequence before; not starting again.")
         return
     enqueue_first_day(member.id)
-    await ctx.reply(f"Queued day_1 for {member.mention} now.")
+    await ctx.reply(f"Queued day_1 for {m_user(member)} now.")
     await log_first(f"🧵 (Admin) Enqueued **day_1** for {_fmt_user(member)}")
 
 @bot.command(name="cancel")
@@ -1520,7 +1541,7 @@ async def cancel_sequence(ctx, member: discord.Member):
         await ctx.reply("User not in active queue.")
         return
     mark_cancelled(member.id, "admin_cancel")
-    await ctx.reply(f"Cancelled sequence for {member.mention}.")
+    await ctx.reply(f"Cancelled sequence for {m_user(member)}.")
     await log_other(f"🛑 (Admin) Cancelled sequence for {_fmt_user(member)}")
 
 @bot.command(name="test")
