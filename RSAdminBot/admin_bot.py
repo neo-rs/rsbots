@@ -2276,14 +2276,18 @@ echo "TARGET=$TARGET"
         log_channel_id = "1452590450631376906"  # Hard-coded as specified
         
         try:
+            sent_ids = set()
             # Always send to log channel
             log_channel = self.bot.get_channel(int(log_channel_id))
-            if log_channel:
+            if log_channel and getattr(log_channel, "id", None) is not None:
                 await log_channel.send(embed=embed)
-            
-            # Also send reply to command channel if specified
-            if reply_channel:
-                await reply_channel.send(embed=embed)
+                sent_ids.add(int(log_channel.id))
+
+            # Also send reply to command channel if specified (but never double-send to same channel)
+            if reply_channel and getattr(reply_channel, "id", None) is not None:
+                rid = int(reply_channel.id)
+                if rid not in sent_ids:
+                    await reply_channel.send(embed=embed)
         except Exception as e:
             print(f"{Colors.RED}[Discord Log] Failed to send message: {e}{Colors.RESET}")
 
@@ -6079,7 +6083,7 @@ echo "CHANGED_END"
         @self.bot.command(name="systemcheck")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
         async def systemcheck(ctx):
-            """Report where RSAdminBot is running and what execution mode it will use (admin only)."""
+            """Report runtime mode + core Ubuntu health stats (admin only)."""
             try:
                 os_name = os.name
                 plat = platform.platform()
@@ -6094,9 +6098,55 @@ echo "CHANGED_END"
                 key = server.get("key", "")
                 key_exists = bool(key) and Path(str(key)).exists()
                 mode_txt = "Ubuntu local-exec (no SSH key needed)" if local_exec else "SSH mode (key required if not local)"
+
+                # --- System health stats (Ubuntu local-exec preferred; fall back to SSH if needed)
+                def _cmd(cmd: str, timeout_s: int = 8) -> str:
+                    ok, out, err = self._execute_ssh_command(cmd, timeout=timeout_s)
+                    return (out or err or "").strip()
+
+                # CPU/load snapshot
+                uptime_txt = _cmd("uptime", timeout_s=5)
+                top_head = _cmd("top -bn1 | head -n 5", timeout_s=6)
+
+                # Memory + disk
+                mem_txt = _cmd("free -h | head -n 3", timeout_s=5)
+                disk_root = _cmd("df -h / | head -n 2", timeout_s=5)
+
+                # journald size (good for catching runaway logs)
+                journal_usage = _cmd("journalctl --disk-usage 2>/dev/null || true", timeout_s=6)
+
+                # RSAdminBot file-logging folder size (if configured)
+                log_base = ""
+                try:
+                    log_base = str(((self.config.get("logging") or {}).get("file_logging") or {}).get("base_path") or "")
+                except Exception:
+                    log_base = ""
+                log_du = ""
+                if log_base:
+                    log_du = _cmd(f"du -sh {shlex.quote(log_base)} 2>/dev/null || true", timeout_s=6)
+
+                # Total size of bots folder (fast-ish, bounded)
+                bots_du = _cmd("du -sh /home/rsadmin/bots 2>/dev/null | head -n 1 || true", timeout_s=10)
+
+                # Top 10 largest files under /home/rsadmin/bots (xdev avoids scanning mounted volumes)
+                top_files = _cmd(
+                    "find /home/rsadmin/bots -xdev -type f -printf '%s\\t%p\\n' 2>/dev/null | sort -nr | head -n 10 | "
+                    "awk -F'\\t' '{printf \"%8.1f MB\\t%s\\n\", ($1/1024/1024), $2}'",
+                    timeout_s=12,
+                )
+
+                # Truncate long blocks for embed fields (1024 char field limit)
+                def _clip(s: str, n: int = 900) -> str:
+                    s = (s or "").strip()
+                    if not s:
+                        return "(no output)"
+                    if len(s) <= n:
+                        return s
+                    return s[:n] + "\n...(truncated)"
+
                 embed = MessageHelper.create_info_embed(
                     title="System Check",
-                    message="Runtime + connectivity summary.",
+                    message="Runtime + connectivity + Ubuntu health snapshot.",
                     fields=[
                         {"name": "OS", "value": f"{os_name} | {plat[:70]}", "inline": False},
                         {"name": "cwd", "value": cwd[:100], "inline": False},
@@ -6107,11 +6157,32 @@ echo "CHANGED_END"
                         {"name": "ssh.target", "value": f"{user}@{host}" if host else "(none)", "inline": True},
                         {"name": "ssh.key.exists", "value": str(bool(key_exists)), "inline": True},
                         {"name": "Decision", "value": mode_txt, "inline": False},
+                        {"name": "CPU/Load", "value": f"```{_clip(uptime_txt, 500)}```", "inline": False},
+                        {"name": "top (header)", "value": f"```{_clip(top_head, 700)}```", "inline": False},
+                        {"name": "Memory", "value": f"```{_clip(mem_txt, 700)}```", "inline": False},
+                        {"name": "Disk (/)", "value": f"```{_clip(disk_root, 700)}```", "inline": False},
+                        {"name": "journald", "value": f"```{_clip(journal_usage, 500)}```", "inline": True},
+                        {"name": "bots folder", "value": f"```{_clip(bots_du, 250)}```", "inline": True},
                     ],
                     footer=f"Triggered by {ctx.author}",
                 )
-                await ctx.send(embed=embed)
+                # Single send path (prevents duplicates when the command channel is also the log channel)
                 await self._log_to_discord(embed, ctx.channel)
+
+                # Post large-file summary as a second embed (keeps main embed readable)
+                lf_fields = []
+                if log_base:
+                    lf_fields.append({"name": "RSAdminBot log path", "value": f"`{log_base}`", "inline": False})
+                    if log_du.strip():
+                        lf_fields.append({"name": "RSAdminBot logs size", "value": f"```{_clip(log_du, 250)}```", "inline": True})
+                lf_fields.append({"name": "Top 10 largest files (/home/rsadmin/bots)", "value": f"```{_clip(top_files, 950)}```", "inline": False})
+                lf_embed = MessageHelper.create_info_embed(
+                    title="Disk Hotspots",
+                    message="Largest files under `/home/rsadmin/bots` (helps detect runaway logs/artifacts).",
+                    fields=lf_fields,
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await self._log_to_discord(lf_embed, ctx.channel)
                 if self.logger:
                     try:
                         log_entry = self.logger.log_command(
@@ -6132,7 +6203,6 @@ echo "CHANGED_END"
                     error_details=err_txt,
                     footer=f"Triggered by {ctx.author}",
                 )
-                await ctx.send(embed=embed)
                 await self._log_to_discord(embed, ctx.channel)
 
         @self.bot.command(name="secretsstatus")
