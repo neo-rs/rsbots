@@ -36,6 +36,15 @@ if not errorlevel 1 (
   exit /b 0
 )
 
+echo.
+echo === STAGED CHANGES (what will be committed) ===
+echo --- files (name-status)
+git diff --cached --name-status
+echo.
+echo --- diffstat
+git diff --cached --stat
+echo.
+
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set TS=%%i
 
 echo.
@@ -46,6 +55,14 @@ if errorlevel 1 (
   exit /b 1
 )
 
+for /f %%i in ('git rev-parse --short HEAD') do set SHA=%%i
+echo.
+echo === COMMIT CREATED ===
+echo Commit: %SHA%
+echo --- commit summary (name-status + stat)
+git show -1 --name-status --stat --pretty=oneline
+echo.
+
 echo.
 echo Pushing to origin/main...
 git push
@@ -53,6 +70,10 @@ if errorlevel 1 (
   echo ERROR: git push failed.
   exit /b 1
 )
+
+echo.
+echo === PUSH COMPLETE ===
+echo Pushed commit: %SHA% to origin/main
 
 echo.
 echo DONE.
