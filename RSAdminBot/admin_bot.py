@@ -1125,6 +1125,11 @@ class RSAdminBot:
         self.bot_movement_tracker: Optional[Any] = None
         self.test_server_organizer: Optional[Any] = None
         
+        # Monitor channel mappings (per-bot channels in test server)
+        self._bot_monitor_channel_ids: Dict[str, int] = {}
+        self._monitor_category_id: Optional[int] = None
+        self._last_service_snapshot: Dict[str, Tuple[str, int]] = {}  # {bot_key: (state, pid)}
+        
         # Setup bot with required intents
         intents = discord.Intents.default()
         intents.message_content = True
@@ -1512,6 +1517,73 @@ echo "TARGET=$TARGET"
                 "rs_errors_channel_id": str(self.config.get("log_channel_id", "1452590450631376906")),
             }
 
+    def _get_monitor_channels_config(self) -> Dict[str, Any]:
+        """Return monitor_channels config."""
+        cfg = self.config.get("monitor_channels") or {}
+        try:
+            return {
+                "enabled": bool(cfg.get("enabled", True)),
+                "test_server_guild_id": int(cfg.get("test_server_guild_id", 1451275225512546497)),
+                "category_name": str(cfg.get("category_name", "RS Bots Terminal Logs")),
+                "channel_prefix": str(cfg.get("channel_prefix", "bot-")),
+                "rs_error_channel_id": int(cfg.get("rs_error_channel_id", 1452590450631376906)),
+                "ping_on_failure_user_ids": [int(uid) for uid in (cfg.get("ping_on_failure_user_ids") or []) if uid],
+                "post_pid_change": bool(cfg.get("post_pid_change", False)),
+                "failure_logs_lines": int(cfg.get("failure_logs_lines", 80)),
+            }
+        except Exception:
+            return {
+                "enabled": False,
+                "test_server_guild_id": 1451275225512546497,
+                "category_name": "RS Bots Terminal Logs",
+                "channel_prefix": "bot-",
+                "rs_error_channel_id": 1452590450631376906,
+                "ping_on_failure_user_ids": [],
+                "post_pid_change": False,
+                "failure_logs_lines": 80,
+            }
+    
+    async def _initialize_monitor_channels(self) -> None:
+        """Initialize monitor category and per-bot channels in test server."""
+        monitor_cfg = self._get_monitor_channels_config()
+        if not monitor_cfg.get("enabled"):
+            return
+        
+        if not self.test_server_organizer:
+            return
+        
+        # Get RS bot keys
+        bot_groups = self.config.get("bot_groups") or {}
+        rs_keys = ["rsadminbot"] + list(bot_groups.get("rs_bots") or [])
+        
+        # Create monitor channels
+        channel_map = await self.test_server_organizer.ensure_monitor_category_and_bot_channels(rs_keys)
+        self._bot_monitor_channel_ids = channel_map
+        
+        # Store category ID from organizer
+        if hasattr(self.test_server_organizer, 'channels_data'):
+            self._monitor_category_id = self.test_server_organizer.channels_data.get("monitor_category_id")
+        
+        if channel_map:
+            print(f"{Colors.GREEN}[Monitor Channels] Initialized {len(channel_map)} per-bot monitor channels{Colors.RESET}")
+        else:
+            print(f"{Colors.YELLOW}[Monitor Channels] No monitor channels created (disabled or failed){Colors.RESET}")
+    
+    def _get_bot_monitor_channel(self, bot_key: str) -> Optional[discord.TextChannel]:
+        """Get the monitor channel for a bot key."""
+        channel_id = self._bot_monitor_channel_ids.get(bot_key)
+        if channel_id:
+            return self.bot.get_channel(channel_id)
+        return None
+    
+    def _get_rs_error_channel(self) -> Optional[discord.TextChannel]:
+        """Get the RS server error channel."""
+        monitor_cfg = self._get_monitor_channels_config()
+        channel_id = monitor_cfg.get("rs_error_channel_id")
+        if channel_id:
+            return self.bot.get_channel(channel_id)
+        return None
+    
     def _start_service_monitor_task(self) -> None:
         """Start background monitoring of RS bot systemd state (posts only on changes/failures)."""
         if getattr(self, "_service_monitor_task", None):
@@ -1540,9 +1612,12 @@ echo "TARGET=$TARGET"
             rs_keys = ["rsadminbot"] + list(bot_groups.get("rs_bots") or [])
 
             # Keep snapshot dict: {bot: (state, pid)} - state includes exists info
-            last_snapshot: Dict[str, Tuple[str, int]] = {}
+            last_snapshot: Dict[str, Tuple[str, int]] = self._last_service_snapshot.copy() if hasattr(self, '_last_service_snapshot') else {}
             last_post_ts: Dict[str, float] = {}
             last_heartbeat = 0.0
+            
+            # Get monitor channels config
+            monitor_cfg = self._get_monitor_channels_config()
 
             async def post(bot_key: str, text: str, severity: str = "info", should_ping: bool = False):
                 """Post monitor message to appropriate channels.
@@ -1559,40 +1634,38 @@ echo "TARGET=$TARGET"
                     return
                 last_post_ts[bot_key] = now
                 
-                # Get channel IDs from config
-                test_channel_id = cfg.get("test_server_channel_id", "")
-                rs_errors_channel_id = cfg.get("rs_errors_channel_id", "1452590450631376906")
+                # Route to bot's monitor channel (test server)
+                bot_channel = self._get_bot_monitor_channel(bot_key)
                 
-                # Route based on severity
                 if severity == "error":
-                    # Post to RS error channel
-                    try:
-                        rs_channel = self.bot.get_channel(int(rs_errors_channel_id))
-                        if rs_channel:
-                            await rs_channel.send(text[:1900])
-                    except Exception:
-                        pass
+                    # Error: post to bot's channel + RS error channel
+                    ping_users = monitor_cfg.get("ping_on_failure_user_ids", [])
+                    ping_text = " ".join(f"<@!{uid}>" for uid in ping_users) if ping_users and should_ping else ""
                     
-                    # Also post to test server progress channel
-                    await self._post_or_edit_progress(None, text)
-                    
-                    # Ping Neo in test server if requested
-                    if should_ping and test_channel_id:
+                    if bot_channel:
+                        full_text = f"{ping_text} {text}" if ping_text else text
                         try:
-                            test_channel = self.bot.get_channel(int(test_channel_id))
-                            if test_channel:
-                                ping_text = f"<@!{self.config.get('admin_user_ids', [])[0] if self.config.get('admin_user_ids') else ''}> {text[:1900]}"
-                                await test_channel.send(ping_text[:2000])
+                            await bot_channel.send(full_text[:2000])
                         except Exception:
-                            # Fallback: just post without ping if ping fails
-                            await self._post_or_edit_progress(None, text)
+                            pass
+                    
+                    # Also post to RS error channel
+                    rs_error_channel = self._get_rs_error_channel()
+                    if rs_error_channel:
+                        try:
+                            await rs_error_channel.send(text[:1900])
+                        except Exception:
+                            pass
                 else:
-                    # Info messages go to test server progress channel only
+                    # Info messages: post to bot's channel only (if enabled)
+                    if bot_channel and monitor_cfg.get("post_pid_change", False):
+                        try:
+                            await bot_channel.send(text[:1900])
+                        except Exception:
+                            pass
+                    
+                    # Also post to progress channel for info
                     await self._post_or_edit_progress(None, text)
-                
-                # Per-bot monitoring channel in test server (if organizer exists)
-                if self.test_server_organizer:
-                    await self.test_server_organizer.send_to_channel(f"{bot_key}_activity", content=text[:1900])
 
             # Always announce the monitor is running (one-time)
             try:
@@ -1668,11 +1741,15 @@ echo "TARGET=$TARGET"
                         
                         # Snapshot changed - detect if it's PID-only or state change
                         prev_state, prev_pid = prev if prev else (None, 0)
-                        is_pid_only = (prev_state == cur_state) and (prev_state == "active") and (prev_pid != cur_pid)
+                        pid_changed = (prev_pid != cur_pid)
+                        state_changed = (prev_state != cur_state)
+                        is_pid_only = pid_changed and not state_changed and (cur_state == "active")
                         is_failure = (cur_state in ("failed", "inactive", "not_found"))
+                        is_recovered = prev_state and (prev_state in ("failed", "inactive")) and (cur_state == "active")
                         
-                        # Update snapshot
+                        # Update snapshot (and persist to instance)
                         last_snapshot[key] = (cur_state, cur_pid)
+                        self._last_service_snapshot[key] = (cur_state, cur_pid)
                         
                         # Get full details for the change
                         info = self.BOTS.get(key) or {}
@@ -1684,42 +1761,56 @@ echo "TARGET=$TARGET"
                         if is_pid_only:
                             # PID-only change while active = restart detected (compact message)
                             msg_lines = [
-                                f"[monitor] {info.get('name', key)} ({key}) - restart detected",
-                                f"PID: {prev_pid} → {cur_pid} (state: active)"
+                                f"✅ Restarted: pid {prev_pid} → {cur_pid}"
                             ]
                             severity = "info"
                             should_ping = False
+                        elif is_recovered:
+                            # State recovered (failed/inactive → active)
+                            msg_lines = [
+                                f"✅ RECOVERED: {info.get('name', key)} back to active pid={cur_pid}"
+                            ]
+                            severity = "info"
+                            should_ping = False
+                        elif is_failure:
+                            # Failure detected - include details and logs
+                            msg_lines = [
+                                f"🚨 FAILURE: {info.get('name', key)} ({key})",
+                                f"State: {cur_state} | PID: {cur_pid}"
+                            ]
+                            if prev_state:
+                                msg_lines.insert(2, f"Previous: {prev_state} (pid: {prev_pid})")
+                            
+                            # Get detailed status (like !details command)
+                            details_success, details_out, _ = self.service_manager.get_detailed_status(svc)
+                            if details_success and details_out:
+                                truncated_details = MessageHelper._truncate_for_discord(details_out, limit=1800)
+                                msg_lines.append("\n**Details:**")
+                                msg_lines.append(MessageHelper._codeblock(truncated_details))
+                            
+                            # Get logs (like !logs command)
+                            failure_lines = monitor_cfg.get("failure_logs_lines", 80)
+                            logs = self.service_manager.get_failure_logs(svc, lines=failure_lines) or ""
+                            if logs:
+                                truncated_logs = MessageHelper._truncate_for_discord(logs, limit=1800)
+                                msg_lines.append("\n**Recent logs:**")
+                                msg_lines.append(MessageHelper._codeblock(truncated_logs))
+                            
+                            severity = "error"
+                            should_ping = True
                         else:
-                            # State change or failure
+                            # Other state change (not failure, not recovery)
                             msg_lines = [
                                 f"[monitor] {info.get('name', key)} ({key}) - state changed",
                                 f"State: {self._format_service_state(exists, state, pid)}"
                             ]
                             if prev_state:
                                 msg_lines.insert(1, f"Previous: {prev_state} (pid: {prev_pid})")
-                            
-                            # If bot is not active, include !details and !logs output
-                            if is_failure:
-                                # Get detailed status (like !details command)
-                                details_success, details_out, _ = self.service_manager.get_detailed_status(svc)
-                                if details_success and details_out:
-                                    msg_lines.append("\n**Details:**")
-                                    msg_lines.append(f"```{details_out[:800]}```")
-                                
-                                # Get logs (like !logs command)
-                                logs = self.service_manager.get_failure_logs(svc, lines=lines) or ""
-                                if logs:
-                                    msg_lines.append("\n**Recent logs:**")
-                                    msg_lines.append(f"```{logs[-1200:]}```")
-                                
-                                severity = "error"
-                                should_ping = True
-                            else:
-                                severity = "info"
-                                should_ping = False
+                            severity = "info"
+                            should_ping = False
                         
                         msg = "\n".join(msg_lines)
-                        await post(key, msg[:1900], severity=severity, should_ping=should_ping)
+                        await post(key, msg, severity=severity, should_ping=should_ping)
                         
                 except Exception:
                     pass
@@ -2850,6 +2941,12 @@ echo "CHANGED_END"
                     await sequence_4_file_sync.run(self)
                     await sequence_5_channels.run(self)
                     await sequence_6_background.run(self)
+                    
+                    # Initialize monitor channels (per-bot channels in test server)
+                    try:
+                        await self._initialize_monitor_channels()
+                    except Exception as e:
+                        print(f"{Colors.YELLOW}[Startup] Monitor channel initialization failed (non-critical): {e}{Colors.RESET}")
 
                     # If a self-update was applied during restart, report it to the update-progress channel now.
                     try:
@@ -3394,7 +3491,7 @@ echo "CHANGED_END"
             print(f"{Colors.CYAN}[Command] Starting {bot_info['name']} (Service: {service_name}){Colors.RESET}")
             print(f"{Colors.CYAN}[Command] Server: {guild_name} (ID: {guild_id}){Colors.RESET}")
             print(f"{Colors.CYAN}[Command] Requested by: {ctx.author} ({ctx.author.id}){Colors.RESET}")
-            await self._log_to_discord(f"🟢 **Starting {bot_info['name']}**\nService: `{service_name}`\nRequested by: {ctx.author.mention}")
+            await self._log_to_discord(f"🟢 **Starting {bot_info['name']}**\nService: `{service_name}`")
             
             # Send immediate acknowledgment
             status_msg = await ctx.send(f"🔄 **Starting {bot_info['name']}...**\n```\nConnecting to server...\n```")
@@ -3485,7 +3582,7 @@ echo "CHANGED_END"
             print(f"{Colors.CYAN}[Command] Stopping {bot_info['name']} (Service: {service_name}){Colors.RESET}")
             print(f"{Colors.CYAN}[Command] Server: {guild_name} (ID: {guild_id}){Colors.RESET}")
             print(f"{Colors.CYAN}[Command] Requested by: {ctx.author} ({ctx.author.id}){Colors.RESET}")
-            await self._log_to_discord(f"🔴 **Stopping {bot_info['name']}**\nService: `{service_name}`\nRequested by: {ctx.author.mention}")
+            await self._log_to_discord(f"🔴 **Stopping {bot_info['name']}**\nService: `{service_name}`")
             
             # Send immediate acknowledgment
             status_msg = await ctx.send(f"🔄 **Stopping {bot_info['name']}...**\n```\nConnecting to server...\n```")
@@ -3565,7 +3662,7 @@ echo "CHANGED_END"
             print(f"{Colors.CYAN}[Command] Restarting {bot_info['name']} (Service: {service_name}){Colors.RESET}")
             print(f"{Colors.CYAN}[Command] Server: {guild_name} (ID: {guild_id}){Colors.RESET}")
             print(f"{Colors.CYAN}[Command] Requested by: {ctx.author} ({ctx.author.id}){Colors.RESET}")
-            await self._log_to_discord(f"🔄 **Restarting {bot_info['name']}**\nService: `{service_name}`\nRequested by: {ctx.author.mention}")
+            await self._log_to_discord(f"🔄 **Restarting {bot_info['name']}**\nService: `{service_name}`")
             
             # Send immediate acknowledgment
             status_msg = await ctx.send(f"🔄 **Restarting {bot_info['name']}...**\n```\nConnecting to server...\n```")
@@ -3686,8 +3783,7 @@ echo "CHANGED_END"
                     progress_msg,
                     (
                         f"[botupdate] {bot_info['name']} ({bot_name}) START\n"
-                        f"Before: {self._format_service_state(before_exists, before_state, before_pid)}\n"
-                        f"Requested by: {ctx.author} ({ctx.author.id})"
+                        f"Before: {self._format_service_state(before_exists, before_state, before_pid)}"
                     ),
                 )
             
@@ -3783,7 +3879,7 @@ echo "CHANGED_END"
             if should_post_progress:
                 progress_msg = await self._post_or_edit_progress(
                     None,
-                    f"[selfupdate] START\nRequested by: {ctx.author} ({ctx.author.id})",
+                    f"[selfupdate] START",
                 )
             success, stats = self._github_py_only_update("RSAdminBot")
             if not success:

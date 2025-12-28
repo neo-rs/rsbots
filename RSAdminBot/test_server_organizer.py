@@ -6,7 +6,7 @@ Auto-creates categories and channels in TEST SERVER for RSAdminBot organization.
 
 import json
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import hashlib
 
 import discord
@@ -171,4 +171,111 @@ class TestServerOrganizer:
         except Exception as e:
             print(f"[TestServerOrganizer] Error sending to {channel_key}: {e}")
             return False
+    
+    async def ensure_monitor_category_and_bot_channels(self, rs_bot_keys: List[str]) -> Dict[str, int]:
+        """
+        Returns mapping {bot_key: channel_id} for per-bot monitor channels in test server.
+        Creates category + channels only in test server, idempotent.
+        
+        Args:
+            rs_bot_keys: List of bot keys (e.g., ["rsforwarder", "rsonboarding", ...])
+            
+        Returns:
+            Dict mapping bot_key to channel_id
+        """
+        # Config gate
+        cfg = self.config.get("monitor_channels") if isinstance(self.config, dict) else {}
+        if not isinstance(cfg, dict) or not cfg.get("enabled"):
+            return {}
+        
+        # Hard guard: only create in test server
+        test_guild_id = cfg.get("test_server_guild_id")
+        if not test_guild_id:
+            return {}
+        
+        test_guild_id = int(test_guild_id)
+        
+        guild = self.bot.get_guild(test_guild_id)
+        if not guild:
+            return {}
+        
+        # Double-check we're in the right guild
+        if guild.id != test_guild_id:
+            return {}
+        
+        category_name = cfg.get("category_name", "RS Bots Terminal Logs")
+        channel_prefix = cfg.get("channel_prefix", "bot-")
+        
+        result = {}
+        
+        # Ensure category exists
+        category_id = self.channels_data.get("monitor_category_id")
+        category = None
+        
+        if category_id:
+            category = guild.get_channel(category_id)
+        
+        if not category:
+            # Search for existing category by name
+            for cat in guild.categories:
+                if cat.name == category_name:
+                    category = cat
+                    category_id = cat.id
+                    self.channels_data["monitor_category_id"] = category_id
+                    self._save_channels_data()
+                    break
+        
+        if not category:
+            # Create category
+            try:
+                category = await guild.create_category(category_name)
+                category_id = category.id
+                self.channels_data["monitor_category_id"] = category_id
+                self._save_channels_data()
+            except discord.Forbidden:
+                print(f"[TestServerOrganizer] Missing permission to create category: {category_name}")
+                return {}
+            except Exception as e:
+                print(f"[TestServerOrganizer] Error creating category: {e}")
+                return {}
+        
+        # Ensure per-bot channels exist
+        if "monitor_channels" not in self.channels_data:
+            self.channels_data["monitor_channels"] = {}
+        
+        for bot_key in rs_bot_keys:
+            channel_name = f"{channel_prefix}{bot_key}"
+            
+            # Check if we already have this channel ID
+            existing_channel_id = self.channels_data["monitor_channels"].get(bot_key)
+            if existing_channel_id:
+                existing_channel = guild.get_channel(existing_channel_id)
+                if existing_channel:
+                    result[bot_key] = existing_channel_id
+                    continue
+            
+            # Search for existing channel by name in category
+            found = None
+            for ch in guild.text_channels:
+                if ch.category_id == category_id and ch.name == channel_name:
+                    found = ch
+                    break
+            
+            if not found:
+                # Create channel in category
+                try:
+                    found = await guild.create_text_channel(channel_name, category=category)
+                except discord.Forbidden:
+                    print(f"[TestServerOrganizer] Missing permission to create channel: {channel_name}")
+                    continue
+                except Exception as e:
+                    print(f"[TestServerOrganizer] Error creating channel {channel_name}: {e}")
+                    continue
+            
+            if found:
+                result[bot_key] = found.id
+                self.channels_data["monitor_channels"][bot_key] = found.id
+                self._save_channels_data()
+        
+        return result
 
