@@ -6011,74 +6011,98 @@ echo "CHANGED_END"
                     footer=f"Triggered by {ctx.author}",
                 )
             )
-            should_post_progress = not (await self._is_progress_channel(ctx.channel))
-            progress_msg = None
-            if should_post_progress:
-                progress_msg = await self._post_or_edit_progress(
-                    None,
-                    f"[oraclefiles] MANUAL START",
-                )
+            try:
+                should_post_progress = not (await self._is_progress_channel(ctx.channel))
+                progress_msg = None
+                if should_post_progress:
+                    progress_msg = await self._post_or_edit_progress(
+                        None,
+                        f"[oraclefiles] MANUAL START",
+                    )
 
-            ok, stats = self._oraclefiles_sync_once(trigger="manual")
-            if not ok:
-                err = str(stats.get("error") or "unknown error")
-                error_embed = MessageHelper.create_error_embed(
-                    title="OracleFiles Sync Failed",
-                    message="OracleFiles sync failed.",
-                    error_details=err[:1200],
+                try:
+                    ok, stats = self._oraclefiles_sync_once(trigger="manual")
+                except Exception as e:
+                    ok, stats = False, {"error": f"oraclefiles sync crashed: {str(e)[:300]}"}
+
+                if not ok:
+                    err = str(stats.get("error") or "unknown error")
+                    error_embed = MessageHelper.create_error_embed(
+                        title="OracleFiles Sync Failed",
+                        message="OracleFiles sync failed.",
+                        error_details=err[:1200],
+                        footer=f"Triggered by {ctx.author}",
+                    )
+                    await status_msg.edit(embed=error_embed)
+                    # Log-channel only (avoid duplicating the in-channel status message)
+                    await self._log_to_discord(error_embed, None)
+                    if self.logger:
+                        try:
+                            log_entry = self.logger.log_command(ctx, "oraclefilesupdate", "error", {"error": err[:1200]})
+                            await self._log_to_discord(self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx)), None)
+                            self.logger.clear_command_context()
+                        except Exception:
+                            pass
+                    if should_post_progress:
+                        await self._post_or_edit_progress(progress_msg, f"[oraclefiles] MANUAL FAILED\n{err[:1600]}")
+                    return
+
+                head = str(stats.get("head") or "")[:12]
+                pushed = "YES" if str(stats.get("pushed") or "").strip() else "NO"
+                no_changes = "YES" if str(stats.get("no_changes") or "").strip() else "NO"
+                sample = stats.get("changed_sample") or []
+
+                fields = [
+                    {"name": "Pushed", "value": pushed, "inline": True},
+                    {"name": "No changes", "value": no_changes, "inline": True},
+                    {"name": "Head", "value": head, "inline": False},
+                ]
+                ok_embed = MessageHelper.create_success_embed(
+                    title="OracleFiles Sync Complete",
+                    message="OracleFiles snapshot pushed successfully.",
+                    fields=fields,
                     footer=f"Triggered by {ctx.author}",
                 )
-                await status_msg.edit(embed=error_embed)
-                await self._log_to_discord(error_embed, ctx.channel)
+                if sample:
+                    sample_txt = "\n".join(str(x) for x in sample[:40])
+                    ok_embed.add_field(name="Changed files (sample)", value=f"```{sample_txt[:900]}```", inline=False)
+                await status_msg.edit(embed=ok_embed)
+                # Log-channel only (avoid duplicating the in-channel status message)
+                await self._log_to_discord(ok_embed, None)
                 if self.logger:
                     try:
-                        log_entry = self.logger.log_command(ctx, "oraclefilesupdate", "error", {"error": err[:1200]})
-                        await self._log_to_discord(self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx)), ctx.channel)
+                        log_entry = self.logger.log_command(
+                            ctx,
+                            "oraclefilesupdate",
+                            "success",
+                            {"pushed": pushed, "no_changes": no_changes, "head": head},
+                        )
+                        await self._log_to_discord(self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx)), None)
                         self.logger.clear_command_context()
                     except Exception:
                         pass
                 if should_post_progress:
-                    await self._post_or_edit_progress(progress_msg, f"[oraclefiles] MANUAL FAILED\n{err[:1600]}")
-                return
-
-            head = str(stats.get("head") or "")[:12]
-            pushed = "YES" if str(stats.get("pushed") or "").strip() else "NO"
-            no_changes = "YES" if str(stats.get("no_changes") or "").strip() else "NO"
-            sample = stats.get("changed_sample") or []
-
-            fields = [
-                {"name": "Pushed", "value": pushed, "inline": True},
-                {"name": "No changes", "value": no_changes, "inline": True},
-                {"name": "Head", "value": head, "inline": False},
-            ]
-            ok_embed = MessageHelper.create_success_embed(
-                title="OracleFiles Sync Complete",
-                message="OracleFiles snapshot pushed successfully.",
-                fields=fields,
-                footer=f"Triggered by {ctx.author}",
-            )
-            if sample:
-                sample_txt = "\n".join(str(x) for x in sample[:40])
-                ok_embed.add_field(name="Changed files (sample)", value=f"```{sample_txt[:900]}```", inline=False)
-            await status_msg.edit(embed=ok_embed)
-            await self._log_to_discord(ok_embed, ctx.channel)
-            if self.logger:
-                try:
-                    log_entry = self.logger.log_command(
-                        ctx,
-                        "oraclefilesupdate",
-                        "success",
-                        {"pushed": pushed, "no_changes": no_changes, "head": head},
+                    await self._post_or_edit_progress(
+                        progress_msg,
+                        f"[oraclefiles] MANUAL OK\nPushed: {pushed}\nHead: {head}",
                     )
-                    await self._log_to_discord(self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx)), ctx.channel)
-                    self.logger.clear_command_context()
+            except Exception as e:
+                err = str(e)[:400]
+                error_embed = MessageHelper.create_error_embed(
+                    title="OracleFiles Sync Failed",
+                    message="oraclefilesupdate crashed.",
+                    error_details=err,
+                    footer=f"Triggered by {ctx.author}",
+                )
+                try:
+                    await status_msg.edit(embed=error_embed)
                 except Exception:
                     pass
-            if should_post_progress:
-                await self._post_or_edit_progress(
-                    progress_msg,
-                    f"[oraclefiles] MANUAL OK\nPushed: {pushed}\nHead: {head}",
-                )
+                try:
+                    await self._log_to_discord(error_embed, None)
+                except Exception:
+                    pass
+                return
 
         @self.bot.command(name="systemcheck")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
