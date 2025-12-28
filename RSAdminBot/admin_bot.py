@@ -224,11 +224,11 @@ class ServiceManager:
             return True, None, stderr or "Status check failed"
     
     
-    def get_detailed_status(self, service_name: str) -> Tuple[bool, Optional[str], Optional[str]]:
+    def get_detailed_status(self, service_name: str) -> Tuple[bool, str, Optional[str]]:
         """Get detailed service status output.
         
         Returns:
-            (success, output, error_msg)
+            (success, output, error_msg) where output is always a string (empty if error)
         """
         # Use canonical .sh scripts (single source of truth) instead of direct SSH/systemctl here.
         bot_name = None
@@ -240,8 +240,9 @@ class ServiceManager:
             if svc.startswith("mirror-world-"):
                 bot_name = svc[len("mirror-world-"):]
         if not bot_name:
-            return False, None, "Could not infer bot_name from service name"
-        return self._execute_script("botctl.sh", "details", bot_name)
+            return False, "", "Could not infer bot_name from service name"
+        success, stdout, stderr = self._execute_script("botctl.sh", "details", bot_name)
+        return success, (stdout or ""), stderr
     
     def get_pid(self, service_name: str) -> Optional[int]:
         """Get service PID if running.
@@ -317,7 +318,7 @@ class ServiceManager:
             return False, None, err
         return self._execute_script(script_name, "restart", bot_name)
     
-    def get_failure_logs(self, service_name: str, lines: int = 50) -> Optional[str]:
+    def get_failure_logs(self, service_name: str, lines: int = 50) -> str:
         """Get recent journalctl logs for service failures.
         
         Args:
@@ -325,7 +326,7 @@ class ServiceManager:
             lines: Number of log lines to retrieve
         
         Returns:
-            Log output or None if error
+            Log output as string (empty string if error)
         """
         bot_name = None
         if service_name:
@@ -335,11 +336,11 @@ class ServiceManager:
             if svc.startswith("mirror-world-"):
                 bot_name = svc[len("mirror-world-"):]
         if not bot_name:
-            return None
+            return ""
         success, stdout, _ = self._execute_script("botctl.sh", "logs", bot_name, str(lines))
         if success and stdout:
             return stdout
-        return None
+        return ""
     
     def verify_started(self, service_name: str, max_wait: int = 10, bot_name: Optional[str] = None) -> Tuple[bool, Optional[str]]:
         """Verify service started successfully with retry logic.
@@ -393,8 +394,8 @@ class ChannelTransferView(ui.View):
         super().__init__(timeout=300)
         self.admin_bot = admin_bot_instance
         self.ctx = ctx
-        self.selected_channel = None
-        self.selected_category = None
+        self.selected_channel_id = None
+        self.selected_category_id = None
         
         # Channel select
         channels = [ch for ch in ctx.guild.channels if isinstance(ch, discord.TextChannel)]
@@ -411,6 +412,8 @@ class ChannelTransferView(ui.View):
             )
             self.channel_select.callback = self.on_channel_select
             self.add_item(self.channel_select)
+        else:
+            self.channel_select = None
         
         # Category select
         categories = [ch for ch in ctx.guild.channels if isinstance(ch, discord.CategoryChannel)]
@@ -427,37 +430,81 @@ class ChannelTransferView(ui.View):
             )
             self.category_select.callback = self.on_category_select
             self.add_item(self.category_select)
+        else:
+            self.category_select = None
     
     async def on_channel_select(self, interaction: discord.Interaction):
-        channel_id = int(self.channel_select.values[0])
-        self.selected_channel = interaction.guild.get_channel(channel_id)
-        await interaction.response.send_message(f"✅ Channel selected: `{self.selected_channel.name}`. Now select a category.", ephemeral=True)
-    
-    async def on_category_select(self, interaction: discord.Interaction):
-        category_id = int(self.category_select.values[0])
-        self.selected_category = interaction.guild.get_channel(category_id)
-        
-        if not self.selected_channel:
-            # Try to get from channel select if it was selected
-            if hasattr(self, 'channel_select') and self.channel_select.values:
-                channel_id = int(self.channel_select.values[0])
-                self.selected_channel = interaction.guild.get_channel(channel_id)
-        
-        if not self.selected_channel:
-            await interaction.response.send_message("❌ Please select a channel first", ephemeral=True)
+        if not interaction.user or not self.admin_bot.is_admin(interaction.user):
+            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
             return
         
-        await interaction.response.defer(ephemeral=False)
+        try:
+            channel_id = int(self.channel_select.values[0])
+            channel = interaction.guild.get_channel(channel_id)
+            if not channel:
+                await interaction.response.send_message("❌ Channel not found", ephemeral=True)
+                return
+            
+            self.selected_channel_id = channel_id
+            await interaction.response.send_message(f"✅ Channel selected: `{channel.name}`. Now select a category.", ephemeral=True)
+            
+            # Check if both are selected now
+            if self.selected_channel_id and self.selected_category_id:
+                await self._perform_transfer(interaction)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error: {str(e)[:200]}", ephemeral=True)
+    
+    async def on_category_select(self, interaction: discord.Interaction):
+        if not interaction.user or not self.admin_bot.is_admin(interaction.user):
+            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+            return
         
         try:
-            await self.selected_channel.edit(category=self.selected_category)
+            category_id = int(self.category_select.values[0])
+            category = interaction.guild.get_channel(category_id)
+            if not category or not isinstance(category, discord.CategoryChannel):
+                await interaction.response.send_message("❌ Category not found", ephemeral=True)
+                return
+            
+            self.selected_category_id = category_id
+            await interaction.response.defer(ephemeral=True)
+            
+            # Check if both are selected now
+            if self.selected_channel_id and self.selected_category_id:
+                await self._perform_transfer(interaction)
+            else:
+                await interaction.followup.send(f"✅ Category selected: `{category.name}`. Now select a channel.", ephemeral=True)
+        except Exception as e:
+            try:
+                await interaction.response.send_message(f"❌ Error: {str(e)[:200]}", ephemeral=True)
+            except:
+                pass
+    
+    async def _perform_transfer(self, interaction: discord.Interaction):
+        """Perform the channel transfer once both channel and category are selected."""
+        try:
+            channel = interaction.guild.get_channel(self.selected_channel_id)
+            category = interaction.guild.get_channel(self.selected_category_id)
+            
+            if not channel or not isinstance(channel, discord.TextChannel):
+                await interaction.followup.send("❌ Channel not found", ephemeral=True)
+                return
+            
+            if not category or not isinstance(category, discord.CategoryChannel):
+                await interaction.followup.send("❌ Category not found", ephemeral=True)
+                return
+            
+            await channel.edit(category=category, reason=f"Transferred by {interaction.user} via RSAdminBot")
             await interaction.followup.send(
-                f"✅ **Channel Transferred**\n`{self.selected_channel.name}` → `{self.selected_category.name}`"
+                f"✅ **Channel Transferred**\n`{channel.name}` → `{category.name}`",
+                ephemeral=False
             )
         except discord.Forbidden:
-            await interaction.followup.send("❌ I don't have permission to edit this channel")
+            await interaction.followup.send("❌ I don't have permission to edit this channel", ephemeral=True)
+        except discord.HTTPException as e:
+            await interaction.followup.send(f"❌ Failed to transfer channel: {str(e)[:200]}", ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"❌ Failed to transfer channel: {str(e)[:200]}")
+            await interaction.followup.send(f"❌ Error: {str(e)[:200]}", ephemeral=True)
 
 class BotSelectView(ui.View):
     """View with SelectMenu for bot selection"""
@@ -1584,6 +1631,23 @@ echo "TARGET=$TARGET"
             return self.bot.get_channel(channel_id)
         return None
     
+    def _failure_mentions(self) -> str:
+        """Get failure ping mentions from config."""
+        monitor_cfg = self._get_monitor_channels_config()
+        user_ids = monitor_cfg.get("ping_on_failure_user_ids", [])
+        if not user_ids:
+            return ""
+        return " ".join(f"<@!{int(uid)}>" for uid in user_ids if uid)
+    
+    def _truncate_codeblock(self, text: str, limit: int = 1800) -> str:
+        """Truncate text for code blocks to fit Discord limits."""
+        if not text:
+            return "(no output)"
+        text = str(text).strip()
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "\n…(truncated)"
+
     def _start_service_monitor_task(self) -> None:
         """Start background monitoring of RS bot systemd state (posts only on changes/failures)."""
         if getattr(self, "_service_monitor_task", None):
@@ -1615,7 +1679,7 @@ echo "TARGET=$TARGET"
             last_snapshot: Dict[str, Tuple[str, int]] = self._last_service_snapshot.copy() if hasattr(self, '_last_service_snapshot') else {}
             last_post_ts: Dict[str, float] = {}
             last_heartbeat = 0.0
-            
+
             # Get monitor channels config
             monitor_cfg = self._get_monitor_channels_config()
 
@@ -1665,7 +1729,7 @@ echo "TARGET=$TARGET"
                             pass
                     
                     # Also post to progress channel for info
-                    await self._post_or_edit_progress(None, text)
+                await self._post_or_edit_progress(None, text)
 
             # Always announce the monitor is running (one-time)
             try:
@@ -1740,12 +1804,26 @@ echo "TARGET=$TARGET"
                             continue
                         
                         # Snapshot changed - detect if it's PID-only or state change
-                        prev_state, prev_pid = prev if prev else (None, 0)
+                        prev_state, prev_pid = prev if prev else ("<none>", 0)
                         pid_changed = (prev_pid != cur_pid)
                         state_changed = (prev_state != cur_state)
                         is_pid_only = pid_changed and not state_changed and (cur_state == "active")
-                        is_failure = (cur_state in ("failed", "inactive", "not_found"))
-                        is_recovered = prev_state and (prev_state in ("failed", "inactive")) and (cur_state == "active")
+                        
+                        # Check for failure states (case-insensitive, check if state contains keywords)
+                        cur_state_lower = (cur_state or "").lower()
+                        prev_state_lower = (prev_state or "").lower()
+                        is_failure = (
+                            cur_state_lower in ("failed", "inactive", "not_found") or
+                            "failed" in cur_state_lower or
+                            "inactive" in cur_state_lower or
+                            "deactivating" in cur_state_lower
+                        )
+                        is_recovered = (
+                            prev_state and 
+                            prev_state_lower != "<none>" and
+                            ("failed" in prev_state_lower or "inactive" in prev_state_lower) and
+                            cur_state_lower == "active"
+                        )
                         
                         # Update snapshot (and persist to instance)
                         last_snapshot[key] = (cur_state, cur_pid)
@@ -1768,33 +1846,36 @@ echo "TARGET=$TARGET"
                         elif is_recovered:
                             # State recovered (failed/inactive → active)
                             msg_lines = [
-                                f"✅ RECOVERED: {info.get('name', key)} back to active pid={cur_pid}"
+                                f"✅ **RECOVERED**: **{info.get('name', key)}** ({key}) back to `active` pid=`{cur_pid}`"
                             ]
                             severity = "info"
                             should_ping = False
-                        elif is_failure:
-                            # Failure detected - include details and logs
+                        elif is_failure and (state_changed or prev_state == "<none>"):
+                            # Failure detected (only on transition or first detection) - include details and logs
+                            mentions = self._failure_mentions()
                             msg_lines = [
-                                f"🚨 FAILURE: {info.get('name', key)} ({key})",
-                                f"State: {cur_state} | PID: {cur_pid}"
+                                f"🚨 **FAILURE**: **{info.get('name', key)}** ({key})",
+                                f"State: `{cur_state}` | PID: `{cur_pid}`"
                             ]
-                            if prev_state:
+                            if mentions:
+                                msg_lines.append(mentions)
+                            if prev_state and prev_state != "<none>":
                                 msg_lines.insert(2, f"Previous: {prev_state} (pid: {prev_pid})")
                             
                             # Get detailed status (like !details command)
                             details_success, details_out, _ = self.service_manager.get_detailed_status(svc)
                             if details_success and details_out:
-                                truncated_details = MessageHelper._truncate_for_discord(details_out, limit=1800)
+                                truncated_details = self._truncate_codeblock(details_out, limit=1800)
                                 msg_lines.append("\n**Details:**")
-                                msg_lines.append(MessageHelper._codeblock(truncated_details))
+                                msg_lines.append(f"```\n{truncated_details}\n```")
                             
                             # Get logs (like !logs command)
                             failure_lines = monitor_cfg.get("failure_logs_lines", 80)
                             logs = self.service_manager.get_failure_logs(svc, lines=failure_lines) or ""
                             if logs:
-                                truncated_logs = MessageHelper._truncate_for_discord(logs, limit=1800)
-                                msg_lines.append("\n**Recent logs:**")
-                                msg_lines.append(MessageHelper._codeblock(truncated_logs))
+                                truncated_logs = self._truncate_codeblock(logs, limit=1800)
+                                msg_lines.append(f"\n**logs (last {failure_lines})**")
+                                msg_lines.append(f"```\n{truncated_logs}\n```")
                             
                             severity = "error"
                             should_ping = True
@@ -2066,33 +2147,29 @@ echo \"CHANGED_END\"
             }
 
     def _rsbots_push_once(self) -> Tuple[bool, Dict[str, Any]]:
-        """Push changes from live mirror-world repo to neo-rs/rsbots GitHub repo."""
+        """Push changes from rsbots-code directory to neo-rs/rsbots GitHub repo."""
         cfg = self._get_rsbots_push_config()
         if not self._should_use_local_exec():
             return False, {"error": "rsbots_push requires Ubuntu local-exec mode (RSAdminBot must run on the same host)."}
 
-        repo_url = str(cfg.get("repo_url") or "git@github.com:neo-rs/rsbots.git")
+        repo_dir = str(cfg.get("repo_dir") or "/home/rsadmin/bots/rsbots-code")
+        remote = str(cfg.get("remote") or "git@github.com:neo-rs/rsbots.git")
         branch = str(cfg.get("branch") or "main")
-        deploy_key = str(cfg.get("deploy_key_path") or "").strip()
-
-        # Default deploy key path if not specified
-        if not deploy_key or deploy_key == "":
-            deploy_key = "/home/rsadmin/.ssh/rsbots_deploy_key"
+        deploy_key = str(cfg.get("deploy_key_path") or "/home/rsadmin/.ssh/rsbots_deploy_key")
+        auto_deploy = bool(cfg.get("auto_deploy_after_push", False))
         
         # Check if key file exists
         check_cmd = f"test -f {shlex.quote(deploy_key)} && echo 'EXISTS' || echo 'MISSING'"
         check_ok, check_out, _ = self._execute_ssh_command(check_cmd, timeout=5)
         if not check_ok or "EXISTS" not in (check_out or ""):
-            return False, {"error": f"rsbots_push deploy key not found at: {deploy_key}\nAdd deploy_key_path to RSAdminBot/config.secrets.json or ensure key exists at default path."}
-
-        live_root = str(getattr(self, "remote_root", "") or "/home/rsadmin/bots/mirror-world")
+            return False, {"error": f"rsbots_push deploy key not found at: {deploy_key}\nEnsure key exists at the specified path."}
 
         cmd = f"""
 set -euo pipefail
 
-REPO_URL={shlex.quote(repo_url)}
+REPO_DIR={shlex.quote(repo_dir)}
+REMOTE={shlex.quote(remote)}
 BRANCH={shlex.quote(branch)}
-LIVE_ROOT={shlex.quote(live_root)}
 DEPLOY_KEY={shlex.quote(deploy_key)}
 
 command -v git >/dev/null 2>&1 || {{ echo "ERR=git_missing"; exit 2; }}
@@ -2107,62 +2184,65 @@ chmod 600 "$KNOWN_HOSTS" || true
 
 export GIT_SSH_COMMAND="ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=accept-new"
 
-cd "$LIVE_ROOT"
+# Ensure repo directory exists
+mkdir -p "$REPO_DIR"
+cd "$REPO_DIR"
 
 # Initialize git repo if it doesn't exist
 if [ ! -d ".git" ]; then
   git init
   git config user.name "RSAdminBot"
   git config user.email "rsadminbot@users.noreply.github.com"
-  git remote add origin "$REPO_URL" 2>/dev/null || git remote set-url origin "$REPO_URL" 2>/dev/null || true
-  git checkout -b "$BRANCH" 2>/dev/null || git branch -M "$BRANCH" 2>/dev/null || true
+  git remote add origin "$REMOTE" 2>/dev/null || git remote set-url origin "$REMOTE" 2>/dev/null || true
+  # Try to fetch and reset to remote/main if remote exists
+  if git fetch origin "$BRANCH" 2>/dev/null; then
+    git checkout -b "$BRANCH" 2>/dev/null || git branch -M "$BRANCH" 2>/dev/null || true
+    git reset --hard "origin/$BRANCH" 2>/dev/null || true
+  else
+    git checkout -b "$BRANCH" 2>/dev/null || git branch -M "$BRANCH" 2>/dev/null || true
+  fi
 else
-  # Ensure origin is set (best effort - don't fail if already set)
-  git remote set-url origin "$REPO_URL" 2>/dev/null || git remote add origin "$REPO_URL" 2>/dev/null || true
-  # Ensure we're on the correct branch
-  git branch -M "$BRANCH" 2>/dev/null || true
-  # Fetch to ensure we have remote refs
+  # Ensure origin is set (best effort)
+  git remote set-url origin "$REMOTE" 2>/dev/null || git remote add origin "$REMOTE" 2>/dev/null || true
+  # Fetch latest from remote
   git fetch origin "$BRANCH" 2>/dev/null || true
+  # Reset to remote/main to get clean state (discard local changes)
+  if git rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
+    git reset --hard "origin/$BRANCH" 2>/dev/null || true
+  fi
+  # Ensure we're on the correct branch
+  git checkout "$BRANCH" 2>/dev/null || git branch -M "$BRANCH" 2>/dev/null || true
 fi
 
-# Stage all changes (only python files should be tracked per .gitignore)
-git add -A
-
-# Check if there are any staged changes
-if git diff --cached --quiet; then
+# Check for changes using git status --porcelain
+if git status --porcelain | grep -q .; then
+  # Stage all changes
+  git add -A
+  
+  # Commit with timestamp
+  TS=$(date +%Y%m%d_%H%M%S)
+  git commit -m "Update from Oracle (rsadminbot): $TS" >/dev/null 2>&1 || {{ echo "ERR=commit_failed"; exit 3; }}
+  
+  # Push to origin
+  if git rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
+    git push origin "$BRANCH" >/dev/null 2>&1 || {{ echo "ERR=push_failed"; exit 4; }}
+  else
+    git push -u origin "$BRANCH" >/dev/null 2>&1 || {{ echo "ERR=push_failed"; exit 4; }}
+  fi
+  
+  echo "OK=1"
+  echo "PUSHED=1"
+  echo "HEAD=$(git rev-parse HEAD)"
+  echo "OLD_HEAD=$(git rev-parse HEAD~1 2>/dev/null || echo '')"
+  echo "CHANGED_BEGIN"
+  git show --name-only --pretty=format: HEAD | sed '/^$/d' | head -n 100
+  echo "CHANGED_END"
+else
   echo "OK=1"
   echo "NO_CHANGES=1"
   HEAD_SHA=$(git rev-parse HEAD 2>/dev/null || echo '')
   echo "HEAD=$HEAD_SHA"
-  exit 0
 fi
-
-# Check if this is the first commit (no HEAD exists)
-FIRST_COMMIT=0
-if ! git rev-parse HEAD >/dev/null 2>&1; then
-  FIRST_COMMIT=1
-fi
-
-# Commit with timestamp
-TS=$(date +%Y%m%d_%H%M%S)
-git commit -m "rsbots py update: $TS" >/dev/null 2>&1 || {{ echo "ERR=commit_failed"; exit 3; }}
-
-# Push to origin (use -u for first push to set upstream)
-if [ "$FIRST_COMMIT" = "1" ]; then
-  git push -u origin "$BRANCH" >/dev/null 2>&1 || {{ echo "ERR=push_failed"; exit 4; }}
-else
-  git push origin "$BRANCH" >/dev/null 2>&1 || {{ echo "ERR=push_failed"; exit 4; }}
-fi
-
-echo "OK=1"
-echo "PUSHED=1"
-echo "HEAD=$(git rev-parse HEAD)"
-if [ "$FIRST_COMMIT" = "0" ]; then
-  echo "OLD_HEAD=$(git rev-parse HEAD~1 2>/dev/null || echo '')"
-fi
-echo "CHANGED_BEGIN"
-git show --name-only --pretty=format: HEAD | sed '/^$/d' | head -n 100
-echo "CHANGED_END"
 """
 
         ok, stdout, stderr = self._execute_ssh_command(cmd, timeout=180)
@@ -2190,6 +2270,19 @@ echo "CHANGED_END"
                 k, v = ln.split("=", 1)
                 stats[k.strip().lower()] = v.strip()
         stats["changed_sample"] = changed[:100]
+        
+        # Optional: auto deploy after push
+        if auto_deploy and stats.get("pushed") == "1":
+            try:
+                deploy_cmd = "bash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh deploy_apply"
+                deploy_ok, deploy_out, deploy_err = self._execute_ssh_command(deploy_cmd, timeout=60)
+                if deploy_ok:
+                    stats["deploy_applied"] = True
+                else:
+                    stats["deploy_error"] = (deploy_err or deploy_out or "deploy failed")[:500]
+            except Exception as e:
+                stats["deploy_error"] = str(e)[:500]
+        
         return True, stats
 
     async def _post_or_edit_progress(self, progress_msg, text: str):
@@ -2375,7 +2468,7 @@ echo "CHANGED_END"
         except Exception as e:
             print(f"{Colors.YELLOW}[Startup] Error checking channel history: {e}{Colors.RESET}")
             # On error, assume content doesn't exist (will send to be safe)
-            return False
+        return False
     
     def _github_py_only_update(self, bot_folder: str) -> Tuple[bool, Dict[str, Any]]:
         """Pull python-only bot code from the server-side GitHub checkout and overwrite live *.py files.
@@ -2914,7 +3007,7 @@ echo "CHANGED_END"
             
             # Mark startup as in progress - commands are already registered, so mark complete even if sequences fail
             self._startup_complete = True
-            
+
             # Wrap entire startup sequence in try/except to ensure on_ready always completes
             try:
                 # Best-effort runtime shims (Ubuntu local-exec only)
@@ -5796,7 +5889,11 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
         async def add_channel(ctx, channel_mention: str = None, category_mention: str = None):
             """Add a channel to a category - use channel mention and category mention (admin only)"""
             # Same as transfer (transfer = move channel to category, add = same thing)
-            await ctx.invoke(self.bot.get_command("transfer"), channel_mention=channel_mention, category_mention=category_mention)
+            transfer_cmd = self.bot.get_command("transfer")
+            if transfer_cmd:
+                await ctx.invoke(transfer_cmd, channel_mention=channel_mention, category_mention=category_mention)
+            else:
+                await ctx.send("❌ Transfer command not found")
         self.registered_commands.append(("add", "Add channel to category", True))
         
         @self.bot.command(name="botdiagnose")

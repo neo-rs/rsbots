@@ -208,7 +208,7 @@ class TestServerOrganizer:
         
         result = {}
         
-        # Ensure category exists
+        # Ensure category exists - use discord.utils.get
         category_id = self.channels_data.get("monitor_category_id")
         category = None
         
@@ -216,19 +216,17 @@ class TestServerOrganizer:
             category = guild.get_channel(category_id)
         
         if not category:
-            # Search for existing category by name
-            for cat in guild.categories:
-                if cat.name == category_name:
-                    category = cat
-                    category_id = cat.id
-                    self.channels_data["monitor_category_id"] = category_id
-                    self._save_channels_data()
-                    break
+            # Search for existing category by name using discord.utils.get
+            category = discord.utils.get(guild.categories, name=category_name)
+            if category:
+                category_id = category.id
+                self.channels_data["monitor_category_id"] = category_id
+                self._save_channels_data()
         
         if not category:
             # Create category
             try:
-                category = await guild.create_category(category_name)
+                category = await guild.create_category(category_name, reason="RSAdminBot monitor channels")
                 category_id = category.id
                 self.channels_data["monitor_category_id"] = category_id
                 self._save_channels_data()
@@ -244,7 +242,7 @@ class TestServerOrganizer:
             self.channels_data["monitor_channels"] = {}
         
         for bot_key in rs_bot_keys:
-            channel_name = f"{channel_prefix}{bot_key}"
+            channel_name = f"{channel_prefix}{bot_key}".lower()
             
             # Check if we already have this channel ID
             existing_channel_id = self.channels_data["monitor_channels"].get(bot_key)
@@ -254,17 +252,13 @@ class TestServerOrganizer:
                     result[bot_key] = existing_channel_id
                     continue
             
-            # Search for existing channel by name in category
-            found = None
-            for ch in guild.text_channels:
-                if ch.category_id == category_id and ch.name == channel_name:
-                    found = ch
-                    break
+            # Search for existing channel by name in category using discord.utils.get
+            found = discord.utils.get(guild.text_channels, name=channel_name, category=category)
             
             if not found:
                 # Create channel in category
                 try:
-                    found = await guild.create_text_channel(channel_name, category=category)
+                    found = await guild.create_text_channel(channel_name, category=category, reason="RSAdminBot per-bot monitor channel")
                 except discord.Forbidden:
                     print(f"[TestServerOrganizer] Missing permission to create channel: {channel_name}")
                     continue
