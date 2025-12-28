@@ -6097,6 +6097,7 @@ echo "CHANGED_END"
                 user = server.get("user", "")
                 key = server.get("key", "")
                 key_exists = bool(key) and Path(str(key)).exists()
+                key_exists_display = "N/A (local_exec)" if local_exec else str(bool(key_exists))
                 mode_txt = "Ubuntu local-exec (no SSH key needed)" if local_exec else "SSH mode (key required if not local)"
 
                 # --- System health stats (Ubuntu local-exec preferred; fall back to SSH if needed)
@@ -6155,7 +6156,7 @@ echo "CHANGED_END"
                         {"name": "remote_root", "value": remote_root or "(unset)", "inline": False},
                         {"name": "remote_root_exists", "value": str(bool(remote_root_exists)), "inline": True},
                         {"name": "ssh.target", "value": f"{user}@{host}" if host else "(none)", "inline": True},
-                        {"name": "ssh.key.exists", "value": str(bool(key_exists)), "inline": True},
+                        {"name": "ssh.key.exists", "value": key_exists_display, "inline": True},
                         {"name": "Decision", "value": mode_txt, "inline": False},
                         {"name": "CPU/Load", "value": f"```{_clip(uptime_txt, 500)}```", "inline": False},
                         {"name": "top (header)", "value": f"```{_clip(top_head, 700)}```", "inline": False},
