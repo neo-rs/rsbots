@@ -274,9 +274,12 @@ def _fmt_role(role_id: int, guild: discord.Guild) -> str:
     return f"`{role_id}`"
 
 def _fmt_role_list(role_ids: set, guild: discord.Guild) -> str:
-    """Format list of roles as names."""
+    """Format list of roles as names. Excludes @everyone role to prevent mentions."""
     roles = []
     for rid in role_ids:
+        # Filter out @everyone role (ID equals guild ID) to prevent mentions
+        if guild and rid == guild.id:
+            continue
         role = guild.get_role(rid) if guild else None
         if role:
             roles.append(f"**{role.name}**")
