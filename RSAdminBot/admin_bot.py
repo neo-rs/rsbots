@@ -386,6 +386,79 @@ class ServiceManager:
         return False, "Service does not exist"
 
 
+class ChannelTransferView(ui.View):
+    """View with SelectMenus for channel and category selection"""
+    
+    def __init__(self, admin_bot_instance, ctx):
+        super().__init__(timeout=300)
+        self.admin_bot = admin_bot_instance
+        self.ctx = ctx
+        self.selected_channel = None
+        self.selected_category = None
+        
+        # Channel select
+        channels = [ch for ch in ctx.guild.channels if isinstance(ch, discord.TextChannel)]
+        channel_options = [
+            ui.SelectOption(label=ch.name, value=str(ch.id), description=f"#{ch.name}")
+            for ch in sorted(channels, key=lambda x: x.position)[:25]
+        ]
+        if channel_options:
+            self.channel_select = ui.Select(
+                placeholder="Select a channel...",
+                options=channel_options,
+                min_values=1,
+                max_values=1
+            )
+            self.channel_select.callback = self.on_channel_select
+            self.add_item(self.channel_select)
+        
+        # Category select
+        categories = [ch for ch in ctx.guild.channels if isinstance(ch, discord.CategoryChannel)]
+        category_options = [
+            ui.SelectOption(label=cat.name, value=str(cat.id), description=f"Category: {cat.name}")
+            for cat in sorted(categories, key=lambda x: x.position)[:25]
+        ]
+        if category_options:
+            self.category_select = ui.Select(
+                placeholder="Select a category...",
+                options=category_options,
+                min_values=1,
+                max_values=1
+            )
+            self.category_select.callback = self.on_category_select
+            self.add_item(self.category_select)
+    
+    async def on_channel_select(self, interaction: discord.Interaction):
+        channel_id = int(self.channel_select.values[0])
+        self.selected_channel = interaction.guild.get_channel(channel_id)
+        await interaction.response.send_message(f"✅ Channel selected: `{self.selected_channel.name}`. Now select a category.", ephemeral=True)
+    
+    async def on_category_select(self, interaction: discord.Interaction):
+        category_id = int(self.category_select.values[0])
+        self.selected_category = interaction.guild.get_channel(category_id)
+        
+        if not self.selected_channel:
+            # Try to get from channel select if it was selected
+            if hasattr(self, 'channel_select') and self.channel_select.values:
+                channel_id = int(self.channel_select.values[0])
+                self.selected_channel = interaction.guild.get_channel(channel_id)
+        
+        if not self.selected_channel:
+            await interaction.response.send_message("❌ Please select a channel first", ephemeral=True)
+            return
+        
+        await interaction.response.defer(ephemeral=False)
+        
+        try:
+            await self.selected_channel.edit(category=self.selected_category)
+            await interaction.followup.send(
+                f"✅ **Channel Transferred**\n`{self.selected_channel.name}` → `{self.selected_category.name}`"
+            )
+        except discord.Forbidden:
+            await interaction.followup.send("❌ I don't have permission to edit this channel")
+        except Exception as e:
+            await interaction.followup.send(f"❌ Failed to transfer channel: {str(e)[:200]}")
+
 class BotSelectView(ui.View):
     """View with SelectMenu for bot selection"""
     
@@ -5509,6 +5582,126 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
         except Exception as e:
             print(f"{Colors.RED}[RunAllCommands] ✗ Error generating report: {str(e)[:500]}{Colors.RESET}")
             await ctx.send(f"⚠️ **Report generation failed**: {str(e)[:500]}")
+        
+        @self.bot.command(name="delete", aliases=["d"])
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def delete_channel(ctx, *channel_mentions):
+            """Delete channel(s) - use in channel to delete current channel, or mention channels to delete multiple (admin only)"""
+            if not ctx.guild:
+                await ctx.send("❌ This command can only be used in a server")
+                return
+            
+            # If no mentions, delete current channel
+            if not channel_mentions:
+                try:
+                    await ctx.send("🗑️ **Deleting this channel...**")
+                    await asyncio.sleep(1)
+                    await ctx.channel.delete()
+                except discord.Forbidden:
+                    await ctx.send("❌ I don't have permission to delete this channel")
+                except Exception as e:
+                    await ctx.send(f"❌ Failed to delete channel: {str(e)[:200]}")
+                return
+            
+            # Parse channel mentions
+            channels_to_delete = []
+            for mention in channel_mentions:
+                try:
+                    channel = commands.TextChannelConverter().convert(ctx, mention)
+                    if channel.guild == ctx.guild:
+                        channels_to_delete.append(channel)
+                except:
+                    try:
+                        channel = await commands.TextChannelConverter().convert(ctx, mention)
+                        if channel.guild == ctx.guild:
+                            channels_to_delete.append(channel)
+                    except:
+                        pass
+            
+            if not channels_to_delete:
+                await ctx.send("❌ No valid channels found to delete")
+                return
+            
+            # Delete channels
+            deleted = []
+            failed = []
+            for channel in channels_to_delete:
+                try:
+                    await channel.delete()
+                    deleted.append(channel.name)
+                except discord.Forbidden:
+                    failed.append(f"{channel.name} (no permission)")
+                except Exception as e:
+                    failed.append(f"{channel.name} ({str(e)[:50]})")
+            
+            result_msg = "🗑️ **Channel Deletion Complete**\n"
+            if deleted:
+                result_msg += f"✅ Deleted: {', '.join(deleted)}\n"
+            if failed:
+                result_msg += f"❌ Failed: {', '.join(failed)}"
+            await ctx.send(result_msg)
+        self.registered_commands.append(("delete", "Delete channel(s)", True))
+        
+        @self.bot.command(name="transfer", aliases=["t"])
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def transfer_channel(ctx, channel_mention: str = None, category_mention: str = None):
+            """Transfer a channel to another category - use channel mention and category mention (admin only)"""
+            if not ctx.guild:
+                await ctx.send("❌ This command can only be used in a server")
+                return
+            
+            # If no arguments, show interactive selector
+            if not channel_mention:
+                view = ChannelTransferView(self, ctx)
+                embed = discord.Embed(
+                    title="📦 Transfer Channel to Category",
+                    description="Select a channel and category from the dropdowns below:",
+                    color=discord.Color.blue()
+                )
+                await ctx.send(embed=embed, view=view)
+                return
+            
+            # Parse channel
+            try:
+                channel = await commands.TextChannelConverter().convert(ctx, channel_mention)
+                if channel.guild != ctx.guild:
+                    await ctx.send("❌ Channel must be in this server")
+                    return
+            except:
+                await ctx.send(f"❌ Channel not found: {channel_mention}")
+                return
+            
+            # Parse category
+            if not category_mention:
+                await ctx.send("❌ Please provide a category name or mention")
+                return
+            
+            try:
+                category = await commands.CategoryChannelConverter().convert(ctx, category_mention)
+                if category.guild != ctx.guild:
+                    await ctx.send("❌ Category must be in this server")
+                    return
+            except:
+                await ctx.send(f"❌ Category not found: {category_mention}")
+                return
+            
+            # Transfer channel
+            try:
+                await channel.edit(category=category)
+                await ctx.send(f"✅ **Channel Transferred**\n`{channel.name}` → `{category.name}`")
+            except discord.Forbidden:
+                await ctx.send("❌ I don't have permission to edit this channel")
+            except Exception as e:
+                await ctx.send(f"❌ Failed to transfer channel: {str(e)[:200]}")
+        self.registered_commands.append(("transfer", "Transfer channel to category", True))
+        
+        @self.bot.command(name="add", aliases=["a"])
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def add_channel(ctx, channel_mention: str = None, category_mention: str = None):
+            """Add a channel to a category - use channel mention and category mention (admin only)"""
+            # Same as transfer (transfer = move channel to category, add = same thing)
+            await ctx.invoke(self.bot.get_command("transfer"), channel_mention=channel_mention, category_mention=category_mention)
+        self.registered_commands.append(("add", "Add channel to category", True))
         
         @self.bot.command(name="botdiagnose")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
