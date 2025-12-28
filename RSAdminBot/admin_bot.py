@@ -157,13 +157,21 @@ class MessageHelper:
         return embed
     
     @staticmethod
-    def create_info_embed(title: str, message: str = "", fields: List[Dict] = None, *, description: str = None) -> discord.Embed:
+    def create_info_embed(
+        title: str,
+        message: str = "",
+        fields: List[Dict] = None,
+        footer: str = None,
+        *,
+        description: str = None,
+    ) -> discord.Embed:
         """Create an info embed with consistent formatting.
         
         Args:
             title: Embed title
             message: Main message/description (can be empty)
             fields: Optional fields list
+            footer: Optional footer text
             description: Alias for message parameter (for compatibility)
         """
         # Support both message and description for compatibility
@@ -172,7 +180,8 @@ class MessageHelper:
             title=title,
             description=desc,
             color=discord.Color.blue(),
-            fields=fields
+            fields=fields,
+            footer=footer,
         )
 
 
