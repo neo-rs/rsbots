@@ -916,13 +916,21 @@ class ChannelTransferView(ui.View):
 class BotSelectView(ui.View):
     """View with SelectMenu for bot selection"""
     
-    def __init__(self, admin_bot_instance, action: str, action_display: str, action_kwargs: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        admin_bot_instance,
+        action: str,
+        action_display: str,
+        action_kwargs: Optional[Dict[str, Any]] = None,
+        bot_keys: Optional[List[str]] = None,
+    ):
         """
         Args:
             admin_bot_instance: RSAdminBot instance
             action: Action name ('start', 'stop', 'restart', 'status', 'update', 'details', 'logs', 'info', 'config', 'movements', 'diagnose')
             action_display: Display name for action ('Start', 'Stop', etc.)
             action_kwargs: Optional extra params for handlers (e.g. logs lines)
+            bot_keys: Optional subset of bot keys to show in the dropdown
         """
         super().__init__(timeout=300)  # 5 minute timeout
         self.admin_bot = admin_bot_instance
@@ -930,18 +938,23 @@ class BotSelectView(ui.View):
         self.action_display = action_display
         self.action_kwargs = action_kwargs or {}
         
-        # Create SelectMenu with all bots + "All Bots" option for start/stop/restart actions
-        options = [
-            discord.SelectOption(
-                label=bot_info['name'],
-                value=bot_key,
-                description=f"{action_display} {bot_info['name']}"
+        # Create SelectMenu with selected bots (or all) + optional "All Bots" for service control actions
+        keys = list(bot_keys) if bot_keys else list(admin_bot_instance.BOTS.keys())
+        options: List[discord.SelectOption] = []
+        for bot_key in keys:
+            bot_info = admin_bot_instance.BOTS.get(bot_key)
+            if not bot_info:
+                continue
+            options.append(
+                discord.SelectOption(
+                    label=bot_info.get("name", bot_key),
+                    value=bot_key,
+                    description=f"{action_display} {bot_info.get('name', bot_key)}"
+                )
             )
-            for bot_key, bot_info in admin_bot_instance.BOTS.items()
-        ]
         
         # Add "All Bots" option for service control actions
-        if self.action in ["start", "stop", "restart"]:
+        if self.action in ["start", "stop", "restart"] and not bot_keys:
             options.insert(0, discord.SelectOption(
                 label="🔄 All Bots",
                 value="all_bots",
@@ -1601,7 +1614,20 @@ class BotSelectView(ui.View):
     
     async def _handle_config(self, interaction, bot_name, bot_info):
         """Handle bot config"""
-        await interaction.followup.send("ℹ️ Use `!botconfig <botname>` to view config.")
+        if not self.admin_bot.is_admin(interaction.user):
+            await interaction.followup.send("❌ You don't have permission to use this command.")
+            return
+        # RS-only for config (inspector-based)
+        if not self.admin_bot._is_rs_bot(bot_name):
+            embed = MessageHelper.create_error_embed(
+                title="Unsupported Bot",
+                message=f"`{bot_name}` is not an RS bot. Bot config is only available for RS bots.",
+                footer=f"Triggered by {interaction.user}",
+            )
+            await interaction.followup.send(embed=embed)
+            return
+        embed = self.admin_bot._build_botconfig_embed(bot_name, triggered_by=interaction.user)
+        await interaction.followup.send(embed=embed)
     
     async def _handle_movements(self, interaction, bot_name, bot_info):
         """Handle bot movements"""
@@ -3801,32 +3827,137 @@ echo "CHANGED_END"
             except Exception:
                 return
 
-        text = self._build_command_index_text()
-        content = f"```{text[:1900]}```"
-        content_hash = self.test_server_organizer._sha256_text(text)  # stable hash
-        prev_hash = self.test_server_organizer.get_meta("commands_hash", "")
-        msg_id = self.test_server_organizer.get_meta("commands_message_id", None)
+        # Build/refresh a multi-message command index:
+        # - First message: RSAdminBot commands list
+        # - One message per RS bot: management commands + link buttons to journal/log channels
+        test_guild_id = int(self.config.get("test_server_guild_id") or 0)
 
-        # If unchanged and we have a message id, do nothing.
-        if prev_hash == content_hash and msg_id:
-            return
+        def ch_url(cid: int) -> str:
+            return f"https://discord.com/channels/{test_guild_id}/{int(cid)}"
 
-        try:
+        class _LinksView(ui.View):
+            def __init__(self, journal_cid: Optional[int], monitor_cid: Optional[int]):
+                super().__init__(timeout=None)
+                if journal_cid:
+                    self.add_item(ui.Button(label="Journal", style=discord.ButtonStyle.link, url=ch_url(journal_cid)))
+                if monitor_cid:
+                    self.add_item(ui.Button(label="Monitor Logs", style=discord.ButtonStyle.link, url=ch_url(monitor_cid)))
+
+        # Gather stored channel mappings (created elsewhere; do not create categories/channels here)
+        channels_data = getattr(self.test_server_organizer, "channels_data", {}) or {}
+        journal_map = channels_data.get("journal_channels") if isinstance(channels_data, dict) else {}
+        monitor_map = channels_data.get("monitor_channels") if isinstance(channels_data, dict) else {}
+        if not isinstance(journal_map, dict):
+            journal_map = {}
+        if not isinstance(monitor_map, dict):
+            monitor_map = {}
+
+        pages: List[Tuple[str, str, Optional[discord.Embed], Optional[ui.View]]] = []
+
+        # Page 1: RSAdminBot commands
+        cmd_text = self._build_command_index_text()
+        cmd_hash = self.test_server_organizer._sha256_text(cmd_text)
+        cmd_embed = MessageHelper.create_info_embed(
+            title="RSAdminBot Commands",
+            message="This channel is an index (not where outputs go). Run commands in any channel you want.\n\nBelow is the live list of RSAdminBot commands:",
+            footer="RSAdminBot",
+        )
+        cmd_body = f"```{cmd_text[:1800]}```"
+        pages.append(("rsadminbot_commands", cmd_hash, cmd_embed, None))
+
+        # Bot cards: management commands per RS bot (RS-only list)
+        rs_keys = self._get_rs_bot_keys()
+        # Prefer to show all management commands that exist in this running bot
+        available_cmds = {c.name for c in list(self.bot.commands) if getattr(c, "name", "")}
+
+        def bot_cmds(bot_key: str) -> str:
+            lines = []
+            # Common management commands
+            for name, fmt in [
+                ("botstatus", "!botstatus {b}"),
+                ("details", "!details {b}"),
+                ("logs", "!logs {b} 80"),
+                ("botstart", "!botstart {b}"),
+                ("botstop", "!botstop {b}"),
+                ("botrestart", "!botrestart {b}"),
+                ("botupdate", "!botupdate {b}"),
+                ("botinfo", "!botinfo {b}"),
+                ("botconfig", "!botconfig {b}"),
+            ]:
+                if name in available_cmds:
+                    # Keep RS-only enforcement in botconfig/botinfo; this is just an index.
+                    lines.append(fmt.format(b=bot_key))
+            return "\n".join(lines).strip()
+
+        for bot_key in rs_keys:
+            bot_info = self.BOTS.get(bot_key) or {}
+            title = f"{bot_info.get('name', bot_key)} ({bot_key})"
+            body = bot_cmds(bot_key)
+            if not body:
+                continue
+            h = self.test_server_organizer._sha256_text(body)
+            embed = MessageHelper.create_info_embed(
+                title=title,
+                message="Common management commands:",
+                footer="RSAdminBot",
+            )
+            embed.add_field(name="Commands", value=f"```{body[:950]}```", inline=False)
+            jcid = None
+            mcid = None
+            try:
+                if bot_key in journal_map:
+                    jcid = int(journal_map.get(bot_key) or 0) or None
+                if bot_key in monitor_map:
+                    mcid = int(monitor_map.get(bot_key) or 0) or None
+            except Exception:
+                jcid = None
+                mcid = None
+            view = _LinksView(jcid, mcid) if (jcid or mcid) and test_guild_id else None
+            pages.append((f"bot_{bot_key}", h, embed, view))
+
+        # Persist/edit messages idempotently
+        cards: Dict[str, Any] = self.test_server_organizer.get_meta("commands_cards", {}) or {}
+        cards_hash: Dict[str, Any] = self.test_server_organizer.get_meta("commands_cards_hash", {}) or {}
+        if not isinstance(cards, dict):
+            cards = {}
+        if not isinstance(cards_hash, dict):
+            cards_hash = {}
+
+        updated_cards: Dict[str, Any] = dict(cards)
+        updated_hashes: Dict[str, Any] = dict(cards_hash)
+
+        async def upsert(card_key: str, content_hash: str, embed: Optional[discord.Embed], view: Optional[ui.View], content: Optional[str] = None):
+            msg_id = updated_cards.get(card_key)
+            # If unchanged, still ensure message exists.
             if msg_id:
                 try:
                     msg = await channel.fetch_message(int(msg_id))  # type: ignore[attr-defined]
-                    await msg.edit(content=content)
-                    self.test_server_organizer.set_meta("commands_hash", content_hash)
+                    if updated_hashes.get(card_key) != content_hash:
+                        await msg.edit(content=content, embed=embed, view=view)
+                        updated_hashes[card_key] = content_hash
+                    else:
+                        # Refresh view/embed to keep buttons alive after restarts
+                        await msg.edit(content=content, embed=embed, view=view)
                     return
                 except Exception:
-                    # fallthrough: create a new message
+                    # fallthrough to send new
                     pass
+            msg = await channel.send(content=content, embed=embed, view=view)
+            updated_cards[card_key] = int(msg.id)
+            updated_hashes[card_key] = content_hash
 
-            msg = await channel.send(content)
-            self.test_server_organizer.set_meta("commands_hash", content_hash)
-            self.test_server_organizer.set_meta("commands_message_id", int(msg.id))
+        try:
+            # First card includes the command text as message content (keeps it copyable).
+            await upsert("rsadminbot_commands", cmd_hash, cmd_embed, None, content=cmd_body)
+            for key, h, embed, view in pages:
+                if key == "rsadminbot_commands":
+                    continue
+                await upsert(key, h, embed, view, content=None)
         except Exception:
             return
+
+        self.test_server_organizer.set_meta("commands_cards", updated_cards)
+        self.test_server_organizer.set_meta("commands_cards_hash", updated_hashes)
     
     
     def _execute_ssh_command(self, command: str, timeout: int = 30, *, log_it: bool = True) -> Tuple[bool, str, str]:
@@ -4125,6 +4256,192 @@ echo "CHANGED_END"
             return True
         
         return False
+
+    def _get_rs_bot_keys(self) -> List[str]:
+        """Return RS-only bot keys (rsadminbot + bot_groups.rs_bots)."""
+        bot_groups = self.config.get("bot_groups") or {}
+        rs_keys = ["rsadminbot"] + list(bot_groups.get("rs_bots") or [])
+        # Keep stable ordering and only include known BOTS
+        out = []
+        for k in rs_keys:
+            k = str(k).strip().lower()
+            if not k:
+                continue
+            if k in self.BOTS and k not in out:
+                out.append(k)
+        return out
+
+    def _build_botconfig_embed(self, bot_name: str, *, triggered_by: Optional[Any] = None) -> discord.Embed:
+        """Build the botconfig embed for a bot (RS-only, inspector-based)."""
+        who = f"Triggered by {triggered_by}" if triggered_by else None
+
+        if not self._is_rs_bot(bot_name):
+            return MessageHelper.create_error_embed(
+                title="Unsupported Bot",
+                message=f"`{bot_name}` is not an RS bot. Bot config is only available for RS bots.",
+                footer=who,
+            )
+
+        if not INSPECTOR_AVAILABLE or not self.inspector:
+            return MessageHelper.create_error_embed(
+                title="Bot Inspector Not Available",
+                message="Bot inspector module is not loaded or initialized.",
+                footer=who,
+            )
+
+        config = self.inspector.get_bot_config(bot_name)
+        if not config:
+            return MessageHelper.create_error_embed(
+                title="Config Not Found",
+                message=f"Bot not found or no config: `{bot_name}`",
+                footer=who,
+            )
+
+        # Get bot display name
+        bot_display_name = bot_name
+        if bot_name.lower() in self.BOTS:
+            bot_display_name = self.BOTS[bot_name.lower()]["name"]
+
+        try:
+            embed = discord.Embed(
+                title=f"⚙️ {bot_display_name} Configuration",
+                color=discord.Color.blue(),
+                timestamp=datetime.now()
+            )
+
+            # Basic settings
+            if "bot_token" in config:
+                embed.add_field(
+                    name="🔐 Authentication",
+                    value="✅ Token configured (hidden)",
+                    inline=False
+                )
+
+            if "guild_id" in config:
+                embed.add_field(
+                    name="🏠 Server ID",
+                    value=f"`{config.get('guild_id')}`",
+                    inline=True
+                )
+
+            if "brand_name" in config:
+                embed.add_field(
+                    name="🏷️ Brand Name",
+                    value=str(config.get("brand_name") or ""),
+                    inline=True
+                )
+
+            # Channel IDs
+            channel_fields = []
+            if "log_channel_id" in config:
+                channel_fields.append(f"📝 Log Channel: `{config['log_channel_id']}`")
+            if "forwarding_logs_channel_id" in config:
+                channel_fields.append(f"📤 Forwarding Logs: `{config['forwarding_logs_channel_id']}`")
+            if "whop_logs_channel_id" in config:
+                channel_fields.append(f"💳 Whop Logs: `{config['whop_logs_channel_id']}`")
+            if "ssh_commands_channel_id" in config:
+                channel_fields.append(f"🖥️ SSH Commands: `{config['ssh_commands_channel_id']}`")
+            if channel_fields:
+                embed.add_field(
+                    name="📡 Channels",
+                    value="\n".join(channel_fields)[:1000],
+                    inline=False
+                )
+
+            # Forwarder channels array
+            if "channels" in config and isinstance(config["channels"], list):
+                channels_info = []
+                for i, channel in enumerate(config["channels"][:5], 1):
+                    source_name = channel.get("source_channel_name", "Unknown")
+                    source_id = channel.get("source_channel_id", "N/A")
+                    role_id = (channel.get("role_mention") or {}).get("role_id", "None")
+                    channels_info.append(f"**{i}. {source_name}**\n   Source: `{source_id}`\n   Role: `{role_id}`")
+                if len(config["channels"]) > 5:
+                    channels_info.append(f"\n*... and {len(config['channels']) - 5} more channel(s)*")
+                embed.add_field(
+                    name="🔄 Forwarding Channels",
+                    value="\n".join(channels_info)[:1000],
+                    inline=False
+                )
+
+            # Invite tracking
+            if "invite_tracking" in config and isinstance(config.get("invite_tracking"), dict):
+                invite = config["invite_tracking"]
+                invite_info = []
+                if "invite_channel_id" in invite:
+                    invite_info.append(f"📨 Invite Channel: `{invite['invite_channel_id']}`")
+                if "fallback_invite" in invite and invite.get("fallback_invite"):
+                    fb = str(invite.get("fallback_invite"))
+                    invite_info.append(f"🔗 Fallback: `{fb[:50]}...`" if len(fb) > 50 else f"🔗 Fallback: `{fb}`")
+                if invite_info:
+                    embed.add_field(
+                        name="📨 Invite Tracking",
+                        value="\n".join(invite_info)[:1000],
+                        inline=False
+                    )
+
+            # DM sequence
+            if "dm_sequence" in config and isinstance(config.get("dm_sequence"), dict):
+                dm = config["dm_sequence"]
+                dm_info = []
+                if "send_spacing_seconds" in dm:
+                    dm_info.append(f"⏱️ Spacing: {dm['send_spacing_seconds']}s")
+                if "day_gap_hours" in dm:
+                    dm_info.append(f"📅 Day Gap: {dm['day_gap_hours']}h")
+                if dm_info:
+                    embed.add_field(
+                        name="💬 DM Sequence",
+                        value="\n".join(dm_info)[:1000],
+                        inline=True
+                    )
+
+            # Tickets / success
+            if "ticket_category_id" in config:
+                embed.add_field(
+                    name="🎫 Tickets",
+                    value=f"Category: `{config['ticket_category_id']}`",
+                    inline=True
+                )
+            if "success_channel_ids" in config:
+                count = len(config["success_channel_ids"]) if isinstance(config["success_channel_ids"], list) else 1
+                embed.add_field(
+                    name="🏆 Success Channels",
+                    value=f"{count} channel(s) configured",
+                    inline=True
+                )
+
+            # Other short scalar fields
+            other_fields = []
+            skip = {
+                "bot_token", "guild_id", "brand_name", "log_channel_id",
+                "forwarding_logs_channel_id", "whop_logs_channel_id", "ssh_commands_channel_id",
+                "channels", "invite_tracking", "dm_sequence", "ticket_category_id", "success_channel_ids",
+            }
+            for key, value in config.items():
+                if key in skip:
+                    continue
+                if isinstance(value, (str, int, float, bool)):
+                    if len(str(value)) < 100:
+                        other_fields.append(f"**{key.replace('_', ' ').title()}**: `{value}`")
+            if other_fields:
+                other_text = "\n".join(other_fields[:10])
+                if len(other_fields) > 10:
+                    other_text += f"\n*... and {len(other_fields) - 10} more field(s)*"
+                embed.add_field(
+                    name="⚙️ Other Settings",
+                    value=other_text[:1000],
+                    inline=False
+                )
+
+            embed.set_footer(text=who or "Use !botconfig <bot> to view full config")
+            return embed
+        except Exception as e:
+            return MessageHelper.create_error_embed(
+                title="Config Render Error",
+                message=f"Failed to render config for `{bot_name}`.",
+                error_details=str(e)[:900],
+                footer=who,
+            )
     
     def _setup_events(self):
         """Setup Discord event handlers"""
@@ -6555,175 +6872,17 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                 return
             
             if not bot_name:
-                embed = MessageHelper.create_warning_embed(
-                    title="Bot Name Required",
-                    message="Please specify which bot's config to view.",
-                    details="Usage: `!botconfig <bot>`",
+                embed = MessageHelper.create_info_embed(
+                    title="Select a Bot",
+                    message="Pick an RS bot to view its config.",
                     footer=f"Triggered by {ctx.author}",
                 )
-                await ctx.send(embed=embed)
+                view = BotSelectView(self, "config", "Config", bot_keys=self._get_rs_bot_keys())
+                await ctx.send(embed=embed, view=view)
                 return
             
-            try:
-                config = self.inspector.get_bot_config(bot_name)
-                
-                if not config:
-                    embed = MessageHelper.create_error_embed(
-                        title="Config Not Found",
-                        message=f"Bot not found or no config: `{bot_name}`",
-                        footer=f"Triggered by {ctx.author}",
-                    )
-                    await ctx.send(embed=embed)
-                    return
-                
-                # Get bot display name
-                bot_display_name = bot_name
-                if bot_name.lower() in self.BOTS:
-                    bot_display_name = self.BOTS[bot_name.lower()]["name"]
-                
-                embed = discord.Embed(
-                    title=f"⚙️ {bot_display_name} Configuration",
-                    color=discord.Color.blue(),
-                    timestamp=datetime.now()
-                )
-                
-                # Format config in user-friendly way
-                description_parts = []
-                
-                # Basic settings
-                if "bot_token" in config:
-                    embed.add_field(
-                        name="🔐 Authentication",
-                        value="✅ Token configured (hidden)",
-                        inline=False
-                    )
-                
-                if "guild_id" in config:
-                    guild_id = config["guild_id"]
-                    embed.add_field(
-                        name="🏠 Server ID",
-                        value=f"`{guild_id}`",
-                        inline=True
-                    )
-                
-                # Brand/Name
-                if "brand_name" in config:
-                    embed.add_field(
-                        name="🏷️ Brand Name",
-                        value=config["brand_name"],
-                        inline=True
-                    )
-                
-                # Channel IDs
-                channel_fields = []
-                if "log_channel_id" in config:
-                    channel_fields.append(f"📝 Log Channel: `{config['log_channel_id']}`")
-                if "forwarding_logs_channel_id" in config:
-                    channel_fields.append(f"📤 Forwarding Logs: `{config['forwarding_logs_channel_id']}`")
-                if "whop_logs_channel_id" in config:
-                    channel_fields.append(f"💳 Whop Logs: `{config['whop_logs_channel_id']}`")
-                if "ssh_commands_channel_id" in config:
-                    channel_fields.append(f"🖥️ SSH Commands: `{config['ssh_commands_channel_id']}`")
-                
-                if channel_fields:
-                    embed.add_field(
-                        name="📡 Channels",
-                        value="\n".join(channel_fields),
-                        inline=False
-                    )
-                
-                # Channels array (for forwarder, etc.)
-                if "channels" in config and isinstance(config["channels"], list):
-                    channels_info = []
-                    for i, channel in enumerate(config["channels"][:5], 1):  # Limit to 5
-                        source_name = channel.get("source_channel_name", "Unknown")
-                        source_id = channel.get("source_channel_id", "N/A")
-                        role_id = channel.get("role_mention", {}).get("role_id", "None")
-                        channels_info.append(f"**{i}. {source_name}**\n   Source: `{source_id}`\n   Role: `{role_id}`")
-                    
-                    if len(config["channels"]) > 5:
-                        channels_info.append(f"\n*... and {len(config['channels']) - 5} more channel(s)*")
-                    
-                    embed.add_field(
-                        name="🔄 Forwarding Channels",
-                        value="\n".join(channels_info),
-                        inline=False
-                    )
-                
-                # Invite tracking (for checker bot)
-                if "invite_tracking" in config:
-                    invite = config["invite_tracking"]
-                    invite_info = []
-                    if "invite_channel_id" in invite:
-                        invite_info.append(f"📨 Invite Channel: `{invite['invite_channel_id']}`")
-                    if "fallback_invite" in invite:
-                        invite_info.append(f"🔗 Fallback: `{invite['fallback_invite'][:50]}...`")
-                    if invite_info:
-                        embed.add_field(
-                            name="📨 Invite Tracking",
-                            value="\n".join(invite_info),
-                            inline=False
-                        )
-                
-                # DM Sequence (for checker bot)
-                if "dm_sequence" in config:
-                    dm = config["dm_sequence"]
-                    dm_info = []
-                    if "send_spacing_seconds" in dm:
-                        dm_info.append(f"⏱️ Spacing: {dm['send_spacing_seconds']}s")
-                    if "day_gap_hours" in dm:
-                        dm_info.append(f"📅 Day Gap: {dm['day_gap_hours']}h")
-                    if dm_info:
-                        embed.add_field(
-                            name="💬 DM Sequence",
-                            value="\n".join(dm_info),
-                            inline=True
-                        )
-                
-                # Tickets (for onboarding)
-                if "ticket_category_id" in config:
-                    embed.add_field(
-                        name="🎫 Tickets",
-                        value=f"Category: `{config['ticket_category_id']}`",
-                        inline=True
-                    )
-                
-                # Success channels (for success bot)
-                if "success_channel_ids" in config:
-                    count = len(config["success_channel_ids"]) if isinstance(config["success_channel_ids"], list) else 1
-                    embed.add_field(
-                        name="🏆 Success Channels",
-                        value=f"{count} channel(s) configured",
-                        inline=True
-                    )
-                
-                # Other important fields
-                other_fields = []
-                for key, value in config.items():
-                    if key not in ["bot_token", "guild_id", "brand_name", "log_channel_id", 
-                                  "forwarding_logs_channel_id", "whop_logs_channel_id",
-                                  "ssh_commands_channel_id", "channels", "invite_tracking",
-                                  "dm_sequence", "ticket_category_id", "success_channel_ids"]:
-                        if isinstance(value, (str, int, float, bool)):
-                            if len(str(value)) < 100:  # Only show short values
-                                other_fields.append(f"**{key.replace('_', ' ').title()}**: `{value}`")
-                
-                if other_fields:
-                    other_text = "\n".join(other_fields[:10])  # Limit to 10
-                    if len(other_fields) > 10:
-                        other_text += f"\n*... and {len(other_fields) - 10} more field(s)*"
-                    embed.add_field(
-                        name="⚙️ Other Settings",
-                        value=other_text,
-                        inline=False
-                    )
-                
-                embed.set_footer(text="Use !botconfig <bot> to view full config")
-                
-                await ctx.send(embed=embed)
-                
-            except Exception as e:
-                await ctx.send(f"❌ Error getting config: {str(e)[:500]}")
+            embed = self._build_botconfig_embed(bot_name, triggered_by=ctx.author)
+            await ctx.send(embed=embed)
 
         # Whop tracking commands
         @self.bot.command(name="whopscan")
@@ -6982,6 +7141,11 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                 embed.add_field(name="Channels Created", value=channels_text[:1024], inline=False)
             
             await ctx.send(embed=embed)
+            # Also (re)publish the RSAdminBot command index/cards into the commands channel.
+            try:
+                await self._publish_command_index_to_test_server()
+            except Exception:
+                pass
         
         # Run all commands for all bots
         @self.bot.command(name="runallcommands")
