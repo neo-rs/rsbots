@@ -93,6 +93,7 @@ QUEUE_FILE = BASE_DIR / "queue.json"
 REGISTRY_FILE = BASE_DIR / "registry.json"
 INVITES_FILE = BASE_DIR / "invites.json"
 MESSAGES_FILE = BASE_DIR / "messages.json"
+SETTINGS_FILE = BASE_DIR / "settings.json"
 
 # Message order keys
 DAY_KEYS = ["day_1", "day_2", "day_3", "day_4", "day_5", "day_6", "day_7a", "day_7b"]
@@ -244,6 +245,20 @@ def save_json(path: Path, data: dict) -> None:
 def save_all():
     save_json(QUEUE_FILE, queue_state)
     save_json(REGISTRY_FILE, registry)
+
+def load_settings() -> dict:
+    """Load settings from JSON file, default to enabled if missing/bad"""
+    if not SETTINGS_FILE.exists():
+        return {"dm_sequence_enabled": True}
+    try:
+        data = load_json(SETTINGS_FILE)
+        return {"dm_sequence_enabled": data.get("dm_sequence_enabled", True)}
+    except Exception:
+        return {"dm_sequence_enabled": True}
+
+def save_settings(settings: dict) -> None:
+    """Save settings to JSON file"""
+    save_json(SETTINGS_FILE, settings)
 
 # -----------------------------
 # Logging to Discord channels
@@ -415,6 +430,9 @@ def mark_finished(user_id: int):
 # Queue helpers
 # -----------------------------
 def enqueue_first_day(user_id: int):
+    settings = load_settings()
+    if not settings.get("dm_sequence_enabled", True):
+        return  # DM sequence disabled, don't enqueue
     queue_state[str(user_id)] = {
         "current_day": "day_1",
         "next_send": _now().isoformat().replace("+00:00", "Z"),
@@ -468,6 +486,9 @@ def has_former_member_role(member: discord.Member) -> bool:
 # Message loader/sender
 # -----------------------------
 async def send_day(member: discord.Member, day_key: str):
+    settings = load_settings()
+    if not settings.get("dm_sequence_enabled", True):
+        return  # DM sequence disabled, don't send
     global last_send_at
 
     if last_send_at:
@@ -1521,6 +1542,45 @@ async def cleanup_data(ctx):
     except Exception:
         pass
 
+@bot.command(name="dmenable")
+@commands.has_permissions(administrator=True)
+async def dm_enable(ctx):
+    """Enable DM sequence"""
+    settings = load_settings()
+    settings["dm_sequence_enabled"] = True
+    save_settings(settings)
+    await ctx.send("✅ DM sequence enabled", delete_after=5)
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+@bot.command(name="dmdisable")
+@commands.has_permissions(administrator=True)
+async def dm_disable(ctx):
+    """Disable DM sequence"""
+    settings = load_settings()
+    settings["dm_sequence_enabled"] = False
+    save_settings(settings)
+    await ctx.send("⛔ DM sequence disabled", delete_after=5)
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+@bot.command(name="dmstatus")
+@commands.has_permissions(administrator=True)
+async def dm_status(ctx):
+    """Show DM sequence status"""
+    settings = load_settings()
+    status = "ENABLED" if settings.get("dm_sequence_enabled", True) else "DISABLED"
+    emoji = "✅" if settings.get("dm_sequence_enabled", True) else "⛔"
+    await ctx.send(f"{emoji} DM sequence: **{status}**", delete_after=10)
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
 @bot.command(name="start")
 @commands.has_permissions(administrator=True)
 async def start_sequence(ctx, member: discord.Member):
@@ -1547,7 +1607,7 @@ async def cancel_sequence(ctx, member: discord.Member):
 @bot.command(name="test")
 @commands.has_permissions(administrator=True)
 async def test_sequence(ctx, member: discord.Member):
-    await ctx.reply(f"Starting test sequence for {member.mention}...")
+    await ctx.reply(f"Starting test sequence for {m_user(member)}...")
     for day_key in DAY_KEYS:
         try:
             join_url = UTM_LINKS[day_key]
@@ -1581,7 +1641,7 @@ async def test_sequence(ctx, member: discord.Member):
         except Exception as e:
             await log_other(f"🧪❌ TEST failed `{day_key}` for {_fmt_user(member)}: `{e}`")
         await asyncio.sleep(TEST_INTERVAL_SECONDS)
-    await ctx.send(f"✅ Test sequence complete for {member.mention}.")
+    await ctx.send(f"✅ Test sequence complete for {m_user(member)}.")
 
 @bot.command(name="relocate")
 @commands.has_permissions(administrator=True)
@@ -1606,7 +1666,7 @@ async def relocate_sequence(ctx, member: discord.Member, day: str):
         "next_send": (_now() + timedelta(seconds=5)).isoformat().replace("+00:00", "Z"),
     }
     save_json(QUEUE_FILE, queue_state)
-    await ctx.reply(f"Relocated {member.mention} to **{day_key}**, will send in ~5s.")
+    await ctx.reply(f"Relocated {m_user(member)} to **{day_key}**, will send in ~5s.")
     await log_other(f"➡️ Relocated {_fmt_user(member)} to **{day_key}**")
 
 # -----------------------------
