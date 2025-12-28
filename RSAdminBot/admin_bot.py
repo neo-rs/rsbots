@@ -1841,6 +1841,10 @@ class RSAdminBot:
         
         self.load_config()
 
+        # Load SSH server config (must exist before logger init; logger may reference current_server)
+        self.servers: List[Dict[str, Any]] = []
+        self.current_server: Optional[Dict[str, Any]] = None
+
         # Canonical owner: Logging
         # Initialize after config load so it can read logging settings.
         self.logger: Optional[CommandLogger] = CommandLogger(self)
@@ -1870,8 +1874,6 @@ class RSAdminBot:
             sys.exit(1)
         
         # Load SSH server config (self-contained - only from config.json)
-        self.servers: List[Dict[str, Any]] = []
-        self.current_server: Optional[Dict[str, Any]] = None
         self._load_ssh_config()
         
         # Initialize ServiceManager (canonical owner for bot management operations)
@@ -2602,7 +2604,16 @@ echo "TARGET=$TARGET"
                 while True:
                     if proc.stdout is None:
                         break
-                    raw = await proc.stdout.readline()
+                    # Flush on timer even if no new lines arrive (prevents "silent channels")
+                    try:
+                        raw = await asyncio.wait_for(proc.stdout.readline(), timeout=flush_seconds)
+                    except asyncio.TimeoutError:
+                        if buf:
+                            await self._flush_journal_batch(bot_key, webhook_url, buf)
+                            buf = []
+                            buf_chars = 0
+                            last_flush = time.time()
+                        continue
                     if not raw:
                         break
                     line = raw.decode(errors="replace").rstrip("\n")
