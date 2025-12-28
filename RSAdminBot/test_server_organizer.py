@@ -273,3 +273,72 @@ class TestServerOrganizer:
         
         return result
 
+    async def ensure_journal_channels_in_category(self, rs_bot_keys: List[str]) -> Dict[str, int]:
+        """Ensure per-bot journal channels exist inside a configured test-server category.
+
+        Hard rules:
+        - Test server only (guild must match configured test_server_guild_id)
+        - Do not create categories here (category must already exist)
+        - Idempotent: reuse by stored IDs or existing channel names to avoid duplicates
+        """
+        cfg = self.config.get("journal_live") if isinstance(self.config, dict) else {}
+        if not isinstance(cfg, dict) or not cfg.get("enabled"):
+            return {}
+
+        if not self.test_server_guild_id:
+            return {}
+
+        guild = self.bot.get_guild(self.test_server_guild_id)
+        if not guild or guild.id != self.test_server_guild_id:
+            return {}
+
+        category_id = cfg.get("category_id")
+        if not category_id:
+            return {}
+        try:
+            category_id = int(category_id)
+        except Exception:
+            return {}
+
+        category = guild.get_channel(category_id)
+        if not category or not isinstance(category, discord.CategoryChannel):
+            # Do not create categories; fail quietly.
+            return {}
+
+        channel_prefix = str(cfg.get("channel_prefix") or "journal-")
+
+        if "journal_channels" not in self.channels_data:
+            self.channels_data["journal_channels"] = {}
+
+        result: Dict[str, int] = {}
+        for bot_key in rs_bot_keys:
+            channel_name = f"{channel_prefix}{bot_key}".lower()
+
+            # 1) Stored ID
+            existing_id = self.channels_data["journal_channels"].get(bot_key)
+            if existing_id:
+                ch = guild.get_channel(int(existing_id))
+                if ch and isinstance(ch, discord.TextChannel):
+                    result[bot_key] = ch.id
+                    continue
+
+            # 2) Search by name within the category
+            found = discord.utils.get(guild.text_channels, name=channel_name, category=category)
+            if not found:
+                try:
+                    found = await guild.create_text_channel(
+                        channel_name,
+                        category=category,
+                        reason="RSAdminBot per-bot journal channel (test server only)",
+                    )
+                except discord.Forbidden:
+                    continue
+                except Exception:
+                    continue
+
+            result[bot_key] = found.id
+            self.channels_data["journal_channels"][bot_key] = found.id
+            self._save_channels_data()
+
+        return result
+

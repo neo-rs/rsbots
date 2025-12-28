@@ -24,9 +24,13 @@ import importlib.util
 import platform
 import requests
 import time
+import re
+from collections import deque
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
+
+import aiohttp
 
 # Ensure repo root is importable when executed as a script (matches Ubuntu run_bot.sh PYTHONPATH).
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +39,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from mirror_world_config import load_config_with_secrets
 from mirror_world_config import is_placeholder_secret, mask_secret
+from mirror_world_config import _deep_merge_dict
 
 from rsbots_manifest import compare_manifests as rs_compare_manifests
 from rsbots_manifest import generate_manifest as rs_generate_manifest
@@ -1830,6 +1835,8 @@ class RSAdminBot:
     def __init__(self):
         self.base_path = Path(__file__).parent
         self.config_path = self.base_path / "config.json"
+        # Server-only secrets (merged on top of config.json by load_config_with_secrets)
+        self.secrets_path = self.base_path / "config.secrets.json"
         self.config: Dict[str, Any] = {}
         
         self.load_config()
@@ -1898,6 +1905,14 @@ class RSAdminBot:
         self._bot_monitor_channel_ids: Dict[str, int] = {}
         self._monitor_category_id: Optional[int] = None
         self._last_service_snapshot: Dict[str, Tuple[str, int]] = {}  # {bot_key: (state, pid)}
+
+        # Journal live streaming + webhooks (test server only; webhooks are stored server-side in config.secrets.json)
+        self._http_session: Optional[aiohttp.ClientSession] = None
+        self._journal_channel_ids: Dict[str, int] = {}
+        self._journal_webhook_urls_by_bot: Dict[str, str] = {}
+        self._systemd_events_webhook_url: str = ""
+        self._journal_tasks: Dict[str, asyncio.Task] = {}
+        self._journal_last_alert_ts: Dict[str, float] = {}
         
         # Setup bot with required intents
         intents = discord.Intents.default()
@@ -2347,6 +2362,332 @@ echo "TARGET=$TARGET"
                 "post_pid_change": False,
                 "failure_logs_lines": 80,
             }
+
+    def _get_systemd_events_config(self) -> Dict[str, Any]:
+        """Return systemd_events config (IDs only; webhook URLs come from config.secrets.json)."""
+        cfg = self.config.get("systemd_events") or {}
+        try:
+            return {
+                "enabled": bool(cfg.get("enabled", False)),
+                "test_server_channel_id": int(cfg.get("test_server_channel_id") or 0),
+                "rs_server_enabled": bool(cfg.get("rs_server_enabled", False)),
+                "rs_server_channel_id": int(cfg.get("rs_server_channel_id") or 0),
+            }
+        except Exception:
+            return {
+                "enabled": False,
+                "test_server_channel_id": 0,
+                "rs_server_enabled": False,
+                "rs_server_channel_id": 0,
+            }
+
+    def _get_journal_live_config(self) -> Dict[str, Any]:
+        """Return journal_live config (IDs only; webhooks are server-only secrets)."""
+        cfg = self.config.get("journal_live") or {}
+        try:
+            return {
+                "enabled": bool(cfg.get("enabled", False)),
+                "category_id": int(cfg.get("category_id") or 0),
+                "channel_prefix": str(cfg.get("channel_prefix") or "journal-"),
+                "startup_backfill_lines": int(cfg.get("startup_backfill_lines") or 20),
+                "flush_seconds": float(cfg.get("flush_seconds") or 1),
+                "max_chars": int(cfg.get("max_chars") or 1800),
+            }
+        except Exception:
+            return {
+                "enabled": False,
+                "category_id": 0,
+                "channel_prefix": "journal-",
+                "startup_backfill_lines": 20,
+                "flush_seconds": 1,
+                "max_chars": 1800,
+            }
+
+    def _get_webhooks_config(self) -> Dict[str, Any]:
+        """Return webhooks config (merged from config.secrets.json)."""
+        cfg = self.config.get("webhooks") or {}
+        if not isinstance(cfg, dict):
+            return {"journal_by_bot": {}, "systemd_events_url": ""}
+        journal_by_bot = cfg.get("journal_by_bot") or {}
+        if not isinstance(journal_by_bot, dict):
+            journal_by_bot = {}
+        return {
+            "journal_by_bot": journal_by_bot,
+            "systemd_events_url": str(cfg.get("systemd_events_url") or ""),
+        }
+
+    def _load_secrets_dict(self) -> Dict[str, Any]:
+        """Load RSAdminBot/config.secrets.json (server-only)."""
+        try:
+            if not self.secrets_path.exists():
+                return {}
+            data = json.loads(self.secrets_path.read_text(encoding="utf-8") or "{}")
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _merge_write_secrets(self, overlay: Dict[str, Any]) -> bool:
+        """Deep-merge overlay into config.secrets.json and write atomically.
+
+        Returns True if a write happened (best-effort), else False.
+        """
+        if not self._should_use_local_exec():
+            # Never attempt to write secrets remotely from a non-local-exec context.
+            return False
+        try:
+            base = self._load_secrets_dict()
+            if not isinstance(base, dict):
+                base = {}
+            if not isinstance(overlay, dict):
+                return False
+            _deep_merge_dict(base, overlay)
+            tmp = self.secrets_path.with_suffix(self.secrets_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(base, indent=2, sort_keys=True), encoding="utf-8")
+            tmp.replace(self.secrets_path)
+            try:
+                os.chmod(self.secrets_path, 0o600)
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
+    async def _get_http_session(self) -> aiohttp.ClientSession:
+        if self._http_session and not self._http_session.closed:
+            return self._http_session
+        timeout = aiohttp.ClientTimeout(total=15)
+        self._http_session = aiohttp.ClientSession(timeout=timeout)
+        return self._http_session
+
+    async def _send_webhook(
+        self,
+        url: str,
+        *,
+        content: Optional[str] = None,
+        embed: Optional[discord.Embed] = None,
+        allowed_user_ids: Optional[List[int]] = None,
+    ) -> bool:
+        """Send a message to a Discord webhook URL (webhooks-only delivery)."""
+        u = str(url or "").strip()
+        if not u:
+            return False
+        payload: Dict[str, Any] = {}
+        if content:
+            payload["content"] = str(content)[:1900]
+        if embed is not None:
+            try:
+                payload["embeds"] = [embed.to_dict()]
+            except Exception:
+                pass
+        # Prevent accidental mass-mentions; optionally allow explicit user mentions.
+        if allowed_user_ids:
+            payload["allowed_mentions"] = {"parse": [], "users": [int(x) for x in allowed_user_ids if x]}
+        else:
+            payload["allowed_mentions"] = {"parse": []}
+        try:
+            session = await self._get_http_session()
+            async with session.post(u, json=payload) as resp:
+                if 200 <= resp.status < 300:
+                    return True
+                # Best-effort: do not spam logs with webhook URL.
+                return False
+        except Exception:
+            return False
+
+    async def _send_systemd_event(self, bot_key: str, text: str, *, severity: str = "info", should_ping: bool = False) -> None:
+        """Send a structured systemd movement/event message to the systemd events webhook (test server only)."""
+        cfg = self._get_systemd_events_config()
+        if not cfg.get("enabled"):
+            return
+        url = str(self._systemd_events_webhook_url or "").strip()
+        if not url:
+            # Allow config to provide it (merged secrets)
+            url = str(self._get_webhooks_config().get("systemd_events_url") or "").strip()
+        if not url:
+            return
+
+        title = "Systemd event"
+        if severity == "error":
+            title = "Systemd failure"
+
+        details = (text or "").strip()
+        # Avoid nested code fences inside an embed code block.
+        details = details.replace("```", "").strip()
+        # Embed field value hard-limit is 1024 chars; keep buffer for code block fences.
+        if len(details) > 950:
+            details = details[:950] + "\n...(truncated)"
+
+        embed = MessageHelper.create_status_embed(
+            title=title,
+            description="",
+            color=discord.Color.red() if severity == "error" else discord.Color.blue(),
+            fields=[
+                {"name": "Bot", "value": bot_key, "inline": True},
+                {"name": "Severity", "value": severity, "inline": True},
+                {"name": "Details", "value": f"```{details}```", "inline": False},
+            ],
+            footer="RSAdminBot",
+        )
+
+        ping_users = []
+        if severity == "error" and should_ping:
+            ping_users = list(self._get_monitor_channels_config().get("ping_on_failure_user_ids") or [])
+
+        content = ""
+        if ping_users:
+            content = " ".join(f"<@{int(uid)}>" for uid in ping_users if uid)
+
+        await self._send_webhook(url, content=content or None, embed=embed, allowed_user_ids=ping_users or None)
+
+    @staticmethod
+    def _strip_ansi(text: str) -> str:
+        # Remove ANSI escape sequences (keeps Discord output clean)
+        return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text or "")
+
+    @staticmethod
+    def _is_hint_banner_line(line: str) -> bool:
+        s = (line or "").strip()
+        return s.startswith("Hint: You are currently not seeing messages")
+
+    @staticmethod
+    def _looks_high_signal(line: str) -> bool:
+        s = (line or "").lower()
+        if not s:
+            return False
+        needles = (
+            "error",
+            "exception",
+            "traceback",
+            "failed",
+            "missing",
+            "not found",
+            "unknown channel",
+            "config missing",
+            "permission",
+            "denied",
+        )
+        return any(n in s for n in needles)
+
+    async def _journal_follow_loop(self, bot_key: str, unit_name: str, webhook_url: str) -> None:
+        """Follow journald for a unit and stream batched lines to the bot's journal channel webhook."""
+        cfg = self._get_journal_live_config()
+        backfill = max(0, min(int(cfg.get("startup_backfill_lines") or 20), 200))
+        flush_seconds = max(0.5, min(float(cfg.get("flush_seconds") or 1), 10))
+        max_chars = max(400, min(int(cfg.get("max_chars") or 1800), 1900))
+
+        # Context window for high-signal extraction
+        ctx_window = deque(maxlen=6)
+        skip_hint_lines = 0
+        buf: List[str] = []
+        buf_chars = 0
+        last_flush = time.time()
+
+        while True:
+            try:
+                # Start journalctl - follow unit
+                proc = await asyncio.create_subprocess_exec(
+                    "journalctl",
+                    "-q",
+                    "-f",
+                    "-o",
+                    "cat",
+                    "-n",
+                    str(backfill),
+                    "-u",
+                    unit_name,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+
+                while True:
+                    if proc.stdout is None:
+                        break
+                    raw = await proc.stdout.readline()
+                    if not raw:
+                        break
+                    line = raw.decode(errors="replace").rstrip("\n")
+                    line = self._strip_ansi(line).rstrip()
+                    if not line:
+                        continue
+
+                    # Drop the multi-line hint banner if it appears
+                    if skip_hint_lines > 0:
+                        skip_hint_lines -= 1
+                        continue
+                    if self._is_hint_banner_line(line):
+                        skip_hint_lines = 2
+                        continue
+
+                    ctx_window.append(line)
+
+                    # High-signal mirror to systemd events (hybrid)
+                    if self._looks_high_signal(line):
+                        await self._maybe_send_journal_alert(bot_key, list(ctx_window))
+
+                    # Add to batch buffer
+                    buf.append(line)
+                    buf_chars += len(line) + 1
+
+                    now = time.time()
+                    if buf and (buf_chars >= max_chars or (now - last_flush) >= flush_seconds):
+                        await self._flush_journal_batch(bot_key, webhook_url, buf)
+                        buf = []
+                        buf_chars = 0
+                        last_flush = now
+
+                # Process ended; flush any remaining buffer
+                if buf:
+                    await self._flush_journal_batch(bot_key, webhook_url, buf)
+                    buf = []
+                    buf_chars = 0
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                # Backoff on unexpected errors
+                await asyncio.sleep(3)
+
+    async def _flush_journal_batch(self, bot_key: str, webhook_url: str, lines: List[str]) -> None:
+        try:
+            joined = "\n".join(lines)
+            if not joined:
+                return
+            # Keep Discord-safe size; rely on configured max_chars, but double-guard.
+            if len(joined) > 1800:
+                joined = joined[-1800:]
+            content = f"journal: {bot_key}\n```log\n{joined}\n```"
+            await self._send_webhook(webhook_url, content=content)
+        except Exception:
+            return
+
+    async def _maybe_send_journal_alert(self, bot_key: str, context_lines: List[str]) -> None:
+        """Mirror a condensed warning/error alert into systemd events channel (rate-limited per bot)."""
+        sys_cfg = self._get_systemd_events_config()
+        if not sys_cfg.get("enabled"):
+            return
+        url = str(self._systemd_events_webhook_url or "").strip()
+        if not url:
+            return
+
+        now = time.time()
+        last = float(self._journal_last_alert_ts.get(bot_key, 0.0))
+        if (now - last) < 15:
+            return
+        self._journal_last_alert_ts[bot_key] = now
+
+        ctx = "\n".join(context_lines[-6:])
+        if len(ctx) > 900:
+            ctx = ctx[-900:]
+        embed = MessageHelper.create_warning_embed(
+            title="Journal alert",
+            message=f"High-signal log line detected for {bot_key}.",
+            details=ctx,
+        )
+        await self._send_webhook(url, embed=embed)
     
     async def _initialize_monitor_channels(self) -> None:
         """Initialize monitor category and per-bot channels in test server."""
@@ -2373,6 +2714,145 @@ echo "TARGET=$TARGET"
             print(f"{Colors.GREEN}[Monitor Channels] Initialized {len(channel_map)} per-bot monitor channels{Colors.RESET}")
         else:
             print(f"{Colors.YELLOW}[Monitor Channels] No monitor channels created (disabled or failed){Colors.RESET}")
+
+    async def _initialize_journal_live(self) -> None:
+        """Initialize per-bot journal channels + webhooks and start journal follow tasks (test server only)."""
+        cfg = self._get_journal_live_config()
+        if not cfg.get("enabled"):
+            return
+
+        if not self._should_use_local_exec():
+            # Journal streaming is only supported on the Ubuntu host.
+            return
+
+        if not self.test_server_organizer:
+            return
+
+        try:
+            test_guild_id = int(self.config.get("test_server_guild_id") or 0)
+        except Exception:
+            test_guild_id = 0
+        if not test_guild_id:
+            return
+
+        guild = self.bot.get_guild(test_guild_id)
+        if not guild or guild.id != test_guild_id:
+            return
+
+        # RS-only: rsadminbot + rs_bots group
+        bot_groups = self.config.get("bot_groups") or {}
+        rs_keys = ["rsadminbot"] + list(bot_groups.get("rs_bots") or [])
+
+        # Ensure journal channels exist in configured category (do not create categories)
+        channel_map = await self.test_server_organizer.ensure_journal_channels_in_category(rs_keys)
+        self._journal_channel_ids = channel_map
+
+        # Ensure webhooks exist (auto-create) and persist URLs to config.secrets.json
+        created_any = False
+        webhook_cfg = self._get_webhooks_config()
+        journal_by_bot = dict(webhook_cfg.get("journal_by_bot") or {})
+
+        for bot_key, channel_id in channel_map.items():
+            try:
+                ch = guild.get_channel(int(channel_id))
+                if not ch or not isinstance(ch, discord.TextChannel):
+                    continue
+                hook_name = f"rsadminbot-journal-{bot_key}"
+                hooks = []
+                try:
+                    hooks = await ch.webhooks()
+                except Exception:
+                    hooks = []
+                found = None
+                for h in hooks:
+                    try:
+                        if h and str(getattr(h, "name", "")) == hook_name:
+                            found = h
+                            break
+                    except Exception:
+                        continue
+                if found is None:
+                    try:
+                        found = await ch.create_webhook(name=hook_name, reason="RSAdminBot journal live (test server only)")
+                    except Exception:
+                        continue
+                if found and getattr(found, "url", None):
+                    url = str(found.url)
+                    if journal_by_bot.get(bot_key) != url:
+                        journal_by_bot[bot_key] = url
+                        created_any = True
+            except Exception:
+                continue
+
+        # Systemd events webhook (single shared channel)
+        sys_cfg = self._get_systemd_events_config()
+        systemd_url = str(webhook_cfg.get("systemd_events_url") or "").strip()
+        if sys_cfg.get("enabled"):
+            sys_ch_id = int(sys_cfg.get("test_server_channel_id") or 0)
+            if sys_ch_id:
+                sys_ch = guild.get_channel(sys_ch_id)
+                if sys_ch and isinstance(sys_ch, discord.TextChannel):
+                    hook_name = "rsadminbot-systemd-events"
+                    hooks = []
+                    try:
+                        hooks = await sys_ch.webhooks()
+                    except Exception:
+                        hooks = []
+                    found = None
+                    for h in hooks:
+                        try:
+                            if h and str(getattr(h, "name", "")) == hook_name:
+                                found = h
+                                break
+                        except Exception:
+                            continue
+                    if found is None:
+                        try:
+                            found = await sys_ch.create_webhook(name=hook_name, reason="RSAdminBot systemd events (test server only)")
+                        except Exception:
+                            found = None
+                    if found and getattr(found, "url", None):
+                        url = str(found.url)
+                        if systemd_url != url:
+                            systemd_url = url
+                            created_any = True
+
+        if created_any:
+            overlay = {"webhooks": {"journal_by_bot": journal_by_bot}}
+            if systemd_url:
+                overlay["webhooks"]["systemd_events_url"] = systemd_url
+            self._merge_write_secrets(overlay)
+            # Update in-memory config (no restart required to use freshly created webhooks)
+            self.config.setdefault("webhooks", {})
+            if isinstance(self.config.get("webhooks"), dict):
+                self.config["webhooks"]["journal_by_bot"] = journal_by_bot
+                if systemd_url:
+                    self.config["webhooks"]["systemd_events_url"] = systemd_url
+
+        # Cache webhook URLs for runtime
+        self._journal_webhook_urls_by_bot = {k: str(v) for k, v in journal_by_bot.items() if v}
+        self._systemd_events_webhook_url = systemd_url
+
+        # Start per-bot journal follow tasks
+        self._start_journal_follow_tasks(rs_keys)
+
+    def _start_journal_follow_tasks(self, rs_keys: List[str]) -> None:
+        cfg = self._get_journal_live_config()
+        if not cfg.get("enabled"):
+            return
+        if not self._should_use_local_exec():
+            return
+        for bot_key in rs_keys:
+            if bot_key in self._journal_tasks:
+                continue
+            info = self.BOTS.get(bot_key) or {}
+            svc = str(info.get("service") or "")
+            if not svc:
+                continue
+            url = str(self._journal_webhook_urls_by_bot.get(bot_key) or "").strip()
+            if not url:
+                continue
+            self._journal_tasks[bot_key] = asyncio.create_task(self._journal_follow_loop(bot_key, svc, url))
     
     def _get_bot_monitor_channel(self, bot_key: str) -> Optional[discord.TextChannel]:
         """Get the monitor channel for a bot key."""
@@ -2487,6 +2967,12 @@ echo "TARGET=$TARGET"
                             pass
                     
                     # Also post to progress channel for info
+                # Systemd events channel (webhooks-only)
+                try:
+                    await self._send_systemd_event(bot_key, text, severity=severity, should_ping=should_ping)
+                except Exception:
+                    pass
+
                 await self._post_or_edit_progress(None, text)
 
             # Always announce the monitor is running (one-time)
@@ -3690,6 +4176,12 @@ echo "CHANGED_END"
                     await self._initialize_monitor_channels()
                 except Exception as e:
                     print(f"{Colors.YELLOW}[Startup] Monitor channel initialization failed (non-critical): {e}{Colors.RESET}")
+
+                # Initialize per-bot journal live channels + webhooks (test server only)
+                try:
+                    await self._initialize_journal_live()
+                except Exception as e:
+                    print(f"{Colors.YELLOW}[Startup] Journal live initialization failed (non-critical): {e}{Colors.RESET}")
 
                 # If a self-update was applied during restart, report it to the update-progress channel now.
                 try:
