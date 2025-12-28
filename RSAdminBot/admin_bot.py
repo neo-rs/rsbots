@@ -1421,6 +1421,8 @@ echo "TARGET=$TARGET"
                 "failure_log_lines": int(cfg.get("failure_log_lines") or 25),
                 "min_seconds_between_posts": int(cfg.get("min_seconds_between_posts") or 120),
                 "heartbeat_seconds": int(cfg.get("heartbeat_seconds") or 0),  # Legacy: kept for backward compat
+                "test_server_channel_id": str(cfg.get("test_server_channel_id") or self.config.get("update_progress", {}).get("channel_id", "")),
+                "rs_errors_channel_id": str(cfg.get("rs_errors_channel_id") or self.config.get("log_channel_id", "1452590450631376906")),
             }
         except Exception:
             return {
@@ -1433,6 +1435,8 @@ echo "TARGET=$TARGET"
                 "failure_log_lines": 25,
                 "min_seconds_between_posts": 120,
                 "heartbeat_seconds": 0,
+                "test_server_channel_id": str(self.config.get("update_progress", {}).get("channel_id", "")),
+                "rs_errors_channel_id": str(self.config.get("log_channel_id", "1452590450631376906")),
             }
 
     def _start_service_monitor_task(self) -> None:
@@ -1467,14 +1471,52 @@ echo "TARGET=$TARGET"
             last_post_ts: Dict[str, float] = {}
             last_heartbeat = 0.0
 
-            async def post(bot_key: str, text: str):
+            async def post(bot_key: str, text: str, severity: str = "info", should_ping: bool = False):
+                """Post monitor message to appropriate channels.
+                
+                Args:
+                    bot_key: Bot key name
+                    text: Message text
+                    severity: "info" or "error"
+                    should_ping: Whether to ping Neo (only for failures)
+                """
                 now = time.time()
                 last = last_post_ts.get(bot_key, 0.0)
                 if min_gap and (now - last) < min_gap:
                     return
                 last_post_ts[bot_key] = now
-                # Progress channel
-                await self._post_or_edit_progress(None, text)
+                
+                # Get channel IDs from config
+                test_channel_id = cfg.get("test_server_channel_id", "")
+                rs_errors_channel_id = cfg.get("rs_errors_channel_id", "1452590450631376906")
+                
+                # Route based on severity
+                if severity == "error":
+                    # Post to RS error channel
+                    try:
+                        rs_channel = self.bot.get_channel(int(rs_errors_channel_id))
+                        if rs_channel:
+                            await rs_channel.send(text[:1900])
+                    except Exception:
+                        pass
+                    
+                    # Also post to test server progress channel
+                    await self._post_or_edit_progress(None, text)
+                    
+                    # Ping Neo in test server if requested
+                    if should_ping and test_channel_id:
+                        try:
+                            test_channel = self.bot.get_channel(int(test_channel_id))
+                            if test_channel:
+                                ping_text = f"<@!{self.config.get('admin_user_ids', [])[0] if self.config.get('admin_user_ids') else ''}> {text[:1900]}"
+                                await test_channel.send(ping_text[:2000])
+                        except Exception:
+                            # Fallback: just post without ping if ping fails
+                            await self._post_or_edit_progress(None, text)
+                else:
+                    # Info messages go to test server progress channel only
+                    await self._post_or_edit_progress(None, text)
+                
                 # Per-bot monitoring channel in test server (if organizer exists)
                 if self.test_server_organizer:
                     await self.test_server_organizer.send_to_channel(f"{bot_key}_activity", content=text[:1900])
@@ -1551,7 +1593,12 @@ echo "TARGET=$TARGET"
                         if prev == (cur_state, cur_pid):
                             continue
                         
-                        # Snapshot changed - update and post
+                        # Snapshot changed - detect if it's PID-only or state change
+                        prev_state, prev_pid = prev if prev else (None, 0)
+                        is_pid_only = (prev_state == cur_state) and (prev_state == "active") and (prev_pid != cur_pid)
+                        is_failure = (cur_state in ("failed", "inactive", "not_found"))
+                        
+                        # Update snapshot
                         last_snapshot[key] = (cur_state, cur_pid)
                         
                         # Get full details for the change
@@ -1560,28 +1607,46 @@ echo "TARGET=$TARGET"
                         exists, state, _ = self.service_manager.get_status(svc, bot_name=key)
                         pid = self.service_manager.get_pid(svc) or 0
                         
-                        # Build message with state info
-                        msg_lines = [
-                            f"[monitor] {info.get('name', key)} ({key}) - state changed",
-                            f"State: {self._format_service_state(exists, state, pid)}"
-                        ]
-                        
-                        # If bot is not active, include !details and !logs output
-                        if (not exists) or (state != "active"):
-                            # Get detailed status (like !details command)
-                            details_success, details_out, _ = self.service_manager.get_detailed_status(svc)
-                            if details_success and details_out:
-                                msg_lines.append("\nDetails:")
-                                msg_lines.append(details_out[:800])  # Truncate details
+                        # Build message based on change type
+                        if is_pid_only:
+                            # PID-only change while active = restart detected (compact message)
+                            msg_lines = [
+                                f"[monitor] {info.get('name', key)} ({key}) - restart detected",
+                                f"PID: {prev_pid} → {cur_pid} (state: active)"
+                            ]
+                            severity = "info"
+                            should_ping = False
+                        else:
+                            # State change or failure
+                            msg_lines = [
+                                f"[monitor] {info.get('name', key)} ({key}) - state changed",
+                                f"State: {self._format_service_state(exists, state, pid)}"
+                            ]
+                            if prev_state:
+                                msg_lines.insert(1, f"Previous: {prev_state} (pid: {prev_pid})")
                             
-                            # Get logs (like !logs command)
-                            logs = self.service_manager.get_failure_logs(svc, lines=lines) or ""
-                            if logs:
-                                msg_lines.append("\nRecent logs:")
-                                msg_lines.append(logs[-1200:])  # Last 1200 chars
+                            # If bot is not active, include !details and !logs output
+                            if is_failure:
+                                # Get detailed status (like !details command)
+                                details_success, details_out, _ = self.service_manager.get_detailed_status(svc)
+                                if details_success and details_out:
+                                    msg_lines.append("\n**Details:**")
+                                    msg_lines.append(f"```{details_out[:800]}```")
+                                
+                                # Get logs (like !logs command)
+                                logs = self.service_manager.get_failure_logs(svc, lines=lines) or ""
+                                if logs:
+                                    msg_lines.append("\n**Recent logs:**")
+                                    msg_lines.append(f"```{logs[-1200:]}```")
+                                
+                                severity = "error"
+                                should_ping = True
+                            else:
+                                severity = "info"
+                                should_ping = False
                         
                         msg = "\n".join(msg_lines)
-                        await post(key, msg[:1900])
+                        await post(key, msg[:1900], severity=severity, should_ping=should_ping)
                         
                 except Exception:
                     pass
@@ -1868,12 +1933,6 @@ DEPLOY_KEY={shlex.quote(deploy_key)}
 
 command -v git >/dev/null 2>&1 || {{ echo "ERR=git_missing"; exit 2; }}
 
-if [ ! -d "$LIVE_ROOT/.git" ]; then
-  echo "ERR=not_a_git_repo"
-  echo "DETAIL=$LIVE_ROOT/.git not found"
-  exit 2
-fi
-
 # Ensure GitHub SSH host key can be accepted non-interactively.
 SSH_DIR="${{HOME:-/home/rsadmin}}/.ssh"
 KNOWN_HOSTS="$SSH_DIR/known_hosts"
@@ -1886,11 +1945,21 @@ export GIT_SSH_COMMAND="ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes -o UserKnownHos
 
 cd "$LIVE_ROOT"
 
-# Ensure origin is set (best effort - don't fail if already set)
-git remote set-url origin "$REPO_URL" 2>/dev/null || git remote add origin "$REPO_URL" 2>/dev/null || true
-
-# Ensure we're on the correct branch
-git branch -M "$BRANCH" 2>/dev/null || true
+# Initialize git repo if it doesn't exist
+if [ ! -d ".git" ]; then
+  git init
+  git config user.name "RSAdminBot"
+  git config user.email "rsadminbot@users.noreply.github.com"
+  git remote add origin "$REPO_URL" 2>/dev/null || git remote set-url origin "$REPO_URL" 2>/dev/null || true
+  git checkout -b "$BRANCH" 2>/dev/null || git branch -M "$BRANCH" 2>/dev/null || true
+else
+  # Ensure origin is set (best effort - don't fail if already set)
+  git remote set-url origin "$REPO_URL" 2>/dev/null || git remote add origin "$REPO_URL" 2>/dev/null || true
+  # Ensure we're on the correct branch
+  git branch -M "$BRANCH" 2>/dev/null || true
+  # Fetch to ensure we have remote refs
+  git fetch origin "$BRANCH" 2>/dev/null || true
+fi
 
 # Stage all changes (only python files should be tracked per .gitignore)
 git add -A
@@ -1899,21 +1968,34 @@ git add -A
 if git diff --cached --quiet; then
   echo "OK=1"
   echo "NO_CHANGES=1"
-  echo "HEAD=$(git rev-parse HEAD 2>/dev/null || echo '')"
+  HEAD_SHA=$(git rev-parse HEAD 2>/dev/null || echo '')
+  echo "HEAD=$HEAD_SHA"
   exit 0
+fi
+
+# Check if this is the first commit (no HEAD exists)
+FIRST_COMMIT=0
+if ! git rev-parse HEAD >/dev/null 2>&1; then
+  FIRST_COMMIT=1
 fi
 
 # Commit with timestamp
 TS=$(date +%Y%m%d_%H%M%S)
 git commit -m "rsbots py update: $TS" >/dev/null 2>&1 || {{ echo "ERR=commit_failed"; exit 3; }}
 
-# Push to origin
-git push origin "$BRANCH" >/dev/null 2>&1 || {{ echo "ERR=push_failed"; exit 4; }}
+# Push to origin (use -u for first push to set upstream)
+if [ "$FIRST_COMMIT" = "1" ]; then
+  git push -u origin "$BRANCH" >/dev/null 2>&1 || {{ echo "ERR=push_failed"; exit 4; }}
+else
+  git push origin "$BRANCH" >/dev/null 2>&1 || {{ echo "ERR=push_failed"; exit 4; }}
+fi
 
 echo "OK=1"
 echo "PUSHED=1"
 echo "HEAD=$(git rev-parse HEAD)"
-echo "OLD_HEAD=$(git rev-parse HEAD~1 2>/dev/null || echo '')"
+if [ "$FIRST_COMMIT" = "0" ]; then
+  echo "OLD_HEAD=$(git rev-parse HEAD~1 2>/dev/null || echo '')"
+fi
 echo "CHANGED_BEGIN"
 git show --name-only --pretty=format: HEAD | sed '/^$/d' | head -n 100
 echo "CHANGED_END"
@@ -3467,6 +3549,11 @@ echo "CHANGED_END"
         @commands.check(lambda ctx: self.is_admin(ctx.author))
         async def botupdate(ctx, bot_name: str = None):
             """Update a bot by pulling python-only code from GitHub and restarting it (admin only)."""
+            # RS-only: exclude non-RS bots from updates
+            if bot_name and not self._is_rs_bot(bot_name):
+                await ctx.send(f"❌ `{bot_name}` is not an RS bot. Updates are only available for RS bots.\nUse `!start`, `!stop`, or `!restart` for non-RS bots.")
+                return
+            
             ssh_ok, error_msg = self._check_ssh_available()
             if not ssh_ok:
                 await ctx.send(f"❌ SSH not configured: {error_msg}")
@@ -4313,6 +4400,11 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
         @commands.check(lambda ctx: self.is_admin(ctx.author))
         async def botinfo(ctx, bot_name: str = None):
             """Get detailed information about a bot (admin only)"""
+            # RS-only: exclude non-RS bots from botinfo
+            if bot_name and not self._is_rs_bot(bot_name):
+                await ctx.send(f"❌ `{bot_name}` is not an RS bot. Bot info is only available for RS bots.")
+                return
+            
             if not INSPECTOR_AVAILABLE or not self.inspector:
                 await ctx.send("❌ Bot inspector not available")
                 return
@@ -4472,6 +4564,11 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
         @commands.check(lambda ctx: self.is_admin(ctx.author))
         async def botconfig(ctx, bot_name: str = None):
             """Get config.json for a bot in user-friendly format (admin only)"""
+            # RS-only: exclude non-RS bots from botconfig
+            if bot_name and not self._is_rs_bot(bot_name):
+                await ctx.send(f"❌ `{bot_name}` is not an RS bot. Bot config is only available for RS bots.")
+                return
+            
             if not INSPECTOR_AVAILABLE or not self.inspector:
                 await ctx.send("❌ Bot inspector not available")
                 return
@@ -4774,6 +4871,11 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
         @commands.check(lambda ctx: self.is_admin(ctx.author))
         async def botmovements(ctx, bot_name: str = None, limit: int = 50):
             """Show bot's activity log (admin only)"""
+            # RS-only: exclude non-RS bots from movement tracking
+            if bot_name and not self._is_rs_bot(bot_name):
+                await ctx.send(f"❌ `{bot_name}` is not an RS bot. Movement tracking is only available for RS bots.")
+                return
+            
             if not self.bot_movement_tracker:
                 error_embed = MessageHelper.create_error_embed(
                     "Bot Movement Tracker Not Available",
@@ -4919,8 +5021,14 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                 "skipped": []
             }
             
-            # Get all bot names
-            bot_names = list(self.BOTS.keys())
+            # Get all bot names - filter to RS bots only for advanced commands
+            all_bot_names = list(self.BOTS.keys())
+            bot_names = [name for name in all_bot_names if self._is_rs_bot(name)]
+            non_rs_bots = [name for name in all_bot_names if not self._is_rs_bot(name)]
+            
+            if non_rs_bots:
+                print(f"{Colors.YELLOW}[RunAllCommands] Excluding non-RS bots from advanced commands: {', '.join(non_rs_bots)}{Colors.RESET}")
+                print(f"{Colors.YELLOW}[RunAllCommands] Non-RS bots can still use: !status, !start, !stop, !restart{Colors.RESET}\n")
             # Calculate total operations:
             # INITIALIZATION (Phase 0):
             # - ping (1)
