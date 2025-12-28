@@ -97,36 +97,60 @@ class MessageHelper:
         return embed
     
     @staticmethod
-    def create_success_embed(title: str, message: str, details: str = None) -> discord.Embed:
+    def create_success_embed(
+        title: str,
+        message: str,
+        details: str = None,
+        fields: List[Dict] = None,
+        footer: str = None,
+    ) -> discord.Embed:
         """Create a success embed with consistent formatting."""
         embed = MessageHelper.create_status_embed(
             title=f"✅ {title}",
             description=message,
-            color=discord.Color.green()
+            color=discord.Color.green(),
+            fields=fields,
+            footer=footer,
         )
         if details:
             embed.add_field(name="Details", value=f"```{details[:1000]}```", inline=False)
         return embed
     
     @staticmethod
-    def create_error_embed(title: str, message: str, error_details: str = None) -> discord.Embed:
+    def create_error_embed(
+        title: str,
+        message: str,
+        error_details: str = None,
+        fields: List[Dict] = None,
+        footer: str = None,
+    ) -> discord.Embed:
         """Create an error embed with consistent formatting."""
         embed = MessageHelper.create_status_embed(
             title=f"❌ {title}",
             description=message,
-            color=discord.Color.red()
+            color=discord.Color.red(),
+            fields=fields,
+            footer=footer,
         )
         if error_details:
             embed.add_field(name="Error", value=f"```{error_details[:1000]}```", inline=False)
         return embed
     
     @staticmethod
-    def create_warning_embed(title: str, message: str, details: str = None) -> discord.Embed:
+    def create_warning_embed(
+        title: str,
+        message: str,
+        details: str = None,
+        fields: List[Dict] = None,
+        footer: str = None,
+    ) -> discord.Embed:
         """Create a warning embed with consistent formatting."""
         embed = MessageHelper.create_status_embed(
             title=f"⚠️ {title}",
             description=message,
-            color=discord.Color.orange()
+            color=discord.Color.orange(),
+            fields=fields,
+            footer=footer,
         )
         if details:
             embed.add_field(name="Details", value=f"```{details[:1000]}```", inline=False)
@@ -150,6 +174,352 @@ class MessageHelper:
             color=discord.Color.blue(),
             fields=fields
         )
+
+
+class CommandLogger:
+    """Centralized logging service for RSAdminBot.
+    
+    Handles structured JSON logging to files and Discord embed generation.
+    All logs are written to remote server JSON files and formatted as Discord embeds.
+    """
+    
+    def __init__(self, admin_bot_instance):
+        """Initialize CommandLogger.
+        
+        Args:
+            admin_bot_instance: RSAdminBot instance for accessing config and methods
+        """
+        self.admin_bot = admin_bot_instance
+        self.log_config = admin_bot_instance.config.get("logging", {})
+        self.file_logging_enabled = self.log_config.get("file_logging", {}).get("enabled", True)
+        self.log_base_path = self.log_config.get("file_logging", {}).get("base_path", "/home/rsadmin/bots/logs/rsadminbot")
+        self.log_ssh_commands = self.log_config.get("log_ssh_commands", True)
+        self.log_config_validation_enabled = self.log_config.get("log_config_validation", True)
+        self.log_all_commands = self.log_config.get("log_all_commands", True)
+        self._current_command_context = None  # Track which command is currently executing
+    
+    def _get_context_from_ctx(self, ctx) -> Dict[str, Any]:
+        """Extract context information from Discord command context.
+        
+        Args:
+            ctx: Discord command context
+            
+        Returns:
+            Dictionary with context information
+        """
+        try:
+            return {
+                "user_id": ctx.author.id if ctx.author else None,
+                "user_name": str(ctx.author) if ctx.author else None,
+                "guild_id": ctx.guild.id if ctx.guild else None,
+                "guild_name": ctx.guild.name if ctx.guild else None,
+                "channel_id": ctx.channel.id if ctx.channel else None,
+                "channel_name": ctx.channel.name if hasattr(ctx.channel, 'name') else None,
+            }
+        except Exception:
+            return {}
+    
+    def _get_timestamp(self) -> str:
+        """Get current timestamp in ISO format."""
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    def _create_base_log_entry(self, log_type: str, level: str, **kwargs) -> Dict[str, Any]:
+        """Create base log entry structure.
+        
+        Args:
+            log_type: Type of log (command, ssh_command, config, system)
+            level: Log level (info, success, error, warning)
+            **kwargs: Additional fields to include
+            
+        Returns:
+            Dictionary with log entry
+        """
+        entry = {
+            "timestamp": self._get_timestamp(),
+            "type": log_type,
+            "level": level,
+        }
+        entry.update(kwargs)
+        return entry
+    
+    def write_log_file(self, log_entry: Dict[str, Any]):
+        """Write log entry to JSON file on remote server.
+        
+        Args:
+            log_entry: Dictionary with log entry data
+        """
+        if not self.file_logging_enabled:
+            return
+        
+        try:
+            date_str = datetime.now().strftime("%Y-%m-%d")
+            log_file = f"{self.log_base_path}/rsadminbot_{date_str}.jsonl"
+            
+            # Create JSON line (compact format, one object per line)
+            json_line = json.dumps(log_entry, ensure_ascii=False, separators=(',', ':'))
+            
+            # Write to remote file (avoid logger recursion by disabling ssh-command logging here)
+            cmd = (
+                f"mkdir -p {shlex.quote(self.log_base_path)} && "
+                f"printf %s\\\\n {shlex.quote(json_line)} >> {shlex.quote(log_file)}"
+            )
+            self.admin_bot._execute_ssh_command(cmd, timeout=5, log_it=False)
+        except Exception as e:
+            # Don't fail if logging fails - just print error
+            print(f"{Colors.YELLOW}[Logger] Failed to write log file: {e}{Colors.RESET}")
+    
+    def log_command(self, ctx, command_name: str, status: str, details: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Log command execution.
+        
+        Args:
+            ctx: Discord command context
+            command_name: Name of the command (e.g., "start", "stop")
+            status: Status (pending, success, error)
+            details: Additional details about the command execution
+            
+        Returns:
+            Log entry dictionary
+        """
+        if not self.log_all_commands:
+            return {}
+        
+        context = self._get_context_from_ctx(ctx)
+        level = "info"
+        if status == "success":
+            level = "success"
+        elif status == "error":
+            level = "error"
+        
+        log_entry = self._create_base_log_entry(
+            log_type="command",
+            level=level,
+            command=f"!{command_name}",
+            status=status,
+            **context
+        )
+        
+        if details:
+            log_entry["details"] = details
+        
+        # Write to file
+        self.write_log_file(log_entry)
+        
+        # Set current command context for SSH command association
+        self._current_command_context = {
+            "command": command_name,
+            "context": context,
+            "log_entry": log_entry
+        }
+        
+        return log_entry
+    
+    def log_ssh_command(self, command: str, success: Optional[bool], stdout: Optional[str] = None, 
+                       stderr: Optional[str] = None, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Log SSH/shell command execution.
+        
+        Args:
+            command: Command string that was executed
+            success: Whether command succeeded (None if not executed yet)
+            stdout: Command stdout (truncated if too long)
+            stderr: Command stderr (truncated if too long)
+            context: Optional context from calling command
+            
+        Returns:
+            Log entry dictionary
+        """
+        if not self.log_ssh_commands:
+            return {}
+        
+        # Use current command context if available
+        if context is None and self._current_command_context:
+            context = self._current_command_context.get("context", {})
+            command_name = self._current_command_context.get("command", "unknown")
+        else:
+            command_name = context.get("command", "unknown") if context else "unknown"
+        
+        level = "info"
+        if success is True:
+            level = "success"
+        elif success is False:
+            level = "error"
+        
+        # Truncate stdout/stderr for storage (keep last 2000 chars)
+        stdout_truncated = None
+        stderr_truncated = None
+        if stdout:
+            stdout_truncated = stdout[-2000:] if len(stdout) > 2000 else stdout
+        if stderr:
+            stderr_truncated = stderr[-2000:] if len(stderr) > 2000 else stderr
+        
+        log_entry = self._create_base_log_entry(
+            log_type="ssh_command",
+            level=level,
+            ssh_command=command[:500],  # Truncate command to 500 chars
+            success=success,
+            **context if context else {}
+        )
+        
+        if stdout_truncated:
+            log_entry["ssh_stdout"] = stdout_truncated
+        if stderr_truncated:
+            log_entry["ssh_stderr"] = stderr_truncated
+        if command_name != "unknown":
+            log_entry["triggered_by_command"] = command_name
+        
+        # Write to file
+        self.write_log_file(log_entry)
+        
+        return log_entry
+    
+    def log_config_validation(self, check_name: str, status: str, message: str, details: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Log configuration validation event.
+        
+        Args:
+            check_name: Name of the config check (e.g., "ssh_config", "ssh_key")
+            status: Status (valid, invalid, missing, warning)
+            message: Human-readable message
+            details: Additional details
+            
+        Returns:
+            Log entry dictionary
+        """
+        if not self.log_config_validation_enabled:
+            return {}
+        
+        level = "info"
+        if status in ("invalid", "missing"):
+            level = "error"
+        elif status == "warning":
+            level = "warning"
+        elif status == "valid":
+            level = "success"
+        
+        log_entry = self._create_base_log_entry(
+            log_type="config",
+            level=level,
+            check_name=check_name,
+            status=status,
+            message=message
+        )
+        
+        if details:
+            log_entry["config_check"] = details
+        
+        # Write to file
+        self.write_log_file(log_entry)
+        
+        return log_entry
+    
+    def create_embed(self, log_entry: Dict[str, Any], reply_context: Optional[Dict[str, Any]] = None) -> discord.Embed:
+        """Convert log entry to Discord embed.
+        
+        Args:
+            log_entry: Log entry dictionary
+            reply_context: Optional context for reply footer (user info)
+            
+        Returns:
+            Discord embed
+        """
+        log_type = log_entry.get("type", "system")
+        level = log_entry.get("level", "info")
+        timestamp = log_entry.get("timestamp", self._get_timestamp())
+        
+        # Determine color and emoji based on level
+        if level == "success":
+            color = discord.Color.green()
+            emoji = "✅"
+        elif level == "error":
+            color = discord.Color.red()
+            emoji = "❌"
+        elif level == "warning":
+            color = discord.Color.orange()
+            emoji = "⚠️"
+        else:
+            color = discord.Color.blue()
+            emoji = "ℹ️"
+        
+        # Build embed based on log type
+        embed = discord.Embed(color=color, timestamp=datetime.now())
+        
+        # Command logs
+        if log_type == "command":
+            command = log_entry.get("command", "unknown")
+            status = log_entry.get("status", "unknown")
+            details = log_entry.get("details", {})
+            bot_name = details.get("bot_name") or log_entry.get("bot_name")
+            
+            if status == "success":
+                embed.title = f"{emoji} Command Succeeded"
+            elif status == "error":
+                embed.title = f"{emoji} Command Failed"
+            else:
+                embed.title = f"{emoji} Command Executed"
+            
+            embed.description = f"Command: `{command}`"
+            
+            if bot_name:
+                embed.add_field(name="Bot", value=bot_name, inline=True)
+            
+            if status == "success" and details:
+                if "after_state" in details:
+                    state_change = ""
+                    if "before_state" in details and details["before_state"] != details["after_state"]:
+                        state_change = f"{details['before_state']} → {details['after_state']}"
+                    else:
+                        state_change = details["after_state"]
+                    embed.add_field(name="Status", value=state_change, inline=True)
+                
+                if "pid" in details or "after_pid" in details:
+                    pid = details.get("pid") or details.get("after_pid")
+                    embed.add_field(name="PID", value=str(pid), inline=True)
+                
+                if "service" in details:
+                    embed.add_field(name="Service", value=details["service"], inline=False)
+            
+            elif status == "error" and details:
+                error_msg = details.get("error") or details.get("error_msg") or "Unknown error"
+                embed.add_field(name="Error", value=f"```{error_msg[:500]}```", inline=False)
+        
+        # SSH command logs (usually don't create embeds for these unless error)
+        elif log_type == "ssh_command" and level == "error":
+            command = log_entry.get("ssh_command", "unknown")[:100]
+            embed.title = f"{emoji} SSH Command Failed"
+            embed.description = f"Command: `{command}...`"
+            if log_entry.get("ssh_stderr"):
+                embed.add_field(name="Error", value=f"```{log_entry['ssh_stderr'][:500]}```", inline=False)
+        
+        # Config validation logs
+        elif log_type == "config":
+            check_name = log_entry.get("check_name", "unknown")
+            status = log_entry.get("status", "unknown")
+            message = log_entry.get("message", "")
+            
+            embed.title = f"{emoji} Configuration Check"
+            embed.description = message
+            embed.add_field(name="Check", value=check_name, inline=True)
+            embed.add_field(name="Status", value=status, inline=True)
+        
+        # System logs
+        else:
+            message = log_entry.get("message", log_entry.get("description", ""))
+            embed.title = f"{emoji} System Event"
+            embed.description = message
+        
+        # Add footer with user info if available
+        footer_parts = []
+        if reply_context:
+            user_name = reply_context.get("user_name")
+            if user_name:
+                footer_parts.append(f"Triggered by {user_name}")
+        if not footer_parts:
+            footer_parts.append("RSAdminBot")
+        embed.set_footer(text=" • ".join(footer_parts))
+        
+        return embed
+    
+    def clear_command_context(self):
+        """Clear current command context (called after command completes)."""
+        self._current_command_context = None
 
 # RSAdminBot is self-contained - no external dependencies
 # All functionality is within RSAdminBot folder
@@ -446,11 +816,14 @@ class ChannelTransferView(ui.View):
                 return
             
             self.selected_channel_id = channel_id
-            await interaction.response.send_message(f"✅ Channel selected: `{channel.name}`. Now select a category.", ephemeral=True)
             
-            # Check if both are selected now
+            # Check if both are selected now - if category was already selected, perform transfer
             if self.selected_channel_id and self.selected_category_id:
+                # Both selected - defer and transfer
+                await interaction.response.defer(ephemeral=True)
                 await self._perform_transfer(interaction)
+            else:
+                await interaction.response.send_message(f"✅ Channel selected: `{channel.name}`. Now select a category.", ephemeral=True)
         except Exception as e:
             await interaction.response.send_message(f"❌ Error: {str(e)[:200]}", ephemeral=True)
     
@@ -467,13 +840,13 @@ class ChannelTransferView(ui.View):
                 return
             
             self.selected_category_id = category_id
-            await interaction.response.defer(ephemeral=True)
             
-            # Check if both are selected now
+            # Check if both are selected now - if channel was already selected, perform transfer
             if self.selected_channel_id and self.selected_category_id:
+                await interaction.response.defer(ephemeral=True)
                 await self._perform_transfer(interaction)
             else:
-                await interaction.followup.send(f"✅ Category selected: `{category.name}`. Now select a channel.", ephemeral=True)
+                await interaction.response.send_message(f"✅ Category selected: `{category.name}`. Now select a channel.", ephemeral=True)
         except Exception as e:
             try:
                 await interaction.response.send_message(f"❌ Error: {str(e)[:200]}", ephemeral=True)
@@ -487,24 +860,44 @@ class ChannelTransferView(ui.View):
             category = interaction.guild.get_channel(self.selected_category_id)
             
             if not channel or not isinstance(channel, discord.TextChannel):
-                await interaction.followup.send("❌ Channel not found", ephemeral=True)
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ Channel not found", ephemeral=True)
+                else:
+                    await interaction.followup.send("❌ Channel not found", ephemeral=True)
                 return
             
             if not category or not isinstance(category, discord.CategoryChannel):
-                await interaction.followup.send("❌ Category not found", ephemeral=True)
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ Category not found", ephemeral=True)
+                else:
+                    await interaction.followup.send("❌ Category not found", ephemeral=True)
                 return
             
             await channel.edit(category=category, reason=f"Transferred by {interaction.user} via RSAdminBot")
-            await interaction.followup.send(
-                f"✅ **Channel Transferred**\n`{channel.name}` → `{category.name}`",
-                ephemeral=False
-            )
+            
+            success_msg = f"✅ **Channel Transferred**\n`{channel.name}` → `{category.name}`"
+            if not interaction.response.is_done():
+                await interaction.response.send_message(success_msg, ephemeral=False)
+            else:
+                await interaction.followup.send(success_msg, ephemeral=False)
         except discord.Forbidden:
-            await interaction.followup.send("❌ I don't have permission to edit this channel", ephemeral=True)
+            msg = "❌ I don't have permission to edit this channel"
+            if not interaction.response.is_done():
+                await interaction.response.send_message(msg, ephemeral=True)
+            else:
+                await interaction.followup.send(msg, ephemeral=True)
         except discord.HTTPException as e:
-            await interaction.followup.send(f"❌ Failed to transfer channel: {str(e)[:200]}", ephemeral=True)
+            msg = f"❌ Failed to transfer channel: {str(e)[:200]}"
+            if not interaction.response.is_done():
+                await interaction.response.send_message(msg, ephemeral=True)
+            else:
+                await interaction.followup.send(msg, ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"❌ Error: {str(e)[:200]}", ephemeral=True)
+            msg = f"❌ Error: {str(e)[:200]}"
+            if not interaction.response.is_done():
+                await interaction.response.send_message(msg, ephemeral=True)
+            else:
+                await interaction.followup.send(msg, ephemeral=True)
 
 class BotSelectView(ui.View):
     """View with SelectMenu for bot selection"""
@@ -599,7 +992,17 @@ class BotSelectView(ui.View):
         
         # Handle "all_bots" case - use group-specific scripts for efficiency
         if bot_name == "all_bots":
-            status_msg = await interaction.followup.send(f"🔄 **Starting all bots using group-specific scripts...**\n```\nCalling manage_rsadminbot.sh, manage_rs_bots.sh, and manage_mirror_bots.sh...\n```")
+            status_msg = await interaction.followup.send(
+                embed=MessageHelper.create_info_embed(
+                    title="Starting All Bots",
+                    message="Starting all bots using group scripts.",
+                    fields=[
+                        {"name": "Action", "value": "start", "inline": True},
+                        {"name": "Mode", "value": "group scripts", "inline": True},
+                    ],
+                    footer=f"Triggered by {interaction.user}",
+                )
+            )
             
             results = []
             
@@ -639,14 +1042,38 @@ class BotSelectView(ui.View):
             summary = f"🔄 **Start All Complete**\n\n" + "\n".join(results)
             if len(summary) > 2000:
                 summary = summary[:1997] + "..."
-            await status_msg.edit(content=summary)
-            await self.admin_bot._log_to_discord(f"🔄 **All Bots Start** completed")
+            await status_msg.edit(
+                embed=MessageHelper.create_info_embed(
+                    title="Start All Complete",
+                    message=summary[:1800],
+                    footer=f"Triggered by {interaction.user}",
+                )
+            )
+            try:
+                embed = MessageHelper.create_info_embed(
+                    title="Start All Complete",
+                    message="All bots start sequence completed.",
+                    footer=f"Triggered by {interaction.user}",
+                )
+                await self.admin_bot._log_to_discord(embed, interaction.channel if hasattr(interaction, "channel") else None)
+            except Exception:
+                pass
             return
         
         # Handle single bot case
         bot_info = self.admin_bot.BOTS[bot_name]
         service_name = bot_info["service"]
-        await interaction.followup.send(f"🔄 **Starting {bot_info['name']}...**\n```\nConnecting to server...\n```")
+        await interaction.followup.send(
+            embed=MessageHelper.create_info_embed(
+                title="Starting Bot",
+                message=f"Starting {bot_info['name']}...",
+                fields=[
+                    {"name": "Bot", "value": bot_info["name"], "inline": True},
+                    {"name": "Service", "value": service_name, "inline": True},
+                ],
+                footer=f"Triggered by {interaction.user}",
+            )
+        )
         before_exists, before_state, _ = self.admin_bot.service_manager.get_status(service_name, bot_name=bot_name)
         before_pid = self.admin_bot.service_manager.get_pid(service_name)
 
@@ -666,19 +1093,72 @@ class BotSelectView(ui.View):
                 after_state_txt = after_state or "unknown"
                 before_pid_txt = str(before_pid or 0)
                 after_pid_txt = str(after_pid or 0)
+                fields = [
+                    {"name": "Bot", "value": bot_info["name"], "inline": True},
+                    {"name": "Service", "value": service_name, "inline": True},
+                    {"name": "Status", "value": f"{before_state_txt} → {after_state_txt}" if before_state_txt != after_state_txt else after_state_txt, "inline": True},
+                    {"name": "PID", "value": f"{before_pid_txt} → {after_pid_txt}" if before_pid_txt != after_pid_txt else after_pid_txt, "inline": True},
+                ]
                 await interaction.followup.send(
-                    f"✅ **{bot_info['name']}** started successfully!{pid_note}\n"
-                    f"```\nBefore: state={before_state_txt} pid={before_pid_txt}\nAfter:  state={after_state_txt} pid={after_pid_txt}\n```"
+                    embed=MessageHelper.create_success_embed(
+                        title="Bot Started",
+                        message=f"{bot_info['name']} started successfully.",
+                        fields=fields,
+                        footer=f"Triggered by {interaction.user}",
+                    )
                 )
-                await self.admin_bot._log_to_discord(
-                    f"✅ **{bot_info['name']}** started\nState: `{after_state or 'unknown'}` | PID: `{after_pid or 0}`\nBefore: `{before_state or 'unknown'}` | PID: `{before_pid or 0}`"
+            try:
+                fields = [
+                    {"name": "Bot", "value": bot_info["name"], "inline": True},
+                    {"name": "Service", "value": service_name, "inline": True},
+                ]
+                if after_state:
+                    state_display = after_state
+                    if before_state and before_state != after_state:
+                        state_display = f"{before_state} → {after_state}"
+                    fields.append({"name": "Status", "value": state_display, "inline": True})
+                if after_pid:
+                    pid_display = str(after_pid)
+                    if before_pid and before_pid != after_pid:
+                        pid_display = f"{before_pid} → {after_pid}"
+                    fields.append({"name": "PID", "value": pid_display, "inline": True})
+                embed = MessageHelper.create_success_embed(
+                    title="Bot Started",
+                    message=f"{bot_info['name']} started successfully.",
+                    fields=fields,
+                    footer=f"Triggered by {interaction.user}",
                 )
+                await self.admin_bot._log_to_discord(embed, interaction.channel if hasattr(interaction, "channel") else None)
+            except Exception:
+                pass
             else:
                 error_msg = verify_error or stderr or stdout or "Unknown error"
-                await interaction.followup.send(f"❌ Failed to start {bot_info['name']}:\n```{error_msg[:500]}```")
+                await interaction.followup.send(
+                    embed=MessageHelper.create_error_embed(
+                        title="Failed to Start Bot",
+                        message=f"Failed to start {bot_info['name']}.",
+                        error_details=error_msg[:500],
+                        fields=[
+                            {"name": "Bot", "value": bot_info["name"], "inline": True},
+                            {"name": "Service", "value": service_name, "inline": True},
+                        ],
+                        footer=f"Triggered by {interaction.user}",
+                    )
+                )
         else:
             error_msg = stderr or stdout or "Unknown error"
-            await interaction.followup.send(f"❌ Failed to start {bot_info['name']}:\n```{error_msg[:500]}```")
+            await interaction.followup.send(
+                embed=MessageHelper.create_error_embed(
+                    title="Failed to Start Bot",
+                    message=f"Failed to start {bot_info['name']}.",
+                    error_details=error_msg[:500],
+                    fields=[
+                        {"name": "Bot", "value": bot_info["name"], "inline": True},
+                        {"name": "Service", "value": service_name, "inline": True},
+                    ],
+                    footer=f"Triggered by {interaction.user}",
+                )
+            )
     
     async def _handle_stop(self, interaction, bot_name):
         """Handle bot stop (supports single bot or 'all_bots')"""
@@ -688,7 +1168,17 @@ class BotSelectView(ui.View):
         
         # Handle "all_bots" case - use group-specific scripts for efficiency
         if bot_name == "all_bots":
-            status_msg = await interaction.followup.send(f"🔄 **Stopping all bots using group-specific scripts...**\n```\nCalling manage_rsadminbot.sh, manage_rs_bots.sh, and manage_mirror_bots.sh...\n```")
+            status_msg = await interaction.followup.send(
+                embed=MessageHelper.create_info_embed(
+                    title="Stopping All Bots",
+                    message="Stopping all bots using group scripts.",
+                    fields=[
+                        {"name": "Action", "value": "stop", "inline": True},
+                        {"name": "Mode", "value": "group scripts", "inline": True},
+                    ],
+                    footer=f"Triggered by {interaction.user}",
+                )
+            )
             
             results = []
             
@@ -728,15 +1218,39 @@ class BotSelectView(ui.View):
             summary = f"🔄 **Stop All Complete**\n\n" + "\n".join(results)
             if len(summary) > 2000:
                 summary = summary[:1997] + "..."
-            await status_msg.edit(content=summary)
-            await self.admin_bot._log_to_discord(f"🔄 **All Bots Stop** completed")
+            await status_msg.edit(
+                embed=MessageHelper.create_info_embed(
+                    title="Stop All Complete",
+                    message=summary[:1800],
+                    footer=f"Triggered by {interaction.user}",
+                )
+            )
+            try:
+                embed = MessageHelper.create_info_embed(
+                    title="Stop All Complete",
+                    message="All bots stop sequence completed.",
+                    footer=f"Triggered by {interaction.user}",
+                )
+                await self.admin_bot._log_to_discord(embed, interaction.channel if hasattr(interaction, "channel") else None)
+            except Exception:
+                pass
             return
         
         # Handle single bot case
         bot_info = self.admin_bot.BOTS[bot_name]
         service_name = bot_info["service"]
         script_pattern = bot_info.get("script", bot_name)
-        await interaction.followup.send(f"🔄 **Stopping {bot_info['name']}...**\n```\nConnecting to server...\n```")
+        await interaction.followup.send(
+            embed=MessageHelper.create_info_embed(
+                title="Stopping Bot",
+                message=f"Stopping {bot_info['name']}...",
+                fields=[
+                    {"name": "Bot", "value": bot_info["name"], "inline": True},
+                    {"name": "Service", "value": service_name, "inline": True},
+                ],
+                footer=f"Triggered by {interaction.user}",
+            )
+        )
         before_exists, before_state, _ = self.admin_bot.service_manager.get_status(service_name, bot_name=bot_name)
         before_pid = self.admin_bot.service_manager.get_pid(service_name)
 
@@ -752,16 +1266,55 @@ class BotSelectView(ui.View):
             after_state_txt = after_state or "unknown"
             before_pid_txt = str(before_pid or 0)
             after_pid_txt = str(after_pid or 0)
+            fields = [
+                {"name": "Bot", "value": bot_info["name"], "inline": True},
+                {"name": "Service", "value": service_name, "inline": True},
+                {"name": "Status", "value": f"{before_state_txt} → {after_state_txt}" if before_state_txt != after_state_txt else after_state_txt, "inline": True},
+                {"name": "PID", "value": f"{before_pid_txt} → {after_pid_txt}" if before_pid_txt != after_pid_txt else after_pid_txt, "inline": True},
+            ]
             await interaction.followup.send(
-                f"✅ **{bot_info['name']}** stopped successfully!{pid_note}\n"
-                f"```\nBefore: state={before_state_txt} pid={before_pid_txt}\nAfter:  state={after_state_txt} pid={after_pid_txt}\n```"
+                embed=MessageHelper.create_success_embed(
+                    title="Bot Stopped",
+                    message=f"{bot_info['name']} stopped successfully.",
+                    fields=fields,
+                    footer=f"Triggered by {interaction.user}",
+                )
             )
-            await self.admin_bot._log_to_discord(
-                f"✅ **{bot_info['name']}** stopped\nState: `{after_state or 'unknown'}` | PID: `{after_pid or 0}`\nBefore: `{before_state or 'unknown'}` | PID: `{before_pid or 0}`"
-            )
+            try:
+                fields = [
+                    {"name": "Bot", "value": bot_info["name"], "inline": True},
+                    {"name": "Service", "value": service_name, "inline": True},
+                ]
+                if after_state:
+                    state_display = after_state
+                    if before_state and before_state != after_state:
+                        state_display = f"{before_state} → {after_state}"
+                    fields.append({"name": "Status", "value": state_display, "inline": True})
+                if before_pid and not after_pid:
+                    fields.append({"name": "PID", "value": f"{before_pid} → 0", "inline": True})
+                embed = MessageHelper.create_success_embed(
+                    title="Bot Stopped",
+                    message=f"{bot_info['name']} stopped successfully.",
+                    fields=fields,
+                    footer=f"Triggered by {interaction.user}",
+                )
+                await self.admin_bot._log_to_discord(embed, interaction.channel if hasattr(interaction, "channel") else None)
+            except Exception:
+                pass
         else:
             error_msg = stderr or stdout or "Unknown error"
-            await interaction.followup.send(f"❌ Failed to stop {bot_info['name']}:\n```{error_msg[:500]}```")
+            await interaction.followup.send(
+                embed=MessageHelper.create_error_embed(
+                    title="Failed to Stop Bot",
+                    message=f"Failed to stop {bot_info['name']}.",
+                    error_details=error_msg[:500],
+                    fields=[
+                        {"name": "Bot", "value": bot_info["name"], "inline": True},
+                        {"name": "Service", "value": service_name, "inline": True},
+                    ],
+                    footer=f"Triggered by {interaction.user}",
+                )
+            )
     
     async def _handle_restart(self, interaction, bot_name):
         """Handle bot restart (supports single bot or 'all_bots')"""
@@ -771,7 +1324,17 @@ class BotSelectView(ui.View):
         
         # Handle "all_bots" case - use group-specific scripts for efficiency
         if bot_name == "all_bots":
-            status_msg = await interaction.followup.send(f"🔄 **Restarting all bots using group-specific scripts...**\n```\nCalling manage_rsadminbot.sh, manage_rs_bots.sh, and manage_mirror_bots.sh...\n```")
+            status_msg = await interaction.followup.send(
+                embed=MessageHelper.create_info_embed(
+                    title="Restarting All Bots",
+                    message="Restarting all bots using group scripts.",
+                    fields=[
+                        {"name": "Action", "value": "restart", "inline": True},
+                        {"name": "Mode", "value": "group scripts", "inline": True},
+                    ],
+                    footer=f"Triggered by {interaction.user}",
+                )
+            )
             
             results = []
             
@@ -811,15 +1374,39 @@ class BotSelectView(ui.View):
             summary = f"🔄 **Restart All Complete**\n\n" + "\n".join(results)
             if len(summary) > 2000:
                 summary = summary[:1997] + "..."
-            await status_msg.edit(content=summary)
-            await self.admin_bot._log_to_discord(f"🔄 **All Bots Restart** completed")
+            await status_msg.edit(
+                embed=MessageHelper.create_info_embed(
+                    title="Restart All Complete",
+                    message=summary[:1800],
+                    footer=f"Triggered by {interaction.user}",
+                )
+            )
+            try:
+                embed = MessageHelper.create_info_embed(
+                    title="Restart All Complete",
+                    message="All bots restart sequence completed.",
+                    footer=f"Triggered by {interaction.user}",
+                )
+                await self.admin_bot._log_to_discord(embed, interaction.channel if hasattr(interaction, "channel") else None)
+            except Exception:
+                pass
             return
         
         # Handle single bot case
         bot_info = self.admin_bot.BOTS[bot_name]
         service_name = bot_info["service"]
         script_pattern = bot_info.get("script", bot_name)
-        await interaction.followup.send(f"🔄 **Restarting {bot_info['name']}...**\n```\nConnecting to server...\n```")
+        await interaction.followup.send(
+            embed=MessageHelper.create_info_embed(
+                title="Restarting Bot",
+                message=f"Restarting {bot_info['name']}...",
+                fields=[
+                    {"name": "Bot", "value": bot_info["name"], "inline": True},
+                    {"name": "Service", "value": service_name, "inline": True},
+                ],
+                footer=f"Triggered by {interaction.user}",
+            )
+        )
         before_exists, before_state, _ = self.admin_bot.service_manager.get_status(service_name, bot_name=bot_name)
         before_pid = self.admin_bot.service_manager.get_pid(service_name)
 
@@ -841,19 +1428,72 @@ class BotSelectView(ui.View):
                 after_state_txt = after_state or "unknown"
                 before_pid_txt = str(before_pid or 0)
                 after_pid_txt = str(after_pid or 0)
+                fields = [
+                    {"name": "Bot", "value": bot_info["name"], "inline": True},
+                    {"name": "Service", "value": service_name, "inline": True},
+                    {"name": "Status", "value": f"{before_state_txt} → {after_state_txt}" if before_state_txt != after_state_txt else after_state_txt, "inline": True},
+                    {"name": "PID", "value": f"{before_pid_txt} → {after_pid_txt}" if before_pid_txt != after_pid_txt else after_pid_txt, "inline": True},
+                ]
                 await interaction.followup.send(
-                    f"✅ **{bot_info['name']}** restarted successfully!{pid_note}\n"
-                    f"```\nBefore: state={before_state_txt} pid={before_pid_txt}\nAfter:  state={after_state_txt} pid={after_pid_txt}\n```"
+                    embed=MessageHelper.create_success_embed(
+                        title="Bot Restarted",
+                        message=f"{bot_info['name']} restarted successfully.",
+                        fields=fields,
+                        footer=f"Triggered by {interaction.user}",
+                    )
                 )
-                await self.admin_bot._log_to_discord(
-                    f"✅ **{bot_info['name']}** restarted{pid_note}\nState: `{after_state or 'unknown'}` | PID: `{after_pid or 0}`\nBefore: `{before_state or 'unknown'}` | PID: `{before_pid or 0}`"
+            try:
+                fields = [
+                    {"name": "Bot", "value": bot_info["name"], "inline": True},
+                    {"name": "Service", "value": service_name, "inline": True},
+                ]
+                if after_state:
+                    state_display = after_state
+                    if before_state and before_state != after_state:
+                        state_display = f"{before_state} → {after_state}"
+                    fields.append({"name": "Status", "value": state_display, "inline": True})
+                if after_pid:
+                    pid_display = str(after_pid)
+                    if before_pid and before_pid != after_pid:
+                        pid_display = f"{before_pid} → {after_pid}"
+                    fields.append({"name": "PID", "value": pid_display, "inline": True})
+                embed = MessageHelper.create_success_embed(
+                    title="Bot Restarted",
+                    message=f"{bot_info['name']} restarted successfully.",
+                    fields=fields,
+                    footer=f"Triggered by {interaction.user}",
                 )
+                await self.admin_bot._log_to_discord(embed, interaction.channel if hasattr(interaction, "channel") else None)
+            except Exception:
+                pass
             else:
                 error_msg = verify_error or stderr or stdout or "Unknown error"
-                await interaction.followup.send(f"❌ Failed to restart {bot_info['name']}:\n```{error_msg[:500]}```")
+                await interaction.followup.send(
+                    embed=MessageHelper.create_error_embed(
+                        title="Failed to Restart Bot",
+                        message=f"Failed to restart {bot_info['name']}.",
+                        error_details=error_msg[:500],
+                        fields=[
+                            {"name": "Bot", "value": bot_info["name"], "inline": True},
+                            {"name": "Service", "value": service_name, "inline": True},
+                        ],
+                        footer=f"Triggered by {interaction.user}",
+                    )
+                )
         else:
             error_msg = stderr or stdout or "Unknown error"
-            await interaction.followup.send(f"❌ Failed to restart {bot_info['name']}:\n```{error_msg[:500]}```")
+            await interaction.followup.send(
+                embed=MessageHelper.create_error_embed(
+                    title="Failed to Restart Bot",
+                    message=f"Failed to restart {bot_info['name']}.",
+                    error_details=error_msg[:500],
+                    fields=[
+                        {"name": "Bot", "value": bot_info["name"], "inline": True},
+                        {"name": "Service", "value": service_name, "inline": True},
+                    ],
+                    footer=f"Triggered by {interaction.user}",
+                )
+            )
     
     async def _handle_status(self, interaction, bot_name, bot_info):
         """Handle bot status check"""
@@ -1032,8 +1672,20 @@ class StartBotView(ui.View):
         bot_info = self.admin_bot.BOTS[self.bot_name]
         service_name = bot_info["service"]
         
-        # Log to Discord
-        await self.admin_bot._log_to_discord(f"🟢 **Starting {bot_info['name']}**\nService: `{service_name}`")
+        # Log to Discord (embed)
+        try:
+            start_embed = MessageHelper.create_info_embed(
+                title="Starting Bot",
+                message=f"Starting {bot_info['name']}...",
+                fields=[
+                    {"name": "Bot", "value": bot_info["name"], "inline": True},
+                    {"name": "Service", "value": service_name, "inline": True},
+                ],
+                footer=f"Triggered by {interaction.user}",
+            )
+            await self.admin_bot._log_to_discord(start_embed, interaction.channel if hasattr(interaction, "channel") else None)
+        except Exception:
+            pass
         
         # Start service using ServiceManager
         if not self.admin_bot.service_manager:
@@ -1049,19 +1701,57 @@ class StartBotView(ui.View):
                 button.label = "✅ Started"
                 button.style = discord.ButtonStyle.success
                 await interaction.followup.send(f"✅ **{bot_info['name']}** started successfully!", ephemeral=False)
-                await self.admin_bot._log_to_discord(f"✅ **{bot_info['name']}** started successfully!")
+                try:
+                    ok_embed = MessageHelper.create_success_embed(
+                        title="Bot Started",
+                        message=f"{bot_info['name']} started successfully.",
+                        fields=[
+                            {"name": "Bot", "value": bot_info["name"], "inline": True},
+                            {"name": "Service", "value": service_name, "inline": True},
+                        ],
+                        footer=f"Triggered by {interaction.user}",
+                    )
+                    await self.admin_bot._log_to_discord(ok_embed, interaction.channel if hasattr(interaction, "channel") else None)
+                except Exception:
+                    pass
             else:
                 button.label = "❌ Failed"
                 button.style = discord.ButtonStyle.danger
                 error_msg = verify_error or stderr or stdout or "Unknown error"
                 await interaction.followup.send(f"❌ Failed to start {bot_info['name']}:\n```{error_msg[:500]}```", ephemeral=False)
-                await self.admin_bot._log_to_discord(f"❌ **{bot_info['name']}** failed to start:\n```{error_msg[:500]}```")
+                try:
+                    err_embed = MessageHelper.create_error_embed(
+                        title="Failed to Start Bot",
+                        message=f"Failed to start {bot_info['name']}.",
+                        error_details=error_msg[:500],
+                        fields=[
+                            {"name": "Bot", "value": bot_info["name"], "inline": True},
+                            {"name": "Service", "value": service_name, "inline": True},
+                        ],
+                        footer=f"Triggered by {interaction.user}",
+                    )
+                    await self.admin_bot._log_to_discord(err_embed, interaction.channel if hasattr(interaction, "channel") else None)
+                except Exception:
+                    pass
         else:
             button.label = "❌ Failed"
             button.style = discord.ButtonStyle.danger
             error_msg = stderr or stdout or "Unknown error"
             await interaction.followup.send(f"❌ Failed to start {bot_info['name']}:\n```{error_msg[:500]}```", ephemeral=False)
-            await self.admin_bot._log_to_discord(f"❌ **{bot_info['name']}** failed to start:\n```{error_msg[:500]}```")
+            try:
+                err_embed = MessageHelper.create_error_embed(
+                    title="Failed to Start Bot",
+                    message=f"Failed to start {bot_info['name']}.",
+                    error_details=error_msg[:500],
+                    fields=[
+                        {"name": "Bot", "value": bot_info["name"], "inline": True},
+                        {"name": "Service", "value": service_name, "inline": True},
+                    ],
+                    footer=f"Triggered by {interaction.user}",
+                )
+                await self.admin_bot._log_to_discord(err_embed, interaction.channel if hasattr(interaction, "channel") else None)
+            except Exception:
+                pass
         
         # Update the message
         await interaction.edit_original_response(view=self)
@@ -1134,10 +1824,33 @@ class RSAdminBot:
         self.config: Dict[str, Any] = {}
         
         self.load_config()
+
+        # Canonical owner: Logging
+        # Initialize after config load so it can read logging settings.
+        self.logger: Optional[CommandLogger] = CommandLogger(self)
+        try:
+            self.logger.log_config_validation(
+                "config_load",
+                "valid",
+                "Configuration loaded successfully",
+                {"config_path": str(self.config_path)},
+            )
+        except Exception:
+            pass
         
         # Validate required config
         if not self.config.get("bot_token"):
             print(f"{Colors.RED}[Config] ERROR: 'bot_token' is required in config.secrets.json (server-only){Colors.RESET}")
+            try:
+                if self.logger:
+                    self.logger.log_config_validation(
+                        "bot_token",
+                        "missing",
+                        "bot_token is required in config.secrets.json (server-only)",
+                        {},
+                    )
+            except Exception:
+                pass
             sys.exit(1)
         
         # Load SSH server config (self-contained - only from config.json)
@@ -1228,17 +1941,36 @@ class RSAdminBot:
                             self._fix_ssh_key_permissions(key_path)
                         ssh_server_config["key"] = str(key_path)
                         print(f"{Colors.GREEN}[SSH] Using SSH key: {key_path}{Colors.RESET}")
+                        if hasattr(self, 'logger') and self.logger:
+                            self.logger.log_config_validation("ssh_key", "valid", f"SSH key found: {key_path}", {"key_path": str(key_path)})
+                    else:
+                        if hasattr(self, 'logger') and self.logger:
+                            self.logger.log_config_validation("ssh_key", "missing", f"SSH key not found: {key_path}", {"key_path": str(key_path)})
                 else:
                     # On Ubuntu local-exec mode, a missing SSH key is expected (we don't need it).
                     if self._should_use_local_exec():
                         print(f"{Colors.GREEN}[Local Exec] SSH key not found (ok in local-exec): {key_name}{Colors.RESET}")
+                        if hasattr(self, 'logger') and self.logger:
+                            self.logger.log_config_validation("ssh_key", "valid", "SSH key not required in local-exec mode", {"local_exec": True})
                     else:
                         print(f"{Colors.YELLOW}[SSH Warning] SSH key not found: {key_name}{Colors.RESET}")
+                        if hasattr(self, 'logger') and self.logger:
+                            self.logger.log_config_validation("ssh_key", "warning", f"SSH key not found: {key_name}", {"key_name": key_name})
                 
                 print(f"{Colors.GREEN}[SSH] Loaded server config from config.json: {ssh_server_config.get('name', 'Unknown')}{Colors.RESET}")
                 print(f"{Colors.CYAN}[SSH] Host: {ssh_server_config.get('host', 'N/A')}, User: {ssh_server_config.get('user', 'N/A')}{Colors.RESET}")
                 if self._should_use_local_exec():
                     print(f"{Colors.GREEN}[Local Exec] Enabled: running management commands locally on this host{Colors.RESET}")
+                    if hasattr(self, 'logger') and self.logger:
+                        self.logger.log_config_validation("local_exec", "valid", "Local execution mode enabled", {"enabled": True, "remote_root": str(getattr(self, "remote_root", ""))})
+                
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.log_config_validation("ssh_config", "valid", f"SSH config loaded: {ssh_server_config.get('name', 'Unknown')}", {
+                        "server_name": ssh_server_config.get('name'),
+                        "host": ssh_server_config.get('host'),
+                        "user": ssh_server_config.get('user'),
+                        "local_exec": self._should_use_local_exec()
+                    })
                 
                 return
             
@@ -1246,11 +1978,15 @@ class RSAdminBot:
             print(f"{Colors.YELLOW}[SSH] No SSH server configured in config.json{Colors.RESET}")
             print(f"{Colors.YELLOW}[SSH] Add 'ssh_server' section to config.json to enable SSH functionality{Colors.RESET}")
             print(f"{Colors.YELLOW}[SSH] RSAdminBot is self-contained - all config must be in config.json{Colors.RESET}")
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.log_config_validation("ssh_config", "missing", "No SSH server configured in config.json", {})
             
         except Exception as e:
             print(f"{Colors.RED}[SSH] Failed to load SSH config: {e}{Colors.RESET}")
             import traceback
             print(f"{Colors.RED}[SSH] Traceback: {traceback.format_exc()[:200]}{Colors.RESET}")
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.log_config_validation("ssh_config", "invalid", f"Failed to load SSH config: {e}", {"error": str(e)})
     
     def _build_ssh_base(self, server_config: Dict[str, Any]) -> List[str]:
         """Build SSH base command list (self-contained, no external dependencies).
@@ -1364,12 +2100,16 @@ class RSAdminBot:
             error_msg = "No SSH server configured in config.json"
             print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
             print(f"{Colors.RED}[SSH Error] Add 'ssh_server' section to config.json{Colors.RESET}")
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.log_config_validation("ssh_available", "invalid", error_msg, {})
             return False, error_msg
 
         # If we're running on Linux and the repo root exists locally, prefer local execution when
         # the SSH key is not present. This keeps RSAdminBot functional on the Ubuntu host without
         # storing private keys on the server.
         if self._should_use_local_exec():
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.log_config_validation("ssh_available", "valid", "SSH available via local execution", {"local_exec": True})
             return True, ""
         
         # Check SSH key (should already be resolved to absolute path in _load_ssh_config)
@@ -1380,8 +2120,12 @@ class RSAdminBot:
                 error_msg = f"SSH key file not found: {key_path}"
                 print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
                 print(f"{Colors.YELLOW}[SSH Error] Expected SSH key in RSAdminBot folder{Colors.RESET}")
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.log_config_validation("ssh_available", "invalid", error_msg, {"key_path": str(key_path)})
                 return False, error_msg
         
+        if hasattr(self, 'logger') and self.logger:
+            self.logger.log_config_validation("ssh_available", "valid", "SSH available and configured", {"key_path": str(ssh_key) if ssh_key else None})
         return True, ""
 
     def _should_use_local_exec(self) -> bool:
@@ -1470,19 +2214,24 @@ echo "TARGET=$TARGET"
             except Exception:
                 pass
     
-    async def _log_to_discord(self, message: str, embed: Optional[discord.Embed] = None):
-        """Log message to Discord status channel"""
-        log_channel_id = self.config.get("log_channel_id")
-        if not log_channel_id:
-            return
+    async def _log_to_discord(self, embed: discord.Embed, reply_channel: Optional[discord.TextChannel] = None):
+        """Log embed message to Discord log channel and optionally reply channel.
+        
+        Args:
+            embed: Discord embed to send
+            reply_channel: Optional channel to also send reply (where command was triggered)
+        """
+        log_channel_id = "1452590450631376906"  # Hard-coded as specified
         
         try:
-            channel = self.bot.get_channel(int(log_channel_id))
-            if channel:
-                if embed:
-                    await channel.send(embed=embed)
-                else:
-                    await channel.send(message)
+            # Always send to log channel
+            log_channel = self.bot.get_channel(int(log_channel_id))
+            if log_channel:
+                await log_channel.send(embed=embed)
+            
+            # Also send reply to command channel if specified
+            if reply_channel:
+                await reply_channel.send(embed=embed)
         except Exception as e:
             print(f"{Colors.RED}[Discord Log] Failed to send message: {e}{Colors.RESET}")
 
@@ -1749,7 +2498,10 @@ echo "TARGET=$TARGET"
                             continue
                         exists, state, _ = self.service_manager.get_status(svc, bot_name=key)
                         pid = self.service_manager.get_pid(svc) or 0
-                        lines_out.append(f"{key}: {self._format_service_state(exists, state, pid)}")
+                        # Snapshot output: keep human-friendly (no PID lists unless explicitly needed)
+                        state_txt = state or "unknown"
+                        exists_txt = "exists" if exists else "missing"
+                        lines_out.append(f"{key}: exists={exists_txt} state={state_txt}")
                         # Store as (state, pid) - normalize None state to "not_found"
                         snapshot_state = state if state else ("not_found" if not exists else "unknown")
                         last_snapshot[key] = (snapshot_state, pid)
@@ -1772,7 +2524,9 @@ echo "TARGET=$TARGET"
                                     continue
                                 exists, state, _ = self.service_manager.get_status(svc, bot_name=key)
                                 pid = self.service_manager.get_pid(svc) or 0
-                                lines_out.append(f"{key}: {self._format_service_state(exists, state, pid)}")
+                                state_txt = state or "unknown"
+                                exists_txt = "exists" if exists else "missing"
+                                lines_out.append(f"{key}: exists={exists_txt} state={state_txt}")
                             lines_out.append("```")
                             await self._post_or_edit_progress(None, "\n".join(lines_out)[:1900])
                         except Exception:
@@ -2117,187 +2871,28 @@ echo \"CHANGED_END\"
         self._oraclefiles_sync_task = asyncio.create_task(_loop())
         print(f"[oraclefiles] periodic sync task started interval={cfg.get('interval_seconds')}s")
 
-    def _get_rsbots_push_config(self) -> Dict[str, Any]:
-        """Return RS bots push config for pushing to neo-rs/rsbots.
-        
-        Recommended config:
-        - config.json (non-secret):
-            "rsbots_push": {
-              "repo_url": "git@github.com:neo-rs/rsbots.git",
-              "branch": "main"
-            }
-        - config.secrets.json (server-only):
-            "rsbots_push": {
-              "deploy_key_path": "/home/rsadmin/.ssh/rsbots_deploy_key"
-            }
-        """
-        base = (self.config.get("rsbots_push") or {}) if isinstance(self.config, dict) else {}
-        try:
-            return {
-                "repo_url": str(base.get("repo_url") or "git@github.com:neo-rs/rsbots.git"),
-                "branch": str(base.get("branch") or "main"),
-                # NOTE: should be provided via config.secrets.json (merged by load_config_with_secrets).
-                "deploy_key_path": str(base.get("deploy_key_path") or ""),
-            }
-        except Exception:
-            return {
-                "repo_url": "git@github.com:neo-rs/rsbots.git",
-                "branch": "main",
-                "deploy_key_path": "/home/rsadmin/.ssh/rsbots_deploy_key",
-            }
-
-    def _rsbots_push_once(self) -> Tuple[bool, Dict[str, Any]]:
-        """Push changes from rsbots-code directory to neo-rs/rsbots GitHub repo."""
-        cfg = self._get_rsbots_push_config()
-        if not self._should_use_local_exec():
-            return False, {"error": "rsbots_push requires Ubuntu local-exec mode (RSAdminBot must run on the same host)."}
-
-        repo_dir = str(cfg.get("repo_dir") or "/home/rsadmin/bots/rsbots-code")
-        remote = str(cfg.get("remote") or "git@github.com:neo-rs/rsbots.git")
-        branch = str(cfg.get("branch") or "main")
-        deploy_key = str(cfg.get("deploy_key_path") or "/home/rsadmin/.ssh/rsbots_deploy_key")
-        auto_deploy = bool(cfg.get("auto_deploy_after_push", False))
-        
-        # Check if key file exists
-        check_cmd = f"test -f {shlex.quote(deploy_key)} && echo 'EXISTS' || echo 'MISSING'"
-        check_ok, check_out, _ = self._execute_ssh_command(check_cmd, timeout=5)
-        if not check_ok or "EXISTS" not in (check_out or ""):
-            return False, {"error": f"rsbots_push deploy key not found at: {deploy_key}\nEnsure key exists at the specified path."}
-
-        cmd = f"""
-set -euo pipefail
-
-REPO_DIR={shlex.quote(repo_dir)}
-REMOTE={shlex.quote(remote)}
-BRANCH={shlex.quote(branch)}
-DEPLOY_KEY={shlex.quote(deploy_key)}
-
-command -v git >/dev/null 2>&1 || {{ echo "ERR=git_missing"; exit 2; }}
-
-# Ensure GitHub SSH host key can be accepted non-interactively.
-SSH_DIR="${{HOME:-/home/rsadmin}}/.ssh"
-KNOWN_HOSTS="$SSH_DIR/known_hosts"
-mkdir -p "$SSH_DIR"
-chmod 700 "$SSH_DIR" || true
-touch "$KNOWN_HOSTS"
-chmod 600 "$KNOWN_HOSTS" || true
-
-export GIT_SSH_COMMAND="ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=accept-new"
-
-# Ensure repo directory exists
-mkdir -p "$REPO_DIR"
-cd "$REPO_DIR"
-
-# Initialize git repo if it doesn't exist
-if [ ! -d ".git" ]; then
-  git init
-  git config user.name "RSAdminBot"
-  git config user.email "rsadminbot@users.noreply.github.com"
-  git remote add origin "$REMOTE" 2>/dev/null || git remote set-url origin "$REMOTE" 2>/dev/null || true
-  # Try to fetch and reset to remote/main if remote exists
-  if git fetch origin "$BRANCH" 2>/dev/null; then
-    git checkout -b "$BRANCH" 2>/dev/null || git branch -M "$BRANCH" 2>/dev/null || true
-    git reset --hard "origin/$BRANCH" 2>/dev/null || true
-  else
-    git checkout -b "$BRANCH" 2>/dev/null || git branch -M "$BRANCH" 2>/dev/null || true
-  fi
-else
-  # Ensure origin is set (best effort)
-  git remote set-url origin "$REMOTE" 2>/dev/null || git remote add origin "$REMOTE" 2>/dev/null || true
-  # Fetch latest from remote
-  git fetch origin "$BRANCH" 2>/dev/null || true
-  # Reset to remote/main to get clean state (discard local changes)
-  if git rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
-    git reset --hard "origin/$BRANCH" 2>/dev/null || true
-  fi
-  # Ensure we're on the correct branch
-  git checkout "$BRANCH" 2>/dev/null || git branch -M "$BRANCH" 2>/dev/null || true
-fi
-
-# Check for changes using git status --porcelain
-if git status --porcelain | grep -q .; then
-  # Stage all changes
-  git add -A
-  
-  # Commit with timestamp
-  TS=$(date +%Y%m%d_%H%M%S)
-  git commit -m "Update from Oracle (rsadminbot): $TS" >/dev/null 2>&1 || {{ echo "ERR=commit_failed"; exit 3; }}
-  
-  # Push to origin
-  if git rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
-    git push origin "$BRANCH" >/dev/null 2>&1 || {{ echo "ERR=push_failed"; exit 4; }}
-  else
-    git push -u origin "$BRANCH" >/dev/null 2>&1 || {{ echo "ERR=push_failed"; exit 4; }}
-  fi
-  
-  echo "OK=1"
-  echo "PUSHED=1"
-  echo "HEAD=$(git rev-parse HEAD)"
-  echo "OLD_HEAD=$(git rev-parse HEAD~1 2>/dev/null || echo '')"
-  echo "CHANGED_BEGIN"
-  git show --name-only --pretty=format: HEAD | sed '/^$/d' | head -n 100
-  echo "CHANGED_END"
-else
-  echo "OK=1"
-  echo "NO_CHANGES=1"
-  HEAD_SHA=$(git rev-parse HEAD 2>/dev/null || echo '')
-  echo "HEAD=$HEAD_SHA"
-fi
-"""
-
-        ok, stdout, stderr = self._execute_ssh_command(cmd, timeout=180)
-        out = (stdout or "").strip()
-        err = (stderr or "").strip()
-        if not ok:
-            return False, {"error": (err or out or "rsbots push failed")[:1600]}
-
-        stats: Dict[str, Any] = {"raw": out[-1600:]}
-        in_changed = False
-        changed: List[str] = []
-        for ln in out.splitlines():
-            ln = ln.strip()
-            if ln == "CHANGED_BEGIN":
-                in_changed = True
-                continue
-            if ln == "CHANGED_END":
-                in_changed = False
-                continue
-            if in_changed:
-                if ln:
-                    changed.append(ln)
-                continue
-            if "=" in ln:
-                k, v = ln.split("=", 1)
-                stats[k.strip().lower()] = v.strip()
-        stats["changed_sample"] = changed[:100]
-        
-        # Optional: auto deploy after push
-        if auto_deploy and stats.get("pushed") == "1":
-            try:
-                deploy_cmd = "bash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh deploy_apply"
-                deploy_ok, deploy_out, deploy_err = self._execute_ssh_command(deploy_cmd, timeout=60)
-                if deploy_ok:
-                    stats["deploy_applied"] = True
-                else:
-                    stats["deploy_error"] = (deploy_err or deploy_out or "deploy failed")[:500]
-            except Exception as e:
-                stats["deploy_error"] = str(e)[:500]
-        
-        return True, stats
-
     async def _post_or_edit_progress(self, progress_msg, text: str):
-        """Best-effort: edit an existing progress message, else send a new one."""
+        """Post progress updates as embeds to the log channel (no noisy progress channel).
+
+        Note: We intentionally do not maintain/edit a dedicated progress message anymore.
+        Progress updates are emitted as structured embeds to the log channel.
+        """
         try:
-            if progress_msg is not None:
-                await progress_msg.edit(content=text[:1900])
-                return progress_msg
-        except Exception:
-            progress_msg = None
-        try:
-            ch = await self._get_update_progress_channel()
-            if ch is None:
+            raw = (text or "").strip()
+            if not raw:
                 return None
-            return await ch.send(text[:1900])
+
+            first_line = raw.splitlines()[0].strip()
+            title = first_line if first_line else "Progress"
+            # Keep the full text available (truncated) in a codeblock for readability.
+            body = raw
+            embed = MessageHelper.create_info_embed(
+                title=title[:256],
+                message=self._codeblock(body, limit=1700),
+                footer="RSAdminBot",
+            )
+            await self._log_to_discord(embed, None)
+            return None
         except Exception:
             return None
 
@@ -2728,7 +3323,7 @@ echo "CHANGED_END"
             return
     
     
-    def _execute_ssh_command(self, command: str, timeout: int = 30) -> Tuple[bool, str, str]:
+    def _execute_ssh_command(self, command: str, timeout: int = 30, *, log_it: bool = True) -> Tuple[bool, str, str]:
         """Execute SSH command and return (success, stdout, stderr)
         
         Uses shell=False to prevent PowerShell parsing on Windows.
@@ -2743,6 +3338,10 @@ echo "CHANGED_END"
         # Local execution mode (Ubuntu host): run commands directly in bash without SSH.
         if self._should_use_local_exec():
             try:
+                # Log SSH command before execution
+                if log_it and hasattr(self, 'logger') and self.logger:
+                    self.logger.log_ssh_command(command, None, None, None, None)
+                
                 result = subprocess.run(
                     ["bash", "-lc", command],
                     shell=False,
@@ -2754,18 +3353,28 @@ echo "CHANGED_END"
                 )
                 stdout_clean = (result.stdout or "").strip()
                 stderr_clean = (result.stderr or "").strip()
-                if result.returncode != 0:
+                success = result.returncode == 0
+                
+                # Log SSH command result
+                if log_it and hasattr(self, 'logger') and self.logger:
+                    self.logger.log_ssh_command(command, success, stdout_clean, stderr_clean, None)
+                
+                if not success:
                     print(f"{Colors.RED}[Local Exec Error] Command failed: {command[:100]}{Colors.RESET}")
                     if stderr_clean:
                         print(f"{Colors.RED}[Local Exec Error] {stderr_clean[:200]}{Colors.RESET}")
-                return result.returncode == 0, stdout_clean, stderr_clean
+                return success, stdout_clean, stderr_clean
             except subprocess.TimeoutExpired:
                 error_msg = f"Command timed out after {timeout}s"
                 print(f"{Colors.RED}[Local Exec Error] {error_msg}{Colors.RESET}")
+                if log_it and hasattr(self, 'logger') and self.logger:
+                    self.logger.log_ssh_command(command, False, None, error_msg, None)
                 return False, "", error_msg
             except Exception as e:
                 error_msg = f"Unexpected error executing local command: {str(e)}"
                 print(f"{Colors.RED}[Local Exec Error] {error_msg}{Colors.RESET}")
+                if log_it and hasattr(self, 'logger') and self.logger:
+                    self.logger.log_ssh_command(command, False, None, error_msg, None)
                 return False, "", error_msg
         
         # Build SSH command locally (self-contained)
@@ -2780,11 +3389,17 @@ echo "CHANGED_END"
                 return False, "", error_msg
         
         try:
+            # Log SSH command before execution
+            if log_it and hasattr(self, 'logger') and self.logger:
+                self.logger.log_ssh_command(command, None, None, None, None)
+            
             # Build SSH base command locally (self-contained)
             base = self._build_ssh_base(self.current_server)
             if not base:
                 error_msg = "Failed to build SSH base command (check server config)"
                 print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
+                if log_it and hasattr(self, 'logger') and self.logger:
+                    self.logger.log_ssh_command(command, False, None, error_msg, None)
                 return False, "", error_msg
             
             # Escape command for bash -c
@@ -2809,9 +3424,14 @@ echo "CHANGED_END"
             # Clean output (strip whitespace)
             stdout_clean = (result.stdout or "").strip()
             stderr_clean = (result.stderr or "").strip()
+            success = result.returncode == 0
+            
+            # Log SSH command result
+            if log_it and hasattr(self, 'logger') and self.logger:
+                self.logger.log_ssh_command(command, success, stdout_clean, stderr_clean, None)
             
             # Only log errors, not every command execution
-            if result.returncode != 0:
+            if not success:
                 if not is_validation:
                     print(f"{Colors.RED}[SSH Error] Command failed: {command[:100]}{Colors.RESET}")
                     if stderr_clean:
@@ -2819,16 +3439,20 @@ echo "CHANGED_END"
                     if stdout_clean:
                         print(f"{Colors.YELLOW}[SSH Error] {stdout_clean[:200]}{Colors.RESET}")
             
-            return result.returncode == 0, stdout_clean, stderr_clean
+            return success, stdout_clean, stderr_clean
         except subprocess.TimeoutExpired:
             error_msg = f"Command timed out after {timeout}s"
             print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
             print(f"{Colors.RED}[SSH Error] Command: {command[:200]}{Colors.RESET}")
+            if log_it and hasattr(self, 'logger') and self.logger:
+                self.logger.log_ssh_command(command, False, None, error_msg, None)
             return False, "", error_msg
         except FileNotFoundError as e:
             error_msg = f"SSH executable not found: {e}"
             print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
             print(f"{Colors.YELLOW}[SSH Error] Make sure SSH is installed and in PATH{Colors.RESET}")
+            if log_it and hasattr(self, 'logger') and self.logger:
+                self.logger.log_ssh_command(command, False, None, error_msg, None)
             return False, "", error_msg
         except Exception as e:
             error_msg = f"Unexpected error executing SSH command: {str(e)}"
@@ -2836,6 +3460,8 @@ echo "CHANGED_END"
             print(f"{Colors.RED}[SSH Error] Command: {command[:200]}{Colors.RESET}")
             import traceback
             print(f"{Colors.RED}[SSH Error] Traceback: {traceback.format_exc()[:500]}{Colors.RESET}")
+            if log_it and hasattr(self, 'logger') and self.logger:
+                self.logger.log_ssh_command(command, False, None, error_msg, None)
             return False, "", error_msg
     
     def _service_name_to_bot_name(self, service_name: str) -> Optional[str]:
@@ -2945,14 +3571,22 @@ echo "CHANGED_END"
                 if not secrets_path.exists():
                     print(f"{Colors.YELLOW}[Config] Missing config.secrets.json (server-only): {secrets_path}{Colors.RESET}")
                     print(f"{Colors.YELLOW}[Config] Create it to provide required secrets like bot_token{Colors.RESET}")
+                    if hasattr(self, 'logger') and self.logger:
+                        self.logger.log_config_validation("config_secrets", "missing", f"Missing config.secrets.json: {secrets_path}", {"secrets_path": str(secrets_path)})
                 print(f"{Colors.GREEN}[Config] Loaded configuration{Colors.RESET}")
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.log_config_validation("config_load", "valid", "Configuration loaded successfully", {"config_path": str(self.config_path)})
             except Exception as e:
                 print(f"{Colors.RED}[Config] Failed to load config: {e}{Colors.RESET}")
                 self.config = default_config
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.log_config_validation("config_load", "invalid", f"Failed to load config: {e}", {"error": str(e)})
         else:
             self.config = default_config
             self.save_config()
             print(f"{Colors.YELLOW}[Config] Created default config.json - please configure it{Colors.RESET}")
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.log_config_validation("config_load", "warning", "Created default config.json - needs configuration", {})
     
     def save_config(self):
         """Save configuration to JSON file"""
@@ -3015,7 +3649,7 @@ echo "CHANGED_END"
                     await self._ensure_botctl_symlink()
                 except Exception as e:
                     print(f"{Colors.YELLOW}[Startup] botctl symlink setup failed (non-critical): {e}{Colors.RESET}")
-                
+
                 # Import and run startup sequences
                 try:
                     from startup_sequences import (
@@ -3024,59 +3658,15 @@ echo "CHANGED_END"
                         sequence_3_server_status,
                         sequence_4_file_sync,
                         sequence_5_channels,
-                        sequence_6_background
+                        sequence_6_background,
                     )
-                    
-                    # Run all sequences
+
                     await sequence_1_initialization.run(self)
                     await sequence_2_tracking.run(self)
                     await sequence_3_server_status.run(self)
                     await sequence_4_file_sync.run(self)
                     await sequence_5_channels.run(self)
                     await sequence_6_background.run(self)
-                    
-                    # Initialize monitor channels (per-bot channels in test server)
-                    try:
-                        await self._initialize_monitor_channels()
-                    except Exception as e:
-                        print(f"{Colors.YELLOW}[Startup] Monitor channel initialization failed (non-critical): {e}{Colors.RESET}")
-
-                    # If a self-update was applied during restart, report it to the update-progress channel now.
-                    try:
-                        marker = self.base_path / ".last_selfupdate_applied.json"
-                        if marker.exists():
-                            data = json.loads(marker.read_text(encoding="utf-8") or "{}")
-                            backup = str(data.get("backup") or "")
-                            ts = str(data.get("timestamp") or "")
-                            changes = data.get("changes") or {}
-                            sample = changes.get("sample") or []
-                            py_sample = changes.get("py_sample") or []
-                            total = changes.get("total")
-                            py_total = changes.get("py_total")
-                            # Fetch some recent journal lines for context.
-                            ok_j, out_j, _ = self._execute_ssh_command("journalctl -u mirror-world-rsadminbot.service -n 40 --no-pager | tail -n 40", timeout=20)
-                            tail = (out_j or "").strip()
-                            msg = (
-                                "[selfupdate] APPLIED\n"
-                                f"Timestamp: {ts}\n"
-                                f"Backup: {backup}\n"
-                            )
-                            if isinstance(total, int) and isinstance(py_total, int):
-                                msg += f"Files changed: {total} (py: {py_total})\n"
-                            if py_sample:
-                                msg += "\nChanged .py (sample):\n" + "\n".join(str(p) for p in py_sample[:20]) + "\n"
-                            elif sample:
-                                msg += "\nChanged files (sample):\n" + "\n".join(str(p) for p in sample[:20]) + "\n"
-                            if ok_j and tail:
-                                msg += "\nRecent service logs:\n" + tail[-1400:]
-                            await self._post_or_edit_progress(None, msg)
-                            try:
-                                marker.unlink()
-                            except Exception:
-                                pass
-                    except Exception as e:
-                        print(f"{Colors.YELLOW}[Startup] Self-update marker processing failed (non-critical): {e}{Colors.RESET}")
-                    
                 except ImportError as e:
                     print(f"{Colors.YELLOW}[Startup] Startup sequences not available (non-critical): {e}{Colors.RESET}")
                     import traceback
@@ -3085,7 +3675,53 @@ echo "CHANGED_END"
                     print(f"{Colors.YELLOW}[Startup] Startup sequences error (non-critical): {e}{Colors.RESET}")
                     import traceback
                     print(f"{Colors.DIM}[Startup] Sequence traceback: {traceback.format_exc()[:500]}{Colors.RESET}")
-                
+
+                # Initialize monitor channels (per-bot channels in test server)
+                try:
+                    await self._initialize_monitor_channels()
+                except Exception as e:
+                    print(f"{Colors.YELLOW}[Startup] Monitor channel initialization failed (non-critical): {e}{Colors.RESET}")
+
+                # If a self-update was applied during restart, report it to the update-progress channel now.
+                try:
+                    marker = self.base_path / ".last_selfupdate_applied.json"
+                    if marker.exists():
+                        data = json.loads(marker.read_text(encoding="utf-8") or "{}")
+                        backup = str(data.get("backup") or "")
+                        ts = str(data.get("timestamp") or "")
+                        changes = data.get("changes") or {}
+                        sample = changes.get("sample") or []
+                        py_sample = changes.get("py_sample") or []
+                        total = changes.get("total")
+                        py_total = changes.get("py_total")
+
+                        ok_j, out_j, _ = self._execute_ssh_command(
+                            "journalctl -u mirror-world-rsadminbot.service -n 40 --no-pager | tail -n 40",
+                            timeout=20,
+                        )
+                        tail = (out_j or "").strip()
+                        msg = (
+                            "[selfupdate] APPLIED\n"
+                            f"Timestamp: {ts}\n"
+                            f"Backup: {backup}\n"
+                        )
+                        if isinstance(total, int) and isinstance(py_total, int):
+                            msg += f"Files changed: {total} (py: {py_total})\n"
+                        if py_sample:
+                            msg += "\nChanged .py (sample):\n" + "\n".join(str(p) for p in py_sample[:20]) + "\n"
+                        elif sample:
+                            msg += "\nChanged files (sample):\n" + "\n".join(str(p) for p in sample[:20]) + "\n"
+                        if ok_j and tail:
+                            msg += "\nRecent service logs:\n" + tail[-1400:]
+
+                        await self._post_or_edit_progress(None, msg)
+                        try:
+                            marker.unlink()
+                        except Exception:
+                            pass
+                except Exception as e:
+                    print(f"{Colors.YELLOW}[Startup] Self-update marker processing failed (non-critical): {e}{Colors.RESET}")
+
             except Exception as e:
                 # Critical error - log but don't prevent bot from running
                 print(f"{Colors.RED}[Startup] Critical error in on_ready (continuing anyway): {e}{Colors.RESET}")
@@ -3130,10 +3766,22 @@ echo "CHANGED_END"
                 return  # Ignore unknown commands
             elif isinstance(error, commands.MissingPermissions):
                 print(f"{Colors.YELLOW}[Command Error] Missing permissions: {ctx.author} tried to use {ctx.command}{Colors.RESET}")
-                await ctx.send("❌ **Error:** You don't have permission to use this command.")
+                embed = MessageHelper.create_error_embed(
+                    title="Missing Permissions",
+                    message="You don't have permission to use this command.",
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
+                await self._log_to_discord(embed, None)
             elif isinstance(error, commands.CommandOnCooldown):
                 print(f"{Colors.YELLOW}[Command Error] Cooldown: {ctx.author} tried to use {ctx.command} too soon{Colors.RESET}")
-                await ctx.send(f"❌ **Cooldown:** Please wait {error.retry_after:.1f} seconds.")
+                embed = MessageHelper.create_warning_embed(
+                    title="Command Cooldown",
+                    message=f"Please wait {error.retry_after:.1f} seconds.",
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
+                await self._log_to_discord(embed, None)
             else:
                 error_msg = str(error)
                 print(f"{Colors.RED}[Command Error] {error_msg}{Colors.RESET}")
@@ -3143,7 +3791,67 @@ echo "CHANGED_END"
                 for line in traceback.format_exc().split('\n')[:10]:
                     if line.strip():
                         print(f"{Colors.RED}[Command Error]   {line}{Colors.RESET}")
-                await ctx.send("❌ **Error:** An error occurred while executing the command.")
+                embed = MessageHelper.create_error_embed(
+                    title="Command Error",
+                    message="An error occurred while executing the command.",
+                    error_details=error_msg[:500],
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
+                await self._log_to_discord(embed, None)
+
+            # Structured logging for errors (file + log channel)
+            if self.logger:
+                try:
+                    cmd_name = getattr(getattr(ctx, "command", None), "name", None) or "unknown"
+                    log_entry = self.logger.log_command(
+                        ctx,
+                        cmd_name,
+                        "error",
+                        {"error": str(error)[:800], "error_type": type(error).__name__},
+                    )
+                    await self._log_to_discord(self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx)), None)
+                    self.logger.clear_command_context()
+                except Exception:
+                    pass
+
+        @self.bot.event
+        async def on_command(ctx):
+            """Global command start hook (structured logging for ALL commands)."""
+            if not self.logger:
+                return
+            try:
+                cmd_name = getattr(getattr(ctx, "command", None), "name", None) or "unknown"
+                # Avoid duplicating if command already started logging this run.
+                current = getattr(self.logger, "_current_command_context", None) or {}
+                if current.get("command") == cmd_name and (current.get("log_entry") or {}).get("status") == "pending":
+                    return
+                self.logger.log_command(
+                    ctx,
+                    cmd_name,
+                    "pending",
+                    {"content": (getattr(getattr(ctx, "message", None), "content", "") or "")[:300]},
+                )
+            except Exception:
+                pass
+
+        @self.bot.event
+        async def on_command_completion(ctx):
+            """Global command completion hook (structured logging for ALL commands)."""
+            if not self.logger:
+                return
+            try:
+                cmd_name = getattr(getattr(ctx, "command", None), "name", None) or "unknown"
+                current = getattr(self.logger, "_current_command_context", None) or {}
+                # If this command already logged a final status, don't double-log.
+                if current.get("command") == cmd_name and (current.get("log_entry") or {}).get("status") in ("success", "error"):
+                    self.logger.clear_command_context()
+                    return
+                log_entry = self.logger.log_command(ctx, cmd_name, "success", {})
+                await self._log_to_discord(self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx)), None)
+                self.logger.clear_command_context()
+            except Exception:
+                pass
     
     def _setup_commands(self):
         """Setup prefix commands"""
@@ -3154,7 +3862,21 @@ echo "CHANGED_END"
         async def ping(ctx):
             """Check bot latency"""
             latency = round(self.bot.latency * 1000)
-            await ctx.send(f"🏓 Pong! Latency: {latency}ms")
+            embed = MessageHelper.create_info_embed(
+                title="Pong",
+                message="RSAdminBot is responding.",
+                fields=[{"name": "Latency", "value": f"{latency}ms", "inline": True}],
+                footer=f"Triggered by {ctx.author}",
+            )
+            await ctx.send(embed=embed)
+            await self._log_to_discord(embed, ctx.channel)
+            if self.logger:
+                try:
+                    log_entry = self.logger.log_command(ctx, "ping", "success", {"latency_ms": latency})
+                    await self._log_to_discord(self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx)), ctx.channel)
+                    self.logger.clear_command_context()
+                except Exception:
+                    pass
         self.registered_commands.append(("ping", "Check bot latency", False))
         
         @self.bot.command(name="status")
@@ -3265,8 +3987,23 @@ echo "CHANGED_END"
                     except Exception as e:
                         print(f"{Colors.YELLOW}[Restart] ⚠️  Failed to store restart info: {e}{Colors.RESET}")
                     
-                    # Log to Discord before exit
-                    await self.admin_bot._log_to_discord(f"🔄 **Local Restart Initiated**")
+                    # Log to Discord before exit (embed)
+                    try:
+                        restart_embed = MessageHelper.create_warning_embed(
+                            title="Local Restart Initiated",
+                            message="RSAdminBot is restarting locally (systemd will bring it back).",
+                            fields=[
+                                {"name": "Service", "value": "mirror-world-rsadminbot.service", "inline": True},
+                                {"name": "Mode", "value": "local", "inline": True},
+                            ],
+                            footer=f"Triggered by {interaction.user}",
+                        )
+                        await self.admin_bot._log_to_discord(
+                            restart_embed,
+                            interaction.channel if hasattr(interaction, "channel") else None,
+                        )
+                    except Exception:
+                        pass
                     
                     # Close the bot gracefully
                     await self.admin_bot.bot.close()
@@ -3306,15 +4043,60 @@ echo "CHANGED_END"
                             
                             if exists and state == "active":
                                 await interaction.followup.send("✅ **RSAdminBot restarted successfully on remote server!**\nThe bot will sync files on next startup.", ephemeral=True)
-                                await self.admin_bot._log_to_discord(f"✅ **Remote Restart Successful**\nService: {service_name}")
+                                try:
+                                    ok_embed = MessageHelper.create_success_embed(
+                                        title="Remote Restart Successful",
+                                        message="RSAdminBot restarted successfully on remote server.",
+                                        fields=[
+                                            {"name": "Service", "value": service_name, "inline": True},
+                                            {"name": "State", "value": "active", "inline": True},
+                                        ],
+                                        footer=f"Triggered by {interaction.user}",
+                                    )
+                                    await self.admin_bot._log_to_discord(
+                                        ok_embed,
+                                        interaction.channel if hasattr(interaction, "channel") else None,
+                                    )
+                                except Exception:
+                                    pass
                                 print(f"{Colors.GREEN}[Restart] Remote restart successful{Colors.RESET}")
                             else:
                                 await interaction.followup.send(f"⚠️ **Restart initiated but status unclear**\nState: {state if exists else 'Service not found'}", ephemeral=True)
-                                await self.admin_bot._log_to_discord(f"⚠️ **Remote Restart Status Unclear**\nState: {state if exists else 'Service not found'}")
+                                try:
+                                    warn_embed = MessageHelper.create_warning_embed(
+                                        title="Remote Restart Status Unclear",
+                                        message="Restart initiated but status is unclear.",
+                                        details=f"State: {state if exists else 'Service not found'}",
+                                        fields=[
+                                            {"name": "Service", "value": service_name, "inline": True},
+                                        ],
+                                        footer=f"Triggered by {interaction.user}",
+                                    )
+                                    await self.admin_bot._log_to_discord(
+                                        warn_embed,
+                                        interaction.channel if hasattr(interaction, "channel") else None,
+                                    )
+                                except Exception:
+                                    pass
                         else:
                             error_msg = stderr or stdout or "Unknown error"
                             await interaction.followup.send(f"❌ **Restart failed**: {error_msg[:500]}", ephemeral=True)
-                            await self.admin_bot._log_to_discord(f"❌ **Remote Restart Failed**\nError: {error_msg[:500]}")
+                            try:
+                                err_embed = MessageHelper.create_error_embed(
+                                    title="Remote Restart Failed",
+                                    message="Failed to restart RSAdminBot on remote server.",
+                                    error_details=error_msg[:500],
+                                    fields=[
+                                        {"name": "Service", "value": service_name, "inline": True},
+                                    ],
+                                    footer=f"Triggered by {interaction.user}",
+                                )
+                                await self.admin_bot._log_to_discord(
+                                    err_embed,
+                                    interaction.channel if hasattr(interaction, "channel") else None,
+                                )
+                            except Exception:
+                                pass
                             print(f"{Colors.RED}[Restart] Remote restart failed: {error_msg}{Colors.RESET}")
                     else:
                         await interaction.followup.send("❌ **ServiceManager not available**", ephemeral=True)
@@ -3362,7 +4144,33 @@ echo "CHANGED_END"
                 return
             info = self.BOTS[bot_key]
             success, out, err = self._execute_sh_script("botctl.sh", "details", bot_key)
-            await ctx.send(f"🧾 **Details: {info.get('name', bot_key)}**\n{self._codeblock(out or err or '')}"[:1900])
+            svc = str(info.get("service") or "")
+            output = out or err or ""
+            embed = MessageHelper.create_status_embed(
+                title="🧾 Details",
+                description=self._codeblock(output, limit=1500),
+                color=discord.Color.blurple(),
+                fields=[
+                    {"name": "Bot", "value": info.get("name", bot_key), "inline": True},
+                    {"name": "Service", "value": svc or "(missing)", "inline": True},
+                    {"name": "OK", "value": "YES" if success else "NO", "inline": True},
+                ],
+                footer=f"Triggered by {ctx.author}",
+            )
+            await ctx.send(embed=embed)
+            await self._log_to_discord(embed, ctx.channel)
+            if self.logger:
+                try:
+                    log_entry = self.logger.log_command(
+                        ctx,
+                        "details",
+                        "success" if success else "error",
+                        {"bot_name": bot_key, "service": svc, "ok": bool(success)},
+                    )
+                    await self._log_to_discord(self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx)), ctx.channel)
+                    self.logger.clear_command_context()
+                except Exception:
+                    pass
         self.registered_commands.append(("details", "Show systemctl status/details for a bot", True))
 
         @self.bot.command(name="logs")
@@ -3389,7 +4197,34 @@ echo "CHANGED_END"
             n = max(10, min(n, 400))
             info = self.BOTS[bot_key]
             success, out, err = self._execute_sh_script("botctl.sh", "logs", bot_key, str(n))
-            await ctx.send(f"📜 **Logs: {info.get('name', bot_key)}** (last {n})\n{self._codeblock(out or err or '')}"[:1900])
+            svc = str(info.get("service") or "")
+            output = out or err or ""
+            embed = MessageHelper.create_status_embed(
+                title="📜 Logs",
+                description=self._codeblock(output, limit=1500),
+                color=discord.Color.blurple(),
+                fields=[
+                    {"name": "Bot", "value": info.get("name", bot_key), "inline": True},
+                    {"name": "Lines", "value": str(n), "inline": True},
+                    {"name": "OK", "value": "YES" if success else "NO", "inline": True},
+                    {"name": "Service", "value": svc or "(missing)", "inline": False},
+                ],
+                footer=f"Triggered by {ctx.author}",
+            )
+            await ctx.send(embed=embed)
+            await self._log_to_discord(embed, ctx.channel)
+            if self.logger:
+                try:
+                    log_entry = self.logger.log_command(
+                        ctx,
+                        "logs",
+                        "success" if success else "error",
+                        {"bot_name": bot_key, "service": svc, "lines": n, "ok": bool(success)},
+                    )
+                    await self._log_to_discord(self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx)), ctx.channel)
+                    self.logger.clear_command_context()
+                except Exception:
+                    pass
         self.registered_commands.append(("logs", "Show journalctl logs for a bot", True))
         
         @self.bot.command(name="botlist")
@@ -3578,20 +4413,36 @@ echo "CHANGED_END"
             bot_info = self.BOTS[bot_name_lower]
             service_name = bot_info["service"]
             
-            # Log to terminal and Discord
+            # Log command triggered
             guild_name = ctx.guild.name if ctx.guild else "DM"
             guild_id = ctx.guild.id if ctx.guild else 0
             print(f"{Colors.CYAN}[Command] Starting {bot_info['name']} (Service: {service_name}){Colors.RESET}")
             print(f"{Colors.CYAN}[Command] Server: {guild_name} (ID: {guild_id}){Colors.RESET}")
             print(f"{Colors.CYAN}[Command] Requested by: {ctx.author} ({ctx.author.id}){Colors.RESET}")
-            await self._log_to_discord(f"🟢 **Starting {bot_info['name']}**\nService: `{service_name}`")
+            
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.log_command(ctx, "start", "pending", {"bot_name": bot_name_lower, "service": service_name})
             
             # Send immediate acknowledgment
-            status_msg = await ctx.send(f"🔄 **Starting {bot_info['name']}...**\n```\nConnecting to server...\n```")
+            loading_embed = MessageHelper.create_info_embed(
+                title="🔄 Starting Bot",
+                message=f"Starting {bot_info['name']}...",
+                fields=[{"name": "Service", "value": service_name, "inline": True}]
+            )
+            status_msg = await ctx.send(embed=loading_embed)
             
             # Start service using ServiceManager
             if not self.service_manager:
-                await ctx.send("❌ ServiceManager not available")
+                error_embed = MessageHelper.create_error_embed(
+                    title="ServiceManager Not Available",
+                    message="ServiceManager is not available. Cannot start bot."
+                )
+                await status_msg.edit(embed=error_embed)
+                await self._log_to_discord(error_embed, ctx.channel)
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.log_command(ctx, "start", "error", {"bot_name": bot_name_lower, "error": "ServiceManager not available"})
+                    log_entry = self.logger.log_command(ctx, "start", "error", {"bot_name": bot_name_lower, "error": "ServiceManager not available"})
+                    await self._log_to_discord(self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx)), ctx.channel)
                 return
 
             # Snapshot before action (so we can confirm PID/state changes)
@@ -3606,35 +4457,100 @@ echo "CHANGED_END"
                 if is_running:
                     after_exists, after_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name_lower)
                     after_pid = self.service_manager.get_pid(service_name)
-                    pid_note = ""
-                    if before_pid and after_pid and before_pid != after_pid:
-                        pid_note = f" (pid {before_pid} -> {after_pid})"
-                    elif before_pid is None and after_pid:
-                        pid_note = f" (pid -> {after_pid})"
                     print(f"{Colors.GREEN}[Success] {bot_info['name']} started successfully!{Colors.RESET}")
-                    before_state_txt = before_state or "unknown"
-                    after_state_txt = after_state or "unknown"
-                    before_pid_txt = str(before_pid or 0)
-                    after_pid_txt = str(after_pid or 0)
-                    await status_msg.edit(
-                        content=(
-                            f"✅ **{bot_info['name']}** started successfully!{pid_note}\n"
-                            f"```\nBefore: state={before_state_txt} pid={before_pid_txt}\nAfter:  state={after_state_txt} pid={after_pid_txt}\n```"
-                        )
+                    
+                    # Create success embed
+                    fields = [
+                        {"name": "Bot", "value": bot_info['name'], "inline": True},
+                        {"name": "Service", "value": service_name, "inline": True},
+                    ]
+                    if after_state:
+                        state_display = after_state
+                        if before_state and before_state != after_state:
+                            state_display = f"{before_state} → {after_state}"
+                        fields.append({"name": "Status", "value": state_display, "inline": True})
+                    if after_pid:
+                        fields.append({"name": "PID", "value": str(after_pid), "inline": True})
+                    
+                    success_embed = MessageHelper.create_success_embed(
+                        title="Bot Started",
+                        message=f"{bot_info['name']} started successfully!",
+                        fields=fields
                     )
-                    await self._log_to_discord(
-                        f"✅ **{bot_info['name']}** started\nState: `{after_state or 'unknown'}` | PID: `{after_pid or 0}`\nBefore: `{before_state or 'unknown'}` | PID: `{before_pid or 0}`"
-                    )
+                    success_embed.set_footer(text=f"Triggered by {ctx.author}")
+                    
+                    await status_msg.edit(embed=success_embed)
+                    
+                    # Log and send to Discord
+                    if hasattr(self, 'logger') and self.logger:
+                        log_entry = self.logger.log_command(ctx, "start", "success", {
+                            "bot_name": bot_name_lower,
+                            "service": service_name,
+                            "before_state": before_state,
+                            "after_state": after_state,
+                            "before_pid": before_pid,
+                            "pid": after_pid,
+                            "after_pid": after_pid
+                        })
+                        embed = self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx))
+                        await self._log_to_discord(embed, ctx.channel)
+                        self.logger.clear_command_context()
+                    else:
+                        await self._log_to_discord(success_embed, ctx.channel)
                 else:
                     error_msg = verify_error or stderr or stdout or "Unknown error"
                     print(f"{Colors.RED}[Error] Failed to start {bot_info['name']}: {error_msg[:500]}{Colors.RESET}")
-                    await status_msg.edit(content=f"❌ Failed to start {bot_info['name']}:\n```{error_msg[:500]}```")
-                    await self._log_to_discord(f"❌ **{bot_info['name']}** failed to start:\n```{error_msg[:500]}```")
+                    
+                    error_embed = MessageHelper.create_error_embed(
+                        title="Failed to Start Bot",
+                        message=f"Failed to start {bot_info['name']}",
+                        error_details=error_msg[:500]
+                    )
+                    error_embed.add_field(name="Bot", value=bot_info['name'], inline=True)
+                    error_embed.add_field(name="Service", value=service_name, inline=True)
+                    error_embed.set_footer(text=f"Triggered by {ctx.author}")
+                    
+                    await status_msg.edit(embed=error_embed)
+                    
+                    # Log and send to Discord
+                    if hasattr(self, 'logger') and self.logger:
+                        log_entry = self.logger.log_command(ctx, "start", "error", {
+                            "bot_name": bot_name_lower,
+                            "service": service_name,
+                            "error": error_msg[:500]
+                        })
+                        embed = self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx))
+                        await self._log_to_discord(embed, ctx.channel)
+                        self.logger.clear_command_context()
+                    else:
+                        await self._log_to_discord(error_embed, ctx.channel)
             else:
                 error_msg = stderr or stdout or "Unknown error"
                 print(f"{Colors.RED}[Error] Failed to start {bot_info['name']}: {error_msg[:500]}{Colors.RESET}")
-                await status_msg.edit(content=f"❌ Failed to start {bot_info['name']}:\n```{error_msg[:500]}```")
-                await self._log_to_discord(f"❌ **{bot_info['name']}** failed to start:\n```{error_msg[:500]}```")
+                
+                error_embed = MessageHelper.create_error_embed(
+                    title="Failed to Start Bot",
+                    message=f"Failed to start {bot_info['name']}",
+                    error_details=error_msg[:500]
+                )
+                error_embed.add_field(name="Bot", value=bot_info['name'], inline=True)
+                error_embed.add_field(name="Service", value=service_name, inline=True)
+                error_embed.set_footer(text=f"Triggered by {ctx.author}")
+                
+                await status_msg.edit(embed=error_embed)
+                
+                # Log and send to Discord
+                if hasattr(self, 'logger') and self.logger:
+                    log_entry = self.logger.log_command(ctx, "start", "error", {
+                        "bot_name": bot_name_lower,
+                        "service": service_name,
+                        "error": error_msg[:500]
+                    })
+                    embed = self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx))
+                    await self._log_to_discord(embed, ctx.channel)
+                    self.logger.clear_command_context()
+                else:
+                    await self._log_to_discord(error_embed, ctx.channel)
         
         @self.bot.command(name="botstop")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
@@ -3669,20 +4585,37 @@ echo "CHANGED_END"
             service_name = bot_info["service"]
             script_pattern = bot_info.get("script", bot_name_lower)
             
-            # Log to terminal and Discord
+            # Log command triggered
             guild_name = ctx.guild.name if ctx.guild else "DM"
             guild_id = ctx.guild.id if ctx.guild else 0
             print(f"{Colors.CYAN}[Command] Stopping {bot_info['name']} (Service: {service_name}){Colors.RESET}")
             print(f"{Colors.CYAN}[Command] Server: {guild_name} (ID: {guild_id}){Colors.RESET}")
             print(f"{Colors.CYAN}[Command] Requested by: {ctx.author} ({ctx.author.id}){Colors.RESET}")
-            await self._log_to_discord(f"🔴 **Stopping {bot_info['name']}**\nService: `{service_name}`")
+            
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.log_command(ctx, "stop", "pending", {"bot_name": bot_name_lower, "service": service_name})
             
             # Send immediate acknowledgment
-            status_msg = await ctx.send(f"🔄 **Stopping {bot_info['name']}...**\n```\nConnecting to server...\n```")
+            loading_embed = MessageHelper.create_info_embed(
+                title="🔄 Stopping Bot",
+                message=f"Stopping {bot_info['name']}...",
+                fields=[{"name": "Service", "value": service_name, "inline": True}]
+            )
+            status_msg = await ctx.send(embed=loading_embed)
             
             # Stop service using ServiceManager
             if not self.service_manager:
-                await ctx.send("❌ ServiceManager not available")
+                error_embed = MessageHelper.create_error_embed(
+                    title="ServiceManager Not Available",
+                    message="ServiceManager is not available. Cannot stop bot."
+                )
+                await status_msg.edit(embed=error_embed)
+                await self._log_to_discord(error_embed, ctx.channel)
+                if hasattr(self, 'logger') and self.logger:
+                    log_entry = self.logger.log_command(ctx, "stop", "error", {"bot_name": bot_name_lower, "error": "ServiceManager not available"})
+                    embed = self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx))
+                    await self._log_to_discord(embed, ctx.channel)
+                    self.logger.clear_command_context()
                 return
 
             before_exists, before_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name_lower)
@@ -3693,28 +4626,72 @@ echo "CHANGED_END"
             if success:
                 after_exists, after_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name_lower)
                 after_pid = self.service_manager.get_pid(service_name)
-                pid_note = ""
-                if before_pid and not after_pid:
-                    pid_note = f" (pid {before_pid} -> 0)"
                 print(f"{Colors.GREEN}[Success] {bot_info['name']} stopped successfully!{Colors.RESET}")
-                before_state_txt = before_state or "unknown"
-                after_state_txt = after_state or "unknown"
-                before_pid_txt = str(before_pid or 0)
-                after_pid_txt = str(after_pid or 0)
-                await status_msg.edit(
-                    content=(
-                        f"✅ **{bot_info['name']}** stopped successfully!{pid_note}\n"
-                        f"```\nBefore: state={before_state_txt} pid={before_pid_txt}\nAfter:  state={after_state_txt} pid={after_pid_txt}\n```"
-                    )
+                
+                # Create success embed
+                fields = [
+                    {"name": "Bot", "value": bot_info['name'], "inline": True},
+                    {"name": "Service", "value": service_name, "inline": True},
+                ]
+                if after_state:
+                    state_display = after_state
+                    if before_state and before_state != after_state:
+                        state_display = f"{before_state} → {after_state}"
+                    fields.append({"name": "Status", "value": state_display, "inline": True})
+                if before_pid and not after_pid:
+                    fields.append({"name": "PID", "value": f"{before_pid} → 0", "inline": True})
+                
+                success_embed = MessageHelper.create_success_embed(
+                    title="Bot Stopped",
+                    message=f"{bot_info['name']} stopped successfully!",
+                    fields=fields
                 )
-                await self._log_to_discord(
-                    f"✅ **{bot_info['name']}** stopped\nState: `{after_state or 'unknown'}` | PID: `{after_pid or 0}`\nBefore: `{before_state or 'unknown'}` | PID: `{before_pid or 0}`"
-                )
+                success_embed.set_footer(text=f"Triggered by {ctx.author}")
+                
+                await status_msg.edit(embed=success_embed)
+                
+                # Log and send to Discord
+                if hasattr(self, 'logger') and self.logger:
+                    log_entry = self.logger.log_command(ctx, "stop", "success", {
+                        "bot_name": bot_name_lower,
+                        "service": service_name,
+                        "before_state": before_state,
+                        "after_state": after_state,
+                        "before_pid": before_pid,
+                        "after_pid": after_pid
+                    })
+                    embed = self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx))
+                    await self._log_to_discord(embed, ctx.channel)
+                    self.logger.clear_command_context()
+                else:
+                    await self._log_to_discord(success_embed, ctx.channel)
             else:
                 error_msg = stderr or stdout or "Unknown error"
                 print(f"{Colors.RED}[Error] Failed to stop {bot_info['name']}: {error_msg[:500]}{Colors.RESET}")
-                await status_msg.edit(content=f"❌ Failed to stop {bot_info['name']}:\n```{error_msg[:500]}```")
-                await self._log_to_discord(f"❌ **{bot_info['name']}** failed to stop:\n```{error_msg[:500]}```")
+                
+                error_embed = MessageHelper.create_error_embed(
+                    title="Failed to Stop Bot",
+                    message=f"Failed to stop {bot_info['name']}",
+                    error_details=error_msg[:500]
+                )
+                error_embed.add_field(name="Bot", value=bot_info['name'], inline=True)
+                error_embed.add_field(name="Service", value=service_name, inline=True)
+                error_embed.set_footer(text=f"Triggered by {ctx.author}")
+                
+                await status_msg.edit(embed=error_embed)
+                
+                # Log and send to Discord
+                if hasattr(self, 'logger') and self.logger:
+                    log_entry = self.logger.log_command(ctx, "stop", "error", {
+                        "bot_name": bot_name_lower,
+                        "service": service_name,
+                        "error": error_msg[:500]
+                    })
+                    embed = self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx))
+                    await self._log_to_discord(embed, ctx.channel)
+                    self.logger.clear_command_context()
+                else:
+                    await self._log_to_discord(error_embed, ctx.channel)
         
         @self.bot.command(name="botrestart")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
@@ -3749,20 +4726,37 @@ echo "CHANGED_END"
             service_name = bot_info["service"]
             script_pattern = bot_info.get("script", bot_name_lower)
             
-            # Log to terminal and Discord
+            # Log command triggered
             guild_name = ctx.guild.name if ctx.guild else "DM"
             guild_id = ctx.guild.id if ctx.guild else 0
             print(f"{Colors.CYAN}[Command] Restarting {bot_info['name']} (Service: {service_name}){Colors.RESET}")
             print(f"{Colors.CYAN}[Command] Server: {guild_name} (ID: {guild_id}){Colors.RESET}")
             print(f"{Colors.CYAN}[Command] Requested by: {ctx.author} ({ctx.author.id}){Colors.RESET}")
-            await self._log_to_discord(f"🔄 **Restarting {bot_info['name']}**\nService: `{service_name}`")
+            
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.log_command(ctx, "restart", "pending", {"bot_name": bot_name_lower, "service": service_name})
             
             # Send immediate acknowledgment
-            status_msg = await ctx.send(f"🔄 **Restarting {bot_info['name']}...**\n```\nConnecting to server...\n```")
+            loading_embed = MessageHelper.create_info_embed(
+                title="🔄 Restarting Bot",
+                message=f"Restarting {bot_info['name']}...",
+                fields=[{"name": "Service", "value": service_name, "inline": True}]
+            )
+            status_msg = await ctx.send(embed=loading_embed)
             
             # Restart service using ServiceManager
             if not self.service_manager:
-                await ctx.send("❌ ServiceManager not available")
+                error_embed = MessageHelper.create_error_embed(
+                    title="ServiceManager Not Available",
+                    message="ServiceManager is not available. Cannot restart bot."
+                )
+                await status_msg.edit(embed=error_embed)
+                await self._log_to_discord(error_embed, ctx.channel)
+                if hasattr(self, 'logger') and self.logger:
+                    log_entry = self.logger.log_command(ctx, "restart", "error", {"bot_name": bot_name_lower, "error": "ServiceManager not available"})
+                    embed = self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx))
+                    await self._log_to_discord(embed, ctx.channel)
+                    self.logger.clear_command_context()
                 return
 
             before_exists, before_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name_lower)
@@ -3776,37 +4770,79 @@ echo "CHANGED_END"
                 if is_running:
                     after_exists, after_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name_lower)
                     after_pid = self.service_manager.get_pid(service_name)
-                    pid_note = ""
-                    if before_pid and after_pid and before_pid != after_pid:
-                        pid_note = f" (pid {before_pid} -> {after_pid})"
-                    elif before_pid and after_pid and before_pid == after_pid:
-                        pid_note = f" (pid unchanged: {after_pid})"
-                    elif before_pid is None and after_pid:
-                        pid_note = f" (pid -> {after_pid})"
                     print(f"{Colors.GREEN}[Success] {bot_info['name']} restarted successfully!{Colors.RESET}")
-                    before_state_txt = before_state or "unknown"
-                    after_state_txt = after_state or "unknown"
-                    before_pid_txt = str(before_pid or 0)
-                    after_pid_txt = str(after_pid or 0)
-                    await status_msg.edit(
-                        content=(
-                            f"✅ **{bot_info['name']}** restarted successfully!{pid_note}\n"
-                            f"```\nBefore: state={before_state_txt} pid={before_pid_txt}\nAfter:  state={after_state_txt} pid={after_pid_txt}\n```"
-                        )
+                    
+                    # Create success embed
+                    fields = [
+                        {"name": "Bot", "value": bot_info['name'], "inline": True},
+                        {"name": "Service", "value": service_name, "inline": True},
+                    ]
+                    if after_state:
+                        state_display = after_state
+                        if before_state and before_state != after_state:
+                            state_display = f"{before_state} → {after_state}"
+                        fields.append({"name": "Status", "value": state_display, "inline": True})
+                    if after_pid:
+                        pid_display = str(after_pid)
+                        if before_pid and before_pid != after_pid:
+                            pid_display = f"{before_pid} → {after_pid}"
+                        fields.append({"name": "PID", "value": pid_display, "inline": True})
+                    
+                    success_embed = MessageHelper.create_success_embed(
+                        title="Bot Restarted",
+                        message=f"{bot_info['name']} restarted successfully!",
+                        fields=fields
                     )
-                    await self._log_to_discord(
-                        f"✅ **{bot_info['name']}** restarted{pid_note}\nState: `{after_state or 'unknown'}` | PID: `{after_pid or 0}`\nBefore: `{before_state or 'unknown'}` | PID: `{before_pid or 0}`"
-                    )
+                    success_embed.set_footer(text=f"Triggered by {ctx.author}")
+                    
+                    await status_msg.edit(embed=success_embed)
+                    
+                    # Log and send to Discord
+                    if hasattr(self, 'logger') and self.logger:
+                        log_entry = self.logger.log_command(ctx, "restart", "success", {
+                            "bot_name": bot_name_lower,
+                            "service": service_name,
+                            "before_state": before_state,
+                            "after_state": after_state,
+                            "before_pid": before_pid,
+                            "pid": after_pid,
+                            "after_pid": after_pid
+                        })
+                        embed = self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx))
+                        await self._log_to_discord(embed, ctx.channel)
+                        self.logger.clear_command_context()
+                    else:
+                        await self._log_to_discord(success_embed, ctx.channel)
                 else:
                     error_msg = verify_error or stderr or stdout or "Unknown error"
                     print(f"{Colors.YELLOW}[Warning] Restart completed but verification failed for {bot_info['name']}: {error_msg[:500]}{Colors.RESET}")
-                    await status_msg.edit(content=f"⚠️ Restart completed but verification failed for {bot_info['name']}:\n```{error_msg[:500]}```")
-                    await self._log_to_discord(f"⚠️ **{bot_info['name']}** restart completed but verification failed:\n```{error_msg[:500]}```")
+                    warning_embed = MessageHelper.create_warning_embed(
+                        title="Restart Verification Failed",
+                        message=f"Restart completed but verification failed for {bot_info['name']}.",
+                        details=error_msg[:500],
+                        fields=[
+                            {"name": "Bot", "value": bot_info["name"], "inline": True},
+                            {"name": "Service", "value": service_name, "inline": True},
+                        ],
+                        footer=f"Triggered by {ctx.author}",
+                    )
+                    await status_msg.edit(embed=warning_embed)
+                    await self._log_to_discord(warning_embed, ctx.channel)
             else:
                 error_msg = stderr or stdout or "Unknown error"
                 print(f"{Colors.RED}[Error] Failed to restart {bot_info['name']}: {error_msg[:500]}{Colors.RESET}")
-                await status_msg.edit(content=f"❌ Failed to restart {bot_info['name']}:\n```{error_msg[:500]}```")
-                await self._log_to_discord(f"❌ **{bot_info['name']}** failed to restart:\n```{error_msg[:500]}```")
+                error_embed = MessageHelper.create_error_embed(
+                    title="Failed to Restart Bot",
+                    message=f"Failed to restart {bot_info['name']}.",
+                    error_details=error_msg[:500],
+                    fields=[
+                        {"name": "Bot", "value": bot_info["name"], "inline": True},
+                        {"name": "Service", "value": service_name, "inline": True},
+                    ],
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await status_msg.edit(embed=error_embed)
+                await self._log_to_discord(error_embed, ctx.channel)
         
         @self.bot.command(name="botupdate")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
@@ -3861,8 +4897,16 @@ echo "CHANGED_END"
             )
 
             status_msg = await ctx.send(
-                f"📦 **Updating {bot_info['name']} from GitHub (python-only)...**\n"
-                "```\nPulling + copying *.py from /home/rsadmin/bots/rsbots-code\n```"
+                embed=MessageHelper.create_info_embed(
+                    title="Updating Bot (python-only)",
+                    message=f"Updating {bot_info['name']} from GitHub and restarting service.",
+                    fields=[
+                        {"name": "Bot", "value": bot_info["name"], "inline": True},
+                        {"name": "Folder", "value": bot_folder, "inline": True},
+                        {"name": "Service", "value": service_name or "(missing)", "inline": False},
+                    ],
+                    footer=f"Triggered by {ctx.author}",
+                )
             )
             print(f"{Colors.YELLOW}[Update] Starting GitHub py-only update for {bot_folder}...{Colors.RESET}")
 
@@ -3884,8 +4928,18 @@ echo "CHANGED_END"
             if not success:
                 error_msg = stats.get("error", "Unknown error")
                 print(f"{Colors.RED}[Error] GitHub py-only update failed for {bot_info['name']}: {error_msg[:500]}{Colors.RESET}")
-                await status_msg.edit(content=f"❌ GitHub py-only update failed for {bot_info['name']}:\n```{error_msg[:800]}```")
-                await self._log_to_discord(f"❌ **{bot_info['name']}** update failed:\n```{error_msg[:800]}```")
+                error_embed = MessageHelper.create_error_embed(
+                    title="Update Failed",
+                    message=f"GitHub py-only update failed for {bot_info['name']}.",
+                    error_details=str(error_msg)[:800],
+                    fields=[
+                        {"name": "Bot", "value": bot_info["name"], "inline": True},
+                        {"name": "Folder", "value": bot_folder, "inline": True},
+                    ],
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await status_msg.edit(embed=error_embed)
+                await self._log_to_discord(error_embed, ctx.channel)
                 if should_post_progress and self.service_manager and service_name:
                     after_exists, after_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name)
                     after_pid = self.service_manager.get_pid(service_name)
@@ -3922,25 +4976,57 @@ echo "CHANGED_END"
                     if not restart_ok:
                         restart_err = (verify_err or "service did not become active")[:800]
 
-            summary = f"✅ **{bot_info['name']} updated from GitHub (python-only)**\n"
-            summary += "```"
-            summary += f"\nGit: {old[:12]} -> {new[:12]}"
-            summary += f"\nPython copied: {py_count}"
-            summary += f"\nChanged .py in folder: {changed_count}"
-            summary += f"\nRestart: {'OK' if restart_ok else 'FAILED'}"
-            summary += "```"
+            fields = [
+                {"name": "Bot", "value": bot_info["name"], "inline": True},
+                {"name": "Git", "value": f"{old[:12]} -> {new[:12]}", "inline": False},
+                {"name": "Python copied", "value": py_count, "inline": True},
+                {"name": "Changed", "value": changed_count, "inline": True},
+                {"name": "Restart", "value": "OK" if restart_ok else "FAILED", "inline": True},
+            ]
+            success_embed = MessageHelper.create_success_embed(
+                title="Update Complete",
+                message=f"{bot_info['name']} updated from GitHub (python-only).",
+                fields=fields,
+                footer=f"Triggered by {ctx.author}",
+            )
             if changed_sample:
-                summary += "\n**Changed sample (first 30):**\n```"
-                summary += "\n".join(str(x) for x in changed_sample[:30])
-                summary += "```"
+                sample_txt = "\n".join(str(x) for x in changed_sample[:30])
+                success_embed.add_field(
+                    name="Changed sample (first 30)",
+                    value=f"```{sample_txt[:900]}```",
+                    inline=False,
+                )
             if not restart_ok and restart_err:
-                summary += "\n**Restart error:**\n```"
-                summary += restart_err[:1200]
-                summary += "```"
+                success_embed.add_field(
+                    name="Restart error",
+                    value=f"```{restart_err[:900]}```",
+                    inline=False,
+                )
 
-            await status_msg.edit(content=summary[:1900])
-            await self._log_to_discord(f"✅ **{bot_info['name']}** updated from GitHub (python-only)")
+            await status_msg.edit(embed=success_embed)
 
+            # Structured log entry (file + embed to log channel)
+            if self.logger:
+                try:
+                    log_entry = self.logger.log_command(
+                        ctx,
+                        "botupdate",
+                        "success" if restart_ok else "error",
+                        {
+                            "bot_name": bot_name,
+                            "service": service_name,
+                            "git_old": old[:12],
+                            "git_new": new[:12],
+                            "python_copied": py_count,
+                            "changed_count": changed_count,
+                            "restart_ok": restart_ok,
+                            "restart_error": restart_err[:500] if restart_err else "",
+                        },
+                    )
+                    await self._log_to_discord(self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx)), ctx.channel)
+                    self.logger.clear_command_context()
+                except Exception:
+                    pass
             if should_post_progress and self.service_manager and service_name:
                 after_exists, after_state, _ = self.service_manager.get_status(service_name, bot_name=bot_name)
                 after_pid = self.service_manager.get_pid(service_name)
@@ -3964,8 +5050,15 @@ echo "CHANGED_END"
                 return
 
             status_msg = await ctx.send(
-                "📦 **Updating RSAdminBot from GitHub (python-only)...**\n"
-                "```\nPulling + copying RSAdminBot/*.py from /home/rsadmin/bots/rsbots-code\n```"
+                embed=MessageHelper.create_info_embed(
+                    title="Updating RSAdminBot (python-only)",
+                    message="Pulling + copying RSAdminBot/*.py from /home/rsadmin/bots/rsbots-code",
+                    fields=[
+                        {"name": "Service", "value": "mirror-world-rsadminbot.service", "inline": True},
+                        {"name": "Next", "value": "Restart if changes detected", "inline": True},
+                    ],
+                    footer=f"Triggered by {ctx.author}",
+                )
             )
             should_post_progress = not (await self._is_progress_channel(ctx.channel))
             progress_msg = None
@@ -3976,7 +5069,22 @@ echo "CHANGED_END"
                 )
             success, stats = self._github_py_only_update("RSAdminBot")
             if not success:
-                await status_msg.edit(content=f"❌ Failed to update RSAdminBot from GitHub:\n```{stats.get('error','Unknown error')[:800]}```")
+                err_txt = str(stats.get("error", "Unknown error"))[:800]
+                error_embed = MessageHelper.create_error_embed(
+                    title="Selfupdate Failed",
+                    message="Failed to update RSAdminBot from GitHub (python-only).",
+                    error_details=err_txt,
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await status_msg.edit(embed=error_embed)
+                await self._log_to_discord(error_embed, ctx.channel)
+                if self.logger:
+                    try:
+                        log_entry = self.logger.log_command(ctx, "selfupdate", "error", {"error": err_txt})
+                        await self._log_to_discord(self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx)), ctx.channel)
+                        self.logger.clear_command_context()
+                    except Exception:
+                        pass
                 if should_post_progress:
                     await self._post_or_edit_progress(
                         progress_msg,
@@ -3993,12 +5101,21 @@ echo "CHANGED_END"
             # Check if actually updated (old != new)
             if old and new and old == new:
                 # No changes - skip restart
-                await status_msg.edit(
-                    content=(
-                        f"✅ **Up to date** (commit `{old[:12]}`).\n"
-                        f"No changes detected. No restart needed."
-                    )[:1900]
+                ok_embed = MessageHelper.create_success_embed(
+                    title="Up to Date",
+                    message="No changes detected. No restart needed.",
+                    fields=[{"name": "Git", "value": old[:12], "inline": True}],
+                    footer=f"Triggered by {ctx.author}",
                 )
+                await status_msg.edit(embed=ok_embed)
+                await self._log_to_discord(ok_embed, ctx.channel)
+                if self.logger:
+                    try:
+                        log_entry = self.logger.log_command(ctx, "selfupdate", "success", {"git": old[:12], "no_changes": True})
+                        await self._log_to_discord(self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx)), ctx.channel)
+                        self.logger.clear_command_context()
+                    except Exception:
+                        pass
                 if should_post_progress:
                     await self._post_or_edit_progress(
                         progress_msg,
@@ -4007,18 +5124,35 @@ echo "CHANGED_END"
                 return
             
             # Has changes - proceed with update message and restart
-            changed_block = "\n".join(str(x) for x in changed_sample[:15]) if changed_sample else "(none)"
-            await status_msg.edit(
-                content=(
-                    "✅ **RSAdminBot updated from GitHub (python-only).**\n"
-                    f"Git: `{old[:12]} -> {new[:12]}`\n"
-                    f"Python copied: `{py_count}` | Changed: `{changed_count}`\n"
-                    "Restarting RSAdminBot now to apply...\n"
-                    "```"
-                    f"\nChanged sample:\n{changed_block}"
-                    "\n```"
-                )[:1900]
+            fields = [
+                {"name": "Git", "value": f"{old[:12]} -> {new[:12]}", "inline": False},
+                {"name": "Python copied", "value": py_count, "inline": True},
+                {"name": "Changed", "value": changed_count, "inline": True},
+                {"name": "Next", "value": "Restarting service to apply", "inline": False},
+            ]
+            ok_embed = MessageHelper.create_success_embed(
+                title="Selfupdate Applied",
+                message="RSAdminBot updated from GitHub (python-only).",
+                fields=fields,
+                footer=f"Triggered by {ctx.author}",
             )
+            if changed_sample:
+                changed_block = "\n".join(str(x) for x in changed_sample[:15])
+                ok_embed.add_field(name="Changed sample (first 15)", value=f"```{changed_block[:900]}```", inline=False)
+            await status_msg.edit(embed=ok_embed)
+            await self._log_to_discord(ok_embed, ctx.channel)
+            if self.logger:
+                try:
+                    log_entry = self.logger.log_command(
+                        ctx,
+                        "selfupdate",
+                        "success",
+                        {"git_old": old[:12], "git_new": new[:12], "python_copied": py_count, "changed_count": changed_count},
+                    )
+                    await self._log_to_discord(self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx)), ctx.channel)
+                    self.logger.clear_command_context()
+                except Exception:
+                    pass
             if should_post_progress:
                 await self._post_or_edit_progress(
                     progress_msg,
@@ -4037,7 +5171,13 @@ echo "CHANGED_END"
         @commands.check(lambda ctx: self.is_admin(ctx.author))
         async def oraclefilesupdate(ctx):
             """Push a python-only snapshot of the live Ubuntu RS bot folders to neo-rs/oraclefiles (admin only)."""
-            status_msg = await ctx.send("📦 **OracleFiles sync**\n```\nRunning snapshot export + git push...\n```")
+            status_msg = await ctx.send(
+                embed=MessageHelper.create_info_embed(
+                    title="OracleFiles Sync",
+                    message="Running snapshot export + git push (python-only).",
+                    footer=f"Triggered by {ctx.author}",
+                )
+            )
             should_post_progress = not (await self._is_progress_channel(ctx.channel))
             progress_msg = None
             if should_post_progress:
@@ -4049,7 +5189,21 @@ echo "CHANGED_END"
             ok, stats = self._oraclefiles_sync_once(trigger="manual")
             if not ok:
                 err = str(stats.get("error") or "unknown error")
-                await status_msg.edit(content=f"❌ OracleFiles sync failed:\n```{err[:1200]}```")
+                error_embed = MessageHelper.create_error_embed(
+                    title="OracleFiles Sync Failed",
+                    message="OracleFiles sync failed.",
+                    error_details=err[:1200],
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await status_msg.edit(embed=error_embed)
+                await self._log_to_discord(error_embed, ctx.channel)
+                if self.logger:
+                    try:
+                        log_entry = self.logger.log_command(ctx, "oraclefilesupdate", "error", {"error": err[:1200]})
+                        await self._log_to_discord(self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx)), ctx.channel)
+                        self.logger.clear_command_context()
+                    except Exception:
+                        pass
                 if should_post_progress:
                     await self._post_or_edit_progress(progress_msg, f"[oraclefiles] MANUAL FAILED\n{err[:1600]}")
                 return
@@ -4059,70 +5213,39 @@ echo "CHANGED_END"
             no_changes = "YES" if str(stats.get("no_changes") or "").strip() else "NO"
             sample = stats.get("changed_sample") or []
 
-            msg = (
-                "✅ **OracleFiles sync complete**\n"
-                "```"
-                f"\nPushed: {pushed}"
-                f"\nNo changes: {no_changes}"
-                f"\nHead: {head}"
-                "```"
+            fields = [
+                {"name": "Pushed", "value": pushed, "inline": True},
+                {"name": "No changes", "value": no_changes, "inline": True},
+                {"name": "Head", "value": head, "inline": False},
+            ]
+            ok_embed = MessageHelper.create_success_embed(
+                title="OracleFiles Sync Complete",
+                message="OracleFiles snapshot pushed successfully.",
+                fields=fields,
+                footer=f"Triggered by {ctx.author}",
             )
             if sample:
-                msg += "\n**Changed files (sample):**\n```" + "\n".join(str(x) for x in sample[:40]) + "```"
-            await status_msg.edit(content=msg[:1900])
+                sample_txt = "\n".join(str(x) for x in sample[:40])
+                ok_embed.add_field(name="Changed files (sample)", value=f"```{sample_txt[:900]}```", inline=False)
+            await status_msg.edit(embed=ok_embed)
+            await self._log_to_discord(ok_embed, ctx.channel)
+            if self.logger:
+                try:
+                    log_entry = self.logger.log_command(
+                        ctx,
+                        "oraclefilesupdate",
+                        "success",
+                        {"pushed": pushed, "no_changes": no_changes, "head": head},
+                    )
+                    await self._log_to_discord(self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx)), ctx.channel)
+                    self.logger.clear_command_context()
+                except Exception:
+                    pass
             if should_post_progress:
                 await self._post_or_edit_progress(
                     progress_msg,
                     f"[oraclefiles] MANUAL OK\nPushed: {pushed}\nHead: {head}",
                 )
-
-        @self.bot.command(name="pushrsbots", aliases=["pushrsbotsupdate", "pushrsbotspush"])
-        @commands.check(lambda ctx: self.is_admin(ctx.author))
-        async def pushrsbots(ctx):
-            """Push python-only changes from live Ubuntu repo to neo-rs/rsbots GitHub (admin only)."""
-            status_msg = await ctx.send("📤 **RS Bots Push**\n```\nStaging changes + git push...\n```")
-            should_post_progress = not (await self._is_progress_channel(ctx.channel))
-            progress_msg = None
-            if should_post_progress:
-                progress_msg = await self._post_or_edit_progress(
-                    None,
-                    f"[pushrsbots] START",
-                )
-
-            ok, stats = self._rsbots_push_once()
-            if not ok:
-                err = str(stats.get("error") or "unknown error")
-                await status_msg.edit(content=f"❌ RS Bots push failed:\n```{err[:1200]}```")
-                if should_post_progress:
-                    await self._post_or_edit_progress(progress_msg, f"[pushrsbots] FAILED\n{err[:1600]}")
-                return
-
-            head = str(stats.get("head") or "")[:12]
-            old_head = str(stats.get("old_head") or "")[:12]
-            pushed = "YES" if str(stats.get("pushed") or "").strip() else "NO"
-            no_changes = "YES" if str(stats.get("no_changes") or "").strip() else "NO"
-            sample = stats.get("changed_sample") or []
-
-            msg = (
-                "✅ **RS Bots push complete**\n"
-                "```"
-                f"\nPushed: {pushed}"
-                f"\nNo changes: {no_changes}"
-            )
-            if old_head and pushed == "YES":
-                msg += f"\nGit: {old_head} -> {head}"
-            elif head:
-                msg += f"\nHead: {head}"
-            msg += "```"
-            if sample:
-                msg += "\n**Changed files (sample):**\n```" + "\n".join(str(x) for x in sample[:40]) + "```"
-            await status_msg.edit(content=msg[:1900])
-            if should_post_progress:
-                await self._post_or_edit_progress(
-                    progress_msg,
-                    f"[pushrsbots] OK\nPushed: {pushed}\nHead: {head}",
-                )
-        self.registered_commands.append(("pushrsbots", "Push changes to neo-rs/rsbots GitHub", True))
 
         @self.bot.command(name="systemcheck")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
@@ -4141,28 +5264,47 @@ echo "CHANGED_END"
                 user = server.get("user", "")
                 key = server.get("key", "")
                 key_exists = bool(key) and Path(str(key)).exists()
-
-                lines = [
-                    "🧭 **RSAdminBot System Check**",
-                    "```",
-                    f"os.name: {os_name}",
-                    f"platform: {plat}",
-                    f"cwd: {cwd}",
-                    f"remote_root: {remote_root or '(unset)'}",
-                    f"remote_root_exists: {remote_root_exists}",
-                    f"local_exec.config.enabled: {local_exec_cfg}",
-                    f"local_exec.active: {local_exec}",
-                    f"ssh.target: {user}@{host}" if host else "ssh.target: (none)",
-                    f"ssh.key: {key or '(none)'}",
-                    f"ssh.key.exists: {key_exists}",
-                    "```",
-                    "",
-                    "Decision:",
-                    f"- **Mode**: {'Ubuntu local-exec (no SSH key needed)' if local_exec else 'SSH mode (key required if not local)'}",
-                ]
-                await ctx.send("\n".join(lines)[:1900])
+                mode_txt = "Ubuntu local-exec (no SSH key needed)" if local_exec else "SSH mode (key required if not local)"
+                embed = MessageHelper.create_info_embed(
+                    title="System Check",
+                    message="Runtime + connectivity summary.",
+                    fields=[
+                        {"name": "OS", "value": f"{os_name} | {plat[:70]}", "inline": False},
+                        {"name": "cwd", "value": cwd[:100], "inline": False},
+                        {"name": "local_exec.config", "value": str(bool(local_exec_cfg)), "inline": True},
+                        {"name": "local_exec.active", "value": str(bool(local_exec)), "inline": True},
+                        {"name": "remote_root", "value": remote_root or "(unset)", "inline": False},
+                        {"name": "remote_root_exists", "value": str(bool(remote_root_exists)), "inline": True},
+                        {"name": "ssh.target", "value": f"{user}@{host}" if host else "(none)", "inline": True},
+                        {"name": "ssh.key.exists", "value": str(bool(key_exists)), "inline": True},
+                        {"name": "Decision", "value": mode_txt, "inline": False},
+                    ],
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
+                await self._log_to_discord(embed, ctx.channel)
+                if self.logger:
+                    try:
+                        log_entry = self.logger.log_command(
+                            ctx,
+                            "systemcheck",
+                            "success",
+                            {"local_exec": local_exec, "ssh_target": f"{user}@{host}" if host else "", "key_exists": key_exists},
+                        )
+                        await self._log_to_discord(self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx)), ctx.channel)
+                        self.logger.clear_command_context()
+                    except Exception:
+                        pass
             except Exception as e:
-                await ctx.send(f"❌ systemcheck failed: `{str(e)[:400]}`")
+                err_txt = str(e)[:400]
+                embed = MessageHelper.create_error_embed(
+                    title="System Check Failed",
+                    message="systemcheck failed.",
+                    error_details=err_txt,
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
+                await self._log_to_discord(embed, ctx.channel)
 
         @self.bot.command(name="secretsstatus")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
@@ -4652,9 +5794,43 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                     f"rsbots_code_head={head_code}",
                     f"live_tree_head={head_live}",
                 ]
-                await ctx.send("```text\n" + "\n".join(lines)[:1900] + "\n```")
+                payload = "\n".join(lines)
+                embed = MessageHelper.create_info_embed(
+                    title="Where Am I",
+                    message=self._codeblock(payload, limit=1800),
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
+                await self._log_to_discord(embed, ctx.channel)
+                if self.logger:
+                    try:
+                        log_entry = self.logger.log_command(
+                            ctx,
+                            "whereami",
+                            "success",
+                            {
+                                "cwd": cwd,
+                                "file": file_path,
+                                "local_exec": local_exec,
+                                "live_root": live_repo,
+                                "rsbots_code_head": head_code,
+                                "live_tree_head": head_live,
+                            },
+                        )
+                        await self._log_to_discord(self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx)), ctx.channel)
+                        self.logger.clear_command_context()
+                    except Exception:
+                        pass
             except Exception as e:
-                await ctx.send(f"❌ whereami failed: {str(e)[:300]}")
+                err_txt = str(e)[:300]
+                embed = MessageHelper.create_error_embed(
+                    title="whereami Failed",
+                    message="whereami failed.",
+                    error_details=err_txt,
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
+                await self._log_to_discord(embed, ctx.channel)
         
         # botscan removed: legacy scan/tree compare was removed entirely.
         
@@ -4664,22 +5840,43 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             """Get detailed information about a bot (admin only)"""
             # RS-only: exclude non-RS bots from botinfo
             if bot_name and not self._is_rs_bot(bot_name):
-                await ctx.send(f"❌ `{bot_name}` is not an RS bot. Bot info is only available for RS bots.")
+                embed = MessageHelper.create_error_embed(
+                    title="Unsupported Bot",
+                    message=f"`{bot_name}` is not an RS bot. Bot info is only available for RS bots.",
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
                 return
             
             if not INSPECTOR_AVAILABLE or not self.inspector:
-                await ctx.send("❌ Bot inspector not available")
+                embed = MessageHelper.create_error_embed(
+                    title="Bot Inspector Not Available",
+                    message="Bot inspector module is not loaded or initialized.",
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
                 return
             
             if not bot_name:
-                await ctx.send("❓ **Bot Name Required**\nPlease specify which bot to get information about.\nUse `!botlist` to see configured bots.")
+                embed = MessageHelper.create_warning_embed(
+                    title="Bot Name Required",
+                    message="Please specify which bot to get information about.",
+                    details="Usage: `!botinfo <bot>`",
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
                 return
             
             try:
                 bot_info = self.inspector.get_bot_info(bot_name)
                 
                 if not bot_info:
-                    await ctx.send(f"❌ Bot not found: {bot_name}")
+                    embed = MessageHelper.create_error_embed(
+                        title="Bot Not Found",
+                        message=f"Bot not found: `{bot_name}`",
+                        footer=f"Triggered by {ctx.author}",
+                    )
+                    await ctx.send(embed=embed)
                     return
                 
                 embed = discord.Embed(
@@ -4828,22 +6025,43 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             """Get config.json for a bot in user-friendly format (admin only)"""
             # RS-only: exclude non-RS bots from botconfig
             if bot_name and not self._is_rs_bot(bot_name):
-                await ctx.send(f"❌ `{bot_name}` is not an RS bot. Bot config is only available for RS bots.")
+                embed = MessageHelper.create_error_embed(
+                    title="Unsupported Bot",
+                    message=f"`{bot_name}` is not an RS bot. Bot config is only available for RS bots.",
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
                 return
             
             if not INSPECTOR_AVAILABLE or not self.inspector:
-                await ctx.send("❌ Bot inspector not available")
+                embed = MessageHelper.create_error_embed(
+                    title="Bot Inspector Not Available",
+                    message="Bot inspector module is not loaded or initialized.",
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
                 return
             
             if not bot_name:
-                await ctx.send("❓ **Bot Name Required**\nPlease specify which bot's config to view.\nUse `!botlist` to see configured bots.")
+                embed = MessageHelper.create_warning_embed(
+                    title="Bot Name Required",
+                    message="Please specify which bot's config to view.",
+                    details="Usage: `!botconfig <bot>`",
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
                 return
             
             try:
                 config = self.inspector.get_bot_config(bot_name)
                 
                 if not config:
-                    await ctx.send(f"❌ Bot not found or no config: {bot_name}")
+                    embed = MessageHelper.create_error_embed(
+                        title="Config Not Found",
+                        message=f"Bot not found or no config: `{bot_name}`",
+                        footer=f"Triggered by {ctx.author}",
+                    )
+                    await ctx.send(embed=embed)
                     return
                 
                 # Get bot display name
@@ -5274,7 +6492,13 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             print(f"{Colors.CYAN}[RunAllCommands] Server: {ctx.guild.name if ctx.guild else 'DM'} (ID: {ctx.guild.id if ctx.guild else 0}){Colors.RESET}\n")
             
             # Send initial status
-            status_msg = await ctx.send("🔄 **Running ALL commands...**\n```\nInitializing comprehensive test...\n```")
+            status_msg = await ctx.send(
+                embed=MessageHelper.create_info_embed(
+                    title="Run All Commands",
+                    message="Initializing comprehensive test...",
+                    footer=f"Triggered by {ctx.author}",
+                )
+            )
             
             results = {
                 "commands_executed": [],
@@ -5349,7 +6573,14 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             
             # 0.1 Run ping (check bot latency)
             print(f"{Colors.CYAN}[RunAllCommands] [0.1] Running !ping (check bot latency)...{Colors.RESET}")
-            await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Initialization: !ping (checking bot latency)...\n```")
+            await status_msg.edit(
+                content="",
+                embed=MessageHelper.create_info_embed(
+                    title="Run All Commands",
+                    message=f"[Phase {phase}] Initialization: !ping (checking bot latency)...",
+                    footer=f"Triggered by {ctx.author}",
+                ),
+            )
             success, error = await invoke_command_direct("ping")
             if success:
                 results["commands_executed"].append("ping")
@@ -5363,7 +6594,14 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             
             # 0.2 Run status (check bot readiness)
             print(f"{Colors.CYAN}[RunAllCommands] [0.2] Running !status (check bot readiness)...{Colors.RESET}")
-            await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Initialization: !status (checking bot readiness)...\n```")
+            await status_msg.edit(
+                content="",
+                embed=MessageHelper.create_info_embed(
+                    title="Run All Commands",
+                    message=f"[Phase {phase}] Initialization: !status (checking bot readiness)...",
+                    footer=f"Triggered by {ctx.author}",
+                ),
+            )
             success, error = await invoke_command_direct("status")
             if success:
                 results["commands_executed"].append("status")
@@ -5377,7 +6615,14 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             
             # 0.3 Run reload (reload configuration)
             print(f"{Colors.CYAN}[RunAllCommands] [0.3] Running !reload (reload configuration)...{Colors.RESET}")
-            await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Initialization: !reload (reloading configuration)...\n```")
+            await status_msg.edit(
+                content="",
+                embed=MessageHelper.create_info_embed(
+                    title="Run All Commands",
+                    message=f"[Phase {phase}] Initialization: !reload (reloading configuration)...",
+                    footer=f"Triggered by {ctx.author}",
+                ),
+            )
             success, error = await invoke_command_direct("reload")
             if success:
                 results["commands_executed"].append("reload")
@@ -5391,7 +6636,14 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             
             # 0.4 Run botlist (list all available bots)
             print(f"{Colors.CYAN}[RunAllCommands] [0.5] Running !botlist (list all bots)...{Colors.RESET}")
-            await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Initialization: !botlist (listing all bots)...\n```")
+            await status_msg.edit(
+                content="",
+                embed=MessageHelper.create_info_embed(
+                    title="Run All Commands",
+                    message=f"[Phase {phase}] Initialization: !botlist (listing all bots)...",
+                    footer=f"Triggered by {ctx.author}",
+                ),
+            )
             success, error = await invoke_command_direct("botlist")
             if success:
                 results["commands_executed"].append("botlist")
@@ -5405,7 +6657,14 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             
             # 0.6 Run setupmonitoring (setup test server monitoring channels)
             print(f"{Colors.CYAN}[RunAllCommands] [0.6] Running !setupmonitoring (setup monitoring channels)...{Colors.RESET}")
-            await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Initialization: !setupmonitoring (setting up monitoring channels)...\n```")
+            await status_msg.edit(
+                content="",
+                embed=MessageHelper.create_info_embed(
+                    title="Run All Commands",
+                    message=f"[Phase {phase}] Initialization: !setupmonitoring (setting up monitoring channels)...",
+                    footer=f"Triggered by {ctx.author}",
+                ),
+            )
             success, error = await invoke_command_direct("setupmonitoring")
             if success:
                 results["commands_executed"].append("setupmonitoring")
@@ -5425,7 +6684,14 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             
             # 1.1 Run botstatus for all bots
             print(f"{Colors.CYAN}[RunAllCommands] [1.1] Running !botstatus (all bots)...{Colors.RESET}")
-            await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Bot Management: !botstatus (all bots)...\n```")
+            await status_msg.edit(
+                content="",
+                embed=MessageHelper.create_info_embed(
+                    title="Run All Commands",
+                    message=f"[Phase {phase}] Bot Management: !botstatus (all bots)...",
+                    footer=f"Triggered by {ctx.author}",
+                ),
+            )
             success, error = await invoke_command_direct("botstatus")
             if success:
                 results["commands_executed"].append("botstatus (all)")
@@ -5440,7 +6706,14 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             # 1.2 Run botinfo for each bot
             print(f"{Colors.CYAN}[RunAllCommands] [1.2] Running !botinfo for each bot...{Colors.RESET}")
             for idx, bot_name in enumerate(bot_names, 1):
-                await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Bot Management: !botinfo {bot_name} ({idx}/{len(bot_names)})...\n```")
+                await status_msg.edit(
+                    content="",
+                    embed=MessageHelper.create_info_embed(
+                        title="Run All Commands",
+                        message=f"[Phase {phase}] Bot Management: !botinfo {bot_name} ({idx}/{len(bot_names)})...",
+                        footer=f"Triggered by {ctx.author}",
+                    ),
+                )
                 success, error = await invoke_command_direct("botinfo", bot_name=bot_name)
                 if success:
                     results["commands_executed"].append(f"botinfo ({bot_name})")
@@ -5455,7 +6728,14 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             # 1.3 Run botconfig for each bot
             print(f"{Colors.CYAN}[RunAllCommands] [1.3] Running !botconfig for each bot...{Colors.RESET}")
             for idx, bot_name in enumerate(bot_names, 1):
-                await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Bot Management: !botconfig {bot_name} ({idx}/{len(bot_names)})...\n```")
+                await status_msg.edit(
+                    content="",
+                    embed=MessageHelper.create_info_embed(
+                        title="Run All Commands",
+                        message=f"[Phase {phase}] Bot Management: !botconfig {bot_name} ({idx}/{len(bot_names)})...",
+                        footer=f"Triggered by {ctx.author}",
+                    ),
+                )
                 success, error = await invoke_command_direct("botconfig", bot_name=bot_name)
                 if success:
                     results["commands_executed"].append(f"botconfig ({bot_name})")
@@ -5477,7 +6757,14 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             
             # 3.1 Run whopscan (default: 2000 messages, 30 days)
             print(f"{Colors.CYAN}[RunAllCommands] [3.1] Running !whopscan (2000, 30)...{Colors.RESET}")
-            await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Whop: !whopscan (2000 messages, 30 days)...\n```")
+            await status_msg.edit(
+                content="",
+                embed=MessageHelper.create_info_embed(
+                    title="Run All Commands",
+                    message=f"[Phase {phase}] Whop: !whopscan (2000 messages, 30 days)...",
+                    footer=f"Triggered by {ctx.author}",
+                ),
+            )
             success, error = await invoke_command_direct("whopscan", limit=2000, days=30)
             if success:
                 results["commands_executed"].append("whopscan (2000, 30)")
@@ -5491,7 +6778,14 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             
             # 3.2 Run whopstats
             print(f"{Colors.CYAN}[RunAllCommands] [3.2] Running !whopstats...{Colors.RESET}")
-            await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Whop: !whopstats...\n```")
+            await status_msg.edit(
+                content="",
+                embed=MessageHelper.create_info_embed(
+                    title="Run All Commands",
+                    message=f"[Phase {phase}] Whop: !whopstats...",
+                    footer=f"Triggered by {ctx.author}",
+                ),
+            )
             success, error = await invoke_command_direct("whopstats")
             if success:
                 results["commands_executed"].append("whopstats")
@@ -5514,7 +6808,14 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             # 4.1 Run botmovements for each bot
             print(f"{Colors.CYAN}[RunAllCommands] [4.1] Running !botmovements for each bot...{Colors.RESET}")
             for idx, bot_name in enumerate(bot_names, 1):
-                await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Movements: !botmovements {bot_name} ({idx}/{len(bot_names)})...\n```")
+                await status_msg.edit(
+                    content="",
+                    embed=MessageHelper.create_info_embed(
+                        title="Run All Commands",
+                        message=f"[Phase {phase}] Movements: !botmovements {bot_name} ({idx}/{len(bot_names)})...",
+                        footer=f"Triggered by {ctx.author}",
+                    ),
+                )
                 success, error = await invoke_command_direct("botmovements", bot_name=bot_name, limit=50)
                 if success:
                     results["commands_executed"].append(f"botmovements ({bot_name})")
@@ -5537,7 +6838,14 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             # 4.1 Run botupdate for each bot
             print(f"{Colors.CYAN}[RunAllCommands] [4.1] Running !botupdate for each bot...{Colors.RESET}")
             for idx, bot_name in enumerate(bot_names, 1):
-                await status_msg.edit(content=f"🔄 **Running ALL commands...**\n```\n[Phase {phase}] Sync: !botupdate {bot_name} ({idx}/{len(bot_names)})...\n```")
+                await status_msg.edit(
+                    content="",
+                    embed=MessageHelper.create_info_embed(
+                        title="Run All Commands",
+                        message=f"[Phase {phase}] Sync: !botupdate {bot_name} ({idx}/{len(bot_names)})...",
+                        footer=f"Triggered by {ctx.author}",
+                    ),
+                )
                 success, error = await invoke_command_direct("botupdate", bot_name=bot_name)
                 if success:
                     results["commands_executed"].append(f"botupdate ({bot_name})")
@@ -5777,38 +7085,90 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
         async def delete_channel(ctx, *channel_mentions):
             """Delete channel(s) - use in channel to delete current channel, or mention channels to delete multiple (admin only)"""
             if not ctx.guild:
-                await ctx.send("❌ This command can only be used in a server")
+                embed = MessageHelper.create_error_embed(
+                    title="Server Only",
+                    message="This command can only be used in a server.",
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
                 return
             
             # If no mentions, delete current channel
             if not channel_mentions:
                 try:
-                    await ctx.send("🗑️ **Deleting this channel...**")
-                    await asyncio.sleep(1)
-                    await ctx.channel.delete()
+                    confirm_embed = MessageHelper.create_warning_embed(
+                        title="Deleting Channel",
+                        message="Deleting this channel in 2 seconds...",
+                        fields=[
+                            {"name": "Channel", "value": f"#{getattr(ctx.channel, 'name', 'unknown')}", "inline": True},
+                            {"name": "Channel ID", "value": str(getattr(ctx.channel, "id", "")), "inline": True},
+                        ],
+                        footer=f"Triggered by {ctx.author}",
+                    )
+                    confirm_msg = await ctx.send(embed=confirm_embed)
+                    await asyncio.sleep(2)
+                    await ctx.channel.delete(reason=f"Deleted by {ctx.author} via RSAdminBot")
+                    # Log success to log channel (reply channel no longer exists)
+                    try:
+                        await self._log_to_discord(confirm_embed, None)
+                    except Exception:
+                        pass
                 except discord.Forbidden:
-                    await ctx.send("❌ I don't have permission to delete this channel")
+                    try:
+                        err_embed = MessageHelper.create_error_embed(
+                            title="Delete Failed",
+                            message="I don't have permission to delete this channel.",
+                            footer=f"Triggered by {ctx.author}",
+                        )
+                        await confirm_msg.edit(embed=err_embed)
+                        await self._log_to_discord(err_embed, None)
+                    except:
+                        await ctx.send(embed=MessageHelper.create_error_embed("Delete Failed", "I don't have permission to delete this channel."))
+                except discord.HTTPException as e:
+                    try:
+                        err_embed = MessageHelper.create_error_embed(
+                            title="Delete Failed",
+                            message="Failed to delete channel.",
+                            error_details=str(e)[:200],
+                            footer=f"Triggered by {ctx.author}",
+                        )
+                        await confirm_msg.edit(embed=err_embed)
+                        await self._log_to_discord(err_embed, None)
+                    except:
+                        await ctx.send(embed=MessageHelper.create_error_embed("Delete Failed", "Failed to delete channel.", str(e)[:200]))
                 except Exception as e:
-                    await ctx.send(f"❌ Failed to delete channel: {str(e)[:200]}")
+                    try:
+                        err_embed = MessageHelper.create_error_embed(
+                            title="Delete Failed",
+                            message="Unexpected error while deleting channel.",
+                            error_details=str(e)[:200],
+                            footer=f"Triggered by {ctx.author}",
+                        )
+                        await confirm_msg.edit(embed=err_embed)
+                        await self._log_to_discord(err_embed, None)
+                    except:
+                        await ctx.send(embed=MessageHelper.create_error_embed("Delete Failed", "Unexpected error while deleting channel.", str(e)[:200]))
                 return
             
             # Parse channel mentions
             channels_to_delete = []
             for mention in channel_mentions:
                 try:
-                    channel = commands.TextChannelConverter().convert(ctx, mention)
-                    if channel.guild == ctx.guild:
+                    channel = await commands.TextChannelConverter().convert(ctx, mention)
+                    if channel and channel.guild == ctx.guild:
                         channels_to_delete.append(channel)
-                except:
-                    try:
-                        channel = await commands.TextChannelConverter().convert(ctx, mention)
-                        if channel.guild == ctx.guild:
-                            channels_to_delete.append(channel)
-                    except:
-                        pass
+                except commands.ChannelNotFound:
+                    pass
+                except Exception as e:
+                    pass
             
             if not channels_to_delete:
-                await ctx.send("❌ No valid channels found to delete")
+                embed = MessageHelper.create_error_embed(
+                    title="No Valid Channels",
+                    message="No valid channels found to delete. Use channel mentions like `#channel-name`.",
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
                 return
             
             # Delete channels
@@ -5816,19 +7176,28 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             failed = []
             for channel in channels_to_delete:
                 try:
-                    await channel.delete()
-                    deleted.append(channel.name)
+                    await channel.delete(reason=f"Deleted by {ctx.author} via RSAdminBot")
+                    deleted.append(f"`{channel.name}`")
                 except discord.Forbidden:
-                    failed.append(f"{channel.name} (no permission)")
+                    failed.append(f"`{channel.name}` (no permission)")
+                except discord.HTTPException as e:
+                    failed.append(f"`{channel.name}` ({str(e)[:50]})")
                 except Exception as e:
-                    failed.append(f"{channel.name} ({str(e)[:50]})")
+                    failed.append(f"`{channel.name}` ({str(e)[:50]})")
             
-            result_msg = "🗑️ **Channel Deletion Complete**\n"
+            fields = []
             if deleted:
-                result_msg += f"✅ Deleted: {', '.join(deleted)}\n"
+                fields.append({"name": "Deleted", "value": ", ".join(deleted)[:900], "inline": False})
             if failed:
-                result_msg += f"❌ Failed: {', '.join(failed)}"
-            await ctx.send(result_msg)
+                fields.append({"name": "Failed", "value": ", ".join(failed)[:900], "inline": False})
+            result_embed = MessageHelper.create_info_embed(
+                title="Channel Deletion Complete",
+                message="Deletion run finished.",
+                fields=fields or [{"name": "Result", "value": "No channels deleted.", "inline": False}],
+                footer=f"Triggered by {ctx.author}",
+            )
+            await ctx.send(embed=result_embed)
+            await self._log_to_discord(result_embed, None)
         self.registered_commands.append(("delete", "Delete channel(s)", True))
         
         @self.bot.command(name="transfer", aliases=["t"])
@@ -5836,16 +7205,21 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
         async def transfer_channel(ctx, channel_mention: str = None, category_mention: str = None):
             """Transfer a channel to another category - use channel mention and category mention (admin only)"""
             if not ctx.guild:
-                await ctx.send("❌ This command can only be used in a server")
+                embed = MessageHelper.create_error_embed(
+                    title="Server Only",
+                    message="This command can only be used in a server.",
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
                 return
             
             # If no arguments, show interactive selector
             if not channel_mention:
                 view = ChannelTransferView(self, ctx)
-                embed = discord.Embed(
-                    title="📦 Transfer Channel to Category",
-                    description="Select a channel and category from the dropdowns below:",
-                    color=discord.Color.blue()
+                embed = MessageHelper.create_info_embed(
+                    title="Transfer Channel",
+                    message="Select a channel and category from the dropdowns.",
+                    footer=f"Triggered by {ctx.author}",
                 )
                 await ctx.send(embed=embed, view=view)
                 return
@@ -5853,35 +7227,58 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             # Parse channel
             try:
                 channel = await commands.TextChannelConverter().convert(ctx, channel_mention)
-                if channel.guild != ctx.guild:
-                    await ctx.send("❌ Channel must be in this server")
+                if not channel or channel.guild != ctx.guild:
+                    await ctx.send(embed=MessageHelper.create_error_embed("Channel Not Found", "Channel not found or not in this server."))
                     return
-            except:
-                await ctx.send(f"❌ Channel not found: {channel_mention}")
+            except commands.ChannelNotFound:
+                await ctx.send(embed=MessageHelper.create_error_embed("Channel Not Found", f"Channel not found: {channel_mention}"))
+                return
+            except Exception as e:
+                await ctx.send(embed=MessageHelper.create_error_embed("Parse Error", "Error parsing channel.", str(e)[:200]))
                 return
             
             # Parse category
             if not category_mention:
-                await ctx.send("❌ Please provide a category name or mention")
+                await ctx.send(embed=MessageHelper.create_warning_embed(
+                    "Category Required",
+                    "Please provide a category name or mention.",
+                    details="Usage: `!transfer #channel CategoryName`",
+                    footer=f"Triggered by {ctx.author}",
+                ))
                 return
             
             try:
                 category = await commands.CategoryChannelConverter().convert(ctx, category_mention)
-                if category.guild != ctx.guild:
-                    await ctx.send("❌ Category must be in this server")
+                if not category or category.guild != ctx.guild:
+                    await ctx.send(embed=MessageHelper.create_error_embed("Category Not Found", "Category not found or not in this server."))
                     return
-            except:
-                await ctx.send(f"❌ Category not found: {category_mention}")
+            except commands.ChannelNotFound:
+                await ctx.send(embed=MessageHelper.create_error_embed("Category Not Found", f"Category not found: {category_mention}"))
+                return
+            except Exception as e:
+                await ctx.send(embed=MessageHelper.create_error_embed("Parse Error", "Error parsing category.", str(e)[:200]))
                 return
             
             # Transfer channel
             try:
-                await channel.edit(category=category)
-                await ctx.send(f"✅ **Channel Transferred**\n`{channel.name}` → `{category.name}`")
+                await channel.edit(category=category, reason=f"Transferred by {ctx.author} via RSAdminBot")
+                ok_embed = MessageHelper.create_success_embed(
+                    title="Channel Transferred",
+                    message=f"`{channel.name}` → `{category.name}`",
+                    fields=[
+                        {"name": "Channel", "value": f"#{channel.name}", "inline": True},
+                        {"name": "Category", "value": category.name, "inline": True},
+                    ],
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=ok_embed)
+                await self._log_to_discord(ok_embed, None)
             except discord.Forbidden:
-                await ctx.send("❌ I don't have permission to edit this channel")
+                await ctx.send(embed=MessageHelper.create_error_embed("Transfer Failed", "I don't have permission to edit this channel."))
+            except discord.HTTPException as e:
+                await ctx.send(embed=MessageHelper.create_error_embed("Transfer Failed", "Failed to transfer channel.", str(e)[:200]))
             except Exception as e:
-                await ctx.send(f"❌ Failed to transfer channel: {str(e)[:200]}")
+                await ctx.send(embed=MessageHelper.create_error_embed("Transfer Failed", "Unexpected error.", str(e)[:200]))
         self.registered_commands.append(("transfer", "Transfer channel to category", True))
         
         @self.bot.command(name="add", aliases=["a"])
@@ -5893,7 +7290,7 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             if transfer_cmd:
                 await ctx.invoke(transfer_cmd, channel_mention=channel_mention, category_mention=category_mention)
             else:
-                await ctx.send("❌ Transfer command not found")
+                await ctx.send(embed=MessageHelper.create_error_embed("Command Missing", "Transfer command not found."))
         self.registered_commands.append(("add", "Add channel to category", True))
         
         @self.bot.command(name="botdiagnose")
