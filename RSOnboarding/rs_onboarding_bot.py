@@ -653,11 +653,12 @@ class RSOnboardingBot:
                             context=f"grant_member_and_close - {source}"
                         )
 
-                # Re-resolve channel from storage
-                ch = None
-                data = self.ticket_data.get(str(member.id))
-                if data:
-                    ch = await self.safe_get_channel(guild, data.get("channel_id"))
+                # Prefer the passed-in channel (button/cleanup paths), otherwise resolve from storage.
+                ch = channel
+                if ch is None:
+                    data = self.ticket_data.get(str(member.id))
+                    if data:
+                        ch = await self.safe_get_channel(guild, data.get("channel_id"))
 
                 # Best-effort message + delete if channel exists
                 if ch:
@@ -681,9 +682,10 @@ class RSOnboardingBot:
                             )
 
                 # Clean storage regardless of channel existence (match original)
-                    self.ticket_data.pop(str(member.id), None)
+                removed = self.ticket_data.pop(str(member.id), None)
+                if removed is not None:
                     self.save_tickets()
-                    
+
                     print(f"{Colors.GREEN}[Success] Ticket closed for {member.name}{Colors.RESET}")
                     await self.log_action(
                         guild,
@@ -1533,27 +1535,16 @@ class RSOnboardingBot:
                 await self.send_member_granted_dm(after, source="on_member_update")
 
                 # If they became a Member while a ticket exists, close it immediately
-                # Use lock to prevent duplicate closes if button was clicked
+                # grant_member_and_close() already locks per-user; do not lock here (asyncio.Lock is not re-entrant).
                 if str(after.id) in self.ticket_data:
-                    async with self._close_locks[after.id]:
-                        # Double-check ticket still exists (might have been closed by button)
-                        if str(after.id) in self.ticket_data:
-                            await self.log_action(
-                                guild,
-                                f"Closing ticket for {after.mention} (Member role added)",
-                                log_type="info",
-                                member=after,
-                                source="on_member_update"
-                            )
-                            await self.grant_member_and_close(after, None, source="member_role_added")
-                        else:
-                            await self.log_action(
-                                guild,
-                                f"Skipped duplicate close - ticket already closed for {after.mention}",
-                                log_type="info",
-                                member=after,
-                                source="on_member_update"
-                            )
+                    await self.log_action(
+                        guild,
+                        f"Closing ticket for {after.mention} (Member role added)",
+                        log_type="info",
+                        member=after,
+                        source="on_member_update"
+                    )
+                    await self.grant_member_and_close(after, None, source="member_role_added")
         
         @self.bot.event
         async def on_member_join(member):
