@@ -14,8 +14,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from rsbots_manifest import (
+    DEFAULT_EXCLUDE_GLOBS,
+    DEFAULT_INCLUDE_GLOBS,
     DEFAULT_RS_BOT_FOLDERS,
     compare_manifests,
+    generate_manifest,
 )
 
 
@@ -70,49 +73,81 @@ def _summarize_diff(diff: Dict) -> Dict[str, Dict[str, int]]:
     return out
 
 
-def _should_skip_dir(name: str) -> bool:
-    return name in {"__pycache__", ".git", ".venv", "venv"} or name.startswith(".staging-")
+_SKIP_DIR_PARTS = {"__pycache__", ".git", ".venv", "venv"}
 
 
-def _sha256_text_normalized(path: Path) -> str:
-    """SHA256 over text content with EOL normalized to LF, so Windows CRLF doesn't cause false mismatches."""
-    b = path.read_bytes()
-    # Normalize EOLs: CRLF -> LF and lone CR -> LF
-    b = b.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-    import hashlib
-
-    return hashlib.sha256(b).hexdigest()
+def _should_skip_any_part(p: Path) -> bool:
+    for part in p.parts:
+        if part in _SKIP_DIR_PARTS or part.startswith(".staging-"):
+            return True
+    return False
 
 
-def _generate_py_manifest_text_normalized(repo_root: Path, bot_folders: List[str]) -> Dict:
-    repo_root = Path(repo_root).resolve()
-    out: Dict = {
-        "repo_root": str(repo_root),
-        "bot_folders": bot_folders,
-        "files": {},
-    }
-
+def _iter_json_files(snapshot_root: Path, bot_folders: List[str]) -> List[Path]:
+    out: List[Path] = []
     for folder in bot_folders:
-        base = repo_root / folder
+        base = snapshot_root / folder
         if not base.exists():
-            out["files"][folder] = {"__missing__": True}
             continue
-        files: Dict[str, str] = {}
-        for p in base.rglob("*.py"):
+        for p in base.rglob("*.json"):
             if p.is_dir():
                 continue
-            if any(_should_skip_dir(part) for part in p.parts):
+            if _should_skip_any_part(p):
                 continue
             rel = p.relative_to(base).as_posix()
-            # The live snapshot excludes original_files, so ignore it on both sides.
             if rel.startswith("original_files/"):
                 continue
-            # Local-only helper; not part of the Ubuntu snapshot comparison.
-            if folder == "RSAdminBot" and rel == "compare_oraclefiles_snapshot.py":
-                continue
-            files[rel] = _sha256_text_normalized(p)
-        out["files"][folder] = files
+            out.append(p)
+    return out
 
+
+def _find_bot_token_hits(snapshot_root: Path, bot_folders: List[str], *, max_bytes: int = 5_000_000) -> List[str]:
+    """Return relative paths of JSON files in snapshot that appear to contain a bot_token key."""
+    hits: List[str] = []
+    for p in _iter_json_files(snapshot_root, bot_folders):
+        try:
+            size = p.stat().st_size
+            if size <= 0:
+                continue
+            if size > max_bytes:
+                # Avoid scanning huge JSON files (still should not contain bot_token).
+                continue
+            b = p.read_bytes()
+            if b.find(b'"bot_token"') != -1:
+                hits.append(p.relative_to(snapshot_root).as_posix())
+        except Exception:
+            continue
+    return hits
+
+
+def _runtime_json_visibility(snapshot_root: Path, bot_folders: List[str]) -> Dict[str, Dict[str, int]]:
+    """Summarize non-config JSON files present in the snapshot (proof runtime data exists/changes)."""
+    allow_names = {"config.json", "messages.json", "vouch_config.json"}
+    out: Dict[str, Dict[str, int]] = {}
+    for folder in bot_folders:
+        base = snapshot_root / folder
+        if not base.exists():
+            out[folder] = {"count": 0, "bytes": 0}
+            continue
+        total_count = 0
+        total_bytes = 0
+        for p in base.rglob("*.json"):
+            if p.is_dir():
+                continue
+            if _should_skip_any_part(p):
+                continue
+            rel = p.relative_to(base).as_posix()
+            if rel.startswith("original_files/"):
+                continue
+            if p.name in allow_names or p.name == "config.secrets.json":
+                continue
+            try:
+                sz = p.stat().st_size
+            except Exception:
+                continue
+            total_count += 1
+            total_bytes += max(0, int(sz))
+        out[folder] = {"count": total_count, "bytes": total_bytes}
     return out
 
 
@@ -120,7 +155,7 @@ def main() -> int:
     repo_root = REPO_ROOT
 
     ap = argparse.ArgumentParser(
-        description="Compare local mirror-world python files against the latest neo-rs/oraclefiles py_snapshot (SHA256)."
+        description="Compare local mirror-world syncable files against the latest neo-rs/oraclefiles snapshot (SHA256, text-normalized)."
     )
     ap.add_argument(
         "--oraclefiles-dir",
@@ -130,7 +165,7 @@ def main() -> int:
     ap.add_argument(
         "--oraclefiles-repo",
         default="https://github.com/neo-rs/oraclefiles.git",
-        help="Git URL for oraclefiles (public HTTPS recommended).",
+        help="Git URL for oraclefiles (private supported; use SSH or HTTPS with credentials).",
     )
     ap.add_argument(
         "--folders",
@@ -148,13 +183,38 @@ def main() -> int:
     oracle_dir = Path(args.oraclefiles_dir).resolve()
     _ensure_oraclefiles_repo(oracle_dir, args.oraclefiles_repo)
 
-    snapshot_root = oracle_dir / "py_snapshot"
+    snapshot_root = oracle_dir / "snapshot"
     if not snapshot_root.exists():
-        print(f"ERROR: oraclefiles repo has no py_snapshot/: {snapshot_root}", file=sys.stderr)
+        print(f"ERROR: oraclefiles repo has no snapshot/: {snapshot_root}", file=sys.stderr)
         return 2
 
-    local_manifest = _generate_py_manifest_text_normalized(repo_root=repo_root, bot_folders=list(args.folders))
-    snapshot_manifest = _generate_py_manifest_text_normalized(repo_root=snapshot_root, bot_folders=list(args.folders))
+    bot_folders = list(args.folders)
+
+    # Match the oraclefiles snapshot behavior: original_files is intentionally excluded.
+    exclude_globs = list(DEFAULT_EXCLUDE_GLOBS) + ["original_files/*", "original_files/**"]
+
+    # Security check: snapshot must not include bot_token-bearing JSON.
+    hits = _find_bot_token_hits(snapshot_root, bot_folders)
+    if hits:
+        print("SECURITY: bot_token found in snapshot JSON files (this should never happen):", file=sys.stderr)
+        for p in hits[:30]:
+            print(f"- {p}", file=sys.stderr)
+        return 3
+
+    local_manifest = generate_manifest(
+        repo_root=repo_root,
+        bot_folders=bot_folders,
+        include_globs=list(DEFAULT_INCLUDE_GLOBS),
+        exclude_globs=exclude_globs,
+        normalize_text_eol=True,
+    )
+    snapshot_manifest = generate_manifest(
+        repo_root=snapshot_root,
+        bot_folders=bot_folders,
+        include_globs=list(DEFAULT_INCLUDE_GLOBS),
+        exclude_globs=exclude_globs,
+        normalize_text_eol=True,
+    )
 
     diff = compare_manifests(local_manifest, snapshot_manifest)
     summary = _summarize_diff(diff)
@@ -165,7 +225,7 @@ def main() -> int:
             changed_any = True
             break
 
-    print("COMPARE: local mirror-world vs oraclefiles/py_snapshot (python-only)")
+    print("COMPARE: local mirror-world vs oraclefiles/snapshot (syncable files)")
     print(f"local_repo_root={repo_root}")
     print(f"oraclefiles_dir={oracle_dir}")
     print(f"snapshot_root={snapshot_root}")
@@ -180,7 +240,7 @@ def main() -> int:
     print("")
 
     if not changed_any:
-        print("RESULT: OK (all compared *.py files match by SHA256).")
+        print("RESULT: OK (all compared syncable files match by SHA256).")
     else:
         print("RESULT: NOT IN SYNC (details below).")
         # print up to a small limit per folder for quick scanning
@@ -206,16 +266,24 @@ def main() -> int:
                 for p in os_[:30]:
                     print(f"    - {p}")
 
+    # Runtime JSON visibility (not compared for equality; used to confirm data exists/changes on Ubuntu).
+    runtime = _runtime_json_visibility(snapshot_root, bot_folders)
+    print("")
+    print("Runtime JSON visibility in snapshot (non-config JSON only):")
+    for folder in sorted(runtime):
+        d = runtime[folder]
+        print(f"- {folder}: json_files={d['count']} bytes={d['bytes']}")
+
     if args.write_report:
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         docs = repo_root / "docs"
         docs.mkdir(parents=True, exist_ok=True)
-        base = docs / f"COMPARE_RSBOTS_VS_ORACLEFILES_{ts}"
+        base = docs / f"COMPARE_RSBOTS_VS_ORACLEFILES_SNAPSHOT_{ts}"
 
         (base.with_suffix(".json")).write_text(json.dumps(diff, indent=2), encoding="utf-8")
 
         md_lines = [
-            "# Compare: mirror-world vs oraclefiles py_snapshot (python-only)",
+            "# Compare: mirror-world vs oraclefiles snapshot (syncable files)",
             "",
             f"- local_repo_root: `{repo_root}`",
             f"- oraclefiles_dir: `{oracle_dir}`",

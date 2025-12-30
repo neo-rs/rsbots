@@ -3192,8 +3192,13 @@ echo "TARGET=$TARGET"
     def _get_oraclefiles_sync_config(self) -> Dict[str, Any]:
         """Return OracleFiles snapshot sync config.
 
-        This feature publishes a python-only snapshot of the live Ubuntu bot code to:
+        This feature publishes a bots-only snapshot of the live Ubuntu bot folders to:
           https://github.com/neo-rs/oraclefiles  (repo should exist)
+
+        Snapshot rules (safety):
+        - Never include config.secrets.json
+        - Never include key material (*.key/*.pem/*.ppk)
+        - Never include any *.json that contains the key "bot_token"
 
         Recommended config:
         - config.json (non-secret):
@@ -3239,7 +3244,7 @@ echo "TARGET=$TARGET"
             }
 
     def _oraclefiles_sync_once(self, trigger: str = "manual") -> Tuple[bool, Dict[str, Any]]:
-        """Create/update oraclefiles repo and push a python-only snapshot (live Ubuntu -> GitHub)."""
+        """Create/update oraclefiles repo and push a bots-only snapshot (live Ubuntu -> GitHub)."""
         cfg = self._get_oraclefiles_sync_config()
         if not cfg.get("enabled"):
             return False, {"error": "oraclefiles_sync is disabled (enable it in RSAdminBot/config.json)."}
@@ -3261,7 +3266,7 @@ echo "TARGET=$TARGET"
         live_root = str(getattr(self, "remote_root", "") or "/home/rsadmin/bots/mirror-world")
         trigger_txt = (trigger or "manual").strip().lower()
 
-        folders = " ".join(shlex.quote(x) for x in include)
+        folders_arr = " ".join(shlex.quote(x) for x in include)
         cmd = f"""
 set -euo pipefail
 
@@ -3273,6 +3278,8 @@ DEPLOY_KEY={shlex.quote(deploy_key)}
 TRIGGER={shlex.quote(trigger_txt)}
 
 command -v git >/dev/null 2>&1 || {{ echo \"ERR=git_missing\"; exit 2; }}
+test -f \"$DEPLOY_KEY\" || {{ echo \"ERR=deploy_key_missing\"; echo \"DEPLOY_KEY=$DEPLOY_KEY\"; exit 2; }}
+test -d \"$LIVE_ROOT\" || {{ echo \"ERR=live_root_missing\"; echo \"LIVE_ROOT=$LIVE_ROOT\"; exit 2; }}
 
 # Ensure GitHub SSH host key can be accepted non-interactively.
 # Use a dedicated known_hosts file and `accept-new` so the first connection pins the key.
@@ -3294,7 +3301,7 @@ fi
 cd \"$REPO_DIR\"
 git config user.name \"RSAdminBot\"
 git config user.email \"rsadminbot@users.noreply.github.com\"
-git fetch origin || true
+git fetch origin
 
 if git show-ref --verify --quiet \"refs/remotes/origin/$BRANCH\"; then
   git checkout -B \"$BRANCH\" \"origin/$BRANCH\"
@@ -3303,14 +3310,59 @@ else
   git checkout -B \"$BRANCH\"
 fi
 
-rm -rf py_snapshot
-mkdir -p py_snapshot
+rm -rf snapshot py_snapshot
+mkdir -p snapshot
 
 cd \"$LIVE_ROOT\"
-TMP0=/tmp/mw_oraclefiles_py_list.bin
+TMP0=/tmp/mw_oraclefiles_snapshot_list.bin
 rm -f \"$TMP0\"
-find {folders} -type f -name \"*.py\" ! -path \"RSAdminBot/original_files/*\" -print0 > \"$TMP0\"
-tar --null -T \"$TMP0\" -cf - | (cd \"$REPO_DIR/py_snapshot\" && tar -xf -)
+
+# Snapshot scope (bots-only) comes from include_folders.
+FOLDERS=({folders_arr})
+VALID_FOLDERS=()
+for d in \"${{FOLDERS[@]}}\"; do
+  if [ -d \"$LIVE_ROOT/$d\" ]; then
+    VALID_FOLDERS+=(\"$d\")
+  else
+    echo \"WARN_MISSING_FOLDER=$d\"
+  fi
+done
+if [ ${{#VALID_FOLDERS[@]}} -eq 0 ]; then
+  echo \"ERR=no_valid_folders\"
+  exit 2
+fi
+
+# Detect forbidden DB artifacts (visibility without uploading them).
+DB_HITS=$(find \"${{VALID_FOLDERS[@]}}\" -type f \\( -name \"*.db\" -o -name \"*.sqlite\" -o -name \"*.sqlite3\" \\) 2>/dev/null | head -n 10 || true)
+if [ -n \"$DB_HITS\" ]; then
+  echo \"WARN_FORBIDDEN_DB_FILES=1\"
+  echo \"$DB_HITS\" | while IFS= read -r ln; do echo \"WARN_DB_FILE=$ln\"; done
+fi
+
+# Build a null-delimited file list of all files, excluding secrets and junk.
+find \"${{VALID_FOLDERS[@]}}\" -type f \
+  ! -path \"*/.git/*\" \
+  ! -path \"*/__pycache__/*\" \
+  ! -path \"*/.venv/*\" \
+  ! -path \"*/venv/*\" \
+  ! -path \"RSAdminBot/original_files/*\" \
+  ! -name \"*.pyc\" \
+  ! -name \"*.log\" \
+  ! -name \"config.secrets.json\" \
+  ! -name \"*.key\" ! -name \"*.pem\" ! -name \"*.ppk\" \
+  ! -name \"*.db\" ! -name \"*.sqlite\" ! -name \"*.sqlite3\" \
+  -print0 \
+| while IFS= read -r -d '' f; do
+    # Extra safety: skip any JSON that appears to include bot_token.
+    if [[ \"$f\" == *.json ]]; then
+      if grep -a -q '\"bot_token\"' \"$f\" 2>/dev/null; then
+        continue
+      fi
+    fi
+    printf '%s\\0' \"$f\"
+  done > \"$TMP0\"
+
+tar --null -T \"$TMP0\" -cf - | (cd \"$REPO_DIR/snapshot\" && tar -xf -)
 
 cd \"$REPO_DIR\"
 git add -A
@@ -3323,7 +3375,7 @@ if git diff --cached --quiet; then
 fi
 
 TS=$(date +%Y%m%d_%H%M%S)
-git commit -m \"oraclefiles py_snapshot: $TS trigger=$TRIGGER\" >/dev/null
+git commit -m \"oraclefiles snapshot: $TS trigger=$TRIGGER\" >/dev/null
 
 git push origin \"$BRANCH\" >/dev/null
 
@@ -3339,7 +3391,8 @@ echo \"CHANGED_END\"
         out = (stdout or "").strip()
         err = (stderr or "").strip()
         if not ok:
-            return False, {"error": (err or out or "oraclefiles sync failed")[:1600]}
+            combined = "\n".join([x for x in (err, out) if x]).strip()
+            return False, {"error": (combined or "oraclefiles sync failed")[-1600:]}
 
         stats: Dict[str, Any] = {"raw": out[-1600:]}
         in_changed = False
@@ -6003,11 +6056,11 @@ echo "CHANGED_END"
         @self.bot.command(name="oraclefilesupdate", aliases=["oraclefilespush", "oraclepush"])
         @commands.check(lambda ctx: self.is_admin(ctx.author))
         async def oraclefilesupdate(ctx):
-            """Push a python-only snapshot of the live Ubuntu RS bot folders to neo-rs/oraclefiles (admin only)."""
+            """Push a bots-only snapshot of the live Ubuntu RS bot folders to neo-rs/oraclefiles (admin only)."""
             status_msg = await ctx.send(
                 embed=MessageHelper.create_info_embed(
                     title="OracleFiles Sync",
-                    message="Running snapshot export + git push (python-only).",
+                    message="Running snapshot export + git push (bots-only; excludes secrets).",
                     footer=f"Triggered by {ctx.author}",
                 )
             )
