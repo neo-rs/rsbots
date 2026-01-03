@@ -1576,39 +1576,47 @@ class RSSuccessBot:
                 # Create main embed
                 embed = discord.Embed(
                     title=f"{rocket_emoji} Reselling Secrets — Success Points System",
-                    description="This is an automated system that rewards **REAL wins** shared in the community.\nAll activity is logged and monitored to keep things fair.",
+                    description="Turn your real wins into real rewards.\n\nEvery verified success you share earns points — tracked automatically, reviewed fairly, and redeemable for free membership time.",
                     color=self.get_embed_color(),
                     timestamp=datetime.now(timezone.utc)
                 )
                 
-                # Where You Can Earn Points
+                # Where You Earn Points
                 embed.add_field(
-                    name=f"{eye_emoji} Where You Can Earn Points",
-                    value=f"Post a **valid success image** in ANY of the following channels:\n{success_channels.strip()}",
+                    name=f"{eye_emoji} Where You Earn Points",
+                    value=f"Post a REAL success image in any official success channel:\n\n{success_channels.strip()}",
                     inline=False
                 )
                 
-                # How Points Are Earned
-                points_earned_text = (
-                    f"• **1 valid success image = +1 Success Point**\n"
-                    f"• The bot reacts with {reaction_emoji} and confirms your updated total\n"
-                    f"• Admins may adjust points when necessary\n\n"
-                    f"📸 **Image Required**\n"
-                    f"If you post **without an image**:\n"
-                    f"• Your message will be removed\n"
-                    f"• You will receive an automatic reminder"
+                # How Points Work
+                points_work_text = (
+                    f"• 1 valid success image = +1 Success Point\n"
+                    f"• Bot reacts with {reaction_emoji} and confirms your updated total\n"
+                    f"• Admins may adjust points when necessary"
                 )
                 embed.add_field(
-                    name=f"{trophy_emoji} How Points Are Earned",
-                    value=points_earned_text,
+                    name=f"{trophy_emoji} How Points Work",
+                    value=points_work_text,
+                    inline=False
+                )
+                
+                # Image Required
+                image_required_text = (
+                    "No image = no points.\n\n"
+                    "• Messages without images are removed\n"
+                    "• You'll receive an automatic reminder"
+                )
+                embed.add_field(
+                    name="📸 Image Required",
+                    value=image_required_text,
                     inline=False
                 )
                 
                 # Duplicates & Abuse
                 abuse_text = (
-                    "• Reposting the same image (even re-uploaded) earns **NO points**\n"
+                    "• Reposting the same image earns NO points\n"
                     "• Duplicate images are detected automatically\n"
-                    "• Splitting one success into multiple posts is **not allowed**\n"
+                    "• Splitting one success into multiple posts is not allowed\n"
                     "• Abuse may result in point removal or a full reset"
                 )
                 embed.add_field(
@@ -1620,20 +1628,35 @@ class RSSuccessBot:
                 # Redemption Rewards
                 embed.add_field(
                     name=f"{love_emoji} Redemption Rewards",
-                    value=f"Use **`/rsredeeminfo`** to redeem your points.\n{redemption_tiers_text.strip()}\n\n⚠ Points are **NOT** automatically deducted. All redemptions require **staff approval**.",
+                    value=f"Redeem using /rsredeeminfo\n\n{redemption_tiers_text.strip()}\n\n⚠ Points are NOT auto-deducted. All redemptions require staff approval.",
                     inline=False
                 )
                 
+                # How to Redeem (Step-by-Step)
+                redeem_steps_text = (
+                    "1️⃣ Run /rsredeeminfo\n"
+                    "2️⃣ View your points + rewards\n"
+                    "3️⃣ Click a reward button\n"
+                    "4️⃣ A ticket is created automatically\n"
+                    "5️⃣ Staff reviews and applies your reward"
+                )
+                embed.add_field(
+                    name="▶️ How to Redeem (Step-by-Step)",
+                    value=redeem_steps_text,
+                    inline=False
+                )
+                
+                # Set GIF image for redemption guide
+                image_url = self.config.get("redemption_info_image_url")
+                if image_url:
+                    embed.set_image(url=image_url)
+                
                 # Member Slash Commands
                 commands_text = (
-                    "`/rspoints`\n"
-                    "• Check your current points (private)\n\n"
-                    "`/rsleaderboard`\n"
-                    "• View the Top 10 members by points\n\n"
-                    "`/rshelp`\n"
-                    "• View the full system rules and explanation\n\n"
-                    "`/rsredeeminfo`\n"
-                    "• Redeem points and create a redemption ticket"
+                    "/rspoints        → Check your points (private)\n"
+                    "/rsleaderboard   → Top 10 members\n"
+                    "/rshelp          → Full system guide\n"
+                    "/rsredeeminfo    → Redeem rewards"
                 )
                 embed.add_field(
                     name=f"{flag_emoji} Member Slash Commands",
@@ -1648,7 +1671,7 @@ class RSSuccessBot:
                     inline=False
                 )
                 
-                embed.set_footer(text=footer_text)
+                embed.set_footer(text=f"{footer_text} • Earn. Share. Get Rewarded.")
                 
                 await target_channel.send(embed=embed)
                 
