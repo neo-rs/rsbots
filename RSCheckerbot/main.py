@@ -65,6 +65,7 @@ INVITE_CHANNEL_ID = INVITE_CONFIG.get("invite_channel_id")
 FALLBACK_INVITE = INVITE_CONFIG.get("fallback_invite", "")
 WHOP_LOGS_CHANNEL_ID = INVITE_CONFIG.get("whop_logs_channel_id")
 WHOP_WEBHOOK_CHANNEL_ID = INVITE_CONFIG.get("whop_webhook_channel_id")
+DISCORD_WEBHOOK_URL = INVITE_CONFIG.get("discord_webhook_url", "")
 GHL_API_KEY = INVITE_CONFIG.get("ghl_api_key", "")
 GHL_LOCATION_ID = INVITE_CONFIG.get("ghl_location_id", "")
 GHL_CF_DISCORD_USERNAME = INVITE_CONFIG.get("ghl_cf_discord_username", "")
@@ -95,6 +96,7 @@ INVITES_FILE = BASE_DIR / "invites.json"
 MESSAGES_FILE = BASE_DIR / "messages.json"
 SETTINGS_FILE = BASE_DIR / "settings.json"
 MEMBER_HISTORY_FILE = BASE_DIR / "member_history.json"
+WHOP_WEBHOOK_RAW_LOG_FILE = BASE_DIR / "whop_webhook_raw_payloads.json"
 
 # Message order keys
 DAY_KEYS = ["day_1", "day_2", "day_3", "day_4", "day_5", "day_6", "day_7a", "day_7b"]
@@ -246,6 +248,35 @@ def save_json(path: Path, data: dict) -> None:
 def save_all():
     save_json(QUEUE_FILE, queue_state)
     save_json(REGISTRY_FILE, registry)
+
+def _save_raw_webhook_payload(payload: dict, headers: dict = None):
+    """Save raw webhook payload to JSON file for inspection"""
+    try:
+        # Load existing payloads
+        if WHOP_WEBHOOK_RAW_LOG_FILE.exists():
+            with open(WHOP_WEBHOOK_RAW_LOG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            data = {"payloads": []}
+        
+        # Add new payload with timestamp
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "payload": payload,
+            "headers": dict(headers) if headers else {}
+        }
+        data["payloads"].append(entry)
+        
+        # Keep last 1000 entries to avoid file bloat
+        data["payloads"] = data["payloads"][-1000:]
+        
+        # Save to file
+        with open(WHOP_WEBHOOK_RAW_LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        
+        log.info(f"Saved raw webhook payload to {WHOP_WEBHOOK_RAW_LOG_FILE.name}")
+    except Exception as e:
+        log.error(f"Failed to save raw webhook payload: {e}")
 
 # -----------------------------
 # Member History Helpers
@@ -781,15 +812,59 @@ async def handle_create_invite(request):
         log.error(f"Error handling invite request: {e}")
         return web.json_response({"error": str(e)}, status=500)
 
+async def handle_whop_webhook_receiver(request):
+    """Receive Whop webhook payloads, log them, and forward to Discord"""
+    try:
+        # Get raw payload
+        if request.content_type == 'application/json':
+            payload = await request.json()
+        else:
+            # Try form data
+            form_data = await request.post()
+            payload = dict(form_data)
+        
+        # Get headers (for debugging)
+        headers = dict(request.headers)
+        
+        # Log the raw payload
+        _save_raw_webhook_payload(payload, headers)
+        log.info(f"Received Whop webhook payload (saved to {WHOP_WEBHOOK_RAW_LOG_FILE.name})")
+        
+        # Forward to Discord webhook if URL is configured
+        if not DISCORD_WEBHOOK_URL:
+            log.warning("Discord webhook URL not configured - payload logged but not forwarded")
+            return web.Response(text="OK (logged, not forwarded - no webhook URL)", status=200)
+        
+        # Forward to Discord webhook
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                DISCORD_WEBHOOK_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            ) as resp:
+                if resp.status == 200 or resp.status == 204:
+                    log.info(f"Forwarded webhook to Discord successfully (status: {resp.status})")
+                    return web.Response(text="OK", status=200)
+                else:
+                    error_text = await resp.text()
+                    log.error(f"Failed to forward webhook to Discord (status: {resp.status}): {error_text}")
+                    return web.Response(text=f"Forward failed: {error_text}", status=500)
+    
+    except Exception as e:
+        log.error(f"Error handling webhook receiver: {e}", exc_info=True)
+        return web.Response(text=f"Error: {str(e)}", status=500)
+
 async def init_http_server():
-    """Initialize the HTTP server for invite creation."""
+    """Initialize the HTTP server for invite creation and Whop webhook receiver."""
     app = web.Application()
     app.router.add_post("/create-invite", handle_create_invite)
+    app.router.add_post("/whop-webhook", handle_whop_webhook_receiver)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", HTTP_SERVER_PORT)
     await site.start()
     log.info(f"HTTP server started on port {HTTP_SERVER_PORT}")
+    log.info(f"Whop webhook receiver: http://0.0.0.0:{HTTP_SERVER_PORT}/whop-webhook")
 
 # -----------------------------
 # Cross-bot communication checks

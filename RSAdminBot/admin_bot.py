@@ -7112,11 +7112,11 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             if stats.get("total_members", 0) == 0:
                 embed.add_field(
                     name="ℹ️ Note",
-                    value="**Database is empty.** Run `!whopscan` first to scan the whop-logs channel and populate membership data.",
+                    value="**No membership data found.** Run `!whopscan` first to scan the whop-logs channel and populate membership data.",
                     inline=False
                 )
             
-            embed.set_footer(text="Data source: whop_history.db | Run !whopscan to update")
+            embed.set_footer(text="Data source: whop_history.json | Run !whopscan to update")
             await ctx.send(embed=embed)
         
         @self.bot.command(name="whophistory")

@@ -8,12 +8,11 @@ Scans whop-logs channel (1076440941814091787) to extract:
 - Cancellations
 - Membership duration
 
-Stores data in SQLite + JSON files.
+Stores data in JSON files only (CANONICAL_RULES compliant).
 """
 
 import os
 import json
-import sqlite3
 import re
 import time
 from pathlib import Path
@@ -55,59 +54,46 @@ class WhopTracker:
         self.data_dir = Path(__file__).parent / "whop_data"
         self.data_dir.mkdir(exist_ok=True)
         
-        # Database path
-        self.db_path = self.data_dir / "whop_history.db"
+        # JSON storage path
+        self.json_path = self.data_dir / "whop_history.json"
         
         # Scan history file
         self.scan_history_path = self.data_dir / "whop_scan_history.json"
-        
-        # Initialize database
-        self._init_db()
     
-    def _init_db(self):
-        """Initialize SQLite database for membership history."""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        
-        # Membership events table
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS membership_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                discord_id TEXT NOT NULL,
-                discord_username TEXT,
-                whop_key TEXT,
-                access_pass TEXT,
-                name TEXT,
-                email TEXT,
-                membership_status TEXT,
-                event_type TEXT,
-                message_id INTEGER UNIQUE,
-                timestamp TEXT NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Membership timeline (for duration tracking)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS membership_timeline (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                discord_id TEXT NOT NULL,
-                started_at TEXT NOT NULL,
-                ended_at TEXT,
-                duration_days INTEGER,
-                status TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Indexes
-        c.execute("CREATE INDEX IF NOT EXISTS idx_discord_id ON membership_events(discord_id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON membership_events(timestamp)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_event_type ON membership_events(event_type)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_timeline_discord_id ON membership_timeline(discord_id)")
-        
-        conn.commit()
-        conn.close()
+    def _load_json(self) -> dict:
+        """Load whop_history.json, return default structure if missing"""
+        if not self.json_path.exists():
+            return {
+                "membership_events": [],
+                "membership_timeline": []
+            }
+        try:
+            with open(self.json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                # Ensure required keys exist
+                if "membership_events" not in data:
+                    data["membership_events"] = []
+                if "membership_timeline" not in data:
+                    data["membership_timeline"] = []
+                return data
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"[WARN] Failed to load whop_history.json: {e}")
+            return {
+                "membership_events": [],
+                "membership_timeline": []
+            }
+    
+    def _save_json(self, data: dict) -> None:
+        """Save data to whop_history.json"""
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            # Use atomic write (write to temp file, then replace)
+            tmp_path = self.json_path.with_suffix(self.json_path.suffix + ".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            tmp_path.replace(self.json_path)
+        except Exception as e:
+            print(f"[ERROR] Failed to save whop_history.json: {e}")
     
     def _parse_whop_message(self, message: discord.Message) -> Optional[Dict]:
         """Parse whop log message to extract membership data."""
@@ -170,58 +156,80 @@ class WhopTracker:
             return "new"
     
     def _store_membership_event(self, event_data: Dict):
-        """Store membership event in database."""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
+        """Store membership event in JSON file."""
+        data = self._load_json()
+        events = data["membership_events"]
         
-        try:
-            c.execute("""
-                INSERT OR IGNORE INTO membership_events 
-                (discord_id, discord_username, whop_key, access_pass, name, email, 
-                 membership_status, event_type, message_id, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                event_data.get("discord_id"),
-                event_data.get("discord_username"),
-                event_data.get("whop_key"),
-                event_data.get("access_pass"),
-                event_data.get("name"),
-                event_data.get("email"),
-                event_data.get("membership_status"),
-                event_data.get("event_type"),
-                event_data.get("message_id"),
-                event_data.get("timestamp")
-            ))
-            conn.commit()
-        except sqlite3.IntegrityError:
-            pass  # Already exists
-        finally:
-            conn.close()
+        # Check if message_id already exists (uniqueness check)
+        message_id = event_data.get("message_id")
+        if message_id:
+            if any(e.get("message_id") == message_id for e in events):
+                return  # Already exists
+        
+        # Auto-increment id (max existing id + 1, or start at 1)
+        next_id = 1
+        if events:
+            next_id = max(e.get("id", 0) for e in events) + 1
+        
+        # Add created_at if not present
+        created_at = event_data.get("created_at")
+        if not created_at:
+            created_at = datetime.now(timezone.utc).isoformat()
+        
+        # Create event record
+        event_record = {
+            "id": next_id,
+            "discord_id": event_data.get("discord_id"),
+            "discord_username": event_data.get("discord_username"),
+            "whop_key": event_data.get("whop_key"),
+            "access_pass": event_data.get("access_pass"),
+            "name": event_data.get("name"),
+            "email": event_data.get("email"),
+            "membership_status": event_data.get("membership_status"),
+            "event_type": event_data.get("event_type"),
+            "message_id": message_id,
+            "timestamp": event_data.get("timestamp"),
+            "created_at": created_at
+        }
+        
+        events.append(event_record)
+        data["membership_events"] = events
+        self._save_json(data)
     
     def _update_membership_timeline(self):
         """Update membership timeline for duration tracking."""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
+        data = self._load_json()
+        events = data.get("membership_events", [])
+        timeline = []
         
-        # Get all events grouped by user, ordered by timestamp
-        c.execute("""
-            SELECT discord_id, event_type, timestamp
-            FROM membership_events
-            ORDER BY discord_id, timestamp ASC
-        """)
-        
+        # Group events by user
         events_by_user = defaultdict(list)
-        for discord_id, event_type, timestamp in c.fetchall():
-            events_by_user[discord_id].append((event_type, timestamp))
+        for event in events:
+            discord_id = event.get("discord_id")
+            if discord_id:
+                events_by_user[discord_id].append((
+                    event.get("event_type"),
+                    event.get("timestamp")
+                ))
+        
+        # Sort events by timestamp for each user
+        for discord_id in events_by_user:
+            events_by_user[discord_id].sort(key=lambda x: x[1] or "")
         
         # Build timeline
-        for discord_id, events in events_by_user.items():
+        next_timeline_id = 1
+        if data.get("membership_timeline"):
+            existing_ids = [t.get("id", 0) for t in data["membership_timeline"] if t.get("id")]
+            if existing_ids:
+                next_timeline_id = max(existing_ids) + 1
+        
+        for discord_id, events_list in events_by_user.items():
             # Find start (new) and end (cancellation/completed) events
             started_at = None
             ended_at = None
             status = "active"
             
-            for event_type, timestamp in events:
+            for event_type, timestamp in events_list:
                 if event_type == "new" and not started_at:
                     started_at = timestamp
                 elif event_type in ["cancellation", "completed"]:
@@ -238,21 +246,20 @@ class WhopTracker:
                     except (ValueError, AttributeError):
                         pass
                 
-                # Store/update timeline
-                c.execute("""
-                    INSERT OR REPLACE INTO membership_timeline
-                    (discord_id, started_at, ended_at, duration_days, status)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (
-                    discord_id,
-                    started_at,
-                    ended_at,
-                    duration_days,
-                    status
-                ))
+                timeline_entry = {
+                    "id": next_timeline_id,
+                    "discord_id": discord_id,
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                    "duration_days": duration_days,
+                    "status": status,
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                }
+                timeline.append(timeline_entry)
+                next_timeline_id += 1
         
-        conn.commit()
-        conn.close()
+        data["membership_timeline"] = timeline
+        self._save_json(data)
     
     async def scan_whop_logs(self, limit: int = 2000, lookback_days: int = 30, progress_callback=None) -> Dict:
         """
@@ -359,92 +366,67 @@ class WhopTracker:
     
     def get_membership_stats(self) -> Dict:
         """Get membership statistics."""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
+        data = self._load_json()
+        events = data.get("membership_events", [])
+        timeline = data.get("membership_timeline", [])
         
         stats = {}
         
-        # Total members
-        c.execute("SELECT COUNT(DISTINCT discord_id) FROM membership_events")
-        stats["total_members"] = c.fetchone()[0]
+        # Total members (distinct discord_ids)
+        unique_members = set(e.get("discord_id") for e in events if e.get("discord_id"))
+        stats["total_members"] = len(unique_members)
         
         # New members
-        c.execute("SELECT COUNT(*) FROM membership_events WHERE event_type = 'new'")
-        stats["new_members"] = c.fetchone()[0]
+        stats["new_members"] = sum(1 for e in events if e.get("event_type") == "new")
         
         # Renewals
-        c.execute("SELECT COUNT(*) FROM membership_events WHERE event_type = 'renewal'")
-        stats["renewals"] = c.fetchone()[0]
+        stats["renewals"] = sum(1 for e in events if e.get("event_type") == "renewal")
         
         # Cancellations
-        c.execute("SELECT COUNT(*) FROM membership_events WHERE event_type = 'cancellation'")
-        stats["cancellations"] = c.fetchone()[0]
+        stats["cancellations"] = sum(1 for e in events if e.get("event_type") == "cancellation")
         
         # Average duration
-        c.execute("SELECT AVG(duration_days) FROM membership_timeline WHERE duration_days IS NOT NULL")
-        avg_duration = c.fetchone()[0]
-        stats["avg_duration_days"] = round(avg_duration, 2) if avg_duration else None
+        durations = [t.get("duration_days") for t in timeline if t.get("duration_days") is not None]
+        if durations:
+            avg_duration = sum(durations) / len(durations)
+            stats["avg_duration_days"] = round(avg_duration, 2)
+        else:
+            stats["avg_duration_days"] = None
         
         # Active memberships
-        c.execute("SELECT COUNT(*) FROM membership_timeline WHERE status = 'active'")
-        stats["active_memberships"] = c.fetchone()[0]
+        stats["active_memberships"] = sum(1 for t in timeline if t.get("status") == "active")
         
-        conn.close()
         return stats
     
     def get_user_history(self, discord_id: str) -> Dict:
         """Get membership history for a specific user."""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
+        data = self._load_json()
+        events = data.get("membership_events", [])
+        timeline = data.get("membership_timeline", [])
         
-        # Get all events for user
-        c.execute("""
-            SELECT discord_id, discord_username, whop_key, access_pass, name, email,
-                   membership_status, event_type, message_id, timestamp
-            FROM membership_events
-            WHERE discord_id = ?
-            ORDER BY timestamp ASC
-        """, (discord_id,))
+        # Filter events by discord_id
+        user_events = [e for e in events if e.get("discord_id") == discord_id]
+        user_events.sort(key=lambda x: x.get("timestamp") or "")
         
-        events = []
-        for row in c.fetchall():
-            events.append({
-                "discord_id": row[0],
-                "discord_username": row[1],
-                "whop_key": row[2],
-                "access_pass": row[3],
-                "name": row[4],
-                "email": row[5],
-                "membership_status": row[6],
-                "event_type": row[7],
-                "message_id": row[8],
-                "timestamp": row[9]
+        # Filter timeline by discord_id
+        user_timeline = [t for t in timeline if t.get("discord_id") == discord_id]
+        user_timeline.sort(key=lambda x: x.get("started_at") or "", reverse=True)
+        
+        # Remove id fields from timeline for response (keep structure consistent)
+        timeline_response = []
+        for t in user_timeline:
+            timeline_response.append({
+                "started_at": t.get("started_at"),
+                "ended_at": t.get("ended_at"),
+                "duration_days": t.get("duration_days"),
+                "status": t.get("status")
             })
-        
-        # Get timeline
-        c.execute("""
-            SELECT started_at, ended_at, duration_days, status
-            FROM membership_timeline
-            WHERE discord_id = ?
-            ORDER BY started_at DESC
-        """, (discord_id,))
-        
-        timeline = []
-        for row in c.fetchall():
-            timeline.append({
-                "started_at": row[0],
-                "ended_at": row[1],
-                "duration_days": row[2],
-                "status": row[3]
-            })
-        
-        conn.close()
         
         return {
             "discord_id": discord_id,
-            "events": events,
-            "timeline": timeline,
-            "total_events": len(events),
-            "total_periods": len(timeline)
+            "events": user_events,
+            "timeline": timeline_response,
+            "total_events": len(user_events),
+            "total_periods": len(user_timeline)
         }
 
