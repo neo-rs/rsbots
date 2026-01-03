@@ -1038,6 +1038,12 @@ class RSSuccessBot:
         @commands.has_permissions(manage_messages=True)
         async def add_points(ctx: commands.Context, member: discord.Member, amount: int):
             """Add points to a member (Admin only)"""
+            # Delete user's command message
+            try:
+                await ctx.message.delete()
+            except Exception:
+                pass
+            
             if amount <= 0:
                 embed = discord.Embed(
                     title=self.get_message("invalid_amount.title"),
@@ -1096,6 +1102,12 @@ class RSSuccessBot:
         @commands.has_permissions(manage_messages=True)
         async def remove_points(ctx: commands.Context, member: discord.Member, amount: int):
             """Remove points from a member (Admin only)"""
+            # Delete user's command message
+            try:
+                await ctx.message.delete()
+            except Exception:
+                pass
+            
             if amount <= 0:
                 embed = discord.Embed(
                     title=self.get_message("invalid_amount.title"),
@@ -1159,6 +1171,12 @@ class RSSuccessBot:
         @commands.has_permissions(manage_messages=True)
         async def check_points(ctx: commands.Context, member: discord.Member):
             """Check points for a specific user (Admin only)"""
+            # Delete user's command message
+            try:
+                await ctx.message.delete()
+            except Exception:
+                pass
+            
             user_points = self.get_user_points(member.id)
             
             embed = discord.Embed(
@@ -1180,6 +1198,12 @@ class RSSuccessBot:
         @commands.has_permissions(manage_messages=True)
         async def set_points(ctx: commands.Context, member: discord.Member, amount: int):
             """Set exact points for a member (Admin only)"""
+            # Delete user's command message
+            try:
+                await ctx.message.delete()
+            except Exception:
+                pass
+            
             if amount < 0:
                 embed = discord.Embed(
                     title=self.get_message("invalid_amount.title"),
@@ -1657,9 +1681,9 @@ class RSSuccessBot:
         
         @self.bot.command(name='removetier')
         @commands.has_permissions(manage_messages=True)
-        async def remove_tier(ctx: commands.Context, tier_name: str):
+        async def remove_tier(ctx: commands.Context, *, tier_name: str):
             """Remove a redemption tier by name (Admin only)
-            Usage: !removetier "Tier Name"
+            Usage: !removetier "Tier Name" or !removetier Tier Name
             """
             tiers = self.config.get("redemption_tiers", [])
             if not tiers:

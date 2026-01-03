@@ -132,6 +132,44 @@ class TierNavigationView(ui.View):
         modal = TierDescriptionModal(self.bot_instance, self.current_tier_index)
         await interaction.response.send_modal(modal)
     
+    @ui.button(label="Delete Tier", style=discord.ButtonStyle.danger, row=0)
+    async def delete_tier(self, interaction: discord.Interaction, button: ui.Button):
+        """Delete the current tier"""
+        tiers = self.bot_instance.config.get("redemption_tiers", [])
+        if self.current_tier_index >= len(tiers):
+            await interaction.response.send_message("❌ Invalid tier index.", ephemeral=True)
+            return
+        
+        removed_tier = tiers.pop(self.current_tier_index)
+        self.bot_instance.config["redemption_tiers"] = tiers
+        self.bot_instance.save_config()
+        
+        # If we deleted the last tier, go back to main menu
+        if not tiers:
+            view = TierEditorView(self.bot_instance)
+            embed = view.get_main_embed()
+            await interaction.response.send_message(
+                f"✅ Successfully deleted tier: **{removed_tier.get('name')}**\n\nNo tiers remaining. Returning to main menu.",
+                ephemeral=True
+            )
+            await interaction.followup.edit_message(interaction.message.id, embed=embed, view=view)
+            return
+        
+        # Adjust index if we deleted the last tier
+        if self.current_tier_index >= len(tiers):
+            self.current_tier_index = len(tiers) - 1
+        
+        # Update view to show next tier
+        embed = self.get_tier_embed(self.current_tier_index)
+        await interaction.response.send_message(
+            f"✅ Successfully deleted tier: **{removed_tier.get('name')}** ({removed_tier.get('points_required')} points)",
+            ephemeral=True
+        )
+        try:
+            await interaction.followup.edit_message(interaction.message.id, embed=embed, view=self)
+        except:
+            pass
+    
     @ui.button(label="◀ Previous", style=discord.ButtonStyle.secondary, row=1)
     async def prev_tier(self, interaction: discord.Interaction, button: ui.Button):
         """Go to previous tier"""
