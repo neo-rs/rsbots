@@ -1571,68 +1571,79 @@ class RSSuccessBot:
             # Get footer text from config
             footer_text = self.config.get("footer_text", "Reselling Secrets Staff")
             
-            # Build and send embed guide
+            # Build and send embed guide as separate messages
             try:
-                # Create main embed
-                embed = discord.Embed(
+                # Message 1: Title + Description
+                embed1 = discord.Embed(
                     title=f"{rocket_emoji} Reselling Secrets — Success Points System",
                     description="Turn your real wins into real rewards.\n\nEvery verified success you share earns points — tracked automatically, reviewed fairly, and redeemable for free membership time.",
                     color=self.get_embed_color(),
                     timestamp=datetime.now(timezone.utc)
                 )
+                await target_channel.send(embed=embed1)
                 
-                # Where You Earn Points
-                embed.add_field(
-                    name=f"{eye_emoji} Where You Earn Points",
-                    value=f"Post a REAL success image in any official success channel:\n\n{success_channels.strip()}",
-                    inline=False
+                # Message 2: Where You Earn Points
+                embed2 = discord.Embed(
+                    title=f"{eye_emoji} Where You Earn Points",
+                    description=f"Post a REAL success image in any official success channel:\n\n{success_channels.strip()}",
+                    color=self.get_embed_color(),
+                    timestamp=datetime.now(timezone.utc)
                 )
+                await target_channel.send(embed=embed2)
                 
-                # How Points Work
+                # Message 3: How Points Work
                 points_work_text = (
                     f"• 1 valid success image = +1 Success Point\n"
                     f"• Bot reacts with {reaction_emoji} and confirms your updated total\n"
                     f"• Admins may adjust points when necessary"
                 )
-                embed.add_field(
-                    name=f"{trophy_emoji} How Points Work",
-                    value=points_work_text,
-                    inline=False
+                embed3 = discord.Embed(
+                    title=f"{trophy_emoji} How Points Work",
+                    description=points_work_text,
+                    color=self.get_embed_color(),
+                    timestamp=datetime.now(timezone.utc)
                 )
+                await target_channel.send(embed=embed3)
                 
-                # Image Required
+                # Message 4: Image Required
                 image_required_text = (
                     "No image = no points.\n\n"
                     "• Messages without images are removed\n"
                     "• You'll receive an automatic reminder"
                 )
-                embed.add_field(
-                    name="📸 Image Required",
-                    value=image_required_text,
-                    inline=False
+                embed4 = discord.Embed(
+                    title="📸 Image Required",
+                    description=image_required_text,
+                    color=self.get_embed_color(),
+                    timestamp=datetime.now(timezone.utc)
                 )
+                await target_channel.send(embed=embed4)
                 
-                # Duplicates & Abuse
+                # Message 5: Duplicates & Abuse
                 abuse_text = (
                     "• Reposting the same image earns NO points\n"
                     "• Duplicate images are detected automatically\n"
                     "• Splitting one success into multiple posts is not allowed\n"
                     "• Abuse may result in point removal or a full reset"
                 )
-                embed.add_field(
-                    name=f"{gun_emoji} Duplicates & Abuse",
-                    value=abuse_text,
-                    inline=False
+                embed5 = discord.Embed(
+                    title=f"{gun_emoji} Duplicates & Abuse",
+                    description=abuse_text,
+                    color=self.get_embed_color(),
+                    timestamp=datetime.now(timezone.utc)
                 )
+                await target_channel.send(embed=embed5)
                 
-                # Redemption Rewards
-                embed.add_field(
-                    name=f"{love_emoji} Redemption Rewards",
-                    value=f"Redeem using /rsredeeminfo\n\n{redemption_tiers_text.strip()}\n\n⚠ Points are NOT auto-deducted. All redemptions require staff approval.",
-                    inline=False
+                # Message 6: Redemption Rewards
+                embed6 = discord.Embed(
+                    title=f"{love_emoji} Redemption Rewards",
+                    description=f"Redeem using /rsredeeminfo\n\n{redemption_tiers_text.strip()}\n\n⚠ Points are NOT auto-deducted. All redemptions require staff approval.",
+                    color=self.get_embed_color(),
+                    timestamp=datetime.now(timezone.utc)
                 )
+                await target_channel.send(embed=embed6)
                 
-                # How to Redeem (Step-by-Step)
+                # Message 7: How to Redeem (Step-by-Step) with GIF
                 redeem_steps_text = (
                     "1️⃣ Run /rsredeeminfo\n"
                     "2️⃣ View your points + rewards\n"
@@ -1640,40 +1651,42 @@ class RSSuccessBot:
                     "4️⃣ A ticket is created automatically\n"
                     "5️⃣ Staff reviews and applies your reward"
                 )
-                embed.add_field(
-                    name="▶️ How to Redeem (Step-by-Step)",
-                    value=redeem_steps_text,
-                    inline=False
+                embed7 = discord.Embed(
+                    title="▶️ How to Redeem (Step-by-Step)",
+                    description=redeem_steps_text,
+                    color=self.get_embed_color(),
+                    timestamp=datetime.now(timezone.utc)
                 )
-                
                 # Set GIF image for redemption guide
                 image_url = self.config.get("redemption_info_image_url")
                 if image_url:
-                    embed.set_image(url=image_url)
+                    embed7.set_image(url=image_url)
+                await target_channel.send(embed=embed7)
                 
-                # Member Slash Commands
+                # Message 8: Member Slash Commands
                 commands_text = (
                     "/rspoints        → Check your points (private)\n"
                     "/rsleaderboard   → Top 10 members\n"
                     "/rshelp          → Full system guide\n"
                     "/rsredeeminfo    → Redeem rewards"
                 )
-                embed.add_field(
-                    name=f"{flag_emoji} Member Slash Commands",
-                    value=commands_text,
-                    inline=False
+                embed8 = discord.Embed(
+                    title=f"{flag_emoji} Member Slash Commands",
+                    description=commands_text,
+                    color=self.get_embed_color(),
+                    timestamp=datetime.now(timezone.utc)
                 )
+                embed8.set_footer(text=f"{footer_text} • Earn. Share. Get Rewarded.")
+                await target_channel.send(embed=embed8)
                 
-                # Membership Role Notice
-                embed.add_field(
-                    name=f"{gun_emoji} Membership Role Notice",
-                    value="If your membership role is removed, your success points may reset to **0**.\nIf this happens by mistake, contact staff immediately.",
-                    inline=False
+                # Message 9: Membership Role Notice
+                embed9 = discord.Embed(
+                    title=f"{gun_emoji} Membership Role Notice",
+                    description="If your membership role is removed, your success points may reset to **0**.\nIf this happens by mistake, contact staff immediately.",
+                    color=self.get_embed_color(),
+                    timestamp=datetime.now(timezone.utc)
                 )
-                
-                embed.set_footer(text=f"{footer_text} • Earn. Share. Get Rewarded.")
-                
-                await target_channel.send(embed=embed)
+                await target_channel.send(embed=embed9)
                 
                 embed = discord.Embed(
                     title="✅ Points Guide Posted",
