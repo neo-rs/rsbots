@@ -1546,7 +1546,30 @@ class RSSuccessBot:
                     redemption_tiers_text=redemption_tiers_text.strip()
                 )
                 
-                await target_channel.send(guide_content)
+                # Split message if it's too long (Discord limit is 2000 characters)
+                # Split by double newlines (sections) to keep formatting intact
+                max_length = 2000
+                if len(guide_content) <= max_length:
+                    await target_channel.send(guide_content)
+                else:
+                    # Split into chunks, trying to break at section boundaries
+                    sections = guide_content.split("\n\n━━━━━━━━━━━━━━━━━━━━━━\n")
+                    current_message = sections[0]  # First section (header)
+                    
+                    for i, section in enumerate(sections[1:], 1):
+                        section_with_divider = "\n\n━━━━━━━━━━━━━━━━━━━━━━\n" + section
+                        
+                        # If adding this section would exceed limit, send current and start new
+                        if len(current_message) + len(section_with_divider) > max_length:
+                            await target_channel.send(current_message)
+                            current_message = section_with_divider
+                        else:
+                            current_message += section_with_divider
+                    
+                    # Send remaining content
+                    if current_message:
+                        await target_channel.send(current_message)
+                
                 embed = discord.Embed(
                     title="✅ Points Guide Posted",
                     description=f"Successfully posted points guide to {target_channel.mention}",
