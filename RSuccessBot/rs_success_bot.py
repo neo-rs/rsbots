@@ -985,9 +985,10 @@ class RSSuccessBot:
         
         @self.bot.tree.command(name="rshelp", description="Learn how the success points system works")
         async def help_slash(interaction: discord.Interaction):
+            reaction_emoji = self.config.get("reaction_emoji", "🤑")
             embed = discord.Embed(
                 title=self.get_message("help_member.title"),
-                description=self.get_message("help_member.description"),
+                description=self.get_message("help_member.description", reaction_emoji=reaction_emoji),
                 color=self.get_embed_color(),
                 timestamp=datetime.now(timezone.utc)
             )
@@ -1009,11 +1010,17 @@ class RSSuccessBot:
                 await interaction.response.send_message(embed=embed, ephemeral=True)
                 return
             
-            # Build tier list text
+            # Build tier list text with better clarity
             redeem_tiers_text = ""
             for tier in tiers:
                 can_afford = "✅" if current_points >= tier['points_required'] else "❌"
-                redeem_tiers_text += f"{can_afford} **{tier['name']}** - {tier['points_required']} points\n"
+                points_needed = tier['points_required'] - current_points
+                
+                if current_points >= tier['points_required']:
+                    redeem_tiers_text += f"{can_afford} **{tier['name']}** - {tier['points_required']} points\n"
+                else:
+                    redeem_tiers_text += f"{can_afford} **{tier['name']}** - {tier['points_required']} points (Need {points_needed} more)\n"
+                
                 redeem_tiers_text += f"   {tier.get('description', 'No description')}\n\n"
             
             embed = discord.Embed(
@@ -1497,6 +1504,62 @@ class RSSuccessBot:
                 )
             
             await ctx.send(embed=embed)
+
+        @self.bot.command(name='postpointsguide')
+        @commands.has_permissions(manage_messages=True)
+        async def post_points_guide(ctx: commands.Context, channel: discord.TextChannel = None):
+            """Post the points guide to a channel (Admin only)
+            Usage: !postpointsguide [channel]
+            If no channel is specified, posts to current channel.
+            """
+            target_channel = channel or ctx.channel
+            
+            # Build success channels list
+            success_channel_ids = self.config.get("success_channel_ids", [])
+            success_channels = ""
+            for ch_id in success_channel_ids:
+                ch = ctx.guild.get_channel(ch_id)
+                if ch:
+                    success_channels += f"• {ch.mention}\n"
+            
+            if not success_channels:
+                success_channels = "• No success channels configured"
+            
+            # Build redemption tiers list
+            tiers = self.config.get("redemption_tiers", [])
+            redemption_tiers_text = ""
+            for tier in tiers:
+                redemption_tiers_text += f"• **{tier['points_required']} points**  → <a:rsmoneyrain:910339595797925898> {tier['name']}\n"
+            
+            if not redemption_tiers_text:
+                redemption_tiers_text = "• No redemption tiers configured yet."
+            
+            # Get reaction emoji
+            reaction_emoji = self.config.get("reaction_emoji", "🤑")
+            
+            # Build and send message
+            try:
+                guide_content = self.get_message(
+                    "points_guide.content",
+                    success_channels=success_channels.strip(),
+                    reaction_emoji=reaction_emoji,
+                    redemption_tiers_text=redemption_tiers_text.strip()
+                )
+                
+                await target_channel.send(guide_content)
+                embed = discord.Embed(
+                    title="✅ Points Guide Posted",
+                    description=f"Successfully posted points guide to {target_channel.mention}",
+                    color=discord.Color.green(),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                await ctx.send(embed=embed, delete_after=10)
+            except KeyError:
+                await ctx.send("❌ Points guide message not found in messages.json. Please update messages.json on the server.", delete_after=10)
+            except discord.Forbidden:
+                await ctx.send(f"❌ Missing permissions to send messages in {target_channel.mention}", delete_after=10)
+            except Exception as e:
+                await ctx.send(f"❌ Failed to post guide: {str(e)}", delete_after=10)
 
         @self.bot.command(name="listsuccesschannels")
         @commands.has_permissions(manage_messages=True)
@@ -2008,6 +2071,7 @@ class RSSuccessBot:
         @edit_messages.error
         @scan_history.error
         @import_history.error
+        @post_points_guide.error
         async def admin_command_error(ctx: commands.Context, error: commands.CommandError):
             if isinstance(error, commands.MissingPermissions):
                 embed = discord.Embed(
