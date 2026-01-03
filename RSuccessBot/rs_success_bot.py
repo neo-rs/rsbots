@@ -1033,6 +1033,10 @@ class RSSuccessBot:
                 color=self.get_embed_color(),
                 timestamp=datetime.now(timezone.utc)
             )
+            # Set image from config if available
+            image_url = self.config.get("redemption_info_image_url")
+            if image_url:
+                embed.set_image(url=image_url)
             embed.set_footer(text=self.get_message("redemption_ticket_intro.footer"))
             
             view = self.RedemptionView(self, interaction.user)
@@ -1045,11 +1049,15 @@ class RSSuccessBot:
         @commands.has_permissions(manage_messages=True)
         async def add_points(ctx: commands.Context, member: discord.Member, amount: int):
             """Add points to a member (Admin only)"""
-            # Delete user's command message
+            # Delete user's command message immediately
             try:
                 await ctx.message.delete()
-            except Exception:
-                pass
+            except discord.Forbidden:
+                print(f"{Colors.YELLOW}[Warning] Cannot delete message in channel {ctx.channel.id} - missing permissions{Colors.RESET}")
+            except discord.NotFound:
+                pass  # Message already deleted
+            except Exception as e:
+                print(f"{Colors.YELLOW}[Warning] Failed to delete message: {e}{Colors.RESET}")
             
             if amount <= 0:
                 embed = discord.Embed(
@@ -1109,11 +1117,15 @@ class RSSuccessBot:
         @commands.has_permissions(manage_messages=True)
         async def remove_points(ctx: commands.Context, member: discord.Member, amount: int):
             """Remove points from a member (Admin only)"""
-            # Delete user's command message
+            # Delete user's command message immediately
             try:
                 await ctx.message.delete()
-            except Exception:
-                pass
+            except discord.Forbidden:
+                print(f"{Colors.YELLOW}[Warning] Cannot delete message in channel {ctx.channel.id} - missing permissions{Colors.RESET}")
+            except discord.NotFound:
+                pass  # Message already deleted
+            except Exception as e:
+                print(f"{Colors.YELLOW}[Warning] Failed to delete message: {e}{Colors.RESET}")
             
             if amount <= 0:
                 embed = discord.Embed(
@@ -1178,11 +1190,15 @@ class RSSuccessBot:
         @commands.has_permissions(manage_messages=True)
         async def check_points(ctx: commands.Context, member: discord.Member):
             """Check points for a specific user (Admin only)"""
-            # Delete user's command message
+            # Delete user's command message immediately
             try:
                 await ctx.message.delete()
-            except Exception:
-                pass
+            except discord.Forbidden:
+                print(f"{Colors.YELLOW}[Warning] Cannot delete message in channel {ctx.channel.id} - missing permissions{Colors.RESET}")
+            except discord.NotFound:
+                pass  # Message already deleted
+            except Exception as e:
+                print(f"{Colors.YELLOW}[Warning] Failed to delete message: {e}{Colors.RESET}")
             
             user_points = self.get_user_points(member.id)
             
@@ -1205,11 +1221,15 @@ class RSSuccessBot:
         @commands.has_permissions(manage_messages=True)
         async def set_points(ctx: commands.Context, member: discord.Member, amount: int):
             """Set exact points for a member (Admin only)"""
-            # Delete user's command message
+            # Delete user's command message immediately
             try:
                 await ctx.message.delete()
-            except Exception:
-                pass
+            except discord.Forbidden:
+                print(f"{Colors.YELLOW}[Warning] Cannot delete message in channel {ctx.channel.id} - missing permissions{Colors.RESET}")
+            except discord.NotFound:
+                pass  # Message already deleted
+            except Exception as e:
+                print(f"{Colors.YELLOW}[Warning] Failed to delete message: {e}{Colors.RESET}")
             
             if amount < 0:
                 embed = discord.Embed(
@@ -1527,9 +1547,12 @@ class RSSuccessBot:
             
             # Build redemption tiers list
             tiers = self.config.get("redemption_tiers", [])
+            guide_emojis = self.config.get("guide_emojis", {})
+            moneyrain_emoji = guide_emojis.get("moneyrain", "💰")
+            
             redemption_tiers_text = ""
             for tier in tiers:
-                redemption_tiers_text += f"• **{tier['points_required']} points**  → <a:rsmoneyrain:910339595797925898> {tier['name']}\n"
+                redemption_tiers_text += f"• **{tier['points_required']} points**  → {moneyrain_emoji} {tier['name']}\n"
             
             if not redemption_tiers_text:
                 redemption_tiers_text = "• No redemption tiers configured yet."
@@ -1537,38 +1560,97 @@ class RSSuccessBot:
             # Get reaction emoji
             reaction_emoji = self.config.get("reaction_emoji", "🤑")
             
-            # Build and send message
+            # Get emojis from config
+            rocket_emoji = guide_emojis.get("rocket", "🚀")
+            eye_emoji = guide_emojis.get("eye", "👁️")
+            trophy_emoji = guide_emojis.get("trophy", "🏆")
+            gun_emoji = guide_emojis.get("gun", "🔫")
+            love_emoji = guide_emojis.get("love", "❤️")
+            flag_emoji = guide_emojis.get("flag", "🏳️")
+            
+            # Get footer text from config
+            footer_text = self.config.get("footer_text", "Reselling Secrets Staff")
+            
+            # Build and send embed guide
             try:
-                guide_content = self.get_message(
-                    "points_guide.content",
-                    success_channels=success_channels.strip(),
-                    reaction_emoji=reaction_emoji,
-                    redemption_tiers_text=redemption_tiers_text.strip()
+                # Create main embed
+                embed = discord.Embed(
+                    title=f"{rocket_emoji} Reselling Secrets — Success Points System",
+                    description="This is an automated system that rewards **REAL wins** shared in the community.\nAll activity is logged and monitored to keep things fair.",
+                    color=self.get_embed_color(),
+                    timestamp=datetime.now(timezone.utc)
                 )
                 
-                # Split message if it's too long (Discord limit is 2000 characters)
-                # Split by double newlines (sections) to keep formatting intact
-                max_length = 2000
-                if len(guide_content) <= max_length:
-                    await target_channel.send(guide_content)
-                else:
-                    # Split into chunks, trying to break at section boundaries
-                    sections = guide_content.split("\n\n━━━━━━━━━━━━━━━━━━━━━━\n")
-                    current_message = sections[0]  # First section (header)
-                    
-                    for i, section in enumerate(sections[1:], 1):
-                        section_with_divider = "\n\n━━━━━━━━━━━━━━━━━━━━━━\n" + section
-                        
-                        # If adding this section would exceed limit, send current and start new
-                        if len(current_message) + len(section_with_divider) > max_length:
-                            await target_channel.send(current_message)
-                            current_message = section_with_divider
-                        else:
-                            current_message += section_with_divider
-                    
-                    # Send remaining content
-                    if current_message:
-                        await target_channel.send(current_message)
+                # Where You Can Earn Points
+                embed.add_field(
+                    name=f"{eye_emoji} Where You Can Earn Points",
+                    value=f"Post a **valid success image** in ANY of the following channels:\n{success_channels.strip()}",
+                    inline=False
+                )
+                
+                # How Points Are Earned
+                points_earned_text = (
+                    f"• **1 valid success image = +1 Success Point**\n"
+                    f"• The bot reacts with {reaction_emoji} and confirms your updated total\n"
+                    f"• Admins may adjust points when necessary\n\n"
+                    f"📸 **Image Required**\n"
+                    f"If you post **without an image**:\n"
+                    f"• Your message will be removed\n"
+                    f"• You will receive an automatic reminder"
+                )
+                embed.add_field(
+                    name=f"{trophy_emoji} How Points Are Earned",
+                    value=points_earned_text,
+                    inline=False
+                )
+                
+                # Duplicates & Abuse
+                abuse_text = (
+                    "• Reposting the same image (even re-uploaded) earns **NO points**\n"
+                    "• Duplicate images are detected automatically\n"
+                    "• Splitting one success into multiple posts is **not allowed**\n"
+                    "• Abuse may result in point removal or a full reset"
+                )
+                embed.add_field(
+                    name=f"{gun_emoji} Duplicates & Abuse",
+                    value=abuse_text,
+                    inline=False
+                )
+                
+                # Redemption Rewards
+                embed.add_field(
+                    name=f"{love_emoji} Redemption Rewards",
+                    value=f"Use **`/rsredeeminfo`** to redeem your points.\n{redemption_tiers_text.strip()}\n\n⚠ Points are **NOT** automatically deducted. All redemptions require **staff approval**.",
+                    inline=False
+                )
+                
+                # Member Slash Commands
+                commands_text = (
+                    "`/rspoints`\n"
+                    "• Check your current points (private)\n\n"
+                    "`/rsleaderboard`\n"
+                    "• View the Top 10 members by points\n\n"
+                    "`/rshelp`\n"
+                    "• View the full system rules and explanation\n\n"
+                    "`/rsredeeminfo`\n"
+                    "• Redeem points and create a redemption ticket"
+                )
+                embed.add_field(
+                    name=f"{flag_emoji} Member Slash Commands",
+                    value=commands_text,
+                    inline=False
+                )
+                
+                # Membership Role Notice
+                embed.add_field(
+                    name=f"{gun_emoji} Membership Role Notice",
+                    value="If your membership role is removed, your success points may reset to **0**.\nIf this happens by mistake, contact staff immediately.",
+                    inline=False
+                )
+                
+                embed.set_footer(text=footer_text)
+                
+                await target_channel.send(embed=embed)
                 
                 embed = discord.Embed(
                     title="✅ Points Guide Posted",
