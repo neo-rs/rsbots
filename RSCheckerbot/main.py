@@ -1066,7 +1066,8 @@ async def on_ready():
             role_cancel_b=ROLE_CANCEL_B,
             log_other_func=log_other,
             log_member_status_func=log_member_status,
-            fmt_user_func=_fmt_user
+            fmt_user_func=_fmt_user,
+            member_status_logs_channel_id=MEMBER_STATUS_LOGS_CHANNEL_ID
         )
         channels = []
         if WHOP_WEBHOOK_CHANNEL_ID:

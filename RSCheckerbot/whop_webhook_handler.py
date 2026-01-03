@@ -30,9 +30,141 @@ _log_other = None
 _log_member_status = None
 _fmt_user = None
 
+# Identity tracking and trial abuse detection
+MEMBER_STATUS_LOGS_CHANNEL_ID = None
+
+# File paths for JSON storage (canonical: JSON-only, no SQLite)
+IDENTITY_CACHE_FILE = Path(__file__).resolve().parent / "whop_identity_cache.json"
+TRIAL_CACHE_FILE = Path(__file__).resolve().parent / "trial_history.json"
+
+
+def _norm_email(s: str) -> str:
+    """Normalize email address for consistent storage/lookup"""
+    return (s or "").strip().lower()
+
+def _load_json(path: Path) -> dict:
+    """Load JSON file, returning empty dict if file doesn't exist or is invalid"""
+    try:
+        if not path.exists() or path.stat().st_size == 0:
+            return {}
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _save_json(path: Path, data: dict) -> None:
+    """Save data to JSON file with error handling"""
+    try:
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+def _cache_identity(email: str, discord_id: str, discord_username: str = "") -> None:
+    """Cache email -> discord_id mapping for future enrichment"""
+    email = _norm_email(email)
+    if not email or not discord_id:
+        return
+    db = _load_json(IDENTITY_CACHE_FILE)
+    db[email] = {
+        "discord_id": str(discord_id),
+        "discord_username": (discord_username or "").strip(),
+        "last_seen": datetime.now(timezone.utc).isoformat(),
+    }
+    _save_json(IDENTITY_CACHE_FILE, db)
+
+def _lookup_identity(email: str) -> dict | None:
+    """Look up cached identity mapping by email"""
+    email = _norm_email(email)
+    if not email:
+        return None
+    db = _load_json(IDENTITY_CACHE_FILE)
+    return db.get(email)
+
+async def _send_lookup_request(message: discord.Message, event_type: str, email: str, whop_user_id: str = "", membership_id: str = ""):
+    """
+    Posts a 'lookup needed' message into #member-status-logs so staff/bots can resolve identity.
+    Only posts if identity is not already cached.
+    """
+    if not MEMBER_STATUS_LOGS_CHANNEL_ID or not message.guild:
+        return
+    ch = message.guild.get_channel(MEMBER_STATUS_LOGS_CHANNEL_ID)
+    if not ch:
+        return
+
+    email_n = _norm_email(email)
+    cached = _lookup_identity(email_n)
+
+    if cached and cached.get("discord_id"):
+        # already resolved, no lookup needed
+        return
+
+    lines = []
+    lines.append("🔎 **Lookup Needed (Whop → Discord)**")
+    lines.append(f"• Event: `{event_type}`")
+    if email_n:
+        lines.append(f"• Email: `{email_n}`")
+    if whop_user_id:
+        lines.append(f"• Whop User: `{whop_user_id}`")
+    if membership_id:
+        lines.append(f"• Membership: `{membership_id}`")
+    lines.append("")
+    lines.append("Action:")
+    # Use channel mention format (resolves to actual channel name, no hardcoded text)
+    # WHOP_LOGS_CHANNEL_ID is available as a global from initialize()
+    whop_logs_mention = f"<#{WHOP_LOGS_CHANNEL_ID}>" if WHOP_LOGS_CHANNEL_ID else "Whop logs channel"
+    lines.append(f"• Check {whop_logs_mention} native Whop event (Discord ID field) or forwarder logs")
+    lines.append("• Once found, link it (email ↔ discord_id)")
+
+    await ch.send("\n".join(lines))
+
+def _record_trial_event(email: str, discord_id: str, membership_id: str, trial_days: str, is_first_membership: str, event_type: str) -> dict:
+    """
+    Store trial activity and detect suspicious patterns.
+    Returns dict with 'suspicious', 'reason', 'key', 'count' fields.
+    """
+    email_n = _norm_email(email)
+    key = f"{email_n}|{discord_id or 'no_discord'}"
+
+    db = _load_json(TRIAL_CACHE_FILE)
+    rec = db.get(key, {"email": email_n, "discord_id": discord_id or "", "events": []})
+
+    rec["events"].append({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event_type": event_type,
+        "membership_id": membership_id or "",
+        "trial_days": str(trial_days or ""),
+        "is_first_membership": str(is_first_membership or ""),
+    })
+
+    # Keep last 50 events per identity to avoid bloat
+    rec["events"] = rec["events"][-50:]
+    db[key] = rec
+    _save_json(TRIAL_CACHE_FILE, db)
+
+    # Suspicion logic:
+    # 1) If is_first_membership == false AND trial_days > 0 => strong repeat-trial signal
+    # 2) If we see multiple trial activations historically => weak repeat-trial signal
+    suspicious = False
+    reason = ""
+    try:
+        td = int(str(trial_days or "0"))
+    except ValueError:
+        td = 0
+
+    if str(is_first_membership).lower() == "false" and td > 0:
+        suspicious = True
+        reason = "Trial started but is_first_membership=false (repeat trial likely)"
+    else:
+        # count trial-type events
+        trial_events = [e for e in rec["events"] if str(e.get("trial_days","0")).isdigit() and int(e.get("trial_days","0")) > 0]
+        if len(trial_events) >= 2:
+            suspicious = True
+            reason = f"Multiple trial events seen ({len(trial_events)})"
+
+    return {"suspicious": suspicious, "reason": reason, "key": key, "count": len(rec["events"])}
+
 
 def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_role_id, role_cancel_a, role_cancel_b,
-               log_other_func, log_member_status_func, fmt_user_func):
+               log_other_func, log_member_status_func, fmt_user_func, member_status_logs_channel_id=None):
     """
     Initialize handler with configuration and logging functions.
     
@@ -46,9 +178,11 @@ def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_r
         log_other_func: Function to log to other channel (canonical owner)
         log_member_status_func: Function to log to member status channel (canonical owner)
         fmt_user_func: Function to format user display (canonical owner)
+        member_status_logs_channel_id: Channel ID for member status logs (lookup requests, trial alerts)
     """
     global WHOP_WEBHOOK_CHANNEL_ID, WHOP_LOGS_CHANNEL_ID, ROLE_TRIGGER, WELCOME_ROLE_ID, ROLE_CANCEL_A, ROLE_CANCEL_B
     global _log_other, _log_member_status, _fmt_user
+    global MEMBER_STATUS_LOGS_CHANNEL_ID
     
     WHOP_WEBHOOK_CHANNEL_ID = webhook_channel_id
     WHOP_LOGS_CHANNEL_ID = whop_logs_channel_id
@@ -59,6 +193,7 @@ def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_r
     _log_other = log_other_func
     _log_member_status = log_member_status_func
     _fmt_user = fmt_user_func
+    MEMBER_STATUS_LOGS_CHANNEL_ID = member_status_logs_channel_id
     
     log.info(f"Whop webhook handler initialized")
     log.info(f"Monitoring webhook channel {webhook_channel_id} and logs channel {whop_logs_channel_id}")
@@ -134,6 +269,43 @@ async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embe
         
         log.info(f"Processing Whop workflow event: {event_type} for user {discord_user_id}")
         
+        # Trial abuse tracking (workflow path)
+        trial_days = event_data.get("trial_period_days", "") or event_data.get("trial_days", "")
+        is_first = event_data.get("is_first_membership", "")
+        membership_id_val = event_data.get("membership_id", "")
+
+        # Consider trial tracking for activation/pending events
+        if event_type in ("membership.activated.pending", "membership.activated", "payment.succeeded.activation", "payment.succeeded.renewal"):
+            info = _record_trial_event(
+                email=email,
+                discord_id=discord_user_id,
+                membership_id=membership_id_val,
+                trial_days=trial_days,
+                is_first_membership=is_first,
+                event_type=event_type,
+            )
+            # Alert logic: only alert when actionable
+            # - If discord_id is empty: only alert on strong signal (is_first=false && trial_days>0)
+            # - If discord_id exists: alert on any suspicious pattern
+            should_alert = info.get("suspicious", False)
+            if not discord_user_id:
+                # When discord_id missing, only alert on strong signal (not weak "multiple trials" signal)
+                try:
+                    td = int(str(trial_days or "0"))
+                    is_strong_signal = (str(is_first).lower() == "false" and td > 0)
+                    should_alert = should_alert and is_strong_signal
+                except ValueError:
+                    should_alert = False
+            
+            if should_alert and _log_member_status:
+                await _log_member_status(
+                    "🚩 **Trial Abuse Signal**\n"
+                    f"• Email: `{_norm_email(email)}`\n"
+                    f"• Discord: `{discord_user_id}`\n"
+                    f"• Reason: {info.get('reason')}\n"
+                    f"• Membership: `{membership_id_val}`"
+                )
+        
         if not discord_user_id:
             if _log_other:
                 await _log_other(
@@ -142,6 +314,15 @@ async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embe
                     f"**Email:** {email if email else 'N/A'}\n"
                     f"**Message ID:** {message.id}"
                 )
+
+            # Request a lookup in #member-status-logs
+            await _send_lookup_request(
+                message=message,
+                event_type=event_type,
+                email=email,
+                whop_user_id=event_data.get("user_id", ""),
+                membership_id=event_data.get("membership_id", ""),
+            )
             return
         
         # Get guild and member
@@ -270,6 +451,14 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
             or fields_data.get("Email")
             or ""
         )
+
+        # Cache identity mapping for enrichment (email -> discord_id)
+        discord_username_value = (
+            parsed_data.get("discord_username")
+            or fields_data.get("discord username")
+            or ""
+        )
+        _cache_identity(email_value, str(discord_user_id), str(discord_username_value))
 
         # Process role changes if member found
         if member:
