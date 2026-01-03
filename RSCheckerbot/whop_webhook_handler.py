@@ -163,6 +163,159 @@ def _record_trial_event(email: str, discord_id: str, membership_id: str, trial_d
     return {"suspicious": suspicious, "reason": reason, "key": key, "count": len(rec["events"])}
 
 
+def _fmt_discord_ts(ts_str: str | None, style: str = "D") -> str:
+    """Format timestamp string as Discord timestamp (human-readable)
+    
+    Args:
+        ts_str: ISO timestamp string or Unix timestamp string
+        style: Discord timestamp style ('D' = short date, 'F' = full date, 'R' = relative)
+    
+    Returns:
+        Discord timestamp string like <t:1234567890:D> or "—" if invalid
+    """
+    if not ts_str:
+        return "—"
+    try:
+        # Try parsing as ISO timestamp
+        if "T" in str(ts_str) or "-" in str(ts_str):
+            dt = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+            unix_ts = int(dt.timestamp())
+        else:
+            # Assume Unix timestamp (string or int)
+            unix_ts = int(float(str(ts_str)))
+        return f"<t:{unix_ts}:{style}>"
+    except (ValueError, TypeError, AttributeError):
+        return "—"
+
+
+def _safe_get(event_data: dict, *keys: str, default: str = "—") -> str:
+    """Safely get nested dict value using dot notation keys (e.g., 'user.username', 'membership.status')
+    
+    Args:
+        event_data: Event data dictionary
+        keys: Variable number of key paths to try (e.g., 'user.username', 'username')
+        default: Default value if all keys fail
+    
+    Returns:
+        Value as string, or default
+    """
+    for key_path in keys:
+        parts = key_path.split(".")
+        value = event_data
+        try:
+            for part in parts:
+                if isinstance(value, dict):
+                    value = value.get(part)
+                else:
+                    value = None
+                if value is None:
+                    break
+            if value is not None and value != "":
+                return str(value)
+        except (AttributeError, TypeError, KeyError):
+            continue
+    return default
+
+
+def _build_support_card_embed(
+    title: str,
+    color: int,
+    member: discord.Member | None,
+    event_data: dict,
+    guild: discord.Guild | None = None
+) -> discord.Embed:
+    """Build a support card embed with structured fields (Success Bot style)
+    
+    Args:
+        title: Embed title
+        color: Embed color (hex integer)
+        member: Discord member object (if available)
+        event_data: Event data dictionary
+        guild: Discord guild object (for member lookup fallback)
+    
+    Returns:
+        discord.Embed with structured fields
+    """
+    embed = discord.Embed(
+        title=title,
+        color=color,
+        timestamp=datetime.now(timezone.utc)
+    )
+    
+    # Member field (mention if available, otherwise user ID)
+    if member:
+        embed.add_field(name="Member", value=member.mention, inline=False)
+        embed.add_field(name="User ID", value=str(member.id), inline=False)
+    else:
+        discord_id = event_data.get("discord_user_id", "") or _safe_get(event_data, "user.discord_id", default="")
+        if discord_id and discord_id != "—":
+            try:
+                user_id_int = int(str(discord_id).strip())
+                if guild:
+                    fallback_member = guild.get_member(user_id_int)
+                    if fallback_member:
+                        embed.add_field(name="Member", value=fallback_member.mention, inline=False)
+                    else:
+                        embed.add_field(name="Member", value=f"<@{user_id_int}>", inline=False)
+                else:
+                    embed.add_field(name="Member", value=f"<@{user_id_int}>", inline=False)
+                embed.add_field(name="User ID", value=str(user_id_int), inline=False)
+            except (ValueError, TypeError):
+                embed.add_field(name="User ID", value=str(discord_id), inline=False)
+        else:
+            embed.add_field(name="User ID", value="N/A", inline=False)
+    
+    # Identity fields (username, name, email)
+    username = _safe_get(event_data, "user.username", "username", default="—")
+    name = _safe_get(event_data, "user.name", "name", default="—")
+    email = _safe_get(event_data, "email", "user.email", default="")
+    
+    if username != "—":
+        embed.add_field(name="Username", value=username, inline=True)
+    if name != "—" and name != username:
+        embed.add_field(name="Name", value=name, inline=True)
+    if email:
+        embed.add_field(name="Email", value=f"`{_norm_email(email)}`", inline=False)
+    
+    # Membership fields
+    membership_status = _safe_get(event_data, "membership.status", "status", default="")
+    membership_id = _safe_get(event_data, "membership_id", "membership.id", default="")
+    
+    if membership_status and membership_status != "—":
+        embed.add_field(name="Membership Status", value=membership_status, inline=True)
+    if membership_id and membership_id != "—":
+        embed.add_field(name="Membership ID", value=f"`{membership_id}`", inline=True)
+    
+    # Financial fields
+    total_spent = _safe_get(event_data, "user.total_spent_in_usd", "total_spent", default="")
+    amount = _safe_get(event_data, "amount", "payment.formatted_amount", "payment.amount", default="")
+    
+    if total_spent and total_spent != "—":
+        embed.add_field(name="Total Spent", value=f"${total_spent}", inline=True)
+    if amount and amount != "—" and amount != "N/A":
+        embed.add_field(name="Amount", value=f"${amount}" if not amount.startswith("$") else amount, inline=True)
+    
+    # Links (dashboard, manage, checkout)
+    dashboard_url = _safe_get(event_data, "user.dashboard_url", "dashboard_url", default="")
+    manage_url = _safe_get(event_data, "membership.manage_url", "manage_url", default="")
+    checkout_url = _safe_get(event_data, "plan.purchase_url", "checkout_url", "purchase_url", default="")
+    
+    links_text = []
+    if dashboard_url and dashboard_url != "—":
+        links_text.append(f"[Dashboard]({dashboard_url})")
+    if manage_url and manage_url != "—":
+        links_text.append(f"[Manage]({manage_url})")
+    if checkout_url and checkout_url != "—":
+        links_text.append(f"[Checkout]({checkout_url})")
+    
+    if links_text:
+        embed.add_field(name="Actions", value=" • ".join(links_text), inline=False)
+    
+    embed.set_footer(text="RSCheckerbot • Member Status Tracking")
+    
+    return embed
+
+
 def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_role_id, role_cancel_a, role_cancel_b,
                log_other_func, log_member_status_func, fmt_user_func, member_status_logs_channel_id=None):
     """
@@ -594,29 +747,58 @@ def _determine_event_type_from_message(title: str, description: str, content: st
 
 # Event handlers - canonical owners for their respective event types
 async def handle_membership_activated(member: discord.Member, event_data: dict):
-    """Handle new active membership - assign Cleanup role only"""
+    """Handle new active membership - assign Cleanup role and log with support card embed"""
     guild = member.guild
     
     cleanup_role = guild.get_role(ROLE_TRIGGER)
     
     if cleanup_role and cleanup_role not in member.roles:
         await member.add_roles(cleanup_role, reason="Whop: Membership activated")
-        if _log_other:
-            await _log_other(f"✅ **Whop Webhook:** Assigned cleanup role to {_fmt_user(member)} - Membership activated")
         log.info(f"Assigned cleanup role to {member} for membership activation")
-    else:
-        if _log_other:
-            await _log_other(f"ℹ️ **Whop Webhook:** {_fmt_user(member)} already has cleanup role")
+    
+    if _log_member_status:
+        embed = _build_support_card_embed(
+            title="✅ Membership Activated",
+            color=0x00FF00,  # Green
+            member=member,
+            event_data=event_data,
+            guild=guild
+        )
+        
+        # Add trial info if available
+        trial_days = _safe_get(event_data, "trial_period_days", "trial_days", "plan.trial_period_days", default="")
+        if trial_days and trial_days != "—" and trial_days != "0":
+            embed.add_field(name="Trial Days", value=trial_days, inline=True)
+        
+        is_first = _safe_get(event_data, "is_first_membership", "membership.is_first_membership", default="")
+        if is_first and is_first != "—":
+            embed.add_field(name="First Membership", value="Yes" if str(is_first).lower() == "true" else "No", inline=True)
+        
+        if cleanup_role and cleanup_role not in member.roles:
+            embed.add_field(name="Action", value="Assigned cleanup role", inline=False)
+        else:
+            embed.add_field(name="Status", value="Already has cleanup role", inline=False)
+        
+        await _log_member_status("", embed=embed)
 
 
 async def handle_membership_activated_pending(member: discord.Member, event_data: dict):
-    """Handle pending membership activation - just log"""
-    if _log_other:
-        await _log_other(f"⏳ **Whop Webhook:** {_fmt_user(member)} - Membership activated (pending status)")
+    """Handle pending membership activation - log with support card embed"""
+    if _log_member_status:
+        guild = member.guild if member else None
+        embed = _build_support_card_embed(
+            title="⏳ Membership Activated (Pending)",
+            color=0xFFFF00,  # Yellow
+            member=member,
+            event_data=event_data,
+            guild=guild
+        )
+        embed.add_field(name="Status", value="Pending activation", inline=False)
+        await _log_member_status("", embed=embed)
 
 
 async def handle_membership_deactivated(member: discord.Member, event_data: dict):
-    """Handle membership deactivation - remove Member and Welcome roles"""
+    """Handle membership deactivation - remove Member and Welcome roles and log with support card embed"""
     guild = member.guild
     
     member_role = guild.get_role(ROLE_CANCEL_A)
@@ -630,9 +812,31 @@ async def handle_membership_deactivated(member: discord.Member, event_data: dict
     
     if roles_to_remove:
         await member.remove_roles(*roles_to_remove, reason="Whop: Membership deactivated")
-        if _log_member_status:
-            await _log_member_status(f"📉 **Whop Webhook:** Removed roles from {_fmt_user(member)} - Membership deactivated")
         log.info(f"Removed roles from {member} for membership deactivation")
+    
+    if _log_member_status:
+        embed = _build_support_card_embed(
+            title="📉 Membership Deactivated",
+            color=0xFFA500,  # Orange
+            member=member,
+            event_data=event_data,
+            guild=guild
+        )
+        
+        # Add cancellation reason if available
+        cancellation_reason = _safe_get(event_data, "membership.cancellation_reason", "cancellation_reason", default="")
+        if cancellation_reason and cancellation_reason != "—":
+            embed.add_field(name="Cancellation Reason", value=cancellation_reason, inline=False)
+        
+        canceled_at = _safe_get(event_data, "membership.canceled_at", "canceled_at", default="")
+        if canceled_at and canceled_at != "—":
+            canceled_fmt = _fmt_discord_ts(canceled_at, "D")
+            embed.add_field(name="Canceled At", value=canceled_fmt, inline=True)
+        
+        if roles_to_remove:
+            embed.add_field(name="Action", value="Removed Member and Welcome roles", inline=False)
+        
+        await _log_member_status("", embed=embed)
 
 
 async def handle_membership_deactivated_payment_failure(member: discord.Member, event_data: dict):
@@ -641,35 +845,72 @@ async def handle_membership_deactivated_payment_failure(member: discord.Member, 
 
 
 async def handle_payment_renewal(member: discord.Member, event_data: dict):
-    """Handle payment renewal - ensure Member role is assigned"""
+    """Handle payment renewal - ensure Member role is assigned and log with support card embed"""
     guild = member.guild
     member_role = guild.get_role(ROLE_CANCEL_A)
     
     if member_role and member_role not in member.roles:
         await member.add_roles(member_role, reason="Whop: Payment renewal")
-        if _log_member_status:
-            await _log_member_status(f"✅ **Whop Webhook:** Assigned Member role to {_fmt_user(member)} - Payment renewal")
         log.info(f"Assigned Member role to {member} for payment renewal")
+    
+    if _log_member_status:
+        embed = _build_support_card_embed(
+            title="✅ Payment Renewed",
+            color=0x00FF00,  # Green
+            member=member,
+            event_data=event_data,
+            guild=guild
+        )
+        embed.add_field(name="Action", value="Payment renewal - Member role maintained", inline=False)
+        await _log_member_status("", embed=embed)
 
 
 async def handle_payment_activation(member: discord.Member, event_data: dict):
-    """Handle first payment - assign Member role"""
+    """Handle first payment - assign Member role and log with support card embed"""
     guild = member.guild
     member_role = guild.get_role(ROLE_CANCEL_A)
     
     if member_role and member_role not in member.roles:
         await member.add_roles(member_role, reason="Whop: Payment activation")
-        if _log_member_status:
-            await _log_member_status(f"✅ **Whop Webhook:** Assigned Member role to {_fmt_user(member)} - First payment")
         log.info(f"Assigned Member role to {member} for payment activation")
+    
+    if _log_member_status:
+        embed = _build_support_card_embed(
+            title="✅ Payment Activated",
+            color=0x00FF00,  # Green
+            member=member,
+            event_data=event_data,
+            guild=guild
+        )
+        embed.add_field(name="Action", value="First payment - Member role assigned", inline=False)
+        await _log_member_status("", embed=embed)
 
 
 async def handle_payment_failed(member: discord.Member, event_data: dict):
-    """Handle payment failure - log only"""
-    amount = event_data.get('amount', 'N/A')
-    reason = event_data.get('failure_reason', 'Unknown')
+    """Handle payment failure - log with support card embed"""
     if _log_member_status:
-        await _log_member_status(f"❌ **Whop Webhook:** Payment failed for {_fmt_user(member)} - ${amount} - {reason}")
+        guild = member.guild if member else None
+        embed = _build_support_card_embed(
+            title="❌ Payment Failed (Action Needed)",
+            color=0xFF6B6B,  # Red
+            member=member,
+            event_data=event_data,
+            guild=guild
+        )
+        
+        # Add payment-specific fields
+        failure_reason = _safe_get(event_data, "failure_reason", "payment.failure_reason", default="Unknown")
+        embed.add_field(name="Failure Reason", value=failure_reason, inline=False)
+        
+        # Renewal window if available
+        renewal_start = _safe_get(event_data, "membership.renewal_period_start", "renewal_period_start", default="")
+        renewal_end = _safe_get(event_data, "membership.renewal_period_end", "renewal_period_end", default="")
+        if renewal_start != "—" and renewal_end != "—":
+            start_fmt = _fmt_discord_ts(renewal_start, "D")
+            end_fmt = _fmt_discord_ts(renewal_end, "D")
+            embed.add_field(name="Renewal Window", value=f"{start_fmt} → {end_fmt}", inline=False)
+        
+        await _log_member_status("", embed=embed)
 
 
 async def handle_payment_refunded(member: discord.Member, event_data: dict):
