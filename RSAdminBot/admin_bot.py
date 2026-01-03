@@ -3700,11 +3700,7 @@ git fetch origin
 git pull --ff-only origin main
 NEW="$(git rev-parse HEAD)"
 
-CHANGED="$(git diff --name-only "$OLD" "$NEW" -- "$BOT_FOLDER" 2>/dev/null | grep -E \"\\\\.py$\" || true)"
-# NOTE: grep returns exit code 1 on empty input, which would abort under `set -e`.
-# Use sed to drop empty lines (always exit 0), then count.
-CHANGED_COUNT="$(echo \"$CHANGED\" | sed '/^$/d' | wc -l | tr -d \" \")"
-
+# Get list of Python files in git repo
 TMP_LIST="/tmp/mw_pyonly_${{BOT_FOLDER}}.txt"
 git ls-files "$BOT_FOLDER" 2>/dev/null | grep -E \"\\\\.py$\" > "$TMP_LIST" || true
 PY_COUNT="$(wc -l < "$TMP_LIST" | tr -d \" \")"
@@ -3715,15 +3711,44 @@ if [ "$PY_COUNT" = "0" ]; then
   exit 3
 fi
 
+# Compare live files with git repo files to detect actual differences
+# This catches cases where files differ even if commit hash didn't change
+DIFF_FILES="/tmp/mw_pyonly_diff_${{BOT_FOLDER}}.txt"
+> "$DIFF_FILES"
+while IFS= read -r git_file; do
+  if [ -z "$git_file" ]; then continue; fi
+  git_path="$CODE_ROOT/$git_file"
+  live_path="$LIVE_ROOT/$git_file"
+  if [ ! -f "$live_path" ]; then
+    echo "$git_file" >> "$DIFF_FILES"
+  elif ! cmp -s "$git_path" "$live_path" 2>/dev/null; then
+    echo "$git_file" >> "$DIFF_FILES"
+  fi
+done < "$TMP_LIST"
+
+# Also check for files changed in git commits (for reporting)
+GIT_CHANGED="$(git diff --name-only "$OLD" "$NEW" -- "$BOT_FOLDER" 2>/dev/null | grep -E \"\\\\.py$\" || true)"
+GIT_CHANGED_COUNT="$(echo \"$GIT_CHANGED\" | sed '/^$/d' | wc -l | tr -d \" \")"
+
+# Count actual file differences
+ACTUAL_CHANGED_COUNT="$(wc -l < "$DIFF_FILES" | tr -d \" \")"
+if [ "$ACTUAL_CHANGED_COUNT" = "" ]; then ACTUAL_CHANGED_COUNT="0"; fi
+
+# Copy files (always sync, even if no differences detected)
 tar -cf - -T "$TMP_LIST" | (cd "$LIVE_ROOT" && tar -xf -)
+
+# Use actual changed count for reporting (more accurate than git diff)
+CHANGED_COUNT="$ACTUAL_CHANGED_COUNT"
+CHANGED="$(cat \"$DIFF_FILES\" | grep -v \"^$\" || true)"
 
 echo "OK=1"
 echo "OLD=$OLD"
 echo "NEW=$NEW"
 echo "PY_COUNT=$PY_COUNT"
 echo "CHANGED_COUNT=$CHANGED_COUNT"
+echo "GIT_CHANGED_COUNT=$GIT_CHANGED_COUNT"
 echo "CHANGED_BEGIN"
-echo "$CHANGED" | grep -v "^$" | head -n 30 || true
+echo "$CHANGED" | head -n 30 || true
 echo "CHANGED_END"
 """
 
@@ -5842,8 +5867,17 @@ echo "CHANGED_END"
             old = (stats.get("old") or "").strip()
             new = (stats.get("new") or "").strip()
             py_count = str(stats.get("py_count") or "0").strip()
-            changed_count = str(stats.get("changed_count") or "0").strip()
+            changed_count = int(stats.get("changed_count") or "0")
+            git_changed_count = int(stats.get("git_changed_count") or "0")
             changed_sample = stats.get("changed_sample") or []
+
+            # Determine status message
+            if old == new:
+                git_status = f"{old[:12]} (no new commits)"
+                status_note = "Already up to date" if changed_count == 0 else f"{changed_count} file(s) synced"
+            else:
+                git_status = f"{old[:12]} -> {new[:12]}"
+                status_note = f"{git_changed_count} file(s) changed in git"
 
             # Restart (required to pick up new code)
             restart_ok = False
@@ -5864,9 +5898,10 @@ echo "CHANGED_END"
 
             fields = [
                 {"name": "Bot", "value": bot_info["name"], "inline": True},
-                {"name": "Git", "value": f"{old[:12]} -> {new[:12]}", "inline": False},
+                {"name": "Git", "value": git_status, "inline": False},
                 {"name": "Python copied", "value": py_count, "inline": True},
-                {"name": "Changed", "value": changed_count, "inline": True},
+                {"name": "Files synced", "value": str(changed_count), "inline": True},
+                {"name": "Status", "value": status_note, "inline": True},
                 {"name": "Restart", "value": "OK" if restart_ok else "FAILED", "inline": True},
             ]
             success_embed = MessageHelper.create_success_embed(
@@ -5904,7 +5939,9 @@ echo "CHANGED_END"
                             "git_old": old[:12],
                             "git_new": new[:12],
                             "python_copied": py_count,
-                            "changed_count": changed_count,
+                            "files_synced": changed_count,
+                            "git_changed_count": git_changed_count,
+                            "status": status_note,
                             "restart_ok": restart_ok,
                             "restart_error": restart_err[:500] if restart_err else "",
                         },
@@ -5920,9 +5957,9 @@ echo "CHANGED_END"
                     progress_msg,
                     (
                         f"[botupdate] {bot_info['name']} ({bot_name}) COMPLETE\n"
-                        f"Git: {old[:7]} -> {new[:7]}\n"
+                        f"Git: {git_status}\n"
                         f"After:  {self._format_service_state(after_exists, after_state, after_pid)}\n"
-                        f"Python copied: {py_count} | Changed: {changed_count} | Restart: {'OK' if restart_ok else 'FAILED'}"
+                        f"Python copied: {py_count} | Files synced: {changed_count} | Restart: {'OK' if restart_ok else 'FAILED'}"
                     ),
                 )
 
