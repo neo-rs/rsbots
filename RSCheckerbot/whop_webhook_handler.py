@@ -298,13 +298,45 @@ async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embe
                     should_alert = False
             
             if should_alert and _log_member_status:
-                await _log_member_status(
-                    "🚩 **Trial Abuse Signal**\n"
-                    f"• Email: `{_norm_email(email)}`\n"
-                    f"• Discord: `{discord_user_id}`\n"
-                    f"• Reason: {info.get('reason')}\n"
-                    f"• Membership: `{membership_id_val}`"
+                # Create embed with structured fields (like Success Bot format)
+                embed = discord.Embed(
+                    title="🚩 Trial Abuse Signal",
+                    color=0xFF6B6B,  # Red/orange for alert
+                    timestamp=datetime.now(timezone.utc)
                 )
+                
+                # Format Discord member mention and User ID
+                guild = message.guild if message.guild else None
+                if discord_user_id:
+                    try:
+                        user_id_int = int(discord_user_id)
+                        if guild:
+                            member = guild.get_member(user_id_int)
+                            if member:
+                                embed.add_field(name="Member", value=member.mention, inline=False)
+                                embed.add_field(name="User ID", value=str(user_id_int), inline=False)
+                            else:
+                                # User not in guild, use mention format
+                                embed.add_field(name="Member", value=f"<@{user_id_int}>", inline=False)
+                                embed.add_field(name="User ID", value=str(user_id_int), inline=False)
+                        else:
+                            embed.add_field(name="Member", value=f"<@{user_id_int}>", inline=False)
+                            embed.add_field(name="User ID", value=str(user_id_int), inline=False)
+                    except (ValueError, TypeError):
+                        embed.add_field(name="User ID", value=str(discord_user_id), inline=False)
+                else:
+                    embed.add_field(name="User ID", value="N/A", inline=False)
+                
+                # Email field
+                if email:
+                    embed.add_field(name="Email", value=f"`{_norm_email(email)}`", inline=False)
+                
+                # Reason field
+                embed.add_field(name="Reason", value=info.get('reason', 'Unknown'), inline=False)
+                
+                embed.set_footer(text="RSCheckerbot • Member Status Tracking")
+                
+                await _log_member_status("", embed=embed)
         
         if not discord_user_id:
             if _log_other:

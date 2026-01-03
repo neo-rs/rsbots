@@ -94,6 +94,7 @@ REGISTRY_FILE = BASE_DIR / "registry.json"
 INVITES_FILE = BASE_DIR / "invites.json"
 MESSAGES_FILE = BASE_DIR / "messages.json"
 SETTINGS_FILE = BASE_DIR / "settings.json"
+MEMBER_HISTORY_FILE = BASE_DIR / "member_history.json"
 
 # Message order keys
 DAY_KEYS = ["day_1", "day_2", "day_3", "day_4", "day_5", "day_6", "day_7a", "day_7b"]
@@ -245,6 +246,82 @@ def save_json(path: Path, data: dict) -> None:
 def save_all():
     save_json(QUEUE_FILE, queue_state)
     save_json(REGISTRY_FILE, registry)
+
+# -----------------------------
+# Member History Helpers
+# -----------------------------
+def _load_member_history() -> dict:
+    """Load member history from JSON file"""
+    try:
+        if not MEMBER_HISTORY_FILE.exists() or MEMBER_HISTORY_FILE.stat().st_size == 0:
+            return {}
+        return json.loads(MEMBER_HISTORY_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _save_member_history(db: dict) -> None:
+    """Save member history to JSON file"""
+    try:
+        MEMBER_HISTORY_FILE.write_text(json.dumps(db, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+def _touch_join(discord_id: int) -> dict:
+    """Record member join event, return history record"""
+    now = int(datetime.now(timezone.utc).timestamp())
+    db = _load_member_history()
+    key = str(discord_id)
+    rec = db.get(key, {
+        "first_join_ts": now,
+        "last_join_ts": now,
+        "last_leave_ts": None,
+        "join_count": 0
+    })
+    rec["last_join_ts"] = now
+    rec["join_count"] = int(rec.get("join_count", 0)) + 1
+    # Only set first_join_ts if this is truly the first join
+    if "first_join_ts" not in rec or rec["first_join_ts"] is None:
+        rec["first_join_ts"] = now
+    db[key] = rec
+    _save_member_history(db)
+    return rec
+
+def _touch_leave(discord_id: int) -> dict:
+    """Record member leave event, return history record"""
+    now = int(datetime.now(timezone.utc).timestamp())
+    db = _load_member_history()
+    key = str(discord_id)
+    rec = db.get(key)
+    if not rec:
+        # User left but we never tracked a join (edge case)
+        rec = {
+            "first_join_ts": None,
+            "last_join_ts": None,
+            "last_leave_ts": now,
+            "join_count": 0
+        }
+    else:
+        rec["last_leave_ts"] = now
+    db[key] = rec
+    _save_member_history(db)
+    return rec
+
+def _fmt_ts(ts: int | None, style: str = "D") -> str:
+    """Format timestamp as Discord timestamp (human-readable)
+    
+    Styles:
+    - 'D' = Short date: Aug 11, 2025
+    - 'F' = Full date: August 11, 2025 4:40 PM
+    - 'R' = Relative: 3 months ago
+    """
+    if not ts:
+        return "—"
+    return f"<t:{int(ts)}:{style}>"
+
+def get_member_history(discord_id: int) -> dict:
+    """Get member history record (exposed for whop_webhook_handler and support cards)"""
+    db = _load_member_history()
+    return db.get(str(discord_id), {})
 
 def load_settings() -> dict:
     """Load settings from JSON file, default to enabled if missing/bad"""
@@ -1093,6 +1170,27 @@ async def on_ready():
 @bot.event
 async def on_member_join(member: discord.Member):
     if member.guild.id == GUILD_ID and not member.bot:
+        # Track join event FIRST (before other logic)
+        rec = _touch_join(member.id)
+        
+        # Optional: Log join to member-status-logs
+        if MEMBER_STATUS_LOGS_CHANNEL_ID:
+            ch = bot.get_channel(MEMBER_STATUS_LOGS_CHANNEL_ID)
+            if ch:
+                embed = discord.Embed(
+                    title="👋 Member Joined",
+                    color=0x00FF00,  # Green
+                    timestamp=datetime.now(timezone.utc)
+                )
+                embed.add_field(name="Member", value=member.mention, inline=False)
+                embed.add_field(name="User ID", value=str(member.id), inline=False)
+                embed.add_field(name="Member Since", value=_fmt_ts(rec.get("first_join_ts"), "D"), inline=True)
+                embed.add_field(name="Join Count", value=str(rec.get("join_count")), inline=True)
+                if rec.get("join_count", 0) > 1:
+                    embed.add_field(name="Status", value="Returning member", inline=True)
+                embed.set_footer(text="RSCheckerbot • Member Status Tracking")
+                await log_member_status("", embed=embed)
+        
         guild = member.guild
         current_roles = {r.id for r in member.roles}
         current_role_names = _fmt_role_list(current_roles, guild) if current_roles else "none"
@@ -1185,6 +1283,31 @@ async def on_member_join(member: discord.Member):
                 
         except Exception as e:
             log.error(f"❌ Error tracking invite for {member} ({member.id}): {e}")
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    """Track member leave events and log to member-status-logs"""
+    if member.guild.id == GUILD_ID and not member.bot:
+        rec = _touch_leave(member.id)
+        
+        # Log to member-status-logs channel
+        if MEMBER_STATUS_LOGS_CHANNEL_ID:
+            ch = bot.get_channel(MEMBER_STATUS_LOGS_CHANNEL_ID)
+            if ch:
+                embed = discord.Embed(
+                    title="🚪 Member Left",
+                    color=0xFFA500,  # Orange
+                    timestamp=datetime.now(timezone.utc)
+                )
+                embed.add_field(name="Member", value=f"`{member}`", inline=False)
+                embed.add_field(name="User ID", value=str(member.id), inline=False)
+                embed.add_field(name="Last Left", value=_fmt_ts(rec.get("last_leave_ts"), "D"), inline=True)
+                if rec.get("first_join_ts"):
+                    embed.add_field(name="First Joined", value=_fmt_ts(rec.get("first_join_ts"), "D"), inline=True)
+                if rec.get("join_count", 0) > 0:
+                    embed.add_field(name="Join Count", value=str(rec.get("join_count")), inline=True)
+                embed.set_footer(text="RSCheckerbot • Member Status Tracking")
+                await log_member_status("", embed=embed)
 
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
