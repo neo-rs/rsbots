@@ -14,6 +14,8 @@ Per CANONICAL_RULES:
 import json
 import sys
 import subprocess
+import shutil
+import shlex
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -39,6 +41,11 @@ SSH_USER = server_config["user"]
 SSH_HOST = server_config["host"]
 SSH_OPTIONS = server_config.get("ssh_options", "")
 REMOTE_ROOT = str(server_config.get("remote_root") or server_config.get("live_root") or "/home/rsadmin/bots/mirror-world")
+
+# If we are running on the Oracle host (local-exec mode), prefer direct filesystem copy.
+# This avoids SSH-to-self failures (missing key, SSH blocked, etc.) that otherwise appear as "missing".
+_LOCAL_REMOTE_ROOT = Path(REMOTE_ROOT)
+LOCAL_MODE = _LOCAL_REMOTE_ROOT.is_dir() and (_LOCAL_REMOTE_ROOT / "RSAdminBot").is_dir()
 
 # Output directory
 OUTPUT_DIR = _REPO_ROOT / "OracleServerData"
@@ -99,8 +106,18 @@ def run_ssh_command(cmd: str) -> tuple[int, str, str]:
         return 1, "", str(e)
 
 
-def download_file(remote_path: str, local_path: Path) -> bool:
-    """Download a single file from Oracle server using scp"""
+def download_file(remote_path: str, local_path: Path) -> tuple[bool, str]:
+    """Download a single file from Oracle server using scp (or local copy when LOCAL_MODE is True)."""
+    if LOCAL_MODE:
+        try:
+            src = Path(remote_path)
+            if not src.exists():
+                return False, "missing_local_file"
+            shutil.copy2(src, local_path)
+            return True, ""
+        except Exception as e:
+            return False, f"local_copy_failed: {e}"
+
     scp_cmd = [
         "scp",
         "-i", str(SSH_KEY_PATH),
@@ -116,17 +133,32 @@ def download_file(remote_path: str, local_path: Path) -> bool:
             text=True,
             timeout=60
         )
-        return result.returncode == 0
+        if result.returncode == 0:
+            return True, ""
+        err = (result.stderr or result.stdout or "").strip()
+        return False, (err[:300] if err else "scp_failed")
     except Exception as e:
-        print(f"  Error downloading {remote_path}: {e}")
-        return False
+        return False, str(e)
 
 
-def check_file_exists(remote_path: str) -> bool:
-    """Check if file exists on remote server"""
-    cmd = f"test -f {remote_path} && echo 'EXISTS' || echo 'NOT_EXISTS'"
-    code, stdout, _ = run_ssh_command(cmd)
-    return code == 0 and "EXISTS" in stdout
+def check_file_exists(remote_path: str) -> tuple[bool, str]:
+    """Check if file exists on remote server (or locally when LOCAL_MODE is True).
+
+    Returns:
+        (exists, err) where err is non-empty when the check itself failed (e.g., SSH error).
+    """
+    if LOCAL_MODE:
+        try:
+            return Path(remote_path).is_file(), ""
+        except Exception as e:
+            return False, f"local_stat_failed: {e}"
+
+    cmd = f"test -f {shlex.quote(remote_path)} && echo 'EXISTS' || echo 'NOT_EXISTS'"
+    code, stdout, stderr = run_ssh_command(cmd)
+    if code != 0:
+        err = (stderr or stdout or "").strip()
+        return False, (err[:300] if err else "ssh_failed")
+    return ("EXISTS" in (stdout or "")), ""
 
 
 def sync_bot_data(bot_name: str, files: list[str]) -> dict:
@@ -152,13 +184,19 @@ def sync_bot_data(bot_name: str, files: list[str]) -> dict:
         local_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Check if file exists
-        if not check_file_exists(remote_path):
+        exists, check_err = check_file_exists(remote_path)
+        if check_err:
+            results["errors"].append({"file": file_path, "remote_path": remote_path, "error": check_err})
+            print(f"  [ERR]  {file_path} - Check failed ({check_err})")
+            continue
+        if not exists:
             results["missing"].append(file_path)
             print(f"  [WARN] {file_path} - Not found on server")
             continue
         
         # Download file
-        if download_file(remote_path, local_path):
+        ok_dl, dl_err = download_file(remote_path, local_path)
+        if ok_dl:
             file_size = local_path.stat().st_size if local_path.exists() else 0
             results["downloaded"].append({
                 "file": file_path,
@@ -168,8 +206,8 @@ def sync_bot_data(bot_name: str, files: list[str]) -> dict:
             })
             print(f"  [OK]   {file_path} ({file_size:,} bytes)")
         else:
-            results["errors"].append(file_path)
-            print(f"  [ERR]  {file_path} - Download failed")
+            results["errors"].append({"file": file_path, "remote_path": remote_path, "error": dl_err})
+            print(f"  [ERR]  {file_path} - Download failed ({dl_err})")
     
     return results
 
@@ -182,6 +220,7 @@ def create_manifest(all_results: list[dict]) -> dict:
             "host": SSH_HOST,
             "user": SSH_USER,
             "remote_root": REMOTE_ROOT,
+            "local_mode": bool(LOCAL_MODE),
         },
         "bots": {},
     }
