@@ -89,6 +89,22 @@ LOG_FIRST_CHANNEL_ID = DM_CONFIG.get("log_first_channel_id")
 LOG_OTHER_CHANNEL_ID = DM_CONFIG.get("log_other_channel_id")
 MEMBER_STATUS_LOGS_CHANNEL_ID = DM_CONFIG.get("member_status_logs_channel_id")
 
+# Logging controls (spam reduction + correlation)
+LOG_CONTROLS = config.get("log_controls", {}) if isinstance(config, dict) else {}
+try:
+    BOOT_POST_MIN_HOURS = float(LOG_CONTROLS.get("boot_post_min_hours", 6))
+except Exception:
+    BOOT_POST_MIN_HOURS = 6.0
+try:
+    ROLE_UPDATE_BATCH_SECONDS = float(LOG_CONTROLS.get("role_update_batch_seconds", 2))
+except Exception:
+    ROLE_UPDATE_BATCH_SECONDS = 2.0
+try:
+    CID_TTL_MINUTES = float(LOG_CONTROLS.get("cid_ttl_minutes", 10))
+except Exception:
+    CID_TTL_MINUTES = 10.0
+VERBOSE_ROLE_LISTS = bool(LOG_CONTROLS.get("verbose_role_lists", False))
+
 # Files
 QUEUE_FILE = BASE_DIR / "queue.json"
 REGISTRY_FILE = BASE_DIR / "registry.json"
@@ -97,6 +113,7 @@ MESSAGES_FILE = BASE_DIR / "messages.json"
 SETTINGS_FILE = BASE_DIR / "settings.json"
 MEMBER_HISTORY_FILE = BASE_DIR / "member_history.json"
 WHOP_WEBHOOK_RAW_LOG_FILE = BASE_DIR / "whop_webhook_raw_payloads.json"
+BOOT_STATE_FILE = BASE_DIR / "boot_state.json"
 
 # Message order keys
 DAY_KEYS = ["day_1", "day_2", "day_3", "day_4", "day_5", "day_6", "day_7a", "day_7b"]
@@ -218,6 +235,12 @@ pending_former_checks: set[int] = set()
 invite_tracking: Dict[str, str] = {}  # invite_code -> lead_id
 invite_usage_cache: Dict[str, int] = {}  # invite_code -> last known uses
 
+# Correlation IDs (short-lived, for searchability across related events)
+cid_cache: Dict[int, Dict[str, str]] = {}  # user_id -> {"cid": str, "expires_at": iso}
+
+# Role update batching (reduce spam from rapid add/remove sequences)
+pending_role_updates: Dict[int, Dict[str, object]] = {}  # user_id -> {"added": set[int], "removed": set[int], "member": discord.Member, "task": asyncio.Task}
+
 # -----------------------------
 # Utils: persistence/time
 # -----------------------------
@@ -248,6 +271,67 @@ def save_json(path: Path, data: dict) -> None:
 def save_all():
     save_json(QUEUE_FILE, queue_state)
     save_json(REGISTRY_FILE, registry)
+
+def _cid_for(user_id: int) -> str:
+    """Return a short-lived correlation ID for a user (helps support search one token)."""
+    now = _now()
+    rec = cid_cache.get(int(user_id))
+    if rec:
+        try:
+            exp = datetime.fromisoformat(str(rec.get("expires_at", "")).replace("Z", "+00:00"))
+            if exp > now and rec.get("cid"):
+                return str(rec["cid"])
+        except Exception:
+            pass
+    cid = f"CID-{int(user_id)}-{now.strftime('%m%d%H%M%S')}"
+    cid_cache[int(user_id)] = {"cid": cid, "expires_at": (now + timedelta(minutes=CID_TTL_MINUTES)).isoformat()}
+    return cid
+
+def _should_post_boot() -> bool:
+    """Throttle noisy boot posts to Discord."""
+    try:
+        if BOOT_POST_MIN_HOURS <= 0:
+            return True
+        state = load_json(BOOT_STATE_FILE)
+        last_iso = str(state.get("last_boot_post_iso") or "").strip()
+        if last_iso:
+            try:
+                last_dt = datetime.fromisoformat(last_iso.replace("Z", "+00:00"))
+                if (_now() - last_dt) < timedelta(hours=BOOT_POST_MIN_HOURS):
+                    return False
+            except Exception:
+                pass
+        state["last_boot_post_iso"] = _now().isoformat()
+        save_json(BOOT_STATE_FILE, state)
+        return True
+    except Exception:
+        return True
+
+async def _flush_role_update(user_id: int) -> None:
+    """Flush a batched role update after a short debounce window."""
+    await asyncio.sleep(max(0.2, ROLE_UPDATE_BATCH_SECONDS))
+    rec = pending_role_updates.pop(int(user_id), None)
+    if not rec:
+        return
+    member = rec.get("member")
+    if not isinstance(member, discord.Member):
+        return
+    added: set[int] = rec.get("added") or set()
+    removed: set[int] = rec.get("removed") or set()
+    if not added and not removed:
+        return
+
+    cid = _cid_for(member.id)
+    added_names = _fmt_role_list(set(added), member.guild) if added else None
+    removed_names = _fmt_role_list(set(removed), member.guild) if removed else None
+
+    log_msg = f"🔄 **Roles Changed:** {_fmt_user(member)}\n"
+    log_msg += f"   🧩 CID: `{cid}`\n"
+    if removed_names:
+        log_msg += f"   ➖ **Removed:** {removed_names}\n"
+    if added_names:
+        log_msg += f"   ➕ **Added:** {added_names}\n"
+    await log_role_event(log_msg.rstrip())
 
 def _save_raw_webhook_payload(payload: dict, headers: dict = None):
     """Save raw webhook payload to JSON file for inspection"""
@@ -1342,7 +1426,8 @@ async def on_ready():
         scheduler_loop.start()
         log.info("[Scheduler] Started and state restored")
 
-    await log_other("🟢 [BOOT] Scheduler started and state restored.")
+    if _should_post_boot():
+        await log_other("🟢 [BOOT] Scheduler started and state restored.")
     
     # Cleanup old data on startup
     cleanup_old_data()
@@ -1408,6 +1493,7 @@ async def on_member_join(member: discord.Member):
     if member.guild.id == GUILD_ID and not member.bot:
         # Track join event FIRST (before other logic)
         rec = _touch_join(member.id)
+        cid = _cid_for(member.id)
 
         # Determine join method via invite usage deltas (best-effort).
         used_invite_code = None
@@ -1467,6 +1553,7 @@ async def on_member_join(member: discord.Member):
                     embed.add_field(name="Status", value="🔄 Returning member", inline=True)
                 embed.add_field(name="Join Method", value="\n".join(join_method_lines)[:1024], inline=False)
                 embed.add_field(name="Current Roles", value=_roles_plain(member), inline=False)
+                embed.add_field(name="CID", value=f"`{cid}`", inline=True)
                 # Footer removed per user request
                 await log_member_status("", embed=embed)
         
@@ -1489,14 +1576,18 @@ async def on_member_join(member: discord.Member):
         else:
             checked_status = f"   ❌ Has NO checked roles\n"
         
-        all_checked_roles = _fmt_role_list(ROLES_TO_CHECK, guild)
+        # Avoid spam: only print the full checked role list when verbose logging is enabled.
+        all_checked_roles = _fmt_role_list(ROLES_TO_CHECK, guild) if VERBOSE_ROLE_LISTS else ""
+        sample_checked = _fmt_role_list(set(list(ROLES_TO_CHECK)[:3]), guild) if ROLES_TO_CHECK else ""
         
         await log_role_event(
             f"👤 **New Member Joined:** {_fmt_user(member)}\n"
             f"   {welcome_status}\n"
             f"   📋 Current roles: {current_role_names}\n"
             f"   {checked_status}"
-            f"   🔍 **Basis for 60s check:** Will verify if user has ANY of these checked roles ({len(ROLES_TO_CHECK)} total): {all_checked_roles}\n"
+            f"   🔍 **Basis for 60s check:** Will verify user has ANY checked role ({len(ROLES_TO_CHECK)} total)"
+            f"{f': {all_checked_roles}' if all_checked_roles else ''}\n"
+            f"{f'   🧪 Sample checked roles: {sample_checked}' if (not all_checked_roles and sample_checked) else ''}\n"
             f"   ⏱️ If user has NONE after 60s → will assign trigger role"
         )
         asyncio.create_task(check_and_assign_role(member))
@@ -1559,17 +1650,24 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         )
         
         if not is_specific_case:
-            # General role change - log it
-            added_names = _fmt_role_list(roles_added, after.guild) if roles_added else None
-            removed_names = _fmt_role_list(roles_removed, after.guild) if roles_removed else None
-            
-            log_msg = f"🔄 **Role Update:** {_fmt_user(after)}\n"
-            if removed_names:
-                log_msg += f"   ➖ **Removed:** {removed_names}\n"
-            if added_names:
-                log_msg += f"   ➕ **Added:** {added_names}\n"
-            
-            await log_role_event(log_msg.rstrip())
+            # General role change - batch to reduce spam (rapid sequences often produce multiple events)
+            uid = int(after.id)
+            rec = pending_role_updates.get(uid)
+            if not rec:
+                rec = {"added": set(), "removed": set(), "member": after, "task": None}
+                pending_role_updates[uid] = rec
+            try:
+                rec["added"].update(set(roles_added))
+                rec["removed"].update(set(roles_removed))
+                # Cancel out roles that were both added and removed within the batch window
+                both = rec["added"].intersection(rec["removed"])
+                if both:
+                    rec["added"].difference_update(both)
+                    rec["removed"].difference_update(both)
+            except Exception:
+                pass
+            if not rec.get("task"):
+                rec["task"] = asyncio.create_task(_flush_role_update(uid))
 
     if (ROLE_CANCEL_A in after_roles or ROLE_CANCEL_B in after_roles) and str(after.id) in queue_state:
         cancel_roles = []
