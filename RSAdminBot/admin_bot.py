@@ -7135,25 +7135,47 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             
             stats = self.whop_tracker.get_membership_stats()
             
-            embed = discord.Embed(title="Membership Statistics", color=0x5865F2)
-            embed.add_field(name="Total Members", value=stats.get("total_members", 0))
-            embed.add_field(name="New Members", value=stats.get("new_members", 0))
-            embed.add_field(name="Renewals", value=stats.get("renewals", 0))
-            embed.add_field(name="Cancellations", value=stats.get("cancellations", 0))
-            embed.add_field(name="Active Memberships", value=stats.get("active_memberships", 0))
+            # Build rich embed matching RSCheckerbot support card style
+            embed = discord.Embed(
+                title="Membership Statistics",
+                color=0x5865F2,  # Discord blurple
+                timestamp=datetime.now()
+            )
             
-            if stats.get("avg_duration_days"):
-                embed.add_field(name="Avg Duration (days)", value=stats["avg_duration_days"])
+            total_members = stats.get("total_members", 0)
+            new_members = stats.get("new_members", 0)
+            renewals = stats.get("renewals", 0)
+            cancellations = stats.get("cancellations", 0)
+            active_memberships = stats.get("active_memberships", 0)
+            avg_duration_days = stats.get("avg_duration_days")
+            
+            # Overview section (inline fields for compact display)
+            embed.add_field(name="Total Members", value=f"**{total_members}**", inline=True)
+            embed.add_field(name="Active Memberships", value=f"**{active_memberships}**", inline=True)
+            
+            if avg_duration_days:
+                embed.add_field(name="Avg Duration", value=f"**{avg_duration_days}** days", inline=True)
+            
+            # Event breakdown section
+            events_text = f"• New Members: **{new_members}**\n"
+            events_text += f"• Renewals: **{renewals}**\n"
+            events_text += f"• Cancellations: **{cancellations}**"
+            
+            embed.add_field(
+                name="Event Breakdown",
+                value=events_text,
+                inline=False
+            )
             
             # Add note if database is empty
-            if stats.get("total_members", 0) == 0:
+            if total_members == 0:
                 embed.add_field(
                     name="ℹ️ Note",
                     value="**No membership data found.** Run `!whopscan` first to scan the whop-logs channel and populate membership data.",
                     inline=False
                 )
             
-            embed.set_footer(text="Data source: whop_history.json | Run !whopscan to update")
+            embed.set_footer(text="RSAdminBot • Whop Statistics | Data source: whop_history.json | Run !whopscan to update")
             await ctx.send(embed=embed)
         
         @self.bot.command(name="whophistory")

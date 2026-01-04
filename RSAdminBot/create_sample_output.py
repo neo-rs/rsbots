@@ -9,8 +9,44 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Any
 
-# Sample data based on the enhancements we made
+# Sample data based on the enhancements we made and real whopstats data
 SAMPLE_OUTPUT = {
+    "whopstats_sample": {
+        "title": "Membership Statistics",
+        "scan_date": "2026-01-04T00:21:34",
+        "messages_scanned": 1331,
+        "events_found": 1031,
+        "statistics": {
+            "total_members": 533,
+            "new_members": 6,
+            "renewals": 950,
+            "cancellations": 39,
+            "active_memberships": 6,
+            "avg_duration_days": None
+        },
+        "embed_format": {
+            "title": "Membership Statistics",
+            "color": "0x5865F2",
+            "fields": [
+                {
+                    "name": "Total Members",
+                    "value": "**533**",
+                    "inline": True
+                },
+                {
+                    "name": "Active Memberships",
+                    "value": "**6**",
+                    "inline": True
+                },
+                {
+                    "name": "Event Breakdown",
+                    "value": "• New Members: **6**\n• Renewals: **950**\n• Cancellations: **39**",
+                    "inline": False
+                }
+            ],
+            "footer": "RSAdminBot • Whop Statistics | Data source: whop_history.json | Run !whopscan to update"
+        }
+    },
     "enhancements_summary": {
         "title": "RSCheckerbot Enhancement Summary",
         "date": "2026-01-03",
