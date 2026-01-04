@@ -347,12 +347,143 @@ def _fmt_ts(ts: int | None, style: str = "D") -> str:
     """
     if not ts:
         return "—"
-    return f"<t:{int(ts)}:{style}>"
+    try:
+        return f"<t:{int(ts)}:{style}>"
+    except Exception:
+        return "—"
 
 def get_member_history(discord_id: int) -> dict:
     """Get member history record (exposed for whop_webhook_handler and support cards)"""
     db = _load_member_history()
     return db.get(str(discord_id), {})
+
+def _backfill_whop_timeline_from_whop_history() -> None:
+    """Backfill Whop lifecycle timeline from whop_history.json.
+    
+    Stores Whop events in member_history[discord_id]["whop"] sub-object.
+    Non-destructive: only adds/updates "whop" timeline, never overwrites Discord join/leave fields.
+    """
+    try:
+        # Load path from config
+        default_path = BASE_DIR.parent / "RSAdminBot" / "whop_data" / "whop_history.json"
+        whop_history_path = default_path
+        
+        try:
+            config_path = BASE_DIR / "config.json"
+            if config_path.exists():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    config_data = json.load(f)
+                custom_path = config_data.get("paths", {}).get("whop_history")
+                if custom_path:
+                    whop_history_path = (BASE_DIR / custom_path).resolve()
+        except Exception:
+            pass  # Use default path if config loading fails
+        
+        if not whop_history_path.exists():
+            log.info("whop_history.json not found, skipping Whop timeline backfill")
+            return
+        
+        # Load whop_history.json
+        try:
+            with open(whop_history_path, "r", encoding="utf-8") as f:
+                whop_history = json.load(f)
+        except Exception as e:
+            log.warning(f"Failed to load whop_history.json: {e}")
+            return
+        
+        events = whop_history.get("membership_events", [])
+        if not events:
+            log.info("No membership events in whop_history.json")
+            return
+        
+        # Load existing member_history
+        member_history = _load_member_history()
+        backfilled_count = 0
+        
+        for event in events:
+            discord_id_str = event.get("discord_id", "").strip()
+            if not discord_id_str:
+                continue
+            
+            try:
+                discord_id = int(discord_id_str)
+            except (ValueError, TypeError):
+                continue
+            
+            # Parse timestamp
+            timestamp_str = event.get("timestamp") or event.get("created_at")
+            if not timestamp_str:
+                continue
+            
+            try:
+                # Parse ISO timestamp to Unix timestamp
+                if "T" in str(timestamp_str):
+                    dt = datetime.fromisoformat(str(timestamp_str).replace("Z", "+00:00"))
+                    event_ts = int(dt.timestamp())
+                else:
+                    event_ts = int(float(str(timestamp_str)))
+            except (ValueError, TypeError, AttributeError):
+                continue
+            
+            # Get or create member record
+            key = str(discord_id)
+            if key not in member_history:
+                member_history[key] = {}
+            
+            # Get or create whop timeline sub-object
+            if "whop" not in member_history[key]:
+                member_history[key]["whop"] = {}
+            
+            whop_timeline = member_history[key]["whop"]
+            
+            # Get status (normalize to lowercase)
+            status = (event.get("membership_status", "") or "").strip().lower()
+            event_type = (event.get("event_type", "") or "").strip().lower()
+            
+            # Update timeline fields
+            # first_seen_ts: min of all timestamps (only set if missing or new event is earlier)
+            if "first_seen_ts" not in whop_timeline or whop_timeline["first_seen_ts"] is None or event_ts < whop_timeline["first_seen_ts"]:
+                whop_timeline["first_seen_ts"] = event_ts
+            
+            # last_seen_ts: max of all timestamps
+            if "last_seen_ts" not in whop_timeline or whop_timeline["last_seen_ts"] is None or event_ts > whop_timeline["last_seen_ts"]:
+                whop_timeline["last_seen_ts"] = event_ts
+            
+            # last_active_ts: max timestamp where status is "active" or "trialing"
+            if status in ("active", "trialing"):
+                if "last_active_ts" not in whop_timeline or whop_timeline["last_active_ts"] is None or event_ts > whop_timeline["last_active_ts"]:
+                    whop_timeline["last_active_ts"] = event_ts
+            
+            # last_canceled_ts: max timestamp where status is "canceled" or event_type is "cancellation"
+            if status == "canceled" or event_type == "cancellation":
+                if "last_canceled_ts" not in whop_timeline or whop_timeline["last_canceled_ts"] is None or event_ts > whop_timeline["last_canceled_ts"]:
+                    whop_timeline["last_canceled_ts"] = event_ts
+            
+            # last_status: most recent status (normalize to lowercase)
+            if status:
+                whop_timeline["last_status"] = status
+            
+            # last_membership_id: from event if available
+            membership_id = event.get("whop_key") or event.get("membership_id")
+            if membership_id:
+                whop_timeline["last_membership_id"] = str(membership_id)
+            
+            # last_user_id: from event if available (though whop_history.json doesn't seem to have this)
+            # Keeping for future compatibility
+            
+            backfilled_count += 1
+        
+        # Save merged history (non-destructive: only whop sub-object was modified)
+        _save_member_history(member_history)
+        
+        log.info(f"Whop timeline backfill complete: {backfilled_count} events processed, {len([k for k, v in member_history.items() if v.get('whop')])} members with Whop timeline")
+    except Exception as e:
+        log.error(f"Whop timeline backfill failed: {e}", exc_info=True)
+
+def _roles_plain(member: discord.Member) -> str:
+    """Comma-separated role names (no role mentions, excludes @everyone and managed roles)."""
+    roles = [r.name for r in member.roles if r != member.guild.default_role and not r.managed]
+    return ", ".join(roles) if roles else "—"
 
 def load_settings() -> dict:
     """Load settings from JSON file, default to enabled if missing/bad"""
@@ -1087,6 +1218,9 @@ async def on_ready():
     queue_state = load_json(QUEUE_FILE)
     registry = load_json(REGISTRY_FILE)
     
+    # Backfill Whop timeline from whop_history.json (before initializing whop handler)
+    _backfill_whop_timeline_from_whop_history()
+    
     guild = bot.get_guild(GUILD_ID)
     if guild:
         log.info(f"[Bot] Connected to: {guild.name}")
@@ -1219,7 +1353,8 @@ async def on_ready():
             log_other_func=log_other,
             log_member_status_func=log_member_status,
             fmt_user_func=_fmt_user,
-            member_status_logs_channel_id=MEMBER_STATUS_LOGS_CHANNEL_ID
+            member_status_logs_channel_id=MEMBER_STATUS_LOGS_CHANNEL_ID,
+            get_member_history_func=get_member_history
         )
         channels = []
         if WHOP_WEBHOOK_CHANNEL_ID:
@@ -1257,13 +1392,18 @@ async def on_member_join(member: discord.Member):
                     color=0x00FF00,  # Green
                     timestamp=datetime.now(timezone.utc)
                 )
+                with suppress(Exception):
+                    embed.set_author(name=str(member), icon_url=member.display_avatar.url)
+                    embed.set_thumbnail(url=member.display_avatar.url)
                 embed.add_field(name="Member", value=member.mention, inline=False)
                 embed.add_field(name="User ID", value=str(member.id), inline=False)
-                embed.add_field(name="Member Since", value=_fmt_ts(rec.get("first_join_ts"), "D"), inline=True)
-                embed.add_field(name="Join Count", value=str(rec.get("join_count")), inline=True)
+                embed.add_field(name="Account Created", value=member.created_at.strftime("%b %d, %Y"), inline=True)
+                embed.add_field(name="First Joined", value=_fmt_ts(rec.get("first_join_ts"), "D"), inline=True)
+                embed.add_field(name="Join Count", value=str(rec.get("join_count", 1)), inline=True)
                 if rec.get("join_count", 0) > 1:
-                    embed.add_field(name="Status", value="Returning member", inline=True)
-                embed.set_footer(text="RSCheckerbot • Member Status Tracking")
+                    embed.add_field(name="Status", value="🔄 Returning member", inline=True)
+                embed.add_field(name="Current Roles", value=_roles_plain(member), inline=False)
+                # Footer removed per user request
                 await log_member_status("", embed=embed)
         
         guild = member.guild
@@ -1374,14 +1514,19 @@ async def on_member_remove(member: discord.Member):
                     color=0xFFA500,  # Orange
                     timestamp=datetime.now(timezone.utc)
                 )
-                embed.add_field(name="Member", value=f"`{member}`", inline=False)
+                embed.add_field(name="Member", value=f"{member.mention} (`{member}`)", inline=False)
+                with suppress(Exception):
+                    embed.set_author(name=str(member), icon_url=member.display_avatar.url)
+                    embed.set_thumbnail(url=member.display_avatar.url)
+                # Snapshot roles at leave time (no mentions)
+                embed.add_field(name="Roles At Leave", value=_roles_plain(member), inline=False)
                 embed.add_field(name="User ID", value=str(member.id), inline=False)
                 embed.add_field(name="Last Left", value=_fmt_ts(rec.get("last_leave_ts"), "D"), inline=True)
                 if rec.get("first_join_ts"):
                     embed.add_field(name="First Joined", value=_fmt_ts(rec.get("first_join_ts"), "D"), inline=True)
                 if rec.get("join_count", 0) > 0:
                     embed.add_field(name="Join Count", value=str(rec.get("join_count")), inline=True)
-                embed.set_footer(text="RSCheckerbot • Member Status Tracking")
+                # Footer removed per user request
                 await log_member_status("", embed=embed)
 
 @bot.event

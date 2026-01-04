@@ -14,6 +14,7 @@ import logging
 import discord
 from pathlib import Path
 from datetime import datetime, timezone
+from contextlib import suppress
 
 log = logging.getLogger("rs-checker")
 
@@ -29,18 +30,29 @@ ROLE_CANCEL_B = None
 _log_other = None
 _log_member_status = None
 _fmt_user = None
+_get_member_history = None
 
 # Identity tracking and trial abuse detection
 MEMBER_STATUS_LOGS_CHANNEL_ID = None
 
+# Expected roles config (loaded from config.json)
+EXPECTED_ROLES = {}
+
 # File paths for JSON storage (canonical: JSON-only, no SQLite)
-IDENTITY_CACHE_FILE = Path(__file__).resolve().parent / "whop_identity_cache.json"
-TRIAL_CACHE_FILE = Path(__file__).resolve().parent / "trial_history.json"
+BASE_DIR = Path(__file__).resolve().parent
+IDENTITY_CACHE_FILE = BASE_DIR / "whop_identity_cache.json"
+TRIAL_CACHE_FILE = BASE_DIR / "trial_history.json"
+IDENTITY_CONFLICTS_FILE = BASE_DIR / "identity_conflicts.jsonl"
 
 
 def _norm_email(s: str) -> str:
     """Normalize email address for consistent storage/lookup"""
     return (s or "").strip().lower()
+
+def _roles_plain(member: discord.Member) -> str:
+    """Comma-separated role names (no role mentions, excludes @everyone and managed roles)."""
+    roles = [r.name for r in member.roles if r != member.guild.default_role and not r.managed]
+    return ", ".join(roles) if roles else "—"
 
 def _load_json(path: Path) -> dict:
     """Load JSON file, returning empty dict if file doesn't exist or is invalid"""
@@ -78,6 +90,148 @@ def _lookup_identity(email: str) -> dict | None:
         return None
     db = _load_json(IDENTITY_CACHE_FILE)
     return db.get(email)
+
+def _load_whop_history() -> dict:
+    """Load whop_history.json from RSAdminBot/whop_data/ directory.
+    
+    Path is resolved from config or uses default relative path.
+    Returns empty dict if file doesn't exist or is invalid.
+    """
+    try:
+        # Default path (relative to RSCheckerbot folder)
+        default_path = BASE_DIR.parent / "RSAdminBot" / "whop_data" / "whop_history.json"
+        whop_history_path = default_path
+        
+        # Try to load config to get custom path (if available)
+        try:
+            config_path = BASE_DIR / "config.json"
+            if config_path.exists():
+                config_data = _load_json(config_path)
+                custom_path = config_data.get("paths", {}).get("whop_history")
+                if custom_path:
+                    # Resolve relative to BASE_DIR
+                    whop_history_path = (BASE_DIR / custom_path).resolve()
+        except Exception:
+            pass  # Use default path if config loading fails
+        
+        if not whop_history_path.exists():
+            return {}
+        
+        data = _load_json(whop_history_path)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        log.warning(f"Failed to load whop_history.json: {e}")
+        return {}
+
+def _build_identity_cache_from_history(whop_history: dict) -> dict:
+    """Build identity cache dictionary from whop_history membership events.
+    
+    Args:
+        whop_history: Dictionary with 'membership_events' key containing list of events
+    
+    Returns:
+        Dictionary mapping email (normalized) to {discord_id, discord_username, last_seen, source}
+    """
+    cache = {}
+    events = whop_history.get("membership_events", [])
+    
+    for event in events:
+        email = event.get("email", "").strip()
+        discord_id = event.get("discord_id", "").strip()
+        discord_username = event.get("discord_username", "").strip()
+        timestamp = event.get("timestamp") or event.get("created_at")
+        
+        if not email or not discord_id:
+            continue
+        
+        email_norm = _norm_email(email)
+        if not email_norm:
+            continue
+        
+        # Parse timestamp to ISO format for last_seen
+        last_seen_iso = timestamp if timestamp else datetime.now(timezone.utc).isoformat()
+        
+        cache[email_norm] = {
+            "discord_id": str(discord_id),
+            "discord_username": discord_username,
+            "last_seen": last_seen_iso,
+            "source": "whop_history"
+        }
+    
+    return cache
+
+def _backfill_identity_cache() -> None:
+    """Backfill identity cache from whop_history.json.
+    
+    Merge rules:
+    - If email not present → add
+    - If email present and discord_id matches → update metadata
+    - If email present and discord_id differs → log conflict, do NOT overwrite
+    """
+    try:
+        whop_history = _load_whop_history()
+        if not whop_history:
+            log.info("whop_history.json not found or empty, skipping identity backfill")
+            return
+        
+        history_cache = _build_identity_cache_from_history(whop_history)
+        if not history_cache:
+            log.info("No identity mappings found in whop_history.json")
+            return
+        
+        # Load existing cache
+        existing_cache = _load_json(IDENTITY_CACHE_FILE)
+        
+        added_count = 0
+        updated_count = 0
+        conflict_count = 0
+        
+        # Log conflicts to file
+        conflicts_log = []
+        
+        for email, history_entry in history_cache.items():
+            existing_entry = existing_cache.get(email)
+            
+            if not existing_entry:
+                # New entry - add it
+                existing_cache[email] = history_entry
+                added_count += 1
+            else:
+                # Entry exists - check discord_id
+                existing_id = str(existing_entry.get("discord_id", "")).strip()
+                history_id = str(history_entry.get("discord_id", "")).strip()
+                
+                if existing_id == history_id:
+                    # IDs match - update metadata (last_seen, username if newer)
+                    existing_cache[email]["last_seen"] = history_entry["last_seen"]
+                    if history_entry.get("discord_username"):
+                        existing_cache[email]["discord_username"] = history_entry["discord_username"]
+                    updated_count += 1
+                else:
+                    # IDs differ - log conflict, do NOT overwrite
+                    conflict_count += 1
+                    conflicts_log.append({
+                        "email": email,
+                        "existing_discord_id": existing_id,
+                        "history_discord_id": history_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    })
+        
+        # Save merged cache
+        _save_json(IDENTITY_CACHE_FILE, existing_cache)
+        
+        # Log conflicts if any
+        if conflicts_log:
+            try:
+                with open(IDENTITY_CONFLICTS_FILE, "a", encoding="utf-8") as f:
+                    for conflict in conflicts_log:
+                        f.write(json.dumps(conflict, ensure_ascii=False) + "\n")
+            except Exception as e:
+                log.warning(f"Failed to write identity conflicts log: {e}")
+        
+        log.info(f"Identity backfill complete: {added_count} added, {updated_count} updated, {conflict_count} conflicts")
+    except Exception as e:
+        log.error(f"Identity backfill failed: {e}", exc_info=True)
 
 async def _send_lookup_request(message: discord.Message, event_type: str, email: str, whop_user_id: str = "", membership_id: str = ""):
     """
@@ -188,6 +342,36 @@ def _fmt_discord_ts(ts_str: str | None, style: str = "D") -> str:
         return "—"
 
 
+async def _resolve_member_safe(guild: discord.Guild, discord_id: int | None, force_fetch: bool = False) -> discord.Member | None:
+    """Safely resolve a member with rate-limit protection.
+    
+    Args:
+        guild: Discord guild to resolve member in
+        discord_id: Discord user ID to resolve
+        force_fetch: If True, always try fetch_member (bypasses cache check)
+    
+    Returns:
+        discord.Member if found, None otherwise
+    """
+    if not discord_id or not guild:
+        return None
+    
+    # Try fast path first (cached member)
+    member = guild.get_member(discord_id)
+    if member:
+        return member
+    
+    # Only fetch if explicitly requested or for critical events
+    # (This prevents API spam - fetch_member is expensive)
+    if force_fetch:
+        try:
+            member = await guild.fetch_member(discord_id)
+            return member
+        except (discord.NotFound, discord.HTTPException):
+            return None
+    
+    return None
+
 def _safe_get(event_data: dict, *keys: str, default: str = "—") -> str:
     """Safely get nested dict value using dot notation keys (e.g., 'user.username', 'membership.status')
     
@@ -222,7 +406,10 @@ def _build_support_card_embed(
     color: int,
     member: discord.Member | None,
     event_data: dict,
-    guild: discord.Guild | None = None
+    guild: discord.Guild | None = None,
+    roles_added: list[str] | None = None,
+    roles_removed: list[str] | None = None,
+    flags: list[str] | None = None
 ) -> discord.Embed:
     """Build a support card embed with structured fields (Success Bot style)
     
@@ -232,23 +419,33 @@ def _build_support_card_embed(
         member: Discord member object (if available)
         event_data: Event data dictionary
         guild: Discord guild object (for member lookup fallback)
+        roles_added: List of role names that were added in this event
+        roles_removed: List of role names that were removed in this event
+        flags: List of warning/info flags to display in Access section
     
     Returns:
         discord.Embed with structured fields
     """
+    roles_added = roles_added or []
+    roles_removed = roles_removed or []
+    flags = flags or []
+    
     embed = discord.Embed(
         title=title,
         color=color,
         timestamp=datetime.now(timezone.utc)
     )
     
+    # Author + thumbnail (Amazon-style card header)
+    if member:
+        with suppress(Exception):
+            embed.set_author(name=str(member), icon_url=member.display_avatar.url)
+            embed.set_thumbnail(url=member.display_avatar.url)
+    
     # Member field (mention if available, otherwise user ID) + avatar thumbnail when resolvable
     if member:
         embed.add_field(name="Member", value=member.mention, inline=False)
         embed.add_field(name="User ID", value=str(member.id), inline=False)
-        avatar = getattr(member, "display_avatar", None)
-        if avatar:
-            embed.set_thumbnail(url=avatar.url)
     else:
         discord_id = event_data.get("discord_user_id", "") or _safe_get(event_data, "user.discord_id", default="")
         if discord_id and discord_id != "—":
@@ -259,9 +456,9 @@ def _build_support_card_embed(
                     if fallback_member:
                         embed.add_field(name="Member", value=fallback_member.mention, inline=False)
                         embed.add_field(name="User ID", value=str(user_id_int), inline=False)
-                        avatar = getattr(fallback_member, "display_avatar", None)
-                        if avatar:
-                            embed.set_thumbnail(url=avatar.url)
+                        with suppress(Exception):
+                            embed.set_author(name=str(fallback_member), icon_url=fallback_member.display_avatar.url)
+                            embed.set_thumbnail(url=fallback_member.display_avatar.url)
                     else:
                         embed.add_field(name="Member", value=f"<@{user_id_int}>", inline=False)
                         embed.add_field(name="User ID", value=str(user_id_int), inline=False)
@@ -310,6 +507,70 @@ def _build_support_card_embed(
     if membership_lines:
         embed.add_field(name="Membership", value="\n".join(membership_lines), inline=False)
     
+    # Member history (join/leave) - from Discord events only
+    try:
+        did = None
+        if member:
+            did = member.id
+        else:
+            raw_did = _safe_get(event_data, "discord_user_id", "user.discord_id", default="")
+            if raw_did and raw_did != "—":
+                try:
+                    did = int(str(raw_did).strip())
+                except (ValueError, TypeError):
+                    pass
+        if did and _get_member_history:
+            hist = _get_member_history(did) or {}
+            if hist:
+                hist_lines = []
+                if hist.get("first_join_ts"):
+                    try:
+                        hist_lines.append(f"• First joined: <t:{int(hist.get('first_join_ts'))}:D>")
+                    except Exception:
+                        pass
+                if hist.get("last_join_ts"):
+                    try:
+                        hist_lines.append(f"• Last joined: <t:{int(hist.get('last_join_ts'))}:R>")
+                    except Exception:
+                        pass
+                if hist.get("last_leave_ts"):
+                    try:
+                        hist_lines.append(f"• Last left: <t:{int(hist.get('last_leave_ts'))}:R>")
+                    except Exception:
+                        pass
+                if hist.get("join_count", 0) > 0:
+                    hist_lines.append(f"• Join count: {hist.get('join_count', 0)}")
+                if hist_lines:
+                    embed.add_field(name="Member History", value="\n".join(hist_lines), inline=False)
+    except Exception:
+        pass
+    
+    # Access section (roles changed + current roles + flags)
+    access_lines: list[str] = []
+    if roles_added:
+        access_lines.append("**+ Added:** " + ", ".join(roles_added))
+    if roles_removed:
+        access_lines.append("**- Removed:** " + ", ".join(roles_removed))
+    if member:
+        access_lines.append("**Current Roles:** " + _roles_plain(member))
+        
+        # Missing role detection (compare expected vs current)
+        membership_status = _safe_get(event_data, "membership.status", "status", default="")
+        if membership_status and membership_status != "—":
+            status_normalized = (membership_status or "").strip().lower()
+            expected_role_names = EXPECTED_ROLES.get(status_normalized, [])
+            if expected_role_names:
+                current_role_names = {r.name for r in member.roles if r != member.guild.default_role and not r.managed}
+                for expected_role in expected_role_names:
+                    if expected_role not in current_role_names:
+                        flags.append(f"{status_normalized} on Whop but missing {expected_role} role")
+    else:
+        access_lines.append("**Current Roles:** — (member not found)")
+    if flags:
+        access_lines.extend([f"⚠️ {f}" for f in flags])
+    if access_lines:
+        embed.add_field(name="Access", value="\n".join(access_lines), inline=False)
+    
     # Links (dashboard, manage, checkout)
     dashboard_url = _safe_get(event_data, "user.dashboard_url", "dashboard_url", default="")
     manage_url = _safe_get(event_data, "membership.manage_url", "manage_url", default="")
@@ -326,13 +587,13 @@ def _build_support_card_embed(
     if links_text:
         embed.add_field(name="Links", value=" • ".join(links_text), inline=False)
     
-    embed.set_footer(text="RSCheckerbot • Member Status Tracking")
+    # Footer removed per user request (clean card style)
     
     return embed
 
 
 def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_role_id, role_cancel_a, role_cancel_b,
-               log_other_func, log_member_status_func, fmt_user_func, member_status_logs_channel_id=None):
+               log_other_func, log_member_status_func, fmt_user_func, member_status_logs_channel_id=None, get_member_history_func=None):
     """
     Initialize handler with configuration and logging functions.
     
@@ -347,10 +608,11 @@ def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_r
         log_member_status_func: Function to log to member status channel (canonical owner)
         fmt_user_func: Function to format user display (canonical owner)
         member_status_logs_channel_id: Channel ID for member status logs (lookup requests, trial alerts)
+        get_member_history_func: Function to get member history record (canonical owner)
     """
     global WHOP_WEBHOOK_CHANNEL_ID, WHOP_LOGS_CHANNEL_ID, ROLE_TRIGGER, WELCOME_ROLE_ID, ROLE_CANCEL_A, ROLE_CANCEL_B
-    global _log_other, _log_member_status, _fmt_user
-    global MEMBER_STATUS_LOGS_CHANNEL_ID
+    global _log_other, _log_member_status, _fmt_user, _get_member_history
+    global MEMBER_STATUS_LOGS_CHANNEL_ID, EXPECTED_ROLES
     
     WHOP_WEBHOOK_CHANNEL_ID = webhook_channel_id
     WHOP_LOGS_CHANNEL_ID = whop_logs_channel_id
@@ -361,7 +623,23 @@ def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_r
     _log_other = log_other_func
     _log_member_status = log_member_status_func
     _fmt_user = fmt_user_func
+    _get_member_history = get_member_history_func
     MEMBER_STATUS_LOGS_CHANNEL_ID = member_status_logs_channel_id
+    
+    # Load expected roles config
+    try:
+        config_path = BASE_DIR / "config.json"
+        if config_path.exists():
+            config_data = _load_json(config_path)
+            EXPECTED_ROLES = config_data.get("whop_webhook", {}).get("expected_roles", {})
+        else:
+            EXPECTED_ROLES = {}
+    except Exception as e:
+        log.warning(f"Failed to load expected roles config: {e}")
+        EXPECTED_ROLES = {}
+    
+    # Backfill identity cache from whop_history.json
+    _backfill_identity_cache()
     
     log.info(f"Whop webhook handler initialized")
     log.info(f"Monitoring webhook channel {webhook_channel_id} and logs channel {whop_logs_channel_id}")
@@ -777,7 +1055,8 @@ async def handle_membership_activated(member: discord.Member, event_data: dict):
             color=0x00FF00,  # Green
             member=member,
             event_data=event_data,
-            guild=guild
+            guild=guild,
+            roles_added=[cleanup_role.name] if cleanup_role else None
         )
         embed.description = "New membership activated from Whop."
         
@@ -837,7 +1116,8 @@ async def handle_membership_deactivated(member: discord.Member, event_data: dict
             color=0xFFA500,  # Orange
             member=member,
             event_data=event_data,
-            guild=guild
+            guild=guild,
+            roles_removed=[r.name for r in roles_to_remove] if roles_to_remove else None
         )
         embed.description = "Membership was deactivated and access roles have been removed from this member."
         
@@ -907,7 +1187,8 @@ async def handle_payment_activation(member: discord.Member, event_data: dict):
             color=0x00FF00,  # Green
             member=member,
             event_data=event_data,
-            guild=guild
+            guild=guild,
+            roles_added=[member_role.name] if member_role else None
         )
         embed.description = "First Whop payment succeeded. Member role has been assigned."
         embed.add_field(
@@ -927,7 +1208,8 @@ async def handle_payment_failed(member: discord.Member, event_data: dict):
             color=0xFF6B6B,  # Red
             member=member,
             event_data=event_data,
-            guild=guild
+            guild=guild,
+            flags=["Billing issue (access risk)"]
         )
         embed.description = "A Whop payment failed for this member. Review billing and take follow-up action."
         
