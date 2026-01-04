@@ -7224,6 +7224,216 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             
             await ctx.send(embed=embed)
         
+        # Oracle data sync commands
+        @self.bot.command(name="oracledatasync")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def oracledatasync(ctx):
+            """Sync runtime data from Oracle server to local (admin only)"""
+            status_msg = await ctx.send("⏳ **Syncing Oracle server runtime data...**\n```\nDownloading data files...\n```")
+            
+            script_path = self.base_path.parent / "scripts" / "sync_oracle_runtime_data.py"
+            if not script_path.exists():
+                await status_msg.edit(content="❌ **Error:** Script not found. Expected: `scripts/sync_oracle_runtime_data.py`")
+                return
+            
+            # Run script locally (subprocess)
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(script_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    cwd=str(self.base_path.parent)
+                )
+                
+                stdout = result.stdout or ""
+                stderr = result.stderr or ""
+                
+                if result.returncode == 0:
+                    embed = MessageHelper.create_success_embed(
+                        title="Oracle Data Sync Complete",
+                        message="Runtime data downloaded from Oracle server.",
+                        details=stdout[-1500:] if stdout else "Sync completed successfully.",
+                        footer=f"Triggered by {ctx.author}"
+                    )
+                    await status_msg.edit(content="", embed=embed)
+                else:
+                    error_msg = stderr or stdout or "Unknown error"
+                    embed = MessageHelper.create_error_embed(
+                        title="Oracle Data Sync Failed",
+                        message="Failed to sync runtime data from Oracle server.",
+                        error_details=error_msg[-1500:],
+                        footer=f"Triggered by {ctx.author}"
+                    )
+                    await status_msg.edit(content="", embed=embed)
+            except subprocess.TimeoutExpired:
+                await status_msg.edit(content="❌ **Error:** Sync script timed out after 5 minutes.")
+            except Exception as e:
+                embed = MessageHelper.create_error_embed(
+                    title="Oracle Data Sync Error",
+                    message="Exception occurred while running sync script.",
+                    error_details=str(e)[:1500],
+                    footer=f"Triggered by {ctx.author}"
+                )
+                await status_msg.edit(content="", embed=embed)
+        self.registered_commands.append(("oracledatasync", "Sync runtime data from Oracle server to local", True))
+        
+        @self.bot.command(name="oracledataanalyze")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def oracledataanalyze(ctx):
+            """Analyze downloaded Oracle server runtime data (admin only)"""
+            status_msg = await ctx.send("⏳ **Analyzing Oracle server runtime data...**\n```\nGenerating statistics...\n```")
+            
+            script_path = self.base_path.parent / "scripts" / "analyze_oracle_data.py"
+            if not script_path.exists():
+                await status_msg.edit(content="❌ **Error:** Script not found. Expected: `scripts/analyze_oracle_data.py`")
+                return
+            
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(script_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    cwd=str(self.base_path.parent)
+                )
+                
+                stdout = result.stdout or ""
+                stderr = result.stderr or ""
+                
+                if result.returncode == 0:
+                    embed = MessageHelper.create_success_embed(
+                        title="Oracle Data Analysis Complete",
+                        message="Analysis report generated successfully.",
+                        details=stdout[-1500:] if stdout else "Analysis completed successfully.",
+                        footer=f"Triggered by {ctx.author} | Report: OracleServerData/analysis_report.md"
+                    )
+                    await status_msg.edit(content="", embed=embed)
+                else:
+                    error_msg = stderr or stdout or "Unknown error"
+                    embed = MessageHelper.create_error_embed(
+                        title="Oracle Data Analysis Failed",
+                        message="Failed to analyze runtime data.",
+                        error_details=error_msg[-1500:],
+                        footer=f"Triggered by {ctx.author}"
+                    )
+                    await status_msg.edit(content="", embed=embed)
+            except subprocess.TimeoutExpired:
+                await status_msg.edit(content="❌ **Error:** Analysis script timed out after 2 minutes.")
+            except Exception as e:
+                embed = MessageHelper.create_error_embed(
+                    title="Oracle Data Analysis Error",
+                    message="Exception occurred while running analysis script.",
+                    error_details=str(e)[:1500],
+                    footer=f"Triggered by {ctx.author}"
+                )
+                await status_msg.edit(content="", embed=embed)
+        self.registered_commands.append(("oracledataanalyze", "Analyze downloaded Oracle server runtime data", True))
+        
+        @self.bot.command(name="oracledatadoc")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def oracledatadoc(ctx):
+            """Generate documentation report of ask mode changes (admin only)"""
+            status_msg = await ctx.send("⏳ **Generating documentation report...**\n```\nDocumenting changes...\n```")
+            
+            script_path = self.base_path.parent / "scripts" / "document_ask_mode_changes.py"
+            if not script_path.exists():
+                await status_msg.edit(content="❌ **Error:** Script not found. Expected: `scripts/document_ask_mode_changes.py`")
+                return
+            
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(script_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    cwd=str(self.base_path.parent)
+                )
+                
+                stdout = result.stdout or ""
+                stderr = result.stderr or ""
+                
+                if result.returncode == 0:
+                    embed = MessageHelper.create_success_embed(
+                        title="Documentation Report Generated",
+                        message="Documentation report created successfully.",
+                        details=stdout[-1500:] if stdout else "Report generated successfully.",
+                        footer=f"Triggered by {ctx.author} | Report: docs/ASK_MODE_CHANGES_REPORT.md"
+                    )
+                    await status_msg.edit(content="", embed=embed)
+                else:
+                    error_msg = stderr or stdout or "Unknown error"
+                    embed = MessageHelper.create_error_embed(
+                        title="Documentation Generation Failed",
+                        message="Failed to generate documentation report.",
+                        error_details=error_msg[-1500:],
+                        footer=f"Triggered by {ctx.author}"
+                    )
+                    await status_msg.edit(content="", embed=embed)
+            except subprocess.TimeoutExpired:
+                await status_msg.edit(content="❌ **Error:** Documentation script timed out after 1 minute.")
+            except Exception as e:
+                embed = MessageHelper.create_error_embed(
+                    title="Documentation Generation Error",
+                    message="Exception occurred while running documentation script.",
+                    error_details=str(e)[:1500],
+                    footer=f"Triggered by {ctx.author}"
+                )
+                await status_msg.edit(content="", embed=embed)
+        self.registered_commands.append(("oracledatadoc", "Generate documentation report of ask mode changes", True))
+        
+        @self.bot.command(name="oracledatasample")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def oracledatasample(ctx):
+            """Generate sample embed outputs from scanned data (admin only)"""
+            status_msg = await ctx.send("⏳ **Generating sample embed outputs...**\n```\nCreating sample embeds...\n```")
+            
+            script_path = self.base_path.parent / "scripts" / "generate_sample_embeds_from_data.py"
+            if not script_path.exists():
+                await status_msg.edit(content="❌ **Error:** Script not found. Expected: `scripts/generate_sample_embeds_from_data.py`")
+                return
+            
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(script_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    cwd=str(self.base_path.parent)
+                )
+                
+                stdout = result.stdout or ""
+                stderr = result.stderr or ""
+                
+                if result.returncode == 0:
+                    embed = MessageHelper.create_success_embed(
+                        title="Sample Embed Generation Complete",
+                        message="Sample embed outputs generated successfully.",
+                        details=stdout[-1500:] if stdout else "Sample generation completed successfully.",
+                        footer=f"Triggered by {ctx.author} | Report: OracleServerData/sample_embeds_report.md"
+                    )
+                    await status_msg.edit(content="", embed=embed)
+                else:
+                    error_msg = stderr or stdout or "Unknown error"
+                    embed = MessageHelper.create_error_embed(
+                        title="Sample Embed Generation Failed",
+                        message="Failed to generate sample embed outputs.",
+                        error_details=error_msg[-1500:],
+                        footer=f"Triggered by {ctx.author}"
+                    )
+                    await status_msg.edit(content="", embed=embed)
+            except subprocess.TimeoutExpired:
+                await status_msg.edit(content="❌ **Error:** Sample generation script timed out after 2 minutes.")
+            except Exception as e:
+                embed = MessageHelper.create_error_embed(
+                    title="Sample Embed Generation Error",
+                    message="Exception occurred while running sample generation script.",
+                    error_details=str(e)[:1500],
+                    footer=f"Triggered by {ctx.author}"
+                )
+                await status_msg.edit(content="", embed=embed)
+        self.registered_commands.append(("oracledatasample", "Generate sample embed outputs from scanned data", True))
+        
         # Bot movement tracking commands
         @self.bot.command(name="botmovements")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
