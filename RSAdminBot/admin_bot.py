@@ -7395,8 +7395,14 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
         
         @self.bot.command(name="oracledatasample")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
-        async def oracledatasample(ctx):
-            """Generate sample embed outputs from scanned data (admin only)"""
+        async def oracledatasample(ctx, post: str = "no", event_type: str = "all"):
+            """Generate sample embed outputs from scanned data (admin only).
+
+            Usage:
+              - !oracledatasample
+              - !oracledatasample post
+              - !oracledatasample post cancellation
+            """
             status_msg = await ctx.send("⏳ **Generating sample embed outputs...**\n```\nCreating sample embeds...\n```")
             
             script_path = self.base_path.parent / "scripts" / "generate_sample_embeds_from_data.py"
@@ -7424,6 +7430,101 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                         footer=f"Triggered by {ctx.author} | Report: OracleServerData/sample_embeds_report.md"
                     )
                     await status_msg.edit(content="", embed=embed)
+
+                    # Optional: post the generated sample embeds into the channel for visual verification.
+                    try:
+                        post_flag = str(post or "").strip().lower()
+                        should_post = post_flag in ("yes", "y", "true", "1", "post")
+                        type_filter = str(event_type or "all").strip().lower()
+
+                        if should_post:
+                            out_path = self.base_path.parent / "OracleServerData" / "sample_embeds_output.json"
+                            if not out_path.exists():
+                                await ctx.send("⚠️ Sample output JSON not found. Expected: `OracleServerData/sample_embeds_output.json`")
+                                return
+
+                            try:
+                                payload = json.loads(out_path.read_text(encoding="utf-8") or "{}")
+                            except Exception as e:
+                                await ctx.send(f"⚠️ Failed to read sample output JSON: {str(e)[:200]}")
+                                return
+
+                            samples = (payload.get("sample_embeds") or {}) if isinstance(payload, dict) else {}
+                            if not isinstance(samples, dict) or not samples:
+                                await ctx.send("⚠️ No sample embeds were generated (sample_embeds is empty).")
+                                return
+
+                            ordered_types = ["new", "renewal", "cancellation", "completed"]
+                            available_types = [t for t in ordered_types if t in samples] + [t for t in samples.keys() if t not in ordered_types]
+
+                            if type_filter != "all":
+                                # allow short aliases (e.g. cancel -> cancellation)
+                                aliases = {
+                                    "cancel": "cancellation",
+                                    "canceled": "cancellation",
+                                    "cancelled": "cancellation",
+                                }
+                                type_filter = aliases.get(type_filter, type_filter)
+                                available_types = [t for t in available_types if t == type_filter]
+
+                            if not available_types:
+                                await ctx.send(f"⚠️ No samples match event_type `{type_filter}`.")
+                                return
+
+                            await ctx.send(f"🧪 Posting sample embeds ({', '.join(available_types)})...")
+
+                            for t in available_types[:10]:
+                                block = samples.get(t) or {}
+                                embed_data = block.get("embed") or {}
+                                sample_event = block.get("sample_event_data") or {}
+                                if not isinstance(embed_data, dict):
+                                    continue
+
+                                title = str(embed_data.get("title") or f"Sample ({t})")
+                                color = embed_data.get("color")
+                                try:
+                                    color_int = int(color) if color is not None else 0x5865F2
+                                except Exception:
+                                    color_int = 0x5865F2
+
+                                rs_embed = discord.Embed(
+                                    title=title,
+                                    color=color_int,
+                                    timestamp=datetime.now(timezone.utc),
+                                )
+
+                                # Try to mimic "support card" header using the real Discord member (if resolvable)
+                                try:
+                                    did = str(sample_event.get("discord_id") or "").strip()
+                                    if did and ctx.guild:
+                                        m = ctx.guild.get_member(int(did))
+                                        if m:
+                                            rs_embed.set_author(name=str(m), icon_url=m.display_avatar.url)
+                                            rs_embed.set_thumbnail(url=m.display_avatar.url)
+                                except Exception:
+                                    pass
+
+                                # Fields
+                                fields = embed_data.get("fields") or []
+                                if isinstance(fields, list):
+                                    for f in fields[:25]:
+                                        if not isinstance(f, dict):
+                                            continue
+                                        name = str(f.get("name") or "")[:256] or "Field"
+                                        value = str(f.get("value") or "—")
+                                        inline = bool(f.get("inline", False))
+                                        # Discord embed field value limit is 1024 chars
+                                        rs_embed.add_field(name=name, value=value[:1024], inline=inline)
+
+                                footer = embed_data.get("footer")
+                                if footer:
+                                    rs_embed.set_footer(text=str(footer)[:2048])
+
+                                await ctx.send(embed=rs_embed)
+
+                    except Exception:
+                        # Never fail the command after generation succeeded.
+                        pass
                 else:
                     error_msg = stderr or stdout or "Unknown error"
                     embed = MessageHelper.create_error_embed(
