@@ -28,7 +28,7 @@ import re
 from collections import deque
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 
 import aiohttp
 
@@ -7522,9 +7522,12 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
 
                                 await ctx.send(embed=rs_embed)
 
-                    except Exception:
-                        # Never fail the command after generation succeeded.
-                        pass
+                    except Exception as e:
+                        # Never fail the command after generation succeeded, but do report why posting failed.
+                        try:
+                            await ctx.send(f"⚠️ Sample embed posting failed: {str(e)[:200]}")
+                        except Exception:
+                            pass
                 else:
                     error_msg = stderr or stdout or "Unknown error"
                     embed = MessageHelper.create_error_embed(

@@ -1408,6 +1408,45 @@ async def on_member_join(member: discord.Member):
     if member.guild.id == GUILD_ID and not member.bot:
         # Track join event FIRST (before other logic)
         rec = _touch_join(member.id)
+
+        # Determine join method via invite usage deltas (best-effort).
+        used_invite_code = None
+        used_invite_inviter = None
+        used_invite_inviter_name = None
+        used_invite_inviter_id = None
+        join_method_lines: list[str] = []
+        try:
+            invites = await member.guild.invites()
+            for invite in invites:
+                previous_uses = invite_usage_cache.get(invite.code, 0)
+                if invite.uses > previous_uses and used_invite_code is None:
+                    used_invite_code = invite.code
+                    used_invite_inviter = invite.inviter
+                    used_invite_inviter_name = invite.inviter.name if invite.inviter else None
+                    used_invite_inviter_id = invite.inviter.id if invite.inviter else None
+                # Keep cache updated
+                invite_usage_cache[invite.code] = invite.uses
+        except Exception as e:
+            join_method_lines.append(f"• Invite tracking: error ({str(e)[:120]})")
+
+        if used_invite_code:
+            join_method_lines.append(f"• Invite code: `{used_invite_code}`")
+            if used_invite_inviter_name and used_invite_inviter_id:
+                join_method_lines.append(f"• Invited by: {used_invite_inviter_name} (`{used_invite_inviter_id}`)")
+            invite_entry = invites_data.get(used_invite_code) or {}
+            is_tracked = bool(invite_entry) and invite_entry.get("used_at") is None
+            join_method_lines.append(f"• Tracked invite: {'yes' if is_tracked else 'no'}")
+            if is_tracked:
+                join_method_lines.append("• Source: One-time invite")
+                lead_id = invite_entry.get("lead_id") or ""
+                if lead_id:
+                    join_method_lines.append(f"• Lead ID: `{lead_id}`")
+            else:
+                join_method_lines.append("• Source: Untracked/permanent or external")
+        else:
+            if not join_method_lines:
+                join_method_lines.append("• No invite delta detected")
+                join_method_lines.append("• Possible: vanity/permanent invite, direct link, or invite cache not warm yet")
         
         # Optional: Log join to member-status-logs
         if MEMBER_STATUS_LOGS_CHANNEL_ID:
@@ -1426,6 +1465,7 @@ async def on_member_join(member: discord.Member):
                 embed.add_field(name="Join Count", value=str(rec.get("join_count", 1)), inline=True)
                 if rec.get("join_count", 0) > 1:
                     embed.add_field(name="Status", value="🔄 Returning member", inline=True)
+                embed.add_field(name="Join Method", value="\n".join(join_method_lines)[:1024], inline=False)
                 embed.add_field(name="Current Roles", value=_roles_plain(member), inline=False)
                 # Footer removed per user request
                 await log_member_status("", embed=embed)
@@ -1461,81 +1501,14 @@ async def on_member_join(member: discord.Member):
         )
         asyncio.create_task(check_and_assign_role(member))
 
-        # Track invite usage
+        # If we detected a tracked invite, mark it used (non-destructive; persists metadata for audit).
         try:
-            invites = await member.guild.invites()
-            matched_invite = None
-            used_invite_code = None
-            used_invite_inviter = None
-            
-            # First pass: Find which invite was used (uses increased)
-            for invite in invites:
-                previous_uses = invite_usage_cache.get(invite.code, 0)
-                if invite.uses > previous_uses:
-                    # This invite was used - capture it (only first one found)
-                    if used_invite_code is None:
-                        used_invite_code = invite.code
-                        used_invite_inviter = invite.inviter
-                    invite_usage_cache[invite.code] = invite.uses
-                else:
-                    # Update cache even if not used (to track current state)
-                    invite_usage_cache[invite.code] = invite.uses
-            
-            # Second pass: Check if the used invite is in our tracked invites
             if used_invite_code:
-                # Check if invite exists and is unused
                 invite_entry = invites_data.get(used_invite_code)
                 if invite_entry and invite_entry.get("used_at") is None:
-                    matched_invite = used_invite_code
                     await track_invite_usage(used_invite_code, member)
-                    # Log to terminal with details
-                    inviter_name = used_invite_inviter.name if used_invite_inviter else "Unknown"
-                    log.info(f"✅ Member {member} ({member.id}) joined via tracked invite: {used_invite_code} (invited by {inviter_name})")
-            
-            if not matched_invite:
-                # Determine join method
-                if used_invite_code:
-                    # Invite was used but not in our tracked invites (untracked invite)
-                    inviter_name = used_invite_inviter.name if used_invite_inviter else "Unknown"
-                    inviter_id = used_invite_inviter.id if used_invite_inviter else "Unknown"
-                    log.warning(f"⚠️ Member {member} ({member.id}) joined via untracked invite: {used_invite_code} (invited by {inviter_name} ({inviter_id}))")
-                    # Could be a bot invite from Whop - log as structured embed (with avatar)
-                    embed = discord.Embed(
-                        title="🔐 Bot Invite (untracked)",
-                        color=0xFEE75C,  # Yellow
-                        timestamp=datetime.now(timezone.utc),
-                    )
-                    _apply_member_header(embed, member)
-                    embed.add_field(name="Member", value=member.mention, inline=False)
-                    embed.add_field(name="User ID", value=str(member.id), inline=False)
-                    embed.add_field(name="Invite Code", value=f"`{used_invite_code}`", inline=True)
-                    embed.add_field(name="Inviter", value=f"{inviter_name} (`{inviter_id}`)", inline=True)
-                    embed.add_field(name="Status", value="⚠️ Not tracked in invites", inline=False)
-                    embed.add_field(name="First Joined", value=_fmt_ts(rec.get("first_join_ts"), "D"), inline=True)
-                    embed.add_field(name="Join Count", value=str(rec.get("join_count", 1)), inline=True)
-                    await log_member_status("", embed=embed)
-                else:
-                    # No invite code matched - could be bot invite, direct link, or unknown
-                    join_method = "Bot Invite (likely Whop)" if not member.bot else "Bot Account Join"
-                    log.warning(f"❓ Member {member} ({member.id}) joined via {join_method} or direct link")
-                    # Log to member status channel since this is likely a subscription-based join (structured embed)
-                    embed = discord.Embed(
-                        title=f"🔐 {join_method}",
-                        color=0xFEE75C,  # Yellow
-                        timestamp=datetime.now(timezone.utc),
-                    )
-                    _apply_member_header(embed, member)
-                    embed.add_field(name="Member", value=member.mention, inline=False)
-                    embed.add_field(name="User ID", value=str(member.id), inline=False)
-                    embed.add_field(name="Invite Code", value="No matching code found", inline=False)
-                    embed.add_field(name="Type", value="May be subscription-based (Whop)", inline=False)
-                    embed.add_field(name="Status", value="⚠️ Not tracked in invites", inline=False)
-                    embed.add_field(name="First Joined", value=_fmt_ts(rec.get("first_join_ts"), "D"), inline=True)
-                    embed.add_field(name="Join Count", value=str(rec.get("join_count", 1)), inline=True)
-                    await log_member_status("", embed=embed)
-                
         except Exception as e:
-            log.error(f"❌ Error tracking invite for {member} ({member.id}): {e}")
+            log.error(f"❌ Error updating tracked invite usage for {member} ({member.id}): {e}")
 
 @bot.event
 async def on_member_remove(member: discord.Member):
