@@ -96,7 +96,15 @@ class WhopTracker:
             print(f"[ERROR] Failed to save whop_history.json: {e}")
     
     def _parse_whop_message(self, message: discord.Message) -> Optional[Dict]:
-        """Parse whop log message to extract membership data."""
+        """Parse whop log message to extract membership data from embeds or plain text."""
+        # Try to parse from embed fields first (modern Whop format)
+        if message.embeds:
+            for embed in message.embeds:
+                parsed = self._parse_from_embed(embed, message)
+                if parsed:
+                    return parsed
+        
+        # Fallback to plain text parsing (legacy format)
         content = message.content or ""
         
         # Check if message contains whop data
@@ -117,7 +125,10 @@ class WhopTracker:
         if not discord_id_value:
             return None
         
-        # Extract numeric Discord ID
+        # Extract numeric Discord ID (skip if "No Discord")
+        if "no discord" in discord_id_value.lower():
+            return None
+        
         discord_id_match = re.search(r'(\d{17,19})', discord_id_value)
         if not discord_id_match:
             return None
@@ -135,6 +146,94 @@ class WhopTracker:
             "access_pass": get_value_after("Access Pass"),
             "name": get_value_after("Name"),
             "email": get_value_after("Email"),
+            "membership_status": membership_status,
+            "event_type": event_type,
+            "message_id": message.id,
+            "timestamp": message.created_at.isoformat()
+        }
+    
+    def _parse_from_embed(self, embed: discord.Embed, message: discord.Message) -> Optional[Dict]:
+        """Parse membership data from Discord embed fields."""
+        # Collect all field values into a dict
+        field_values = {}
+        full_text = ""
+        
+        for field in embed.fields:
+            name = field.name or ""
+            value = field.value or ""
+            field_values[name.lower()] = value
+            full_text += f"{name} {value}\n"
+        
+        # Also check embed description and title
+        if embed.description:
+            full_text += embed.description + "\n"
+        if embed.title:
+            full_text += embed.title + "\n"
+        
+        # Look for Discord ID in fields
+        discord_id_value = None
+        for key in ["discord id", "discord_id", "discord user id"]:
+            if key in field_values:
+                discord_id_value = field_values[key]
+                break
+        
+        # Also check description/content for Discord ID
+        if not discord_id_value:
+            content_text = full_text
+            discord_id_match = re.search(r'Discord ID[:\s]+([^\n]+)', content_text, re.IGNORECASE)
+            if discord_id_match:
+                discord_id_value = discord_id_match.group(1).strip()
+        
+        if not discord_id_value:
+            return None
+        
+        # Skip if "No Discord"
+        if "no discord" in discord_id_value.lower():
+            return None
+        
+        # Extract numeric Discord ID
+        discord_id_match = re.search(r'(\d{17,19})', discord_id_value)
+        if not discord_id_match:
+            return None
+        
+        discord_id = discord_id_match.group(1)
+        
+        # Extract other fields
+        def get_field(key_aliases: list) -> str:
+            for key in key_aliases:
+                if key in field_values:
+                    val = field_values[key].strip()
+                    # Remove markdown formatting
+                    val = re.sub(r'[`*_]', '', val)
+                    return val
+            return ""
+        
+        # Also try parsing from full text if not in fields
+        def get_from_text(label: str) -> str:
+            match = re.search(rf'{re.escape(label)}[:\s]+([^\n]+)', full_text, re.IGNORECASE)
+            if match:
+                val = match.group(1).strip()
+                val = re.sub(r'[`*_]', '', val)
+                return val
+            return ""
+        
+        whop_key = get_field(["key"]) or get_from_text("Key")
+        access_pass = get_field(["access pass", "access_pass"]) or get_from_text("Access Pass")
+        name = get_field(["name"]) or get_from_text("Name")
+        email = get_field(["email"]) or get_from_text("Email")
+        membership_status = get_field(["membership status", "membership_status", "status"]) or get_from_text("Membership Status")
+        discord_username = get_field(["discord username", "discord_username"]) or get_from_text("Discord Username")
+        
+        # Determine event type
+        event_type = self._determine_event_type(membership_status, full_text)
+        
+        return {
+            "discord_id": discord_id,
+            "discord_username": discord_username,
+            "whop_key": whop_key,
+            "access_pass": access_pass,
+            "name": name,
+            "email": email,
             "membership_status": membership_status,
             "event_type": event_type,
             "message_id": message.id,
