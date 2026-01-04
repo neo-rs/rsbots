@@ -9,6 +9,7 @@ Shows what RSCheckerbot embeds would look like based on real scanned data.
 
 import json
 import sys
+import re
 from pathlib import Path
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -39,16 +40,71 @@ def load_whop_history() -> dict | None:
         return None
 
 
+def _norm_text(s: str) -> str:
+    return (s or "").strip()
+
+
+def _norm_status(s: str) -> str:
+    return _norm_text(s).lower()
+
+
+def _norm_username(s: str) -> str:
+    """Normalize a stored discord_username so sample output doesn't duplicate mentions."""
+    s = _norm_text(s)
+    if not s:
+        return ""
+    # Remove raw mentions like <@123> or <@!123>
+    s = re.sub(r"<@!?\d+>", "", s).strip()
+    # Remove trailing parentheses like "name (....)"
+    s = re.sub(r"\s*\([^)]*\)\s*$", "", s).strip()
+    return s
+
+
+def pick_sample_event(event_type: str, events: list[dict]) -> dict:
+    """Pick a representative sample event for a given type.
+
+    Avoids misleading samples (e.g., renewal events where membership_status is 'Canceled').
+    Prefers events with a discord_id present and status matching the type.
+    """
+    et = _norm_text(event_type).lower()
+    # Iterate from newest to oldest to get a more current representative event.
+    candidates = [e for e in reversed(events) if isinstance(e, dict)]
+
+    def status_ok(ev: dict) -> bool:
+        st = _norm_status(ev.get("membership_status", ""))
+        if et in ("cancellation",):
+            return ("cancel" in st) or (st == "canceled")
+        if et in ("completed",):
+            return "completed" in st
+        if et in ("new", "renewal"):
+            # Prefer non-canceled / non-completed states for positive events.
+            if "cancel" in st or "completed" in st:
+                return False
+            return True if st else True
+        return True
+
+    # 1) Prefer events with discord_id and a matching status
+    for ev in candidates:
+        if _norm_text(ev.get("discord_id", "")) and status_ok(ev):
+            return ev
+    # 2) Next prefer any event with discord_id
+    for ev in candidates:
+        if _norm_text(ev.get("discord_id", "")):
+            return ev
+    # 3) Fallback
+    return candidates[0] if candidates else (events[0] if events else {})
+
+
 def generate_embed_preview(event_type: str, sample_event: dict) -> dict:
     """Generate embed preview structure for a sample event"""
     discord_id = sample_event.get("discord_id", "")
-    discord_username = sample_event.get("discord_username", "")
-    name = sample_event.get("name", "")
-    email = sample_event.get("email", "")
-    membership_status = sample_event.get("membership_status", "")
-    whop_key = sample_event.get("whop_key", "")
-    access_pass = sample_event.get("access_pass", "")
-    timestamp = sample_event.get("timestamp", "")
+    discord_username = _norm_username(sample_event.get("discord_username", ""))
+    name = _norm_text(sample_event.get("name", ""))
+    email = _norm_text(sample_event.get("email", ""))
+    membership_status = _norm_text(sample_event.get("membership_status", ""))
+    whop_key = _norm_text(sample_event.get("whop_key", ""))
+    access_pass = _norm_text(sample_event.get("access_pass", ""))
+    timestamp = _norm_text(sample_event.get("timestamp", ""))
     
     # Determine embed title and color based on event type
     if event_type == "new":
@@ -99,10 +155,10 @@ def generate_embed_preview(event_type: str, sample_event: dict) -> dict:
     identity_lines = []
     if discord_username:
         identity_lines.append(f"• Username: {discord_username}")
-    if name:
+    if name and name != discord_username:
         identity_lines.append(f"• Name: {name}")
     if email:
-        identity_lines.append(f"• Email: {email}")
+        identity_lines.append(f"• Email: `{email}`")
     
     if identity_lines:
         embed["fields"].append({
@@ -217,7 +273,7 @@ def main():
         if event_type not in events_by_type:
             continue
         
-        sample_event = events_by_type[event_type][0]  # Take first event of each type
+        sample_event = pick_sample_event(event_type, events_by_type[event_type])
         
         # Generate embed structure
         embed_data = generate_embed_preview(event_type, sample_event)

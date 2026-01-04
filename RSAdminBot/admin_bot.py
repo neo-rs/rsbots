@@ -7494,13 +7494,25 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                                 )
 
                                 # Try to mimic "support card" header using the real Discord member (if resolvable)
+                                resolved_user = None
+                                resolved_member = None
+                                resolved_user_id = None
                                 try:
                                     did = str(sample_event.get("discord_id") or "").strip()
                                     if did and ctx.guild:
-                                        m = ctx.guild.get_member(int(did))
-                                        if m:
-                                            rs_embed.set_author(name=str(m), icon_url=m.display_avatar.url)
-                                            rs_embed.set_thumbnail(url=m.display_avatar.url)
+                                        resolved_user_id = int(did)
+                                        resolved_member = ctx.guild.get_member(resolved_user_id)
+                                        if resolved_member:
+                                            resolved_user = resolved_member
+                                        else:
+                                            # Not in this guild (e.g., posting samples in a test server). Fetch user anyway for avatar/name.
+                                            resolved_user = await self.bot.fetch_user(resolved_user_id)
+                                    elif did:
+                                        resolved_user_id = int(did)
+                                        resolved_user = await self.bot.fetch_user(resolved_user_id)
+                                    if resolved_user:
+                                        rs_embed.set_author(name=str(resolved_user), icon_url=resolved_user.display_avatar.url)
+                                        rs_embed.set_thumbnail(url=resolved_user.display_avatar.url)
                                 except Exception:
                                     pass
 
@@ -7513,6 +7525,15 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                                         name = str(f.get("name") or "")[:256] or "Field"
                                         value = str(f.get("value") or "—")
                                         inline = bool(f.get("inline", False))
+                                        # If we're posting in a server where the user isn't a member, raw <@id> mentions render as-is.
+                                        # Improve readability while preserving the ID.
+                                        try:
+                                            if resolved_user_id and name.strip().lower() == "member":
+                                                raw_mention = f"<@{resolved_user_id}>"
+                                                if value.strip() == raw_mention and resolved_user and not resolved_member:
+                                                    value = f"{resolved_user.name} ({raw_mention})"
+                                        except Exception:
+                                            pass
                                         # Discord embed field value limit is 1024 chars
                                         rs_embed.add_field(name=name, value=value[:1024], inline=inline)
 
