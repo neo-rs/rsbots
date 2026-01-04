@@ -318,14 +318,14 @@ def main():
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(report_data, f, indent=2, ensure_ascii=False)
     
-    print(f"✅ JSON report saved to: {OUTPUT_FILE}")
+    print(f"[OK] JSON report saved to: {OUTPUT_FILE}")
     
     # Generate markdown report
     markdown = generate_markdown_report(all_analysis)
     with open(REPORT_FILE, "w", encoding="utf-8") as f:
         f.write(markdown)
     
-    print(f"✅ Markdown report saved to: {REPORT_FILE}")
+    print(f"[OK] Markdown report saved to: {REPORT_FILE}")
     print("")
     print("Analysis complete!")
 

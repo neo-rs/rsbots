@@ -154,7 +154,7 @@ def sync_bot_data(bot_name: str, files: list[str]) -> dict:
         # Check if file exists
         if not check_file_exists(remote_path):
             results["missing"].append(file_path)
-            print(f"  ⚠️  {file_path} - Not found on server")
+            print(f"  [WARN] {file_path} - Not found on server")
             continue
         
         # Download file
@@ -166,10 +166,10 @@ def sync_bot_data(bot_name: str, files: list[str]) -> dict:
                 "remote_path": remote_path,
                 "local_path": str(local_path),
             })
-            print(f"  ✅ {file_path} ({file_size:,} bytes)")
+            print(f"  [OK]   {file_path} ({file_size:,} bytes)")
         else:
             results["errors"].append(file_path)
-            print(f"  ❌ {file_path} - Download failed")
+            print(f"  [ERR]  {file_path} - Download failed")
     
     return results
 

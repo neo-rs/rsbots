@@ -244,13 +244,13 @@ def main():
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(samples, f, indent=2, ensure_ascii=False)
     
-    print(f"✅ JSON output saved to: {OUTPUT_FILE}")
+    print(f"[OK] JSON output saved to: {OUTPUT_FILE}")
     
     # Save markdown report
     with open(REPORT_FILE, "w", encoding="utf-8") as f:
         f.write("\n".join(text_report_lines))
     
-    print(f"✅ Markdown report saved to: {REPORT_FILE}")
+    print(f"[OK] Markdown report saved to: {REPORT_FILE}")
     print("")
     print("Sample embed generation complete!")
 

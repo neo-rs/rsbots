@@ -290,7 +290,7 @@ def main():
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write(markdown)
     
-    print(f"✅ Documentation report saved to: {OUTPUT_FILE}")
+    print(f"[OK] Documentation report saved to: {OUTPUT_FILE}")
     print(f"   Total lines: {len(markdown.splitlines())}")
 
 
