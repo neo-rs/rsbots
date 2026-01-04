@@ -5990,6 +5990,7 @@ echo "CHANGED_END"
                     None,
                     f"[selfupdate] START",
                 )
+            # First, sync RSAdminBot/*.py from rsbots-code to live tree
             success, stats = self._github_py_only_update("RSAdminBot")
             if not success:
                 err_txt = str(stats.get("error", "Unknown error"))[:800]
@@ -6014,6 +6015,16 @@ echo "CHANGED_END"
                         f"[selfupdate] FAILED\nError: {stats.get('error','Unknown error')[:500]}",
                     )
                 return
+
+            # Also sync shared scripts/*.py so admin tooling commands (!oracledatasync, etc.) are available.
+            try:
+                scripts_ok, scripts_stats = self._github_py_only_update("scripts")
+                if not scripts_ok:
+                    warn_txt = str((scripts_stats or {}).get("error", "unknown error"))
+                    print(f"{Colors.YELLOW}[selfupdate] Warning: failed to sync scripts/: {warn_txt}{Colors.RESET}")
+            except Exception as e:
+                # Non-fatal; RSAdminBot code is already updated.
+                print(f"{Colors.YELLOW}[selfupdate] Warning: exception while syncing scripts/: {e}{Colors.RESET}")
 
             old = (stats.get("old") or "").strip()
             new = (stats.get("new") or "").strip()
