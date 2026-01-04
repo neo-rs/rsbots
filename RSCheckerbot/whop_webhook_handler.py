@@ -806,12 +806,14 @@ async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embe
         # Get guild and member
         guild = message.guild
         try:
-            member = guild.get_member(int(discord_user_id))
+            did_int = int(str(discord_user_id).strip())
         except ValueError:
             log.error(f"Invalid discord_user_id format: {discord_user_id}")
             if _log_other:
                 await _log_other(f"❌ **Whop Webhook Error:** Invalid discord_user_id format: `{discord_user_id}`")
             return
+        
+        member = await _resolve_member_safe(guild, did_int, force_fetch=True)
         
         if not member:
             if _log_other:

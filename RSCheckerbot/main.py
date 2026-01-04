@@ -87,7 +87,7 @@ DAY7B_DELAY_MIN = DM_CONFIG.get("day7b_delay_min", 30)
 TEST_INTERVAL_SECONDS = DM_CONFIG.get("test_interval_seconds", 10.0)
 LOG_FIRST_CHANNEL_ID = DM_CONFIG.get("log_first_channel_id")
 LOG_OTHER_CHANNEL_ID = DM_CONFIG.get("log_other_channel_id")
-MEMBER_STATUS_LOGS_CHANNEL_ID = DM_CONFIG.get("member_status_logs_channel_id", 1452835008170426368)
+MEMBER_STATUS_LOGS_CHANNEL_ID = DM_CONFIG.get("member_status_logs_channel_id")
 
 # Files
 QUEUE_FILE = BASE_DIR / "queue.json"
@@ -484,6 +484,32 @@ def _roles_plain(member: discord.Member) -> str:
     """Comma-separated role names (no role mentions, excludes @everyone and managed roles)."""
     roles = [r.name for r in member.roles if r != member.guild.default_role and not r.managed]
     return ", ".join(roles) if roles else "—"
+
+def _member_avatar_url(user: discord.abc.User) -> str | None:
+    """Best-effort avatar URL that works across discord.py versions and user types."""
+    try:
+        return str(user.display_avatar.url)
+    except Exception:
+        pass
+    try:
+        avatar = getattr(user, "avatar", None)
+        if avatar:
+            return str(avatar.url)
+    except Exception:
+        pass
+    try:
+        return str(user.default_avatar.url)
+    except Exception:
+        return None
+
+def _apply_member_header(embed: discord.Embed, user: discord.abc.User) -> None:
+    """Apply author icon + thumbnail if an avatar URL is available."""
+    url = _member_avatar_url(user)
+    if not url:
+        return
+    with suppress(Exception):
+        embed.set_author(name=str(user), icon_url=url)
+        embed.set_thumbnail(url=url)
 
 def load_settings() -> dict:
     """Load settings from JSON file, default to enabled if missing/bad"""
@@ -1392,9 +1418,7 @@ async def on_member_join(member: discord.Member):
                     color=0x00FF00,  # Green
                     timestamp=datetime.now(timezone.utc)
                 )
-                with suppress(Exception):
-                    embed.set_author(name=str(member), icon_url=member.display_avatar.url)
-                    embed.set_thumbnail(url=member.display_avatar.url)
+                _apply_member_header(embed, member)
                 embed.add_field(name="Member", value=member.mention, inline=False)
                 embed.add_field(name="User ID", value=str(member.id), inline=False)
                 embed.add_field(name="Account Created", value=member.created_at.strftime("%b %d, %Y"), inline=True)
@@ -1475,26 +1499,40 @@ async def on_member_join(member: discord.Member):
                     inviter_name = used_invite_inviter.name if used_invite_inviter else "Unknown"
                     inviter_id = used_invite_inviter.id if used_invite_inviter else "Unknown"
                     log.warning(f"⚠️ Member {member} ({member.id}) joined via untracked invite: {used_invite_code} (invited by {inviter_name} ({inviter_id}))")
-                    # Could be a bot invite from Whop - log to member status channel
-                    await log_member_status(
-                        f"🤖 **Potential Bot Invite Join**\n"
-                        f"**User:** {_fmt_user(member)}\n"
-                        f"**Invite Code:** `{used_invite_code}`\n"
-                        f"**Inviter:** {inviter_name} (`{inviter_id}`)\n"
-                        f"**Status:** ⚠️ Not in tracked invites"
+                    # Could be a bot invite from Whop - log as structured embed (with avatar)
+                    embed = discord.Embed(
+                        title="🔐 Bot Invite (untracked)",
+                        color=0xFEE75C,  # Yellow
+                        timestamp=datetime.now(timezone.utc),
                     )
+                    _apply_member_header(embed, member)
+                    embed.add_field(name="Member", value=member.mention, inline=False)
+                    embed.add_field(name="User ID", value=str(member.id), inline=False)
+                    embed.add_field(name="Invite Code", value=f"`{used_invite_code}`", inline=True)
+                    embed.add_field(name="Inviter", value=f"{inviter_name} (`{inviter_id}`)", inline=True)
+                    embed.add_field(name="Status", value="⚠️ Not tracked in invites", inline=False)
+                    embed.add_field(name="First Joined", value=_fmt_ts(rec.get("first_join_ts"), "D"), inline=True)
+                    embed.add_field(name="Join Count", value=str(rec.get("join_count", 1)), inline=True)
+                    await log_member_status("", embed=embed)
                 else:
                     # No invite code matched - could be bot invite, direct link, or unknown
                     join_method = "Bot Invite (likely Whop)" if not member.bot else "Bot Account Join"
                     log.warning(f"❓ Member {member} ({member.id}) joined via {join_method} or direct link")
-                    # Log to member status channel since this is likely a subscription-based join
-                    await log_member_status(
-                        f"🔐 **{join_method}**\n"
-                        f"**User:** {_fmt_user(member)}\n"
-                        f"**Invite Code:** No matching code found\n"
-                        f"**Type:** 💳 May be subscription-based (Whop)\n"
-                        f"**Status:** ⚠️ Not tracked in invites"
+                    # Log to member status channel since this is likely a subscription-based join (structured embed)
+                    embed = discord.Embed(
+                        title=f"🔐 {join_method}",
+                        color=0xFEE75C,  # Yellow
+                        timestamp=datetime.now(timezone.utc),
                     )
+                    _apply_member_header(embed, member)
+                    embed.add_field(name="Member", value=member.mention, inline=False)
+                    embed.add_field(name="User ID", value=str(member.id), inline=False)
+                    embed.add_field(name="Invite Code", value="No matching code found", inline=False)
+                    embed.add_field(name="Type", value="May be subscription-based (Whop)", inline=False)
+                    embed.add_field(name="Status", value="⚠️ Not tracked in invites", inline=False)
+                    embed.add_field(name="First Joined", value=_fmt_ts(rec.get("first_join_ts"), "D"), inline=True)
+                    embed.add_field(name="Join Count", value=str(rec.get("join_count", 1)), inline=True)
+                    await log_member_status("", embed=embed)
                 
         except Exception as e:
             log.error(f"❌ Error tracking invite for {member} ({member.id}): {e}")
@@ -1515,9 +1553,7 @@ async def on_member_remove(member: discord.Member):
                     timestamp=datetime.now(timezone.utc)
                 )
                 embed.add_field(name="Member", value=f"{member.mention} (`{member}`)", inline=False)
-                with suppress(Exception):
-                    embed.set_author(name=str(member), icon_url=member.display_avatar.url)
-                    embed.set_thumbnail(url=member.display_avatar.url)
+                _apply_member_header(embed, member)
                 # Snapshot roles at leave time (no mentions)
                 embed.add_field(name="Roles At Leave", value=_roles_plain(member), inline=False)
                 embed.add_field(name="User ID", value=str(member.id), inline=False)
@@ -1715,13 +1751,27 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         # If Member role was the ONLY role added, likely payment reactivation
         only_member_added = len(all_added_in_update) == 1
         if only_member_added:
-            # Log to member status channel for payment tracking
-            await log_member_status(
-                f"✅ **Payment Reactivated**\n"
-                f"**User:** {_fmt_user(after)}\n"
-                f"**Roles Added:** {added_names}\n"
-                f"**Reason:** Member role regained — may indicate subscription reactivated or payment successful"
+            # Log to member status channel for payment tracking (structured embed + avatar)
+            hist = get_member_history(after.id) or {}
+            embed = discord.Embed(
+                title="✅ Payment Reactivated",
+                color=0x57F287,  # Green
+                timestamp=datetime.now(timezone.utc),
             )
+            _apply_member_header(embed, after)
+            embed.add_field(name="Member", value=after.mention, inline=False)
+            embed.add_field(name="User ID", value=str(after.id), inline=False)
+            embed.add_field(name="Roles Added", value=added_names, inline=False)
+            embed.add_field(
+                name="Reason",
+                value="Member role regained — may indicate subscription reactivated or payment successful",
+                inline=False,
+            )
+            if hist.get("first_join_ts"):
+                embed.add_field(name="First Joined", value=_fmt_ts(hist.get("first_join_ts"), "D"), inline=True)
+            if hist.get("join_count"):
+                embed.add_field(name="Join Count", value=str(hist.get("join_count")), inline=True)
+            await log_member_status("", embed=embed)
         
         if has_former_member_role(after):
             role = after.guild.get_role(FORMER_MEMBER_ROLE)
@@ -1755,10 +1805,9 @@ async def on_message(message: discord.Message):
         
         # Check native Whop logs channel
         if (WHOP_LOGS_CHANNEL_ID and message.channel.id == WHOP_LOGS_CHANNEL_ID):
-            # Check if it's from Whop Events app (native integration)
-            if message.author.name == "Whop Events" or "Whop" in (message.author.name or ""):
-                await handle_whop_webhook_message(message)
-                return
+            # Channel ID is the source of truth (do not gate on bot/app name).
+            await handle_whop_webhook_message(message)
+            return
     
     # Message processing continues here if needed for other handlers
     # (Currently no other message handlers, but this preserves extensibility)

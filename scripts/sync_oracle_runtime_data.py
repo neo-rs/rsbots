@@ -38,7 +38,7 @@ SSH_KEY_PATH = _REPO_ROOT / "oraclekeys" / server_config["key"]
 SSH_USER = server_config["user"]
 SSH_HOST = server_config["host"]
 SSH_OPTIONS = server_config.get("ssh_options", "")
-REMOTE_ROOT = "/home/rsadmin/bots/mirror-world"
+REMOTE_ROOT = str(server_config.get("remote_root") or server_config.get("live_root") or "/home/rsadmin/bots/mirror-world")
 
 # Output directory
 OUTPUT_DIR = _REPO_ROOT / "OracleServerData"

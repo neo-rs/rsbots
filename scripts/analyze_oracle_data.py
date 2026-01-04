@@ -266,8 +266,12 @@ def generate_markdown_report(all_analysis: list[dict]) -> str:
         lines.append("")
         
         for filename, file_data in analysis["files"].items():
-            status = file_data["status"]
-            size = file_data["size_bytes"]
+            # Some entries are aggregates (e.g., bot_movements) and may not include size_bytes.
+            status = file_data.get("status", "unknown")
+            try:
+                size = int(file_data.get("size_bytes") or 0)
+            except Exception:
+                size = 0
             
             status_icon = "✅" if status == "ok" else "⚠️" if status == "missing" else "❌"
             lines.append(f"### {status_icon} {filename}")
