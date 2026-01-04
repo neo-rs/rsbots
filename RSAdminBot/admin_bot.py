@@ -7167,7 +7167,7 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                 inline=False
             )
             
-            # Add note if database is empty
+            # Add note if no data found
             if total_members == 0:
                 embed.add_field(
                     name="ℹ️ Note",

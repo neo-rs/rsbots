@@ -398,7 +398,7 @@ class WhopTracker:
             event_data = self._parse_whop_message(message)
             if event_data:
                 events_found.append(event_data)
-                # Store in database
+                # Store in JSON file
                 self._store_membership_event(event_data)
             
             # Progress updates every 100 messages or every 2 seconds
