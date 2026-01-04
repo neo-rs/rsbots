@@ -38,6 +38,12 @@
 !RSuccessBot/*.py
 !RSuccessBot/**/*.py
 
+# Allow shared scripts used by RSAdminBot (Oracle data tools)
+!scripts/
+!scripts/**/
+!scripts/*.py
+!scripts/**/*.py
+
 # Explicitly keep legacy/original sources out of GitHub
 RSAdminBot/original_files/**
 
