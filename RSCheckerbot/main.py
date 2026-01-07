@@ -68,6 +68,11 @@ GUILD_ID = config.get("guild_id")
 # Whop API Config
 WHOP_API_CONFIG = config.get("whop_api", {})
 WHOP_API_KEY = WHOP_API_CONFIG.get("api_key", "")
+WHOP_RESOLUTION_CATEGORY_ID = WHOP_API_CONFIG.get("resolution_category_id")
+WHOP_DISPUTE_CHANNEL_NAME = WHOP_API_CONFIG.get("dispute_channel_name", "dispute-fighter")
+WHOP_RESOLUTION_CHANNEL_NAME = WHOP_API_CONFIG.get("resolution_channel_name", "resolution-center")
+WHOP_SUPPORT_PING_ROLE_ID = WHOP_API_CONFIG.get("support_ping_role_id", "")
+WHOP_SUPPORT_PING_ROLE_NAME = WHOP_API_CONFIG.get("support_ping_role_name", "")
 
 # Invite Tracking Config
 INVITE_CONFIG = config.get("invite_tracking", {})
@@ -248,6 +253,10 @@ invite_usage_cache: Dict[str, int] = {}  # invite_code -> last known uses
 
 # Whop API client (initialized from config)
 whop_api_client = None
+
+# Channels for Whop resolution/dispute reporting (created/located at runtime)
+WHOP_DISPUTE_CHANNEL_ID: int | None = None
+WHOP_RESOLUTION_CHANNEL_ID: int | None = None
 
 # Correlation IDs (short-lived, for searchability across related events)
 cid_cache: Dict[int, Dict[str, str]] = {}  # user_id -> {"cid": str, "expires_at": iso}
@@ -1653,6 +1662,9 @@ async def on_ready():
             else:
                 log.warning(f"⚠️  Invite Channel: Not found (ID: {INVITE_CHANNEL_ID})")
         
+        # Ensure Whop dispute/resolution channels exist (optional, config-driven)
+        await _ensure_whop_resolution_channels(guild)
+        
         log.info("-"*60)
         
         # Initialize invite usage cache
@@ -1744,7 +1756,11 @@ async def on_ready():
             member_status_logs_channel_id=MEMBER_STATUS_LOGS_CHANNEL_ID,
             get_member_history_func=get_member_history,
             whop_api_key=WHOP_API_KEY,
-            whop_api_config=WHOP_API_CONFIG
+            whop_api_config=WHOP_API_CONFIG,
+            dispute_channel_id=WHOP_DISPUTE_CHANNEL_ID,
+            resolution_channel_id=WHOP_RESOLUTION_CHANNEL_ID,
+            support_ping_role_id=WHOP_SUPPORT_PING_ROLE_ID,
+            support_ping_role_name=WHOP_SUPPORT_PING_ROLE_NAME,
         )
         channels = []
         if WHOP_WEBHOOK_CHANNEL_ID:
@@ -1771,6 +1787,56 @@ async def on_ready():
             sync_whop_memberships.change_interval(hours=sync_interval)
             sync_whop_memberships.start()
             log.info(f"[Whop Sync] Membership sync job started (every {sync_interval} hours)")
+
+
+async def _ensure_whop_resolution_channels(guild: discord.Guild) -> None:
+    """Ensure dispute/resolution channels exist under configured category (best-effort)."""
+    global WHOP_DISPUTE_CHANNEL_ID, WHOP_RESOLUTION_CHANNEL_ID
+
+    if not WHOP_API_CONFIG.get("enable_resolution_reporting", True):
+        return
+    if not guild:
+        return
+    if not WHOP_RESOLUTION_CATEGORY_ID:
+        return
+    try:
+        category_id_int = int(str(WHOP_RESOLUTION_CATEGORY_ID).strip())
+    except Exception:
+        return
+
+    category = guild.get_channel(category_id_int)
+    if not isinstance(category, discord.CategoryChannel):
+        log.warning(f"[Whop Resolution] Category not found (ID: {category_id_int})")
+        return
+
+    async def ensure_channel(name: str) -> discord.TextChannel | None:
+        if not name:
+            return None
+        # Look for existing channel with same name under category
+        for ch in category.channels:
+            if isinstance(ch, discord.TextChannel) and ch.name == name:
+                return ch
+        # Create it
+        try:
+            return await guild.create_text_channel(
+                name=name,
+                category=category,
+                reason="RSCheckerbot: Whop resolution/dispute reporting channel",
+            )
+        except Exception as e:
+            log.warning(f"[Whop Resolution] Failed to create channel '{name}': {e}")
+            return None
+
+    dispute_ch = await ensure_channel(str(WHOP_DISPUTE_CHANNEL_NAME).strip())
+    resolution_ch = await ensure_channel(str(WHOP_RESOLUTION_CHANNEL_NAME).strip())
+
+    WHOP_DISPUTE_CHANNEL_ID = dispute_ch.id if dispute_ch else None
+    WHOP_RESOLUTION_CHANNEL_ID = resolution_ch.id if resolution_ch else None
+
+    if dispute_ch:
+        log.info(f"[Whop Resolution] Dispute channel ready: {dispute_ch.name} (ID: {dispute_ch.id})")
+    if resolution_ch:
+        log.info(f"[Whop Resolution] Resolution channel ready: {resolution_ch.name} (ID: {resolution_ch.id})")
     else:
         if not whop_api_client:
             log.info("[Whop Sync] Sync job disabled (no API client)")
