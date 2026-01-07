@@ -6209,6 +6209,13 @@ echo "CHANGED_END"
                 await self._log_to_discord(embed, ctx.channel)
 
         self.registered_commands.append(("whereami", "Print runtime environment details", True))
+
+        # Register the rest of the command suite (admin tooling, deploy, diagnostics, etc.).
+        #
+        # NOTE: These commands previously lived in the codebase but were accidentally nested under
+        # `_sync_bot_via_ssh` due to indentation, which meant they only registered after running
+        # botsync fallback. Keep them registered at startup.
+        self._setup_extended_commands()
     
     async def _sync_bot_via_script(self, ctx, status_msg, bot_info, bot_folder, local_bot_path, remote_bot_path, rsync_script, dry_run, delete):
         """Sync bot using the dedicated rsync_sync.py script."""
@@ -6428,6 +6435,12 @@ echo "CHANGED_END"
             )
             await status_msg.edit(embed=error_embed)
             await self._log_to_discord(error_embed, ctx.channel if ctx else None)
+
+    def _setup_extended_commands(self) -> None:
+        """Register extended/admin commands.
+
+        Keep these separate from `_setup_commands` to keep the core startup path readable.
+        """
 
         @self.bot.command(name="selfupdate")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
@@ -6671,7 +6684,7 @@ echo "CHANGED_END"
                     pass
                 return
 
-        @self.bot.command(name="systemcheck")
+        @self.bot.command(name="systemcheck", aliases=["systemstatus"])
         @commands.check(lambda ctx: self.is_admin(ctx.author))
         async def systemcheck(ctx):
             """Report runtime mode + core Ubuntu health stats (admin only)."""
