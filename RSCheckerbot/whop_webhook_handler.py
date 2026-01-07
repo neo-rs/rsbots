@@ -177,7 +177,12 @@ def _looks_like_resolution_needed(membership: dict, payment: dict) -> bool:
         return True
     if isinstance(retryable, bool) and retryable:
         return True
-    return status in ("open", "failed") or substatus in ("past_due", "unpaid")
+    # Avoid spamming on generic "open" invoices; require a stronger signal.
+    if payment.get("dispute_alerted_at"):
+        return True
+    if payment.get("refunded_at") or (float(payment.get("refunded_amount") or 0) > 0 if str(payment.get("refunded_amount") or "").strip() else False):
+        return True
+    return status in ("failed",) or substatus in ("past_due", "unpaid")
 
 
 async def _post_resolution_or_dispute_alert(
