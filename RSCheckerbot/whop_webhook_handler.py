@@ -60,6 +60,7 @@ IDENTITY_CACHE_FILE = BASE_DIR / "whop_identity_cache.json"
 TRIAL_CACHE_FILE = BASE_DIR / "trial_history.json"
 IDENTITY_CONFLICTS_FILE = BASE_DIR / "identity_conflicts.jsonl"
 RESOLUTION_ALERT_STATE_FILE = BASE_DIR / "whop_resolution_alert_state.json"
+DISCORD_LINK_FILE = BASE_DIR / "whop_discord_link.json"
 
 
 def _norm_email(s: str) -> str:
@@ -86,6 +87,50 @@ def _save_json(path: Path, data: dict) -> None:
         path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
+
+
+def _load_discord_link_db() -> dict:
+    db = _load_json(DISCORD_LINK_FILE)
+    if not isinstance(db, dict):
+        return {}
+    if "by_discord_id" not in db or not isinstance(db.get("by_discord_id"), dict):
+        db["by_discord_id"] = {}
+    return db
+
+
+def _save_discord_link_db(db: dict) -> None:
+    if not isinstance(db, dict):
+        return
+    _save_json(DISCORD_LINK_FILE, db)
+
+
+def _cache_discord_membership_link(discord_id: str, membership_id: str, whop_member_id: str = "", source_event: str = "") -> None:
+    did = str(discord_id or "").strip()
+    mid = str(membership_id or "").strip()
+    if not did.isdigit() or not mid:
+        return
+    db = _load_discord_link_db()
+    by = db.get("by_discord_id") or {}
+    by[did] = {
+        "membership_id": mid,
+        "whop_member_id": str(whop_member_id or "").strip(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "source_event": str(source_event or "").strip(),
+    }
+    db["by_discord_id"] = by
+    _save_discord_link_db(db)
+
+
+def _get_cached_membership_id_for_discord(discord_id: int | str) -> str:
+    did = str(discord_id or "").strip()
+    if not did:
+        return ""
+    db = _load_discord_link_db()
+    by = db.get("by_discord_id") or {}
+    rec = by.get(did) if isinstance(by, dict) else None
+    if isinstance(rec, dict):
+        return str(rec.get("membership_id") or "").strip()
+    return ""
 
 
 def _load_resolution_state() -> dict:
@@ -221,10 +266,31 @@ async def _post_resolution_or_dispute_alert(
     color = 0xED4245 if is_dispute else 0xFEE75C
     embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
 
+    # Try to enrich with Whop admin details (email/name) via /members/{mber_...}
+    whop_email = ""
+    whop_name = ""
+    try:
+        whop_member_id = ""
+        if isinstance((membership or {}).get("member"), dict):
+            whop_member_id = str(membership["member"].get("id") or "").strip()
+        if whop_member_id and _whop_api_client:
+            rec = await _whop_api_client.get_member_by_id(whop_member_id)
+            if isinstance(rec, dict):
+                u = rec.get("user")
+                if isinstance(u, dict):
+                    whop_email = str(u.get("email") or "").strip()
+                    whop_name = str(u.get("name") or "").strip()
+    except Exception:
+        pass
+
     # Do NOT mention member (requested); provide only identifying text + ID
     embed.add_field(name="Support", value=sup or "(configure support role to ping)", inline=False)
-    embed.add_field(name="Discord User", value=str(member), inline=True)
-    embed.add_field(name="Discord User ID", value=str(member.id), inline=True)
+    embed.add_field(name="Discord", value=f"[{str(member)}](https://discord.com/users/{member.id})", inline=False)
+    embed.add_field(name="Discord User ID", value=f"`{member.id}`", inline=True)
+    if whop_email:
+        embed.add_field(name="Email (API)", value=f"`{whop_email}`", inline=True)
+    if whop_name and len(embed.fields) < 25:
+        embed.add_field(name="Name (API)", value=whop_name[:256], inline=True)
     if source_event:
         embed.add_field(name="Source", value=source_event[:128], inline=True)
 
@@ -502,6 +568,10 @@ async def _send_lookup_request(message: discord.Message, event_type: str, email:
     whop_logs_mention = f"<#{WHOP_LOGS_CHANNEL_ID}>" if WHOP_LOGS_CHANNEL_ID else "Whop logs channel"
     lines.append(f"• Check {whop_logs_mention} native Whop event (Discord ID field) or forwarder logs")
     lines.append("• Once found, link it (email ↔ discord_id)")
+    lines.append("")
+    lines.append("Why this happens:")
+    lines.append("• User has not linked Discord to Whop yet, OR the workflow didn't pass discord_user_id")
+    lines.append("• If this was a paid event, treat as urgent: member may have paid but won't be auto-verified")
 
     await ch.send("\n".join(lines))
 
@@ -1004,6 +1074,15 @@ async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embe
         is_first = event_data.get("is_first_membership", "")
         membership_id_val = event_data.get("membership_id", "")
 
+        # Persist Discord -> membership_id link when available (prevents incorrect API lookups later)
+        if discord_user_id and membership_id_val:
+            with suppress(Exception):
+                _cache_discord_membership_link(
+                    discord_id=discord_user_id,
+                    membership_id=membership_id_val,
+                    source_event=event_type,
+                )
+
         # Consider trial tracking for activation/pending events
         if event_type in ("membership.activated.pending", "membership.activated", "payment.succeeded.activation", "payment.succeeded.renewal"):
             info = _record_trial_event(
@@ -1341,8 +1420,6 @@ async def _verify_webhook_with_api(member: discord.Member, event_data: dict, eve
     if not _whop_api_config.get("enable_verification", True):
         return
     
-    discord_id = str(member.id)
-    
     try:
         # Determine expected status from event type
         expected_status = None
@@ -1354,10 +1431,15 @@ async def _verify_webhook_with_api(member: discord.Member, event_data: dict, eve
             expected_status = "active"
         
         if expected_status:
-            verification = await _whop_api_client.verify_membership_status(
-                discord_id, 
-                expected_status
-            )
+            membership_id = _safe_get(event_data, "membership_id", "membership.id", default="").strip()
+            if membership_id == "—":
+                membership_id = ""
+            if not membership_id:
+                membership_id = _get_cached_membership_id_for_discord(member.id)
+            if not membership_id:
+                return  # Can't verify without membership_id
+
+            verification = await _whop_api_client.verify_membership_status(membership_id, expected_status)
             
             if not verification["matches"]:
                 # Log discrepancy
@@ -1389,104 +1471,126 @@ async def _enrich_support_card_with_api(embed: discord.Embed, member: discord.Me
         return
     
     discord_id = str(member.id)
-    
+
     try:
-        # Get membership data
-        membership = await _whop_api_client.get_membership_by_discord_id(discord_id)
-        
+        # Prefer membership_id from webhook payload; fallback to cached link.
+        membership_id = _safe_get(event_data, "membership_id", "membership.id", default="").strip()
+        if membership_id == "—":
+            membership_id = ""
+        if not membership_id:
+            membership_id = _get_cached_membership_id_for_discord(discord_id)
+
+        if not membership_id:
+            return  # Cannot safely enrich without a stable membership_id
+
+        # Get membership data by ID (stable)
+        membership = await _whop_api_client.get_membership_by_id(membership_id)
         if membership:
-            membership_id = membership.get("id", "")
             payments = []
-            if membership_id:
-                # Get payment history
-                payments = await _whop_api_client.get_payments_for_membership(membership_id)
-                if payments:
-                    latest_payment = payments[0]  # Most recent (sorted in client)
-                    pay_currency = (latest_payment.get("currency") or membership.get("currency") or "").strip()
-                    pay_total = (
-                        latest_payment.get("usd_total")
-                        or latest_payment.get("total")
-                        or latest_payment.get("subtotal")
-                        or latest_payment.get("amount_after_fees")
-                    )
-                    pay_status = str(latest_payment.get("status") or "").strip()
-                    pay_substatus = str(latest_payment.get("substatus") or "").strip()
-                    pay_created = latest_payment.get("created_at") or latest_payment.get("paid_at")
-                    pay_paid = latest_payment.get("paid_at") or ""
-                    failure_msg = str(latest_payment.get("failure_message") or "").strip()
-                    retryable = latest_payment.get("retryable")
-                    card_brand = str(latest_payment.get("card_brand") or "").strip()
-                    card_last4 = str(latest_payment.get("card_last4") or "").strip()
-                    payment_method_type = str(latest_payment.get("payment_method_type") or "").strip()
+            # Get payment history
+            payments = await _whop_api_client.get_payments_for_membership(membership_id)
+            if payments:
+                latest_payment = payments[0]  # Most recent (sorted in client)
+                pay_currency = (latest_payment.get("currency") or membership.get("currency") or "").strip()
+                pay_total = (
+                    latest_payment.get("usd_total")
+                    or latest_payment.get("total")
+                    or latest_payment.get("subtotal")
+                    or latest_payment.get("amount_after_fees")
+                )
+                pay_status = str(latest_payment.get("status") or "").strip()
+                pay_substatus = str(latest_payment.get("substatus") or "").strip()
+                pay_created = latest_payment.get("created_at") or latest_payment.get("paid_at")
+                pay_paid = latest_payment.get("paid_at") or ""
+                failure_msg = str(latest_payment.get("failure_message") or "").strip()
+                retryable = latest_payment.get("retryable")
+                card_brand = str(latest_payment.get("card_brand") or "").strip()
+                card_last4 = str(latest_payment.get("card_last4") or "").strip()
+                payment_method_type = str(latest_payment.get("payment_method_type") or "").strip()
 
-                    # Latest payment summary
-                    if len(embed.fields) < 25:
-                        parts = []
-                        amt = _fmt_money(pay_total, pay_currency)
-                        if amt:
-                            parts.append(amt)
-                        if pay_status:
-                            parts.append(f"status: {pay_status}{f' ({pay_substatus})' if pay_substatus else ''}")
-                        if pay_paid:
-                            parts.append(f"paid: {_fmt_discord_ts(pay_paid, 'R')}")
-                        elif pay_created:
-                            parts.append(f"created: {_fmt_discord_ts(pay_created, 'R')}")
-                        if parts:
-                            embed.add_field(
-                                name="Latest Payment (API)",
-                                value="\n".join(parts)[:1024],
-                                inline=True,
-                            )
-
-                    # Payment method (staff-only helpful)
-                    if len(embed.fields) < 25:
-                        pm = ""
-                        if card_brand and card_last4:
-                            pm = f"{card_brand.upper()} ****{card_last4}"
-                        elif payment_method_type and card_last4:
-                            pm = f"{payment_method_type} ****{card_last4}"
-                        elif card_brand:
-                            pm = card_brand.upper()
-                        elif payment_method_type:
-                            pm = payment_method_type
-                        if pm:
-                            embed.add_field(name="Payment Method (API)", value=pm[:1024], inline=True)
-
-                    # Failure / resolution signals
-                    resolution_lines = []
-                    if failure_msg:
-                        resolution_lines.append(f"failure: {failure_msg}")
-                    if isinstance(retryable, bool):
-                        resolution_lines.append(f"retryable: {'yes' if retryable else 'no'}")
-                    dispute_alerted_at = latest_payment.get("dispute_alerted_at")
-                    if dispute_alerted_at:
-                        resolution_lines.append(f"dispute_alerted: {_fmt_discord_ts(dispute_alerted_at, 'D')}")
-                    refunded_at = latest_payment.get("refunded_at")
-                    refunded_amount = latest_payment.get("refunded_amount")
-                    if refunded_at:
-                        ra = _fmt_money(refunded_amount, pay_currency)
-                        resolution_lines.append(
-                            f"refunded: {_fmt_discord_ts(refunded_at, 'D')}{f' ({ra})' if ra else ''}"
-                        )
-                    if resolution_lines and len(embed.fields) < 25:
+                # Latest payment summary
+                if len(embed.fields) < 25:
+                    parts = []
+                    amt = _fmt_money(pay_total, pay_currency)
+                    if amt:
+                        parts.append(amt)
+                    if pay_status:
+                        parts.append(f"status: {pay_status}{f' ({pay_substatus})' if pay_substatus else ''}")
+                    if pay_paid:
+                        parts.append(f"paid: {_fmt_discord_ts(pay_paid, 'R')}")
+                    elif pay_created:
+                        parts.append(f"created: {_fmt_discord_ts(pay_created, 'R')}")
+                    if parts:
                         embed.add_field(
-                            name="Resolution (API)",
-                            value="\n".join(resolution_lines)[:1024],
-                            inline=False,
+                            name="Latest Payment (API)",
+                            value="\n".join(parts)[:1024],
+                            inline=True,
                         )
 
-                    # Optional: also post a dedicated dispute/resolution alert to configured channels
-                    with suppress(Exception):
-                        await _post_resolution_or_dispute_alert(
-                            member=member,
-                            membership=membership,
-                            latest_payment=latest_payment,
-                            source_event=str(event_data.get("event_type") or "") or "api_enrichment",
-                        )
+                # Payment method (staff-only helpful)
+                if len(embed.fields) < 25:
+                    pm = ""
+                    if card_brand and card_last4:
+                        pm = f"{card_brand.upper()} ****{card_last4}"
+                    elif payment_method_type and card_last4:
+                        pm = f"{payment_method_type} ****{card_last4}"
+                    elif card_brand:
+                        pm = card_brand.upper()
+                    elif payment_method_type:
+                        pm = payment_method_type
+                    if pm:
+                        embed.add_field(name="Payment Method (API)", value=pm[:1024], inline=True)
 
-                    # Payment count
-                    if len(embed.fields) < 25:
-                        embed.add_field(name="Total Payments (API)", value=str(len(payments)), inline=True)
+                # Failure / resolution signals
+                resolution_lines = []
+                if failure_msg:
+                    resolution_lines.append(f"failure: {failure_msg}")
+                if isinstance(retryable, bool):
+                    resolution_lines.append(f"retryable: {'yes' if retryable else 'no'}")
+                dispute_alerted_at = latest_payment.get("dispute_alerted_at")
+                if dispute_alerted_at:
+                    resolution_lines.append(f"dispute_alerted: {_fmt_discord_ts(dispute_alerted_at, 'D')}")
+                refunded_at = latest_payment.get("refunded_at")
+                refunded_amount = latest_payment.get("refunded_amount")
+                if refunded_at:
+                    ra = _fmt_money(refunded_amount, pay_currency)
+                    resolution_lines.append(
+                        f"refunded: {_fmt_discord_ts(refunded_at, 'D')}{f' ({ra})' if ra else ''}"
+                    )
+                if resolution_lines and len(embed.fields) < 25:
+                    embed.add_field(
+                        name="Resolution (API)",
+                        value="\n".join(resolution_lines)[:1024],
+                        inline=False,
+                    )
+
+                # Optional: also post a dedicated dispute/resolution alert to configured channels
+                with suppress(Exception):
+                    await _post_resolution_or_dispute_alert(
+                        member=member,
+                        membership=membership,
+                        latest_payment=latest_payment,
+                        source_event=str(event_data.get("event_type") or "") or "api_enrichment",
+                    )
+
+                # Payment count
+                if len(embed.fields) < 25:
+                    embed.add_field(name="Total Payments (API)", value=str(len(payments)), inline=True)
+
+            # Update cached link with whop_member_id if available
+            try:
+                whop_member_id = ""
+                if isinstance(membership.get("member"), dict):
+                    whop_member_id = str(membership["member"].get("id") or "").strip()
+                if whop_member_id:
+                    _cache_discord_membership_link(
+                        discord_id=discord_id,
+                        membership_id=membership_id,
+                        whop_member_id=whop_member_id,
+                        source_event=str(event_data.get("event_type") or "") or "api_enrichment",
+                    )
+            except Exception:
+                pass
             
             # Add membership start date from API
             started_at = membership.get("started_at") or membership.get("created_at")

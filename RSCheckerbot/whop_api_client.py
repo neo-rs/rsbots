@@ -123,38 +123,14 @@ class WhopAPIClient:
     
     async def get_membership_by_discord_id(self, discord_id: str) -> Optional[Dict]:
         """
-        Get active membership for a Discord user ID.
-        
-        Args:
-            discord_id: Discord user ID (as string)
-        
-        Returns:
-            Membership data dict or None if not found
+        Deprecated: Discord IDs are not reliably queryable via Whop Company API.
+        Keep this method for backwards compatibility but return None to avoid incorrect matches.
         """
-        try:
-            # Search memberships by Discord ID
-            # Whop API v1: Company API requires company_id for /memberships list.
-            response = await self._request(
-                "GET",
-                "/memberships",
-                params={"company_id": self.company_id, "discord_id": discord_id}
-            )
-            
-            # Response structure: { "data": [...] } or direct array
-            memberships = response.get("data", [])
-            if isinstance(memberships, list) and memberships:
-                # Return first active membership, or first if no status filter
-                for membership in memberships:
-                    status = membership.get("status", "").lower()
-                    if status in ("active", "trialing"):
-                        return membership
-                # If no active found, return first one
-                return memberships[0]
-            
-            return None
-        except WhopAPIError as e:
-            log.warning(f"Failed to get membership for Discord ID {discord_id}: {e}")
-            return None
+        log.warning(
+            "get_membership_by_discord_id is deprecated and disabled to prevent mismatched memberships. "
+            "Use get_membership_by_id with a membership_id derived from webhook events."
+        )
+        return None
     
     async def get_membership_by_id(self, membership_id: str) -> Optional[Dict]:
         """
@@ -172,6 +148,21 @@ class WhopAPIClient:
             return response.get("data") if "data" in response else response
         except WhopAPIError as e:
             log.warning(f"Failed to get membership {membership_id}: {e}")
+            return None
+
+    async def get_member_by_id(self, member_id: str) -> Optional[Dict]:
+        """
+        Get Whop Member (company member record) by member ID (mber_...).
+        This endpoint includes user email/name which is useful for support tooling.
+        """
+        if not member_id:
+            return None
+        try:
+            response = await self._request("GET", f"/members/{member_id}")
+            # /members/{id} returns a direct object (not wrapped)
+            return response.get("data") if "data" in response else response
+        except WhopAPIError as e:
+            log.warning(f"Failed to get member {member_id}: {e}")
             return None
     
     async def get_user_memberships(self, user_id: str) -> List[Dict]:
@@ -229,39 +220,28 @@ class WhopAPIClient:
             return []
     
     async def verify_membership_status(
-        self, 
-        discord_id: str, 
-        expected_status: str = "active"
+        self,
+        membership_id: str,
+        expected_status: str = "active",
     ) -> Dict[str, any]:
         """
-        Verify membership status matches expected value.
-        
-        Args:
-            discord_id: Discord user ID
-            expected_status: Expected membership status (active, canceled, etc.)
-        
-        Returns:
-            Dict with 'matches', 'actual_status', 'membership_data', 'error'
+        Verify membership status matches expected value (membership_id-based).
         """
-        membership = await self.get_membership_by_discord_id(discord_id)
-        
+        membership = await self.get_membership_by_id(membership_id)
         if not membership:
             return {
                 "matches": False,
                 "actual_status": None,
                 "membership_data": None,
-                "error": "No membership found"
+                "error": "No membership found",
             }
-        
-        actual_status = membership.get("status", "").lower()
+        actual_status = str(membership.get("status", "")).lower()
         expected_lower = expected_status.lower()
-        matches = actual_status == expected_lower
-        
         return {
-            "matches": matches,
+            "matches": actual_status == expected_lower,
             "actual_status": actual_status,
             "membership_data": membership,
-            "error": None
+            "error": None,
         }
     
     # NOTE: Do not add /users lookups here. The v1 Company API does not expose a /users list endpoint
