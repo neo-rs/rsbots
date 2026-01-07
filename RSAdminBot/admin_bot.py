@@ -961,6 +961,15 @@ class BotSelectView(ui.View):
                 value="all_bots",
                 description=f"{action_display} all bots"
             ))
+
+        # Add "All RS Bots" option for update action (python-only).
+        # This is RS-only (rsadminbot excluded because it must be updated via !selfupdate).
+        if self.action in ["update"]:
+            options.insert(0, discord.SelectOption(
+                label="📦 All RS Bots",
+                value="all_rs_bots",
+                description="Update all RS bots from GitHub (python-only) and restart services"
+            ))
         
         select = ui.Select(
             placeholder=f"Select bot to {action_display.lower()}...",
@@ -991,8 +1000,11 @@ class BotSelectView(ui.View):
             bot_info = self.admin_bot.BOTS[bot_name]
             await self._handle_status(interaction, bot_name, bot_info)
         elif self.action == "update":
-            bot_info = self.admin_bot.BOTS[bot_name]
-            await self._handle_update(interaction, bot_name, bot_info)
+            if bot_name == "all_rs_bots":
+                await self._handle_update_all_rs_bots(interaction)
+            else:
+                bot_info = self.admin_bot.BOTS[bot_name]
+                await self._handle_update(interaction, bot_name, bot_info)
         elif self.action == "sync":
             bot_info = self.admin_bot.BOTS[bot_name]
             await self._handle_sync(interaction, bot_name, bot_info)
@@ -1558,59 +1570,74 @@ class BotSelectView(ui.View):
     
     async def _handle_update(self, interaction, bot_name, bot_info):
         """Handle bot update (GitHub python-only) from the dropdown."""
-        # This matches the canonical update model: pull rsbots-code and overwrite live *.py.
+        bot_key = (bot_name or "").strip().lower()
+        # RS-only: exclude non-RS bots from updates.
+        if not self.admin_bot._is_rs_bot(bot_key):
+            await interaction.followup.send(f"❌ `{bot_key}` is not an RS bot. Updates are only available for RS bots.")
+            return
+        if bot_key == "rsadminbot":
+            await interaction.followup.send("ℹ️ Use `!selfupdate` to update RSAdminBot.")
+            return
+        await interaction.followup.send(
+            f"📦 **Updating {bot_info['name']} from GitHub (python-only)...**\n"
+            "```\nPulling + copying *.py from /home/rsadmin/bots/rsbots-code\n```"
+        )
+        ok, result = self.admin_bot._botupdate_one_py_only(bot_key)
+        if not ok:
+            await interaction.followup.send(f"❌ Update failed:\n```{str(result.get('error') or 'unknown error')[:900]}```")
+            return
+
+        summary = str(result.get("summary") or "")[:1900]
+        await interaction.followup.send(summary)
+
+    async def _handle_update_all_rs_bots(self, interaction) -> None:
+        """Update all RS bots (python-only) from the dropdown."""
         ssh_ok, error_msg = self.admin_bot._check_ssh_available()
         if not ssh_ok:
             await interaction.followup.send(f"❌ SSH not configured: {error_msg}")
             return
 
-        bot_key = (bot_name or "").strip().lower()
-        if bot_key == "rsadminbot":
-            await interaction.followup.send("ℹ️ Use `!selfupdate` to update RSAdminBot.")
+        rs_keys = [k for k in self.admin_bot._get_rs_bot_keys() if k in self.admin_bot.BOTS and k != "rsadminbot"]
+        if not rs_keys:
+            await interaction.followup.send("❌ No RS bots configured.")
             return
 
-        bot_folder = str(bot_info.get("folder") or "")
-        service_name = str(bot_info.get("service") or "")
-        await interaction.followup.send(
-            f"📦 **Updating {bot_info['name']} from GitHub (python-only)...**\n"
-            "```\nPulling + copying *.py from /home/rsadmin/bots/rsbots-code\n```"
+        status_msg = await interaction.followup.send(
+            embed=MessageHelper.create_info_embed(
+                title="Updating All RS Bots (python-only)",
+                message="Pulling + copying *.py from /home/rsadmin/bots/rsbots-code and restarting each service.",
+                fields=[
+                    {"name": "Bots", "value": str(len(rs_keys)), "inline": True},
+                    {"name": "Note", "value": "RSAdminBot is excluded (use !selfupdate).", "inline": False},
+                ],
+                footer=f"Triggered by {interaction.user}",
+            )
         )
 
-        success, stats = self.admin_bot._github_py_only_update(bot_folder)
-        if not success:
-            await interaction.followup.send(f"❌ Update failed:\n```{stats.get('error','unknown error')[:900]}```")
-            return
-
-        old = (stats.get("old") or "").strip()
-        new = (stats.get("new") or "").strip()
-        py_count = str(stats.get("py_count") or "0").strip()
-        changed_count = str(stats.get("changed_count") or "0").strip()
-        changed_sample = stats.get("changed_sample") or []
-
-        restart_ok = False
-        restart_err = ""
-        if self.admin_bot.service_manager and service_name:
-            ok_r, out_r, err_r = self.admin_bot.service_manager.restart(service_name, bot_name=bot_key)
-            if not ok_r:
-                restart_err = (err_r or out_r or "restart failed")[:800]
+        ok_count = 0
+        fail_count = 0
+        lines: List[str] = []
+        for bot_key in rs_keys:
+            ok, result = self.admin_bot._botupdate_one_py_only(bot_key)
+            if ok:
+                ok_count += 1
+                lines.append(f"✅ {bot_key}: changed={result.get('changed_count')} restart={result.get('restart')}")
             else:
-                running, verify_err = self.admin_bot.service_manager.verify_started(service_name, bot_name=bot_key)
-                restart_ok = bool(running)
-                if not restart_ok:
-                    restart_err = (verify_err or "service did not become active")[:800]
-        else:
-            restart_err = "ServiceManager not available or missing service mapping"
+                fail_count += 1
+                err = str(result.get("error") or "update failed")[:120]
+                lines.append(f"❌ {bot_key}: {err}")
 
-        summary = f"✅ **{bot_info['name']} updated from GitHub (python-only)**\n```"
-        summary += f"\nGit: {old[:12]} -> {new[:12]}"
-        summary += f"\nPython copied: {py_count} | Changed: {changed_count}"
-        summary += f"\nRestart: {'OK' if restart_ok else 'FAILED'}"
-        summary += "\n```"
-        if changed_sample:
-            summary += "\nChanged sample:\n```" + "\n".join(str(x) for x in changed_sample[:20]) + "```"
-        if not restart_ok and restart_err:
-            summary += "\nRestart error:\n```" + restart_err[:900] + "```"
-        await interaction.followup.send(summary[:1900])
+        msg = "\n".join(lines)
+        if len(msg) > 1800:
+            msg = "…(truncated)…\n" + msg[-1800:]
+
+        await status_msg.edit(
+            embed=MessageHelper.create_info_embed(
+                title="RS Bots Update Complete",
+                message=f"✅ OK: {ok_count} | ❌ Failed: {fail_count}\n```{msg}```",
+                footer=f"Triggered by {interaction.user}",
+            )
+        )
     
     async def _handle_sync(self, interaction, bot_name, bot_info):
         """Handle bot sync from dropdown."""
@@ -2857,6 +2884,10 @@ echo "TARGET=$TARGET"
         # Ensure journal channels exist in configured category (do not create categories)
         channel_map = await self.test_server_organizer.ensure_journal_channels_in_category(rs_keys)
         self._journal_channel_ids = channel_map
+        try:
+            print(f"{Colors.GREEN}[Journal Live] Enabled. Channels: {len(channel_map)} (category_id={cfg.get('category_id')}){Colors.RESET}")
+        except Exception:
+            pass
 
         # Ensure webhooks exist (auto-create) and persist URLs to config.secrets.json
         created_any = False
@@ -2946,6 +2977,10 @@ echo "TARGET=$TARGET"
 
         # Start per-bot journal follow tasks
         self._start_journal_follow_tasks(rs_keys)
+        try:
+            print(f"{Colors.GREEN}[Journal Live] Follow tasks started: {len(self._journal_tasks)}{Colors.RESET}")
+        except Exception:
+            pass
 
     def _start_journal_follow_tasks(self, rs_keys: List[str]) -> None:
         cfg = self._get_journal_live_config()
@@ -3854,6 +3889,80 @@ echo "CHANGED_END"
             return True, stats
         except Exception as e:
             return False, {"error": f"github py-only update failed: {str(e)[:300]}"}
+
+    def _botupdate_one_py_only(self, bot_key: str) -> Tuple[bool, Dict[str, Any]]:
+        """Update a single RS bot from rsbots-code (python-only) and restart the service.
+
+        This is the shared implementation used by:
+        - !botupdate (single bot)
+        - BotSelectView update dropdown
+        - "All RS Bots" update dropdown option
+        """
+        key = (bot_key or "").strip().lower()
+        if not key:
+            return False, {"error": "bot_key required"}
+        if key not in self.BOTS:
+            return False, {"error": f"Unknown bot: {key}"}
+        if not self._is_rs_bot(key):
+            return False, {"error": f"{key} is not an RS bot (updates are RS-only)"}
+        if key == "rsadminbot":
+            return False, {"error": "RSAdminBot must be updated via !selfupdate"}
+
+        info = self.BOTS.get(key) or {}
+        folder = str(info.get("folder") or "").strip()
+        service = str(info.get("service") or "").strip()
+        if not folder:
+            return False, {"error": f"Missing folder mapping for bot: {key}"}
+
+        ok, stats = self._github_py_only_update(folder)
+        if not ok:
+            return False, {"error": str((stats or {}).get("error") or "update failed")[:900]}
+
+        # Restart service
+        restart_ok = False
+        restart_err = ""
+        if self.service_manager and service:
+            ok_r, out_r, err_r = self.service_manager.restart(service, bot_name=key)
+            if not ok_r:
+                restart_err = (err_r or out_r or "restart failed")[:800]
+            else:
+                running, verify_err = self.service_manager.verify_started(service, bot_name=key)
+                restart_ok = bool(running)
+                if not restart_ok:
+                    restart_err = (verify_err or "service did not become active")[:800]
+        else:
+            restart_err = "ServiceManager not available or missing service mapping"
+
+        old = str(stats.get("old") or "").strip()
+        new = str(stats.get("new") or "").strip()
+        py_count = str(stats.get("py_count") or "0").strip()
+        changed_count = str(stats.get("changed_count") or "0").strip()
+        changed_sample = stats.get("changed_sample") or []
+
+        summary = f"✅ **{info.get('name', key)} updated from GitHub (python-only)**\n```"
+        if old or new:
+            summary += f"\nGit: {old[:12]} -> {new[:12]}"
+        summary += f"\nPython copied: {py_count} | Changed: {changed_count}"
+        summary += f"\nRestart: {'OK' if restart_ok else 'FAILED'}"
+        summary += "\n```"
+        if changed_sample:
+            summary += "\nChanged sample:\n```" + "\n".join(str(x) for x in changed_sample[:20]) + "```"
+        if not restart_ok and restart_err:
+            summary += "\nRestart error:\n```" + restart_err[:900] + "```"
+
+        return True, {
+            "bot": key,
+            "folder": folder,
+            "service": service,
+            "old": old,
+            "new": new,
+            "py_count": py_count,
+            "changed_count": changed_count,
+            "restart": "OK" if restart_ok else "FAILED",
+            "restart_ok": restart_ok,
+            "restart_err": restart_err,
+            "summary": summary[:1900],
+        }
     
     # Legacy Phase 4 file sync / tree compare / auto-sync removed.
     # Legacy helper functions (_should_exclude_file, _is_unimportant_remote_file, _count_files_recursive) removed.
@@ -5951,7 +6060,8 @@ echo "CHANGED_END"
             
             if not bot_name:
                 # Show interactive SelectMenu
-                view = BotSelectView(self, "update", "Update")
+                # RS-only dropdown (prevents accidental updates of non-RS bots).
+                view = BotSelectView(self, "update", "Update", bot_keys=self._get_rs_bot_keys())
                 embed = discord.Embed(
                     title="📦 Select Bot to Update",
                     description="Choose a bot from the dropdown menu below:",
@@ -6784,6 +6894,108 @@ echo "CHANGED_END"
                 except Exception:
                     pass
                 return
+
+        @self.bot.command(name="syncstatus", aliases=["outdated", "codestatus"])
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def syncstatus(ctx):
+            """Compare rsbots-code (GitHub checkout) vs live tree and report which RS bots are outdated (admin only)."""
+            ssh_ok, error_msg = self._check_ssh_available()
+            if not ssh_ok:
+                await ctx.send(f"❌ SSH not configured: {error_msg}")
+                return
+
+            code_root = Path("/home/rsadmin/bots/rsbots-code")
+            live_root = Path(str(getattr(self, "remote_root", "") or "/home/rsadmin/bots/mirror-world"))
+
+            if not (code_root / ".git").exists():
+                await ctx.send(f"❌ Missing rsbots-code git repo: `{code_root}`")
+                return
+            if not live_root.is_dir():
+                await ctx.send(f"❌ Missing live repo root: `{live_root}`")
+                return
+
+            # Update git refs (read-only aside from fetch)
+            head_local = ""
+            head_remote = ""
+            ahead_behind = ""
+            try:
+                subprocess.run(["git", "-C", str(code_root), "fetch", "origin"], capture_output=True, text=True, timeout=25)
+                head_local = (subprocess.run(["git", "-C", str(code_root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=8).stdout or "").strip()
+                head_remote = (subprocess.run(["git", "-C", str(code_root), "rev-parse", "origin/main"], capture_output=True, text=True, timeout=8).stdout or "").strip()
+                ahead_behind = (subprocess.run(["git", "-C", str(code_root), "rev-list", "--left-right", "--count", "HEAD...origin/main"], capture_output=True, text=True, timeout=8).stdout or "").strip()
+            except Exception:
+                pass
+
+            # Build RS bot folders dynamically (no hardcoded list).
+            rs_keys = [k for k in self._get_rs_bot_keys() if k in self.BOTS]
+            folders = sorted({str((self.BOTS.get(k) or {}).get("folder") or "").strip() for k in rs_keys if (self.BOTS.get(k) or {}).get("folder")})
+            # Include shared scripts folder used by admin tooling.
+            if (code_root / "scripts").is_dir():
+                if "scripts" not in folders:
+                    folders.append("scripts")
+
+            embed = MessageHelper.create_info_embed(
+                title="Sync Status (rsbots-code vs live)",
+                message="Shows which folders differ between `/home/rsadmin/bots/rsbots-code` and the live tree.\n\nFix: run `!botupdate` (select a bot) or use the dropdown **All RS Bots** option.",
+                footer=f"Triggered by {ctx.author}",
+            )
+            if head_local:
+                embed.add_field(name="rsbots-code HEAD", value=f"`{head_local[:12]}`", inline=True)
+            if head_remote:
+                embed.add_field(name="origin/main HEAD", value=f"`{head_remote[:12]}`", inline=True)
+            if ahead_behind:
+                embed.add_field(name="ahead/behind", value=f"`{ahead_behind}`", inline=True)
+
+            any_diff = False
+            for folder in folders:
+                try:
+                    res = subprocess.run(
+                        ["git", "-C", str(code_root), "ls-files", folder],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    files = [ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip().endswith(".py")]
+                except Exception:
+                    files = []
+                if not files:
+                    continue
+
+                diff = 0
+                missing = 0
+                sample: List[str] = []
+                for rel in files:
+                    gp = code_root / rel
+                    lp = live_root / rel
+                    if not lp.exists():
+                        diff += 1
+                        missing += 1
+                        if len(sample) < 5:
+                            sample.append(f"{rel} (missing)")
+                        continue
+                    try:
+                        if gp.read_bytes() != lp.read_bytes():
+                            diff += 1
+                            if len(sample) < 5:
+                                sample.append(rel)
+                    except Exception:
+                        diff += 1
+                        if len(sample) < 5:
+                            sample.append(f"{rel} (read_error)")
+
+                any_diff = any_diff or (diff > 0)
+                status = "✅ in sync" if diff == 0 else f"⚠️ diff={diff} (missing={missing})"
+                details = status
+                if sample:
+                    details += "\n```" + "\n".join(sample)[:900] + "```"
+                embed.add_field(name=folder, value=details[:1024], inline=False)
+
+            if not folders:
+                embed.add_field(name="No folders", value="No RS folders found to compare.", inline=False)
+            elif not any_diff:
+                embed.add_field(name="Result", value="✅ Live tree matches rsbots-code for tracked .py files.", inline=False)
+
+            await ctx.send(embed=embed)
 
         @self.bot.command(name="systemcheck", aliases=["systemstatus"])
         @commands.check(lambda ctx: self.is_admin(ctx.author))
