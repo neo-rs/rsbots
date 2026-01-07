@@ -40,6 +40,7 @@ if str(_REPO_ROOT) not in sys.path:
 from mirror_world_config import load_config_with_secrets
 from mirror_world_config import is_placeholder_secret, mask_secret
 from mirror_world_config import _deep_merge_dict
+from mirror_world_config import load_oracle_servers, pick_oracle_server, resolve_oracle_ssh_key_path
 
 from rsbots_manifest import compare_manifests as rs_compare_manifests
 from rsbots_manifest import generate_manifest as rs_generate_manifest
@@ -1937,7 +1938,7 @@ class RSAdminBot:
                 pass
             sys.exit(1)
         
-        # Load SSH server config (self-contained - only from config.json)
+        # Load SSH server config (canonical: oraclekeys/servers.json + ssh_server_name selector)
         self._load_ssh_config()
         
         # Initialize ServiceManager (canonical owner for bot management operations)
@@ -1993,83 +1994,108 @@ class RSAdminBot:
         self._setup_commands()
     
     def _load_ssh_config(self):
-        """Load SSH server configuration from config.json (self-contained).
-        
-        RSAdminBot is self-contained - all config comes from its own config.json.
-        When RSAdminBot is running on the Ubuntu host it manages, it should prefer local execution
-        (no SSH key needed). When running off-box (e.g. Windows), it will use SSH + key.
+        """Load SSH server configuration from the canonical oraclekeys/servers.json.
+
+        Rules (CANONICAL_RULES.md):
+        - Server list source of truth: <repo_root>/oraclekeys/servers.json
+        - RSAdminBot/config.json should only select the server entry name (no duplicated host/user/key)
+        - On the Ubuntu host itself, prefer local-exec when enabled (no SSH key needed)
         """
         try:
-            # First, try loading from config.json (self-contained)
-            ssh_server_config = self.config.get("ssh_server")
-            if ssh_server_config:
-                # Convert to list format for compatibility
-                self.servers = [ssh_server_config]
-                self.current_server = ssh_server_config
-                
-                # Canonical remote repo root (also used for local-exec detection on Ubuntu)
-                remote_user = ssh_server_config.get("user", "rsadmin") or "rsadmin"
-                self.remote_root = str(Path(f"/home/{remote_user}/bots/mirror-world"))
-                
-                # Resolve SSH key path. Canonical location is repo root `oraclekeys/`.
-                # Fallback to RSAdminBot folder for legacy setups.
-                key_name = ssh_server_config.get("key")
-                if key_name:
-                    key_path = Path(key_name)
-                    if not key_path.is_absolute():
-                        candidates = [
-                            self.base_path.parent / "oraclekeys" / key_name,
-                            self.base_path / key_name,
-                        ]
-                        for c in candidates:
-                            if c.exists():
-                                key_path = c
-                                break
-                    if key_path.is_absolute() and key_path.exists():
-                        # Fix SSH key permissions on Windows (required for SSH to work)
-                        if platform.system() == "Windows":
-                            self._fix_ssh_key_permissions(key_path)
-                        ssh_server_config["key"] = str(key_path)
-                        print(f"{Colors.GREEN}[SSH] Using SSH key: {key_path}{Colors.RESET}")
-                        if hasattr(self, 'logger') and self.logger:
-                            self.logger.log_config_validation("ssh_key", "valid", f"SSH key found: {key_path}", {"key_path": str(key_path)})
-                    else:
-                        if hasattr(self, 'logger') and self.logger:
-                            self.logger.log_config_validation("ssh_key", "missing", f"SSH key not found: {key_path}", {"key_path": str(key_path)})
+            # 1) Determine which server entry to use (selector only; no duplicated host/user/key).
+            server_name = str(self.config.get("ssh_server_name") or "").strip()
+            if not server_name:
+                # Back-compat for configs that still have an ssh_server dict: accept ONLY the name selector.
+                legacy = self.config.get("ssh_server")
+                if isinstance(legacy, dict):
+                    server_name = str(legacy.get("name") or "").strip()
+
+            if not server_name:
+                print(f"{Colors.YELLOW}[SSH] No SSH server selected (missing ssh_server_name){Colors.RESET}")
+                print(f"{Colors.YELLOW}[SSH] Set ssh_server_name in RSAdminBot/config.json to a name from oraclekeys/servers.json{Colors.RESET}")
+                if hasattr(self, "logger") and self.logger:
+                    self.logger.log_config_validation("ssh_config", "missing", "Missing ssh_server_name (must match oraclekeys/servers.json entry name)", {})
+                return
+
+            # 2) Load canonical server list and pick the entry by exact name match.
+            servers, servers_path = load_oracle_servers(self.base_path.parent)
+            entry = pick_oracle_server(servers, server_name)
+
+            host = str(entry.get("host") or "").strip()
+            user = str(entry.get("user") or "").strip() or "rsadmin"
+            key_value = str(entry.get("key") or "").strip()
+            ssh_options = str(entry.get("ssh_options") or "").strip()
+
+            # Optional: port (defaults to 22 if absent)
+            port_val = entry.get("port", 22)
+            try:
+                port = int(port_val) if port_val is not None else 22
+            except Exception:
+                port = 22
+
+            # Remote root can be specified per entry; otherwise derive from user.
+            remote_root = str(entry.get("remote_root") or entry.get("live_root") or f"/home/{user}/bots/mirror-world").strip()
+            self.remote_root = remote_root
+
+            self.current_server = {
+                "name": str(entry.get("name") or server_name),
+                "host": host,
+                "user": user,
+                "key": key_value,
+                "ssh_options": ssh_options,
+                "port": port,
+                "source": str(servers_path),
+            }
+            self.servers = servers
+
+            # 3) Resolve key path when needed (Windows/off-box). In local-exec mode, key is not required.
+            if key_value:
+                key_path = resolve_oracle_ssh_key_path(key_value, self.base_path.parent)
+                if key_path.exists():
+                    if platform.system() == "Windows":
+                        self._fix_ssh_key_permissions(key_path)
+                    self.current_server["key"] = str(key_path)
+                    if hasattr(self, "logger") and self.logger:
+                        self.logger.log_config_validation("ssh_key", "valid", f"SSH key resolved: {key_path}", {"key_path": str(key_path)})
                 else:
-                    # On Ubuntu local-exec mode, a missing SSH key is expected (we don't need it).
                     if self._should_use_local_exec():
-                        print(f"{Colors.GREEN}[Local Exec] SSH key not found (ok in local-exec): {key_name}{Colors.RESET}")
-                        if hasattr(self, 'logger') and self.logger:
+                        # Local execution mode (Oracle Ubuntu host): key is not required.
+                        self.current_server["key"] = ""
+                        if hasattr(self, "logger") and self.logger:
                             self.logger.log_config_validation("ssh_key", "valid", "SSH key not required in local-exec mode", {"local_exec": True})
                     else:
-                        print(f"{Colors.YELLOW}[SSH Warning] SSH key not found: {key_name}{Colors.RESET}")
-                        if hasattr(self, 'logger') and self.logger:
-                            self.logger.log_config_validation("ssh_key", "warning", f"SSH key not found: {key_name}", {"key_name": key_name})
-                
-                print(f"{Colors.GREEN}[SSH] Loaded server config from config.json: {ssh_server_config.get('name', 'Unknown')}{Colors.RESET}")
-                print(f"{Colors.CYAN}[SSH] Host: {ssh_server_config.get('host', 'N/A')}, User: {ssh_server_config.get('user', 'N/A')}{Colors.RESET}")
-                if self._should_use_local_exec():
-                    print(f"{Colors.GREEN}[Local Exec] Enabled: running management commands locally on this host{Colors.RESET}")
-                    if hasattr(self, 'logger') and self.logger:
-                        self.logger.log_config_validation("local_exec", "valid", "Local execution mode enabled", {"enabled": True, "remote_root": str(getattr(self, "remote_root", ""))})
-                
-                if hasattr(self, 'logger') and self.logger:
-                    self.logger.log_config_validation("ssh_config", "valid", f"SSH config loaded: {ssh_server_config.get('name', 'Unknown')}", {
-                        "server_name": ssh_server_config.get('name'),
-                        "host": ssh_server_config.get('host'),
-                        "user": ssh_server_config.get('user'),
-                        "local_exec": self._should_use_local_exec()
-                    })
-                
-                return
-            
-            # No server config found - RSAdminBot is self-contained, only uses config.json
-            print(f"{Colors.YELLOW}[SSH] No SSH server configured in config.json{Colors.RESET}")
-            print(f"{Colors.YELLOW}[SSH] Add 'ssh_server' section to config.json to enable SSH functionality{Colors.RESET}")
-            print(f"{Colors.YELLOW}[SSH] RSAdminBot is self-contained - all config must be in config.json{Colors.RESET}")
-            if hasattr(self, 'logger') and self.logger:
-                self.logger.log_config_validation("ssh_config", "missing", "No SSH server configured in config.json", {})
+                        # Key is optional for SSH (agent/default identity may be used). Never force `-i` if the file is missing.
+                        self.current_server["key"] = ""
+                        print(f"{Colors.YELLOW}[SSH] Warning: SSH key not found at {key_path}; continuing without -i (ssh-agent/default identity may be used){Colors.RESET}")
+                        if hasattr(self, "logger") and self.logger:
+                            self.logger.log_config_validation(
+                                "ssh_key",
+                                "missing",
+                                f"SSH key not found: {key_path} (optional; continuing without -i)",
+                                {"key_path": str(key_path), "optional": True},
+                            )
+
+            print(f"{Colors.GREEN}[SSH] Loaded server config from oraclekeys/servers.json: {self.current_server.get('name')}{Colors.RESET}")
+            print(f"{Colors.CYAN}[SSH] Host: {host}, User: {user}, Port: {port}{Colors.RESET}")
+            if self._should_use_local_exec():
+                print(f"{Colors.GREEN}[Local Exec] Enabled: running management commands locally on this host{Colors.RESET}")
+                if hasattr(self, "logger") and self.logger:
+                    self.logger.log_config_validation("local_exec", "valid", "Local execution mode enabled", {"enabled": True, "remote_root": str(getattr(self, "remote_root", ""))})
+
+            if hasattr(self, "logger") and self.logger:
+                self.logger.log_config_validation(
+                    "ssh_config",
+                    "valid",
+                    f"SSH config loaded: {self.current_server.get('name')}",
+                    {
+                        "server_name": self.current_server.get("name"),
+                        "host": host,
+                        "user": user,
+                        "port": port,
+                        "servers_path": str(servers_path),
+                        "local_exec": self._should_use_local_exec(),
+                    },
+                )
             
         except Exception as e:
             print(f"{Colors.RED}[SSH] Failed to load SSH config: {e}{Colors.RESET}")
@@ -2187,9 +2213,9 @@ class RSAdminBot:
     def _check_ssh_available(self) -> Tuple[bool, str]:
         """Check if SSH is available and configured. Returns (is_available, error_message)"""
         if not self.current_server:
-            error_msg = "No SSH server configured in config.json"
+            error_msg = "No SSH server configured (missing ssh_server_name / servers.json selection)"
             print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
-            print(f"{Colors.RED}[SSH Error] Add 'ssh_server' section to config.json{Colors.RESET}")
+            print(f"{Colors.RED}[SSH Error] Set ssh_server_name in RSAdminBot/config.json to a name from oraclekeys/servers.json{Colors.RESET}")
             if hasattr(self, 'logger') and self.logger:
                 self.logger.log_config_validation("ssh_available", "invalid", error_msg, {})
             return False, error_msg
@@ -2203,19 +2229,25 @@ class RSAdminBot:
             return True, ""
         
         # Check SSH key (should already be resolved to absolute path in _load_ssh_config)
-        ssh_key = self.current_server.get("key")
+        ssh_key = str(self.current_server.get("key") or "").strip()
         if ssh_key:
-            key_path = Path(ssh_key)
+            key_path = Path(ssh_key).expanduser()
             if not key_path.exists():
-                error_msg = f"SSH key file not found: {key_path}"
-                print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
-                print(f"{Colors.YELLOW}[SSH Error] Expected SSH key in RSAdminBot folder{Colors.RESET}")
+                # Key is optional; allow SSH to fall back to default identities/agent.
+                self.current_server["key"] = ""
+                warn_msg = f"SSH key file not found: {key_path} (optional; continuing without -i)"
+                print(f"{Colors.YELLOW}[SSH] Warning: {warn_msg}{Colors.RESET}")
                 if hasattr(self, 'logger') and self.logger:
-                    self.logger.log_config_validation("ssh_available", "invalid", error_msg, {"key_path": str(key_path)})
-                return False, error_msg
+                    self.logger.log_config_validation("ssh_key", "missing", warn_msg, {"key_path": str(key_path), "optional": True})
         
+        effective_key = str(self.current_server.get("key") or "").strip()
         if hasattr(self, 'logger') and self.logger:
-            self.logger.log_config_validation("ssh_available", "valid", "SSH available and configured", {"key_path": str(ssh_key) if ssh_key else None})
+            self.logger.log_config_validation(
+                "ssh_available",
+                "valid",
+                "SSH available and configured",
+                {"key_path": effective_key if effective_key else None},
+            )
         return True, ""
 
     def _should_use_local_exec(self) -> bool:
@@ -4086,9 +4118,9 @@ echo "CHANGED_END"
         Uses shell=False to prevent PowerShell parsing on Windows.
         Commands are executed inside remote bash shell.
         """
-        # Check if server is configured (self-contained - uses config.json)
+        # Check if server is configured (canonical: oraclekeys/servers.json + ssh_server_name selector)
         if not self.current_server:
-            error_msg = "No SSH server configured in config.json"
+            error_msg = "No SSH server configured (missing ssh_server_name / servers.json selection)"
             print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
             return False, "", error_msg
 
@@ -4136,14 +4168,13 @@ echo "CHANGED_END"
         
         # Build SSH command locally (self-contained)
         # Check if SSH key exists (already resolved in _load_ssh_config)
-        ssh_key = self.current_server.get("key")
+        ssh_key = str(self.current_server.get("key") or "").strip()
         if ssh_key:
-            key_path = Path(ssh_key)
+            key_path = Path(ssh_key).expanduser()
             if not key_path.exists():
-                error_msg = f"SSH key file not found: {key_path}"
-                print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
-                print(f"{Colors.YELLOW}[SSH Error] Expected key at: {key_path}{Colors.RESET}")
-                return False, "", error_msg
+                # Key is optional; allow SSH to fall back to default identities/agent.
+                self.current_server["key"] = ""
+                print(f"{Colors.YELLOW}[SSH] Warning: SSH key file not found: {key_path}; continuing without -i{Colors.RESET}")
         
         try:
             # Log SSH command before execution
@@ -4713,6 +4744,16 @@ echo "CHANGED_END"
             """Handle command errors"""
             if isinstance(error, commands.CommandNotFound):
                 return  # Ignore unknown commands
+            elif isinstance(error, commands.CheckFailure):
+                # Most admin-gated commands use commands.check(self.is_admin), which raises CheckFailure (not MissingPermissions).
+                print(f"{Colors.YELLOW}[Command Error] CheckFailure: {ctx.author} tried to use {ctx.command}{Colors.RESET}")
+                embed = MessageHelper.create_error_embed(
+                    title="Missing Permissions",
+                    message="You don't have permission to use this command.",
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
+                await self._log_to_discord(embed, None)
             elif isinstance(error, commands.MissingPermissions):
                 print(f"{Colors.YELLOW}[Command Error] Missing permissions: {ctx.author} tried to use {ctx.command}{Colors.RESET}")
                 embed = MessageHelper.create_error_embed(
@@ -4864,7 +4905,7 @@ echo "CHANGED_END"
                 ssh_status += f"Server: {self.current_server.get('name', 'Unknown')}\n"
                 ssh_status += f"Host: {self.current_server.get('host', 'N/A')}"
             else:
-                ssh_status = "❌ **Not configured**\nAdd `ssh_server` to config.json"
+                ssh_status = "❌ **Not configured**\nSet `ssh_server_name` in RSAdminBot/config.json and ensure `oraclekeys/servers.json` exists"
             embed.add_field(
                 name="🖥️ SSH Server",
                 value=ssh_status,
@@ -4898,7 +4939,7 @@ echo "CHANGED_END"
         async def reload(ctx):
             """Reload configuration (admin only)"""
             self.load_config()
-            self._load_ssh_config()  # Self-contained - always reload from config.json
+            self._load_ssh_config()  # Canonical: reload selection + servers.json mapping
             await ctx.send("✅ Configuration reloaded!")
         
         @self.bot.command(name="restart")
@@ -6074,6 +6115,100 @@ echo "CHANGED_END"
             else:
                 # Use the dedicated rsync script
                 await self._sync_bot_via_script(ctx, status_msg, bot_info, bot_folder, local_bot_path, remote_bot_path, rsync_script, dry_run, delete)
+
+        @self.bot.command(name="whereami")
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def whereami(ctx):
+            """Print runtime environment details (admin only).
+
+            Use this when debugging: it proves which file is executing and what repo/commit is live.
+            """
+            try:
+                import platform
+                import sys as _sys
+
+                cwd = os.getcwd()
+                file_path = str(Path(__file__).resolve())
+                py_exec = _sys.executable
+                py_ver = _sys.version.split()[0]
+                local_exec = "yes" if self._should_use_local_exec() else "no"
+                live_root = str(getattr(self, "remote_root", "") or "")
+
+                code_repo = "/home/rsadmin/bots/rsbots-code"
+                live_repo = live_root if live_root else "/home/rsadmin/bots/mirror-world"
+
+                def _git_head(path: str) -> str:
+                    try:
+                        if not Path(path).is_dir():
+                            return "missing"
+                        if not (Path(path) / ".git").exists():
+                            return "no_git"
+                        res = subprocess.run(
+                            ["git", "-C", path, "rev-parse", "HEAD"],
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                        )
+                        if res.returncode != 0:
+                            return "error"
+                        return (res.stdout or "").strip()[:40] or "error"
+                    except Exception:
+                        return "error"
+
+                head_code = _git_head(code_repo)
+                head_live = _git_head(live_repo)
+
+                lines = [
+                    "WHEREAMI",
+                    f"cwd={cwd}",
+                    f"file={file_path}",
+                    f"os={platform.system()} {platform.release()}",
+                    f"python={py_exec}",
+                    f"python_version={py_ver}",
+                    f"local_exec={local_exec}",
+                    f"live_root={live_repo}",
+                    f"rsbots_code_head={head_code}",
+                    f"live_tree_head={head_live}",
+                ]
+                payload = "\n".join(lines)
+                embed = MessageHelper.create_info_embed(
+                    title="Where Am I",
+                    message=self._codeblock(payload, limit=1800),
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
+                await self._log_to_discord(embed, ctx.channel)
+                if self.logger:
+                    try:
+                        log_entry = self.logger.log_command(
+                            ctx,
+                            "whereami",
+                            "success",
+                            {
+                                "cwd": cwd,
+                                "file": file_path,
+                                "local_exec": local_exec,
+                                "live_root": live_repo,
+                                "rsbots_code_head": head_code,
+                                "live_tree_head": head_live,
+                            },
+                        )
+                        await self._log_to_discord(self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx)), ctx.channel)
+                        self.logger.clear_command_context()
+                    except Exception:
+                        pass
+            except Exception as e:
+                err_txt = str(e)[:300]
+                embed = MessageHelper.create_error_embed(
+                    title="whereami Failed",
+                    message="whereami failed.",
+                    error_details=err_txt,
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
+                await self._log_to_discord(embed, ctx.channel)
+
+        self.registered_commands.append(("whereami", "Print runtime environment details", True))
     
     async def _sync_bot_via_script(self, ctx, status_msg, bot_info, bot_folder, local_bot_path, remote_bot_path, rsync_script, dry_run, delete):
         """Sync bot using the dedicated rsync_sync.py script."""
@@ -7096,98 +7231,6 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             
             await ctx.send(embed=embed)
 
-        @self.bot.command(name="whereami")
-        @commands.check(lambda ctx: self.is_admin(ctx.author))
-        async def whereami(ctx):
-            """Print runtime environment details (admin only).
-
-            Use this when debugging: it proves which file is executing and what repo/commit is live.
-            """
-            try:
-                import platform
-                import sys as _sys
-
-                cwd = os.getcwd()
-                file_path = str(Path(__file__).resolve())
-                py_exec = _sys.executable
-                py_ver = _sys.version.split()[0]
-                local_exec = "yes" if self._should_use_local_exec() else "no"
-                live_root = str(getattr(self, "remote_root", "") or "")
-
-                code_repo = "/home/rsadmin/bots/rsbots-code"
-                live_repo = live_root if live_root else "/home/rsadmin/bots/mirror-world"
-
-                def _git_head(path: str) -> str:
-                    try:
-                        if not Path(path).is_dir():
-                            return "missing"
-                        if not (Path(path) / ".git").exists():
-                            return "no_git"
-                        res = subprocess.run(
-                            ["git", "-C", path, "rev-parse", "HEAD"],
-                            capture_output=True,
-                            text=True,
-                            timeout=5,
-                        )
-                        if res.returncode != 0:
-                            return "error"
-                        return (res.stdout or "").strip()[:40] or "error"
-                    except Exception:
-                        return "error"
-
-                head_code = _git_head(code_repo)
-                head_live = _git_head(live_repo)
-
-                lines = [
-                    "WHEREAMI",
-                    f"cwd={cwd}",
-                    f"file={file_path}",
-                    f"os={platform.system()} {platform.release()}",
-                    f"python={py_exec}",
-                    f"python_version={py_ver}",
-                    f"local_exec={local_exec}",
-                    f"live_root={live_repo}",
-                    f"rsbots_code_head={head_code}",
-                    f"live_tree_head={head_live}",
-                ]
-                payload = "\n".join(lines)
-                embed = MessageHelper.create_info_embed(
-                    title="Where Am I",
-                    message=self._codeblock(payload, limit=1800),
-                    footer=f"Triggered by {ctx.author}",
-                )
-                await ctx.send(embed=embed)
-                await self._log_to_discord(embed, ctx.channel)
-                if self.logger:
-                    try:
-                        log_entry = self.logger.log_command(
-                            ctx,
-                            "whereami",
-                            "success",
-                            {
-                                "cwd": cwd,
-                                "file": file_path,
-                                "local_exec": local_exec,
-                                "live_root": live_repo,
-                                "rsbots_code_head": head_code,
-                                "live_tree_head": head_live,
-                            },
-                        )
-                        await self._log_to_discord(self.logger.create_embed(log_entry, self.logger._get_context_from_ctx(ctx)), ctx.channel)
-                        self.logger.clear_command_context()
-                    except Exception:
-                        pass
-            except Exception as e:
-                err_txt = str(e)[:300]
-                embed = MessageHelper.create_error_embed(
-                    title="whereami Failed",
-                    message="whereami failed.",
-                    error_details=err_txt,
-                    footer=f"Triggered by {ctx.author}",
-                )
-                await ctx.send(embed=embed)
-                await self._log_to_discord(embed, ctx.channel)
-        
         # botscan removed: legacy scan/tree compare was removed entirely.
         
         @self.bot.command(name="botinfo")
@@ -8604,15 +8647,18 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                     remote_path = f"/home/{self.current_server.get('user', 'rsadmin')}/mirror-world/RSAdminBot/{report_filename}"
                     
                     # Use SCP to upload
-                    ssh_key_path = self.base_path / self.current_server.get("key", "ssh-key-2025-12-15.key")
                     scp_cmd = [
                         "scp",
-                        "-i", str(ssh_key_path),
                         "-o", "StrictHostKeyChecking=no",
                         "-P", str(self.current_server.get("port", 22)),
                         str(local_report_path),
                         f"{self.current_server.get('user', 'rsadmin')}@{self.current_server.get('host')}:{remote_path}"
                     ]
+                    ssh_key = str(self.current_server.get("key") or "").strip()
+                    if ssh_key:
+                        ssh_key_path = Path(ssh_key).expanduser()
+                        if ssh_key_path.exists():
+                            scp_cmd[1:1] = ["-i", str(ssh_key_path)]
                     
                     result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=30)
                     if result.returncode == 0:
@@ -9047,6 +9093,7 @@ def main():
     args = parser.parse_args()
 
     if args.check_config:
+        import os
         base = Path(__file__).parent
         cfg, config_path, secrets_path = load_config_with_secrets(base)
         token = (cfg.get("bot_token") or "").strip()
@@ -9056,11 +9103,35 @@ def main():
         if is_placeholder_secret(token):
             errors.append("bot_token missing/placeholder in config.secrets.json")
 
-        ssh = cfg.get("ssh_server") or {}
-        if ssh:
-            for k in ("host", "user", "key"):
-                if not (ssh.get(k) or "").strip():
-                    errors.append(f"ssh_server.{k} missing in config.json")
+        # Canonical SSH config: oraclekeys/servers.json + ssh_server_name selector
+        server_name = str(cfg.get("ssh_server_name") or "").strip()
+        if not server_name:
+            legacy = cfg.get("ssh_server")
+            if isinstance(legacy, dict):
+                server_name = str(legacy.get("name") or "").strip()
+
+        if not server_name:
+            errors.append("Missing ssh_server_name in RSAdminBot/config.json (must match oraclekeys/servers.json entry name)")
+        else:
+            try:
+                servers, servers_path = load_oracle_servers(base.parent)
+                entry = pick_oracle_server(servers, server_name)
+                host = str(entry.get("host") or "").strip()
+                user = str(entry.get("user") or "").strip() or "rsadmin"
+                key_value = str(entry.get("key") or "").strip()
+                remote_root = str(entry.get("remote_root") or entry.get("live_root") or f"/home/{user}/bots/mirror-world").strip()
+                local_exec_cfg = bool((cfg.get("local_exec") or {}).get("enabled", True))
+                local_exec_effective = (os.name != "nt") and local_exec_cfg
+                if not host:
+                    errors.append("servers.json entry missing host")
+                if not key_value and not local_exec_effective:
+                    errors.append("servers.json entry missing key (required when not in local-exec mode)")
+                if key_value:
+                    key_path = resolve_oracle_ssh_key_path(key_value, base.parent)
+                    if not key_path.exists() and not local_exec_effective:
+                        errors.append(f"SSH key not found: {key_path}")
+            except Exception as e:
+                errors.append(f"SSH config error: {e}")
 
         if errors:
             print(f"{Colors.RED}[ConfigCheck] FAILED{Colors.RESET}")
@@ -9072,10 +9143,16 @@ def main():
         print(f"- config: {config_path}")
         print(f"- secrets: {secrets_path}")
         print(f"- bot_token: {mask_secret(token)}")
-        if ssh:
-            print(f"- ssh_server.host: {ssh.get('host')}")
-            print(f"- ssh_server.user: {ssh.get('user')}")
-            print(f"- ssh_server.key: {ssh.get('key')}")
+        print(f"- ssh_server_name: {server_name}")
+        try:
+            servers, servers_path = load_oracle_servers(base.parent)
+            entry = pick_oracle_server(servers, server_name)
+            print(f"- servers.json: {servers_path}")
+            print(f"- ssh.host: {entry.get('host')}")
+            print(f"- ssh.user: {entry.get('user')}")
+            print(f"- ssh.key: {entry.get('key')}")
+        except Exception:
+            pass
         return
 
     bot = RSAdminBot()

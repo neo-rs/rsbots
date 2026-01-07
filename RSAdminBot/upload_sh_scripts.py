@@ -7,6 +7,14 @@ import subprocess
 import json
 import shlex
 from pathlib import Path
+import sys
+
+# Canonical Oracle server config (CANONICAL_RULES.md)
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from mirror_world_config import load_oracle_servers, pick_oracle_server, resolve_oracle_ssh_key_path
 
 # Load config
 config_path = Path(__file__).parent / "config.json"
@@ -20,21 +28,32 @@ except json.JSONDecodeError:
     print(f"Error: Invalid JSON in config.json at {config_path}")
     exit(1)
 
-ssh_config = config.get("ssh_server", {})
-host = ssh_config.get("host")
-user = ssh_config.get("user")
-key = ssh_config.get("key")
-port = ssh_config.get("port", 22)
-ssh_options_str = ssh_config.get("ssh_options", "")  # Get as string
+server_name = str(config.get("ssh_server_name") or "").strip()
+if not server_name:
+    print("Error: Missing ssh_server_name in RSAdminBot/config.json (must match oraclekeys/servers.json entry name)")
+    raise SystemExit(1)
 
-if not all([host, user, key]):
-    print("Error: SSH server configuration (host, user, key) is incomplete in config.json")
-    exit(1)
+servers, _servers_path = load_oracle_servers(_REPO_ROOT)
+entry = pick_oracle_server(servers, server_name)
 
-local_key_path = Path(__file__).parent / key
+host = str(entry.get("host") or "").strip()
+user = str(entry.get("user") or "").strip() or "rsadmin"
+key_value = str(entry.get("key") or "").strip()
+port_val = entry.get("port", 22)
+ssh_options_str = str(entry.get("ssh_options") or "").strip()
+try:
+    port = int(port_val) if port_val is not None else 22
+except Exception:
+    port = 22
+
+if not host or not key_value:
+    print("Error: servers.json entry missing host or key")
+    raise SystemExit(1)
+
+local_key_path = resolve_oracle_ssh_key_path(key_value, _REPO_ROOT)
 if not local_key_path.exists():
     print(f"Error: SSH key file not found at {local_key_path}")
-    exit(1)
+    raise SystemExit(1)
 
 remote_base_path = f"/home/{user}/bots/mirror-world/RSAdminBot"
 

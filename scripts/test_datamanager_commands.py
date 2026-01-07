@@ -103,11 +103,11 @@ def print_command_report(commands: Dict[str, Any]):
     disabled = sum(1 for c in commands.values() if c["status"] == "DISABLED")
     stubs = sum(1 for c in commands.values() if c["status"] == "STUB")
     
-    print(f"\n📊 Summary:")
+    print("\nSummary:")
     print(f"  Total Commands: {total}")
-    print(f"  ✅ Working: {working}")
-    print(f"  ❌ Disabled: {disabled}")
-    print(f"  ⚠️  Stubs: {stubs}")
+    print(f"  [OK] Working: {working}")
+    print(f"  [X] Disabled: {disabled}")
+    print(f"  [!] Stubs: {stubs}")
     
     print(f"\n{'=' * 70}")
     print("  COMMAND DETAILS")
@@ -115,10 +115,10 @@ def print_command_report(commands: Dict[str, Any]):
     
     for cmd_name, cmd_info in sorted(commands.items()):
         status_icon = {
-            "WORKING": "✅",
-            "DISABLED": "❌",
-            "STUB": "⚠️"
-        }.get(cmd_info["status"], "❓")
+            "WORKING": "[OK]",
+            "DISABLED": "[X]",
+            "STUB": "[!]",
+        }.get(cmd_info["status"], "[?]")
         
         print(f"\n{status_icon} `!{cmd_name}`")
         print(f"   Status: {cmd_info['status']}")
@@ -126,7 +126,7 @@ def print_command_report(commands: Dict[str, Any]):
         print(f"   Function: {cmd_info['function']}")
         
         if cmd_info["requires_channel"]:
-            print(f"   🔒 Requires: COMMAND_CHANNEL_ID (1435546857085341857)")
+            print("   Requires: COMMAND_CHANNEL_ID (1435546857085341857)")
         
         if cmd_info["docstring"]:
             doc_lines = cmd_info["docstring"].split('\n')[:3]
@@ -136,31 +136,31 @@ def print_command_report(commands: Dict[str, Any]):
                     print(f"                {line.strip()}")
         
         if cmd_info["disabled"]:
-            print(f"   ⚠️  This command is DISABLED/REMOVED")
+            print("   NOTE: This command is DISABLED/REMOVED")
     
     print(f"\n{'=' * 70}")
     print("  RECOMMENDATIONS")
     print("=" * 70)
     
     if disabled > 0:
-        print(f"\n❌ {disabled} command(s) are disabled and should be removed:")
+        print(f"\n[X] {disabled} command(s) are disabled and should be removed:")
         for cmd_name, cmd_info in commands.items():
             if cmd_info["status"] == "DISABLED":
-                print(f"   • !{cmd_name} (line {cmd_info['line']})")
+                print(f"   - !{cmd_name} (line {cmd_info['line']})")
     
     if working > 0:
-        print(f"\n✅ {working} command(s) are working and could be migrated to slash commands:")
+        print(f"\n[OK] {working} command(s) are working and could be migrated to slash commands:")
         for cmd_name, cmd_info in commands.items():
             if cmd_info["status"] == "WORKING":
-                print(f"   • !{cmd_name} → /{cmd_name}")
+                print(f"   - !{cmd_name} -> /{cmd_name}")
 
 def main():
-    print("\n🔍 Scanning datamanagerbot.py for prefix commands...\n")
+    print("\nScanning datamanagerbot.py for prefix commands...\n")
     
     commands = scan_datamanager_commands()
     
     if "error" in commands:
-        print(f"❌ Error: {commands['error']}")
+        print(f"ERROR: {commands['error']}")
         return 1
     
     print_command_report(commands)

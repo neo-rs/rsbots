@@ -86,7 +86,7 @@ async def run(admin_bot):
                 print(f"{Colors.RED}[Phase 3] Traceback: {traceback.format_exc()[:300]}{Colors.RESET}")
         else:
             print(f"{Colors.YELLOW}[Phase 3] ⚠️  No SSH server configured - skipping remote check{Colors.RESET}")
-            print(f"{Colors.YELLOW}[Phase 3] Configure 'ssh_server' in config.json to enable remote management{Colors.RESET}\n")
+            print(f"{Colors.YELLOW}[Phase 3] Configure ssh_server_name in RSAdminBot/config.json (and oraclekeys/servers.json) to enable remote management{Colors.RESET}\n")
     except Exception as e:
         print(f"{Colors.RED}[Phase 3] ✗ Unexpected error: {e}{Colors.RESET}")
         import traceback
