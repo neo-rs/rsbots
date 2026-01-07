@@ -3936,26 +3936,121 @@ echo "CHANGED_END"
             if name == "help":
                 continue
             desc = ""
-            is_admin = None
+            is_admin: Optional[bool] = None
+            aliases = list(getattr(c, "aliases", []) or [])
             if name in reg_map:
                 desc, is_admin = reg_map[name]
             else:
                 desc = (getattr(c, "help", "") or "").strip().splitlines()[0:1]
                 desc = desc[0] if desc else ""
-            cmds.append((name, desc, is_admin))
+                # Best-effort: commands guarded by @commands.check(...) will have at least one check.
+                try:
+                    is_admin = bool(getattr(c, "checks", []) or [])
+                except Exception:
+                    is_admin = None
+            cmds.append((name, aliases, desc, is_admin))
 
         cmds.sort(key=lambda x: x[0])
         lines = []
         lines.append("RSAdminBot Command Index")
         lines.append("Prefix: !")
         lines.append("")
-        for name, desc, is_admin in cmds:
+        for name, aliases, desc, is_admin in cmds:
             admin_tag = " [ADMIN]" if is_admin else ""
+            alias_txt = ""
+            if aliases:
+                alias_txt = f" (aliases: {', '.join('!' + str(a) for a in aliases[:6])}{'...' if len(aliases) > 6 else ''})"
             if desc:
-                lines.append(f"!{name}{admin_tag} - {desc}")
+                lines.append(f"!{name}{admin_tag}{alias_txt} - {desc}")
             else:
-                lines.append(f"!{name}{admin_tag}")
+                lines.append(f"!{name}{admin_tag}{alias_txt}")
         return "\n".join(lines).strip()
+
+    def _commands_catalog_state_path(self) -> Path:
+        # Use .txt so deploy_unpack preserves it (it preserves *.txt under bot folders).
+        return self.base_path / ".commands_catalog_state.txt"
+
+    async def _publish_command_index_to_configured_channel(self) -> None:
+        """Post or update the command index into a configured channel (on startup/restart)."""
+        cfg = self.config.get("commands_catalog") if isinstance(self.config, dict) else None
+        if not isinstance(cfg, dict) or not cfg.get("enabled"):
+            return
+        if not cfg.get("post_on_startup", True):
+            return
+        chan_id_raw = cfg.get("channel_id")
+        if not chan_id_raw:
+            return
+        try:
+            chan_id = int(str(chan_id_raw).strip())
+        except Exception:
+            return
+
+        channel = self.bot.get_channel(chan_id)
+        if not channel:
+            try:
+                channel = await self.bot.fetch_channel(chan_id)  # type: ignore[attr-defined]
+            except Exception:
+                print(f"{Colors.YELLOW}[Startup] Commands catalog channel not found (ID: {chan_id}){Colors.RESET}")
+                return
+
+        cmd_text = self._build_command_index_text()
+        cmd_body = f"```{cmd_text[:1800]}```"
+
+        # Hash for idempotent edits
+        import hashlib
+        cmd_hash = hashlib.sha256(cmd_text.encode("utf-8")).hexdigest()
+
+        embed = MessageHelper.create_info_embed(
+            title="RSAdminBot Commands",
+            message="Auto-updated on RSAdminBot restart. Run commands anywhere; this is just an index.",
+            footer="RSAdminBot",
+        )
+
+        # Load previous state (if present)
+        state_path = self._commands_catalog_state_path()
+        prev_msg_id: Optional[int] = None
+        prev_hash: str = ""
+        try:
+            if state_path.exists():
+                raw = (state_path.read_text(encoding="utf-8", errors="replace") or "").strip()
+                if raw:
+                    data = json.loads(raw)
+                    if isinstance(data, dict):
+                        prev_hash = str(data.get("hash") or "")
+                        try:
+                            prev_msg_id = int(data.get("message_id") or 0) or None
+                        except Exception:
+                            prev_msg_id = None
+        except Exception:
+            prev_msg_id = None
+            prev_hash = ""
+
+        # Try to edit existing message if we have one
+        if prev_msg_id:
+            try:
+                msg = await channel.fetch_message(int(prev_msg_id))  # type: ignore[attr-defined]
+                # Refresh even if unchanged (keeps it visible and ensures embed formatting)
+                await msg.edit(content=cmd_body, embed=embed)
+                if cmd_hash != prev_hash:
+                    try:
+                        state_path.write_text(json.dumps({"channel_id": chan_id, "message_id": int(prev_msg_id), "hash": cmd_hash}), encoding="utf-8")
+                    except Exception:
+                        pass
+                print(f"{Colors.GREEN}[Startup] Commands catalog updated in #{getattr(channel, 'name', '')} ({chan_id}){Colors.RESET}")
+                return
+            except Exception:
+                pass
+
+        # Otherwise send a fresh message and persist state
+        try:
+            msg = await channel.send(content=cmd_body, embed=embed)
+            try:
+                state_path.write_text(json.dumps({"channel_id": chan_id, "message_id": int(msg.id), "hash": cmd_hash}), encoding="utf-8")
+            except Exception:
+                pass
+            print(f"{Colors.GREEN}[Startup] Commands catalog posted to #{getattr(channel, 'name', '')} ({chan_id}){Colors.RESET}")
+        except Exception as e:
+            print(f"{Colors.YELLOW}[Startup] Failed to post commands catalog: {str(e)[:200]}{Colors.RESET}")
 
     async def _publish_command_index_to_test_server(self) -> None:
         """Post or update the command index in the test server monitoring channel."""
@@ -4661,6 +4756,12 @@ echo "CHANGED_END"
                     await self._initialize_journal_live()
                 except Exception as e:
                     print(f"{Colors.YELLOW}[Startup] Journal live initialization failed (non-critical): {e}{Colors.RESET}")
+
+                # Publish a command catalog to the configured channel (optional).
+                try:
+                    await self._publish_command_index_to_configured_channel()
+                except Exception as e:
+                    print(f"{Colors.YELLOW}[Startup] Commands catalog publish failed (non-critical): {str(e)[:200]}{Colors.RESET}")
 
                 # If a self-update was applied during restart, report it to the update-progress channel now.
                 try:
