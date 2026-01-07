@@ -6078,100 +6078,100 @@ echo "CHANGED_END"
     async def _sync_bot_via_script(self, ctx, status_msg, bot_info, bot_folder, local_bot_path, remote_bot_path, rsync_script, dry_run, delete):
         """Sync bot using the dedicated rsync_sync.py script."""
         try:
-                import subprocess
-                import sys
-                
-                # Build command
-                cmd = [
-                    sys.executable,
-                    "-u",  # Unbuffered output
-                    str(rsync_script),
-                    "--project-dir", str(local_bot_path),
-                    "--remote-dir", remote_bot_path,
-                    "--user", self.current_server.get("user", "rsadmin"),
-                    "--host", self.current_server.get("host", ""),
-                ]
-                
-                if self.current_server.get("key"):
-                    key_path = Path(self.current_server["key"])
-                    if key_path.exists():
-                        cmd.extend(["--key", str(key_path.resolve())])
-                
-                if self.current_server.get("ssh_options"):
-                    cmd.extend(["--ssh-options", self.current_server["ssh_options"]])
-                
-                if dry_run:
-                    cmd.append("--dry-run")
-                
-                if delete:
-                    cmd.append("--delete")
-                
-                # Exclude patterns (from CANONICAL_RULES.md - never sync secrets)
-                exclude_patterns = [
-                    "config.secrets.json",
-                    "__pycache__",
-                    "*.pyc",
-                    "*.pyo",
-                    "*.log",
-                    "*.jsonl",
-                    ".git",
-                ]
-                for pattern in exclude_patterns:
-                    cmd.extend(["--exclude", pattern])
-                
-                # Run rsync script
-                process = subprocess.Popen(
-                    cmd,
-                    cwd=str(self.base_path.parent),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    universal_newlines=True
+            import subprocess
+            import sys
+            
+            # Build command
+            cmd = [
+                sys.executable,
+                "-u",  # Unbuffered output
+                str(rsync_script),
+                "--project-dir", str(local_bot_path),
+                "--remote-dir", remote_bot_path,
+                "--user", self.current_server.get("user", "rsadmin"),
+                "--host", self.current_server.get("host", ""),
+            ]
+            
+            if self.current_server.get("key"):
+                key_path = Path(self.current_server["key"])
+                if key_path.exists():
+                    cmd.extend(["--key", str(key_path.resolve())])
+            
+            if self.current_server.get("ssh_options"):
+                cmd.extend(["--ssh-options", self.current_server["ssh_options"]])
+            
+            if dry_run:
+                cmd.append("--dry-run")
+            
+            if delete:
+                cmd.append("--delete")
+            
+            # Exclude patterns (from CANONICAL_RULES.md - never sync secrets)
+            exclude_patterns = [
+                "config.secrets.json",
+                "__pycache__",
+                "*.pyc",
+                "*.pyo",
+                "*.log",
+                "*.jsonl",
+                ".git",
+            ]
+            for pattern in exclude_patterns:
+                cmd.extend(["--exclude", pattern])
+            
+            # Run rsync script
+            process = subprocess.Popen(
+                cmd,
+                cwd=str(self.base_path.parent),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+            
+            output_lines = []
+            for line in iter(process.stdout.readline, ''):
+                if line:
+                    line = line.rstrip()
+                    output_lines.append(line)
+            
+            process.wait()
+            success = process.returncode == 0
+            
+            output_text = "\n".join(output_lines[-50:])  # Last 50 lines
+            
+            if success:
+                success_embed = MessageHelper.create_success_embed(
+                    title="Bot Sync Complete",
+                    message=f"Successfully synced {bot_info['name']} to server.",
+                    details=output_text[-1000:] if output_text else None,
+                    fields=[
+                        {"name": "Bot", "value": bot_info["name"], "inline": True},
+                        {"name": "Mode", "value": "DRY RUN" if dry_run else "SYNC", "inline": True},
+                    ],
+                    footer=f"Triggered by {ctx.author}",
                 )
-                
-                output_lines = []
-                for line in iter(process.stdout.readline, ''):
-                    if line:
-                        line = line.rstrip()
-                        output_lines.append(line)
-                
-                process.wait()
-                success = process.returncode == 0
-                
-                output_text = "\n".join(output_lines[-50:])  # Last 50 lines
-                
-                if success:
-                    success_embed = MessageHelper.create_success_embed(
-                        title="Bot Sync Complete",
-                        message=f"Successfully synced {bot_info['name']} to server.",
-                        details=output_text[-1000:] if output_text else None,
-                        fields=[
-                            {"name": "Bot", "value": bot_info["name"], "inline": True},
-                            {"name": "Mode", "value": "DRY RUN" if dry_run else "SYNC", "inline": True},
-                        ],
-                        footer=f"Triggered by {ctx.author}",
-                    )
-                    await status_msg.edit(embed=success_embed)
-                    await self._log_to_discord(success_embed, ctx.channel)
-                else:
-                    error_embed = MessageHelper.create_error_embed(
-                        title="Bot Sync Failed",
-                        message=f"Failed to sync {bot_info['name']} to server.",
-                        error_details=output_text[-1000:] if output_text else "Unknown error",
-                        footer=f"Triggered by {ctx.author}",
-                    )
-                    await status_msg.edit(embed=error_embed)
-                    await self._log_to_discord(error_embed, ctx.channel)
-                    
-            except Exception as e:
+                await status_msg.edit(embed=success_embed)
+                await self._log_to_discord(success_embed, ctx.channel)
+            else:
                 error_embed = MessageHelper.create_error_embed(
-                    title="Bot Sync Error",
-                    message=f"Error during sync: {str(e)[:200]}",
+                    title="Bot Sync Failed",
+                    message=f"Failed to sync {bot_info['name']} to server.",
+                    error_details=output_text[-1000:] if output_text else "Unknown error",
                     footer=f"Triggered by {ctx.author}",
                 )
                 await status_msg.edit(embed=error_embed)
-                await self._log_to_discord(error_embed, ctx.channel if ctx else None)
+                await self._log_to_discord(error_embed, ctx.channel)
+                
+        except Exception as e:
+            error_embed = MessageHelper.create_error_embed(
+                title="Bot Sync Error",
+                message=f"Error during sync: {str(e)[:200]}",
+                footer=f"Triggered by {ctx.author}",
+            )
+            await status_msg.edit(embed=error_embed)
+            await self._log_to_discord(error_embed, ctx.channel if ctx else None)
     
     async def _sync_bot_via_ssh(self, ctx, status_msg, bot_info, bot_folder, local_bot_path, remote_bot_path, dry_run, delete):
         """Fallback: sync bot using rsync via SSH command."""
