@@ -927,7 +927,7 @@ class BotSelectView(ui.View):
         """
         Args:
             admin_bot_instance: RSAdminBot instance
-            action: Action name ('start', 'stop', 'restart', 'status', 'update', 'details', 'logs', 'info', 'config', 'movements', 'diagnose')
+            action: Action name ('start', 'stop', 'restart', 'status', 'update', 'sync', 'details', 'logs', 'info', 'config', 'movements', 'diagnose')
             action_display: Display name for action ('Start', 'Stop', etc.)
             action_kwargs: Optional extra params for handlers (e.g. logs lines)
             bot_keys: Optional subset of bot keys to show in the dropdown
@@ -992,6 +992,9 @@ class BotSelectView(ui.View):
         elif self.action == "update":
             bot_info = self.admin_bot.BOTS[bot_name]
             await self._handle_update(interaction, bot_name, bot_info)
+        elif self.action == "sync":
+            bot_info = self.admin_bot.BOTS[bot_name]
+            await self._handle_sync(interaction, bot_name, bot_info)
         elif self.action == "details":
             bot_info = self.admin_bot.BOTS[bot_name]
             await self._handle_details(interaction, bot_name, bot_info)
@@ -1607,6 +1610,41 @@ class BotSelectView(ui.View):
         if not restart_ok and restart_err:
             summary += "\nRestart error:\n```" + restart_err[:900] + "```"
         await interaction.followup.send(summary[:1900])
+    
+    async def _handle_sync(self, interaction, bot_name, bot_info):
+        """Handle bot sync from dropdown."""
+        if bot_name == "all_bots":
+            await interaction.followup.send("❌ Cannot sync all bots at once. Please select a specific bot.")
+            return
+        
+        ssh_ok, error_msg = self.admin_bot._check_ssh_available()
+        if not ssh_ok:
+            await interaction.followup.send(f"❌ SSH not configured: {error_msg}")
+            return
+        
+        bot_folder = str(bot_info.get("folder") or "")
+        local_bot_path = self.admin_bot.base_path.parent / bot_folder
+        if not local_bot_path.exists():
+            await interaction.followup.send(f"❌ Local bot folder not found: {local_bot_path}")
+            return
+        
+        remote_root = getattr(self.admin_bot, "remote_root", "") or "/home/rsadmin/bots/mirror-world"
+        remote_bot_path = f"{remote_root}/{bot_folder}"
+        
+        await interaction.followup.send(
+            f"📤 **Syncing {bot_info['name']} to server...**\n"
+            f"Local: `{local_bot_path}`\n"
+            f"Remote: `{remote_bot_path}`"
+        )
+        
+        # Use the admin_bot's sync method
+        status_msg = await interaction.followup.send("⏳ Starting sync...")
+        rsync_script = self.admin_bot.base_path.parent / "Rsync" / "rsync_sync.py"
+        
+        if not rsync_script.exists():
+            await self.admin_bot._sync_bot_via_ssh(None, status_msg, bot_info, bot_folder, local_bot_path, remote_bot_path, False, False)
+        else:
+            await self.admin_bot._sync_bot_via_script(None, status_msg, bot_info, bot_folder, local_bot_path, remote_bot_path, rsync_script, False, False)
     
     async def _handle_info(self, interaction, bot_name, bot_info):
         """Handle bot info"""
@@ -5962,6 +6000,299 @@ echo "CHANGED_END"
                         f"Python copied: {py_count} | Files synced: {changed_count} | Restart: {'OK' if restart_ok else 'FAILED'}"
                     ),
                 )
+
+        @self.bot.command(name="botsync", aliases=["syncbot"])
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def botsync(ctx, bot_name: str = None, *, flags: str = ""):
+            """Sync local bot files directly to Oracle server via rsync (admin only).
+            
+            Usage:
+                !botsync <bot_name>          - Sync bot folder to server
+                !botsync <bot_name> --dry-run - Preview changes without syncing
+                !botsync <bot_name> --delete  - Delete remote files not present locally
+            """
+            ssh_ok, error_msg = self._check_ssh_available()
+            if not ssh_ok:
+                await ctx.send(f"❌ SSH not configured: {error_msg}")
+                return
+            
+            if not bot_name:
+                # Show interactive SelectMenu
+                view = BotSelectView(self, "sync", "Sync")
+                embed = discord.Embed(
+                    title="📤 Select Bot to Sync",
+                    description="Choose a bot from the dropdown menu below:",
+                    color=discord.Color.blue()
+                )
+                await ctx.send(embed=embed, view=view)
+                return
+            
+            bot_name = bot_name.lower()
+            if bot_name not in self.BOTS:
+                available_bots = ", ".join(self.BOTS.keys())
+                await ctx.send(f"❌ Unknown bot: {bot_name}\nUse `!botlist` to see available bots")
+                return
+            
+            bot_info = self.BOTS[bot_name]
+            bot_folder = bot_info["folder"]
+            service_name = bot_info.get("service", "")
+            
+            # Parse flags
+            flags_lower = flags.lower()
+            dry_run = "--dry-run" in flags_lower or "-n" in flags_lower
+            delete = "--delete" in flags_lower or "-d" in flags_lower
+            
+            # Get local bot folder path
+            local_bot_path = self.base_path.parent / bot_folder
+            if not local_bot_path.exists():
+                await ctx.send(f"❌ Local bot folder not found: {local_bot_path}")
+                return
+            
+            # Get remote path from config
+            remote_root = getattr(self, "remote_root", "") or "/home/rsadmin/bots/mirror-world"
+            remote_bot_path = f"{remote_root}/{bot_folder}"
+            
+            status_msg = await ctx.send(
+                embed=MessageHelper.create_info_embed(
+                    title="Syncing Bot Files",
+                    message=f"Syncing {bot_info['name']} from local to server.",
+                    fields=[
+                        {"name": "Bot", "value": bot_info["name"], "inline": True},
+                        {"name": "Local", "value": str(local_bot_path), "inline": False},
+                        {"name": "Remote", "value": remote_bot_path, "inline": False},
+                        {"name": "Mode", "value": "DRY RUN" if dry_run else "SYNC", "inline": True},
+                    ],
+                    footer=f"Triggered by {ctx.author}",
+                )
+            )
+            
+            # Check if rsync script exists
+            rsync_script = self.base_path.parent / "Rsync" / "rsync_sync.py"
+            if not rsync_script.exists():
+                # Fallback: use rsync directly via SSH
+                await self._sync_bot_via_ssh(ctx, status_msg, bot_info, bot_folder, local_bot_path, remote_bot_path, dry_run, delete)
+            else:
+                # Use the dedicated rsync script
+                await self._sync_bot_via_script(ctx, status_msg, bot_info, bot_folder, local_bot_path, remote_bot_path, rsync_script, dry_run, delete)
+    
+    async def _sync_bot_via_script(self, ctx, status_msg, bot_info, bot_folder, local_bot_path, remote_bot_path, rsync_script, dry_run, delete):
+        """Sync bot using the dedicated rsync_sync.py script."""
+        try:
+                import subprocess
+                import sys
+                
+                # Build command
+                cmd = [
+                    sys.executable,
+                    "-u",  # Unbuffered output
+                    str(rsync_script),
+                    "--project-dir", str(local_bot_path),
+                    "--remote-dir", remote_bot_path,
+                    "--user", self.current_server.get("user", "rsadmin"),
+                    "--host", self.current_server.get("host", ""),
+                ]
+                
+                if self.current_server.get("key"):
+                    key_path = Path(self.current_server["key"])
+                    if key_path.exists():
+                        cmd.extend(["--key", str(key_path.resolve())])
+                
+                if self.current_server.get("ssh_options"):
+                    cmd.extend(["--ssh-options", self.current_server["ssh_options"]])
+                
+                if dry_run:
+                    cmd.append("--dry-run")
+                
+                if delete:
+                    cmd.append("--delete")
+                
+                # Exclude patterns (from CANONICAL_RULES.md - never sync secrets)
+                exclude_patterns = [
+                    "config.secrets.json",
+                    "__pycache__",
+                    "*.pyc",
+                    "*.pyo",
+                    "*.log",
+                    "*.jsonl",
+                    ".git",
+                ]
+                for pattern in exclude_patterns:
+                    cmd.extend(["--exclude", pattern])
+                
+                # Run rsync script
+                process = subprocess.Popen(
+                    cmd,
+                    cwd=str(self.base_path.parent),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    universal_newlines=True
+                )
+                
+                output_lines = []
+                for line in iter(process.stdout.readline, ''):
+                    if line:
+                        line = line.rstrip()
+                        output_lines.append(line)
+                
+                process.wait()
+                success = process.returncode == 0
+                
+                output_text = "\n".join(output_lines[-50:])  # Last 50 lines
+                
+                if success:
+                    success_embed = MessageHelper.create_success_embed(
+                        title="Bot Sync Complete",
+                        message=f"Successfully synced {bot_info['name']} to server.",
+                        details=output_text[-1000:] if output_text else None,
+                        fields=[
+                            {"name": "Bot", "value": bot_info["name"], "inline": True},
+                            {"name": "Mode", "value": "DRY RUN" if dry_run else "SYNC", "inline": True},
+                        ],
+                        footer=f"Triggered by {ctx.author}",
+                    )
+                    await status_msg.edit(embed=success_embed)
+                    await self._log_to_discord(success_embed, ctx.channel)
+                else:
+                    error_embed = MessageHelper.create_error_embed(
+                        title="Bot Sync Failed",
+                        message=f"Failed to sync {bot_info['name']} to server.",
+                        error_details=output_text[-1000:] if output_text else "Unknown error",
+                        footer=f"Triggered by {ctx.author}",
+                    )
+                    await status_msg.edit(embed=error_embed)
+                    await self._log_to_discord(error_embed, ctx.channel)
+                    
+            except Exception as e:
+                error_embed = MessageHelper.create_error_embed(
+                    title="Bot Sync Error",
+                    message=f"Error during sync: {str(e)[:200]}",
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await status_msg.edit(embed=error_embed)
+                await self._log_to_discord(error_embed, ctx.channel if ctx else None)
+    
+    async def _sync_bot_via_ssh(self, ctx, status_msg, bot_info, bot_folder, local_bot_path, remote_bot_path, dry_run, delete):
+        """Fallback: sync bot using rsync via SSH command."""
+        try:
+            import shutil
+            import platform
+            
+            # Check if rsync is available
+            rsync_exe = shutil.which("rsync")
+            if not rsync_exe:
+                error_embed = MessageHelper.create_error_embed(
+                    title="rsync Not Found",
+                    message="rsync is required for file syncing. Install it first.",
+                    error_details="Windows: choco install rsync -y\nLinux: sudo apt install rsync\nMac: brew install rsync",
+                    footer=f"Triggered by {ctx.author if ctx else 'Unknown'}",
+                )
+                await status_msg.edit(embed=error_embed)
+                return
+            
+            # Build rsync command
+            # Note: This is a simplified version - the rsync_sync.py script handles Windows path conversion
+            user = self.current_server.get("user", "rsadmin")
+            host = self.current_server.get("host", "")
+            key = self.current_server.get("key", "")
+            
+            if not host:
+                error_embed = MessageHelper.create_error_embed(
+                    title="SSH Config Error",
+                    message="SSH host not configured.",
+                    footer=f"Triggered by {ctx.author if ctx else 'Unknown'}",
+                )
+                await status_msg.edit(embed=error_embed)
+                return
+            
+            # Build SSH command for rsync -e option
+            ssh_cmd_parts = ["ssh"]
+            if key:
+                key_path = Path(key)
+                if key_path.exists():
+                    ssh_cmd_parts.extend(["-i", str(key_path.resolve())])
+            
+            ssh_options = self.current_server.get("ssh_options", "")
+            if ssh_options:
+                ssh_cmd_parts.extend(shlex.split(ssh_options))
+            
+            ssh_cmd_str = " ".join(shlex.quote(str(p)) for p in ssh_cmd_parts)
+            
+            # Build rsync command
+            rsync_cmd = [rsync_exe, "-avz", "--progress"]
+            rsync_cmd.extend(["-e", ssh_cmd_str])
+            
+            if dry_run:
+                rsync_cmd.append("--dry-run")
+            
+            if delete:
+                rsync_cmd.append("--delete")
+            
+            # Exclude patterns
+            rsync_cmd.extend(["--exclude", "config.secrets.json"])
+            rsync_cmd.extend(["--exclude", "__pycache__"])
+            rsync_cmd.extend(["--exclude", "*.pyc"])
+            rsync_cmd.extend(["--exclude", "*.log"])
+            
+            # Source and destination
+            local_str = str(local_bot_path).replace("\\", "/")
+            if not local_str.endswith("/"):
+                local_str += "/"
+            
+            remote_str = f"{user}@{host}:{remote_bot_path}/"
+            
+            rsync_cmd.append(local_str)
+            rsync_cmd.append(remote_str)
+            
+            # Execute rsync
+            process = subprocess.Popen(
+                rsync_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+            
+            output_lines = []
+            for line in iter(process.stdout.readline, ''):
+                if line:
+                    line = line.rstrip()
+                    output_lines.append(line)
+            
+            process.wait()
+            success = process.returncode == 0
+            
+            output_text = "\n".join(output_lines[-50:])
+            
+            if success:
+                success_embed = MessageHelper.create_success_embed(
+                    title="Bot Sync Complete",
+                    message=f"Successfully synced {bot_info['name']} to server.",
+                    details=output_text[-1000:] if output_text else None,
+                    footer=f"Triggered by {ctx.author if ctx else 'Unknown'}",
+                )
+                await status_msg.edit(embed=success_embed)
+                await self._log_to_discord(success_embed, ctx.channel if ctx else None)
+            else:
+                error_embed = MessageHelper.create_error_embed(
+                    title="Bot Sync Failed",
+                    message=f"Failed to sync {bot_info['name']} to server.",
+                    error_details=output_text[-1000:] if output_text else "Unknown error",
+                    footer=f"Triggered by {ctx.author if ctx else 'Unknown'}",
+                )
+                await status_msg.edit(embed=error_embed)
+                await self._log_to_discord(error_embed, ctx.channel if ctx else None)
+                
+        except Exception as e:
+            error_embed = MessageHelper.create_error_embed(
+                title="Bot Sync Error",
+                message=f"Error during sync: {str(e)[:200]}",
+                footer=f"Triggered by {ctx.author if ctx else 'Unknown'}",
+            )
+            await status_msg.edit(embed=error_embed)
+            await self._log_to_discord(error_embed, ctx.channel if ctx else None)
 
         @self.bot.command(name="selfupdate")
         @commands.check(lambda ctx: self.is_admin(ctx.author))

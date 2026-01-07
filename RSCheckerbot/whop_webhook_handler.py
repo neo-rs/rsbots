@@ -18,6 +18,14 @@ from contextlib import suppress
 
 log = logging.getLogger("rs-checker")
 
+# Import Whop API client
+try:
+    from whop_api_client import WhopAPIClient, WhopAPIError
+except ImportError:
+    WhopAPIClient = None
+    WhopAPIError = None
+    log.warning("whop_api_client module not found - API features disabled")
+
 # Configuration (initialized from main)
 WHOP_WEBHOOK_CHANNEL_ID = None
 WHOP_LOGS_CHANNEL_ID = None
@@ -37,6 +45,10 @@ MEMBER_STATUS_LOGS_CHANNEL_ID = None
 
 # Expected roles config (loaded from config.json)
 EXPECTED_ROLES = {}
+
+# Whop API client (initialized from main)
+_whop_api_client = None
+_whop_api_config = {}
 
 # File paths for JSON storage (canonical: JSON-only, no SQLite)
 BASE_DIR = Path(__file__).resolve().parent
@@ -342,6 +354,20 @@ def _fmt_discord_ts(ts_str: str | None, style: str = "D") -> str:
         return "—"
 
 
+def _fmt_money(amount: object, currency: str | None = None) -> str:
+    """Format money amounts from Whop API (usually floats) into a readable string."""
+    if amount is None or amount == "":
+        return ""
+    try:
+        amt = float(str(amount))
+    except (ValueError, TypeError):
+        return str(amount)
+    cur = (currency or "").strip().lower()
+    if cur in ("", "usd"):
+        return f"${amt:.2f}"
+    return f"{amt:.2f} {cur.upper()}"
+
+
 async def _resolve_member_safe(guild: discord.Guild, discord_id: int | None, force_fetch: bool = False) -> discord.Member | None:
     """Safely resolve a member with rate-limit protection.
     
@@ -593,7 +619,8 @@ def _build_support_card_embed(
 
 
 def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_role_id, role_cancel_a, role_cancel_b,
-               log_other_func, log_member_status_func, fmt_user_func, member_status_logs_channel_id=None, get_member_history_func=None):
+               log_other_func, log_member_status_func, fmt_user_func, member_status_logs_channel_id=None, get_member_history_func=None,
+               whop_api_key=None, whop_api_config=None):
     """
     Initialize handler with configuration and logging functions.
     
@@ -609,10 +636,12 @@ def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_r
         fmt_user_func: Function to format user display (canonical owner)
         member_status_logs_channel_id: Channel ID for member status logs (lookup requests, trial alerts)
         get_member_history_func: Function to get member history record (canonical owner)
+        whop_api_key: Whop API key (optional, from config.secrets.json)
+        whop_api_config: Whop API configuration dict (optional, from config.json)
     """
     global WHOP_WEBHOOK_CHANNEL_ID, WHOP_LOGS_CHANNEL_ID, ROLE_TRIGGER, WELCOME_ROLE_ID, ROLE_CANCEL_A, ROLE_CANCEL_B
     global _log_other, _log_member_status, _fmt_user, _get_member_history
-    global MEMBER_STATUS_LOGS_CHANNEL_ID, EXPECTED_ROLES
+    global MEMBER_STATUS_LOGS_CHANNEL_ID, EXPECTED_ROLES, _whop_api_client, _whop_api_config
     
     WHOP_WEBHOOK_CHANNEL_ID = webhook_channel_id
     WHOP_LOGS_CHANNEL_ID = whop_logs_channel_id
@@ -640,6 +669,30 @@ def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_r
     
     # Backfill identity cache from whop_history.json
     _backfill_identity_cache()
+    
+    # Initialize Whop API client if key provided
+    _whop_api_config = whop_api_config or {}
+    if whop_api_key and WhopAPIClient:
+        try:
+            # Check if key is placeholder
+            from mirror_world_config import is_placeholder_secret
+            if not is_placeholder_secret(whop_api_key):
+                base_url = _whop_api_config.get("base_url", "https://api.whop.com/api/v1")
+                company_id = _whop_api_config.get("company_id", "")
+                _whop_api_client = WhopAPIClient(whop_api_key, base_url, company_id)
+                log.info("Whop API client initialized")
+            else:
+                _whop_api_client = None
+                log.info("Whop API client disabled (placeholder key)")
+        except Exception as e:
+            _whop_api_client = None
+            log.warning(f"Failed to initialize Whop API client: {e}")
+    else:
+        _whop_api_client = None
+        if not WhopAPIClient:
+            log.info("Whop API client disabled (module not available)")
+        else:
+            log.info("Whop API client disabled (no API key)")
     
     log.info(f"Whop webhook handler initialized")
     log.info(f"Monitoring webhook channel {webhook_channel_id} and logs channel {whop_logs_channel_id}")
@@ -1040,6 +1093,238 @@ def _determine_event_type_from_message(title: str, description: str, content: st
         return "new"
 
 
+# API verification and enrichment functions
+async def _verify_webhook_with_api(member: discord.Member, event_data: dict, event_type: str):
+    """
+    Verify webhook data against Whop API.
+    
+    Args:
+        member: Discord member
+        event_data: Webhook event data
+        event_type: Event type string (e.g., "membership.activated")
+    """
+    if not _whop_api_client:
+        return  # API client not available
+    
+    # Check if verification is enabled
+    if not _whop_api_config.get("enable_verification", True):
+        return
+    
+    discord_id = str(member.id)
+    
+    try:
+        # Determine expected status from event type
+        expected_status = None
+        if "activated" in event_type.lower():
+            expected_status = "active"
+        elif "deactivated" in event_type.lower() or "canceled" in event_type.lower() or "cancellation" in event_type.lower():
+            expected_status = "canceled"
+        elif "payment" in event_type.lower() and "succeeded" in event_type.lower():
+            expected_status = "active"
+        
+        if expected_status:
+            verification = await _whop_api_client.verify_membership_status(
+                discord_id, 
+                expected_status
+            )
+            
+            if not verification["matches"]:
+                # Log discrepancy
+                if _log_other:
+                    await _log_other(
+                        f"⚠️ **API Verification Mismatch** for {_fmt_user(member)}\n"
+                        f"   Webhook says: `{expected_status}`\n"
+                        f"   API says: `{verification['actual_status'] or 'N/A'}`\n"
+                        f"   Event: `{event_type}`"
+                    )
+    except Exception as e:
+        log.error(f"API verification failed for {member.id}: {e}")
+
+
+async def _enrich_support_card_with_api(embed: discord.Embed, member: discord.Member, event_data: dict):
+    """
+    Enrich support card embed with additional data from Whop API.
+    
+    Args:
+        embed: Discord embed to enrich
+        member: Discord member
+        event_data: Event data dictionary
+    """
+    if not _whop_api_client:
+        return  # API client not available
+    
+    # Check if enrichment is enabled
+    if not _whop_api_config.get("enable_enrichment", True):
+        return
+    
+    discord_id = str(member.id)
+    
+    try:
+        # Get membership data
+        membership = await _whop_api_client.get_membership_by_discord_id(discord_id)
+        
+        if membership:
+            membership_id = membership.get("id", "")
+            payments = []
+            if membership_id:
+                # Get payment history
+                payments = await _whop_api_client.get_payments_for_membership(membership_id)
+                if payments:
+                    latest_payment = payments[0]  # Most recent (sorted in client)
+                    pay_currency = (latest_payment.get("currency") or membership.get("currency") or "").strip()
+                    pay_total = (
+                        latest_payment.get("usd_total")
+                        or latest_payment.get("total")
+                        or latest_payment.get("subtotal")
+                        or latest_payment.get("amount_after_fees")
+                    )
+                    pay_status = str(latest_payment.get("status") or "").strip()
+                    pay_substatus = str(latest_payment.get("substatus") or "").strip()
+                    pay_created = latest_payment.get("created_at") or latest_payment.get("paid_at")
+                    pay_paid = latest_payment.get("paid_at") or ""
+                    failure_msg = str(latest_payment.get("failure_message") or "").strip()
+                    retryable = latest_payment.get("retryable")
+                    card_brand = str(latest_payment.get("card_brand") or "").strip()
+                    card_last4 = str(latest_payment.get("card_last4") or "").strip()
+                    payment_method_type = str(latest_payment.get("payment_method_type") or "").strip()
+
+                    # Latest payment summary
+                    if len(embed.fields) < 25:
+                        parts = []
+                        amt = _fmt_money(pay_total, pay_currency)
+                        if amt:
+                            parts.append(amt)
+                        if pay_status:
+                            parts.append(f"status: {pay_status}{f' ({pay_substatus})' if pay_substatus else ''}")
+                        if pay_paid:
+                            parts.append(f"paid: {_fmt_discord_ts(pay_paid, 'R')}")
+                        elif pay_created:
+                            parts.append(f"created: {_fmt_discord_ts(pay_created, 'R')}")
+                        if parts:
+                            embed.add_field(
+                                name="Latest Payment (API)",
+                                value="\n".join(parts)[:1024],
+                                inline=True,
+                            )
+
+                    # Payment method (staff-only helpful)
+                    if len(embed.fields) < 25:
+                        pm = ""
+                        if card_brand and card_last4:
+                            pm = f"{card_brand.upper()} ****{card_last4}"
+                        elif payment_method_type and card_last4:
+                            pm = f"{payment_method_type} ****{card_last4}"
+                        elif card_brand:
+                            pm = card_brand.upper()
+                        elif payment_method_type:
+                            pm = payment_method_type
+                        if pm:
+                            embed.add_field(name="Payment Method (API)", value=pm[:1024], inline=True)
+
+                    # Failure / resolution signals
+                    resolution_lines = []
+                    if failure_msg:
+                        resolution_lines.append(f"failure: {failure_msg}")
+                    if isinstance(retryable, bool):
+                        resolution_lines.append(f"retryable: {'yes' if retryable else 'no'}")
+                    dispute_alerted_at = latest_payment.get("dispute_alerted_at")
+                    if dispute_alerted_at:
+                        resolution_lines.append(f"dispute_alerted: {_fmt_discord_ts(dispute_alerted_at, 'D')}")
+                    refunded_at = latest_payment.get("refunded_at")
+                    refunded_amount = latest_payment.get("refunded_amount")
+                    if refunded_at:
+                        ra = _fmt_money(refunded_amount, pay_currency)
+                        resolution_lines.append(
+                            f"refunded: {_fmt_discord_ts(refunded_at, 'D')}{f' ({ra})' if ra else ''}"
+                        )
+                    if resolution_lines and len(embed.fields) < 25:
+                        embed.add_field(
+                            name="Resolution (API)",
+                            value="\n".join(resolution_lines)[:1024],
+                            inline=False,
+                        )
+
+                    # Payment count
+                    if len(embed.fields) < 25:
+                        embed.add_field(name="Total Payments (API)", value=str(len(payments)), inline=True)
+            
+            # Add membership start date from API
+            started_at = membership.get("started_at") or membership.get("created_at")
+            if started_at:
+                started_fmt = _fmt_discord_ts(started_at, "D")
+                if started_fmt != "—":
+                    embed.add_field(
+                        name="Membership Started (API)",
+                        value=started_fmt,
+                        inline=True
+                    )
+            
+            # Add renewal date if available
+            renews_at = (
+                membership.get("renews_at")
+                or membership.get("next_billing_date")
+                or membership.get("renewal_date")
+                or membership.get("renewal_period_end")
+            )
+            if renews_at:
+                renews_fmt = _fmt_discord_ts(renews_at, "D")
+                if renews_fmt != "—":
+                    embed.add_field(
+                        name="Next Renewal (API)",
+                        value=renews_fmt,
+                        inline=True
+                    )
+
+            # Add plan/product/license + cancellation details if available
+            try:
+                product_title = ""
+                if isinstance(membership.get("product"), dict):
+                    product_title = str(membership["product"].get("title") or "").strip()
+                license_key = str(membership.get("license_key") or "").strip()
+                cancel_at_period_end = membership.get("cancel_at_period_end")
+                canceled_at = membership.get("canceled_at")
+                cancellation_reason = str(membership.get("cancellation_reason") or "").strip()
+                payment_paused = membership.get("payment_collection_paused")
+                renewal_start = membership.get("renewal_period_start")
+                renewal_end = membership.get("renewal_period_end")
+                manage_url = str(membership.get("manage_url") or "").strip()
+
+                if product_title and len(embed.fields) < 25:
+                    embed.add_field(name="Product (API)", value=product_title[:1024], inline=True)
+                if license_key and len(embed.fields) < 25:
+                    embed.add_field(name="License Key (API)", value=f"`{license_key}`"[:1024], inline=True)
+
+                if len(embed.fields) < 25:
+                    period_parts = []
+                    if renewal_start:
+                        period_parts.append(_fmt_discord_ts(renewal_start, "D"))
+                    if renewal_end:
+                        period_parts.append(_fmt_discord_ts(renewal_end, "D"))
+                    if len(period_parts) == 2 and "—" not in period_parts:
+                        embed.add_field(name="Renewal Period (API)", value=f"{period_parts[0]} -> {period_parts[1]}", inline=False)
+
+                if isinstance(cancel_at_period_end, bool) and len(embed.fields) < 25:
+                    embed.add_field(
+                        name="Cancel At Period End (API)",
+                        value="Yes" if cancel_at_period_end else "No",
+                        inline=True,
+                    )
+                if canceled_at and len(embed.fields) < 25:
+                    canceled_fmt = _fmt_discord_ts(canceled_at, "D")
+                    if canceled_fmt != "—":
+                        embed.add_field(name="Canceled At (API)", value=canceled_fmt, inline=True)
+                if cancellation_reason and len(embed.fields) < 25:
+                    embed.add_field(name="Cancellation Reason (API)", value=cancellation_reason[:1024], inline=False)
+                if isinstance(payment_paused, bool) and payment_paused and len(embed.fields) < 25:
+                    embed.add_field(name="Payment Collection Paused (API)", value="Yes", inline=True)
+                if manage_url and manage_url != "—" and len(embed.fields) < 25:
+                    embed.add_field(name="Manage (API)", value=f"[Open]({manage_url})", inline=True)
+            except Exception:
+                pass
+    except Exception as e:
+        log.error(f"Failed to enrich support card with API data for {member.id}: {e}")
+
+
 # Event handlers - canonical owners for their respective event types
 async def handle_membership_activated(member: discord.Member, event_data: dict):
     """Handle new active membership - assign Cleanup role and log with support card embed"""
@@ -1076,7 +1361,13 @@ async def handle_membership_activated(member: discord.Member, event_data: dict):
         else:
             embed.add_field(name="Next Step", value="Member already had cleanup role. Verify they still have correct access.", inline=False)
         
+        # Enrich with API data
+        await _enrich_support_card_with_api(embed, member, event_data)
+        
         await _log_member_status("", embed=embed)
+    
+    # Verify with API after processing
+    await _verify_webhook_with_api(member, event_data, "membership.activated")
 
 
 async def handle_membership_activated_pending(member: discord.Member, event_data: dict):
@@ -1092,7 +1383,14 @@ async def handle_membership_activated_pending(member: discord.Member, event_data
         )
         embed.description = "Membership activation is pending. Awaiting first payment or Whop confirmation."
         embed.add_field(name="Next Step", value="Verify payment status in Whop and confirm whether activation should complete.", inline=False)
+        
+        # Enrich with API data
+        await _enrich_support_card_with_api(embed, member, event_data)
+        
         await _log_member_status("", embed=embed)
+    
+    # Verify with API after processing
+    await _verify_webhook_with_api(member, event_data, "membership.activated.pending")
 
 
 async def handle_membership_deactivated(member: discord.Member, event_data: dict):
@@ -1132,6 +1430,18 @@ async def handle_membership_deactivated(member: discord.Member, event_data: dict
         if canceled_at and canceled_at != "—":
             canceled_fmt = _fmt_discord_ts(canceled_at, "D")
             embed.add_field(name="Canceled At", value=canceled_fmt, inline=True)
+
+        # Payment-failure / resolution hints if present in webhook payload
+        failure_reason = _safe_get(
+            event_data,
+            "failure_reason",
+            "payment.failure_reason",
+            "payment.failure_message",
+            "failure_message",
+            default="",
+        )
+        if failure_reason and failure_reason != "—":
+            embed.add_field(name="Billing Issue", value=str(failure_reason)[:1024], inline=False)
         
         if roles_to_remove:
             embed.add_field(
@@ -1140,7 +1450,13 @@ async def handle_membership_deactivated(member: discord.Member, event_data: dict
                 inline=False,
             )
         
+        # Enrich with API data
+        await _enrich_support_card_with_api(embed, member, event_data)
+        
         await _log_member_status("", embed=embed)
+    
+    # Verify with API after processing
+    await _verify_webhook_with_api(member, event_data, "membership.deactivated")
 
 
 async def handle_membership_deactivated_payment_failure(member: discord.Member, event_data: dict):
@@ -1171,7 +1487,14 @@ async def handle_payment_renewal(member: discord.Member, event_data: dict):
             value="No immediate action required. Spot-check renewal schedule if this member has a complex plan.",
             inline=False,
         )
+        
+        # Enrich with API data
+        await _enrich_support_card_with_api(embed, member, event_data)
+        
         await _log_member_status("", embed=embed)
+    
+    # Verify with API after processing
+    await _verify_webhook_with_api(member, event_data, "payment.succeeded.renewal")
 
 
 async def handle_payment_activation(member: discord.Member, event_data: dict):
@@ -1198,7 +1521,14 @@ async def handle_payment_activation(member: discord.Member, event_data: dict):
             value="Confirm onboarding is complete and that the member can see all paid channels.",
             inline=False,
         )
+        
+        # Enrich with API data
+        await _enrich_support_card_with_api(embed, member, event_data)
+        
         await _log_member_status("", embed=embed)
+    
+    # Verify with API after processing
+    await _verify_webhook_with_api(member, event_data, "payment.succeeded.activation")
 
 
 async def handle_payment_failed(member: discord.Member, event_data: dict):
@@ -1234,6 +1564,9 @@ async def handle_payment_failed(member: discord.Member, event_data: dict):
             value="Check the member's Whop invoice, confirm card status, and decide whether to retry, grace, or revoke access.",
             inline=False,
         )
+
+        # Enrich with API data (membership + latest payment/resolution signals)
+        await _enrich_support_card_with_api(embed, member, event_data)
         
         await _log_member_status("", embed=embed)
 

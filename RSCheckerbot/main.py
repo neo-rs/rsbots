@@ -30,6 +30,13 @@ from whop_webhook_handler import (
     handle_whop_webhook_message,
 )
 
+# Import Whop API client
+try:
+    from whop_api_client import WhopAPIClient, WhopAPIError
+except ImportError:
+    WhopAPIClient = None
+    WhopAPIError = None
+
 # -----------------------------
 # RSCheckerbot Rules
 # -----------------------------
@@ -57,6 +64,10 @@ config = load_config()
 # -----------------------------
 TOKEN = config.get("bot_token")
 GUILD_ID = config.get("guild_id")
+
+# Whop API Config
+WHOP_API_CONFIG = config.get("whop_api", {})
+WHOP_API_KEY = WHOP_API_CONFIG.get("api_key", "")
 
 # Invite Tracking Config
 INVITE_CONFIG = config.get("invite_tracking", {})
@@ -234,6 +245,9 @@ pending_checks: set[int] = set()
 pending_former_checks: set[int] = set()
 invite_tracking: Dict[str, str] = {}  # invite_code -> lead_id
 invite_usage_cache: Dict[str, int] = {}  # invite_code -> last known uses
+
+# Whop API client (initialized from config)
+whop_api_client = None
 
 # Correlation IDs (short-lived, for searchability across related events)
 cid_cache: Dict[int, Dict[str, str]] = {}  # user_id -> {"cid": str, "expires_at": iso}
@@ -435,6 +449,172 @@ def _fmt_ts(ts: int | None, style: str = "D") -> str:
         return f"<t:{int(ts)}:{style}>"
     except Exception:
         return "—"
+
+
+def _fmt_discord_ts_any(ts_str: str | int | float | None, style: str = "D") -> str:
+    """Format ISO or unix timestamp into a Discord timestamp string."""
+    if ts_str is None or ts_str == "":
+        return "—"
+    try:
+        s = str(ts_str).strip()
+        if not s:
+            return "—"
+        # ISO-ish path
+        if "T" in s or "-" in s:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return f"<t:{int(dt.timestamp())}:{style}>"
+        return f"<t:{int(float(s))}:{style}>"
+    except Exception:
+        return "—"
+
+
+def _fmt_money(amount: object, currency: str | None = None) -> str:
+    """Format Whop money values (usually floats) into a readable string."""
+    if amount is None or amount == "":
+        return ""
+    try:
+        amt = float(str(amount))
+    except (ValueError, TypeError):
+        return str(amount)
+    cur = (currency or "").strip().lower()
+    if cur in ("", "usd"):
+        return f"${amt:.2f}"
+    return f"{amt:.2f} {cur.upper()}"
+
+
+async def _add_whop_snapshot_to_embed(
+    embed: discord.Embed,
+    member: discord.Member,
+    field_name: str = "Whop Snapshot",
+) -> None:
+    """Add a Whop API snapshot field to an embed (best-effort, non-blocking)."""
+    global whop_api_client
+    if not whop_api_client:
+        return
+    if not WHOP_API_CONFIG.get("enable_enrichment", True):
+        return
+    if len(embed.fields) >= 25:
+        return
+
+    try:
+        membership = await whop_api_client.get_membership_by_discord_id(str(member.id))
+    except Exception:
+        return
+
+    if not membership:
+        embed.add_field(name=field_name, value="No Whop membership found for this Discord ID.", inline=False)
+        return
+
+    lines: list[str] = []
+    status = str(membership.get("status") or "").strip()
+    if status:
+        lines.append(f"Status: {status}")
+
+    mem_id = str(membership.get("id") or "").strip()
+    if mem_id:
+        lines.append(f"Membership ID: `{mem_id}`")
+
+    product_title = ""
+    if isinstance(membership.get("product"), dict):
+        product_title = str(membership["product"].get("title") or "").strip()
+    if product_title:
+        lines.append(f"Product: {product_title}")
+
+    license_key = str(membership.get("license_key") or "").strip()
+    if license_key:
+        lines.append(f"License Key: `{license_key}`")
+
+    created_at = membership.get("created_at")
+    if created_at:
+        created_fmt = _fmt_discord_ts_any(created_at, "D")
+        if created_fmt != "—":
+            lines.append(f"Started: {created_fmt}")
+
+    renewal_start = membership.get("renewal_period_start")
+    renewal_end = membership.get("renewal_period_end")
+    rs = _fmt_discord_ts_any(renewal_start, "D") if renewal_start else "—"
+    re = _fmt_discord_ts_any(renewal_end, "D") if renewal_end else "—"
+    if rs != "—" and re != "—":
+        lines.append(f"Renewal Period: {rs} -> {re}")
+    elif re != "—":
+        lines.append(f"Next Renewal: {re}")
+
+    cap_end = membership.get("cancel_at_period_end")
+    if isinstance(cap_end, bool):
+        lines.append(f"Cancel At Period End: {'yes' if cap_end else 'no'}")
+
+    canceled_at = membership.get("canceled_at")
+    if canceled_at:
+        cf = _fmt_discord_ts_any(canceled_at, "D")
+        if cf != "—":
+            lines.append(f"Canceled At: {cf}")
+
+    cancellation_reason = str(membership.get("cancellation_reason") or "").strip()
+    if cancellation_reason:
+        lines.append(f"Cancellation Reason: {cancellation_reason}")
+
+    paused = membership.get("payment_collection_paused")
+    if isinstance(paused, bool) and paused:
+        lines.append("Payment Collection Paused: yes")
+
+    manage_url = str(membership.get("manage_url") or "").strip()
+    if manage_url:
+        lines.append(f"Manage: {manage_url}")
+
+    # Payment snapshot
+    try:
+        if mem_id:
+            payments = await whop_api_client.get_payments_for_membership(mem_id)
+        else:
+            payments = []
+    except Exception:
+        payments = []
+    if payments and isinstance(payments, list):
+        p0 = payments[0] if isinstance(payments[0], dict) else {}
+        pay_currency = str(p0.get("currency") or "").strip()
+        total = p0.get("usd_total") or p0.get("total") or p0.get("subtotal") or p0.get("amount_after_fees")
+        status0 = str(p0.get("status") or "").strip()
+        substatus0 = str(p0.get("substatus") or "").strip()
+        paid_at = p0.get("paid_at") or ""
+        created0 = p0.get("created_at") or ""
+        failure_msg = str(p0.get("failure_message") or "").strip()
+        retryable = p0.get("retryable")
+        card_brand = str(p0.get("card_brand") or "").strip()
+        card_last4 = str(p0.get("card_last4") or "").strip()
+
+        amt = _fmt_money(total, pay_currency)
+        pay_parts = []
+        if amt:
+            pay_parts.append(amt)
+        if status0:
+            pay_parts.append(f"status: {status0}{f' ({substatus0})' if substatus0 else ''}")
+        if paid_at:
+            pay_parts.append(f"paid: {_fmt_discord_ts_any(paid_at, 'R')}")
+        elif created0:
+            pay_parts.append(f"created: {_fmt_discord_ts_any(created0, 'R')}")
+        if card_brand and card_last4:
+            pay_parts.append(f"method: {card_brand.upper()} ****{card_last4}")
+        if failure_msg:
+            pay_parts.append(f"failure: {failure_msg}")
+        if isinstance(retryable, bool):
+            pay_parts.append(f"retryable: {'yes' if retryable else 'no'}")
+        if pay_parts:
+            lines.append("Latest Payment: " + " | ".join(pay_parts))
+
+        dispute_alerted_at = p0.get("dispute_alerted_at")
+        if dispute_alerted_at:
+            lines.append(f"Dispute Alerted: {_fmt_discord_ts_any(dispute_alerted_at, 'D')}")
+        refunded_at = p0.get("refunded_at")
+        if refunded_at:
+            refunded_amount = p0.get("refunded_amount")
+            ra = _fmt_money(refunded_amount, pay_currency)
+            lines.append(f"Refunded: {_fmt_discord_ts_any(refunded_at, 'D')}{f' ({ra})' if ra else ''}")
+
+    # Keep field readable + within Discord field limits
+    value = "\n".join([ln for ln in lines if ln]).strip()
+    if not value:
+        value = "Whop membership found, but no readable fields were available."
+    embed.add_field(name=field_name, value=value[:1024], inline=False)
 
 def get_member_history(discord_id: int) -> dict:
     """Get member history record (exposed for whop_webhook_handler and support cards)"""
@@ -1313,11 +1493,87 @@ async def scheduler_loop_error(error):
         scheduler_loop.start()
 
 # -----------------------------
+# Whop membership sync job
+# -----------------------------
+@tasks.loop(hours=6)  # Default interval, changed in on_ready() from config
+async def sync_whop_memberships():
+    """Periodically sync Discord roles with Whop membership status"""
+    global whop_api_client
+    
+    if not whop_api_client:
+        return  # API client not available
+    
+    if not bot.is_ready():
+        return
+    
+    # Check if sync is enabled
+    if not WHOP_API_CONFIG.get("enable_sync", True):
+        return
+    
+    guild = bot.get_guild(GUILD_ID)
+    if not guild:
+        return
+    
+    log.info("Starting Whop membership sync...")
+    synced_count = 0
+    error_count = 0
+    
+    # Get all members with Member role
+    member_role = guild.get_role(ROLE_CANCEL_A)
+    if not member_role:
+        log.warning("Member role not found, skipping sync")
+        return
+    
+    members_to_check = [m for m in guild.members if member_role in m.roles]
+    log.info(f"Checking {len(members_to_check)} members with Member role...")
+    
+    for member in members_to_check:
+        try:
+            # Check membership status via API
+            verification = await whop_api_client.verify_membership_status(
+                str(member.id),
+                "active"
+            )
+            
+            if not verification["matches"]:
+                actual_status = verification["actual_status"]
+                
+                # If API says canceled but user has Member role, remove it
+                if actual_status in ("canceled", "completed", "past_due"):
+                    await member.remove_roles(
+                        member_role, 
+                        reason=f"Whop sync: Status is {actual_status}"
+                    )
+                    await log_other(
+                        f"🔄 **Sync Removed Role:** {_fmt_user(member)}\n"
+                        f"   API Status: `{actual_status}`\n"
+                        f"   Removed: {_fmt_role(ROLE_CANCEL_A, guild)}"
+                    )
+                    synced_count += 1
+        except Exception as e:
+            error_count += 1
+            log.error(f"Error syncing member {member.id}: {e}")
+    
+    log.info(f"Sync complete: {synced_count} roles updated, {error_count} errors")
+    if synced_count > 0 or error_count > 0:
+        await log_other(
+            f"🔄 **Whop Sync Complete**\n"
+            f"   Members checked: {len(members_to_check)}\n"
+            f"   Roles updated: {synced_count}\n"
+            f"   Errors: {error_count}"
+        )
+
+@sync_whop_memberships.error
+async def sync_whop_memberships_error(error):
+    await log_other(f"❌ Sync job error: `{error}`")
+    log.error(f"Sync job error: {error}", exc_info=True)
+
+# -----------------------------
 # Events
 # -----------------------------
 @bot.event
 async def on_ready():
-    global queue_state, registry, invite_usage_cache
+    global queue_state, registry, invite_usage_cache, whop_api_client
     
     # Comprehensive startup logging
     log.info("="*60)
@@ -1452,6 +1708,27 @@ async def on_ready():
     asyncio.create_task(init_http_server())
     log.info(f"[HTTP Server] Started on port {HTTP_SERVER_PORT}")
     
+    # Initialize Whop API client if key provided
+    if WHOP_API_KEY and WhopAPIClient:
+        try:
+            if not is_placeholder_secret(WHOP_API_KEY):
+                base_url = WHOP_API_CONFIG.get("base_url", "https://api.whop.com/api/v1")
+                company_id = WHOP_API_CONFIG.get("company_id", "")
+                whop_api_client = WhopAPIClient(WHOP_API_KEY, base_url, company_id)
+                log.info("[Whop API] Client initialized")
+            else:
+                whop_api_client = None
+                log.info("[Whop API] Client disabled (placeholder key)")
+        except Exception as e:
+            whop_api_client = None
+            log.warning(f"[Whop API] Failed to initialize: {e}")
+    else:
+        whop_api_client = None
+        if not WhopAPIClient:
+            log.info("[Whop API] Client disabled (module not available)")
+        else:
+            log.info("[Whop API] Client disabled (no API key)")
+    
     # Initialize Whop webhook handler
     if WHOP_WEBHOOK_CHANNEL_ID or WHOP_LOGS_CHANNEL_ID:
         init_whop_handler(
@@ -1465,7 +1742,9 @@ async def on_ready():
             log_member_status_func=log_member_status,
             fmt_user_func=_fmt_user,
             member_status_logs_channel_id=MEMBER_STATUS_LOGS_CHANNEL_ID,
-            get_member_history_func=get_member_history
+            get_member_history_func=get_member_history,
+            whop_api_key=WHOP_API_KEY,
+            whop_api_config=WHOP_API_CONFIG
         )
         channels = []
         if WHOP_WEBHOOK_CHANNEL_ID:
@@ -1484,6 +1763,19 @@ async def on_ready():
     
     periodic_cleanup.start()
     log.info("[Cleanup] Periodic cleanup scheduled (every 24 hours)")
+    
+    # Start Whop membership sync job if enabled
+    if whop_api_client and WHOP_API_CONFIG.get("enable_sync", True):
+        sync_interval = WHOP_API_CONFIG.get("sync_interval_hours", 6)
+        if not sync_whop_memberships.is_running():
+            sync_whop_memberships.change_interval(hours=sync_interval)
+            sync_whop_memberships.start()
+            log.info(f"[Whop Sync] Membership sync job started (every {sync_interval} hours)")
+    else:
+        if not whop_api_client:
+            log.info("[Whop Sync] Sync job disabled (no API client)")
+        else:
+            log.info("[Whop Sync] Sync job disabled (enable_sync=false)")
     
     log.info("="*60)
     log.info("")
@@ -1555,6 +1847,7 @@ async def on_member_join(member: discord.Member):
                 embed.add_field(name="Current Roles", value=_roles_plain(member), inline=False)
                 embed.add_field(name="CID", value=f"`{cid}`", inline=True)
                 # Footer removed per user request
+                await _add_whop_snapshot_to_embed(embed, member, field_name="Whop Snapshot (API)")
                 await log_member_status("", embed=embed)
         
         guild = member.guild
@@ -1627,6 +1920,7 @@ async def on_member_remove(member: discord.Member):
                 if rec.get("join_count", 0) > 0:
                     embed.add_field(name="Join Count", value=str(rec.get("join_count")), inline=True)
                 # Footer removed per user request
+                await _add_whop_snapshot_to_embed(embed, member, field_name="Whop Snapshot (API)")
                 await log_member_status("", embed=embed)
 
 @bot.event
@@ -1782,6 +2076,9 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                     value="No matching Whop log found in last 24 hours", 
                     inline=False
                 )
+
+            # Add live Whop API snapshot (best-effort)
+            await _add_whop_snapshot_to_embed(embed, after, field_name="Whop Snapshot (API)")
             
             embed.add_field(
                 name="Reason", 
