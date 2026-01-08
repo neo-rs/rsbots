@@ -18,13 +18,13 @@ from contextlib import suppress
 
 log = logging.getLogger("rs-checker")
 
-# Import Whop API client
-try:
-    from whop_api_client import WhopAPIClient, WhopAPIError
-except ImportError:
-    WhopAPIClient = None
-    WhopAPIError = None
-    log.warning("whop_api_client module not found - API features disabled")
+# Canonical shared helpers (single source of truth)
+from rschecker_utils import load_json as _load_json
+from rschecker_utils import save_json as _save_json
+from rschecker_utils import roles_plain as _roles_plain
+
+# Import Whop API client (required; do not silently disable modules)
+from whop_api_client import WhopAPIClient, WhopAPIError
 
 # Configuration (initialized from main)
 WHOP_WEBHOOK_CHANNEL_ID = None
@@ -67,27 +67,6 @@ def _norm_email(s: str) -> str:
     """Normalize email address for consistent storage/lookup"""
     return (s or "").strip().lower()
 
-def _roles_plain(member: discord.Member) -> str:
-    """Comma-separated role names (no role mentions, excludes @everyone and managed roles)."""
-    roles = [r.name for r in member.roles if r != member.guild.default_role and not r.managed]
-    return ", ".join(roles) if roles else "—"
-
-def _load_json(path: Path) -> dict:
-    """Load JSON file, returning empty dict if file doesn't exist or is invalid"""
-    try:
-        if not path.exists() or path.stat().st_size == 0:
-            return {}
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-def _save_json(path: Path, data: dict) -> None:
-    """Save data to JSON file with error handling"""
-    try:
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
-
 
 def _load_discord_link_db() -> dict:
     db = _load_json(DISCORD_LINK_FILE)
@@ -125,12 +104,34 @@ def _get_cached_membership_id_for_discord(discord_id: int | str) -> str:
     did = str(discord_id or "").strip()
     if not did:
         return ""
+
+    # 1) Primary: whop_discord_link.json mapping
     db = _load_discord_link_db()
     by = db.get("by_discord_id") or {}
     rec = by.get(did) if isinstance(by, dict) else None
     if isinstance(rec, dict):
-        return str(rec.get("membership_id") or "").strip()
+        mid = str(rec.get("membership_id") or "").strip()
+        if mid:
+            return mid
+
+    # 2) Fallback: member_history.json backfill (whop.last_membership_id)
+    try:
+        if _get_member_history and did.isdigit():
+            hist = _get_member_history(int(did)) or {}
+            wh = hist.get("whop") if isinstance(hist, dict) else None
+            if isinstance(wh, dict):
+                mid = str(wh.get("last_membership_id") or "").strip()
+                if mid:
+                    return mid
+    except Exception:
+        pass
+
     return ""
+
+
+def get_cached_whop_membership_id(discord_id: int | str) -> str:
+    """Public helper for other modules (single source of truth for the link DB)."""
+    return _get_cached_membership_id_for_discord(discord_id)
 
 
 def _load_resolution_state() -> dict:
@@ -184,11 +185,21 @@ def _support_mention(guild: discord.Guild) -> str:
     if not guild:
         return ""
     if WHOP_SUPPORT_PING_ROLE_ID:
-        return f"<@&{WHOP_SUPPORT_PING_ROLE_ID}>"
+        try:
+            rid = int(WHOP_SUPPORT_PING_ROLE_ID)
+        except Exception:
+            rid = 0
+        role = guild.get_role(rid) if rid else None
+        if role:
+            # No role mentions (forbidden); return plain text only.
+            return f"{role.name} (`{role.id}`)"
+        return f"support_role_id `{WHOP_SUPPORT_PING_ROLE_ID}`"
     if WHOP_SUPPORT_PING_ROLE_NAME:
         role = discord.utils.get(guild.roles, name=WHOP_SUPPORT_PING_ROLE_NAME)
         if role:
-            return role.mention
+            # No role mentions (forbidden); return plain text only.
+            return f"{role.name} (`{role.id}`)"
+        return f"support_role `{WHOP_SUPPORT_PING_ROLE_NAME}`"
     return ""
 
 

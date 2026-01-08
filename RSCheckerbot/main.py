@@ -24,18 +24,17 @@ from discord.ext import commands, tasks
 from aiohttp import web
 import aiohttp
 
+from rschecker_utils import load_json, save_json, roles_plain
+
 # Import Whop webhook handler
 from whop_webhook_handler import (
     initialize as init_whop_handler,
     handle_whop_webhook_message,
+    get_cached_whop_membership_id,
 )
 
 # Import Whop API client
-try:
-    from whop_api_client import WhopAPIClient, WhopAPIError
-except ImportError:
-    WhopAPIClient = None
-    WhopAPIError = None
+from whop_api_client import WhopAPIClient, WhopAPIError
 
 # -----------------------------
 # RSCheckerbot Rules
@@ -73,7 +72,6 @@ WHOP_DISPUTE_CHANNEL_NAME = WHOP_API_CONFIG.get("dispute_channel_name", "dispute
 WHOP_RESOLUTION_CHANNEL_NAME = WHOP_API_CONFIG.get("resolution_channel_name", "resolution-center")
 WHOP_SUPPORT_PING_ROLE_ID = WHOP_API_CONFIG.get("support_ping_role_id", "")
 WHOP_SUPPORT_PING_ROLE_NAME = WHOP_API_CONFIG.get("support_ping_role_name", "")
-WHOP_DISCORD_LINK_FILE = BASE_DIR / "whop_discord_link.json"
 
 # Invite Tracking Config
 INVITE_CONFIG = config.get("invite_tracking", {})
@@ -270,47 +268,6 @@ pending_role_updates: Dict[int, Dict[str, object]] = {}  # user_id -> {"added": 
 # -----------------------------
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-def load_json(path: Path) -> dict:
-    path = Path(path)
-    if not path.exists():
-        return {}
-    try:
-        if path.stat().st_size == 0:
-            return {}
-        with open(path, "r", encoding="utf-8") as f:
-            data = f.read().strip()
-            return {} if not data else json.loads(data)
-    except Exception as e:
-        log.error(f"Failed to read {path}: {e}. Treating as empty.")
-        return {}
-
-def save_json(path: Path, data: dict) -> None:
-    path = Path(path)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
-
-def _load_whop_discord_link_db() -> dict:
-    db = load_json(WHOP_DISCORD_LINK_FILE)
-    if not isinstance(db, dict):
-        return {"by_discord_id": {}}
-    if "by_discord_id" not in db or not isinstance(db.get("by_discord_id"), dict):
-        db["by_discord_id"] = {}
-    return db
-
-
-def _get_cached_whop_membership_id(discord_id: int) -> str:
-    try:
-        db = _load_whop_discord_link_db()
-        by = db.get("by_discord_id") or {}
-        rec = by.get(str(int(discord_id))) if isinstance(by, dict) else None
-        if isinstance(rec, dict):
-            return str(rec.get("membership_id") or "").strip()
-    except Exception:
-        pass
-    return ""
 
 def save_all():
     save_json(QUEUE_FILE, queue_state)
@@ -517,7 +474,10 @@ async def _add_whop_snapshot_to_embed(
     member: discord.Member,
     field_name: str = "Whop Snapshot",
 ) -> None:
-    """Add a Whop API snapshot field(s) to an embed (best-effort, non-blocking, membership_id-based)."""
+    """Add a Whop API snapshot field (best-effort, non-blocking, membership_id-based).
+
+    Output is intentionally "pure output" key:value lines only.
+    """
     global whop_api_client
     if not whop_api_client:
         return
@@ -526,128 +486,136 @@ async def _add_whop_snapshot_to_embed(
     if len(embed.fields) >= 23:
         return
 
-    membership_id = _get_cached_whop_membership_id(member.id)
+    def _mask_email(email: str) -> str:
+        e = (email or "").strip()
+        if "@" not in e:
+            return e
+        local, domain = e.split("@", 1)
+        if len(local) <= 2:
+            return f"{local[:1]}***@{domain}"
+        return f"{local[:2]}***@{domain}"
+
+    membership_id = get_cached_whop_membership_id(member.id)
+
+    def _placeholder(mid: str) -> str:
+        return "\n".join(
+            [
+                f"membership_id: {mid or '—'}",
+                "member_id: —",
+                "user_id: —",
+                "email: —",
+                "status: —",
+                "product: —",
+                "renewal_start: —",
+                "renewal_end: —",
+                "cancel_at_period_end: —",
+                "is_first_membership: —",
+                "last_payment_status: —",
+                "last_payment_amount: —",
+                "last_payment_at: —",
+            ]
+        )[:1024]
+
     if not membership_id:
-        embed.add_field(
-            name=field_name,
-            value=(
-                "No Whop membership is linked to this Discord ID yet.\n"
-                "Why: Whop events did not include a membership_id for this user, or the user has not completed checkout.\n"
-                "Next: check `#whop-logs` / `#whop-membership-logs` and ensure the user linked Discord in Whop."
-            )[:1024],
-            inline=False,
-        )
+        embed.add_field(name=field_name, value=_placeholder(""), inline=False)
         return
 
     try:
         membership = await whop_api_client.get_membership_by_id(membership_id)
     except Exception:
         membership = None
+
     if not membership:
-        embed.add_field(name=field_name, value=f"Linked membership_id `{membership_id}` not found in Whop API.", inline=False)
+        embed.add_field(name=field_name, value=_placeholder(membership_id), inline=False)
         return
 
-    # Optional admin details via Whop member record (email/name)
-    whop_member_id = ""
-    if isinstance(membership.get("member"), dict):
-        whop_member_id = str(membership["member"].get("id") or "").strip()
-    member_rec = None
-    if whop_member_id:
-        with suppress(Exception):
-            member_rec = await whop_api_client.get_member_by_id(whop_member_id)
-
-    # Whop Admin details (like native embed format)
-    admin_lines = []
-    user_rec = (member_rec or {}).get("user") if isinstance(member_rec, dict) else None
-    if isinstance(user_rec, dict):
-        nm = str(user_rec.get("name") or "").strip()
-        un = str(user_rec.get("username") or "").strip()
-        em = str(user_rec.get("email") or "").strip()
-        if nm:
-            admin_lines.append(f"Name: {nm}")
-        if em:
-            admin_lines.append(f"Email: `{em}`")
-        if un:
-            admin_lines.append(f"Whop Username: {un}")
-    if whop_member_id:
-        admin_lines.append(f"Whop Member ID: `{whop_member_id}`")
-    if admin_lines and len(embed.fields) < 25:
-        embed.add_field(name="Whop Admin (API)", value="\n".join(admin_lines)[:1024], inline=False)
-
-    # Whop Membership summary
-    m_lines = []
-    status = str(membership.get("status") or "").strip()
-    if status:
-        m_lines.append(f"Status: **{status}**")
-    m_lines.append(f"Membership ID: `{membership_id}`")
-    product_title = ""
+    status = str(membership.get("status") or "").strip() or "—"
+    product_title = "—"
     if isinstance(membership.get("product"), dict):
-        product_title = str(membership["product"].get("title") or "").strip()
-    if product_title:
-        m_lines.append(f"Product: {product_title}")
-    license_key = str(membership.get("license_key") or "").strip()
-    if license_key:
-        m_lines.append(f"License Key: `{license_key}`")
+        product_title = str(membership["product"].get("title") or "").strip() or "—"
+
     renewal_start = membership.get("renewal_period_start")
     renewal_end = membership.get("renewal_period_end")
     rs = _fmt_discord_ts_any(renewal_start, "D") if renewal_start else "—"
     re = _fmt_discord_ts_any(renewal_end, "D") if renewal_end else "—"
-    if rs != "—" and re != "—":
-        m_lines.append(f"Renewal Period: {rs} -> {re}")
-    cancel_at_period_end = membership.get("cancel_at_period_end")
-    if isinstance(cancel_at_period_end, bool):
-        m_lines.append(f"Cancel At Period End: {'yes' if cancel_at_period_end else 'no'}")
-    cancellation_reason = str(membership.get("cancellation_reason") or "").strip()
-    if cancellation_reason:
-        m_lines.append(f"Cancellation Reason: {cancellation_reason}")
-    manage_url = str(membership.get("manage_url") or "").strip()
-    if manage_url:
-        m_lines.append(f"Manage: [Open]({manage_url})")
-    embed.add_field(name="Whop Membership (API)", value="\n".join(m_lines)[:1024], inline=False)
 
-    # Whop Billing summary
+    cancel_at_period_end = membership.get("cancel_at_period_end")
+    cape = "—"
+    if isinstance(cancel_at_period_end, bool):
+        cape = "yes" if cancel_at_period_end else "no"
+
+    is_first = membership.get("is_first_membership")
+    is_first_s = "—"
+    if isinstance(is_first, bool):
+        is_first_s = "true" if is_first else "false"
+
+    whop_member_id = "—"
+    if isinstance(membership.get("member"), dict):
+        whop_member_id = str(membership["member"].get("id") or "").strip() or "—"
+
+    whop_user_id = "—"
+    whop_email = "—"
+    if whop_member_id != "—":
+        with suppress(Exception):
+            member_rec = await whop_api_client.get_member_by_id(whop_member_id)
+            if isinstance(member_rec, dict):
+                user_rec = member_rec.get("user")
+                if isinstance(user_rec, dict):
+                    whop_user_id = str(user_rec.get("id") or "").strip() or "—"
+                    em = str(user_rec.get("email") or "").strip()
+                    if em:
+                        whop_email = _mask_email(em)
+
+    last_payment_status = "—"
+    last_payment_amount = "—"
+    last_payment_at = "—"
+    last_payment_failure = ""
+
     payments = []
     with suppress(Exception):
         payments = await whop_api_client.get_payments_for_membership(membership_id)
-    if payments and isinstance(payments, list):
-        p0 = payments[0] if isinstance(payments[0], dict) else {}
+
+    if payments and isinstance(payments, list) and isinstance(payments[0], dict):
+        p0 = payments[0]
         pay_currency = str(p0.get("currency") or "").strip()
         total = p0.get("usd_total") or p0.get("total") or p0.get("subtotal") or p0.get("amount_after_fees")
         amt = _fmt_money(total, pay_currency)
         status0 = str(p0.get("status") or "").strip()
         substatus0 = str(p0.get("substatus") or "").strip()
-        paid_at = p0.get("paid_at") or ""
         created0 = p0.get("created_at") or ""
+        paid_at = p0.get("paid_at") or ""
         failure_msg = str(p0.get("failure_message") or "").strip()
-        retryable = p0.get("retryable")
-        card_brand = str(p0.get("card_brand") or "").strip()
-        card_last4 = str(p0.get("card_last4") or "").strip()
-        dispute_alerted_at = p0.get("dispute_alerted_at")
-        refunded_at = p0.get("refunded_at")
-        refunded_amount = p0.get("refunded_amount")
 
-        b_lines = []
-        if amt:
-            b_lines.append(f"Amount: {amt}")
         if status0:
-            b_lines.append(f"Status: {status0}{f' ({substatus0})' if substatus0 else ''}")
+            last_payment_status = status0 + (f" ({substatus0})" if substatus0 else "")
+        if amt:
+            last_payment_amount = amt
         if paid_at:
-            b_lines.append(f"Paid: {_fmt_discord_ts_any(paid_at, 'R')}")
+            last_payment_at = _fmt_discord_ts_any(paid_at, "R")
         elif created0:
-            b_lines.append(f"Created: {_fmt_discord_ts_any(created0, 'R')}")
-        if card_brand and card_last4:
-            b_lines.append(f"Method: {card_brand.upper()} ****{card_last4}")
+            last_payment_at = _fmt_discord_ts_any(created0, "R")
         if failure_msg:
-            b_lines.append(f"Failure: {failure_msg[:200]}")
-        if isinstance(retryable, bool):
-            b_lines.append(f"Retryable: {'yes' if retryable else 'no'}")
-        if dispute_alerted_at:
-            b_lines.append(f"Dispute Alerted: {_fmt_discord_ts_any(dispute_alerted_at, 'D')}")
-        if refunded_at:
-            ra = _fmt_money(refunded_amount, pay_currency)
-            b_lines.append(f"Refunded: {_fmt_discord_ts_any(refunded_at, 'D')}{f' ({ra})' if ra else ''}")
-        if b_lines and len(embed.fields) < 25:
-            embed.add_field(name="Whop Billing (API)", value="\n".join(b_lines)[:1024], inline=False)
+            last_payment_failure = failure_msg[:140]
+
+    lines = [
+        f"membership_id: {membership_id}",
+        f"member_id: {whop_member_id}",
+        f"user_id: {whop_user_id}",
+        f"email: {whop_email}",
+        f"status: {status}",
+        f"product: {product_title}",
+        f"renewal_start: {rs}",
+        f"renewal_end: {re}",
+        f"cancel_at_period_end: {cape}",
+        f"is_first_membership: {is_first_s}",
+        f"last_payment_status: {last_payment_status}",
+        f"last_payment_amount: {last_payment_amount}",
+        f"last_payment_at: {last_payment_at}",
+    ]
+    if last_payment_failure:
+        lines.append(f"last_payment_failure: {last_payment_failure}")
+
+    embed.add_field(name=field_name, value="\n".join(lines)[:1024], inline=False)
 
 def get_member_history(discord_id: int) -> dict:
     """Get member history record (exposed for whop_webhook_handler and support cards)"""
@@ -776,11 +744,6 @@ def _backfill_whop_timeline_from_whop_history() -> None:
         log.info(f"Whop timeline backfill complete: {backfilled_count} events processed, {len([k for k, v in member_history.items() if v.get('whop')])} members with Whop timeline")
     except Exception as e:
         log.error(f"Whop timeline backfill failed: {e}", exc_info=True)
-
-def _roles_plain(member: discord.Member) -> str:
-    """Comma-separated role names (no role mentions, excludes @everyone and managed roles)."""
-    roles = [r.name for r in member.roles if r != member.guild.default_role and not r.managed]
-    return ", ".join(roles) if roles else "—"
 
 def _member_avatar_url(user: discord.abc.User) -> str | None:
     """Best-effort avatar URL that works across discord.py versions and user types."""
@@ -1563,7 +1526,7 @@ async def sync_whop_memberships():
     for member in members_to_check:
         try:
             # Check membership status via API (membership_id-based; avoids mismatched users)
-            membership_id = _get_cached_whop_membership_id(member.id)
+            membership_id = get_cached_whop_membership_id(member.id)
             if not membership_id:
                 continue
             verification = await whop_api_client.verify_membership_status(membership_id, "active")
@@ -1875,7 +1838,6 @@ async def on_member_join(member: discord.Member):
     if member.guild.id == GUILD_ID and not member.bot:
         # Track join event FIRST (before other logic)
         rec = _touch_join(member.id)
-        cid = _cid_for(member.id)
 
         # Determine join method via invite usage deltas (best-effort).
         used_invite_code = None
@@ -1912,9 +1874,12 @@ async def on_member_join(member: discord.Member):
             else:
                 join_method_lines.append("• Source: Untracked/permanent or external")
         else:
+            # Pure output (no explanations)
             if not join_method_lines:
-                join_method_lines.append("• No invite delta detected")
-                join_method_lines.append("• Possible: vanity/permanent invite, direct link, or invite cache not warm yet")
+                join_method_lines.append("• Invite code: —")
+                join_method_lines.append("• Invited by: —")
+                join_method_lines.append("• Tracked invite: —")
+                join_method_lines.append("• Source: —")
         
         # Optional: Log join to member-status-logs
         if MEMBER_STATUS_LOGS_CHANNEL_ID:
@@ -1933,21 +1898,21 @@ async def on_member_join(member: discord.Member):
                 embed.add_field(name="Join Count", value=str(rec.get("join_count", 1)), inline=True)
                 if rec.get("join_count", 0) > 1:
                     embed.add_field(name="Status", value="🔄 Returning member", inline=True)
-                # More support-friendly invite attribution (explicit unknown + why)
-                invite_value = "\n".join(join_method_lines).strip()
-                if not used_invite_code:
-                    invite_value = (
-                        "• Invite: **Unknown**\n"
-                        "• Why: vanity/permanent invite, direct link, external, or invite cache not warm yet\n"
-                        "• Next: check Discord audit/invite logs or ask the member how they joined"
+                # Pure invite output (no explanations)
+                if used_invite_code:
+                    invite_value = "\n".join(join_method_lines).strip()
+                else:
+                    invite_value = "\n".join(
+                        [
+                            "invite_code: —",
+                            "invited_by: —",
+                            "tracked_invite: —",
+                            "source: —",
+                        ]
                     )
+
                 embed.add_field(name="Invite", value=invite_value[:1024], inline=False)
-                embed.add_field(name="Current Roles", value=_roles_plain(member), inline=False)
-                embed.add_field(
-                    name="CID (Search Token)",
-                    value=f"`{cid}`\nUse this token to search related bot logs from the last ~10 minutes.",
-                    inline=False,
-                )
+                embed.add_field(name="Current Roles", value=roles_plain(member), inline=False)
                 # Footer removed per user request
                 await _add_whop_snapshot_to_embed(embed, member, field_name="Whop Snapshot (API)")
                 await log_member_status("", embed=embed)
@@ -2014,7 +1979,7 @@ async def on_member_remove(member: discord.Member):
                 embed.add_field(name="Member", value=f"{member.mention} (`{member}`)", inline=False)
                 _apply_member_header(embed, member)
                 # Snapshot roles at leave time (no mentions)
-                embed.add_field(name="Roles At Leave", value=_roles_plain(member), inline=False)
+                embed.add_field(name="Roles At Leave", value=roles_plain(member), inline=False)
                 embed.add_field(name="User ID", value=str(member.id), inline=False)
                 embed.add_field(name="Last Left", value=_fmt_ts(rec.get("last_leave_ts"), "D"), inline=True)
                 if rec.get("first_join_ts"):
@@ -2446,6 +2411,133 @@ async def dm_status(ctx):
         await ctx.message.delete()
     except Exception:
         pass
+
+
+@bot.command(name="whois", aliases=["whof"])
+@commands.has_permissions(administrator=True)
+async def whois_member(ctx, member: discord.Member):
+    """Whop API-first lookup for a Discord user.
+
+    Usage:
+      .checker whois @user
+    """
+    try:
+        embed = discord.Embed(title="🔎 Whop Lookup", color=0x2B2D31, timestamp=datetime.now(timezone.utc))
+        _apply_member_header(embed, member)
+        embed.add_field(name="Member", value=member.mention, inline=False)
+        embed.add_field(name="User ID", value=str(member.id), inline=False)
+        embed.add_field(name="Current Roles", value=roles_plain(member), inline=False)
+        await _add_whop_snapshot_to_embed(embed, member, field_name="Whop (API)")
+        await ctx.send(embed=embed, delete_after=30)
+    except Exception as e:
+        await ctx.send(f"❌ whois error: {e}", delete_after=10)
+    finally:
+        with suppress(Exception):
+            await ctx.message.delete()
+
+
+@bot.command(name="whopmembership", aliases=["whopmember", "whopmem"])
+@commands.has_permissions(administrator=True)
+async def whop_membership_lookup(ctx, membership_id: str):
+    """Direct Whop membership lookup by membership_id.
+
+    Usage:
+      .checker whopmembership mem_...
+    """
+    global whop_api_client
+    if not whop_api_client:
+        await ctx.send("❌ Whop API client is not initialized.", delete_after=10)
+        return
+
+    mid = (membership_id or "").strip()
+    if not mid:
+        await ctx.send("❌ Provide a membership_id.", delete_after=10)
+        return
+
+    try:
+        membership = await whop_api_client.get_membership_by_id(mid)
+    except Exception as e:
+        await ctx.send(f"❌ Whop API error: {e}", delete_after=15)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    status = str((membership or {}).get("status") or "").strip() or "—"
+    product_title = "—"
+    if isinstance((membership or {}).get("product"), dict):
+        product_title = str(membership["product"].get("title") or "").strip() or "—"
+
+    renewal_start = (membership or {}).get("renewal_period_start")
+    renewal_end = (membership or {}).get("renewal_period_end")
+    rs = _fmt_discord_ts_any(renewal_start, "D") if renewal_start else "—"
+    re = _fmt_discord_ts_any(renewal_end, "D") if renewal_end else "—"
+
+    cancel_at_period_end = (membership or {}).get("cancel_at_period_end")
+    cape = "—"
+    if isinstance(cancel_at_period_end, bool):
+        cape = "yes" if cancel_at_period_end else "no"
+
+    is_first = (membership or {}).get("is_first_membership")
+    is_first_s = "—"
+    if isinstance(is_first, bool):
+        is_first_s = "true" if is_first else "false"
+
+    whop_member_id = "—"
+    if isinstance((membership or {}).get("member"), dict):
+        whop_member_id = str(membership["member"].get("id") or "").strip() or "—"
+
+    last_payment_status = "—"
+    last_payment_amount = "—"
+    last_payment_at = "—"
+    last_payment_failure = ""
+
+    payments = []
+    with suppress(Exception):
+        payments = await whop_api_client.get_payments_for_membership(mid)
+
+    if payments and isinstance(payments, list) and isinstance(payments[0], dict):
+        p0 = payments[0]
+        pay_currency = str(p0.get("currency") or "").strip()
+        total = p0.get("usd_total") or p0.get("total") or p0.get("subtotal") or p0.get("amount_after_fees")
+        amt = _fmt_money(total, pay_currency)
+        status0 = str(p0.get("status") or "").strip()
+        substatus0 = str(p0.get("substatus") or "").strip()
+        created0 = p0.get("created_at") or ""
+        paid_at = p0.get("paid_at") or ""
+        failure_msg = str(p0.get("failure_message") or "").strip()
+
+        if status0:
+            last_payment_status = status0 + (f" ({substatus0})" if substatus0 else "")
+        if amt:
+            last_payment_amount = amt
+        if paid_at:
+            last_payment_at = _fmt_discord_ts_any(paid_at, "R")
+        elif created0:
+            last_payment_at = _fmt_discord_ts_any(created0, "R")
+        if failure_msg:
+            last_payment_failure = failure_msg[:140]
+
+    lines = [
+        f"membership_id: {mid}",
+        f"member_id: {whop_member_id}",
+        f"status: {status}",
+        f"product: {product_title}",
+        f"renewal_start: {rs}",
+        f"renewal_end: {re}",
+        f"cancel_at_period_end: {cape}",
+        f"is_first_membership: {is_first_s}",
+        f"last_payment_status: {last_payment_status}",
+        f"last_payment_amount: {last_payment_amount}",
+        f"last_payment_at: {last_payment_at}",
+    ]
+    if last_payment_failure:
+        lines.append(f"last_payment_failure: {last_payment_failure}")
+
+    embed = discord.Embed(title="🔎 Whop Membership", color=0x2B2D31, timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="Whop (API)", value="\n".join(lines)[:1024], inline=False)
+    await ctx.send(embed=embed, delete_after=30)
+    with suppress(Exception):
+        await ctx.message.delete()
 
 @bot.command(name="start")
 @commands.has_permissions(administrator=True)
