@@ -771,6 +771,41 @@ def _apply_member_header(embed: discord.Embed, user: discord.abc.User) -> None:
         embed.set_author(name=str(user), icon_url=url)
         embed.set_thumbnail(url=url)
 
+
+def _access_roles_plain(member: discord.Member) -> str:
+    """Return a compact list of access-relevant role names (no mentions).
+
+    This intentionally filters out "noise" roles so support can quickly see access state.
+    """
+    relevant_ids = set()
+    for rid in (ROLE_CANCEL_A, ROLE_CANCEL_B, WELCOME_ROLE_ID, ROLE_TRIGGER, FORMER_MEMBER_ROLE):
+        if isinstance(rid, int):
+            relevant_ids.add(rid)
+        elif isinstance(rid, str) and str(rid).strip().isdigit():
+            relevant_ids.add(int(str(rid).strip()))
+    try:
+        relevant_ids.update({int(x) for x in ROLES_TO_CHECK if str(x).strip().isdigit()})
+    except Exception:
+        pass
+
+    if not relevant_ids:
+        return "—"
+
+    # Preserve Discord role order (member.roles includes @everyone; exclude it)
+    names: list[str] = []
+    seen: set[str] = set()
+    for r in member.roles:
+        if r == member.guild.default_role:
+            continue
+        if r.id not in relevant_ids:
+            continue
+        nm = str(r.name or "").strip()
+        if not nm or nm in seen:
+            continue
+        seen.add(nm)
+        names.append(nm)
+    return ", ".join(names) if names else "—"
+
 def load_settings() -> dict:
     """Load settings from JSON file, default to enabled if missing/bad"""
     if not SETTINGS_FILE.exists():
@@ -1891,30 +1926,37 @@ async def on_member_join(member: discord.Member):
                     timestamp=datetime.now(timezone.utc)
                 )
                 _apply_member_header(embed, member)
-                embed.add_field(name="Member", value=member.mention, inline=False)
-                embed.add_field(name="User ID", value=str(member.id), inline=False)
-                embed.add_field(name="Account Created", value=member.created_at.strftime("%b %d, %Y"), inline=True)
-                embed.add_field(name="First Joined", value=_fmt_ts(rec.get("first_join_ts"), "D"), inline=True)
-                embed.add_field(name="Join Count", value=str(rec.get("join_count", 1)), inline=True)
-                if rec.get("join_count", 0) > 1:
-                    embed.add_field(name="Status", value="🔄 Returning member", inline=True)
-                # Pure invite output (no explanations)
-                if used_invite_code:
-                    invite_value = "\n".join(join_method_lines).strip()
-                else:
-                    invite_value = "\n".join(
-                        [
-                            "invite_code: —",
-                            "invited_by: —",
-                            "tracked_invite: —",
-                            "source: —",
-                        ]
-                    )
 
-                embed.add_field(name="Invite", value=invite_value[:1024], inline=False)
-                embed.add_field(name="Current Roles", value=roles_plain(member), inline=False)
-                # Footer removed per user request
-                await _add_whop_snapshot_to_embed(embed, member, field_name="Whop Snapshot (API)")
+                member_lines = [
+                    f"member: {member.mention}",
+                    f"user_id: {member.id}",
+                    f"account_created: {member.created_at.strftime('%b %d, %Y')}",
+                    f"first_joined: {_fmt_ts(rec.get('first_join_ts'), 'D')}",
+                    f"join_count: {rec.get('join_count', 1)}",
+                    f"returning_member: {'true' if rec.get('join_count', 0) > 1 else 'false'}",
+                ]
+                embed.add_field(name="Member Info", value="\n".join(member_lines)[:1024], inline=False)
+
+                inviter_s = "—"
+                if used_invite_inviter_name and used_invite_inviter_id:
+                    inviter_s = f"{used_invite_inviter_name} ({used_invite_inviter_id})"
+                tracked_s = "—"
+                source_s = "—"
+                if used_invite_code:
+                    invite_entry = invites_data.get(used_invite_code) or {}
+                    is_tracked = bool(invite_entry) and invite_entry.get("used_at") is None
+                    tracked_s = "yes" if is_tracked else "no"
+                    source_s = "one_time_invite" if is_tracked else "untracked_or_external"
+                discord_lines = [
+                    f"invite_code: {used_invite_code or '—'}",
+                    f"invited_by: {inviter_s}",
+                    f"tracked_invite: {tracked_s}",
+                    f"source: {source_s}",
+                    f"access_roles: {_access_roles_plain(member)}",
+                ]
+                embed.add_field(name="Discord Info", value="\n".join(discord_lines)[:1024], inline=False)
+
+                await _add_whop_snapshot_to_embed(embed, member, field_name="Payment Info")
                 await log_member_status("", embed=embed)
         
         guild = member.guild
@@ -2110,48 +2152,35 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         # If Member role was the ONLY role removed (or only with Welcome), likely payment-related
         only_member_removed = len(all_removed_in_update) == 1 or (len(all_removed_in_update) == 2 and ROLE_CANCEL_B in all_removed_in_update)
         if only_member_removed:
-            # Search Whop logs for cancellation details
+            # Search Whop logs for cancellation details (best-effort signal)
             whop_info = await search_whop_logs_for_user(after.id, lookback_hours=24)
-            
-            # Build embed with Whop info if found
+
             embed = discord.Embed(
                 title="💳 Payment Cancellation Detected",
                 color=0xFF0000,  # Red for cancellation
                 timestamp=datetime.now(timezone.utc)
             )
-            
-            embed.add_field(name="User", value=_fmt_user(after), inline=False)
-            embed.add_field(name="Roles Removed", value=removed_names, inline=False)
-            
-            if whop_info:
-                # Add Whop details if found
-                if whop_info.get("key"):
-                    embed.add_field(name="🔑 Whop Key", value=f"`{whop_info['key']}`", inline=True)
-                if whop_info.get("access_pass"):
-                    embed.add_field(name="📦 Access Pass", value=whop_info["access_pass"], inline=True)
-                if whop_info.get("name"):
-                    embed.add_field(name="👤 Name", value=whop_info["name"], inline=True)
-                if whop_info.get("email"):
-                    embed.add_field(name="📧 Email", value=whop_info["email"], inline=True)
-                if whop_info.get("membership_status"):
-                    embed.add_field(name="📊 Membership Status", value=whop_info["membership_status"], inline=True)
-                if whop_info.get("discord_username"):
-                    embed.add_field(name="💬 Discord Username", value=whop_info["discord_username"], inline=True)
-            else:
-                embed.add_field(
-                    name="⚠️ Whop Info", 
-                    value="No matching Whop log found in last 24 hours", 
-                    inline=False
-                )
 
-            # Add live Whop API snapshot (best-effort)
-            await _add_whop_snapshot_to_embed(embed, after, field_name="Whop Snapshot (API)")
-            
-            embed.add_field(
-                name="Reason", 
-                value="Member role removed — may indicate subscription cancellation or payment failure", 
-                inline=False
-            )
+            _apply_member_header(embed, after)
+            hist = get_member_history(after.id) or {}
+            member_lines = [
+                f"member: {after.mention}",
+                f"user_id: {after.id}",
+                f"account_created: {after.created_at.strftime('%b %d, %Y')}",
+                f"first_joined: {_fmt_ts(hist.get('first_join_ts'), 'D')}",
+                f"join_count: {hist.get('join_count', '—')}",
+            ]
+            embed.add_field(name="Member Info", value="\n".join(member_lines)[:1024], inline=False)
+
+            discord_lines = [
+                f"roles_removed: {removed_names}",
+                f"access_roles_now: {_access_roles_plain(after)}",
+                f"whop_log_found_24h: {'yes' if whop_info else 'no'}",
+                "reason: member_role_removed (possible cancellation/payment issue)",
+            ]
+            embed.add_field(name="Discord Info", value="\n".join(discord_lines)[:1024], inline=False)
+
+            await _add_whop_snapshot_to_embed(embed, after, field_name="Payment Info")
             embed.set_footer(text="RSCheckerbot • Member Status Tracking")
             
             await log_member_status("", embed=embed)
@@ -2424,10 +2453,22 @@ async def whois_member(ctx, member: discord.Member):
     try:
         embed = discord.Embed(title="🔎 Whop Lookup", color=0x2B2D31, timestamp=datetime.now(timezone.utc))
         _apply_member_header(embed, member)
-        embed.add_field(name="Member", value=member.mention, inline=False)
-        embed.add_field(name="User ID", value=str(member.id), inline=False)
-        embed.add_field(name="Current Roles", value=roles_plain(member), inline=False)
-        await _add_whop_snapshot_to_embed(embed, member, field_name="Whop (API)")
+        hist = get_member_history(member.id) or {}
+        member_lines = [
+            f"member: {member.mention}",
+            f"user_id: {member.id}",
+            f"account_created: {member.created_at.strftime('%b %d, %Y')}",
+            f"first_joined: {_fmt_ts(hist.get('first_join_ts'), 'D')}",
+            f"join_count: {hist.get('join_count', '—')}",
+        ]
+        embed.add_field(name="Member Info", value="\n".join(member_lines)[:1024], inline=False)
+
+        discord_lines = [
+            f"access_roles: {_access_roles_plain(member)}",
+        ]
+        embed.add_field(name="Discord Info", value="\n".join(discord_lines)[:1024], inline=False)
+
+        await _add_whop_snapshot_to_embed(embed, member, field_name="Payment Info")
         await ctx.send(embed=embed, delete_after=30)
     except Exception as e:
         await ctx.send(f"❌ whois error: {e}", delete_after=10)
@@ -2534,7 +2575,7 @@ async def whop_membership_lookup(ctx, membership_id: str):
         lines.append(f"last_payment_failure: {last_payment_failure}")
 
     embed = discord.Embed(title="🔎 Whop Membership", color=0x2B2D31, timestamp=datetime.now(timezone.utc))
-    embed.add_field(name="Whop (API)", value="\n".join(lines)[:1024], inline=False)
+    embed.add_field(name="Payment Info", value="\n".join(lines)[:1024], inline=False)
     await ctx.send(embed=embed, delete_after=30)
     with suppress(Exception):
         await ctx.message.delete()
