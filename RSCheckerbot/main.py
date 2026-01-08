@@ -601,19 +601,6 @@ async def _post_case_update(member: discord.Member, embed: discord.Embed, issue_
     counts[issue_key] = int(counts.get(issue_key, 0) or 0) + 1
     rec["issue_counts"] = counts
 
-    # Add staff meta field (do not mutate existing field names)
-    try:
-        count_val = counts.get(issue_key, 1)
-        meta_lines = [
-            f"issue_key: {issue_key}",
-            f"alert_count: {count_val}",
-            f"cooldown_hours: {cooldown_hours}",
-        ]
-        if len(embed.fields) < 24:
-            embed.add_field(name="Staff Meta", value="\n".join(meta_lines)[:1024], inline=False)
-    except Exception:
-        pass
-
     with suppress(Exception):
         await ch.send(embed=embed, allowed_mentions=allowed)
 
@@ -862,7 +849,6 @@ async def _add_whop_snapshot_to_embed(
         lines.append(f"{k}: {sv}")
 
     lines: list[str] = []
-    _emit(lines, "membership_id", membership_id, keep_blank=True)
     _emit(lines, "status", status, keep_blank=True)
     _emit(lines, "product", product_title)
     _emit(lines, "member_since", member_since)
@@ -870,10 +856,9 @@ async def _add_whop_snapshot_to_embed(
     _emit(lines, "renewal_start", rs)
     _emit(lines, "renewal_end", re)
     _emit(lines, "cancel_at_period_end", cape)
-    _emit(lines, "is_first_membership", is_first_s)
+    _emit(lines, "is_first_membership", is_first_s, keep_blank=True)
 
-    _emit(lines, "member_id", whop_member_id)
-    _emit(lines, "user_id", whop_user_id)
+    # Keep contact hint without exposing internal IDs
     _emit(lines, "email", whop_email)
 
     _emit(lines, "last_payment_status", last_payment_status)
