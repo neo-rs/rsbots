@@ -2729,6 +2729,96 @@ async def cleanup_data(ctx):
     except Exception:
         pass
 
+
+@bot.command(name="refreshcases", aliases=["refreshcasechannels", "casefix", "fixcases"])
+@commands.has_permissions(administrator=True)
+async def refresh_case_channels(ctx):
+    """Bulk refresh/rename staff-only payment case channels to the current naming scheme.
+
+    This does NOT DM users, does NOT add users to channels, and does NOT repost old messages.
+    """
+    try:
+        guild = bot.get_guild(GUILD_ID)
+        if not guild:
+            await ctx.send("❌ Guild not found / bot not ready.", delete_after=10)
+            return
+        if not PAYMENT_CASE_CATEGORY_ID:
+            await ctx.send("❌ payment_case_category_id not set in config.json (whop_api).", delete_after=12)
+            return
+
+        category = guild.get_channel(PAYMENT_CASE_CATEGORY_ID)
+        if not isinstance(category, discord.CategoryChannel):
+            await ctx.send("❌ payment_case_category_id is not a valid category channel.", delete_after=12)
+            return
+
+        def _extract_did(ch: discord.TextChannel) -> int | None:
+            topic = str(ch.topic or "")
+            for part in topic.split():
+                if part.startswith("discord_id="):
+                    v = part.split("=", 1)[1].strip()
+                    return int(v) if v.isdigit() else None
+            # Back-compat: old channel name pay-<digits>
+            nm = str(ch.name or "")
+            if nm.startswith("pay-"):
+                tail = nm[4:]
+                if tail.isdigit():
+                    return int(tail)
+            return None
+
+        renamed = 0
+        skipped = 0
+        failed = 0
+
+        db = _load_payment_cases()
+        for ch in list(category.channels):
+            if not isinstance(ch, discord.TextChannel):
+                continue
+            did = _extract_did(ch)
+            if not did:
+                skipped += 1
+                continue
+            member = guild.get_member(did)
+            if not member:
+                skipped += 1
+                continue
+
+            desired = _case_channel_name(member)
+            if not desired or ch.name == desired:
+                skipped += 1
+                continue
+
+            try:
+                await ch.edit(name=desired, reason="RSCheckerbot: refresh case channel name (bulk)")
+                # Ensure topic marker exists (for future refresh)
+                if "rschecker_payment_case" not in str(ch.topic or ""):
+                    with suppress(Exception):
+                        await ch.edit(
+                            topic=f"rschecker_payment_case discord_id={did} refreshed_at={_now().isoformat()}",
+                            reason="RSCheckerbot: set missing case topic marker",
+                        )
+                # Update local mapping for quicker lookups
+                uid = str(int(did))
+                rec = db.get(uid) if isinstance(db, dict) else None
+                if not isinstance(rec, dict):
+                    rec = {}
+                    db[uid] = rec
+                rec["channel_id"] = int(ch.id)
+                rec["refreshed_at"] = _now().isoformat()
+                renamed += 1
+            except Exception:
+                failed += 1
+
+        _save_payment_cases(db)
+        await ctx.send(
+            f"✅ refreshcases complete — renamed: {renamed}, skipped: {skipped}, failed: {failed}",
+            delete_after=20,
+        )
+    except Exception as e:
+        await ctx.send(f"❌ refreshcases error: {e}", delete_after=15)
+    finally:
+        with suppress(Exception):
+            await ctx.message.delete()
+
 @bot.command(name="dmenable")
 @commands.has_permissions(administrator=True)
 async def dm_enable(ctx):
