@@ -695,6 +695,30 @@ def _fmt_money(amount: object, currency: str | None = None) -> str:
     return f"{amt:.2f} {cur.upper()}"
 
 
+def _kv_line(key: str, value: object, *, keep_blank: bool = False) -> str | None:
+    """Format `key: value` for embed fields, hiding blanks by default."""
+    k = str(key or "").strip()
+    if not k:
+        return None
+    if value is None:
+        return f"{k}: —" if keep_blank else None
+    s = str(value).strip()
+    if not s or s == "—":
+        return f"{k}: —" if keep_blank else None
+    return f"{k}: {s}"
+
+
+def _kv_block(pairs: list[tuple[str, object]], *, keep_blank_keys: set[str] | None = None) -> str:
+    """Build a newline-separated kv block, skipping blank values unless whitelisted."""
+    keep = keep_blank_keys or set()
+    lines: list[str] = []
+    for k, v in pairs:
+        line = _kv_line(k, v, keep_blank=(k in keep))
+        if line:
+            lines.append(line)
+    return "\n".join(lines)[:1024] if lines else "—"
+
+
 async def _add_whop_snapshot_to_embed(
     embed: discord.Embed,
     member: discord.Member,
@@ -730,8 +754,9 @@ async def _add_whop_snapshot_to_embed(
         # Keep minimal output when we can't resolve the membership yet.
         return "\n".join(
             [
-                f"membership_id: {mid or '—'}",
+                "linked: no",
                 "status: —",
+                "is_first_membership: —",
             ]
         )[:1024]
 
@@ -1151,64 +1176,6 @@ async def log_member_status(msg: str, embed: discord.Embed = None):
                     embed.set_footer(text="RSCheckerbot • Member Status Tracking")
                 # Mentions should be clickable but MUST NOT ping users.
                 await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-
-async def search_whop_logs_for_user(discord_id: int, lookback_hours: int = 24) -> dict:
-    """Search Whop logs channel for user's cancellation/subscription info"""
-    if not WHOP_LOGS_CHANNEL_ID:
-        return {}
-    
-    try:
-        channel = bot.get_channel(WHOP_LOGS_CHANNEL_ID)
-        if not channel:
-            return {}
-        
-        # Search recent messages (last 24 hours by default)
-        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-        whop_info = {}
-        
-        async for message in channel.history(limit=100, after=cutoff_time):
-            content = message.content
-            # Check if message contains the Discord ID (look for "Discord ID" followed by the ID)
-            if f"Discord ID" in content and str(discord_id) in content:
-                # Parse Whop log format (label on one line, value on next line)
-                lines = [line.strip() for line in content.split('\n') if line.strip()]
-                whop_data = {}
-                
-                # Helper function to extract value after a label
-                def get_value_after(label):
-                    for i, line in enumerate(lines):
-                        if label in line and i + 1 < len(lines):
-                            return lines[i + 1]
-                    return None
-                
-                # Extract all fields
-                key_match = get_value_after("Key")
-                access_pass = get_value_after("Access Pass")
-                name = get_value_after("Name")
-                email = get_value_after("Email")
-                membership_status = get_value_after("Membership Status")
-                discord_username = get_value_after("Discord Username")
-                
-                # Verify this is actually for our user by checking Discord ID field
-                discord_id_value = get_value_after("Discord ID")
-                if discord_id_value and str(discord_id) in discord_id_value:
-                    # Store found info
-                    whop_info = {
-                        "key": key_match,
-                        "access_pass": access_pass,
-                        "name": name,
-                        "email": email,
-                        "membership_status": membership_status,
-                        "discord_username": discord_username,
-                        "found_at": message.created_at.isoformat(),
-                        "message_id": message.id
-                    }
-                    return whop_info  # Return immediately when found
-        
-        return whop_info
-    except Exception as e:
-        log.error(f"Error searching Whop logs: {e}")
-        return {}
 
 # -----------------------------
 # Registry helpers
@@ -1847,28 +1814,37 @@ async def sync_whop_memberships():
                     )
                     _apply_member_header(embed, member)
                     hist = get_member_history(member.id) or {}
-                    member_lines = [
-                        f"member: {member.mention}",
-                        f"user_id: {member.id}",
-                    ]
                     fj = _fmt_ts(hist.get("first_join_ts"), "D") if hist.get("first_join_ts") else ""
-                    if fj and fj != "—":
-                        member_lines.append(f"first_joined: {fj}")
                     # Fallback: Discord joined_at (more available than our history for older members)
+                    joined_at = ""
                     try:
                         if getattr(member, "joined_at", None):
-                            member_lines.append(f"guild_joined: {member.joined_at.strftime('%b %d, %Y')}")
+                            joined_at = member.joined_at.strftime("%b %d, %Y")
                     except Exception:
                         pass
-                    if hist.get("join_count"):
-                        member_lines.append(f"join_count: {hist.get('join_count')}")
-                    embed.add_field(name="Member Info", value="\n".join(member_lines)[:1024], inline=False)
+                    embed.add_field(
+                        name="Member Info",
+                        value=_kv_block(
+                            [
+                                ("member", member.mention),
+                                ("first_joined", fj),
+                                ("guild_joined", joined_at),
+                                ("join_count", hist.get("join_count")),
+                            ]
+                        ),
+                        inline=False,
+                    )
 
-                    discord_lines = [
-                        f"access_roles: {_access_roles_plain(member)}",
-                        "reason: cancel_at_period_end=true (user may have canceled to prevent renewal)",
-                    ]
-                    embed.add_field(name="Discord Info", value="\n".join(discord_lines)[:1024], inline=False)
+                    embed.add_field(
+                        name="Discord Info",
+                        value=_kv_block(
+                            [
+                                ("access_roles", _access_roles_plain(member)),
+                                ("reason", "cancellation_scheduled (cancel_at_period_end=true)"),
+                            ]
+                        ),
+                        inline=False,
+                    )
 
                     # Use prefetched membership to avoid an extra membership fetch; skip payments for sync-signal.
                     await _add_whop_snapshot_to_embed(
@@ -2245,13 +2221,24 @@ async def on_member_join(member: discord.Member):
 
                 member_lines = [
                     f"member: {member.mention}",
-                    f"user_id: {member.id}",
                     f"account_created: {member.created_at.strftime('%b %d, %Y')}",
                     f"first_joined: {_fmt_ts(rec.get('first_join_ts'), 'D')}",
                     f"join_count: {rec.get('join_count', 1)}",
                     f"returning_member: {'true' if rec.get('join_count', 0) > 1 else 'false'}",
                 ]
-                embed.add_field(name="Member Info", value="\n".join(member_lines)[:1024], inline=False)
+                embed.add_field(
+                    name="Member Info",
+                    value=_kv_block(
+                        [
+                            ("member", member.mention),
+                            ("account_created", member.created_at.strftime("%b %d, %Y")),
+                            ("first_joined", _fmt_ts(rec.get("first_join_ts"), "D")),
+                            ("join_count", rec.get("join_count", 1)),
+                            ("returning_member", "true" if rec.get("join_count", 0) > 1 else "false"),
+                        ]
+                    ),
+                    inline=False,
+                )
 
                 inviter_s = "—"
                 if used_invite_inviter_name and used_invite_inviter_id:
@@ -2263,14 +2250,19 @@ async def on_member_join(member: discord.Member):
                     is_tracked = bool(invite_entry) and invite_entry.get("used_at") is None
                     tracked_s = "yes" if is_tracked else "no"
                     source_s = "one_time_invite" if is_tracked else "untracked_or_external"
-                discord_lines = [
-                    f"invite_code: {used_invite_code or '—'}",
-                    f"invited_by: {inviter_s}",
-                    f"tracked_invite: {tracked_s}",
-                    f"source: {source_s}",
-                    f"access_roles: {_access_roles_plain(member)}",
-                ]
-                embed.add_field(name="Discord Info", value="\n".join(discord_lines)[:1024], inline=False)
+                embed.add_field(
+                    name="Discord Info",
+                    value=_kv_block(
+                        [
+                            ("invite_code", used_invite_code or "—"),
+                            ("invited_by", inviter_s),
+                            ("tracked_invite", tracked_s),
+                            ("source", source_s),
+                            ("access_roles", _access_roles_plain(member)),
+                        ]
+                    ),
+                    inline=False,
+                )
 
                 await _add_whop_snapshot_to_embed(embed, member, field_name="Payment Info")
                 await log_member_status("", embed=embed)
@@ -2334,18 +2326,25 @@ async def on_member_remove(member: discord.Member):
                     color=0xFFA500,  # Orange
                     timestamp=datetime.now(timezone.utc)
                 )
-                embed.add_field(name="Member", value=f"{member.mention} (`{member}`)", inline=False)
                 _apply_member_header(embed, member)
-                # Snapshot roles at leave time (no mentions)
-                embed.add_field(name="Roles At Leave", value=roles_plain(member), inline=False)
-                embed.add_field(name="User ID", value=str(member.id), inline=False)
-                embed.add_field(name="Last Left", value=_fmt_ts(rec.get("last_leave_ts"), "D"), inline=True)
+
+                member_lines = [
+                    ("member", member.mention),
+                    ("left_at", _fmt_ts(rec.get("last_leave_ts"), "D")),
+                ]
                 if rec.get("first_join_ts"):
-                    embed.add_field(name="First Joined", value=_fmt_ts(rec.get("first_join_ts"), "D"), inline=True)
+                    member_lines.append(("first_joined", _fmt_ts(rec.get("first_join_ts"), "D")))
                 if rec.get("join_count", 0) > 0:
-                    embed.add_field(name="Join Count", value=str(rec.get("join_count")), inline=True)
-                # Footer removed per user request
-                await _add_whop_snapshot_to_embed(embed, member, field_name="Whop Snapshot (API)")
+                    member_lines.append(("join_count", rec.get("join_count")))
+                embed.add_field(name="Member Info", value=_kv_block(member_lines), inline=False)
+
+                embed.add_field(
+                    name="Discord Info",
+                    value=_kv_block([("access_roles_at_leave", _access_roles_plain(member))]),
+                    inline=False,
+                )
+
+                await _add_whop_snapshot_to_embed(embed, member, field_name="Payment Info")
                 await log_member_status("", embed=embed)
 
 @bot.event
@@ -2468,9 +2467,6 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         # If Member role was the ONLY role removed (or only with Welcome), likely payment-related
         only_member_removed = len(all_removed_in_update) == 1 or (len(all_removed_in_update) == 2 and ROLE_CANCEL_B in all_removed_in_update)
         if only_member_removed:
-            # Search Whop logs for cancellation details (best-effort signal)
-            whop_info = await search_whop_logs_for_user(after.id, lookback_hours=24)
-
             embed = discord.Embed(
                 title="💳 Payment Cancellation Detected",
                 color=0xFF0000,  # Red for cancellation
@@ -2480,21 +2476,24 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             _apply_member_header(embed, after)
             hist = get_member_history(after.id) or {}
             member_lines = [
-                f"member: {after.mention}",
-                f"user_id: {after.id}",
-                f"account_created: {after.created_at.strftime('%b %d, %Y')}",
-                f"first_joined: {_fmt_ts(hist.get('first_join_ts'), 'D')}",
-                f"join_count: {hist.get('join_count', '—')}",
+                ("member", after.mention),
+                ("account_created", after.created_at.strftime("%b %d, %Y")),
             ]
-            embed.add_field(name="Member Info", value="\n".join(member_lines)[:1024], inline=False)
+            fj = _fmt_ts(hist.get("first_join_ts"), "D") if hist.get("first_join_ts") else ""
+            member_lines.append(("first_joined", fj))
+            embed.add_field(name="Member Info", value=_kv_block(member_lines), inline=False)
 
-            discord_lines = [
-                f"roles_removed: {removed_names}",
-                f"access_roles_now: {_access_roles_plain(after)}",
-                f"whop_log_found_24h: {'yes' if whop_info else 'no'}",
-                "reason: member_role_removed (possible cancellation/payment issue)",
-            ]
-            embed.add_field(name="Discord Info", value="\n".join(discord_lines)[:1024], inline=False)
+            embed.add_field(
+                name="Discord Info",
+                value=_kv_block(
+                    [
+                        ("roles_removed", removed_names),
+                        ("access_roles_now", _access_roles_plain(after)),
+                        ("reason", "member_role_removed"),
+                    ]
+                ),
+                inline=False,
+            )
 
             await _add_whop_snapshot_to_embed(embed, after, field_name="Payment Info")
             embed.set_footer(text="RSCheckerbot • Member Status Tracking")
@@ -2542,21 +2541,25 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             _apply_member_header(embed, after)
 
             member_lines = [
-                f"member: {after.mention}",
-                f"user_id: {after.id}",
-                f"first_joined: {_fmt_ts(hist.get('first_join_ts'), 'D')}",
-                f"join_count: {hist.get('join_count', '—')}",
+                ("member", after.mention),
             ]
-            embed.add_field(name="Member Info", value="\n".join(member_lines)[:1024], inline=False)
+            fj = _fmt_ts(hist.get("first_join_ts"), "D") if hist.get("first_join_ts") else ""
+            member_lines.append(("first_joined", fj))
+            member_lines.append(("join_count", hist.get("join_count")))
+            embed.add_field(name="Member Info", value=_kv_block(member_lines), inline=False)
 
-            discord_lines = [
-                f"roles_added: {added_names}",
-                f"access_roles_now: {_access_roles_plain(after)}",
-                "reason: member_role_regained (reactivation/payment success)",
-            ]
-            if removed_names:
-                discord_lines.insert(1, f"roles_removed: {removed_names}")
-            embed.add_field(name="Discord Info", value="\n".join(discord_lines)[:1024], inline=False)
+            embed.add_field(
+                name="Discord Info",
+                value=_kv_block(
+                    [
+                        ("roles_added", added_names),
+                        ("roles_removed", removed_names or ""),
+                        ("access_roles_now", _access_roles_plain(after)),
+                        ("reason", "member_role_regained"),
+                    ]
+                ),
+                inline=False,
+            )
 
             await _add_whop_snapshot_to_embed(embed, after, field_name="Payment Info")
             embed.set_footer(text="RSCheckerbot • Member Status Tracking")
@@ -2872,18 +2875,18 @@ async def whois_member(ctx, member: discord.Member):
         _apply_member_header(embed, member)
         hist = get_member_history(member.id) or {}
         member_lines = [
-            f"member: {member.mention}",
-            f"user_id: {member.id}",
-            f"account_created: {member.created_at.strftime('%b %d, %Y')}",
-            f"first_joined: {_fmt_ts(hist.get('first_join_ts'), 'D')}",
-            f"join_count: {hist.get('join_count', '—')}",
+            ("member", member.mention),
+            ("account_created", member.created_at.strftime("%b %d, %Y")),
         ]
-        embed.add_field(name="Member Info", value="\n".join(member_lines)[:1024], inline=False)
+        fj = _fmt_ts(hist.get("first_join_ts"), "D") if hist.get("first_join_ts") else ""
+        member_lines.append(("first_joined", fj))
+        embed.add_field(name="Member Info", value=_kv_block(member_lines), inline=False)
 
-        discord_lines = [
-            f"access_roles: {_access_roles_plain(member)}",
-        ]
-        embed.add_field(name="Discord Info", value="\n".join(discord_lines)[:1024], inline=False)
+        embed.add_field(
+            name="Discord Info",
+            value=_kv_block([("access_roles", _access_roles_plain(member))]),
+            inline=False,
+        )
 
         await _add_whop_snapshot_to_embed(embed, member, field_name="Payment Info")
         await ctx.send(embed=embed, delete_after=30)
@@ -2940,10 +2943,6 @@ async def whop_membership_lookup(ctx, membership_id: str):
     if isinstance(is_first, bool):
         is_first_s = "true" if is_first else "false"
 
-    whop_member_id = "—"
-    if isinstance((membership or {}).get("member"), dict):
-        whop_member_id = str(membership["member"].get("id") or "").strip() or "—"
-
     created_at = (membership or {}).get("created_at")
     member_since = _fmt_discord_ts_any(created_at, "D") if created_at else "—"
     trial_end = (membership or {}).get("trial_end") or (membership or {}).get("trial_ends_at") or (membership or {}).get("trial_end_at")
@@ -2994,25 +2993,31 @@ async def whop_membership_lookup(ctx, membership_id: str):
         if pm_type:
             last_payment_type = str(pm_type).strip()
 
-    lines = [
-        f"membership_id: {mid}",
-        f"member_id: {whop_member_id}",
-        f"status: {status}",
-        f"product: {product_title}",
-        f"member_since: {member_since}",
-        f"trial_end: {trial_end_s}",
-        f"renewal_start: {rs}",
-        f"renewal_end: {re}",
-        f"cancel_at_period_end: {cape}",
-        f"is_first_membership: {is_first_s}",
-        f"last_payment_status: {last_payment_status}",
-        f"last_payment_amount: {last_payment_amount}",
-        f"last_payment_at: {last_payment_at}",
-        f"last_payment_method: {last_payment_method}",
-        f"last_payment_type: {last_payment_type}",
-    ]
-    if last_payment_failure:
-        lines.append(f"last_payment_failure: {last_payment_failure}")
+    def _emit(lines: list[str], k: str, v: object, *, keep_blank: bool = False) -> None:
+        sv = str(v) if v is not None else ""
+        sv = sv.strip()
+        if not sv or sv == "—":
+            if keep_blank:
+                lines.append(f"{k}: —")
+            return
+        lines.append(f"{k}: {sv}")
+
+    lines: list[str] = []
+    _emit(lines, "status", status, keep_blank=True)
+    _emit(lines, "product", product_title)
+    _emit(lines, "member_since", member_since)
+    _emit(lines, "trial_end", trial_end_s)
+    _emit(lines, "renewal_start", rs)
+    _emit(lines, "renewal_end", re)
+    _emit(lines, "cancel_at_period_end", cape)
+    _emit(lines, "is_first_membership", is_first_s, keep_blank=True)
+
+    _emit(lines, "last_payment_status", last_payment_status)
+    _emit(lines, "last_payment_amount", last_payment_amount)
+    _emit(lines, "last_payment_at", last_payment_at)
+    _emit(lines, "last_payment_method", last_payment_method)
+    _emit(lines, "last_payment_type", last_payment_type)
+    _emit(lines, "last_payment_failure", last_payment_failure)
 
     embed = discord.Embed(title="🔎 Whop Membership", color=0x2B2D31, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Payment Info", value="\n".join(lines)[:1024], inline=False)
