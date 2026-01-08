@@ -129,6 +129,20 @@ SETTINGS_FILE = BASE_DIR / "settings.json"
 MEMBER_HISTORY_FILE = BASE_DIR / "member_history.json"
 WHOP_WEBHOOK_RAW_LOG_FILE = BASE_DIR / "whop_webhook_raw_payloads.json"
 BOOT_STATE_FILE = BASE_DIR / "boot_state.json"
+PAYMENT_CASES_FILE = BASE_DIR / "payment_cases.json"
+
+# Staff-only payment case channels (optional; configured under whop_api)
+PAYMENT_CASE_CATEGORY_ID = WHOP_API_CONFIG.get("payment_case_category_id")
+try:
+    PAYMENT_CASE_CATEGORY_ID = int(str(PAYMENT_CASE_CATEGORY_ID).strip()) if PAYMENT_CASE_CATEGORY_ID else None
+except Exception:
+    PAYMENT_CASE_CATEGORY_ID = None
+
+PAYMENT_CASE_ACCESS_ROLE_IDS = WHOP_API_CONFIG.get("payment_case_access_role_ids", [])
+try:
+    PAYMENT_CASE_ACCESS_ROLE_IDS = [int(str(x).strip()) for x in (PAYMENT_CASE_ACCESS_ROLE_IDS or [])]
+except Exception:
+    PAYMENT_CASE_ACCESS_ROLE_IDS = []
 
 # Message order keys
 DAY_KEYS = ["day_1", "day_2", "day_3", "day_4", "day_5", "day_6", "day_7a", "day_7b"]
@@ -382,6 +396,194 @@ def _save_member_history(db: dict) -> None:
     except Exception:
         pass
 
+
+def _load_payment_cases() -> dict:
+    """Load staff-only payment case tracking (dedupe, channel ids, counts)."""
+    try:
+        if not PAYMENT_CASES_FILE.exists() or PAYMENT_CASES_FILE.stat().st_size == 0:
+            return {}
+        return json.loads(PAYMENT_CASES_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_payment_cases(db: dict) -> None:
+    try:
+        PAYMENT_CASES_FILE.write_text(json.dumps(db, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _case_channel_name(discord_id: int) -> str:
+    return f"pay-{int(discord_id)}"
+
+
+def _parse_iso(dt_str: str) -> datetime | None:
+    try:
+        s = (dt_str or "").strip()
+        if not s:
+            return None
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _should_post_case(db: dict, discord_id: int, issue_key: str, cooldown_hours: float = 6.0) -> bool:
+    rec = db.get(str(int(discord_id))) if isinstance(db, dict) else None
+    if not isinstance(rec, dict):
+        return True
+
+    last_key = str(rec.get("last_issue_key") or "")
+    last_iso = str(rec.get("last_post_iso") or "")
+    if issue_key != last_key:
+        return True
+
+    last_dt = _parse_iso(last_iso)
+    if not last_dt:
+        return True
+
+    return (_now() - last_dt) >= timedelta(hours=cooldown_hours)
+
+
+async def _get_or_create_case_channel(guild: discord.Guild, member: discord.Member) -> discord.TextChannel | None:
+    """Return (or create) the staff-only per-user payment case channel.
+
+    IMPORTANT: The user/member is NOT granted channel access. This is for staff visibility only.
+    """
+    if not guild or not member:
+        return None
+    if not PAYMENT_CASE_CATEGORY_ID:
+        return None
+
+    category = guild.get_channel(PAYMENT_CASE_CATEGORY_ID)
+    if not isinstance(category, discord.CategoryChannel):
+        return None
+
+    db = _load_payment_cases()
+    uid = str(int(member.id))
+    rec = db.get(uid) if isinstance(db, dict) else None
+    if isinstance(rec, dict):
+        ch_id = rec.get("channel_id")
+        if str(ch_id).isdigit():
+            ch = guild.get_channel(int(ch_id))
+            if isinstance(ch, discord.TextChannel):
+                return ch
+
+    # Search existing channels in the category by topic marker
+    for ch in category.channels:
+        if isinstance(ch, discord.TextChannel):
+            topic = str(ch.topic or "")
+            if f"rschecker_payment_case discord_id={member.id}" in topic:
+                db[uid] = {
+                    "channel_id": ch.id,
+                    "created_at": _now().isoformat(),
+                    "last_issue_key": "",
+                    "last_post_iso": "",
+                    "issue_counts": {},
+                }
+                _save_payment_cases(db)
+                return ch
+
+    overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+    }
+
+    # Allow configured support roles (optional). Admins always have access regardless of overwrites.
+    for rid in PAYMENT_CASE_ACCESS_ROLE_IDS:
+        role = guild.get_role(rid)
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                embed_links=True,
+                attach_files=True,
+            )
+
+    # Allow the bot
+    me = getattr(guild, "me", None)
+    if me:
+        overwrites[me] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_channels=True,
+            manage_messages=True,
+            embed_links=True,
+            attach_files=True,
+        )
+
+    ch = await guild.create_text_channel(
+        name=_case_channel_name(member.id),
+        category=category,
+        overwrites=overwrites,
+        reason="RSCheckerbot: payment case channel",
+    )
+    with suppress(Exception):
+        await ch.edit(
+            topic=f"rschecker_payment_case discord_id={member.id} created_at={_now().isoformat()}",
+            reason="RSCheckerbot: set case topic",
+        )
+
+    db[uid] = {
+        "channel_id": ch.id,
+        "created_at": _now().isoformat(),
+        "last_issue_key": "",
+        "last_post_iso": "",
+        "issue_counts": {},
+    }
+    _save_payment_cases(db)
+    return ch
+
+
+async def _post_case_update(member: discord.Member, embed: discord.Embed, issue_key: str, cooldown_hours: float = 6.0) -> None:
+    """Post an embed update into the staff-only per-user case channel (deduped)."""
+    if not member or not member.guild:
+        return
+
+    ch = await _get_or_create_case_channel(member.guild, member)
+    if not ch:
+        return
+
+    # Ensure mentions are clickable but do NOT ping anyone
+    allowed = discord.AllowedMentions.none()
+
+    db = _load_payment_cases()
+    uid = str(int(member.id))
+    if not _should_post_case(db, member.id, issue_key, cooldown_hours=cooldown_hours):
+        return
+
+    # Increment issue count
+    rec = db.get(uid) if isinstance(db, dict) else None
+    if not isinstance(rec, dict):
+        rec = {}
+        db[uid] = rec
+    counts = rec.get("issue_counts")
+    if not isinstance(counts, dict):
+        counts = {}
+    counts[issue_key] = int(counts.get(issue_key, 0) or 0) + 1
+    rec["issue_counts"] = counts
+
+    # Add staff meta field (do not mutate existing field names)
+    try:
+        count_val = counts.get(issue_key, 1)
+        meta_lines = [
+            f"issue_key: {issue_key}",
+            f"alert_count: {count_val}",
+            f"cooldown_hours: {cooldown_hours}",
+        ]
+        if len(embed.fields) < 24:
+            embed.add_field(name="Staff Meta", value="\n".join(meta_lines)[:1024], inline=False)
+    except Exception:
+        pass
+
+    with suppress(Exception):
+        await ch.send(embed=embed, allowed_mentions=allowed)
+
+    rec["last_issue_key"] = issue_key
+    rec["last_post_iso"] = _now().isoformat()
+    _save_payment_cases(db)
+
 def _touch_join(discord_id: int) -> dict:
     """Record member join event, return history record"""
     now = int(datetime.now(timezone.utc).timestamp())
@@ -473,6 +675,9 @@ async def _add_whop_snapshot_to_embed(
     embed: discord.Embed,
     member: discord.Member,
     field_name: str = "Whop Snapshot",
+    prefetched_membership: dict | None = None,
+    prefetched_payments: list | None = None,
+    prefetched_membership_id: str | None = None,
 ) -> None:
     """Add a Whop API snapshot field (best-effort, non-blocking, membership_id-based).
 
@@ -495,7 +700,7 @@ async def _add_whop_snapshot_to_embed(
             return f"{local[:1]}***@{domain}"
         return f"{local[:2]}***@{domain}"
 
-    membership_id = get_cached_whop_membership_id(member.id)
+    membership_id = (prefetched_membership_id or "").strip() or get_cached_whop_membership_id(member.id)
 
     def _placeholder(mid: str) -> str:
         return "\n".join(
@@ -506,6 +711,8 @@ async def _add_whop_snapshot_to_embed(
                 "email: —",
                 "status: —",
                 "product: —",
+                "member_since: —",
+                "trial_end: —",
                 "renewal_start: —",
                 "renewal_end: —",
                 "cancel_at_period_end: —",
@@ -513,6 +720,8 @@ async def _add_whop_snapshot_to_embed(
                 "last_payment_status: —",
                 "last_payment_amount: —",
                 "last_payment_at: —",
+                "last_payment_method: —",
+                "last_payment_type: —",
             ]
         )[:1024]
 
@@ -520,10 +729,12 @@ async def _add_whop_snapshot_to_embed(
         embed.add_field(name=field_name, value=_placeholder(""), inline=False)
         return
 
-    try:
-        membership = await whop_api_client.get_membership_by_id(membership_id)
-    except Exception:
-        membership = None
+    membership = prefetched_membership if isinstance(prefetched_membership, dict) else None
+    if membership is None:
+        try:
+            membership = await whop_api_client.get_membership_by_id(membership_id)
+        except Exception:
+            membership = None
 
     if not membership:
         embed.add_field(name=field_name, value=_placeholder(membership_id), inline=False)
@@ -538,6 +749,11 @@ async def _add_whop_snapshot_to_embed(
     renewal_end = membership.get("renewal_period_end")
     rs = _fmt_discord_ts_any(renewal_start, "D") if renewal_start else "—"
     re = _fmt_discord_ts_any(renewal_end, "D") if renewal_end else "—"
+
+    created_at = membership.get("created_at")
+    member_since = _fmt_discord_ts_any(created_at, "D") if created_at else "—"
+    trial_end = membership.get("trial_end") or membership.get("trial_ends_at") or membership.get("trial_end_at")
+    trial_end_s = _fmt_discord_ts_any(trial_end, "D") if trial_end else "—"
 
     cancel_at_period_end = membership.get("cancel_at_period_end")
     cape = "—"
@@ -570,10 +786,14 @@ async def _add_whop_snapshot_to_embed(
     last_payment_amount = "—"
     last_payment_at = "—"
     last_payment_failure = ""
+    last_payment_method = "—"
+    last_payment_type = "—"
 
-    payments = []
-    with suppress(Exception):
-        payments = await whop_api_client.get_payments_for_membership(membership_id)
+    payments = prefetched_payments if isinstance(prefetched_payments, list) else None
+    if payments is None:
+        payments = []
+        with suppress(Exception):
+            payments = await whop_api_client.get_payments_for_membership(membership_id)
 
     if payments and isinstance(payments, list) and isinstance(payments[0], dict):
         p0 = payments[0]
@@ -585,6 +805,14 @@ async def _add_whop_snapshot_to_embed(
         created0 = p0.get("created_at") or ""
         paid_at = p0.get("paid_at") or ""
         failure_msg = str(p0.get("failure_message") or "").strip()
+        card_brand = str(p0.get("card_brand") or "").strip()
+        card_last4 = str(p0.get("card_last4") or "").strip()
+        pm_type = (
+            p0.get("payment_method_type")
+            or p0.get("payment_type")
+            or p0.get("type")
+            or p0.get("method")
+        )
 
         if status0:
             last_payment_status = status0 + (f" ({substatus0})" if substatus0 else "")
@@ -596,6 +824,10 @@ async def _add_whop_snapshot_to_embed(
             last_payment_at = _fmt_discord_ts_any(created0, "R")
         if failure_msg:
             last_payment_failure = failure_msg[:140]
+        if card_brand and card_last4:
+            last_payment_method = f"{card_brand.upper()} ****{card_last4}"
+        if pm_type:
+            last_payment_type = str(pm_type).strip()
 
     lines = [
         f"membership_id: {membership_id}",
@@ -604,6 +836,8 @@ async def _add_whop_snapshot_to_embed(
         f"email: {whop_email}",
         f"status: {status}",
         f"product: {product_title}",
+        f"member_since: {member_since}",
+        f"trial_end: {trial_end_s}",
         f"renewal_start: {rs}",
         f"renewal_end: {re}",
         f"cancel_at_period_end: {cape}",
@@ -611,6 +845,8 @@ async def _add_whop_snapshot_to_embed(
         f"last_payment_status: {last_payment_status}",
         f"last_payment_amount: {last_payment_amount}",
         f"last_payment_at: {last_payment_at}",
+        f"last_payment_method: {last_payment_method}",
+        f"last_payment_type: {last_payment_type}",
     ]
     if last_payment_failure:
         lines.append(f"last_payment_failure: {last_payment_failure}")
@@ -896,7 +1132,8 @@ async def log_member_status(msg: str, embed: discord.Embed = None):
                         timestamp=datetime.now(timezone.utc)
                     )
                     embed.set_footer(text="RSCheckerbot • Member Status Tracking")
-                await ch.send(embed=embed)
+                # Mentions should be clickable but MUST NOT ping users.
+                await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 async def search_whop_logs_for_user(discord_id: int, lookback_hours: int = 24) -> dict:
     """Search Whop logs channel for user's cancellation/subscription info"""
@@ -1565,6 +1802,48 @@ async def sync_whop_memberships():
             if not membership_id:
                 continue
             verification = await whop_api_client.verify_membership_status(membership_id, "active")
+
+            # Cancellation scheduled signal (active/trialing but cancel_at_period_end=true).
+            # This does NOT DM users; it's staff-only visibility (case channel + member status logs).
+            membership_data = verification.get("membership_data") if isinstance(verification, dict) else None
+            if isinstance(membership_data, dict):
+                status_now = str(membership_data.get("status") or "").strip().lower()
+                cape_now = membership_data.get("cancel_at_period_end")
+                if cape_now is True and status_now in ("active", "trialing"):
+                    embed = discord.Embed(
+                        title="⚠️ Cancellation Scheduled",
+                        color=0xFEE75C,  # Yellow
+                        timestamp=datetime.now(timezone.utc),
+                    )
+                    _apply_member_header(embed, member)
+                    hist = get_member_history(member.id) or {}
+                    member_lines = [
+                        f"member: {member.mention}",
+                        f"user_id: {member.id}",
+                        f"first_joined: {_fmt_ts(hist.get('first_join_ts'), 'D')}",
+                        f"join_count: {hist.get('join_count', '—')}",
+                    ]
+                    embed.add_field(name="Member Info", value="\n".join(member_lines)[:1024], inline=False)
+
+                    discord_lines = [
+                        f"access_roles: {_access_roles_plain(member)}",
+                        "reason: cancel_at_period_end=true (user may have canceled to prevent renewal)",
+                    ]
+                    embed.add_field(name="Discord Info", value="\n".join(discord_lines)[:1024], inline=False)
+
+                    # Use prefetched membership to avoid an extra membership fetch; skip payments for sync-signal.
+                    await _add_whop_snapshot_to_embed(
+                        embed,
+                        member,
+                        field_name="Payment Info",
+                        prefetched_membership=membership_data,
+                        prefetched_payments=[],
+                        prefetched_membership_id=membership_id,
+                    )
+                    await log_member_status("", embed=embed)
+                    renewal_end_key = str(membership_data.get("renewal_period_end") or "").strip()
+                    issue_key = f"cancel_scheduled:{membership_id}:{renewal_end_key}"
+                    await _post_case_update(member, embed, issue_key=issue_key, cooldown_hours=24.0)
             
             if not verification["matches"]:
                 actual_status = verification["actual_status"]
@@ -2184,6 +2463,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             embed.set_footer(text="RSCheckerbot • Member Status Tracking")
             
             await log_member_status("", embed=embed)
+            await _post_case_update(after, embed, issue_key="payment_cancellation_detected", cooldown_hours=6.0)
         
         log_msg = (
             f"📉 **Member Role Removed:** {_fmt_user(after)}\n"
@@ -2223,19 +2503,29 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                 timestamp=datetime.now(timezone.utc),
             )
             _apply_member_header(embed, after)
-            embed.add_field(name="Member", value=after.mention, inline=False)
-            embed.add_field(name="User ID", value=str(after.id), inline=False)
-            embed.add_field(name="Roles Added", value=added_names, inline=False)
-            embed.add_field(
-                name="Reason",
-                value="Member role regained — may indicate subscription reactivated or payment successful",
-                inline=False,
-            )
-            if hist.get("first_join_ts"):
-                embed.add_field(name="First Joined", value=_fmt_ts(hist.get("first_join_ts"), "D"), inline=True)
-            if hist.get("join_count"):
-                embed.add_field(name="Join Count", value=str(hist.get("join_count")), inline=True)
+
+            member_lines = [
+                f"member: {after.mention}",
+                f"user_id: {after.id}",
+                f"first_joined: {_fmt_ts(hist.get('first_join_ts'), 'D')}",
+                f"join_count: {hist.get('join_count', '—')}",
+            ]
+            embed.add_field(name="Member Info", value="\n".join(member_lines)[:1024], inline=False)
+
+            discord_lines = [
+                f"roles_added: {added_names}",
+                f"access_roles_now: {_access_roles_plain(after)}",
+                "reason: member_role_regained (reactivation/payment success)",
+            ]
+            if removed_names:
+                discord_lines.insert(1, f"roles_removed: {removed_names}")
+            embed.add_field(name="Discord Info", value="\n".join(discord_lines)[:1024], inline=False)
+
+            await _add_whop_snapshot_to_embed(embed, after, field_name="Payment Info")
+            embed.set_footer(text="RSCheckerbot • Member Status Tracking")
+
             await log_member_status("", embed=embed)
+            await _post_case_update(after, embed, issue_key="payment_reactivated", cooldown_hours=2.0)
         
         if has_former_member_role(after):
             role = after.guild.get_role(FORMER_MEMBER_ROLE)
@@ -2527,10 +2817,17 @@ async def whop_membership_lookup(ctx, membership_id: str):
     if isinstance((membership or {}).get("member"), dict):
         whop_member_id = str(membership["member"].get("id") or "").strip() or "—"
 
+    created_at = (membership or {}).get("created_at")
+    member_since = _fmt_discord_ts_any(created_at, "D") if created_at else "—"
+    trial_end = (membership or {}).get("trial_end") or (membership or {}).get("trial_ends_at") or (membership or {}).get("trial_end_at")
+    trial_end_s = _fmt_discord_ts_any(trial_end, "D") if trial_end else "—"
+
     last_payment_status = "—"
     last_payment_amount = "—"
     last_payment_at = "—"
     last_payment_failure = ""
+    last_payment_method = "—"
+    last_payment_type = "—"
 
     payments = []
     with suppress(Exception):
@@ -2546,6 +2843,14 @@ async def whop_membership_lookup(ctx, membership_id: str):
         created0 = p0.get("created_at") or ""
         paid_at = p0.get("paid_at") or ""
         failure_msg = str(p0.get("failure_message") or "").strip()
+        card_brand = str(p0.get("card_brand") or "").strip()
+        card_last4 = str(p0.get("card_last4") or "").strip()
+        pm_type = (
+            p0.get("payment_method_type")
+            or p0.get("payment_type")
+            or p0.get("type")
+            or p0.get("method")
+        )
 
         if status0:
             last_payment_status = status0 + (f" ({substatus0})" if substatus0 else "")
@@ -2557,12 +2862,18 @@ async def whop_membership_lookup(ctx, membership_id: str):
             last_payment_at = _fmt_discord_ts_any(created0, "R")
         if failure_msg:
             last_payment_failure = failure_msg[:140]
+        if card_brand and card_last4:
+            last_payment_method = f"{card_brand.upper()} ****{card_last4}"
+        if pm_type:
+            last_payment_type = str(pm_type).strip()
 
     lines = [
         f"membership_id: {mid}",
         f"member_id: {whop_member_id}",
         f"status: {status}",
         f"product: {product_title}",
+        f"member_since: {member_since}",
+        f"trial_end: {trial_end_s}",
         f"renewal_start: {rs}",
         f"renewal_end: {re}",
         f"cancel_at_period_end: {cape}",
@@ -2570,6 +2881,8 @@ async def whop_membership_lookup(ctx, membership_id: str):
         f"last_payment_status: {last_payment_status}",
         f"last_payment_amount: {last_payment_amount}",
         f"last_payment_at: {last_payment_at}",
+        f"last_payment_method: {last_payment_method}",
+        f"last_payment_type: {last_payment_type}",
     ]
     if last_payment_failure:
         lines.append(f"last_payment_failure: {last_payment_failure}")
