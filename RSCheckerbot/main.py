@@ -878,6 +878,7 @@ async def log_whop(msg: str):
 
 PAYMENT_FAILURE_CHANNEL_NAME = "payment-failure"
 MEMBER_CANCELLATION_CHANNEL_NAME = "member-cancelation"
+STAFF_ALERTS_CATEGORY_ID = 1458533733681598654
 
 
 def _find_text_channel_by_name(guild: discord.Guild, name: str) -> discord.TextChannel | None:
@@ -891,21 +892,20 @@ def _find_text_channel_by_name(guild: discord.Guild, name: str) -> discord.TextC
 
 
 async def _ensure_alert_channels(guild: discord.Guild) -> None:
-    """Ensure the two staff alert channels exist, created in the same category as member status logs if possible."""
+    """Ensure the two staff alert channels exist and live under the staff alerts category."""
     if not guild:
         return
-    # Prefer the existing member status logs channel's category for consistent perms/layout.
-    category = None
-    try:
-        if MEMBER_STATUS_LOGS_CHANNEL_ID:
-            base_ch = bot.get_channel(MEMBER_STATUS_LOGS_CHANNEL_ID)
-            if isinstance(base_ch, discord.TextChannel):
-                category = base_ch.category
-    except Exception:
+    category = guild.get_channel(STAFF_ALERTS_CATEGORY_ID)
+    if not isinstance(category, discord.CategoryChannel):
         category = None
 
     for name in (PAYMENT_FAILURE_CHANNEL_NAME, MEMBER_CANCELLATION_CHANNEL_NAME):
-        if _find_text_channel_by_name(guild, name):
+        existing = _find_text_channel_by_name(guild, name)
+        if existing:
+            # Best-effort: ensure it is inside the category for visibility/organization.
+            if category and getattr(existing, "category_id", None) != category.id:
+                with suppress(Exception):
+                    await existing.edit(category=category, reason="RSCheckerbot: move staff alert channel into category")
             continue
         try:
             await guild.create_text_channel(name=name, category=category, reason="RSCheckerbot: staff alert channel")
