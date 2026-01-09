@@ -766,6 +766,130 @@ def _add_summary_field(embed: discord.Embed, lines: list[str], *, name: str = "S
     embed.add_field(name=name, value=text, inline=False)
 
 
+def _kv_line(key: str, value: object, *, keep_blank: bool = False) -> str | None:
+    """Format `key: value` while hiding blanks by default."""
+    k = str(key or "").strip()
+    if not k:
+        return None
+    if value is None:
+        return f"{k}: —" if keep_blank else None
+    s = str(value).strip()
+    if not s or s == "—":
+        return f"{k}: —" if keep_blank else None
+    return f"{k}: {s}"
+
+
+def _kv_block(pairs: list[tuple[str, object]], *, keep_blank_keys: set[str] | None = None) -> str:
+    keep = keep_blank_keys or set()
+    lines: list[str] = []
+    for k, v in pairs:
+        line = _kv_line(k, v, keep_blank=(k in keep))
+        if line:
+            lines.append(line)
+    return ("\n".join(lines)[:1024]) if lines else "—"
+
+
+def _brief_payment_kv(brief: dict | None) -> list[tuple[str, object]]:
+    b = brief if isinstance(brief, dict) else {}
+    return [
+        ("status", b.get("status")),
+        ("product", b.get("product")),
+        ("member_since", b.get("member_since")),
+        ("trial_end", b.get("trial_end")),
+        ("renewal_start", b.get("renewal_start")),
+        ("renewal_end", b.get("renewal_end")),
+        ("cancel_at_period_end", b.get("cancel_at_period_end")),
+        ("is_first_membership", b.get("is_first_membership")),
+        ("last_payment_method", b.get("last_payment_method")),
+        ("last_payment_type", b.get("last_payment_type")),
+        ("last_payment_failure", b.get("last_payment_failure")),
+    ]
+
+
+def _build_case_minimal_embed(
+    *,
+    title: str,
+    member: discord.Member,
+    access_roles: str,
+    whop_brief: dict | None,
+    color: int,
+) -> discord.Embed:
+    """Minimal staff case embed (matches requested format)."""
+    b = whop_brief if isinstance(whop_brief, dict) else {}
+    embed = discord.Embed(
+        title=title,
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+    _apply_member_header(embed, member)
+    embed.add_field(
+        name="Member Info",
+        value=_kv_block(
+            [
+                ("member", member.mention),
+                ("product", b.get("product")),
+                ("member_since", b.get("member_since")),
+                ("renewal_start", b.get("renewal_start")),
+                ("renewal_end", b.get("renewal_end")),
+            ]
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Discord Info",
+        value=_kv_block([("access_roles", access_roles)]),
+        inline=False,
+    )
+    embed.set_footer(text="RSCheckerbot")
+    return embed
+
+
+def _build_member_status_detailed_embed(
+    *,
+    title: str,
+    member: discord.Member,
+    access_roles: str,
+    color: int,
+    discord_kv: list[tuple[str, object]] | None = None,
+    member_kv: list[tuple[str, object]] | None = None,
+    whop_brief: dict | None = None,
+) -> discord.Embed:
+    """Detailed staff embed for member-status-logs (more complete card)."""
+    embed = discord.Embed(
+        title=title,
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+    _apply_member_header(embed, member)
+    embed.add_field(
+        name="Member Info",
+        value=_kv_block(
+            [
+                ("member", member.mention),
+                *([p for p in (member_kv or []) if isinstance(p, tuple) and len(p) == 2]),
+            ]
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Discord Info",
+        value=_kv_block(
+            [
+                ("access_roles", access_roles),
+                *([p for p in (discord_kv or []) if isinstance(p, tuple) and len(p) == 2]),
+            ]
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Payment Info",
+        value=_kv_block(_brief_payment_kv(whop_brief), keep_blank_keys={"is_first_membership"}),
+        inline=False,
+    )
+    embed.set_footer(text="RSCheckerbot • Member Status Tracking")
+    return embed
+
+
 def _access_roles_plain(member: discord.Member) -> str:
     """Return a compact list of access-relevant role names (no mentions).
 
@@ -925,6 +1049,8 @@ async def log_member_status(msg: str, embed: discord.Embed = None, *, channel_na
     ch: discord.TextChannel | None = None
     if channel_name:
         ch = _find_text_channel_by_name(guild, channel_name)
+        if ch is None:
+            log.warning(f"[Log] Requested channel '{channel_name}' not found; falling back to member_status_logs_channel_id")
     if ch is None and MEMBER_STATUS_LOGS_CHANNEL_ID:
         base = bot.get_channel(MEMBER_STATUS_LOGS_CHANNEL_ID)
         ch = base if isinstance(base, discord.TextChannel) else None
@@ -1569,29 +1695,37 @@ async def sync_whop_memberships():
                     if not _should_post_alert(db_alerts, member.id, issue_key, cooldown_hours=24.0):
                         continue
 
-                    embed = discord.Embed(
-                        title="⚠️ Cancellation Scheduled",
-                        description=f"Update for {member.mention}",
-                        color=0xFEE75C,  # Yellow
-                        timestamp=datetime.now(timezone.utc),
-                    )
-                    _apply_member_header(embed, member)
-
                     access = _access_roles_plain(member)
-                    _add_staff_fields(embed, member=member, access_roles=access)
+                    whop_brief = await _fetch_whop_brief_by_membership_id(membership_id)
 
-                    product_title = "—"
-                    if isinstance(membership_data.get("product"), dict):
-                        product_title = str(membership_data["product"].get("title") or "").strip() or "—"
+                    # Detailed card -> member-status-logs
+                    hist = get_member_history(member.id) or {}
+                    detailed = _build_member_status_detailed_embed(
+                        title="⚠️ Cancellation Scheduled",
+                        member=member,
+                        access_roles=access,
+                        color=0xFEE75C,
+                        member_kv=[
+                            ("first_joined", _fmt_ts(hist.get("first_join_ts"), "D") if hist.get("first_join_ts") else "—"),
+                            ("join_count", hist.get("join_count") or "—"),
+                        ],
+                        discord_kv=[
+                            ("reason", "cancel_at_period_end=true"),
+                        ],
+                        whop_brief=whop_brief,
+                    )
+                    await log_member_status("", embed=detailed)
 
-                    lines = [
-                        f"{product_title}" if product_title != "—" else "",
-                        f"Member since {_fmt_date_any(membership_data.get('created_at'))}",
-                        f"Renewal {_fmt_date_any(membership_data.get('renewal_period_start'))} to {_fmt_date_any(membership_data.get('renewal_period_end'))}",
-                    ]
-                    _add_summary_field(embed, lines)
+                    # Minimal card -> member-cancelation
+                    minimal = _build_case_minimal_embed(
+                        title="⚠️ Cancellation Scheduled",
+                        member=member,
+                        access_roles=access,
+                        whop_brief=whop_brief,
+                        color=0xFEE75C,
+                    )
+                    await log_member_status("", embed=minimal, channel_name=MEMBER_CANCELLATION_CHANNEL_NAME)
 
-                    await log_member_status("", embed=embed, channel_name=MEMBER_CANCELLATION_CHANNEL_NAME)
                     _record_alert_post(db_alerts, member.id, issue_key)
                     _save_staff_alerts(db_alerts)
             
@@ -1952,13 +2086,6 @@ async def on_member_join(member: discord.Member):
         if MEMBER_STATUS_LOGS_CHANNEL_ID:
             ch = bot.get_channel(MEMBER_STATUS_LOGS_CHANNEL_ID)
             if ch:
-                embed = discord.Embed(
-                    title="👋 Member Joined",
-                    color=0x00FF00,  # Green
-                    timestamp=datetime.now(timezone.utc)
-                )
-                _apply_member_header(embed, member)
-
                 inviter_s = "—"
                 if used_invite_inviter_name and used_invite_inviter_id:
                     inviter_s = f"{used_invite_inviter_name} ({used_invite_inviter_id})"
@@ -1970,17 +2097,30 @@ async def on_member_join(member: discord.Member):
                     tracked_s = "yes" if is_tracked else "no"
                     source_s = "one_time_invite" if is_tracked else "untracked_or_external"
                 access = _access_roles_plain(member)
-                _add_staff_fields(embed, member=member, access_roles=access)
-                embed.add_field(name="Invite", value=(f"`{used_invite_code}`" if used_invite_code else "—"), inline=True)
-                _add_summary_field(
-                    embed,
-                    [
-                        f"Invited by {inviter_s}" if inviter_s != "—" else "",
-                        f"Tracked invite: {tracked_s}" if tracked_s != "—" else "",
-                        f"Source: {source_s}" if source_s != "—" else "",
+
+                # Detailed card in member-status-logs
+                mid = get_cached_whop_membership_id(member.id)
+                whop_brief = await _fetch_whop_brief_by_membership_id(mid) if mid else {}
+                detailed = _build_member_status_detailed_embed(
+                    title="👋 Member Joined",
+                    member=member,
+                    access_roles=access,
+                    color=0x57F287,
+                    member_kv=[
+                        ("account_created", member.created_at.strftime("%b %d, %Y")),
+                        ("first_joined", _fmt_ts(rec.get("first_join_ts"), "D")),
+                        ("join_count", rec.get("join_count", 1)),
+                        ("returning_member", "true" if rec.get("join_count", 0) > 1 else "false"),
                     ],
+                    discord_kv=[
+                        ("invite_code", used_invite_code or "—"),
+                        ("invited_by", inviter_s),
+                        ("tracked_invite", tracked_s),
+                        ("source", source_s),
+                    ],
+                    whop_brief=whop_brief,
                 )
-                await log_member_status("", embed=embed)
+                await log_member_status("", embed=detailed)
         
         guild = member.guild
         current_roles = {r.id for r in member.roles}
@@ -2036,24 +2176,26 @@ async def on_member_remove(member: discord.Member):
         if MEMBER_STATUS_LOGS_CHANNEL_ID:
             ch = bot.get_channel(MEMBER_STATUS_LOGS_CHANNEL_ID)
             if ch:
-                embed = discord.Embed(
-                    title="🚪 Member Left",
-                    color=0xFFA500,  # Orange
-                    timestamp=datetime.now(timezone.utc)
-                )
-                _apply_member_header(embed, member)
-
                 access = _access_roles_plain(member)
-                _add_staff_fields(embed, member=member, access_roles=access)
-                _add_summary_field(
-                    embed,
-                    [
-                        f"Left at {_fmt_date_any(rec.get('last_leave_ts'))}",
-                        f"First joined {_fmt_date_any(rec.get('first_join_ts'))}" if rec.get("first_join_ts") else "",
-                        f"Join count {rec.get('join_count')}" if rec.get("join_count") else "",
+
+                mid = get_cached_whop_membership_id(member.id)
+                whop_brief = await _fetch_whop_brief_by_membership_id(mid) if mid else {}
+                detailed = _build_member_status_detailed_embed(
+                    title="🚪 Member Left",
+                    member=member,
+                    access_roles=access,
+                    color=0xFAA61A,
+                    member_kv=[
+                        ("left_at", _fmt_ts(rec.get("last_leave_ts"), "D") if rec.get("last_leave_ts") else "—"),
+                        ("first_joined", _fmt_ts(rec.get("first_join_ts"), "D") if rec.get("first_join_ts") else "—"),
+                        ("join_count", rec.get("join_count") or "—"),
                     ],
+                    discord_kv=[
+                        ("access_roles_at_leave", access),
+                    ],
+                    whop_brief=whop_brief,
                 )
-                await log_member_status("", embed=embed)
+                await log_member_status("", embed=detailed)
 
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
@@ -2180,47 +2322,44 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             whop_brief = await _fetch_whop_brief_by_membership_id(whop_mid) if whop_mid else {}
             whop_status = str((whop_brief.get("status") or "")).strip().lower()
             is_payment_failed = whop_status in ("past_due", "unpaid") or bool(whop_brief.get("last_payment_failure"))
-
-            embed = discord.Embed(
-                title="💳 Payment Failed — Action Needed" if is_payment_failed else "💳 Payment Cancellation Detected",
-                description=f"Update for {after.mention}",
-                color=0xED4245 if is_payment_failed else 0xFF0000,
-                timestamp=datetime.now(timezone.utc)
-            )
-
-            _apply_member_header(embed, after)
             access = _access_roles_plain(after)
-            _add_staff_fields(embed, member=after, access_roles=access)
-
-            lines = []
-            if whop_brief:
-                product = str(whop_brief.get("product") or "").strip()
-                if product and product != "—":
-                    lines.append(product)
-                if whop_status and whop_status != "—":
-                    lines.append(f"Status {whop_status}")
-                if whop_brief.get("renewal_end") and whop_brief["renewal_end"] != "—":
-                    lines.append(f"Renewal ends {whop_brief['renewal_end']}")
-                if is_payment_failed:
-                    if whop_brief.get("last_payment_method") and whop_brief["last_payment_method"] != "—":
-                        lines.append(f"Method {whop_brief['last_payment_method']}")
-                    if whop_brief.get("last_payment_type") and whop_brief["last_payment_type"] != "—":
-                        lines.append(f"Type {whop_brief['last_payment_type']}")
-                    if whop_brief.get("last_payment_failure"):
-                        lines.append(f"Failure: {whop_brief['last_payment_failure']}")
-            if removed_names and removed_names != "—":
-                lines.append(f"Roles removed: {removed_names}")
-            if access and access != "—":
-                lines.append(f"Access now: {access}")
-            _add_summary_field(embed, lines)
-
-            embed.set_footer(text="RSCheckerbot • Member Status Tracking")
-            
             db_alerts = _load_staff_alerts()
             issue_key = f"payment_failed:{whop_status}" if is_payment_failed else "payment_cancellation_detected"
             if _should_post_alert(db_alerts, after.id, issue_key, cooldown_hours=6.0):
                 dest = PAYMENT_FAILURE_CHANNEL_NAME if is_payment_failed else MEMBER_CANCELLATION_CHANNEL_NAME
-                await log_member_status("", embed=embed, channel_name=dest)
+                title = "💳 Payment Failed — Action Needed" if is_payment_failed else "💳 Payment Cancellation Detected"
+                color = 0xED4245 if is_payment_failed else 0xFF0000
+
+                # Detailed card -> member-status-logs
+                hist = get_member_history(after.id) or {}
+                detailed = _build_member_status_detailed_embed(
+                    title=title,
+                    member=after,
+                    access_roles=access,
+                    color=color,
+                    member_kv=[
+                        ("account_created", after.created_at.strftime("%b %d, %Y")),
+                        ("first_joined", _fmt_ts(hist.get("first_join_ts"), "D") if hist.get("first_join_ts") else "—"),
+                        ("join_count", hist.get("join_count") or "—"),
+                    ],
+                    discord_kv=[
+                        ("roles_removed", removed_names),
+                        ("reason", "member_role_removed"),
+                    ],
+                    whop_brief=whop_brief,
+                )
+                await log_member_status("", embed=detailed)
+
+                # Minimal card -> case channel
+                minimal = _build_case_minimal_embed(
+                    title=title,
+                    member=after,
+                    access_roles=access,
+                    whop_brief=whop_brief,
+                    color=color,
+                )
+                await log_member_status("", embed=minimal, channel_name=dest)
+
                 _record_alert_post(db_alerts, after.id, issue_key)
                 _save_staff_alerts(db_alerts)
         
@@ -2254,31 +2393,43 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         # If Member role was the ONLY role added, likely payment reactivation
         only_member_added = len(all_added_in_update) == 1
         if only_member_added:
-            # Log to member status channel for payment tracking (structured embed + avatar)
-            hist = get_member_history(after.id) or {}
-            embed = discord.Embed(
-                title="✅ Payment Reactivated",
-                description=f"Update for {after.mention}",
-                color=0x57F287,  # Green
-                timestamp=datetime.now(timezone.utc),
-            )
-            _apply_member_header(embed, after)
             access = _access_roles_plain(after)
-            _add_staff_fields(embed, member=after, access_roles=access)
-
-            lines = []
-            if added_names and added_names != "—":
-                lines.append(f"Roles added: {added_names}")
-            if access and access != "—":
-                lines.append(f"Access now: {access}")
-            _add_summary_field(embed, lines)
-
-            embed.set_footer(text="RSCheckerbot • Member Status Tracking")
-
             db_alerts = _load_staff_alerts()
             issue_key = "payment_reactivated"
             if _should_post_alert(db_alerts, after.id, issue_key, cooldown_hours=2.0):
-                await log_member_status("", embed=embed, channel_name=PAYMENT_FAILURE_CHANNEL_NAME)
+                whop_mid = get_cached_whop_membership_id(after.id)
+                whop_brief = await _fetch_whop_brief_by_membership_id(whop_mid) if whop_mid else {}
+                hist = get_member_history(after.id) or {}
+
+                # Detailed card -> member-status-logs
+                detailed = _build_member_status_detailed_embed(
+                    title="✅ Payment Reactivated",
+                    member=after,
+                    access_roles=access,
+                    color=0x57F287,
+                    member_kv=[
+                        ("first_joined", _fmt_ts(hist.get("first_join_ts"), "D") if hist.get("first_join_ts") else "—"),
+                        ("join_count", hist.get("join_count") or "—"),
+                    ],
+                    discord_kv=[
+                        ("roles_added", added_names),
+                        ("roles_removed", removed_names or "—"),
+                        ("reason", "member_role_regained"),
+                    ],
+                    whop_brief=whop_brief,
+                )
+                await log_member_status("", embed=detailed)
+
+                # Minimal card -> payment-failure channel
+                minimal = _build_case_minimal_embed(
+                    title="✅ Payment Reactivated",
+                    member=after,
+                    access_roles=access,
+                    whop_brief=whop_brief,
+                    color=0x57F287,
+                )
+                await log_member_status("", embed=minimal, channel_name=PAYMENT_FAILURE_CHANNEL_NAME)
+
                 _record_alert_post(db_alerts, after.id, issue_key)
                 _save_staff_alerts(db_alerts)
         
