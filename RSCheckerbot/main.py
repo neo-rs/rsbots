@@ -907,8 +907,13 @@ async def _ensure_alert_channels(guild: discord.Guild) -> None:
     for name in (PAYMENT_FAILURE_CHANNEL_NAME, MEMBER_CANCELLATION_CHANNEL_NAME):
         if _find_text_channel_by_name(guild, name):
             continue
-        with suppress(Exception):
+        try:
             await guild.create_text_channel(name=name, category=category, reason="RSCheckerbot: staff alert channel")
+        except Exception as e:
+            # Fallback: category permissions can block creation even if the bot can create channels in general.
+            log.warning(f"[Alerts] Failed to create #{name} in category; retrying without category: {e}")
+            with suppress(Exception):
+                await guild.create_text_channel(name=name, reason="RSCheckerbot: staff alert channel (fallback)")
 
 
 async def log_member_status(msg: str, embed: discord.Embed = None, *, channel_name: str | None = None):
