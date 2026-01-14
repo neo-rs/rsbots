@@ -7,11 +7,16 @@
 # Allow helper scripts at repo root
 !/push_rsbots_py_only.bat
 
+# Allow canonical docs at repo root
+!/CANONICAL_RULES.md
+
 # Only allow python from the RS bot folders
 !RSAdminBot/
 !RSAdminBot/**/
 !RSAdminBot/*.py
 !RSAdminBot/**/*.py
+!RSAdminBot/*.sh
+!RSAdminBot/**/*.sh
 
 !RSCheckerbot/
 !RSCheckerbot/**/
@@ -43,6 +48,11 @@
 !scripts/**/
 !scripts/*.py
 !scripts/**/*.py
+
+# Allow systemd unit templates (used for deployment)
+!systemd/
+!systemd/**/
+!systemd/*.service
 
 # Explicitly keep legacy/original sources out of GitHub
 RSAdminBot/original_files/**

@@ -960,45 +960,54 @@ async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embe
                     should_alert = False
             
             if should_alert and _log_member_status:
-                # Create embed with structured fields (like Success Bot format)
-                embed = discord.Embed(
-                    title="🚩 Trial Abuse Signal",
-                    color=0xFF6B6B,  # Red/orange for alert
-                    timestamp=datetime.now(timezone.utc)
-                )
-                
-                # Format Discord member mention and User ID
                 guild = message.guild if message.guild else None
-                if discord_user_id:
+                mem: discord.Member | None = None
+                if discord_user_id and guild:
                     try:
-                        user_id_int = int(discord_user_id)
-                        if guild:
-                            member = guild.get_member(user_id_int)
-                            if member:
-                                embed.add_field(name="Member", value=member.mention, inline=False)
-                                embed.add_field(name="User ID", value=str(user_id_int), inline=False)
-                            else:
-                                # User not in guild, use mention format
-                                embed.add_field(name="Member", value=f"<@{user_id_int}>", inline=False)
-                                embed.add_field(name="User ID", value=str(user_id_int), inline=False)
-                        else:
-                            embed.add_field(name="Member", value=f"<@{user_id_int}>", inline=False)
-                            embed.add_field(name="User ID", value=str(user_id_int), inline=False)
-                    except (ValueError, TypeError):
-                        embed.add_field(name="User ID", value=str(discord_user_id), inline=False)
+                        user_id_int = int(str(discord_user_id).strip())
+                        mem = await _resolve_member_safe(guild, user_id_int, force_fetch=True)
+                    except Exception:
+                        mem = None
+
+                if mem:
+                    whop_brief = await _whop_brief_from_event(mem, event_data)
+                    access = _access_roles_compact(mem)
+                    detailed = build_member_status_detailed_embed(
+                        title="🚩 Trial Abuse Signal",
+                        member=mem,
+                        access_roles=access,
+                        color=0xED4245,
+                        discord_kv=[
+                            ("event", str(event_type or "").strip() or "whop_workflow"),
+                            ("reason", info.get("reason", "Unknown")),
+                            ("email", _norm_email(email) if email else "—"),
+                        ],
+                        whop_brief=whop_brief,
+                    )
+                    await _log_member_status("", embed=detailed)
                 else:
-                    embed.add_field(name="User ID", value="N/A", inline=False)
-                
-                # Email field
-                if email:
-                    embed.add_field(name="Email", value=f"`{_norm_email(email)}`", inline=False)
-                
-                # Reason field
-                embed.add_field(name="Reason", value=info.get('reason', 'Unknown'), inline=False)
-                
-                embed.set_footer(text="RSCheckerbot • Member Status Tracking")
-                
-                await _log_member_status("", embed=embed)
+                    # Fallback (no resolved member): still avoid legacy field names.
+                    embed = discord.Embed(
+                        title="🚩 Trial Abuse Signal",
+                        color=0xED4245,
+                        timestamp=datetime.now(timezone.utc),
+                    )
+                    embed.add_field(
+                        name="Member Info",
+                        value=f"discord_id `{str(discord_user_id or 'N/A')}`",
+                        inline=False,
+                    )
+                    embed.add_field(
+                        name="Discord Info",
+                        value=f"event `{str(event_type or '').strip()}`",
+                        inline=False,
+                    )
+                    embed.add_field(
+                        name="Payment Info",
+                        value=f"reason `{info.get('reason','Unknown')}`",
+                        inline=False,
+                    )
+                    await _log_member_status("", embed=embed)
         
         if not discord_user_id:
             if _log_other:

@@ -11,6 +11,9 @@ This is used for:
 - producing a structured JSON trace of API actions/outcomes
 
 No secrets are embedded; this script reads server-only secrets on Oracle.
+
+NOTE: This script intentionally reuses RSCheckerbot's canonical embed builders and Whop brief fetch
+to avoid duplicate formatting logic.
 """
 
 from __future__ import annotations
@@ -19,7 +22,6 @@ import argparse
 import asyncio
 import json
 import os
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -34,41 +36,8 @@ def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _fmt_date_any(v: object) -> str:
-    if v is None:
-        return "—"
-    s = str(v).strip()
-    if not s:
-        return "—"
-    try:
-        # ISO-ish timestamps from Whop
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        out = dt.astimezone(timezone.utc).strftime("%B %d, %Y")
-        return out.replace(" 0", " ")
-    except Exception:
-        return "—"
-
-
-def _kv_line(key: str, value: object, *, keep_blank: bool = False) -> str | None:
-    k = str(key or "").strip()
-    if not k:
-        return None
-    if value is None:
-        return f"{k}: —" if keep_blank else None
-    s = str(value).strip()
-    if not s or s == "—":
-        return f"{k}: —" if keep_blank else None
-    return f"{k}: {s}"
-
-
-def _kv_block(pairs: List[Tuple[str, object]], *, keep_blank_keys: set[str] | None = None) -> str:
-    keep = keep_blank_keys or set()
-    lines: List[str] = []
-    for k, v in pairs:
-        line = _kv_line(k, v, keep_blank=(k in keep))
-        if line:
-            lines.append(line)
-    return ("\n".join(lines)[:1024]) if lines else "—"
+from RSCheckerbot.staff_embeds import kv_block
+from RSCheckerbot.whop_brief import fetch_whop_brief
 
 
 def _dreq(token: str, method: str, path: str, body: object | None = None) -> Tuple[int, object]:
@@ -100,12 +69,7 @@ def _dreq(token: str, method: str, path: str, body: object | None = None) -> Tup
 async def _fetch_whop_brief(cfg: dict, membership_id: str) -> dict:
     if not membership_id:
         return {}
-    try:
-        from RSCheckerbot.whop_api_client import WhopAPIClient  # type: ignore
-    except Exception:
-        # Repo-root import fallback
-        from whop_api_client import WhopAPIClient  # type: ignore
-
+    from RSCheckerbot.whop_api_client import WhopAPIClient  # type: ignore
     wh = cfg.get("whop_api") if isinstance(cfg, dict) else {}
     if not isinstance(wh, dict):
         return {}
@@ -114,58 +78,8 @@ async def _fetch_whop_brief(cfg: dict, membership_id: str) -> dict:
     base_url = str(wh.get("base_url") or "https://api.whop.com/api/v1").strip()
     if not api_key or not company_id:
         return {}
-
     client = WhopAPIClient(api_key=api_key, base_url=base_url, company_id=company_id)
-    brief: Dict[str, Any] = {
-        "status": "—",
-        "product": "—",
-        "member_since": "—",
-        "trial_end": "—",
-        "renewal_start": "—",
-        "renewal_end": "—",
-        "cancel_at_period_end": "—",
-        "is_first_membership": "—",
-        "last_payment_method": "—",
-        "last_payment_type": "—",
-        "last_payment_failure": "",
-    }
-
-    mem = await client.get_membership_by_id(membership_id)
-    if isinstance(mem, dict):
-        brief["status"] = str(mem.get("status") or "").strip() or "—"
-        prod = mem.get("product")
-        if isinstance(prod, dict):
-            brief["product"] = str(prod.get("title") or "").strip() or "—"
-        brief["member_since"] = _fmt_date_any(mem.get("created_at"))
-        brief["trial_end"] = _fmt_date_any(mem.get("trial_end") or mem.get("trial_ends_at") or mem.get("trial_end_at"))
-        brief["renewal_start"] = _fmt_date_any(mem.get("renewal_period_start"))
-        brief["renewal_end"] = _fmt_date_any(mem.get("renewal_period_end"))
-        cape = mem.get("cancel_at_period_end")
-        if isinstance(cape, bool):
-            brief["cancel_at_period_end"] = "yes" if cape else "no"
-        first = mem.get("is_first_membership")
-        if isinstance(first, bool):
-            brief["is_first_membership"] = "true" if first else "false"
-
-    payments: list = []
-    try:
-        payments = await client.get_payments_for_membership(membership_id)
-    except Exception:
-        payments = []
-    if payments and isinstance(payments, list) and isinstance(payments[0], dict):
-        p0 = payments[0]
-        failure = str(p0.get("failure_message") or "").strip()
-        brand = str(p0.get("card_brand") or "").strip()
-        last4 = str(p0.get("card_last4") or "").strip()
-        pm_type = p0.get("payment_method_type") or p0.get("payment_type") or p0.get("type") or p0.get("method")
-        if brand and last4:
-            brief["last_payment_method"] = f"{brand.upper()} ****{last4}"
-        if pm_type:
-            brief["last_payment_type"] = str(pm_type).strip()
-        if failure:
-            brief["last_payment_failure"] = failure[:140]
-
-    return dict(brief)
+    return await fetch_whop_brief(client, membership_id, enable_enrichment=bool(wh.get("enable_enrichment", True)))
 
 
 def _resolve_membership_id(discord_id: int) -> str:
@@ -230,11 +144,11 @@ def _embed_detailed(title: str, member_mention: str, access_roles: str, brief: d
         "title": title,
         "color": 0xED4245,
         "fields": [
-            {"name": "Member Info", "value": _kv_block([("member", member_mention)]), "inline": False},
-            {"name": "Discord Info", "value": _kv_block([("access_roles", access_roles)]), "inline": False},
+            {"name": "Member Info", "value": kv_block([("member", member_mention)]), "inline": False},
+            {"name": "Discord Info", "value": kv_block([("access_roles", access_roles)]), "inline": False},
             {
                 "name": "Payment Info",
-                "value": _kv_block(
+                "value": kv_block(
                     [
                         ("status", brief.get("status")),
                         ("product", brief.get("product")),
@@ -264,18 +178,19 @@ def _embed_minimal(title: str, member_mention: str, access_roles: str, brief: di
         "fields": [
             {
                 "name": "Member Info",
-                "value": _kv_block(
+                "value": kv_block(
                     [
                         ("member", member_mention),
                         ("product", brief.get("product")),
                         ("member_since", brief.get("member_since")),
                         ("renewal_start", brief.get("renewal_start")),
                         ("renewal_end", brief.get("renewal_end")),
+                        ("last_payment_failure", brief.get("last_payment_failure")),
                     ]
                 ),
                 "inline": False,
             },
-            {"name": "Discord Info", "value": _kv_block([("access_roles", access_roles)]), "inline": False},
+            {"name": "Discord Info", "value": kv_block([("access_roles", access_roles)]), "inline": False},
         ],
         "footer": {"text": "RSCheckerbot"},
     }

@@ -1,0 +1,67 @@
+#!/bin/bash
+# Install/refresh Mirror World systemd unit files from the repo.
+#
+# Canonical repo root:
+#   /home/rsadmin/bots/mirror-world
+#
+# This script copies unit files from ./systemd into /etc/systemd/system,
+# reloads systemd, enables services, and restarts them.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+UNIT_SRC_DIR="$ROOT_DIR/systemd"
+
+if [ ! -d "$UNIT_SRC_DIR" ]; then
+  echo "ERROR: systemd unit source dir not found: $UNIT_SRC_DIR"
+  exit 1
+fi
+
+units=(
+  "mirror-world-rsadminbot.service"
+  "mirror-world-rsforwarder.service"
+  "mirror-world-rsonboarding.service"
+  "mirror-world-rscheckerbot.service"
+  "mirror-world-rsmentionpinger.service"
+  "mirror-world-rssuccessbot.service"
+)
+
+echo "Bootstrapping shared venv..."
+if [ -f "$SCRIPT_DIR/bootstrap_venv.sh" ]; then
+  bash "$SCRIPT_DIR/bootstrap_venv.sh"
+else
+  echo "WARNING: bootstrap_venv.sh not found; services may fail if .venv is missing."
+fi
+
+echo "Installing unit files from: $UNIT_SRC_DIR"
+for unit in "${units[@]}"; do
+  src="$UNIT_SRC_DIR/$unit"
+  if [ ! -f "$src" ]; then
+    echo "ERROR: missing unit file: $src"
+    exit 1
+  fi
+  sudo cp -f "$src" "/etc/systemd/system/$unit"
+done
+
+echo "Reloading systemd daemon..."
+sudo systemctl daemon-reload
+
+echo "Enabling services..."
+for unit in "${units[@]}"; do
+  sudo systemctl enable "$unit" >/dev/null
+done
+
+echo "Restarting services (non-admin bots first, then RSAdminBot)..."
+for unit in "mirror-world-rsforwarder.service" "mirror-world-rsonboarding.service" "mirror-world-rscheckerbot.service" "mirror-world-rsmentionpinger.service" "mirror-world-rssuccessbot.service"; do
+  sudo systemctl restart "$unit" || true
+done
+sudo systemctl restart "mirror-world-rsadminbot.service" || true
+
+echo "Done. Current status summary:"
+for unit in "${units[@]}"; do
+  state="$(systemctl show "$unit" --property=ActiveState --no-pager --value 2>/dev/null || echo unknown)"
+  echo "  - $unit: $state"
+done
+
+

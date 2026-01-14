@@ -1,0 +1,18 @@
+[Unit]
+Description=Mirror World - RSCheckerbot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=rsadmin
+WorkingDirectory=/home/rsadmin/bots/mirror-world
+ExecStart=/bin/bash /home/rsadmin/bots/mirror-world/RSAdminBot/run_bot.sh rscheckerbot
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+
+

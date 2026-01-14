@@ -8399,6 +8399,203 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                 await self._publish_command_index_to_test_server()
             except Exception:
                 pass
+
+        @self.bot.command(name="testcards", aliases=["testcenter_cards", "tcards"])
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def testcards(ctx, member: discord.Member | None = None):
+            """Post RSCheckerbot sample staff cards into TestCenter channels + write a JSON trace artifact (admin only)."""
+            # Resolve TestCenter guild
+            try:
+                test_gid = int(self.config.get("test_server_guild_id") or 0)
+            except Exception:
+                test_gid = 0
+            test_guild = self.bot.get_guild(test_gid) if test_gid else None
+            if not test_guild:
+                await ctx.send("❌ TestCenter guild not found/available to RSAdminBot.")
+                return
+
+            target_id = int(member.id) if isinstance(member, discord.Member) else int(ctx.author.id)
+            target_member = test_guild.get_member(target_id)
+            if target_member is None:
+                try:
+                    target_member = await test_guild.fetch_member(target_id)
+                except Exception:
+                    target_member = None
+            if not isinstance(target_member, discord.Member):
+                await ctx.send("❌ Target member is not in the TestCenter server (cannot post member-based cards).")
+                return
+
+            # Load RSCheckerbot runtime config+secrets (server-local)
+            try:
+                rs_cfg, _, _ = load_config_with_secrets(_REPO_ROOT / "RSCheckerbot")
+            except Exception as e:
+                await ctx.send(f"❌ Failed to load RSCheckerbot config: {e}")
+                return
+
+            # Resolve target channels in TestCenter
+            dm_cfg = rs_cfg.get("dm_sequence") if isinstance(rs_cfg, dict) else {}
+            status_ch_id = 0
+            if isinstance(dm_cfg, dict):
+                try:
+                    status_ch_id = int(dm_cfg.get("member_status_logs_channel_id") or 0)
+                except Exception:
+                    status_ch_id = 0
+
+            status_ch = self.bot.get_channel(status_ch_id) if status_ch_id else None
+            if not isinstance(status_ch, discord.TextChannel) or status_ch.guild.id != test_guild.id:
+                # Fallback by name
+                status_ch = discord.utils.get(test_guild.text_channels, name="member-status-logs")
+            if not isinstance(status_ch, discord.TextChannel):
+                await ctx.send("❌ TestCenter channel not found: member-status-logs")
+                return
+
+            payment_ch = discord.utils.get(test_guild.text_channels, name="payment-failure")
+            cancel_ch = discord.utils.get(test_guild.text_channels, name="member-cancelation")
+            if not isinstance(payment_ch, discord.TextChannel):
+                await ctx.send("❌ TestCenter channel not found: payment-failure")
+                return
+            if not isinstance(cancel_ch, discord.TextChannel):
+                await ctx.send("❌ TestCenter channel not found: member-cancelation")
+                return
+
+            # Compute access roles (compact, access-relevant only)
+            try:
+                from RSCheckerbot.rschecker_utils import access_roles_plain as _access_roles_plain  # type: ignore
+                from RSCheckerbot.rschecker_utils import coerce_role_ids as _coerce_role_ids  # type: ignore
+            except Exception as e:
+                await ctx.send(f"❌ Failed to import RSCheckerbot role helpers: {e}")
+                return
+
+            relevant = _coerce_role_ids(
+                (dm_cfg or {}).get("role_cancel_a"),
+                (dm_cfg or {}).get("role_cancel_b"),
+                (dm_cfg or {}).get("welcome_role_id"),
+                (dm_cfg or {}).get("role_trigger"),
+                (dm_cfg or {}).get("former_member_role"),
+            )
+            try:
+                for rid in ((dm_cfg or {}).get("roles_to_check") or []):
+                    if str(rid).strip().isdigit():
+                        relevant.add(int(str(rid).strip()))
+            except Exception:
+                pass
+            access_roles = _access_roles_plain(target_member, relevant)
+
+            # Fetch Whop brief (best-effort)
+            whop_brief = {}
+            try:
+                from RSCheckerbot.whop_webhook_handler import get_cached_whop_membership_id  # type: ignore
+                from RSCheckerbot.whop_api_client import WhopAPIClient  # type: ignore
+                from RSCheckerbot.whop_brief import fetch_whop_brief  # type: ignore
+
+                wh = rs_cfg.get("whop_api") if isinstance(rs_cfg, dict) else {}
+                if isinstance(wh, dict):
+                    api_key = str(wh.get("api_key") or "").strip()
+                    company_id = str(wh.get("company_id") or "").strip()
+                    base_url = str(wh.get("base_url") or "https://api.whop.com/api/v1").strip()
+                    if api_key and company_id:
+                        client = WhopAPIClient(api_key=api_key, base_url=base_url, company_id=company_id)
+                        mid = get_cached_whop_membership_id(target_member.id)
+                        whop_brief = await fetch_whop_brief(
+                            client,
+                            mid,
+                            enable_enrichment=bool(wh.get("enable_enrichment", True)),
+                        )
+            except Exception:
+                whop_brief = {}
+
+            # Build + post sample cards (same builders as RSCheckerbot)
+            try:
+                from RSCheckerbot.staff_embeds import build_case_minimal_embed, build_member_status_detailed_embed  # type: ignore
+            except Exception as e:
+                await ctx.send(f"❌ Failed to import RSCheckerbot embed builders: {e}")
+                return
+
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            trace = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "test_server_guild_id": test_guild.id,
+                "target_member_id": target_member.id,
+                "target_member_name": str(target_member),
+                "channels": {
+                    "member_status_logs": status_ch.id,
+                    "payment_failure": payment_ch.id,
+                    "member_cancelation": cancel_ch.id,
+                },
+                "posts": [],
+            }
+
+            allowed = discord.AllowedMentions.none()
+
+            detailed = build_member_status_detailed_embed(
+                title="TEST • Payment Failed — Action Needed",
+                member=target_member,
+                access_roles=access_roles,
+                color=0xED4245,
+                discord_kv=[("test", "true")],
+                whop_brief=whop_brief,
+            )
+            minimal_fail = build_case_minimal_embed(
+                title="TEST • Payment Failed — Action Needed",
+                member=target_member,
+                access_roles=access_roles,
+                whop_brief=whop_brief,
+                color=0xED4245,
+            )
+            minimal_cancel = build_case_minimal_embed(
+                title="TEST • Membership Deactivated",
+                member=target_member,
+                access_roles=access_roles,
+                whop_brief=whop_brief,
+                color=0xFEE75C,
+            )
+
+            # Post messages and record outcomes
+            m1 = await status_ch.send(embed=detailed, allowed_mentions=allowed)
+            trace["posts"].append(
+                {
+                    "channel": "member_status_logs",
+                    "message_id": m1.id,
+                    "embed_title": detailed.title,
+                    "field_names": [f.name for f in (detailed.fields or [])],
+                }
+            )
+            m2 = await payment_ch.send(embed=minimal_fail, allowed_mentions=allowed)
+            trace["posts"].append(
+                {
+                    "channel": "payment_failure",
+                    "message_id": m2.id,
+                    "embed_title": minimal_fail.title,
+                    "field_names": [f.name for f in (minimal_fail.fields or [])],
+                }
+            )
+            m3 = await cancel_ch.send(embed=minimal_cancel, allowed_mentions=allowed)
+            trace["posts"].append(
+                {
+                    "channel": "member_cancelation",
+                    "message_id": m3.id,
+                    "embed_title": minimal_cancel.title,
+                    "field_names": [f.name for f in (minimal_cancel.fields or [])],
+                }
+            )
+
+            # Write artifact on disk and upload to Discord
+            artifact_dir = _REPO_ROOT / "RSAdminBot" / "test_artifacts"
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            artifact_path = artifact_dir / f"testcenter_cards_trace_{ts}.json"
+            artifact_path.write_text(json.dumps(trace, indent=2, ensure_ascii=True), encoding="utf-8")
+
+            summary = MessageHelper.create_success_embed(
+                title="TestCenter Cards Posted",
+                message="Posted sample RSCheckerbot cards to TestCenter channels and wrote JSON trace artifact.",
+                fields=[
+                    {"name": "member-status-logs", "value": f"<#{status_ch.id}> (msg {m1.id})", "inline": False},
+                    {"name": "payment-failure", "value": f"<#{payment_ch.id}> (msg {m2.id})", "inline": False},
+                    {"name": "member-cancelation", "value": f"<#{cancel_ch.id}> (msg {m3.id})", "inline": False},
+                    {"name": "artifact", "value": str(artifact_path), "inline": False},
+                ],
+            )
+            await ctx.send(embed=summary, file=discord.File(str(artifact_path)))
         
         # Run all commands for all bots
         @self.bot.command(name="runallcommands")
