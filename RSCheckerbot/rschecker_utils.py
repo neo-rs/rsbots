@@ -45,3 +45,44 @@ def roles_plain(member: discord.Member) -> str:
     roles = [r.name for r in member.roles if r != member.guild.default_role]
     return ", ".join(roles) if roles else "—"
 
+
+def access_roles_plain(member: discord.Member, relevant_role_ids: set[int]) -> str:
+    """Comma-separated role names for access-relevant roles only (no mentions, excludes @everyone)."""
+    try:
+        ids = {int(x) for x in (relevant_role_ids or set())}
+    except Exception:
+        ids = set()
+    if not ids:
+        return "—"
+    names: list[str] = []
+    seen: set[str] = set()
+    for r in member.roles:
+        if r == member.guild.default_role:
+            continue
+        if r.id not in ids:
+            continue
+        nm = str(r.name or "").strip()
+        if not nm or nm in seen:
+            continue
+        seen.add(nm)
+        names.append(nm)
+    return ", ".join(names) if names else "—"
+
+
+def coerce_role_ids(*values: object) -> set[int]:
+    """Normalize mixed int/str role IDs into a set[int]."""
+    out: set[int] = set()
+    for v in values:
+        if v is None:
+            continue
+        if isinstance(v, int):
+            out.add(v)
+            continue
+        try:
+            s = str(v).strip()
+        except Exception:
+            continue
+        if s.isdigit():
+            out.add(int(s))
+    return out
+

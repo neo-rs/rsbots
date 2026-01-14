@@ -24,7 +24,24 @@ from discord.ext import commands, tasks
 from aiohttp import web
 import aiohttp
 
-from rschecker_utils import load_json, save_json, roles_plain
+from rschecker_utils import load_json, save_json, roles_plain, access_roles_plain, coerce_role_ids
+from staff_embeds import (
+    apply_member_header as _apply_member_header,
+    build_case_minimal_embed as _build_case_minimal_embed,
+    build_member_status_detailed_embed as _build_member_status_detailed_embed,
+)
+from whop_brief import fetch_whop_brief
+from staff_channels import (
+    PAYMENT_FAILURE_CHANNEL_NAME,
+    MEMBER_CANCELLATION_CHANNEL_NAME,
+    STAFF_ALERTS_CATEGORY_ID,
+)
+from staff_alerts_store import (
+    load_staff_alerts,
+    save_staff_alerts,
+    should_post_alert,
+    record_alert_post,
+)
 
 # Import Whop webhook handler
 from whop_webhook_handler import (
@@ -385,59 +402,6 @@ def _save_member_history(db: dict) -> None:
 
 STAFF_ALERTS_FILE = BASE_DIR / "staff_alerts.json"
 
-
-def _load_staff_alerts() -> dict:
-    try:
-        if not STAFF_ALERTS_FILE.exists() or STAFF_ALERTS_FILE.stat().st_size == 0:
-            return {}
-        return json.loads(STAFF_ALERTS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _save_staff_alerts(db: dict) -> None:
-    try:
-        STAFF_ALERTS_FILE.write_text(json.dumps(db, indent=2, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def _parse_iso(dt_str: str) -> datetime | None:
-    try:
-        s = (dt_str or "").strip()
-        if not s:
-            return None
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-
-def _should_post_alert(db: dict, discord_id: int, issue_key: str, cooldown_hours: float = 6.0) -> bool:
-    """Generic staff-alert dedupe (JSON-only persistence)."""
-    uid = str(int(discord_id))
-    rec = db.get(uid) if isinstance(db, dict) else None
-    if not isinstance(rec, dict):
-        return True
-    last = rec.get("last") if isinstance(rec.get("last"), dict) else {}
-    last_iso = str(last.get(issue_key) or "")
-    last_dt = _parse_iso(last_iso)
-    if not last_dt:
-        return True
-    return (_now() - last_dt) >= timedelta(hours=cooldown_hours)
-
-
-def _record_alert_post(db: dict, discord_id: int, issue_key: str) -> None:
-    uid = str(int(discord_id))
-    rec = db.get(uid) if isinstance(db, dict) else None
-    if not isinstance(rec, dict):
-        rec = {}
-        db[uid] = rec
-    last = rec.get("last")
-    if not isinstance(last, dict):
-        last = {}
-    last[issue_key] = _now().isoformat()
-    rec["last"] = last
-
 def _touch_join(discord_id: int) -> dict:
     """Record member join event, return history record"""
     now = int(datetime.now(timezone.utc).timestamp())
@@ -544,58 +508,14 @@ def _fmt_money(amount: object, currency: str | None = None) -> str:
 async def _fetch_whop_brief_by_membership_id(membership_id: str) -> dict:
     """Fetch a minimal Whop summary for staff (no internal IDs)."""
     global whop_api_client
-    if not whop_api_client or not WHOP_API_CONFIG.get("enable_enrichment", True):
-        return {}
     mid = (membership_id or "").strip()
     if not mid:
         return {}
-
-    membership = None
-    with suppress(Exception):
-        membership = await whop_api_client.get_membership_by_id(mid)
-    if not isinstance(membership, dict):
-        return {}
-
-    product_title = "—"
-    if isinstance(membership.get("product"), dict):
-        product_title = str(membership["product"].get("title") or "").strip() or "—"
-
-    brief = {
-        "status": str(membership.get("status") or "").strip() or "—",
-        "product": product_title,
-        "member_since": _fmt_date_any(membership.get("created_at")),
-        "trial_end": _fmt_date_any(membership.get("trial_end") or membership.get("trial_ends_at") or membership.get("trial_end_at")),
-        "renewal_start": _fmt_date_any(membership.get("renewal_period_start")),
-        "renewal_end": _fmt_date_any(membership.get("renewal_period_end")),
-        "cancel_at_period_end": "yes" if membership.get("cancel_at_period_end") is True else ("no" if membership.get("cancel_at_period_end") is False else "—"),
-        "is_first_membership": "true" if membership.get("is_first_membership") is True else ("false" if membership.get("is_first_membership") is False else "—"),
-        "last_payment_method": "—",
-        "last_payment_type": "—",
-        "last_payment_failure": "",
-    }
-
-    payments = []
-    with suppress(Exception):
-        payments = await whop_api_client.get_payments_for_membership(mid)
-    if payments and isinstance(payments, list) and isinstance(payments[0], dict):
-        p0 = payments[0]
-        failure_msg = str(p0.get("failure_message") or "").strip()
-        card_brand = str(p0.get("card_brand") or "").strip()
-        card_last4 = str(p0.get("card_last4") or "").strip()
-        pm_type = (
-            p0.get("payment_method_type")
-            or p0.get("payment_type")
-            or p0.get("type")
-            or p0.get("method")
-        )
-        if card_brand and card_last4:
-            brief["last_payment_method"] = f"{card_brand.upper()} ****{card_last4}"
-        if pm_type:
-            brief["last_payment_type"] = str(pm_type).strip()
-        if failure_msg:
-            brief["last_payment_failure"] = failure_msg[:140]
-
-    return brief
+    return await fetch_whop_brief(
+        whop_api_client,
+        mid,
+        enable_enrichment=bool(WHOP_API_CONFIG.get("enable_enrichment", True)),
+    )
 
 def get_member_history(discord_id: int) -> dict:
     """Get member history record (exposed for whop_webhook_handler and support cards)"""
@@ -725,204 +645,17 @@ def _backfill_whop_timeline_from_whop_history() -> None:
     except Exception as e:
         log.error(f"Whop timeline backfill failed: {e}", exc_info=True)
 
-def _member_avatar_url(user: discord.abc.User) -> str | None:
-    """Best-effort avatar URL that works across discord.py versions and user types."""
-    try:
-        return str(user.display_avatar.url)
-    except Exception:
-        pass
-    try:
-        avatar = getattr(user, "avatar", None)
-        if avatar:
-            return str(avatar.url)
-    except Exception:
-        pass
-    try:
-        return str(user.default_avatar.url)
-    except Exception:
-        return None
-
-def _apply_member_header(embed: discord.Embed, user: discord.abc.User) -> None:
-    """Apply author icon + thumbnail if an avatar URL is available."""
-    url = _member_avatar_url(user)
-    if not url:
-        return
-    with suppress(Exception):
-        embed.set_author(name=str(user), icon_url=url)
-        embed.set_thumbnail(url=url)
-
-def _add_staff_fields(embed: discord.Embed, *, member: discord.Member | None, access_roles: str | None = None) -> None:
-    """RSOnboarding-style compact fields."""
-    if member is not None:
-        embed.add_field(name="Member", value=member.mention, inline=True)
-    if access_roles is not None:
-        embed.add_field(name="Access", value=access_roles or "—", inline=True)
-
-
-def _add_summary_field(embed: discord.Embed, lines: list[str], *, name: str = "Summary") -> None:
-    text = "\n".join([str(x) for x in lines if str(x).strip()])[:1024]
-    if not text:
-        text = "—"
-    embed.add_field(name=name, value=text, inline=False)
-
-
-def _kv_line(key: str, value: object, *, keep_blank: bool = False) -> str | None:
-    """Format `key: value` while hiding blanks by default."""
-    k = str(key or "").strip()
-    if not k:
-        return None
-    if value is None:
-        return f"{k}: —" if keep_blank else None
-    s = str(value).strip()
-    if not s or s == "—":
-        return f"{k}: —" if keep_blank else None
-    return f"{k}: {s}"
-
-
-def _kv_block(pairs: list[tuple[str, object]], *, keep_blank_keys: set[str] | None = None) -> str:
-    keep = keep_blank_keys or set()
-    lines: list[str] = []
-    for k, v in pairs:
-        line = _kv_line(k, v, keep_blank=(k in keep))
-        if line:
-            lines.append(line)
-    return ("\n".join(lines)[:1024]) if lines else "—"
-
-
-def _brief_payment_kv(brief: dict | None) -> list[tuple[str, object]]:
-    b = brief if isinstance(brief, dict) else {}
-    return [
-        ("status", b.get("status")),
-        ("product", b.get("product")),
-        ("member_since", b.get("member_since")),
-        ("trial_end", b.get("trial_end")),
-        ("renewal_start", b.get("renewal_start")),
-        ("renewal_end", b.get("renewal_end")),
-        ("cancel_at_period_end", b.get("cancel_at_period_end")),
-        ("is_first_membership", b.get("is_first_membership")),
-        ("last_payment_method", b.get("last_payment_method")),
-        ("last_payment_type", b.get("last_payment_type")),
-        ("last_payment_failure", b.get("last_payment_failure")),
-    ]
-
-
-def _build_case_minimal_embed(
-    *,
-    title: str,
-    member: discord.Member,
-    access_roles: str,
-    whop_brief: dict | None,
-    color: int,
-) -> discord.Embed:
-    """Minimal staff case embed (matches requested format)."""
-    b = whop_brief if isinstance(whop_brief, dict) else {}
-    embed = discord.Embed(
-        title=title,
-        color=color,
-        timestamp=datetime.now(timezone.utc),
-    )
-    _apply_member_header(embed, member)
-    embed.add_field(
-        name="Member Info",
-        value=_kv_block(
-            [
-                ("member", member.mention),
-                ("product", b.get("product")),
-                ("member_since", b.get("member_since")),
-                ("renewal_start", b.get("renewal_start")),
-                ("renewal_end", b.get("renewal_end")),
-            ]
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="Discord Info",
-        value=_kv_block([("access_roles", access_roles)]),
-        inline=False,
-    )
-    embed.set_footer(text="RSCheckerbot")
-    return embed
-
-
-def _build_member_status_detailed_embed(
-    *,
-    title: str,
-    member: discord.Member,
-    access_roles: str,
-    color: int,
-    discord_kv: list[tuple[str, object]] | None = None,
-    member_kv: list[tuple[str, object]] | None = None,
-    whop_brief: dict | None = None,
-) -> discord.Embed:
-    """Detailed staff embed for member-status-logs (more complete card)."""
-    embed = discord.Embed(
-        title=title,
-        color=color,
-        timestamp=datetime.now(timezone.utc),
-    )
-    _apply_member_header(embed, member)
-    embed.add_field(
-        name="Member Info",
-        value=_kv_block(
-            [
-                ("member", member.mention),
-                *([p for p in (member_kv or []) if isinstance(p, tuple) and len(p) == 2]),
-            ]
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="Discord Info",
-        value=_kv_block(
-            [
-                ("access_roles", access_roles),
-                *([p for p in (discord_kv or []) if isinstance(p, tuple) and len(p) == 2]),
-            ]
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="Payment Info",
-        value=_kv_block(_brief_payment_kv(whop_brief), keep_blank_keys={"is_first_membership"}),
-        inline=False,
-    )
-    embed.set_footer(text="RSCheckerbot • Member Status Tracking")
-    return embed
-
-
 def _access_roles_plain(member: discord.Member) -> str:
     """Return a compact list of access-relevant role names (no mentions).
 
     This intentionally filters out "noise" roles so support can quickly see access state.
     """
-    relevant_ids = set()
-    for rid in (ROLE_CANCEL_A, ROLE_CANCEL_B, WELCOME_ROLE_ID, ROLE_TRIGGER, FORMER_MEMBER_ROLE):
-        if isinstance(rid, int):
-            relevant_ids.add(rid)
-        elif isinstance(rid, str) and str(rid).strip().isdigit():
-            relevant_ids.add(int(str(rid).strip()))
+    relevant_ids = coerce_role_ids(ROLE_CANCEL_A, ROLE_CANCEL_B, WELCOME_ROLE_ID, ROLE_TRIGGER, FORMER_MEMBER_ROLE)
     try:
         relevant_ids.update({int(x) for x in ROLES_TO_CHECK if str(x).strip().isdigit()})
     except Exception:
         pass
-
-    if not relevant_ids:
-        return "—"
-
-    # Preserve Discord role order (member.roles includes @everyone; exclude it)
-    names: list[str] = []
-    seen: set[str] = set()
-    for r in member.roles:
-        if r == member.guild.default_role:
-            continue
-        if r.id not in relevant_ids:
-            continue
-        nm = str(r.name or "").strip()
-        if not nm or nm in seen:
-            continue
-        seen.add(nm)
-        names.append(nm)
-    return ", ".join(names) if names else "—"
+    return access_roles_plain(member, relevant_ids)
 
 def load_settings() -> dict:
     """Load settings from JSON file, default to enabled if missing/bad"""
@@ -999,11 +732,6 @@ async def log_whop(msg: str):
         if ch:
             with suppress(Exception):
                 await ch.send(msg)
-
-PAYMENT_FAILURE_CHANNEL_NAME = "payment-failure"
-MEMBER_CANCELLATION_CHANNEL_NAME = "member-cancelation"
-STAFF_ALERTS_CATEGORY_ID = 1458533733681598654
-
 
 def _find_text_channel_by_name(guild: discord.Guild, name: str) -> discord.TextChannel | None:
     nm = (name or "").strip().lower()
@@ -1691,8 +1419,8 @@ async def sync_whop_memberships():
                     renewal_end_key = str(membership_data.get("renewal_period_end") or "").strip()
                     issue_key = f"cancel_scheduled:{membership_id}:{renewal_end_key}"
 
-                    db_alerts = _load_staff_alerts()
-                    if not _should_post_alert(db_alerts, member.id, issue_key, cooldown_hours=24.0):
+                    db_alerts = load_staff_alerts(STAFF_ALERTS_FILE)
+                    if not should_post_alert(db_alerts, member.id, issue_key, cooldown_hours=24.0):
                         continue
 
                     access = _access_roles_plain(member)
@@ -1726,8 +1454,8 @@ async def sync_whop_memberships():
                     )
                     await log_member_status("", embed=minimal, channel_name=MEMBER_CANCELLATION_CHANNEL_NAME)
 
-                    _record_alert_post(db_alerts, member.id, issue_key)
-                    _save_staff_alerts(db_alerts)
+                    record_alert_post(db_alerts, member.id, issue_key)
+                    save_staff_alerts(STAFF_ALERTS_FILE, db_alerts)
             
             if not verification["matches"]:
                 actual_status = verification["actual_status"]
@@ -2323,9 +2051,9 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             whop_status = str((whop_brief.get("status") or "")).strip().lower()
             is_payment_failed = whop_status in ("past_due", "unpaid") or bool(whop_brief.get("last_payment_failure"))
             access = _access_roles_plain(after)
-            db_alerts = _load_staff_alerts()
+            db_alerts = load_staff_alerts(STAFF_ALERTS_FILE)
             issue_key = f"payment_failed:{whop_status}" if is_payment_failed else "payment_cancellation_detected"
-            if _should_post_alert(db_alerts, after.id, issue_key, cooldown_hours=6.0):
+            if should_post_alert(db_alerts, after.id, issue_key, cooldown_hours=6.0):
                 dest = PAYMENT_FAILURE_CHANNEL_NAME if is_payment_failed else MEMBER_CANCELLATION_CHANNEL_NAME
                 title = "💳 Payment Failed — Action Needed" if is_payment_failed else "💳 Payment Cancellation Detected"
                 color = 0xED4245 if is_payment_failed else 0xFF0000
@@ -2360,8 +2088,8 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                 )
                 await log_member_status("", embed=minimal, channel_name=dest)
 
-                _record_alert_post(db_alerts, after.id, issue_key)
-                _save_staff_alerts(db_alerts)
+                record_alert_post(db_alerts, after.id, issue_key)
+                save_staff_alerts(STAFF_ALERTS_FILE, db_alerts)
         
         log_msg = (
             f"📉 **Member Role Removed:** {_fmt_user(after)}\n"
@@ -2394,9 +2122,9 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         only_member_added = len(all_added_in_update) == 1
         if only_member_added:
             access = _access_roles_plain(after)
-            db_alerts = _load_staff_alerts()
+            db_alerts = load_staff_alerts(STAFF_ALERTS_FILE)
             issue_key = "payment_reactivated"
-            if _should_post_alert(db_alerts, after.id, issue_key, cooldown_hours=2.0):
+            if should_post_alert(db_alerts, after.id, issue_key, cooldown_hours=2.0):
                 whop_mid = get_cached_whop_membership_id(after.id)
                 whop_brief = await _fetch_whop_brief_by_membership_id(whop_mid) if whop_mid else {}
                 hist = get_member_history(after.id) or {}
@@ -2430,8 +2158,8 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                 )
                 await log_member_status("", embed=minimal, channel_name=PAYMENT_FAILURE_CHANNEL_NAME)
 
-                _record_alert_post(db_alerts, after.id, issue_key)
-                _save_staff_alerts(db_alerts)
+                record_alert_post(db_alerts, after.id, issue_key)
+                save_staff_alerts(STAFF_ALERTS_FILE, db_alerts)
         
         if has_former_member_role(after):
             role = after.guild.get_role(FORMER_MEMBER_ROLE)
@@ -2710,7 +2438,8 @@ async def whois_member(ctx, member: discord.Member):
         )
         _apply_member_header(embed, member)
         access = _access_roles_plain(member)
-        _add_staff_fields(embed, member=member, access_roles=access)
+        embed.add_field(name="Member", value=member.mention, inline=True)
+        embed.add_field(name="Access", value=access or "—", inline=True)
 
         mid = get_cached_whop_membership_id(member.id)
         brief = await _fetch_whop_brief_by_membership_id(mid) if mid else {}
@@ -2734,7 +2463,8 @@ async def whois_member(ctx, member: discord.Member):
                 lines.append(f"Last failure: {brief['last_payment_failure']}")
         else:
             lines.append("No Whop membership link found for this Discord user.")
-        _add_summary_field(embed, lines)
+        summary = "\n".join([str(x) for x in lines if str(x).strip()])[:1024] or "—"
+        embed.add_field(name="Summary", value=summary, inline=False)
 
         await ctx.send(embed=embed, delete_after=30)
     except Exception as e:
@@ -2793,7 +2523,8 @@ async def whop_membership_lookup(ctx, membership_id: str):
     if brief.get("last_payment_failure"):
         lines.append(f"Last failure: {brief['last_payment_failure']}")
 
-    _add_summary_field(embed, lines)
+    summary = "\n".join([str(x) for x in lines if str(x).strip()])[:1024] or "—"
+    embed.add_field(name="Summary", value=summary, inline=False)
     await ctx.send(embed=embed, delete_after=30)
     with suppress(Exception):
         await ctx.message.delete()

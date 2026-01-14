@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -131,12 +132,46 @@ def _safe_extract(tar_path: Path, dest_dir: Path) -> None:
         tf.extractall(dest_dir)
 
 
+def _prune_old_snapshots(out_dir: Path, keep: int, current: Path) -> None:
+    """Delete older server_full_snapshot_* directories, keeping the newest N (including current)."""
+    try:
+        keep_n = int(keep)
+    except Exception:
+        keep_n = 1
+    if keep_n < 1:
+        keep_n = 1
+
+    try:
+        dirs = sorted([p for p in out_dir.glob("server_full_snapshot_*") if p.is_dir()])
+    except Exception:
+        return
+
+    # Keep the newest keep_n by name (timestamp is part of name), and always keep current.
+    keep_set = set(dirs[-keep_n:]) if dirs else set()
+    keep_set.add(current)
+
+    for p in dirs:
+        if p in keep_set:
+            continue
+        try:
+            shutil.rmtree(p)
+            print(f"[cleanup] Deleted old snapshot: {p.name}")
+        except Exception as e:
+            print(f"[cleanup] WARNING: Failed to delete {p.name}: {e}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--server-name", default=None, help="Server name from oraclekeys/servers.json (defaults to first entry)")
     ap.add_argument("--out-dir", default=str(REPO_ROOT / "Oraclserver-files"), help="Local output dir (default: Oraclserver-files)")
     ap.add_argument("--remote-root", default=None, help="Remote root override (default: /home/rsadmin/bots/mirror-world or server entry)")
     ap.add_argument("--no-oracle-server-data", action="store_true", help="Do not include OracleServerData in the snapshot")
+    ap.add_argument(
+        "--keep-snapshots",
+        type=int,
+        default=1,
+        help="Keep only the newest N server_full_snapshot_* folders after a successful run (default: 1).",
+    )
     args = ap.parse_args()
 
     servers = _load_servers()
@@ -199,6 +234,7 @@ def main() -> int:
     _safe_extract(local_tar, snap_dir)
 
     print(f"DONE: {snap_dir}")
+    _prune_old_snapshots(out_dir, args.keep_snapshots, snap_dir)
     return 0
 
 
