@@ -2364,27 +2364,24 @@ echo "TARGET=$TARGET"
                 pass
     
     async def _log_to_discord(self, embed: discord.Embed, reply_channel: Optional[discord.TextChannel] = None):
-        """Log embed message to Discord log channel and optionally reply channel.
+        """Log embed message to Discord log channel.
         
         Args:
             embed: Discord embed to send
-            reply_channel: Optional channel to also send reply (where command was triggered)
+            reply_channel: Optional fallback channel if the log channel is unavailable
         """
         log_channel_id = "1452590450631376906"  # Hard-coded as specified
         
         try:
-            sent_ids = set()
-            # Always send to log channel
+            # Prefer log channel; fall back to reply_channel only if logging fails.
+            sent = False
             log_channel = self.bot.get_channel(int(log_channel_id))
             if log_channel and getattr(log_channel, "id", None) is not None:
                 await log_channel.send(embed=embed)
-                sent_ids.add(int(log_channel.id))
+                sent = True
 
-            # Also send reply to command channel if specified (but never double-send to same channel)
-            if reply_channel and getattr(reply_channel, "id", None) is not None:
-                rid = int(reply_channel.id)
-                if rid not in sent_ids:
-                    await reply_channel.send(embed=embed)
+            if (not sent) and reply_channel and getattr(reply_channel, "id", None) is not None:
+                await reply_channel.send(embed=embed)
         except Exception as e:
             print(f"{Colors.RED}[Discord Log] Failed to send message: {e}{Colors.RESET}")
 
@@ -4968,7 +4965,14 @@ echo "CHANGED_END"
         async def on_command_error(ctx, error):
             """Handle command errors"""
             if isinstance(error, commands.CommandNotFound):
-                return  # Ignore unknown commands
+                try:
+                    msg_txt = (getattr(getattr(ctx, "message", None), "content", "") or "")[:500]
+                    who = str(getattr(ctx, "author", "") or "")
+                    where = str(getattr(getattr(ctx, "channel", None), "name", "") or "")
+                    print(f"{Colors.YELLOW}[CommandNotFound] user={who} channel={where} msg={msg_txt}{Colors.RESET}")
+                except Exception:
+                    pass
+                return  # Ignore unknown commands (but log to terminal)
             elif isinstance(error, commands.CheckFailure):
                 # Most admin-gated commands use commands.check(self.is_admin), which raises CheckFailure (not MissingPermissions).
                 print(f"{Colors.YELLOW}[Command Error] CheckFailure: {ctx.author} tried to use {ctx.command}{Colors.RESET}")
@@ -5037,6 +5041,13 @@ echo "CHANGED_END"
                 return
             try:
                 cmd_name = getattr(getattr(ctx, "command", None), "name", None) or "unknown"
+                try:
+                    who = str(getattr(ctx, "author", "") or "")
+                    where = str(getattr(getattr(ctx, "channel", None), "name", "") or "")
+                    msg_txt = (getattr(getattr(ctx, "message", None), "content", "") or "")[:400]
+                    print(f"{Colors.CYAN}[Command] user={who} channel={where} cmd={cmd_name} msg={msg_txt}{Colors.RESET}")
+                except Exception:
+                    pass
                 # Avoid duplicating if command already started logging this run.
                 current = getattr(self.logger, "_current_command_context", None) or {}
                 if current.get("command") == cmd_name and (current.get("log_entry") or {}).get("status") == "pending":
@@ -5158,6 +5169,205 @@ echo "CHANGED_END"
             )
             
             await ctx.send(embed=embed)
+
+        @self.bot.command(name="commands", aliases=["listcommands", "cmds", "helpcommands"])
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def list_commands(ctx, bot_name: str = None):
+            """List all available commands for a specific bot or all bots (admin only).
+            
+            Usage:
+              !commands                    - Show all bots and their command counts
+              !commands rsadminbot         - Show all RSAdminBot commands
+              !commands rsforwarder        - Show all RSForwarder commands
+              !commands rssuccessbot       - Show all RSSuccessBot commands
+              !commands rsmentionpinger    - Show all RSMentionPinger commands
+              !commands rsonboarding       - Show all RSOnboarding commands
+              !commands rscheckerbot       - Show all RSCheckerbot commands
+            """
+            try:
+                repo_root = _REPO_ROOT
+            except Exception:
+                from pathlib import Path
+                repo_root = Path(__file__).resolve().parents[1]
+
+            async def _safe_send(*, content: str | None = None, embed: discord.Embed | None = None) -> bool:
+                """Send in-channel; if forbidden, fallback to DM so the command never appears silent."""
+                try:
+                    await ctx.send(content=content, embed=embed)
+                    return True
+                except Exception:
+                    try:
+                        await ctx.author.send(content=content, embed=embed)
+                        return True
+                    except Exception as e2:
+                        print(f"{Colors.YELLOW}[commands] failed to send response: {str(e2)[:200]}{Colors.RESET}")
+                        return False
+
+            # If the user pasted multiple commands in one message, discord.py will treat the next line as an argument.
+            # Example: a single message containing:
+            #   !commands
+            #   !testcards
+            # becomes: bot_name="!testcards"
+            if bot_name and str(bot_name).strip().startswith("!"):
+                bot_name = None
+            
+            # If no bot_name provided, show summary of all bots
+            if not bot_name:
+                embed = discord.Embed(
+                    title="📋 RS Bots Commands Reference",
+                    description="Use `!commands <bot_name>` to view commands for a specific bot",
+                    color=discord.Color.blue(),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                
+                # Get all RS bots from BOTS registry
+                rs_bot_keys = self._get_rs_bot_keys()
+                
+                for bot_key in rs_bot_keys:
+                    if bot_key not in self.BOTS:
+                        continue
+                    
+                    bot_info = self.BOTS[bot_key]
+                    bot_folder = bot_info.get("folder", "")
+                    
+                    if not bot_folder:
+                        continue
+                    
+                    commands_file = repo_root / bot_folder / "COMMANDS.md"
+                    
+                    # Count commands if file exists
+                    command_count = "?"
+                    if commands_file.exists():
+                        try:
+                            content = commands_file.read_text(encoding="utf-8")
+                            # Count command definitions (look for "#### `!" or "#### `/")
+                            command_count = str(content.count("#### `!") + content.count("#### `/"))
+                        except Exception:
+                            command_count = "?"
+                    
+                    embed.add_field(
+                        name=f"🤖 {bot_info.get('name', bot_key.upper())}",
+                        value=f"{command_count} commands\nUse: `!commands {bot_key}`",
+                        inline=True
+                    )
+                
+                embed.set_footer(text="Example: !commands rsadminbot")
+                ok = await _safe_send(embed=embed)
+                if not ok:
+                    # Last-ditch: attempt plain text
+                    await _safe_send(content="❌ Failed to send commands summary (no permission to post here and DM failed).")
+                return
+            
+            # Resolve bot name using canonical BOTS registry
+            bot_key = bot_name.strip().lower()
+            
+            if bot_key not in self.BOTS:
+                # List available bots in error message
+                available_bots = ", ".join(sorted(self.BOTS.keys()))
+                error_embed = MessageHelper.create_error_embed(
+                    title="Unknown Bot",
+                    message=f"Bot '{bot_name}' not found in bot registry.",
+                    error_details=f"Available bots: {available_bots}",
+                    footer=f"Triggered by {ctx.author}"
+                )
+                await _safe_send(embed=error_embed)
+                return
+            
+            bot_info = self.BOTS[bot_key]
+            bot_folder = bot_info.get("folder", "")
+            
+            if not bot_folder:
+                error_embed = MessageHelper.create_error_embed(
+                    title="Bot Folder Not Configured",
+                    message=f"Bot '{bot_name}' does not have a folder configured in bot registry.",
+                    footer=f"Triggered by {ctx.author}"
+                )
+                await _safe_send(embed=error_embed)
+                return
+            
+            # Read COMMANDS.md file
+            commands_file = repo_root / bot_folder / "COMMANDS.md"
+            
+            if not commands_file.exists():
+                error_embed = MessageHelper.create_error_embed(
+                    title="Commands File Not Found",
+                    message=f"COMMANDS.md not found for {bot_info.get('name', bot_key)}.",
+                    error_details=f"Expected path: {commands_file}",
+                    footer=f"Triggered by {ctx.author}"
+                )
+                await _safe_send(embed=error_embed)
+                return
+            
+            try:
+                content = commands_file.read_text(encoding="utf-8")
+            except Exception as e:
+                error_embed = MessageHelper.create_error_embed(
+                    title="File Read Error",
+                    message=f"Failed to read COMMANDS.md for {bot_info.get('name', bot_key)}.",
+                    error_details=str(e)[:200],
+                    footer=f"Triggered by {ctx.author}"
+                )
+                await _safe_send(embed=error_embed)
+                return
+            
+            # Parse and display content
+            if len(content) <= 1900:
+                # Small enough to send as single code block
+                await _safe_send(content=f"```markdown\n{content}\n```")
+            else:
+                # Split into multiple messages
+                lines = content.split('\n')
+                chunks = []
+                current_chunk = []
+                current_length = 0
+                
+                for line in lines:
+                    line_length = len(line) + 1  # +1 for newline
+                    
+                    # If adding this line would exceed limit, save current chunk
+                    if current_length + line_length > 1900 and current_chunk:
+                        chunks.append('\n'.join(current_chunk))
+                        current_chunk = [line]
+                        current_length = line_length
+                    else:
+                        current_chunk.append(line)
+                        current_length += line_length
+                
+                # Add final chunk
+                if current_chunk:
+                    chunks.append('\n'.join(current_chunk))
+                
+                # Send first chunk as embed with title
+                if chunks:
+                    first_chunk = chunks[0]
+                    embed = discord.Embed(
+                        title=f"📋 {bot_info.get('name', bot_key.upper())} Commands",
+                        description=f"Showing {len(chunks)} part(s)",
+                        color=discord.Color.blue(),
+                        timestamp=datetime.now(timezone.utc)
+                    )
+                    
+                    # Use code block in description if first chunk fits
+                    if len(first_chunk) <= 1900:
+                        embed.description = f"```markdown\n{first_chunk}\n```"
+                    else:
+                        embed.add_field(
+                            name="Part 1",
+                            value=f"```markdown\n{first_chunk[:1020]}\n```",
+                            inline=False
+                        )
+                    
+                    embed.set_footer(text=f"Triggered by {ctx.author}")
+                    await _safe_send(embed=embed)
+                    
+                    # Send remaining chunks
+                    for chunk in chunks[1:]:
+                        if len(chunk) <= 1900:
+                            await _safe_send(content=f"```markdown\n{chunk}\n```")
+                        else:
+                            await _safe_send(content=f"```markdown\n{chunk[:1900]}\n```")
+
+        self.registered_commands.append(("commands", "List all commands for bots", True))
         
         @self.bot.command(name="reload")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
@@ -9563,211 +9773,6 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             else:
                 await ctx.send(embed=MessageHelper.create_error_embed("Command Missing", "Transfer command not found."))
         self.registered_commands.append(("add", "Add channel to category", True))
-        
-        @self.bot.command(name="commands", aliases=["listcommands", "cmds", "helpcommands"])
-        @commands.check(lambda ctx: self.is_admin(ctx.author))
-        async def list_commands(ctx, bot_name: str = None):
-            """List all available commands for a specific bot or all bots (admin only).
-            
-            Usage:
-              !commands                    - Show all bots and their command counts
-              !commands rsadminbot         - Show all RSAdminBot commands
-              !commands rsforwarder        - Show all RSForwarder commands
-              !commands rssuccessbot       - Show all RSSuccessBot commands
-              !commands rsmentionpinger    - Show all RSMentionPinger commands
-              !commands rsonboarding       - Show all RSOnboarding commands
-              !commands rscheckerbot       - Show all RSCheckerbot commands
-            """
-            try:
-                repo_root = _REPO_ROOT
-            except Exception:
-                from pathlib import Path
-                repo_root = Path(__file__).resolve().parents[1]
-
-            async def _safe_send(*, content: str | None = None, embed: discord.Embed | None = None) -> bool:
-                """Send in-channel; if forbidden, fallback to DM so the command never appears silent."""
-                try:
-                    await ctx.send(content=content, embed=embed)
-                    return True
-                except Exception:
-                    try:
-                        await ctx.author.send(content=content, embed=embed)
-                        return True
-                    except Exception as e2:
-                        print(f"{Colors.YELLOW}[commands] failed to send response: {str(e2)[:200]}{Colors.RESET}")
-                        return False
-
-            # If the user pasted multiple commands in one message, discord.py will treat the next line as an argument.
-            # Example: a single message containing:
-            #   !commands
-            #   !testcards
-            # becomes: bot_name="!testcards"
-            if bot_name and str(bot_name).strip().startswith("!"):
-                bot_name = None
-            
-            # If no bot_name provided, show summary of all bots
-            if not bot_name:
-                embed = discord.Embed(
-                    title="📋 RS Bots Commands Reference",
-                    description="Use `!commands <bot_name>` to view commands for a specific bot",
-                    color=discord.Color.blue(),
-                    timestamp=datetime.now(timezone.utc)
-                )
-                
-                # Get all RS bots from BOTS registry
-                rs_bot_keys = self._get_rs_bot_keys()
-                
-                for bot_key in rs_bot_keys:
-                    if bot_key not in self.BOTS:
-                        continue
-                    
-                    bot_info = self.BOTS[bot_key]
-                    bot_folder = bot_info.get("folder", "")
-                    
-                    if not bot_folder:
-                        continue
-                    
-                    commands_file = repo_root / bot_folder / "COMMANDS.md"
-                    
-                    # Count commands if file exists
-                    command_count = "?"
-                    if commands_file.exists():
-                        try:
-                            content = commands_file.read_text(encoding="utf-8")
-                            # Count command definitions (look for "#### `!" or "#### `/")
-                            command_count = str(content.count("#### `!") + content.count("#### `/"))
-                        except Exception:
-                            command_count = "?"
-                    
-                    embed.add_field(
-                        name=f"🤖 {bot_info.get('name', bot_key.upper())}",
-                        value=f"{command_count} commands\nUse: `!commands {bot_key}`",
-                        inline=True
-                    )
-                
-                embed.set_footer(text="Example: !commands rsadminbot")
-                ok = await _safe_send(embed=embed)
-                if not ok:
-                    # Last-ditch: attempt plain text
-                    await _safe_send(content="❌ Failed to send commands summary (no permission to post here and DM failed).")
-                return
-            
-            # Resolve bot name using canonical BOTS registry
-            bot_key = bot_name.strip().lower()
-            
-            if bot_key not in self.BOTS:
-                # List available bots in error message
-                available_bots = ", ".join(sorted(self.BOTS.keys()))
-                error_embed = MessageHelper.create_error_embed(
-                    title="Unknown Bot",
-                    message=f"Bot '{bot_name}' not found in bot registry.",
-                    error_details=f"Available bots: {available_bots}",
-                    footer=f"Triggered by {ctx.author}"
-                )
-                await _safe_send(embed=error_embed)
-                return
-            
-            bot_info = self.BOTS[bot_key]
-            bot_folder = bot_info.get("folder", "")
-            
-            if not bot_folder:
-                error_embed = MessageHelper.create_error_embed(
-                    title="Bot Folder Not Configured",
-                    message=f"Bot '{bot_name}' does not have a folder configured in bot registry.",
-                    footer=f"Triggered by {ctx.author}"
-                )
-                await _safe_send(embed=error_embed)
-                return
-            
-            # Read COMMANDS.md file
-            commands_file = repo_root / bot_folder / "COMMANDS.md"
-            
-            if not commands_file.exists():
-                error_embed = MessageHelper.create_error_embed(
-                    title="Commands File Not Found",
-                    message=f"COMMANDS.md not found for {bot_info.get('name', bot_key)}.",
-                    error_details=f"Expected path: {commands_file}",
-                    footer=f"Triggered by {ctx.author}"
-                )
-                await _safe_send(embed=error_embed)
-                return
-            
-            try:
-                content = commands_file.read_text(encoding="utf-8")
-            except Exception as e:
-                error_embed = MessageHelper.create_error_embed(
-                    title="File Read Error",
-                    message=f"Failed to read COMMANDS.md for {bot_info.get('name', bot_key)}.",
-                    error_details=str(e)[:200],
-                    footer=f"Triggered by {ctx.author}"
-                )
-                await _safe_send(embed=error_embed)
-                return
-            
-            # Parse and display content
-            # Discord message limit is 2000 chars, embed field limit is 1024
-            # Split content intelligently if needed
-            
-            if len(content) <= 1900:
-                # Small enough to send as single code block
-                await _safe_send(content=f"```markdown\n{content}\n```")
-            else:
-                # Split into multiple messages
-                # Try to split at section boundaries (## headers)
-                lines = content.split('\n')
-                chunks = []
-                current_chunk = []
-                current_length = 0
-                
-                for line in lines:
-                    line_length = len(line) + 1  # +1 for newline
-                    
-                    # If adding this line would exceed limit, save current chunk
-                    if current_length + line_length > 1900 and current_chunk:
-                        chunks.append('\n'.join(current_chunk))
-                        current_chunk = [line]
-                        current_length = line_length
-                    else:
-                        current_chunk.append(line)
-                        current_length += line_length
-                
-                # Add final chunk
-                if current_chunk:
-                    chunks.append('\n'.join(current_chunk))
-                
-                # Send first chunk as embed with title
-                if chunks:
-                    first_chunk = chunks[0]
-                    embed = discord.Embed(
-                        title=f"📋 {bot_info.get('name', bot_key.upper())} Commands",
-                        description=f"Showing {len(chunks)} part(s)",
-                        color=discord.Color.blue(),
-                        timestamp=datetime.now(timezone.utc)
-                    )
-                    
-                    # Use code block in description if first chunk fits
-                    if len(first_chunk) <= 1900:
-                        embed.description = f"```markdown\n{first_chunk}\n```"
-                    else:
-                        # Truncate if still too long
-                        embed.add_field(
-                            name="Part 1",
-                            value=f"```markdown\n{first_chunk[:1020]}\n```",
-                            inline=False
-                        )
-                    
-                    embed.set_footer(text=f"Triggered by {ctx.author}")
-                    await _safe_send(embed=embed)
-                    
-                    # Send remaining chunks
-                    for i, chunk in enumerate(chunks[1:], start=2):
-                        if len(chunk) <= 1900:
-                            await _safe_send(content=f"```markdown\n{chunk}\n```")
-                        else:
-                            # Further truncate if needed
-                            await _safe_send(content=f"```markdown\n{chunk[:1900]}\n```")
-        
-        self.registered_commands.append(("commands", "List all commands for bots", True))
         
         @self.bot.command(name="botdiagnose")
         @commands.check(lambda ctx: self.is_admin(ctx.author))
