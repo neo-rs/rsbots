@@ -1383,12 +1383,51 @@ async def handle_membership_deactivated(
     
     member_role = guild.get_role(ROLE_CANCEL_A)
     welcome_role = guild.get_role(ROLE_CANCEL_B)
+
+    # Decide destination channel early (used for kind + alerts).
+    dest = case_channel_name or MEMBER_CANCELLATION_CHANNEL_NAME
+
+    # If Whop reports "deactivated/canceled" but cancel_at_period_end=true, access continues
+    # until the end of the current billing period. In that case, do not remove roles early.
+    still_entitled = False
+    try:
+        evt = str((event_data or {}).get("event_type") or "").strip().lower()
+        is_payment_failure_event = "payment_failure" in evt or "payment failed" in str(title_override or "").lower()
+        membership_id = _safe_get(event_data or {}, "membership_id", "membership.id", default="").strip()
+        if membership_id == "—":
+            membership_id = ""
+        if not membership_id:
+            membership_id = _get_cached_membership_id_for_discord(member.id)
+        if (not is_payment_failure_event) and membership_id and _whop_api_client:
+            m = await _whop_api_client.get_membership_by_id(membership_id)
+            if isinstance(m, dict) and m.get("cancel_at_period_end") is True:
+                renew_end = (
+                    m.get("renewal_period_end")
+                    or m.get("trial_end")
+                    or m.get("trial_ends_at")
+                    or m.get("trial_end_at")
+                )
+                if renew_end:
+                    # Parse ISO/unix-ish timestamps
+                    s = str(renew_end).strip()
+                    if s:
+                        if "T" in s or "-" in s:
+                            end_dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                            if end_dt.tzinfo is None:
+                                end_dt = end_dt.replace(tzinfo=timezone.utc)
+                            end_dt = end_dt.astimezone(timezone.utc)
+                        else:
+                            end_dt = datetime.fromtimestamp(float(s), tz=timezone.utc)
+                        still_entitled = datetime.now(timezone.utc) < end_dt
+    except Exception:
+        still_entitled = False
     
     roles_to_remove = []
-    if member_role and member_role in member.roles:
-        roles_to_remove.append(member_role)
-    if welcome_role and welcome_role in member.roles:
-        roles_to_remove.append(welcome_role)
+    if not still_entitled:
+        if member_role and member_role in member.roles:
+            roles_to_remove.append(member_role)
+        if welcome_role and welcome_role in member.roles:
+            roles_to_remove.append(welcome_role)
     
     if roles_to_remove:
         await member.remove_roles(*roles_to_remove, reason="Whop: Membership deactivated")
@@ -1397,9 +1436,13 @@ async def handle_membership_deactivated(
     if _log_member_status:
         whop_brief = await _whop_brief_from_event(member, event_data)
         access = _access_roles_compact(member)
-        title = title_override or "🟧 Membership Deactivated"
+        title = title_override or ("⚠️ Cancellation Scheduled" if still_entitled else "🟧 Membership Deactivated")
         color = int(color_override) if isinstance(color_override, int) else 0xFEE75C
-        kind = "payment_failed" if ("payment failed" in title.lower() or dest == PAYMENT_FAILURE_CHANNEL_NAME) else "deactivated"
+        kind = (
+            "payment_failed"
+            if ("payment failed" in title.lower() or dest == PAYMENT_FAILURE_CHANNEL_NAME)
+            else ("cancellation_scheduled" if still_entitled else "deactivated")
+        )
         detailed = build_member_status_detailed_embed(
             title=title,
             member=member,
@@ -1415,7 +1458,6 @@ async def handle_membership_deactivated(
         await _log_member_status("", embed=detailed)
 
         # Minimal alert -> dedicated case channel (defaults to member-cancelation)
-        dest = case_channel_name or MEMBER_CANCELLATION_CHANNEL_NAME
         minimal = build_case_minimal_embed(
             title=title,
             member=member,

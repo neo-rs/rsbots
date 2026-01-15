@@ -491,6 +491,27 @@ def _fmt_date_any(ts_str: str | int | float | None) -> str:
     except Exception:
         return "—"
 
+def _parse_dt_any(ts_str: str | int | float | None) -> datetime | None:
+    """Parse ISO/unix-ish timestamps into UTC datetime (best-effort)."""
+    if ts_str is None or ts_str == "":
+        return None
+    try:
+        if isinstance(ts_str, (int, float)):
+            return datetime.fromtimestamp(float(ts_str), tz=timezone.utc)
+        s = str(ts_str).strip()
+        if not s:
+            return None
+        # ISO-ish path
+        if "T" in s or "-" in s:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        # Unix-ish path (strings like "1700000000" or "1700000000.0")
+        return datetime.fromtimestamp(float(s), tz=timezone.utc)
+    except Exception:
+        return None
+
 
 def _fmt_money(amount: object, currency: str | None = None) -> str:
     """Format Whop money values (usually floats) into a readable string."""
@@ -1464,6 +1485,19 @@ async def sync_whop_memberships():
                 
                 # If API says canceled but user has Member role, remove it
                 if actual_status in ("canceled", "completed", "past_due", "unpaid"):
+                    # Whop can report `status=canceled` even when `cancel_at_period_end=true`,
+                    # meaning access remains until the end of the current billing period.
+                    if actual_status == "canceled" and isinstance(membership_data, dict):
+                        cape_now = membership_data.get("cancel_at_period_end")
+                        if cape_now is True:
+                            access_end = _parse_dt_any(
+                                membership_data.get("renewal_period_end")
+                                or membership_data.get("trial_end")
+                                or membership_data.get("trial_ends_at")
+                                or membership_data.get("trial_end_at")
+                            )
+                            if access_end and _now() < access_end:
+                                continue
                     await member.remove_roles(
                         member_role, 
                         reason=f"Whop sync: Status is {actual_status}"

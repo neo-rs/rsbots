@@ -59,14 +59,11 @@ This section documents the canonical operational workflow for managing RS bots o
 
 ### Source of truth: server target and key
 
-- **Server list**: `oraclekeys/servers.json`
-- **SSH key (Windows, when connecting FROM Windows to Oracle)**: `oraclekeys/ssh-key-*.key`
-  - **Current Oracle key in this repo**: `oraclekeys/ssh-key-2025-12-15.key`
-  - **Used by**:
-    - `oraclekeys/servers.json` (`key: "ssh-key-2025-12-15.key"`)
-    - `RSAdminBot/config.json` (`ssh_server.key: "ssh-key-2025-12-15.key"`; resolved relative to `RSAdminBot/`)
-  - **Example (Windows)**:
-    - `ssh -i oraclekeys/ssh-key-2025-12-15.key rsadmin@137.131.14.157`
+- **Server list (non-secret, tracked in git)**: `oraclekeys/servers.json`
+- **SSH private key (secret, NEVER committed)**: `oraclekeys/ssh-key-*.key`
+  - The `key` field in `oraclekeys/servers.json` is typically a **filename**, e.g. `"ssh-key-2025-12-15.key"`.
+  - After a Windows reinstall/clone, you must restore the `.key` file from your private backup into `oraclekeys/`.
+  - **Example (Windows)**: `ssh -i oraclekeys/ssh-key-2025-12-15.key rsadmin@137.131.14.157`
 - **Ubuntu repo root**: `/home/<user>/bots/mirror-world` (usually `/home/rsadmin/bots/mirror-world`)
   - **Note (Ubuntu local-exec mode)**: when you are already on Oracle Ubuntu and `local_exec=yes`, no SSH key is needed.
 
@@ -89,8 +86,8 @@ This section documents the canonical operational workflow for managing RS bots o
 
 - **Hashed manifest verification** must be used to verify local vs server code state:
   - On Ubuntu: `python3 scripts/rsbots_manifest.py --normalize-text-eol --out /tmp/rsbots_manifest_server.json`
-  - On Windows: `python scripts/rsbots_manifest.py --normalize-text-eol --out Oraclserver-files/rsbots_manifest_local.json`
-  - Compare: `python scripts/compare_rsbots_python_only.py`
+  - On Windows: `py -3 scripts/rsbots_manifest.py --normalize-text-eol --out Oraclserver-files/rsbots_manifest_local.json`
+  - Compare: `py -3 scripts/compare_rsbots_python_only.py`
 
 ### Baseline sync rule (MANDATORY - prevents "Cursor edited the wrong code")
 
@@ -100,11 +97,11 @@ Reason: Oracle is not guaranteed to be a git checkout. If the server code is ahe
 
 Required workflow (Windows):
 
-1. Download a fresh Oracle snapshot:
-   - `download_oracle_snapshot.bat`
-2. Run the baseline compare:
-   - `oracle_baseline_check.bat`
-   - (or) `python scripts/oracle_baseline_check.py`
+1. Run the baseline compare (recommended one-shot):
+   - `oracle_baseline_check.bat --download`
+2. Or run it in two steps:
+   - Download snapshot: `py -3 scripts/download_oracle_snapshot.py`
+   - Compare: `oracle_baseline_check.bat` (or `py -3 scripts/oracle_baseline_check.py`)
 
 Enforcement:
 

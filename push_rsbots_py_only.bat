@@ -39,10 +39,10 @@ if not errorlevel 1 (
 echo.
 echo === STAGED CHANGES (what will be committed) ===
 echo --- files (name-status)
-git diff --cached --name-status
+git --no-pager diff --cached --name-status
 echo.
 echo --- diffstat
-git diff --cached --stat
+git --no-pager diff --cached --stat
 echo.
 
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set TS=%%i
@@ -60,7 +60,7 @@ echo.
 echo === COMMIT CREATED ===
 echo Commit: %SHA%
 echo --- commit summary (name-status + stat)
-git show -1 --name-status --stat --pretty=oneline
+git --no-pager show -1 --name-status --stat --pretty=oneline
 echo.
 
 echo.

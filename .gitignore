@@ -6,9 +6,14 @@
 
 # Allow helper scripts at repo root
 !/push_rsbots_py_only.bat
+!/oracle_baseline_check.bat
 
 # Allow canonical docs at repo root
 !/CANONICAL_RULES.md
+
+# Allow non-secret Oracle server list (keys remain untracked)
+!oraclekeys/
+!oraclekeys/servers.json
 
 # Only allow python from the RS bot folders
 !RSAdminBot/
