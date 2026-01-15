@@ -9490,6 +9490,27 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             except Exception:
                 from pathlib import Path
                 repo_root = Path(__file__).resolve().parents[1]
+
+            async def _safe_send(*, content: str | None = None, embed: discord.Embed | None = None) -> bool:
+                """Send in-channel; if forbidden, fallback to DM so the command never appears silent."""
+                try:
+                    await ctx.send(content=content, embed=embed)
+                    return True
+                except Exception:
+                    try:
+                        await ctx.author.send(content=content, embed=embed)
+                        return True
+                    except Exception as e2:
+                        print(f"{Colors.YELLOW}[commands] failed to send response: {str(e2)[:200]}{Colors.RESET}")
+                        return False
+
+            # If the user pasted multiple commands in one message, discord.py will treat the next line as an argument.
+            # Example: a single message containing:
+            #   !commands
+            #   !testcards
+            # becomes: bot_name="!testcards"
+            if bot_name and str(bot_name).strip().startswith("!"):
+                bot_name = None
             
             # If no bot_name provided, show summary of all bots
             if not bot_name:
@@ -9532,10 +9553,10 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                     )
                 
                 embed.set_footer(text="Example: !commands rsadminbot")
-                try:
-                    await ctx.send(embed=embed)
-                except Exception as e:
-                    await ctx.send(f"❌ Failed to send commands summary: {str(e)[:200]}")
+                ok = await _safe_send(embed=embed)
+                if not ok:
+                    # Last-ditch: attempt plain text
+                    await _safe_send(content="❌ Failed to send commands summary (no permission to post here and DM failed).")
                 return
             
             # Resolve bot name using canonical BOTS registry
@@ -9550,7 +9571,7 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                     error_details=f"Available bots: {available_bots}",
                     footer=f"Triggered by {ctx.author}"
                 )
-                await ctx.send(embed=error_embed)
+                await _safe_send(embed=error_embed)
                 return
             
             bot_info = self.BOTS[bot_key]
@@ -9562,7 +9583,7 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                     message=f"Bot '{bot_name}' does not have a folder configured in bot registry.",
                     footer=f"Triggered by {ctx.author}"
                 )
-                await ctx.send(embed=error_embed)
+                await _safe_send(embed=error_embed)
                 return
             
             # Read COMMANDS.md file
@@ -9575,7 +9596,7 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                     error_details=f"Expected path: {commands_file}",
                     footer=f"Triggered by {ctx.author}"
                 )
-                await ctx.send(embed=error_embed)
+                await _safe_send(embed=error_embed)
                 return
             
             try:
@@ -9587,7 +9608,7 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                     error_details=str(e)[:200],
                     footer=f"Triggered by {ctx.author}"
                 )
-                await ctx.send(embed=error_embed)
+                await _safe_send(embed=error_embed)
                 return
             
             # Parse and display content
@@ -9596,7 +9617,7 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             
             if len(content) <= 1900:
                 # Small enough to send as single code block
-                await ctx.send(f"```markdown\n{content}\n```")
+                await _safe_send(content=f"```markdown\n{content}\n```")
             else:
                 # Split into multiple messages
                 # Try to split at section boundaries (## headers)
@@ -9628,7 +9649,7 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                         title=f"📋 {bot_info.get('name', bot_key.upper())} Commands",
                         description=f"Showing {len(chunks)} part(s)",
                         color=discord.Color.blue(),
-                        timestamp=datetime.now()
+                        timestamp=datetime.now(timezone.utc)
                     )
                     
                     # Use code block in description if first chunk fits
@@ -9643,15 +9664,15 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                         )
                     
                     embed.set_footer(text=f"Triggered by {ctx.author}")
-                    await ctx.send(embed=embed)
+                    await _safe_send(embed=embed)
                     
                     # Send remaining chunks
                     for i, chunk in enumerate(chunks[1:], start=2):
                         if len(chunk) <= 1900:
-                            await ctx.send(f"```markdown\n{chunk}\n```")
+                            await _safe_send(content=f"```markdown\n{chunk}\n```")
                         else:
                             # Further truncate if needed
-                            await ctx.send(f"```markdown\n{chunk[:1900]}\n```")
+                            await _safe_send(content=f"```markdown\n{chunk[:1900]}\n```")
         
         self.registered_commands.append(("commands", "List all commands for bots", True))
         
