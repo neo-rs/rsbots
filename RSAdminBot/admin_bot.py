@@ -3760,18 +3760,20 @@ echo \"CHANGED_END\"
         return False
     
     def _github_py_only_update(self, bot_folder: str) -> Tuple[bool, Dict[str, Any]]:
-        """Pull python-only bot code from the server-side GitHub checkout and overwrite live *.py files.
+        """Pull python-only bot code from the server-side GitHub checkout and overwrite live code files.
 
         This is the canonical update path for `!selfupdate` and `!botupdate` when using GitHub as source of truth.
 
         Server expectations:
         - Git repo exists at: /home/rsadmin/bots/rsbots-code
         - Live bot tree exists at: self.remote_root (typically /home/rsadmin/bots/mirror-world)
-        - GitHub repo contains only *.py under the RS bot folders
+        - GitHub repo contains bot code under the RS bot folders
 
         Safety:
         - Never deletes first; overwrite-in-place only
-        - Only copies files tracked by git and ending in .py under the target folder
+        - Only copies files tracked by git under the target folder:
+          - *.py
+          - COMMANDS.md (if present)
         """
         try:
             folder = (bot_folder or "").strip()
@@ -3806,15 +3808,23 @@ git pull --ff-only origin main
 NEW="$(git rev-parse HEAD)"
 
 # Get list of Python files in git repo
-TMP_LIST="/tmp/mw_pyonly_${{BOT_FOLDER}}.txt"
-git ls-files "$BOT_FOLDER" 2>/dev/null | grep -E \"\\\\.py$\" > "$TMP_LIST" || true
-PY_COUNT="$(wc -l < "$TMP_LIST" | tr -d \" \")"
+TMP_PY_LIST="/tmp/mw_pyonly_${{BOT_FOLDER}}.txt"
+git ls-files "$BOT_FOLDER" 2>/dev/null | grep -E \"\\\\.py$\" > "$TMP_PY_LIST" || true
+PY_COUNT="$(wc -l < "$TMP_PY_LIST" | tr -d \" \")"
 if [ "$PY_COUNT" = "" ]; then PY_COUNT="0"; fi
 if [ "$PY_COUNT" = "0" ]; then
   echo "ERR=no_python_files"
   echo "DETAIL=no tracked *.py under $BOT_FOLDER in $CODE_ROOT"
   exit 3
 fi
+
+# Build the full sync list: python files + COMMANDS.md (if tracked)
+TMP_SYNC_LIST="/tmp/mw_sync_${{BOT_FOLDER}}.txt"
+cat "$TMP_PY_LIST" > "$TMP_SYNC_LIST" || true
+git ls-files "$BOT_FOLDER/COMMANDS.md" 2>/dev/null >> "$TMP_SYNC_LIST" || true
+sort -u "$TMP_SYNC_LIST" -o "$TMP_SYNC_LIST" || true
+SYNC_COUNT="$(wc -l < "$TMP_SYNC_LIST" | tr -d \" \")"
+if [ "$SYNC_COUNT" = "" ]; then SYNC_COUNT="0"; fi
 
 # Compare live files with git repo files to detect actual differences
 # This catches cases where files differ even if commit hash didn't change
@@ -3829,7 +3839,7 @@ while IFS= read -r git_file; do
   elif ! cmp -s "$git_path" "$live_path" 2>/dev/null; then
     echo "$git_file" >> "$DIFF_FILES"
   fi
-done < "$TMP_LIST"
+done < "$TMP_SYNC_LIST"
 
 # Also check for files changed in git commits (for reporting)
 GIT_CHANGED="$(git diff --name-only "$OLD" "$NEW" -- "$BOT_FOLDER" 2>/dev/null | grep -E \"\\\\.py$\" || true)"
@@ -3840,7 +3850,7 @@ ACTUAL_CHANGED_COUNT="$(wc -l < "$DIFF_FILES" | tr -d \" \")"
 if [ "$ACTUAL_CHANGED_COUNT" = "" ]; then ACTUAL_CHANGED_COUNT="0"; fi
 
 # Copy files (always sync, even if no differences detected)
-tar -cf - -T "$TMP_LIST" | (cd "$LIVE_ROOT" && tar -xf -)
+tar -cf - -T "$TMP_SYNC_LIST" | (cd "$LIVE_ROOT" && tar -xf -)
 
 # Use actual changed count for reporting (more accurate than git diff)
 CHANGED_COUNT="$ACTUAL_CHANGED_COUNT"
@@ -3850,6 +3860,7 @@ echo "OK=1"
 echo "OLD=$OLD"
 echo "NEW=$NEW"
 echo "PY_COUNT=$PY_COUNT"
+echo "SYNC_COUNT=$SYNC_COUNT"
 echo "CHANGED_COUNT=$CHANGED_COUNT"
 echo "GIT_CHANGED_COUNT=$GIT_CHANGED_COUNT"
 echo "CHANGED_BEGIN"
@@ -3936,13 +3947,17 @@ echo "CHANGED_END"
         old = str(stats.get("old") or "").strip()
         new = str(stats.get("new") or "").strip()
         py_count = str(stats.get("py_count") or "0").strip()
+        sync_count = str(stats.get("sync_count") or "").strip()
         changed_count = str(stats.get("changed_count") or "0").strip()
         changed_sample = stats.get("changed_sample") or []
 
         summary = f"✅ **{info.get('name', key)} updated from GitHub (python-only)**\n```"
         if old or new:
             summary += f"\nGit: {old[:12]} -> {new[:12]}"
-        summary += f"\nPython copied: {py_count} | Changed: {changed_count}"
+        if sync_count:
+            summary += f"\nPython copied: {py_count} | Total copied: {sync_count} | Changed: {changed_count}"
+        else:
+            summary += f"\nPython copied: {py_count} | Changed: {changed_count}"
         summary += f"\nRestart: {'OK' if restart_ok else 'FAILED'}"
         summary += "\n```"
         if changed_sample:
