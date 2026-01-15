@@ -17,31 +17,37 @@
 !RSAdminBot/**/*.py
 !RSAdminBot/*.sh
 !RSAdminBot/**/*.sh
+!RSAdminBot/COMMANDS.md
 
 !RSCheckerbot/
 !RSCheckerbot/**/
 !RSCheckerbot/*.py
 !RSCheckerbot/**/*.py
+!RSCheckerbot/COMMANDS.md
 
 !RSForwarder/
 !RSForwarder/**/
 !RSForwarder/*.py
 !RSForwarder/**/*.py
+!RSForwarder/COMMANDS.md
 
 !RSMentionPinger/
 !RSMentionPinger/**/
 !RSMentionPinger/*.py
 !RSMentionPinger/**/*.py
+!RSMentionPinger/COMMANDS.md
 
 !RSOnboarding/
 !RSOnboarding/**/
 !RSOnboarding/*.py
 !RSOnboarding/**/*.py
+!RSOnboarding/COMMANDS.md
 
 !RSuccessBot/
 !RSuccessBot/**/
 !RSuccessBot/*.py
 !RSuccessBot/**/*.py
+!RSuccessBot/COMMANDS.md
 
 # Allow shared scripts used by RSAdminBot (Oracle data tools)
 !scripts/
