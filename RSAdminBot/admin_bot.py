@@ -8417,7 +8417,7 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
 
         @self.bot.command(name="testcards", aliases=["testcenter_cards", "tcards"])
         @commands.check(lambda ctx: self.is_admin(ctx.author))
-        async def testcards(ctx, member: discord.Member | None = None):
+        async def testcards(ctx, *, args: str = ""):
             """Post RSCheckerbot sample staff cards into TestCenter channels + write a JSON trace artifact (admin only)."""
             # Resolve TestCenter guild
             try:
@@ -8429,13 +8429,74 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                 await ctx.send("❌ TestCenter guild not found/available to RSAdminBot.")
                 return
 
-            target_id = int(member.id) if isinstance(member, discord.Member) else int(ctx.author.id)
-            target_member = test_guild.get_member(target_id)
-            if target_member is None:
-                try:
-                    target_member = await test_guild.fetch_member(target_id)
-                except Exception:
-                    target_member = None
+            # Parse args:
+            # - Default: target is invoking user
+            # - Accept a target (mention/user_id/name) and/or membership_id override (mem_...)
+            raw = str(args or "").strip()
+            tokens = [t for t in raw.split() if t.strip()]
+            membership_override = ""
+            target_token = ""
+            for t in tokens:
+                if t.lower().startswith("mem_"):
+                    membership_override = t.strip()
+                elif not target_token:
+                    target_token = t.strip()
+
+            # Resolve target member in TestCenter
+            target_member: discord.Member | None = None
+            target_id = 0
+            try:
+                import re
+
+                tok = target_token.strip()
+                if not tok:
+                    target_id = int(ctx.author.id)
+                else:
+                    m = re.match(r"^<@!?(\\d+)>$", tok)
+                    if m:
+                        target_id = int(m.group(1))
+                    elif tok.strip().lstrip("@").isdigit():
+                        target_id = int(tok.strip().lstrip("@"))
+                    else:
+                        needle = tok.strip().lstrip("@").lower()
+                        # Prefer exact display_name match, then exact username match, then substring match.
+                        exact = [m for m in (test_guild.members or []) if str(getattr(m, "display_name", "")).lower() == needle]
+                        if not exact:
+                            exact = [m for m in (test_guild.members or []) if str(getattr(m, "name", "")).lower() == needle]
+                        if exact:
+                            target_member = exact[0]
+                        else:
+                            partial = [
+                                m
+                                for m in (test_guild.members or [])
+                                if needle
+                                and (
+                                    needle in str(getattr(m, "display_name", "")).lower()
+                                    or needle in str(getattr(m, "name", "")).lower()
+                                    or needle in str(m).lower()
+                                )
+                            ]
+                            if len(partial) == 1:
+                                target_member = partial[0]
+                            elif len(partial) > 1:
+                                await ctx.send(
+                                    "❌ Multiple TestCenter members match that name. Use an @mention or numeric user ID."
+                                )
+                                return
+                        if target_member is None:
+                            await ctx.send("❌ Target member not found in TestCenter. Use an @mention or user ID.")
+                            return
+
+                if target_member is None and target_id:
+                    target_member = test_guild.get_member(target_id)
+                    if target_member is None:
+                        try:
+                            target_member = await test_guild.fetch_member(target_id)
+                        except Exception:
+                            target_member = None
+            except Exception:
+                target_member = None
+
             if not isinstance(target_member, discord.Member):
                 await ctx.send("❌ Target member is not in the TestCenter server (cannot post member-based cards).")
                 return
@@ -8522,6 +8583,8 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
 
             # Fetch Whop brief (best-effort)
             whop_brief = {}
+            membership_id_used = membership_override
+            whop_fetch = {"status": "skipped", "error": "", "membership_id": "", "used_override": bool(membership_override)}
             try:
                 from RSCheckerbot.whop_webhook_handler import get_cached_whop_membership_id  # type: ignore
                 from RSCheckerbot.whop_api_client import WhopAPIClient  # type: ignore
@@ -8534,13 +8597,24 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                     base_url = str(wh.get("base_url") or "https://api.whop.com/api/v1").strip()
                     if api_key and company_id:
                         client = WhopAPIClient(api_key=api_key, base_url=base_url, company_id=company_id)
-                        mid = get_cached_whop_membership_id(target_member.id)
-                        whop_brief = await fetch_whop_brief(
-                            client,
-                            mid,
-                            enable_enrichment=bool(wh.get("enable_enrichment", True)),
-                        )
-            except Exception:
+                        if not membership_id_used:
+                            membership_id_used = get_cached_whop_membership_id(target_member.id)
+                        mid = membership_id_used
+                        whop_fetch["membership_id"] = mid or ""
+                        if mid:
+                            whop_brief = await fetch_whop_brief(
+                                client,
+                                mid,
+                                enable_enrichment=bool(wh.get("enable_enrichment", True)),
+                            )
+                            whop_fetch["status"] = "ok"
+                        else:
+                            whop_fetch["status"] = "missing_membership_id"
+                    else:
+                        whop_fetch["status"] = "missing_whop_api_config"
+            except Exception as e:
+                whop_fetch["status"] = "error"
+                whop_fetch["error"] = str(e)[:200]
                 whop_brief = {}
 
             # Build + post sample cards (same builders as RSCheckerbot)
@@ -8556,6 +8630,9 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                 "test_server_guild_id": test_guild.id,
                 "target_member_id": target_member.id,
                 "target_member_name": str(target_member),
+                "membership_id_override": membership_override or "",
+                "membership_id_used": membership_id_used or "",
+                "whop_fetch": whop_fetch,
                 "bootstrap": {
                     "category_name": category_name,
                     "category_id": cat.id,
@@ -8577,26 +8654,28 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             allowed = discord.AllowedMentions.none()
 
             detailed = build_member_status_detailed_embed(
-                title="TEST • Payment Failed — Action Needed",
+                title="❌ Payment Failed — Action Needed",
                 member=target_member,
                 access_roles=access_roles,
                 color=0xED4245,
-                discord_kv=[("test", "true")],
                 whop_brief=whop_brief,
+                event_kind="payment_failed",
             )
             minimal_fail = build_case_minimal_embed(
-                title="TEST • Payment Failed — Action Needed",
+                title="❌ Payment Failed — Action Needed",
                 member=target_member,
                 access_roles=access_roles,
                 whop_brief=whop_brief,
                 color=0xED4245,
+                event_kind="payment_failed",
             )
             minimal_cancel = build_case_minimal_embed(
-                title="TEST • Membership Deactivated",
+                title="⚠️ Cancellation Scheduled",
                 member=target_member,
                 access_roles=access_roles,
                 whop_brief=whop_brief,
                 color=0xFEE75C,
+                event_kind="cancellation_scheduled",
             )
 
             # Post messages and record outcomes

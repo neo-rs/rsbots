@@ -1433,6 +1433,7 @@ async def sync_whop_memberships():
                         member=member,
                         access_roles=access,
                         color=0xFEE75C,
+                        event_kind="cancellation_scheduled",
                         member_kv=[
                             ("first_joined", _fmt_ts(hist.get("first_join_ts"), "D") if hist.get("first_join_ts") else "—"),
                             ("join_count", hist.get("join_count") or "—"),
@@ -1451,6 +1452,7 @@ async def sync_whop_memberships():
                         access_roles=access,
                         whop_brief=whop_brief,
                         color=0xFEE75C,
+                        event_kind="cancellation_scheduled",
                     )
                     await log_member_status("", embed=minimal, channel_name=MEMBER_CANCELLATION_CHANNEL_NAME)
 
@@ -1834,6 +1836,7 @@ async def on_member_join(member: discord.Member):
                     member=member,
                     access_roles=access,
                     color=0x57F287,
+                    event_kind="active",
                     member_kv=[
                         ("account_created", member.created_at.strftime("%b %d, %Y")),
                         ("first_joined", _fmt_ts(rec.get("first_join_ts"), "D")),
@@ -1913,6 +1916,7 @@ async def on_member_remove(member: discord.Member):
                     member=member,
                     access_roles=access,
                     color=0xFAA61A,
+                    event_kind="active",
                     member_kv=[
                         ("left_at", _fmt_ts(rec.get("last_leave_ts"), "D") if rec.get("last_leave_ts") else "—"),
                         ("first_joined", _fmt_ts(rec.get("first_join_ts"), "D") if rec.get("first_join_ts") else "—"),
@@ -2050,6 +2054,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             whop_brief = await _fetch_whop_brief_by_membership_id(whop_mid) if whop_mid else {}
             whop_status = str((whop_brief.get("status") or "")).strip().lower()
             is_payment_failed = whop_status in ("past_due", "unpaid") or bool(whop_brief.get("last_payment_failure"))
+            event_kind = "payment_failed" if is_payment_failed else "deactivated"
             access = _access_roles_plain(after)
             db_alerts = load_staff_alerts(STAFF_ALERTS_FILE)
             issue_key = f"payment_failed:{whop_status}" if is_payment_failed else "payment_cancellation_detected"
@@ -2065,6 +2070,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                     member=after,
                     access_roles=access,
                     color=color,
+                    event_kind=event_kind,
                     member_kv=[
                         ("account_created", after.created_at.strftime("%b %d, %Y")),
                         ("first_joined", _fmt_ts(hist.get("first_join_ts"), "D") if hist.get("first_join_ts") else "—"),
@@ -2085,6 +2091,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                     access_roles=access,
                     whop_brief=whop_brief,
                     color=color,
+                    event_kind=event_kind,
                 )
                 await log_member_status("", embed=minimal, channel_name=dest)
 
@@ -2135,6 +2142,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                     member=after,
                     access_roles=access,
                     color=0x57F287,
+                    event_kind="active",
                     member_kv=[
                         ("first_joined", _fmt_ts(hist.get("first_join_ts"), "D") if hist.get("first_join_ts") else "—"),
                         ("join_count", hist.get("join_count") or "—"),
@@ -2155,6 +2163,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                     access_roles=access,
                     whop_brief=whop_brief,
                     color=0x57F287,
+                    event_kind="active",
                 )
                 await log_member_status("", embed=minimal, channel_name=PAYMENT_FAILURE_CHANNEL_NAME)
 

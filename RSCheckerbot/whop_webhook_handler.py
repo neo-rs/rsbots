@@ -1335,6 +1335,7 @@ async def handle_membership_activated(member: discord.Member, event_data: dict):
             member=member,
             access_roles=access,
             color=0x57F287,
+            event_kind="active",
             discord_kv=[
                 ("event", "membership.activated"),
                 ("roles_added", cleanup_role.name if cleanup_role else "—"),
@@ -1357,6 +1358,7 @@ async def handle_membership_activated_pending(member: discord.Member, event_data
             member=member,
             access_roles=access,
             color=0xFEE75C,
+            event_kind="active",
             discord_kv=[
                 ("event", "membership.activated.pending"),
             ],
@@ -1397,11 +1399,13 @@ async def handle_membership_deactivated(
         access = _access_roles_compact(member)
         title = title_override or "🟧 Membership Deactivated"
         color = int(color_override) if isinstance(color_override, int) else 0xFEE75C
+        kind = "payment_failed" if ("payment failed" in title.lower() or dest == PAYMENT_FAILURE_CHANNEL_NAME) else "deactivated"
         detailed = build_member_status_detailed_embed(
             title=title,
             member=member,
             access_roles=access,
             color=color,
+            event_kind=kind,
             discord_kv=[
                 ("event", "membership.deactivated"),
                 ("roles_removed", ", ".join([r.name for r in roles_to_remove]) if roles_to_remove else "—"),
@@ -1418,6 +1422,7 @@ async def handle_membership_deactivated(
             access_roles=access,
             whop_brief=whop_brief,
             color=color,
+            event_kind=kind,
         )
         issue_key = f"whop.deactivated:{_membership_id_from_event(member, event_data)}"
         db_alerts = load_staff_alerts(STAFF_ALERTS_FILE)
@@ -1458,6 +1463,7 @@ async def handle_payment_renewal(member: discord.Member, event_data: dict):
             member=member,
             access_roles=access,
             color=0x57F287,
+            event_kind="active",
             discord_kv=[("event", "payment.succeeded.renewal")],
             whop_brief=whop_brief,
         )
@@ -1484,6 +1490,7 @@ async def handle_payment_activation(member: discord.Member, event_data: dict):
             member=member,
             access_roles=access,
             color=0x57F287,
+            event_kind="active",
             discord_kv=[
                 ("event", "payment.succeeded.activation"),
                 ("roles_added", member_role.name if member_role else "—"),
@@ -1506,6 +1513,7 @@ async def handle_payment_failed(member: discord.Member, event_data: dict):
             member=member,
             access_roles=access,
             color=0xED4245,
+            event_kind="payment_failed",
             discord_kv=[("event", "payment.failed")],
             whop_brief=whop_brief,
         )
@@ -1517,6 +1525,7 @@ async def handle_payment_failed(member: discord.Member, event_data: dict):
             access_roles=access,
             whop_brief=whop_brief,
             color=0xED4245,
+            event_kind="payment_failed",
         )
         issue_key = f"whop.payment_failed:{_membership_id_from_event(member, event_data)}"
         db_alerts = load_staff_alerts(STAFF_ALERTS_FILE)
