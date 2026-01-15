@@ -8447,30 +8447,54 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                 await ctx.send(f"❌ Failed to load RSCheckerbot config: {e}")
                 return
 
-            # Resolve target channels in TestCenter
+            # Resolve target channels in TestCenter (do NOT reuse RS server IDs/config)
             dm_cfg = rs_cfg.get("dm_sequence") if isinstance(rs_cfg, dict) else {}
-            status_ch_id = 0
-            if isinstance(dm_cfg, dict):
-                try:
-                    status_ch_id = int(dm_cfg.get("member_status_logs_channel_id") or 0)
-                except Exception:
-                    status_ch_id = 0
 
-            status_ch = self.bot.get_channel(status_ch_id) if status_ch_id else None
-            if not isinstance(status_ch, discord.TextChannel) or status_ch.guild.id != test_guild.id:
-                # Fallback by name
-                status_ch = discord.utils.get(test_guild.text_channels, name="member-status-logs")
-            if not isinstance(status_ch, discord.TextChannel):
-                await ctx.send("❌ TestCenter channel not found: member-status-logs")
+            async def _get_or_create_category(name: str) -> tuple[discord.CategoryChannel | None, bool]:
+                cat = discord.utils.get(test_guild.categories, name=name)
+                if isinstance(cat, discord.CategoryChannel):
+                    return cat, False
+                try:
+                    created = await test_guild.create_category(name, reason="RSAdminBot !testcards bootstrap")
+                    return created, True
+                except Exception as e:
+                    await ctx.send(f"❌ Failed to create TestCenter category '{name}': {str(e)[:200]}")
+                    return None, False
+
+            async def _get_or_create_text(name: str, category: discord.CategoryChannel | None) -> tuple[discord.TextChannel | None, bool]:
+                ch = discord.utils.get(test_guild.text_channels, name=name)
+                if isinstance(ch, discord.TextChannel):
+                    # Keep channel organized under the category (best-effort).
+                    if category and ch.category_id != category.id:
+                        try:
+                            await ch.edit(category=category, reason="RSAdminBot !testcards bootstrap (organize)")
+                        except Exception:
+                            pass
+                    return ch, False
+                try:
+                    created = await test_guild.create_text_channel(name, category=category, reason="RSAdminBot !testcards bootstrap")
+                    return created, True
+                except Exception as e:
+                    await ctx.send(f"❌ Failed to create TestCenter channel '{name}': {str(e)[:200]}")
+                    return None, False
+
+            category_name = "RSCheckerbot Staff Alerts (TestCenter)"
+            cat, cat_created = await _get_or_create_category(category_name)
+            if cat is None:
                 return
 
-            payment_ch = discord.utils.get(test_guild.text_channels, name="payment-failure")
-            cancel_ch = discord.utils.get(test_guild.text_channels, name="member-cancelation")
+            status_ch, status_created = await _get_or_create_text("member-status-logs", cat)
+            payment_ch, pay_created = await _get_or_create_text("payment-failure", cat)
+            cancel_ch, cancel_created = await _get_or_create_text("member-cancelation", cat)
+
+            if not isinstance(status_ch, discord.TextChannel):
+                await ctx.send("❌ TestCenter channel not available: member-status-logs")
+                return
             if not isinstance(payment_ch, discord.TextChannel):
-                await ctx.send("❌ TestCenter channel not found: payment-failure")
+                await ctx.send("❌ TestCenter channel not available: payment-failure")
                 return
             if not isinstance(cancel_ch, discord.TextChannel):
-                await ctx.send("❌ TestCenter channel not found: member-cancelation")
+                await ctx.send("❌ TestCenter channel not available: member-cancelation")
                 return
 
             # Compute access roles (compact, access-relevant only)
@@ -8532,6 +8556,16 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                 "test_server_guild_id": test_guild.id,
                 "target_member_id": target_member.id,
                 "target_member_name": str(target_member),
+                "bootstrap": {
+                    "category_name": category_name,
+                    "category_id": cat.id,
+                    "category_created": cat_created,
+                    "channels_created": {
+                        "member-status-logs": status_created,
+                        "payment-failure": pay_created,
+                        "member-cancelation": cancel_created,
+                    },
+                },
                 "channels": {
                     "member_status_logs": status_ch.id,
                     "payment_failure": payment_ch.id,
@@ -9451,7 +9485,11 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
               !commands rsonboarding       - Show all RSOnboarding commands
               !commands rscheckerbot       - Show all RSCheckerbot commands
             """
-            repo_root = self.base_path.parent.resolve()
+            try:
+                repo_root = _REPO_ROOT
+            except Exception:
+                from pathlib import Path
+                repo_root = Path(__file__).resolve().parents[1]
             
             # If no bot_name provided, show summary of all bots
             if not bot_name:
@@ -9459,7 +9497,7 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                     title="📋 RS Bots Commands Reference",
                     description="Use `!commands <bot_name>` to view commands for a specific bot",
                     color=discord.Color.blue(),
-                    timestamp=datetime.now()
+                    timestamp=datetime.now(timezone.utc)
                 )
                 
                 # Get all RS bots from BOTS registry
@@ -9494,7 +9532,10 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                     )
                 
                 embed.set_footer(text="Example: !commands rsadminbot")
-                await ctx.send(embed=embed)
+                try:
+                    await ctx.send(embed=embed)
+                except Exception as e:
+                    await ctx.send(f"❌ Failed to send commands summary: {str(e)[:200]}")
                 return
             
             # Resolve bot name using canonical BOTS registry
