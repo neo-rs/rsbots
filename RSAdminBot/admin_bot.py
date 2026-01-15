@@ -8579,7 +8579,21 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                         relevant.add(int(str(rid).strip()))
             except Exception:
                 pass
+            # In TestCenter, RS server role IDs will not match, so the RSCheckerbot filter often returns "—".
+            # Fallback to the member's visible role names in TestCenter to keep the test output human-usable.
             access_roles = _access_roles_plain(target_member, relevant)
+            if not str(access_roles or "").strip() or str(access_roles).strip() == "—":
+                try:
+                    names: list[str] = []
+                    for r in (getattr(target_member, "roles", None) or []):
+                        nm = str(getattr(r, "name", "") or "").strip()
+                        if not nm or nm == "@everyone":
+                            continue
+                        if nm not in names:
+                            names.append(nm)
+                    access_roles = ", ".join(names) if names else "—"
+                except Exception:
+                    access_roles = access_roles or "—"
 
             # Fetch Whop brief (best-effort)
             whop_brief = {}
