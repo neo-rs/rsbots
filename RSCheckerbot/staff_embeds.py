@@ -40,11 +40,11 @@ def _kv_line(key: str, value: object, *, keep_blank: bool = False) -> str | None
     if not k:
         return None
     if value is None:
-        return f"{k}: —" if keep_blank else None
+        return f"{k} - —" if keep_blank else None
     s = str(value).strip()
     if not s or s == "—":
-        return f"{k}: —" if keep_blank else None
-    return f"{k}: {s}"
+        return f"{k} - —" if keep_blank else None
+    return f"{k} - {s}"
 
 
 def kv_block(pairs: list[tuple[str, object]], *, keep_blank_keys: set[str] | None = None) -> str:
