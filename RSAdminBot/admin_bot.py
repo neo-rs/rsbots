@@ -2368,20 +2368,15 @@ echo "TARGET=$TARGET"
         
         Args:
             embed: Discord embed to send
-            reply_channel: Optional fallback channel if the log channel is unavailable
+            reply_channel: Ignored (kept for backwards compatibility)
         """
         log_channel_id = "1452590450631376906"  # Hard-coded as specified
         
         try:
-            # Prefer log channel; fall back to reply_channel only if logging fails.
-            sent = False
+            # Only send to the log channel. Never echo into the invoking channel (prevents duplicates).
             log_channel = self.bot.get_channel(int(log_channel_id))
             if log_channel and getattr(log_channel, "id", None) is not None:
                 await log_channel.send(embed=embed)
-                sent = True
-
-            if (not sent) and reply_channel and getattr(reply_channel, "id", None) is not None:
-                await reply_channel.send(embed=embed)
         except Exception as e:
             print(f"{Colors.RED}[Discord Log] Failed to send message: {e}{Colors.RESET}")
 
@@ -4941,6 +4936,20 @@ echo "CHANGED_END"
             # Skip bot's own messages to prevent loops
             if message.author == self.bot.user:
                 return
+
+            # Lightweight command visibility debug (helps diagnose "no response" cases).
+            # Only logs for a tiny allowlist to avoid spam.
+            try:
+                raw = (message.content or "").strip()
+                low = raw.lower()
+                if low.startswith("!commands") or low.startswith("!testcards") or low.startswith("!whereami"):
+                    who = f"{getattr(message.author, 'name', '')}({getattr(message.author, 'id', '')})"
+                    ch = getattr(getattr(message, "channel", None), "name", "") or ""
+                    guild_id = getattr(getattr(message, "guild", None), "id", None)
+                    gid = str(guild_id) if guild_id is not None else ""
+                    print(f"{Colors.CYAN}[Msg] saw={raw.splitlines()[0][:80]} user={who} channel={ch} guild={gid}{Colors.RESET}")
+            except Exception:
+                pass
             
             # Process commands first (required for bot commands to work)
             await self.bot.process_commands(message)
@@ -5184,6 +5193,13 @@ echo "CHANGED_END"
               !commands rsonboarding       - Show all RSOnboarding commands
               !commands rscheckerbot       - Show all RSCheckerbot commands
             """
+            try:
+                who = str(getattr(ctx, "author", "") or "")
+                where = str(getattr(getattr(ctx, "channel", None), "name", "") or "")
+                msg_txt = (getattr(getattr(ctx, "message", None), "content", "") or "")[:200]
+                print(f"{Colors.CYAN}[commands] entered user={who} channel={where} msg={msg_txt}{Colors.RESET}")
+            except Exception:
+                pass
             try:
                 repo_root = _REPO_ROOT
             except Exception:
