@@ -77,12 +77,13 @@ This section documents the canonical operational workflow for managing RS bots o
    - This applies code update plus venv refresh plus systemd unit refresh in one deterministic sequence.
 
 2. **Bot folder sync (targeted code-only update)**:
-   - Use RSAdminBot (admin-only): `!botupdate <bot>`
+   - Use RSAdminBot (admin-only): `!botupdate <bot>` (pulls from GitHub) or `!botsync <bot>` (syncs local files)
    - Rules:
      - Never sync secrets (`config.secrets.json`) or runtime data
      - Always create a remote backup tar.gz before overwrite
      - Compare using sha256 manifests (not file sizes)
      - On Ubuntu, prefer **local-exec** (no SSH key required on the server)
+     - `COMMANDS.md` files ARE synced (documentation files, same as .py files)
 
 ### Verification (canonical)
 
@@ -207,6 +208,8 @@ Notes:
    - Runtime JSON files (tickets.json, registry.json, etc.) are NOT synced
    - Only `config.json` and `messages.json` are synced
    - All `.py` files are ALWAYS synced
+   - `COMMANDS.md` files are ALWAYS synced (documentation files, same as .py files)
+   - `COMMANDS.md` files are part of code deployment and must be kept in sync with command implementations
 
 5. **Migration requirement:**
    - If a bot currently uses a database, it MUST be migrated to JSON
@@ -274,6 +277,77 @@ Notes:
      }
    }
    ```
+
+## 📚 COMMANDS DOCUMENTATION MAINTENANCE (MANDATORY)
+
+### Automatic COMMANDS.md Updates
+
+**CRITICAL**: When ANY command is added, removed, or modified in ANY bot, the corresponding `COMMANDS.md` file MUST be updated immediately.
+
+#### Cursor AI Instructions
+
+**MANDATORY**: When making ANY changes to bot commands, you MUST update the corresponding `COMMANDS.md` file in the same commit.
+
+1. **Detect command changes automatically**:
+   - When you add/remove/modify `@bot.command()`, `@self.bot.command()`, or `@bot.tree.command()` decorators
+   - When you change command names, aliases, parameters, docstrings, or descriptions
+   - When you modify command functionality that affects usage or behavior
+   - When you change admin/public permissions (`@commands.check()`, `@commands.has_permissions()`)
+   - When you add/remove command parameters or change parameter types/defaults
+
+2. **Update COMMANDS.md immediately** (same commit as code changes):
+   - Locate the bot's `COMMANDS.md` file: `{BotFolder}/COMMANDS.md`
+   - For NEW commands: Add complete entry with all details (name, aliases, parameters, description, admin status, usage, returns)
+   - For MODIFIED commands: Update the existing entry with new information
+   - For DELETED commands: Remove the entry completely
+   - Update command summary counts at the bottom of the file (Total Commands, Admin Commands, Public Commands)
+
+3. **Maintain format consistency**:
+   - Follow the exact format used in existing COMMANDS.md files
+   - Use `#### `!commandname`` for prefix commands
+   - Use `#### `/commandname`` for slash commands
+   - Include ALL aliases in the Aliases field (comma-separated)
+   - Include ALL parameters with descriptions and types if applicable
+   - Include usage examples
+   - Mark admin-only commands clearly (Yes/No)
+   - Include return value descriptions
+
+4. **Verify completeness before committing**:
+   - Count commands in code vs COMMANDS.md (must match exactly)
+   - Ensure all aliases are documented
+   - Ensure all parameters are documented
+   - Update command summary section (Total Commands, Admin Commands, Public Commands)
+   - Verify format matches existing entries
+
+#### Enforcement
+
+- **Before committing**: Verify COMMANDS.md matches actual commands in code
+- **During code review**: Check that COMMANDS.md was updated for any command changes
+- **After deployment**: Use `!commands <bot>` to verify documentation is accurate
+
+#### File Locations
+
+Each bot has its own COMMANDS.md file:
+- `RSAdminBot/COMMANDS.md` - RSAdminBot commands (43 commands)
+- `RSForwarder/COMMANDS.md` - RSForwarder commands (12 commands)
+- `RSuccessBot/COMMANDS.md` - RSSuccessBot commands (27 commands: 23 prefix + 4 slash)
+- `RSMentionPinger/COMMANDS.md` - RSMentionPinger commands (5 commands)
+- `RSOnboarding/COMMANDS.md` - RSOnboarding commands (10 commands)
+- `RSCheckerbot/COMMANDS.md` - RSCheckerbot commands (12 commands)
+
+#### Viewing Commands
+
+Use RSAdminBot command to view commands:
+- `!commands` - Show summary of all bots
+- `!commands <bot_name>` - Show all commands for specific bot
+
+#### Canonical Rules for COMMANDS.md
+
+- **One source of truth**: COMMANDS.md is the canonical documentation for each bot's commands
+- **No duplication**: Commands are documented ONLY in COMMANDS.md (not in README or other docs)
+- **Always synced**: COMMANDS.md files are synced like .py files (always synced, not runtime data)
+- **Must match code**: COMMANDS.md MUST accurately reflect actual commands in bot code
+- **Update immediately**: COMMANDS.md MUST be updated in the same commit as command changes
 
 ## ⚠️ STRICT MODE
 
