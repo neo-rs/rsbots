@@ -679,14 +679,18 @@ def _access_roles_plain(member: discord.Member) -> str:
     return access_roles_plain(member, relevant_ids)
 
 def load_settings() -> dict:
-    """Load settings from JSON file, default to enabled if missing/bad"""
+    """Load settings from JSON file.
+
+    IMPORTANT: Default to DISABLED if missing/bad to avoid DM sequence re-enabling
+    after restarts when settings.json is absent/corrupt on the server.
+    """
     if not SETTINGS_FILE.exists():
-        return {"dm_sequence_enabled": True}
+        return {"dm_sequence_enabled": False}
     try:
         data = load_json(SETTINGS_FILE)
-        return {"dm_sequence_enabled": data.get("dm_sequence_enabled", True)}
+        return {"dm_sequence_enabled": data.get("dm_sequence_enabled", False)}
     except Exception:
-        return {"dm_sequence_enabled": True}
+        return {"dm_sequence_enabled": False}
 
 def save_settings(settings: dict) -> None:
     """Save settings to JSON file"""
