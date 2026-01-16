@@ -46,6 +46,7 @@ ROLE_TRIGGER = None
 WELCOME_ROLE_ID = None
 ROLE_CANCEL_A = None
 ROLE_CANCEL_B = None
+LIFETIME_ROLE_IDS: set[int] = set()
 
 # Logging functions (initialized from main - canonical ownership)
 _log_other = None
@@ -71,6 +72,7 @@ IDENTITY_CONFLICTS_FILE = BASE_DIR / "identity_conflicts.jsonl"
 RESOLUTION_ALERT_STATE_FILE = BASE_DIR / "whop_resolution_alert_state.json"
 DISCORD_LINK_FILE = BASE_DIR / "whop_discord_link.json"
 STAFF_ALERTS_FILE = BASE_DIR / "staff_alerts.json"
+PAYMENT_CACHE_FILE = BASE_DIR / "payment_cache.json"
 
 
 def _norm_email(s: str) -> str:
@@ -217,6 +219,15 @@ def _access_roles_compact(member: discord.Member) -> str:
     """Access-relevant roles only (no mentions)."""
     relevant = coerce_role_ids(ROLE_TRIGGER, WELCOME_ROLE_ID, ROLE_CANCEL_A, ROLE_CANCEL_B)
     return access_roles_plain(member, relevant)
+
+def _has_lifetime_role(member: discord.Member) -> bool:
+    if not LIFETIME_ROLE_IDS:
+        return False
+    try:
+        role_ids = {r.id for r in (member.roles or [])}
+        return bool(role_ids.intersection(LIFETIME_ROLE_IDS))
+    except Exception:
+        return False
 
 
 def _membership_id_from_event(member: discord.Member, event_data: dict) -> str:
@@ -768,7 +779,8 @@ def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_r
                log_other_func, log_member_status_func, fmt_user_func, member_status_logs_channel_id=None, get_member_history_func=None,
                whop_api_key=None, whop_api_config=None,
                dispute_channel_id=None, resolution_channel_id=None,
-               support_ping_role_id=None, support_ping_role_name=None):
+               support_ping_role_id=None, support_ping_role_name=None,
+               lifetime_role_ids=None):
     """
     Initialize handler with configuration and logging functions.
     
@@ -790,6 +802,7 @@ def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_r
     global WHOP_WEBHOOK_CHANNEL_ID, WHOP_LOGS_CHANNEL_ID, WHOP_DISPUTE_CHANNEL_ID, WHOP_RESOLUTION_CHANNEL_ID
     global WHOP_SUPPORT_PING_ROLE_ID, WHOP_SUPPORT_PING_ROLE_NAME
     global ROLE_TRIGGER, WELCOME_ROLE_ID, ROLE_CANCEL_A, ROLE_CANCEL_B
+    global LIFETIME_ROLE_IDS
     global _log_other, _log_member_status, _fmt_user, _get_member_history
     global MEMBER_STATUS_LOGS_CHANNEL_ID, EXPECTED_ROLES, _whop_api_client, _whop_api_config
     
@@ -803,6 +816,14 @@ def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_r
     WELCOME_ROLE_ID = welcome_role_id
     ROLE_CANCEL_A = role_cancel_a
     ROLE_CANCEL_B = role_cancel_b
+    try:
+        ids = set()
+        for x in (lifetime_role_ids or []):
+            if str(x).strip().isdigit():
+                ids.add(int(str(x).strip()))
+        LIFETIME_ROLE_IDS = ids
+    except Exception:
+        LIFETIME_ROLE_IDS = set()
     _log_other = log_other_func
     _log_member_status = log_member_status_func
     _fmt_user = fmt_user_func
@@ -1390,40 +1411,29 @@ async def handle_membership_deactivated(
     # If Whop reports "deactivated/canceled" but cancel_at_period_end=true, access continues
     # until the end of the current billing period. In that case, do not remove roles early.
     still_entitled = False
+    lifetime_protected = _has_lifetime_role(member)
     try:
-        evt = str((event_data or {}).get("event_type") or "").strip().lower()
-        is_payment_failure_event = "payment_failure" in evt or "payment failed" in str(title_override or "").lower()
         membership_id = _safe_get(event_data or {}, "membership_id", "membership.id", default="").strip()
         if membership_id == "—":
             membership_id = ""
         if not membership_id:
             membership_id = _get_cached_membership_id_for_discord(member.id)
-        if (not is_payment_failure_event) and membership_id and _whop_api_client:
+        if membership_id and _whop_api_client:
             m = await _whop_api_client.get_membership_by_id(membership_id)
-            if isinstance(m, dict) and m.get("cancel_at_period_end") is True:
-                renew_end = (
-                    m.get("renewal_period_end")
-                    or m.get("trial_end")
-                    or m.get("trial_ends_at")
-                    or m.get("trial_end_at")
-                )
-                if renew_end:
-                    # Parse ISO/unix-ish timestamps
-                    s = str(renew_end).strip()
-                    if s:
-                        if "T" in s or "-" in s:
-                            end_dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-                            if end_dt.tzinfo is None:
-                                end_dt = end_dt.replace(tzinfo=timezone.utc)
-                            end_dt = end_dt.astimezone(timezone.utc)
-                        else:
-                            end_dt = datetime.fromtimestamp(float(s), tz=timezone.utc)
-                        still_entitled = datetime.now(timezone.utc) < end_dt
+            entitled, _until_dt, _why = await _whop_api_client.is_entitled_until_end(
+                membership_id,
+                m if isinstance(m, dict) else None,
+                cache_path=str(PAYMENT_CACHE_FILE),
+                monthly_days=30,
+                grace_days=3,
+                now=datetime.now(timezone.utc),
+            )
+            still_entitled = bool(entitled)
     except Exception:
         still_entitled = False
     
     roles_to_remove = []
-    if not still_entitled:
+    if (not lifetime_protected) and (not still_entitled):
         if member_role and member_role in member.roles:
             roles_to_remove.append(member_role)
         if welcome_role and welcome_role in member.roles:
@@ -1436,7 +1446,7 @@ async def handle_membership_deactivated(
     if _log_member_status:
         whop_brief = await _whop_brief_from_event(member, event_data)
         access = _access_roles_compact(member)
-        title = title_override or ("⚠️ Cancellation Scheduled" if still_entitled else "🟧 Membership Deactivated")
+        title = title_override or ("Lifetime Access — No Role Removal" if lifetime_protected else ("⚠️ Cancellation Scheduled" if still_entitled else "🟧 Membership Deactivated"))
         color = int(color_override) if isinstance(color_override, int) else 0xFEE75C
         kind = (
             "payment_failed"
@@ -1452,6 +1462,7 @@ async def handle_membership_deactivated(
             discord_kv=[
                 ("event", "membership.deactivated"),
                 ("roles_removed", ", ".join([r.name for r in roles_to_remove]) if roles_to_remove else "—"),
+                ("lifetime_role_protected", "true" if lifetime_protected else "false"),
             ],
             whop_brief=whop_brief,
         )

@@ -112,6 +112,13 @@ ROLE_CANCEL_A = DM_CONFIG.get("role_cancel_a")
 ROLE_CANCEL_B = DM_CONFIG.get("role_cancel_b")
 FORMER_MEMBER_ROLE = DM_CONFIG.get("former_member_role")
 FORMER_MEMBER_DELAY_SECONDS = DM_CONFIG.get("former_member_delay_seconds", 60)
+LIFETIME_ROLE_IDS: set[int] = set()
+try:
+    for _rid in (DM_CONFIG.get("lifetime_role_ids") or []):
+        if str(_rid).strip().isdigit():
+            LIFETIME_ROLE_IDS.add(int(str(_rid).strip()))
+except Exception:
+    LIFETIME_ROLE_IDS = set()
 ROLES_TO_CHECK = set(DM_CONFIG.get("roles_to_check", []))
 SEND_SPACING_SECONDS = DM_CONFIG.get("send_spacing_seconds", 30.0)
 DAY_GAP_HOURS = DM_CONFIG.get("day_gap_hours", 24)
@@ -146,6 +153,7 @@ SETTINGS_FILE = BASE_DIR / "settings.json"
 MEMBER_HISTORY_FILE = BASE_DIR / "member_history.json"
 WHOP_WEBHOOK_RAW_LOG_FILE = BASE_DIR / "whop_webhook_raw_payloads.json"
 BOOT_STATE_FILE = BASE_DIR / "boot_state.json"
+PAYMENT_CACHE_FILE = BASE_DIR / "payment_cache.json"
 
 # Message order keys
 DAY_KEYS = ["day_1", "day_2", "day_3", "day_4", "day_5", "day_6", "day_7a", "day_7b"]
@@ -526,6 +534,31 @@ def _parse_dt_any(ts_str: str | int | float | None) -> datetime | None:
         return datetime.fromtimestamp(float(s), tz=timezone.utc)
     except Exception:
         return None
+
+def _has_lifetime_role(member: discord.Member) -> bool:
+    """True if member has any configured lifetime role IDs."""
+    if not LIFETIME_ROLE_IDS:
+        return False
+    try:
+        role_ids = {r.id for r in (member.roles or [])}
+        return bool(role_ids.intersection(LIFETIME_ROLE_IDS))
+    except Exception:
+        return False
+
+def _access_end_dt_from_membership(membership_data: dict | None) -> datetime | None:
+    """Compute the best-effort access end datetime for a Whop membership object.
+
+    Primary source (matches staff embeds): renewal_period_end.
+    """
+    if not isinstance(membership_data, dict):
+        return None
+    return _parse_dt_any(
+        membership_data.get("renewal_period_end")
+        or membership_data.get("access_ends_at")
+        or membership_data.get("trial_end")
+        or membership_data.get("trial_ends_at")
+        or membership_data.get("trial_end_at")
+    )
 
 
 def _fmt_money(amount: object, currency: str | None = None) -> str:
@@ -1363,6 +1396,15 @@ async def delayed_assign_former_member(member: discord.Member):
         refreshed = guild.get_member(member.id)
         if not refreshed:
             return
+        if _has_lifetime_role(refreshed):
+            e = _make_dyno_embed(
+                member=refreshed,
+                description=f"{refreshed.mention} has Lifetime access; skipping Former Member/extra role assignment",
+                footer=f"ID: {refreshed.id}",
+                color=0x57F287,
+            )
+            await log_role_event(embed=e)
+            return
 
         if has_member_role(refreshed):
             e = _make_dyno_embed(
@@ -1587,19 +1629,20 @@ async def sync_whop_memberships():
                 
                 # If API says canceled but user has Member role, remove it
                 if actual_status in ("canceled", "completed", "past_due", "unpaid"):
-                    # Whop can report `status=canceled` even when `cancel_at_period_end=true`,
-                    # meaning access remains until the end of the current billing period.
-                    if actual_status == "canceled" and isinstance(membership_data, dict):
-                        cape_now = membership_data.get("cancel_at_period_end")
-                        if cape_now is True:
-                            access_end = _parse_dt_any(
-                                membership_data.get("renewal_period_end")
-                                or membership_data.get("trial_end")
-                                or membership_data.get("trial_ends_at")
-                                or membership_data.get("trial_end_at")
-                            )
-                            if access_end and _now() < access_end:
-                                continue
+                    # Lifetime members keep access indefinitely.
+                    if _has_lifetime_role(member):
+                        continue
+
+                    entitled, _until_dt, _reason = await whop_api_client.is_entitled_until_end(
+                        membership_id,
+                        membership_data if isinstance(membership_data, dict) else None,
+                        cache_path=str(PAYMENT_CACHE_FILE),
+                        monthly_days=30,
+                        grace_days=3,
+                        now=_now(),
+                    )
+                    if entitled:
+                        continue
                     await member.remove_roles(
                         member_role, 
                         reason=f"Whop sync: Status is {actual_status}"
@@ -1804,6 +1847,7 @@ async def on_ready():
             welcome_role_id=WELCOME_ROLE_ID,
             role_cancel_a=ROLE_CANCEL_A,
             role_cancel_b=ROLE_CANCEL_B,
+            lifetime_role_ids=sorted(list(LIFETIME_ROLE_IDS)),
             log_other_func=log_other,
             log_member_status_func=log_member_status,
             fmt_user_func=_fmt_user,
@@ -2173,6 +2217,18 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         asyncio.create_task(check_and_assign_role(after))
 
     if (ROLE_CANCEL_A in before_roles) and (ROLE_CANCEL_A not in after_roles):
+        if _has_lifetime_role(after):
+            role_obj = after.guild.get_role(ROLE_CANCEL_A) if after.guild else None
+            role_name = str(role_obj.name) if role_obj else "Member"
+            cid = _cid_for(after.id)
+            e = _make_dyno_embed(
+                member=after,
+                description=f"{after.mention} was removed from the {role_name} role but has Lifetime access; skipping auto actions",
+                footer=f"ID: {after.id} • CID: {cid}",
+                color=0x57F287,
+            )
+            await log_role_event(embed=e)
+            return
         # Show all roles removed in this update (not just Member role)
         all_removed_in_update = before_roles - after_roles
         all_added_in_update = after_roles - before_roles

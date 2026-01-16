@@ -8,6 +8,10 @@ Canonical Owner: This module owns all Whop API interactions.
 
 import aiohttp
 import logging
+import json
+from contextlib import suppress
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Dict, Optional, List
 from aiohttp import ContentTypeError
 
@@ -44,6 +48,128 @@ class WhopAPIClient:
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
+
+    def _parse_dt_any(self, ts_str: object) -> Optional[datetime]:
+        """Parse ISO/unix-ish timestamps into UTC datetime (best-effort)."""
+        if ts_str is None or ts_str == "":
+            return None
+        try:
+            if isinstance(ts_str, (int, float)):
+                return datetime.fromtimestamp(float(ts_str), tz=timezone.utc)
+            s = str(ts_str).strip()
+            if not s:
+                return None
+            if "T" in s or "-" in s:
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc)
+            return datetime.fromtimestamp(float(s), tz=timezone.utc)
+        except Exception:
+            return None
+
+    def access_end_dt_from_membership(self, membership: Optional[Dict]) -> Optional[datetime]:
+        """Primary entitlement end timestamp for a membership (free days included)."""
+        if not isinstance(membership, dict):
+            return None
+        return self._parse_dt_any(
+            membership.get("renewal_period_end")
+            or membership.get("expires_at")
+            or membership.get("trial_end")
+            or membership.get("trial_ends_at")
+            or membership.get("trial_end_at")
+        )
+
+    async def get_last_successful_payment_time(
+        self,
+        membership_id: str,
+        *,
+        cache_path: str | None = None,
+        cache_ttl_hours: float = 24.0,
+    ) -> Optional[datetime]:
+        """Return most recent successful payment time (UTC) with optional JSON cache.
+
+        Intended as a fallback when renewal_period_end is unavailable.
+        """
+        mid = str(membership_id or "").strip()
+        if not mid:
+            return None
+
+        now = datetime.now(timezone.utc)
+        ttl = timedelta(hours=float(cache_ttl_hours)) if cache_ttl_hours else timedelta(hours=24)
+
+        # Cache read
+        cache: dict = {}
+        cache_file = Path(cache_path) if cache_path else None
+        if cache_file:
+            with suppress(Exception):
+                if cache_file.exists():
+                    cache = json.loads(cache_file.read_text(encoding="utf-8") or "{}")
+
+            rec = cache.get(mid) if isinstance(cache, dict) else None
+            if isinstance(rec, dict):
+                fetched_at = self._parse_dt_any(rec.get("fetched_at"))
+                last_iso = str(rec.get("last_success_paid_at") or "").strip()
+                last_dt = self._parse_dt_any(last_iso) if last_iso else None
+                if fetched_at and (now - fetched_at) < ttl:
+                    return last_dt
+
+        # Cache miss: fetch payments and compute
+        payments = await self.get_payments_for_membership(mid)
+        success_dt: Optional[datetime] = None
+        for p in payments:
+            if not isinstance(p, dict):
+                continue
+            st = str(p.get("status") or "").strip().lower()
+            if st not in {"succeeded", "paid", "successful", "success"}:
+                continue
+            ts = p.get("paid_at") or p.get("created_at") or ""
+            dt = self._parse_dt_any(ts)
+            if dt:
+                success_dt = dt
+                break
+
+        # Cache write (best-effort)
+        if cache_file:
+            try:
+                if not isinstance(cache, dict):
+                    cache = {}
+                cache[mid] = {
+                    "last_success_paid_at": (success_dt.isoformat().replace("+00:00", "Z") if success_dt else ""),
+                    "fetched_at": now.isoformat().replace("+00:00", "Z"),
+                }
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                cache_file.write_text(json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                pass
+
+        return success_dt
+
+    async def is_entitled_until_end(
+        self,
+        membership_id: str,
+        membership: Optional[Dict],
+        *,
+        cache_path: str | None = None,
+        monthly_days: int = 30,
+        grace_days: int = 3,
+        now: Optional[datetime] = None,
+    ) -> tuple[bool, Optional[datetime], str]:
+        """Entitlement check:
+        - Primary: now < renewal_period_end (or equivalent end timestamp)
+        - Fallback: if end missing, now < last_success_paid_at + monthly_days + grace_days
+        """
+        now_dt = now or datetime.now(timezone.utc)
+        end_dt = self.access_end_dt_from_membership(membership)
+        if end_dt:
+            return (now_dt < end_dt, end_dt, "membership_end")
+
+        last_paid = await self.get_last_successful_payment_time(membership_id, cache_path=cache_path)
+        if last_paid:
+            cutoff = last_paid + timedelta(days=int(monthly_days) + int(grace_days))
+            return (now_dt < cutoff, cutoff, "last_success_paid_at")
+
+        return (False, None, "no_end_or_payment")
 
     def _extract_error_message(self, data: object, status: int) -> str:
         """Extract a readable error message from Whop's API error formats."""

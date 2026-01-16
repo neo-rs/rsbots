@@ -3824,10 +3824,11 @@ if [ "$PY_COUNT" = "0" ]; then
   exit 3
 fi
 
-# Build the full sync list: python files + COMMANDS.md (if tracked)
+# Build the full sync list: python files + COMMANDS.md + config.json (if tracked)
 TMP_SYNC_LIST="/tmp/mw_sync_${{BOT_FOLDER}}.txt"
 cat "$TMP_PY_LIST" > "$TMP_SYNC_LIST" || true
 git ls-files "$BOT_FOLDER/COMMANDS.md" 2>/dev/null >> "$TMP_SYNC_LIST" || true
+git ls-files "$BOT_FOLDER/config.json" 2>/dev/null >> "$TMP_SYNC_LIST" || true
 sort -u "$TMP_SYNC_LIST" -o "$TMP_SYNC_LIST" || true
 SYNC_COUNT="$(wc -l < "$TMP_SYNC_LIST" | tr -d \" \")"
 if [ "$SYNC_COUNT" = "" ]; then SYNC_COUNT="0"; fi
@@ -3855,6 +3856,14 @@ GIT_CHANGED_COUNT="$(echo \"$GIT_CHANGED\" | sed '/^$/d' | wc -l | tr -d \" \")"
 ACTUAL_CHANGED_COUNT="$(wc -l < "$DIFF_FILES" | tr -d \" \")"
 if [ "$ACTUAL_CHANGED_COUNT" = "" ]; then ACTUAL_CHANGED_COUNT="0"; fi
 
+# Backup the soon-to-be-overwritten files (tracked only; no secrets/runtime).
+TS="$(date +%Y%m%d_%H%M%S)"
+SAFE_BOT="$(echo "$BOT_FOLDER" | tr '/' '_')"
+BACKUP_DIR="$LIVE_ROOT/backups"
+mkdir -p "$BACKUP_DIR"
+BACKUP_TAR="$BACKUP_DIR/${SAFE_BOT}_preupdate_${TS}.tar.gz"
+(cd "$LIVE_ROOT" && tar --ignore-failed-read -czf "$BACKUP_TAR" -T "$TMP_SYNC_LIST") || true
+
 # Copy files (always sync, even if no differences detected)
 tar -cf - -T "$TMP_SYNC_LIST" | (cd "$LIVE_ROOT" && tar -xf -)
 
@@ -3869,6 +3878,7 @@ echo "PY_COUNT=$PY_COUNT"
 echo "SYNC_COUNT=$SYNC_COUNT"
 echo "CHANGED_COUNT=$CHANGED_COUNT"
 echo "GIT_CHANGED_COUNT=$GIT_CHANGED_COUNT"
+echo "BACKUP=$BACKUP_TAR"
 echo "CHANGED_BEGIN"
 echo "$CHANGED" | head -n 30 || true
 echo "CHANGED_END"

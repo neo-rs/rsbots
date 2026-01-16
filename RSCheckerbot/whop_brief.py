@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from contextlib import suppress
 from datetime import datetime, timezone
+from math import ceil
 
 from whop_api_client import WhopAPIClient
 
@@ -25,6 +26,25 @@ def _fmt_date_any(ts_str: str | int | float | None) -> str:
         return out.replace(" 0", " ")
     except Exception:
         return "—"
+
+def _parse_dt_any(ts_str: str | int | float | None) -> datetime | None:
+    """Parse ISO/unix-ish timestamps into UTC datetime (best-effort)."""
+    if ts_str is None or ts_str == "":
+        return None
+    try:
+        if isinstance(ts_str, (int, float)):
+            return datetime.fromtimestamp(float(ts_str), tz=timezone.utc)
+        s = str(ts_str).strip()
+        if not s:
+            return None
+        if "T" in s or "-" in s:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        return datetime.fromtimestamp(float(s), tz=timezone.utc)
+    except Exception:
+        return None
 
 
 async def fetch_whop_brief(
@@ -50,6 +70,16 @@ async def fetch_whop_brief(
     if isinstance(membership.get("product"), dict):
         product_title = str(membership["product"].get("title") or "").strip() or "—"
 
+    renewal_end_iso = str(membership.get("renewal_period_end") or "").strip()
+    renewal_end_dt = _parse_dt_any(renewal_end_iso) if renewal_end_iso else None
+    remaining_days: int | None = None
+    if renewal_end_dt:
+        delta = (renewal_end_dt - datetime.now(timezone.utc)).total_seconds()
+        remaining_days = max(0, int(ceil(delta / 86400.0)))
+
+    manage_url_raw = str(membership.get("manage_url") or "").strip()
+    manage_url = f"[Open]({manage_url_raw})" if manage_url_raw else ""
+
     brief = {
         "status": str(membership.get("status") or "").strip() or "—",
         "product": product_title,
@@ -57,11 +87,16 @@ async def fetch_whop_brief(
         "trial_end": _fmt_date_any(membership.get("trial_end") or membership.get("trial_ends_at") or membership.get("trial_end_at")),
         "renewal_start": _fmt_date_any(membership.get("renewal_period_start")),
         "renewal_end": _fmt_date_any(membership.get("renewal_period_end")),
+        "renewal_end_iso": renewal_end_iso or "",
+        "remaining_days": remaining_days if isinstance(remaining_days, int) else "",
+        "manage_url": manage_url,
         "cancel_at_period_end": "yes" if membership.get("cancel_at_period_end") is True else ("no" if membership.get("cancel_at_period_end") is False else "—"),
         "is_first_membership": "true" if membership.get("is_first_membership") is True else ("false" if membership.get("is_first_membership") is False else "—"),
         "last_payment_method": "—",
         "last_payment_type": "—",
         "last_payment_failure": "",
+        "last_success_paid_at_iso": "",
+        "last_success_paid_at": "—",
     }
 
     payments = []
@@ -88,6 +123,24 @@ async def fetch_whop_brief(
             brief["last_payment_type"] = str(pm_type).strip()
         if failure_msg:
             brief["last_payment_failure"] = failure_msg[:140]
+
+    # Most recent successful payment timestamp (for staff visibility + fallback entitlement logic).
+    try:
+        for p in (payments or []):
+            if not isinstance(p, dict):
+                continue
+            st = str(p.get("status") or "").strip().lower()
+            if st not in {"succeeded", "paid", "successful", "success"}:
+                continue
+            ts = p.get("paid_at") or p.get("created_at") or ""
+            dt = _parse_dt_any(ts)
+            if dt:
+                iso = dt.isoformat().replace("+00:00", "Z")
+                brief["last_success_paid_at_iso"] = iso
+                brief["last_success_paid_at"] = _fmt_date_any(iso)
+                break
+    except Exception:
+        pass
 
     return brief
 

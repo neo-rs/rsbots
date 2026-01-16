@@ -50,6 +50,7 @@ DEFAULT_EXCLUDE_GLOBS = [
     "queue.json",
     "registry.json",
     "invites.json",
+    "payment_cache.json",
     "missed_onboarding_report.json",
     "ticket_history_report.json",
 ]
