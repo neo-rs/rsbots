@@ -340,16 +340,31 @@ async def _flush_role_update(user_id: int) -> None:
         return
 
     cid = _cid_for(member.id)
-    added_names = _fmt_role_list(set(added), member.guild) if added else None
-    removed_names = _fmt_role_list(set(removed), member.guild) if removed else None
 
-    log_msg = f"🔄 **Roles Changed:** {_fmt_user(member)}\n"
-    log_msg += f"   🧩 CID: `{cid}`\n"
-    if removed_names:
-        log_msg += f"   ➖ **Removed:** {removed_names}\n"
-    if added_names:
-        log_msg += f"   ➕ **Added:** {added_names}\n"
-    await log_role_event(log_msg.rstrip())
+    def _role_name(rid: int) -> str:
+        role = member.guild.get_role(int(rid)) if member.guild else None
+        return str(role.name) if role else str(rid)
+
+    added_list = [_role_name(rid) for rid in sorted(set(added))] if added else []
+    removed_list = [_role_name(rid) for rid in sorted(set(removed))] if removed else []
+
+    if len(added_list) == 1 and not removed_list:
+        desc = f"{member.mention} was given the {added_list[0]} role"
+    elif len(removed_list) == 1 and not added_list:
+        desc = f"{member.mention} was removed from the {removed_list[0]} role"
+    else:
+        desc = f"{member.mention} roles updated"
+
+    e = _make_dyno_embed(
+        member=member,
+        description=desc,
+        footer=f"ID: {member.id} • CID: {cid}",
+    )
+    if removed_list and (len(removed_list) > 1 or added_list):
+        e.add_field(name="Removed", value=(", ".join(removed_list)[:1024] or "—"), inline=False)
+    if added_list and (len(added_list) > 1 or removed_list):
+        e.add_field(name="Added", value=(", ".join(added_list)[:1024] or "—"), inline=False)
+    await log_role_event(embed=e)
 
 def _save_raw_webhook_payload(payload: dict, headers: dict = None):
     """Save raw webhook payload to JSON file for inspection"""
@@ -700,7 +715,8 @@ def save_settings(settings: dict) -> None:
 # Logging to Discord channels
 # -----------------------------
 def _fmt_user(member: discord.abc.User) -> str:
-    return f"**{member.display_name}** ({member.id})"
+    # Keep it Dyno-like: simple display + ID (no heavy markdown).
+    return f"{member.display_name} ({member.id})"
 
 def _fmt_role(role_id: int, guild: discord.Guild) -> str:
     """Format role as name (ID) or just ID if not found."""
@@ -718,10 +734,10 @@ def _fmt_role_list(role_ids: set, guild: discord.Guild) -> str:
             continue
         role = guild.get_role(rid) if guild else None
         if role:
-            roles.append(f"**{role.name}**")
+            roles.append(str(role.name))
         else:
             roles.append(f"`{rid}`")
-    return ", ".join(roles) if roles else "none"
+    return ", ".join(roles) if roles else "—"
 
 def m_user(member: discord.Member) -> str:
     """Format member as mentionable user (@user)"""
@@ -735,20 +751,61 @@ def t_role(role_id: int, guild: discord.Guild) -> str:
     """Format role as plain text (no mention) - alias for _fmt_role for clarity"""
     return _fmt_role(role_id, guild)
 
-async def log_first(msg: str):
+def _make_dyno_embed(
+    *,
+    member: discord.abc.User | None,
+    description: str,
+    footer: str = "",
+    color: int = 0x5865F2,
+    timestamp: datetime | None = None,
+) -> discord.Embed:
+    """Build a compact, Dyno-like embed for log channels."""
+    e = discord.Embed(
+        description=str(description or "").strip() or "—",
+        color=int(color) if isinstance(color, int) else 0x5865F2,
+        timestamp=timestamp or datetime.now(timezone.utc),
+    )
+    if member is not None:
+        with suppress(Exception):
+            _apply_member_header(e, member)
+    if footer:
+        with suppress(Exception):
+            e.set_footer(text=str(footer)[:2048])
+    return e
+
+async def log_first(msg: str | None = None, *, embed: discord.Embed | None = None):
     ch = bot.get_channel(LOG_FIRST_CHANNEL_ID)
     if ch:
         with suppress(Exception):
-            await ch.send(msg)
+            e = embed
+            if e is None:
+                e = discord.Embed(
+                    description=str(msg or "").strip() or "—",
+                    color=0x5865F2,
+                    timestamp=datetime.now(timezone.utc),
+                )
+                # Prefer the runtime channel name (no hardcoded labels).
+                nm = str(getattr(ch, "name", "") or "").strip()
+                e.set_footer(text=f"RSCheckerbot • {nm}" if nm else "RSCheckerbot")
+            await ch.send(embed=e, allowed_mentions=discord.AllowedMentions.none())
 
-async def log_other(msg: str):
+async def log_other(msg: str | None = None, *, embed: discord.Embed | None = None):
     ch = bot.get_channel(LOG_OTHER_CHANNEL_ID)
     if ch:
         with suppress(Exception):
-            await ch.send(msg)
+            e = embed
+            if e is None:
+                e = discord.Embed(
+                    description=str(msg or "").strip() or "—",
+                    color=0x5865F2,
+                    timestamp=datetime.now(timezone.utc),
+                )
+                nm = str(getattr(ch, "name", "") or "").strip()
+                e.set_footer(text=f"RSCheckerbot • {nm}" if nm else "RSCheckerbot")
+            await ch.send(embed=e, allowed_mentions=discord.AllowedMentions.none())
 
-async def log_role_event(message: str):
-    await log_other(message)
+async def log_role_event(message: str | None = None, *, embed: discord.Embed | None = None):
+    await log_other(message, embed=embed)
 
 async def log_whop(msg: str):
     """Log to Whop logs channel (for subscription data from Whop system)"""
@@ -973,10 +1030,16 @@ async def send_day(member: discord.Member, day_key: str):
     try:
         await member.send(embeds=embeds, view=view)
         last_send_at = _now()
+        sent_embed = _make_dyno_embed(
+            member=member,
+            description=f"{member.mention} {day_key} sent",
+            footer=f"ID: {member.id}",
+            color=0x57F287,
+        )
         if day_key == "day_1":
-            await log_first(f"✅ Sent **{day_key}** to {_fmt_user(member)}")
+            await log_first(embed=sent_embed)
         else:
-            await log_other(f"✅ Sent **{day_key}** to {_fmt_user(member)}")
+            await log_other(embed=sent_embed)
     except discord.Forbidden:
         mark_cancelled(member.id, "dm_forbidden")
         await log_other(f"🚫 DM forbidden for {_fmt_user(member)} — sequence cancelled (user blocked DMs)")
@@ -1235,44 +1298,55 @@ async def check_and_assign_role(member: discord.Member):
         if not has_any:
             trigger_role = guild.get_role(ROLE_TO_ASSIGN)
             if trigger_role is None:
-                await log_role_event(f"❌ **Error:** Trigger role {_fmt_role(ROLE_TO_ASSIGN, guild)} not found for {_fmt_user(member)}")
+                err = _make_dyno_embed(
+                    member=member,
+                    description=f"{member.mention} trigger role missing",
+                    footer=f"ID: {member.id}",
+                    color=0xED4245,
+                )
+                err.add_field(name="Missing role", value=_fmt_role(ROLE_TO_ASSIGN, guild)[:1024], inline=False)
+                await log_role_event(embed=err)
                 return
             try:
                 roles_to_add = [trigger_role]
                 roles_to_add_names = [trigger_role.name]
                 
                 await member.add_roles(*roles_to_add, reason="No valid roles after 60s")
-                
-                # Format all checked roles and which ones are missing
-                all_checked_roles = _fmt_role_list(ROLES_TO_CHECK, guild)
-                missing_checked_roles = _fmt_role_list(set(user_missing_checked), guild)
-                
-                await log_role_event(
-                    f"✅ **Roles Assigned** to {_fmt_user(member)}\n"
-                    f"   📌 Assigned: {', '.join(f'**{name}**' for name in roles_to_add_names)}\n"
-                    f"   🔍 **Basis for assignment:**\n"
-                    f"      ❌ User has NONE of the checked roles\n"
-                    f"      📋 Checked roles (all {len(ROLES_TO_CHECK)}): {all_checked_roles}\n"
-                    f"      ❌ Missing all: {missing_checked_roles}\n"
-                    f"   ⏱️ Reason: No valid roles found after 60s → assigning trigger role"
+
+                assigned = ", ".join([str(x) for x in roles_to_add_names if str(x).strip()]) or "—"
+                e = _make_dyno_embed(
+                    member=member,
+                    description=f"{member.mention} was given the {assigned} role",
+                    footer=f"ID: {member.id}",
+                    color=0x57F287,
                 )
+                e.add_field(name="Reason", value="No checked roles after 60s", inline=False)
+                e.add_field(name="Checked roles", value=str(len(ROLES_TO_CHECK)), inline=True)
+                await log_role_event(embed=e)
                 
                 if not has_sequence_before(member.id):
                     enqueue_first_day(member.id)
-                    await log_first(f"🧵 Enqueued **day_1** for {_fmt_user(member)} (60s fallback - no checked roles)")
+                    enq = _make_dyno_embed(
+                        member=member,
+                        description=f"{member.mention} queued for day_1 (60s fallback)",
+                        footer=f"ID: {member.id}",
+                        color=0x5865F2,
+                    )
+                    await log_first(embed=enq)
             except Exception as e:
                 await log_role_event(f"⚠️ **Failed to assign roles** to {_fmt_user(member)}\n   ❌ Error: `{e}`")
         else:
-            # User has checked roles - log what they have vs what's checked
+            # User has checked roles - keep log compact (avoid dumping full role lists).
             user_has_names = _fmt_role_list(set(user_has_checked), guild)
-            all_checked_roles = _fmt_role_list(ROLES_TO_CHECK, guild)
-            
-            await log_role_event(
-                f"ℹ️ **Role check skipped** for {_fmt_user(member)}\n"
-                f"   ✅ User HAS checked roles: {user_has_names}\n"
-                f"   🔍 All checked roles ({len(ROLES_TO_CHECK)}): {all_checked_roles}\n"
-                f"   📋 **Basis:** User has valid role(s) → no trigger role needed"
+            sk = _make_dyno_embed(
+                member=member,
+                description=f"{member.mention} has checked roles; no trigger role needed",
+                footer=f"ID: {member.id}",
+                color=0x5865F2,
             )
+            sk.add_field(name="Has", value=user_has_names[:1024] or "—", inline=False)
+            sk.add_field(name="Checked roles", value=str(len(ROLES_TO_CHECK)), inline=True)
+            await log_role_event(embed=sk)
     finally:
         pending_checks.discard(member.id)
 
@@ -1291,24 +1365,37 @@ async def delayed_assign_former_member(member: discord.Member):
             return
 
         if has_member_role(refreshed):
-            await log_role_event(
-                f"↩️ **Member Role Regained:** {_fmt_user(refreshed)}\n"
-                f"   ✅ Has {_fmt_role(ROLE_CANCEL_A, guild)} again\n"
-                f"   📋 Not marking as Former Member"
+            e = _make_dyno_embed(
+                member=refreshed,
+                description=f"{refreshed.mention} regained the member role; not marking as Former Member",
+                footer=f"ID: {refreshed.id}",
+                color=0x57F287,
             )
+            await log_role_event(embed=e)
             return
 
         if not has_former_member_role(refreshed):
             role = guild.get_role(FORMER_MEMBER_ROLE)
             if role is None:
-                await log_role_event(f"❌ **Error:** Former-member role {_fmt_role(FORMER_MEMBER_ROLE, guild)} not found for {_fmt_user(refreshed)}")
+                err = _make_dyno_embed(
+                    member=refreshed,
+                    description=f"{refreshed.mention} former-member role missing",
+                    footer=f"ID: {refreshed.id}",
+                    color=0xED4245,
+                )
+                err.add_field(name="Missing role", value=_fmt_role(FORMER_MEMBER_ROLE, guild)[:1024], inline=False)
+                await log_role_event(embed=err)
             else:
                 try:
                     await refreshed.add_roles(role, reason="Lost member role; mark as former member")
-                    await log_role_event(
-                        f"🏷️ **Former Member Role Assigned:** {_fmt_user(refreshed)}\n"
-                        f"   📌 Assigned: {_fmt_role(FORMER_MEMBER_ROLE, guild)}"
+                    e = _make_dyno_embed(
+                        member=refreshed,
+                        description=f"{refreshed.mention} was given the {role.name} role",
+                        footer=f"ID: {refreshed.id}",
+                        color=0xFEE75C,
                     )
+                    e.add_field(name="Reason", value="Member role not regained within grace period", inline=False)
+                    await log_role_event(embed=e)
                 except Exception as e:
                     await log_role_event(f"⚠️ **Failed to assign Former Member role** to {_fmt_user(refreshed)}\n   ❌ Error: `{e}`")
 
@@ -1316,10 +1403,13 @@ async def delayed_assign_former_member(member: discord.Member):
         if extra_role and extra_role not in refreshed.roles:
             try:
                 await refreshed.add_roles(extra_role, reason="Lost member role; add extra role")
-                await log_role_event(
-                    f"🏷️ **Extra Role Assigned:** {_fmt_user(refreshed)}\n"
-                    f"   📌 Assigned: {_fmt_role(1224748748920328384, guild)}"
+                e = _make_dyno_embed(
+                    member=refreshed,
+                    description=f"{refreshed.mention} was given the {extra_role.name} role",
+                    footer=f"ID: {refreshed.id}",
+                    color=0xFEE75C,
                 )
+                await log_role_event(embed=e)
             except Exception as e:
                 await log_role_event(f"⚠️ **Failed to assign extra role** to {_fmt_user(refreshed)}\n   ❌ Error: `{e}`")
     finally:
@@ -1373,9 +1463,17 @@ async def scheduler_loop():
                     nxt = queue_state.get(str(member.id))
                     if nxt:
                         target_ch = log_other if prev != "day_1" else log_first
-                        await target_ch(
-                            f"🗓️ Scheduled **{nxt['current_day']}** for {_fmt_user(member)} at `{nxt['next_send']}`"
+                        next_send_iso = nxt.get("next_send", "")
+                        next_dt = _parse_dt_any(next_send_iso)
+                        when = _fmt_discord_ts_any(next_send_iso, "F")
+                        sched_embed = _make_dyno_embed(
+                            member=member,
+                            description=f"{member.mention} {nxt.get('current_day', 'next').strip()} scheduled for {when}",
+                            footer=f"ID: {member.id}",
+                            color=0x5865F2,
+                            timestamp=next_dt or datetime.now(timezone.utc),
                         )
+                        await target_ch(embed=sched_embed)
             except Exception as e:
                 await log_other(f"⚠️ scheduler_loop user error for uid `{uid}`: `{e}`")
     except Exception as e:
@@ -1893,7 +1991,7 @@ async def on_member_join(member: discord.Member):
         
         guild = member.guild
         current_roles = {r.id for r in member.roles}
-        current_role_names = _fmt_role_list(current_roles, guild) if current_roles else "none"
+        current_role_names = _fmt_role_list(current_roles, guild) if current_roles else "—"
         
         # Check if they already have Welcome role
         has_welcome = WELCOME_ROLE_ID and WELCOME_ROLE_ID in current_roles
@@ -1904,26 +2002,19 @@ async def on_member_join(member: discord.Member):
         user_missing_checked = [rid for rid in ROLES_TO_CHECK if rid not in current_roles]
         has_any_checked = len(user_has_checked) > 0
         
-        checked_status = ""
-        if has_any_checked:
-            checked_status = f"   ✅ Has checked roles: {_fmt_role_list(set(user_has_checked), guild)}\n"
-        else:
-            checked_status = f"   ❌ Has NO checked roles\n"
-        
-        # Avoid spam: only print the full checked role list when verbose logging is enabled.
-        all_checked_roles = _fmt_role_list(ROLES_TO_CHECK, guild) if VERBOSE_ROLE_LISTS else ""
-        sample_checked = _fmt_role_list(set(list(ROLES_TO_CHECK)[:3]), guild) if ROLES_TO_CHECK else ""
-        
-        await log_role_event(
-            f"👤 **New Member Joined:** {_fmt_user(member)}\n"
-            f"   {welcome_status}\n"
-            f"   📋 Current roles: {current_role_names}\n"
-            f"   {checked_status}"
-            f"   🔍 **Basis for 60s check:** Will verify user has ANY checked role ({len(ROLES_TO_CHECK)} total)"
-            f"{f': {all_checked_roles}' if all_checked_roles else ''}\n"
-            f"{f'   🧪 Sample checked roles: {sample_checked}' if (not all_checked_roles and sample_checked) else ''}\n"
-            f"   ⏱️ If user has NONE after 60s → will assign trigger role"
+        checked_note = "Has checked roles" if has_any_checked else "No checked roles"
+        join_embed = _make_dyno_embed(
+            member=member,
+            description=f"{member.mention} joined",
+            footer=f"ID: {member.id}",
+            color=0x5865F2,
         )
+        join_embed.add_field(name="Welcome", value=("Yes" if has_welcome else "No"), inline=True)
+        join_embed.add_field(name="Checked roles", value=checked_note, inline=True)
+        join_embed.add_field(name="Next", value="Will verify again in 60s", inline=False)
+        if current_role_names and current_role_names != "—":
+            join_embed.add_field(name="Current roles", value=current_role_names[:1024], inline=False)
+        await log_role_event(embed=join_embed)
         asyncio.create_task(check_and_assign_role(member))
 
         # If we detected a tracked invite, mark it used (non-destructive; persists metadata for audit).
@@ -2031,7 +2122,6 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
     if ROLE_TRIGGER not in before_roles and ROLE_TRIGGER in after_roles:
         guild = after.guild
-        trigger_role_name = _fmt_role(ROLE_TRIGGER, guild)
         
         if has_sequence_before(after.id):
             await log_other(f"⏭️ Skipped DM sequence for {_fmt_user(after)} — sequence previously run")
@@ -2039,8 +2129,13 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         
         enqueue_first_day(after.id)
         
-        # Simple logging format with clear trigger indication
-        await log_first(f"🧵 Enqueued **day_1** for {_fmt_user(after)} (trigger role added)")
+        enq = _make_dyno_embed(
+            member=after,
+            description=f"{after.mention} queued for day_1 (trigger role added)",
+            footer=f"ID: {after.id}",
+            color=0x5865F2,
+        )
+        await log_first(embed=enq)
         
         return
 
@@ -2059,21 +2154,22 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         all_added_names = _fmt_role_list(all_added_in_update, after.guild) if all_added_in_update else None
         
         lost_checked_names = _fmt_role_list(set(lost_checked), after.guild)
-        all_checked_roles = _fmt_role_list(ROLES_TO_CHECK, after.guild)
-        
-        log_msg = (
-            f"🔄 **Member lost all checked roles:** {_fmt_user(after)}\n"
-            f"   ➖ **Roles removed:** {all_removed_names}\n"
+
+        cid = _cid_for(after.id)
+        lost_embed = _make_dyno_embed(
+            member=after,
+            description=f"{after.mention} has none of the checked roles",
+            footer=f"ID: {after.id} • CID: {cid}",
+            color=0xFEE75C,
         )
-        if all_added_names:
-            log_msg += f"   ➕ **Roles added:** {all_added_names}\n"
-        log_msg += (
-            f"   ❌ **Lost checked roles:** {lost_checked_names}\n"
-            f"   🔍 **Basis for trigger:** User had checked roles, now has NONE\n"
-            f"   📋 All checked roles ({len(ROLES_TO_CHECK)}): {all_checked_roles}\n"
-            f"   ⏱️ Will check and assign trigger role in 60s if still needed"
-        )
-        await log_role_event(log_msg)
+        if all_removed_names and all_removed_names != "—":
+            lost_embed.add_field(name="Removed", value=all_removed_names[:1024], inline=False)
+        if all_added_names and all_added_names != "—":
+            lost_embed.add_field(name="Added", value=all_added_names[:1024], inline=False)
+        if lost_checked_names and lost_checked_names != "—":
+            lost_embed.add_field(name="Lost checked roles", value=lost_checked_names[:1024], inline=False)
+        lost_embed.add_field(name="Next", value="Will check again in 60s", inline=False)
+        await log_role_event(embed=lost_embed)
         asyncio.create_task(check_and_assign_role(after))
 
     if (ROLE_CANCEL_A in before_roles) and (ROLE_CANCEL_A not in after_roles):
@@ -2136,17 +2232,25 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                 record_alert_post(db_alerts, after.id, issue_key)
                 save_staff_alerts(STAFF_ALERTS_FILE, db_alerts)
         
-        log_msg = (
-            f"📉 **Member Role Removed:** {_fmt_user(after)}\n"
-            f"   ➖ **Roles removed:** {removed_names}\n"
+        role_obj = after.guild.get_role(ROLE_CANCEL_A) if after.guild else None
+        role_name = str(role_obj.name) if role_obj else "Member"
+        cid = _cid_for(after.id)
+        removed_embed = _make_dyno_embed(
+            member=after,
+            description=f"{after.mention} was removed from the {role_name} role",
+            footer=f"ID: {after.id} • CID: {cid}",
+            color=0xFEE75C,
         )
-        if added_names:
-            log_msg += f"   ➕ **Roles added:** {added_names}\n"
-        log_msg += (
-            f"   ⚠️ **Key removal:** {_fmt_role(ROLE_CANCEL_A, after.guild)}\n"
-            f"   ⏱️ Will mark as 'Former Member' in {FORMER_MEMBER_DELAY_SECONDS}s if not regained"
+        if removed_names and removed_names != "—":
+            removed_embed.add_field(name="Removed", value=removed_names[:1024], inline=False)
+        if added_names and added_names != "—":
+            removed_embed.add_field(name="Added", value=added_names[:1024], inline=False)
+        removed_embed.add_field(
+            name="Next",
+            value=f"Will mark as Former Member in {FORMER_MEMBER_DELAY_SECONDS}s if not regained",
+            inline=False,
         )
-        await log_role_event(log_msg)
+        await log_role_event(embed=removed_embed)
         
         # If Member role was removed and user has active DM sequence, cancel it
         if str(after.id) in queue_state:
@@ -2213,14 +2317,19 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             if role:
                 with suppress(Exception):
                     await after.remove_roles(role, reason="Regained member role; remove former-member marker")
-                    log_msg = (
-                        f"🧹 **Former Member Role Removed:** {_fmt_user(after)}\n"
-                        f"   ➕ **Roles added:** {added_names}\n"
+                    cid = _cid_for(after.id)
+                    e = _make_dyno_embed(
+                        member=after,
+                        description=f"{after.mention} was removed from the {role.name} role",
+                        footer=f"ID: {after.id} • CID: {cid}",
+                        color=0x57F287,
                     )
-                    if removed_names:
-                        log_msg += f"   ➖ **Roles removed:** {removed_names}\n"
-                    log_msg += f"   ✅ **Reason:** Regained {_fmt_role(ROLE_CANCEL_A, after.guild)} → removed Former Member"
-                    await log_role_event(log_msg)
+                    if added_names and added_names != "—":
+                        e.add_field(name="Added", value=added_names[:1024], inline=False)
+                    if removed_names and removed_names != "—":
+                        e.add_field(name="Removed", value=str(removed_names)[:1024], inline=False)
+                    e.add_field(name="Reason", value="Regained member role", inline=False)
+                    await log_role_event(embed=e)
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -2587,7 +2696,13 @@ async def start_sequence(ctx, member: discord.Member):
         return
     enqueue_first_day(member.id)
     await ctx.reply(f"Queued day_1 for {m_user(member)} now.")
-    await log_first(f"🧵 (Admin) Enqueued **day_1** for {_fmt_user(member)}")
+    e = _make_dyno_embed(
+        member=member,
+        description=f"{member.mention} queued for day_1 (admin)",
+        footer=f"ID: {member.id}",
+        color=0x5865F2,
+    )
+    await log_first(embed=e)
 
 @bot.command(name="cancel")
 @commands.has_permissions(administrator=True)
@@ -2597,7 +2712,13 @@ async def cancel_sequence(ctx, member: discord.Member):
         return
     mark_cancelled(member.id, "admin_cancel")
     await ctx.reply(f"Cancelled sequence for {m_user(member)}.")
-    await log_other(f"🛑 (Admin) Cancelled sequence for {_fmt_user(member)}")
+    e = _make_dyno_embed(
+        member=member,
+        description=f"{member.mention} sequence cancelled (admin)",
+        footer=f"ID: {member.id}",
+        color=0xFEE75C,
+    )
+    await log_other(embed=e)
 
 @bot.command(name="test")
 @commands.has_permissions(administrator=True)
@@ -2630,9 +2751,21 @@ async def test_sequence(ctx, member: discord.Member):
             await member.send(embeds=embeds, view=view)
             log.info(f"[TEST] Sent {day_key} to {member} ({member.id})")
             if day_key == "day_1":
-                await log_first(f"🧪 TEST sent **{day_key}** to {_fmt_user(member)}")
+                e = _make_dyno_embed(
+                    member=member,
+                    description=f"{member.mention} {day_key} sent (test)",
+                    footer=f"ID: {member.id}",
+                    color=0x57F287,
+                )
+                await log_first(embed=e)
             else:
-                await log_other(f"🧪 TEST sent **{day_key}** to {_fmt_user(member)}")
+                e = _make_dyno_embed(
+                    member=member,
+                    description=f"{member.mention} {day_key} sent (test)",
+                    footer=f"ID: {member.id}",
+                    color=0x57F287,
+                )
+                await log_other(embed=e)
         except Exception as e:
             await log_other(f"🧪❌ TEST failed `{day_key}` for {_fmt_user(member)}: `{e}`")
         await asyncio.sleep(TEST_INTERVAL_SECONDS)
@@ -2662,7 +2795,13 @@ async def relocate_sequence(ctx, member: discord.Member, day: str):
     }
     save_json(QUEUE_FILE, queue_state)
     await ctx.reply(f"Relocated {m_user(member)} to **{day_key}**, will send in ~5s.")
-    await log_other(f"➡️ Relocated {_fmt_user(member)} to **{day_key}**")
+    e = _make_dyno_embed(
+        member=member,
+        description=f"{member.mention} relocated to {day_key}",
+        footer=f"ID: {member.id}",
+        color=0x5865F2,
+    )
+    await log_other(embed=e)
 
 # -----------------------------
 # Run
