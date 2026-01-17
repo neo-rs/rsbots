@@ -29,6 +29,7 @@
 !RSCheckerbot/*.py
 !RSCheckerbot/**/*.py
 !RSCheckerbot/COMMANDS.md
+!RSCheckerbot/config.json
 
 !RSForwarder/
 !RSForwarder/**/
