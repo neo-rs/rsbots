@@ -8,7 +8,7 @@
     1366833116123234354,
     1452226578053464177
   ],
-  "reaction_emoji": "🤑",
+  "reaction_emoji": "\ud83e\udd11",
   "role_id_to_watch": 876569612085518376,
   "log_channel_id": 1452258047362859178,
   "points_log_channel_id": 1452258047362859178,
@@ -33,20 +33,14 @@
   },
   "redemption_tiers": [
     {
-      "name": "Tier 1",
-      "points_required": 10,
-      "description": "Basic reward description"
-    },
-    {
-      "name": "Tier 2",
-      "points_required": 25,
-      "description": "Better reward description"
-    },
-    {
-      "name": "Tier 3",
+      "name": "Starter Reward - 7 Days",
       "points_required": 50,
-      "description": "Premium reward description"
+      "description": "Grinder Reward - 7 Days"
+    },
+    {
+      "name": "Grinder Reward - 30 Days",
+      "points_required": 150,
+      "description": "Grinder Reward - 30 Days"
     }
   ]
 }
-
