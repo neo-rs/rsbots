@@ -96,19 +96,33 @@ def _save_discord_link_db(db: dict) -> None:
     _save_json(DISCORD_LINK_FILE, db)
 
 
-def _cache_discord_membership_link(discord_id: str, membership_id: str, whop_member_id: str = "", source_event: str = "") -> None:
+def _cache_discord_membership_link(
+    discord_id: str,
+    membership_id: str,
+    *,
+    whop_member_id: str = "",
+    whop_user_id: str = "",
+    dashboard_url: str = "",
+    source_event: str = "",
+) -> None:
     did = str(discord_id or "").strip()
     mid = str(membership_id or "").strip()
     if not did.isdigit() or not mid:
         return
     db = _load_discord_link_db()
     by = db.get("by_discord_id") or {}
-    by[did] = {
-        "membership_id": mid,
-        "whop_member_id": str(whop_member_id or "").strip(),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "source_event": str(source_event or "").strip(),
-    }
+    prev = by.get(did) if isinstance(by, dict) else None
+    rec = prev if isinstance(prev, dict) else {}
+    rec["membership_id"] = mid
+    if whop_member_id:
+        rec["whop_member_id"] = str(whop_member_id or "").strip()
+    if whop_user_id:
+        rec["whop_user_id"] = str(whop_user_id or "").strip()
+    if dashboard_url:
+        rec["dashboard_url"] = str(dashboard_url or "").strip()
+    rec["updated_at"] = datetime.now(timezone.utc).isoformat()
+    rec["source_event"] = str(source_event or "").strip()
+    by[did] = rec
     db["by_discord_id"] = by
     _save_discord_link_db(db)
 
@@ -245,11 +259,25 @@ async def _whop_brief_from_event(member: discord.Member, event_data: dict) -> di
     mid = _membership_id_from_event(member, event_data)
     if not mid:
         return {}
-    return await fetch_whop_brief(
+    brief = await fetch_whop_brief(
         _whop_api_client,
         mid,
         enable_enrichment=bool(_whop_api_config.get("enable_enrichment", True)),
     )
+    # Keep link cache enriched so other bots (e.g., SuccessBot) can build dashboard URLs.
+    try:
+        if isinstance(brief, dict):
+            _cache_discord_membership_link(
+                discord_id=str(member.id),
+                membership_id=mid,
+                whop_member_id=str(brief.get("whop_member_id") or "").strip(),
+                whop_user_id=str(brief.get("whop_user_id") or "").strip(),
+                dashboard_url=str(brief.get("dashboard_url") or "").strip(),
+                source_event=str(event_data.get("event_type") or "").strip(),
+            )
+    except Exception:
+        pass
+    return brief
 
 
 def _looks_like_dispute(payment: dict) -> bool:

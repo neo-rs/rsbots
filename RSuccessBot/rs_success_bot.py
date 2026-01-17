@@ -778,11 +778,12 @@ class RSSuccessBot:
         base = f"pointsredeem-{username}".lower()
         return "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in base)[:95]
 
-    def _whop_manage_link_for_member(self, discord_user_id: int) -> str:
-        """Best-effort Whop Manage link using RSCheckerbot's cached link DB."""
+    def _whop_dashboard_link_for_member(self, discord_user_id: int) -> str:
+        """Best-effort Whop Dashboard link using RSCheckerbot's cached link DB."""
         try:
             root = Path(__file__).resolve().parents[1]
             link_path = root / "RSCheckerbot" / "whop_discord_link.json"
+            cfg_path = root / "RSCheckerbot" / "config.json"
             if not link_path.exists():
                 return "—"
             db = json.loads(link_path.read_text(encoding="utf-8") or "{}")
@@ -792,10 +793,25 @@ class RSSuccessBot:
             rec = by.get(str(int(discord_user_id)))  # normalize
             if not isinstance(rec, dict):
                 return "—"
-            mber = str(rec.get("whop_member_id") or "").strip()
-            if not mber:
+            # Prefer a cached full URL if available.
+            cached_url = str(rec.get("dashboard_url") or "").strip()
+            if cached_url.startswith("[Open]("):
+                return cached_url
+
+            user_id = str(rec.get("whop_user_id") or "").strip()
+            if not user_id:
                 return "—"
-            url = f"https://whop.com/billing/manage/{mber}"
+
+            company_id = ""
+            if cfg_path.exists():
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8") or "{}")
+                wa = cfg.get("whop_api") if isinstance(cfg, dict) else None
+                if isinstance(wa, dict):
+                    company_id = str(wa.get("company_id") or "").strip()
+            if not company_id:
+                return "—"
+
+            url = f"https://whop.com/dashboard/{company_id}/users/{user_id}/"
             return f"[Open]({url})"
         except Exception:
             return "—"
@@ -915,8 +931,8 @@ class RSSuccessBot:
                     timestamp=datetime.now(timezone.utc)
                 )
                 try:
-                    manage_link = self.bot_instance._whop_manage_link_for_member(self.member.id)
-                    embed.description = (embed.description or "") + f"\n\n**Whop Manage:** {manage_link}"
+                    dash_link = self.bot_instance._whop_dashboard_link_for_member(self.member.id)
+                    embed.description = (embed.description or "") + f"\n\n**Whop Dashboard:** {dash_link}"
                 except Exception:
                     pass
                 embed.set_footer(text=self.bot_instance.get_message("redemption_ticket_channel_message.footer"))

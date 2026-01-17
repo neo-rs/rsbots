@@ -111,6 +111,50 @@ def _extract_total_spent_usd(member_rec: dict) -> float | None:
     return None
 
 
+def _extract_whop_user_id(membership: dict, member_rec: dict | None = None) -> str:
+    """Best-effort Whop user_id (user_...) extraction for building dashboard URLs."""
+    if not isinstance(membership, dict):
+        return ""
+
+    # Prefer membership.user (if present)
+    u = membership.get("user")
+    if isinstance(u, str):
+        s = u.strip()
+        if s:
+            return s
+    if isinstance(u, dict):
+        s = str(u.get("id") or u.get("user_id") or "").strip()
+        if s:
+            return s
+
+    # Some payloads nest user under member
+    m = membership.get("member")
+    if isinstance(m, dict):
+        u2 = m.get("user")
+        if isinstance(u2, str):
+            s = u2.strip()
+            if s:
+                return s
+        if isinstance(u2, dict):
+            s = str(u2.get("id") or u2.get("user_id") or "").strip()
+            if s:
+                return s
+
+    # Fallback: use member record (/members/{mber_...}) -> user.id
+    if isinstance(member_rec, dict):
+        ur = member_rec.get("user")
+        if isinstance(ur, dict):
+            s = str(ur.get("id") or ur.get("user_id") or "").strip()
+            if s:
+                return s
+        if isinstance(ur, str):
+            s = ur.strip()
+            if s:
+                return s
+
+    return ""
+
+
 async def fetch_whop_brief(
     client: WhopAPIClient | None,
     membership_id: str,
@@ -154,6 +198,7 @@ async def fetch_whop_brief(
         "renewal_end_iso": renewal_end_iso or "",
         "remaining_days": remaining_days if isinstance(remaining_days, int) else "",
         "manage_url": manage_url,
+        "dashboard_url": "",
         "cancel_at_period_end": "yes" if membership.get("cancel_at_period_end") is True else ("no" if membership.get("cancel_at_period_end") is False else "—"),
         "is_first_membership": "true" if membership.get("is_first_membership") is True else ("false" if membership.get("is_first_membership") is False else "—"),
         "last_payment_method": "—",
@@ -162,6 +207,9 @@ async def fetch_whop_brief(
         "last_success_paid_at_iso": "",
         "last_success_paid_at": "—",
         "total_spent": "",
+        # Internal IDs (not shown in staff embeds; used for caching/linking)
+        "whop_user_id": "",
+        "whop_member_id": "",
     }
 
     payments = []
@@ -213,12 +261,23 @@ async def fetch_whop_brief(
         whop_member_id = ""
         if isinstance(membership.get("member"), dict):
             whop_member_id = str(membership["member"].get("id") or "").strip()
+        brief["whop_member_id"] = whop_member_id
+        member_rec = None
         if whop_member_id:
             rec = await client.get_member_by_id(whop_member_id)
             if isinstance(rec, dict):
+                member_rec = rec
                 total_usd = _extract_total_spent_usd(rec)
                 if total_usd is not None:
                     brief["total_spent"] = fmt_money(total_usd, "usd")
+
+        # Dashboard URL (staff-facing): https://whop.com/dashboard/<biz>/users/<user_id>/
+        user_id = _extract_whop_user_id(membership, member_rec=member_rec)
+        brief["whop_user_id"] = user_id
+        if user_id and getattr(client, "company_id", ""):
+            dash = f"https://whop.com/dashboard/{str(client.company_id).strip()}/users/{user_id}/"
+            brief["dashboard_url"] = f"[Open]({dash})"
+
         if not brief.get("total_spent"):
             total = 0.0
             saw_success = False
