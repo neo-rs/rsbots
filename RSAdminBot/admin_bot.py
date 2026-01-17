@@ -4718,43 +4718,205 @@ echo "CHANGED_END"
             await send(embed=error_embed)
             return
 
-        # Discord embed description hard-limit is 4096 chars.
-        # Keep a buffer to avoid edge-case formatting expansion.
-        max_desc = 3900
+        # Render COMMANDS.md as "real help" embeds (one field per command).
+        # This avoids dumping the entire doc into a single wrapper block.
 
-        def _chunk_markdown(text: str, limit: int) -> List[str]:
-            lines = (text or "").split("\n")
-            out: List[str] = []
-            cur: List[str] = []
-            cur_len = 0
-            for line in lines:
-                add_len = len(line) + 1
-                if cur and (cur_len + add_len) > limit:
-                    out.append("\n".join(cur))
-                    cur = [line]
-                    cur_len = add_len
-                else:
-                    cur.append(line)
-                    cur_len += add_len
-            if cur:
-                out.append("\n".join(cur))
-            return out
+        def _strip_ticks(s: str) -> str:
+            s = str(s or "").strip()
+            if s.startswith("`") and s.endswith("`") and len(s) >= 2:
+                s = s[1:-1].strip()
+            return s
 
-        chunks = _chunk_markdown(content, max_desc)
-        total = max(1, len(chunks))
+        def _infer_prefix_from_commands(cmd_names: List[str]) -> str:
+            # Prefer the most common first token (e.g. ".checker") or the leading symbol (e.g. "!").
+            toks: List[str] = []
+            for name in cmd_names:
+                n = str(name or "").strip()
+                if not n:
+                    continue
+                first = n.split()[0]
+                toks.append(first)
+            if not toks:
+                return "?"
+            # Most common
+            counts: Dict[str, int] = {}
+            for t in toks:
+                counts[t] = counts.get(t, 0) + 1
+            best = max(counts.items(), key=lambda kv: kv[1])[0]
+            # Normalize: "!something" -> "!" (unless it's a unique prefix like "!rs")
+            if best.startswith("!") and len(best) > 1 and best != "!rs":
+                return "!"
+            return best
 
-        # Send as normal embeds (no ```markdown``` fences) so the formatting matches the docs.
-        for i, chunk in enumerate(chunks, start=1):
-            title_suffix = f" ({i}/{total})" if total > 1 else ""
+        def _parse_commands_md(text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+            """Parse our COMMANDS.md convention into command dicts.
+
+            Returns:
+              (commands, categories_in_order)
+            """
+            commands_out: List[Dict[str, Any]] = []
+            categories: List[str] = []
+            category = "Commands"
+            current: Optional[Dict[str, Any]] = None
+            pending_key: Optional[str] = None
+
+            def _finish_current():
+                nonlocal current, pending_key
+                if current:
+                    commands_out.append(current)
+                current = None
+                pending_key = None
+
+            for raw in (text or "").splitlines():
+                line = (raw or "").rstrip("\n")
+                if line.startswith("### ") and not line.startswith("#### "):
+                    category = line[4:].strip() or "Commands"
+                    if category not in categories:
+                        categories.append(category)
+                    pending_key = None
+                    continue
+                if line.startswith("#### "):
+                    _finish_current()
+                    cmd_name = _strip_ticks(line[5:].strip())
+                    current = {
+                        "name": cmd_name,
+                        "category": category,
+                        "kv": {},
+                    }
+                    continue
+                if not current:
+                    continue
+
+                m = re.match(r"^- \*\*(.+?)\*\*:\s*(.*)$", line)
+                if m:
+                    key = str(m.group(1) or "").strip().lower()
+                    val = str(m.group(2) or "").strip()
+                    if val == "":
+                        current["kv"][key] = []
+                        pending_key = key
+                    else:
+                        current["kv"][key] = val
+                        pending_key = key
+                    continue
+
+                # Continuation lines for multi-line fields like Parameters / Usage.
+                if pending_key and (line.startswith("  -") or line.startswith("    -") or line.startswith("   ")):
+                    bucket = current["kv"].get(pending_key)
+                    if isinstance(bucket, list):
+                        bucket.append(line.strip())
+                    else:
+                        # Convert a previous string value into a list, preserving it.
+                        current["kv"][pending_key] = [str(bucket).strip(), line.strip()] if bucket else [line.strip()]
+                    continue
+
+                # If we hit a non-indented line, stop collecting continuation.
+                pending_key = None
+
+            _finish_current()
+            return commands_out, categories
+
+        def _format_value(cmd: Dict[str, Any]) -> str:
+            kv = cmd.get("kv") or {}
+
+            def _get(key: str):
+                return kv.get(key)
+
+            def _fmt_block(label: str, value: Any) -> List[str]:
+                if value is None:
+                    return []
+                if isinstance(value, list):
+                    if not value:
+                        return []
+                    # Keep list items readable; they already start with '-' in our docs.
+                    body = "\n".join(value)
+                    return [f"**{label}**:\n{body}"]
+                s = str(value).strip()
+                if not s:
+                    return []
+                return [f"**{label}**: {s}"]
+
+            # Prefer a consistent "help" ordering
+            parts: List[str] = []
+            parts += _fmt_block("Description", _get("description"))
+            parts += _fmt_block("Usage", _get("usage"))
+            parts += _fmt_block("Aliases", _get("aliases"))
+            parts += _fmt_block("Parameters", _get("parameters"))
+            parts += _fmt_block("Returns", _get("returns"))
+            parts += _fmt_block("Note", _get("note"))
+            parts += _fmt_block("Admin Only", _get("admin only"))
+
+            text = "\n".join(parts).strip() or "—"
+            if len(text) > 1000:
+                text = text[:997] + "..."
+            return text
+
+        # Prefer the explicit prefix declared in COMMANDS.md (most reliable).
+        doc_prefix = None
+        try:
+            m_pref = re.search(r"\\*\\*Command Prefix\\*\\*:\\s*`([^`]+)`", content or "")
+            if m_pref:
+                doc_prefix = str(m_pref.group(1) or "").strip()
+        except Exception:
+            doc_prefix = None
+
+        parsed_cmds, categories = _parse_commands_md(content)
+        if not parsed_cmds:
+            # Fallback: if parsing fails, still show raw doc (better than silence).
             embed = discord.Embed(
-                title=f"📋 {bot_info.get('name', bot_key_norm)} Commands{title_suffix}",
-                description=chunk or "(empty)",
+                title=f"📋 {bot_info.get('name', bot_key_norm)} Commands",
+                description=(content[:3900] + "\n…(truncated)") if len(content) > 3900 else (content or "(empty)"),
                 color=discord.Color.blue(),
                 timestamp=datetime.now(timezone.utc),
             )
             if who:
                 embed.set_footer(text=who)
             await send(embed=embed)
+            return
+
+        prefix = doc_prefix or _infer_prefix_from_commands([c.get("name") for c in parsed_cmds])
+        by_cat: Dict[str, List[Dict[str, Any]]] = {}
+        for c in parsed_cmds:
+            by_cat.setdefault(str(c.get("category") or "Commands"), []).append(c)
+
+        # Build and send embeds per category, chunked by field limits.
+        for cat in (categories or list(by_cat.keys())):
+            cmd_list = by_cat.get(cat) or []
+            if not cmd_list:
+                continue
+
+            pages: List[discord.Embed] = []
+            cur = discord.Embed(
+                title=f"📖 {bot_info.get('name', bot_key_norm)} — {cat}",
+                description=f"Prefix: `{prefix}` • Commands: {len(cmd_list)}",
+                color=discord.Color.blue(),
+                timestamp=datetime.now(timezone.utc),
+            )
+            if who:
+                cur.set_footer(text=who)
+
+            for cmd in cmd_list:
+                name = str(cmd.get("name") or "").strip() or "(unnamed)"
+                value = _format_value(cmd)
+                # Discord limits: 25 fields per embed.
+                if len(cur.fields) >= 25:
+                    pages.append(cur)
+                    cur = discord.Embed(
+                        title=f"📖 {bot_info.get('name', bot_key_norm)} — {cat}",
+                        description=f"Prefix: `{prefix}` • Commands: {len(cmd_list)}",
+                        color=discord.Color.blue(),
+                        timestamp=datetime.now(timezone.utc),
+                    )
+                    if who:
+                        cur.set_footer(text=who)
+                cur.add_field(name=name[:256], value=value[:1024], inline=False)
+
+            pages.append(cur)
+
+            total_pages = len(pages)
+            for idx, e in enumerate(pages, start=1):
+                if total_pages > 1:
+                    e.title = f"{e.title} ({idx}/{total_pages})"
+                await send(embed=e)
 
     def _build_botconfig_embed(self, bot_name: str, *, triggered_by: Optional[Any] = None) -> discord.Embed:
         """Build the botconfig embed for a bot (RS-only, inspector-based)."""
