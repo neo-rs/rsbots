@@ -75,6 +75,10 @@ def _extract_total_spent_usd(member_rec: dict) -> float | None:
     # Search both top-level and the nested user dict.
     user = member_rec.get("user") if isinstance(member_rec.get("user"), dict) else {}
     candidates: list[tuple[dict, str, bool]] = [
+        # Whop dashboard uses "Total spend" (spend, not spent) in some payloads.
+        (user, "total_spend_usd", False),
+        (user, "total_spend", False),
+        (user, "total_spend_cents", True),
         (user, "total_spent_usd", False),
         (user, "usd_total_spent", False),
         (user, "total_spent", False),
@@ -82,6 +86,9 @@ def _extract_total_spent_usd(member_rec: dict) -> float | None:
         (user, "lifetime_spend", False),
         (user, "total_spent_cents", True),
         (user, "total_spend_cents", True),
+        (member_rec, "total_spend_usd", False),
+        (member_rec, "total_spend", False),
+        (member_rec, "total_spend_cents", True),
         (member_rec, "total_spent_usd", False),
         (member_rec, "usd_total_spent", False),
         (member_rec, "total_spent", False),
@@ -100,7 +107,13 @@ def _extract_total_spent_usd(member_rec: dict) -> float | None:
 
     # Some APIs put it under user.stats
     stats = user.get("stats") if isinstance(user.get("stats"), dict) else {}
-    for key, is_cents in (("total_spent", False), ("total_spent_cents", True), ("lifetime_spend", False)):
+    for key, is_cents in (
+        ("total_spend", False),
+        ("total_spend_cents", True),
+        ("total_spent", False),
+        ("total_spent_cents", True),
+        ("lifetime_spend", False),
+    ):
         if key not in stats:
             continue
         amt = _coerce_money_amount(stats.get(key))
