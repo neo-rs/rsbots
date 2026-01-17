@@ -561,19 +561,6 @@ def _access_end_dt_from_membership(membership_data: dict | None) -> datetime | N
     )
 
 
-def _fmt_money(amount: object, currency: str | None = None) -> str:
-    """Format Whop money values (usually floats) into a readable string."""
-    if amount is None or amount == "":
-        return ""
-    try:
-        amt = float(str(amount))
-    except (ValueError, TypeError):
-        return str(amount)
-    cur = (currency or "").strip().lower()
-    if cur in ("", "usd"):
-        return f"${amt:.2f}"
-    return f"{amt:.2f} {cur.upper()}"
-
 async def _fetch_whop_brief_by_membership_id(membership_id: str) -> dict:
     """Fetch a minimal Whop summary for staff (no internal IDs)."""
     global whop_api_client

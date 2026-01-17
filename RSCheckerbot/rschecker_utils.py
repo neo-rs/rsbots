@@ -86,3 +86,17 @@ def coerce_role_ids(*values: object) -> set[int]:
             out.add(int(s))
     return out
 
+
+def fmt_money(amount: object, currency: str | None = None) -> str:
+    """Format Whop money values (usually floats) into a readable string."""
+    if amount is None or amount == "":
+        return ""
+    try:
+        amt = float(str(amount))
+    except (ValueError, TypeError):
+        return str(amount)
+    cur = (currency or "").strip().lower()
+    if cur in ("", "usd"):
+        return f"${amt:.2f}"
+    return f"{amt:.2f} {cur.upper()}"
+

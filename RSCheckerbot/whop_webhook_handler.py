@@ -21,6 +21,7 @@ log = logging.getLogger("rs-checker")
 # Canonical shared helpers (single source of truth)
 from rschecker_utils import load_json as _load_json
 from rschecker_utils import save_json as _save_json
+from rschecker_utils import fmt_money
 from rschecker_utils import access_roles_plain, coerce_role_ids
 from staff_embeds import build_case_minimal_embed, build_member_status_detailed_embed
 from whop_brief import fetch_whop_brief
@@ -392,7 +393,7 @@ async def _post_resolution_or_dispute_alert(
             or latest_payment.get("subtotal")
             or latest_payment.get("amount_after_fees")
         )
-        amt = _fmt_money(pay_total, pay_currency)
+        amt = fmt_money(pay_total, pay_currency)
         p_status = str(latest_payment.get("status") or "").strip()
         p_sub = str(latest_payment.get("substatus") or "").strip()
         created = latest_payment.get("created_at") or ""
@@ -421,7 +422,7 @@ async def _post_resolution_or_dispute_alert(
         if dispute_alerted_at:
             pay_lines.append(f"dispute_alerted: {_fmt_discord_ts(str(dispute_alerted_at), 'D')}")
         if refunded_at:
-            ra = _fmt_money(refunded_amount, pay_currency)
+            ra = fmt_money(refunded_amount, pay_currency)
             pay_lines.append(f"refunded: {_fmt_discord_ts(str(refunded_at), 'D')}{f' ({ra})' if ra else ''}")
         if pay_lines:
             embed.add_field(name="Latest Payment (API)", value="\n".join(pay_lines)[:1024], inline=False)
@@ -700,20 +701,6 @@ def _fmt_discord_ts(ts_str: str | None, style: str = "D") -> str:
         return f"<t:{unix_ts}:{style}>"
     except (ValueError, TypeError, AttributeError):
         return "—"
-
-
-def _fmt_money(amount: object, currency: str | None = None) -> str:
-    """Format money amounts from Whop API (usually floats) into a readable string."""
-    if amount is None or amount == "":
-        return ""
-    try:
-        amt = float(str(amount))
-    except (ValueError, TypeError):
-        return str(amount)
-    cur = (currency or "").strip().lower()
-    if cur in ("", "usd"):
-        return f"${amt:.2f}"
-    return f"{amt:.2f} {cur.upper()}"
 
 
 async def _resolve_member_safe(guild: discord.Guild, discord_id: int | None, force_fetch: bool = False) -> discord.Member | None:

@@ -777,6 +777,28 @@ class RSSuccessBot:
         """Create safe channel name for redemption tickets"""
         base = f"pointsredeem-{username}".lower()
         return "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in base)[:95]
+
+    def _whop_manage_link_for_member(self, discord_user_id: int) -> str:
+        """Best-effort Whop Manage link using RSCheckerbot's cached link DB."""
+        try:
+            root = Path(__file__).resolve().parents[1]
+            link_path = root / "RSCheckerbot" / "whop_discord_link.json"
+            if not link_path.exists():
+                return "—"
+            db = json.loads(link_path.read_text(encoding="utf-8") or "{}")
+            by = db.get("by_discord_id") if isinstance(db, dict) else None
+            if not isinstance(by, dict):
+                return "—"
+            rec = by.get(str(int(discord_user_id)))  # normalize
+            if not isinstance(rec, dict):
+                return "—"
+            mber = str(rec.get("whop_member_id") or "").strip()
+            if not mber:
+                return "—"
+            url = f"https://whop.com/billing/manage/{mber}"
+            return f"[Open]({url})"
+        except Exception:
+            return "—"
     
     async def create_redemption_ticket(self, member: discord.Member, tier_name: str, points_required: int):
         """Create a redemption ticket channel"""
@@ -892,6 +914,11 @@ class RSSuccessBot:
                     color=self.bot_instance.get_embed_color(),
                     timestamp=datetime.now(timezone.utc)
                 )
+                try:
+                    manage_link = self.bot_instance._whop_manage_link_for_member(self.member.id)
+                    embed.description = (embed.description or "") + f"\n\n**Whop Manage:** {manage_link}"
+                except Exception:
+                    pass
                 embed.set_footer(text=self.bot_instance.get_message("redemption_ticket_channel_message.footer"))
                 await ticket.send(content=support_mention, embed=embed)
                 

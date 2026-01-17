@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from math import ceil
 
 from whop_api_client import WhopAPIClient
+from rschecker_utils import fmt_money
 
 log = logging.getLogger("rs-checker")
 
@@ -45,6 +46,69 @@ def _parse_dt_any(ts_str: str | int | float | None) -> datetime | None:
         return datetime.fromtimestamp(float(s), tz=timezone.utc)
     except Exception:
         return None
+
+
+def _coerce_money_amount(v: object) -> float | None:
+    """Best-effort float conversion for Whop 'total spent' style values."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, bool):
+        return None
+    try:
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).strip()
+        if not s:
+            return None
+        # Strip common currency symbols/commas.
+        s = s.replace("$", "").replace(",", "")
+        return float(s)
+    except Exception:
+        return None
+
+
+def _extract_total_spent_usd(member_rec: dict) -> float | None:
+    """Extract a lifetime total-spent value (USD) from /members/{mber_...} response (best-effort)."""
+    if not isinstance(member_rec, dict):
+        return None
+
+    # Search both top-level and the nested user dict.
+    user = member_rec.get("user") if isinstance(member_rec.get("user"), dict) else {}
+    candidates: list[tuple[dict, str, bool]] = [
+        (user, "total_spent_usd", False),
+        (user, "usd_total_spent", False),
+        (user, "total_spent", False),
+        (user, "lifetime_spend_usd", False),
+        (user, "lifetime_spend", False),
+        (user, "total_spent_cents", True),
+        (user, "total_spend_cents", True),
+        (member_rec, "total_spent_usd", False),
+        (member_rec, "usd_total_spent", False),
+        (member_rec, "total_spent", False),
+        (member_rec, "lifetime_spend_usd", False),
+        (member_rec, "lifetime_spend", False),
+        (member_rec, "total_spent_cents", True),
+        (member_rec, "total_spend_cents", True),
+    ]
+    for d, key, is_cents in candidates:
+        if not isinstance(d, dict) or key not in d:
+            continue
+        amt = _coerce_money_amount(d.get(key))
+        if amt is None:
+            continue
+        return (amt / 100.0) if is_cents else amt
+
+    # Some APIs put it under user.stats
+    stats = user.get("stats") if isinstance(user.get("stats"), dict) else {}
+    for key, is_cents in (("total_spent", False), ("total_spent_cents", True), ("lifetime_spend", False)):
+        if key not in stats:
+            continue
+        amt = _coerce_money_amount(stats.get(key))
+        if amt is None:
+            continue
+        return (amt / 100.0) if is_cents else amt
+
+    return None
 
 
 async def fetch_whop_brief(
@@ -97,6 +161,7 @@ async def fetch_whop_brief(
         "last_payment_failure": "",
         "last_success_paid_at_iso": "",
         "last_success_paid_at": "—",
+        "total_spent": "",
     }
 
     payments = []
@@ -139,6 +204,37 @@ async def fetch_whop_brief(
                 brief["last_success_paid_at_iso"] = iso
                 brief["last_success_paid_at"] = _fmt_date_any(iso)
                 break
+    except Exception:
+        pass
+
+    # Total spent (lifetime, best-effort from member record).
+    # Fallback: sum succeeded payments for this membership (labeled clearly).
+    try:
+        whop_member_id = ""
+        if isinstance(membership.get("member"), dict):
+            whop_member_id = str(membership["member"].get("id") or "").strip()
+        if whop_member_id:
+            rec = await client.get_member_by_id(whop_member_id)
+            if isinstance(rec, dict):
+                total_usd = _extract_total_spent_usd(rec)
+                if total_usd is not None:
+                    brief["total_spent"] = fmt_money(total_usd, "usd")
+        if not brief.get("total_spent"):
+            total = 0.0
+            saw_success = False
+            for p in (payments or []):
+                if not isinstance(p, dict):
+                    continue
+                st = str(p.get("status") or "").strip().lower()
+                if st not in {"succeeded", "paid", "successful", "success"}:
+                    continue
+                saw_success = True
+                amt = p.get("usd_total") or p.get("total") or p.get("subtotal") or p.get("amount_after_fees")
+                a = _coerce_money_amount(amt)
+                if a is not None:
+                    total += a
+            if saw_success:
+                brief["total_spent"] = f"{fmt_money(total, 'usd')} (membership)"
     except Exception:
         pass
 
