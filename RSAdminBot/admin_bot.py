@@ -3780,6 +3780,7 @@ echo \"CHANGED_END\"
         - Only copies files tracked by git under the target folder:
           - *.py
           - COMMANDS.md (if present)
+          - config.json / messages.json / vouch_config.json (if present + tracked)
         """
         try:
             folder = (bot_folder or "").strip()
@@ -3824,11 +3825,13 @@ if [ "$PY_COUNT" = "0" ]; then
   exit 3
 fi
 
-# Build the full sync list: python files + COMMANDS.md + config.json (if tracked)
+# Build the full sync list: python files + key json/docs (if tracked)
 TMP_SYNC_LIST="/tmp/mw_sync_${{BOT_FOLDER}}.txt"
 cat "$TMP_PY_LIST" > "$TMP_SYNC_LIST" || true
 git ls-files "$BOT_FOLDER/COMMANDS.md" 2>/dev/null >> "$TMP_SYNC_LIST" || true
 git ls-files "$BOT_FOLDER/config.json" 2>/dev/null >> "$TMP_SYNC_LIST" || true
+git ls-files "$BOT_FOLDER/messages.json" 2>/dev/null >> "$TMP_SYNC_LIST" || true
+git ls-files "$BOT_FOLDER/vouch_config.json" 2>/dev/null >> "$TMP_SYNC_LIST" || true
 sort -u "$TMP_SYNC_LIST" -o "$TMP_SYNC_LIST" || true
 SYNC_COUNT="$(wc -l < "$TMP_SYNC_LIST" | tr -d \" \")"
 if [ "$SYNC_COUNT" = "" ]; then SYNC_COUNT="0"; fi

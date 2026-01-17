@@ -23,6 +23,9 @@
 !RSAdminBot/*.sh
 !RSAdminBot/**/*.sh
 !RSAdminBot/COMMANDS.md
+!RSAdminBot/config.json
+!RSAdminBot/messages.json
+!RSAdminBot/vouch_config.json
 
 !RSCheckerbot/
 !RSCheckerbot/**/
@@ -30,30 +33,44 @@
 !RSCheckerbot/**/*.py
 !RSCheckerbot/COMMANDS.md
 !RSCheckerbot/config.json
+!RSCheckerbot/messages.json
+!RSCheckerbot/vouch_config.json
 
 !RSForwarder/
 !RSForwarder/**/
 !RSForwarder/*.py
 !RSForwarder/**/*.py
 !RSForwarder/COMMANDS.md
+!RSForwarder/config.json
+!RSForwarder/messages.json
+!RSForwarder/vouch_config.json
 
 !RSMentionPinger/
 !RSMentionPinger/**/
 !RSMentionPinger/*.py
 !RSMentionPinger/**/*.py
 !RSMentionPinger/COMMANDS.md
+!RSMentionPinger/config.json
+!RSMentionPinger/messages.json
+!RSMentionPinger/vouch_config.json
 
 !RSOnboarding/
 !RSOnboarding/**/
 !RSOnboarding/*.py
 !RSOnboarding/**/*.py
 !RSOnboarding/COMMANDS.md
+!RSOnboarding/config.json
+!RSOnboarding/messages.json
+!RSOnboarding/vouch_config.json
 
 !RSuccessBot/
 !RSuccessBot/**/
 !RSuccessBot/*.py
 !RSuccessBot/**/*.py
 !RSuccessBot/COMMANDS.md
+!RSuccessBot/config.json
+!RSuccessBot/messages.json
+!RSuccessBot/vouch_config.json
 
 # Allow shared scripts used by RSAdminBot (Oracle data tools)
 !scripts/

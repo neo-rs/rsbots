@@ -1,0 +1,32 @@
+{
+  "guild_id": 876528050081251379,
+  "welcome_role_id": 1158658514458263592,
+  "member_role_id": 876569612085518376,
+  "cleanup_role_ids": [1222877651438407731, 1021886425530109994],
+  "ticket_category_id": 1181895489138987008,
+  "overflow_category_id": 1351767213131960423,
+  "log_channel_id": 1405293169876140214,
+  "staff_user_id": 744705253890326599,
+  "alert_user_id": 971528709876113478,
+  "welcome_log_channel_id": 1367949832660058263,
+  "welcome_ping_user_id": 533677624447205387,
+  "embed_color": {
+    "r": 169,
+    "g": 199,
+    "b": 220
+  },
+  "banner_url": "https://cdn.discordapp.com/attachments/887841201481474098/1360728722788847637/image.png",
+  "footer_text": "Reselling Secrets Staff",
+  "auto_close_seconds": 86400,
+  "recent_dm_ttl_seconds": 300,
+  "support_role_id": 876588092927115284,
+  "tickets_file": "tickets.json",
+  "ticket_channel_name_prefix": "🔥welcome-",
+  "progress_emojis": {
+    "completed": "<:rscheck:1352700145845801071>",
+    "current": "<:rsfiree:1352700144797352027>",
+    "pending": "⬜"
+  },
+  "welcome_log_message": "<@{welcome_ping_user_id}> New welcome ticket opened for {member.mention}: {ticket.jump_url}",
+  "full_access_message": "✅ You now have full access!"
+}

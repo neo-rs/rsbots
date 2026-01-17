@@ -1,0 +1,107 @@
+{
+  "point_award": {
+    "description": "**Congratulations {member.mention}!**\nYou've been awarded **1 point** for sharing your success!\n\n🚀 **Your Current Points:** {total_points}"
+  },
+  "duplicate_image": {
+    "title": "Duplicate Image Detected",
+    "description": "⚠️ {member.mention}, one of your images looks like a repost.\n\nNo points were awarded for this submission.\n\nPlease share a new, original success image to earn points!",
+    "footer": "Image hashing prevents duplicate submissions"
+  },
+  "role_removed_dm": {
+    "title": "Membership Status Changed",
+    "description": "⚠️ Your membership status has changed.\n\nIf your membership ends, you'll lose your success points.\n\nPlease contact staff if you believe this is an error.",
+    "footer": "Points reset when membership role is removed"
+  },
+  "help_member": {
+    "title": "Success Points System - Help",
+    "description": "Welcome to the Success Points system! Here's how it works:\n\n**📊 How to Earn Points:**\n• Post images of your successes in designated success channels\n• Each unique success image earns **1 point**\n• Duplicate images are automatically detected (no points)\n\n**💾 Where Points Are Stored:**\n• All points are stored securely in JSON format\n• Points are tied to your Discord user ID\n• Data is persistent and backed up\n\n**🎯 How to Check Your Points:**\n• Use `/rspoints` command to see your current total\n• Use `/rsleaderboard` to see top 10 members\n• Use `/rsredeeminfo` to learn about redemption options\n\n**🏆 Leaderboard:**\n• Top 10 members by points are displayed\n• Updated in real-time as points are awarded\n• Compete with other members!\n\n**⚠️ Important Notes:**\n• Points reset to 0 if you lose your membership role\n• Only original, unique success images count\n• Points are non-transferable",
+    "footer": "Use slash commands for member features"
+  },
+  "help_admin": {
+    "title": "Admin Commands - Success Points Bot",
+    "description": "**Admin Commands (use `!` prefix):**\n\n• `!checkpoints <member>` - Check points for a specific user\n• `!addpoints <member> <amount>` - Add points to a member\n• `!removepoints <member> <amount>` - Remove points from a member\n• `!setpoints <member> <amount>` - Set exact points for a member\n• `!status` - Show bot status and statistics\n• `!reload` - Reload config and messages from files\n• `!configinfo` - Display current configuration\n\n**Required Permission:** `manage_messages`",
+    "footer": "Admin commands require manage_messages permission"
+  },
+  "redeem_info": {
+    "title": "Redeeming Your Success Points",
+    "description": "**How to Redeem Points:**\n\nCurrently, success points are used for:\n• 🏆 **Leaderboard Rankings** - Compete for the top spots!\n• 📊 **Tracking Your Success** - See your progress over time\n• 🎯 **Community Recognition** - Show off your achievements\n\n**Future Redemption Options:**\n• More redemption options may be added in the future\n• Check back regularly for updates\n• Contact staff with suggestions!\n\n**Current Points:** {current_points}\n\nKeep sharing your successes to earn more points!",
+    "footer": "Points system powered by Success Bot"
+  },
+  "points_display": {
+    "title": "Your Success Points",
+    "description": "**Current Points:** {points}\n\n{message}",
+    "footer": "Keep sharing successes to earn more points!"
+  },
+  "leaderboard": {
+    "title": "Success Points Leaderboard",
+    "description": "{leaderboard_text}",
+    "footer": "Top 10 members by success points",
+    "empty": "📉 No points have been awarded yet.\n\nBe the first to share a success!"
+  },
+  "admin_points_added": {
+    "title": "Points Added",
+    "description": "✅ Added **{amount}** point(s) to {member.mention}\n\n**New Total:** {new_total}",
+    "footer": "Admin action logged"
+  },
+  "admin_points_removed": {
+    "title": "Points Removed",
+    "description": "❌ Removed **{amount}** point(s) from {member.mention}\n\n**New Total:** {new_total}",
+    "footer": "Admin action logged"
+  },
+  "admin_points_set": {
+    "title": "Points Set",
+    "description": "⚙️ Set points for {member.mention} to **{amount}**\n\n**Previous Total:** {old_total}\n**New Total:** {amount}",
+    "footer": "Admin action logged"
+  },
+  "admin_user_points": {
+    "title": "User Points Check",
+    "description": "**Member:** {member.mention}\n**User ID:** `{user_id}`\n\n**Current Points:** {points}",
+    "footer": "Points information from JSON storage"
+  },
+  "no_permission": {
+    "title": "Permission Denied",
+    "description": "🚫 You don't have permission to use this command.\n\nAdmin commands require `manage_messages` permission.",
+    "footer": "Contact server staff if you need help"
+  },
+  "member_not_found": {
+    "title": "Member Not Found",
+    "description": "❌ Could not find the specified member.\n\nPlease mention a valid server member.",
+    "footer": "Member must be in the server"
+  },
+  "invalid_amount": {
+    "title": "Invalid Amount",
+    "description": "❌ Please provide a valid number for the amount.\n\nAmount must be a positive integer.",
+    "footer": "Example: !addpoints @member 5"
+  },
+  "status": {
+    "title": "Success Bot Status",
+    "description": "**Bot Information:**\n• Status: ✅ Online\n• Storage: {json_status}\n• Points Awarded: {total_points}\n• Unique Users: {unique_users}\n• Images Processed: {images_processed}\n\n**Statistics:**\n• Points Given Today: {points_today}\n• Errors: {errors}\n• Uptime: {uptime}",
+    "footer": "Success Points Bot v2.0"
+  },
+  "redemption_ticket_intro": {
+    "title": "Points Redemption Request",
+    "description": "**Current Points:** {current_points}\n\n**Available Redemption Tiers:**\n\n{redeem_tiers_text}\n\nPlease select a tier from the buttons below to create a redemption request. A support ticket will be created and staff will assist you shortly.",
+    "footer": "Select a tier to redeem your points"
+  },
+  "redemption_ticket_created": {
+    "title": "Redemption Ticket Created",
+    "description": "✅ Your redemption ticket has been created!\n\n**Selected Tier:** {tier_name}\n**Points Required:** {points_required}\n**Your Points:** {current_points}\n\nA support ticket has been created and staff will assist you shortly.",
+    "footer": "Check your ticket channel"
+  },
+  "redemption_insufficient_points": {
+    "title": "Insufficient Points",
+    "description": "❌ You don't have enough points to redeem this tier.\n\n**Selected Tier:** {tier_name}\n**Points Required:** {points_required}\n**Your Current Points:** {current_points}\n**Points Needed:** {points_needed}",
+    "footer": "Keep earning points to unlock this tier"
+  },
+  "redemption_ticket_channel_message": {
+    "title": "Points Redemption Request",
+    "description": "**Member:** {member.mention}\n**Selected Tier:** {tier_name}\n**Points Required:** {points_required}\n**Member's Current Points:** {current_points}\n\nPlease review this redemption request and process accordingly.",
+    "footer": "Success Points Redemption System"
+  },
+  "no_attachment_reminder": {
+    "title": "📸 Image Required",
+    "description": "Hi {member}!\n\nTo earn success points, please **attach an image** to your message in the success channel.\n\nYour message without an image has been removed from the channel.",
+    "footer": "Only messages with image attachments earn points"
+  }
+}
+

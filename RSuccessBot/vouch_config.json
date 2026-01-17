@@ -1,0 +1,30 @@
+{
+  "vouch_channel_id": 1362122992976531566,
+  "guild_id": 876528050081251379,
+  "staff_role_id": 876598078092754985,
+  "cooldown_seconds": 15,
+  "embed_colors": {
+    "five_stars": {
+      "r": 46,
+      "g": 204,
+      "b": 113
+    },
+    "three_to_four_stars": {
+      "r": 241,
+      "g": 196,
+      "b": 15
+    },
+    "one_to_two_stars": {
+      "r": 231,
+      "g": 76,
+      "b": 60
+    },
+    "list_color": {
+      "r": 52,
+      "g": 152,
+      "b": 219
+    }
+  },
+  "footer_text": "Reselling Secrets Vouch System",
+  "max_vouches_displayed": 10
+}

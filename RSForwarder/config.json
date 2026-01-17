@@ -1,0 +1,35 @@
+{
+  "guild_id": 876528050081251379,
+  "brand_name": "Reselling Secrets",
+  "forwarding_logs_channel_id": "1446374766180307015",
+  "channels": [
+    {
+      "source_channel_id": "1446174806981480578",
+      "source_channel_name": "personal-deals",
+      "destination_webhook_url": "",
+      "role_mention": {
+        "role_id": "886824827745337374",
+        "text": ""
+      }
+    },
+    {
+      "source_channel_id": "1446174861931188387",
+      "source_channel_name": "online-important",
+      "destination_webhook_url": "",
+      "role_mention": {
+        "role_id": "1139627400901169212",
+        "text": ""
+      }
+    },
+    {
+      "source_channel_id": "1446186240272633936",
+      "source_channel_name": "minor-deals",
+      "destination_webhook_url": "",
+      "role_mention": {
+        "role_id": "886824827745337374",
+        "text": ""
+      }
+    }
+  ],
+  "rs_server_icon_url": "https://cdn.discordapp.com/icons/876528050081251379/a_a9a346601bbd93532d931e5280616797.gif?size=256"
+}

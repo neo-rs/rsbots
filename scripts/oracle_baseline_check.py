@@ -202,20 +202,31 @@ def main() -> int:
         _, rel = item
         return rel.endswith("messages.json")
 
+    def _is_vouch_config_json(item: tuple[str, str]) -> bool:
+        _, rel = item
+        return rel.endswith("vouch_config.json")
+
     def _is_service(item: tuple[str, str]) -> bool:
         _, rel = item
         return rel.endswith(".service")
 
     def _is_other_json(item: tuple[str, str]) -> bool:
         _, rel = item
-        return rel.endswith(".json") and (not rel.endswith("config.secrets.json")) and (not _is_config_json(item)) and (not _is_messages_json(item))
+        return (
+            rel.endswith(".json")
+            and (not rel.endswith("config.secrets.json"))
+            and (not _is_config_json(item))
+            and (not _is_messages_json(item))
+            and (not _is_vouch_config_json(item))
+        )
 
     config_json_drift = sorted([x for x in non_py_items if _is_config_json(x)])
     messages_json_drift = sorted([x for x in non_py_items if _is_messages_json(x)])
+    vouch_config_drift = sorted([x for x in non_py_items if _is_vouch_config_json(x)])
     service_drift = sorted([x for x in (non_py_items + root_items) if _is_service(x)])
     other_json_drift = sorted([x for x in non_py_items if _is_other_json(x)])
 
-    critical_drift = sorted(set(config_json_drift + messages_json_drift + service_drift))
+    critical_drift = sorted(set(config_json_drift + messages_json_drift + vouch_config_drift + service_drift))
 
     print("Oracle baseline check")
     print(f"snapshot:       {snapshot_dir}")
@@ -230,6 +241,7 @@ def main() -> int:
     print("Non-.py drift (high-signal)")
     print(f"config.json drift:   {len(config_json_drift)}")
     print(f"messages.json drift: {len(messages_json_drift)}")
+    print(f"vouch_config drift:  {len(vouch_config_drift)}")
     print(f"*.service drift:     {len(service_drift)}")
     print(f"other .json drift:   {len(other_json_drift)}")
     print(f"CRITICAL drift total:{len(critical_drift)}")

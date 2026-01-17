@@ -1,0 +1,102 @@
+{
+  "guild_id": 876528050081251379,
+  "guild_ids": [876528050081251379, 1451275225512546497],
+  "admin_role_ids": [],
+  "admin_user_ids": [],
+  "log_channel_id": "1452590450631376906",
+  "ssh_commands_channel_id": "1452892665514430545",
+  "whop_logs_channel_id": 1076440941814091787,
+  "rs_server_guild_id": 876528050081251379,
+  "test_server_guild_id": 1451275225512546497,
+  "whop_scan_interval_hours": 24,
+  "bot_movement_tracking_enabled": true,
+  "update_test": {
+    "folder": "UpdateTest",
+    "include_globs": ["*"]
+  },
+  "update_progress": {
+    "enabled": true,
+    "guild_id": 1451275225512546497,
+    "channel_id": "1454196909496340540"
+  },
+  "botupdate_restart": {
+    "enabled": true,
+    "max_wait_seconds": 15,
+    "failure_log_lines": 30,
+    "poll_interval_seconds": 1
+  },
+  "backup_retention": {
+    "keep_per_folder": 10
+  },
+  "service_monitor": {
+    "enabled": true,
+    "interval_seconds": 30,
+    "post_on_startup": true,
+    "post_heartbeat": false,
+    "post_on_change": true,
+    "post_on_failure": true,
+    "failure_log_lines": 25,
+    "min_seconds_between_posts": 120,
+    "heartbeat_seconds": 0
+  },
+  "monitor_channels": {
+    "enabled": true,
+    "test_server_guild_id": 1451275225512546497,
+    "category_name": "RS Bots Terminal Logs",
+    "channel_prefix": "bot-",
+    "rs_error_channel_id": 1452590450631376906,
+    "ping_on_failure_user_ids": [971528709876113478],
+    "post_pid_change": false,
+    "failure_logs_lines": 80
+  },
+  "local_exec": {
+    "enabled": true
+  },
+  "oraclefiles_sync": {
+    "enabled": true,
+    "periodic_enabled": false,
+    "interval_seconds": 14400,
+    "repo_dir": "/home/rsadmin/bots/oraclefiles",
+    "repo_url": "git@github.com:neo-rs/oraclefiles.git",
+    "branch": "main",
+    "include_folders": ["RSAdminBot", "RSForwarder", "RSCheckerbot", "RSMentionPinger", "RSOnboarding", "RSuccessBot"]
+  },
+  "bot_groups": {
+    "rsadminbot": ["rsadminbot"],
+    "rs_bots": ["rsforwarder", "rsonboarding", "rsmentionpinger", "rscheckerbot", "rssuccessbot"],
+    "mirror_bots": ["datamanagerbot", "pingbot", "discumbot"]
+  },
+  "ssh_server_name": "instance-enhance (rsadmin)",
+  "logging": {
+    "log_channel_id": "1452590450631376906",
+    "file_logging": {
+      "enabled": true,
+      "base_path": "/home/rsadmin/bots/logs/rsadminbot",
+      "retention_days": 30,
+      "max_file_size_mb": 100
+    },
+    "log_ssh_commands": true,
+    "log_config_validation": true,
+    "log_all_commands": true
+  },
+  "systemd_events": {
+    "enabled": false,
+    "test_server_channel_id": "1454833649722589231",
+    "rs_server_enabled": false,
+    "rs_server_channel_id": ""
+  },
+  "journal_live": {
+    "enabled": true,
+    "category_id": "1454835902839918592",
+    "channel_prefix": "journal-",
+    "startup_backfill_lines": 20,
+    "flush_seconds": 1,
+    "max_chars": 1800
+  },
+  "commands_catalog": {
+    "enabled": true,
+    "post_on_startup": true,
+    "channel_id": "1454869965000671406"
+  }
+}
+

@@ -1,0 +1,52 @@
+{
+  "guild_id": 876528050081251379,
+  "success_channel_ids": [
+    876628405645369344,
+    1359314655797055691,
+    1310391026606669844,
+    1359314770804867163,
+    1366833116123234354,
+    1452226578053464177
+  ],
+  "reaction_emoji": "🤑",
+  "role_id_to_watch": 876569612085518376,
+  "log_channel_id": 1452258047362859178,
+  "points_log_channel_id": 1452258047362859178,
+  "redemption_category_id": 883808208207110154,
+  "support_role_id": 876588092927115284,
+  "embed_color": {
+    "r": 169,
+    "g": 199,
+    "b": 220
+  },
+  "footer_text": "Reselling Secrets Staff",
+  "admin_required_permission": "manage_messages",
+  "redemption_info_image_url": "https://i.imgur.com/XEedHeb.gif",
+  "guide_emojis": {
+    "rocket": "<a:rslrocket:1247632438252011550>",
+    "eye": "<:rseye:1352700150023458908>",
+    "trophy": "<:rstrophy:1352700148022513841>",
+    "gun": "<:rslgun1:1247997545947336754>",
+    "love": "<a:rsllove:1247632675766931558>",
+    "flag": "<:rslflag:1247632804938907648>",
+    "moneyrain": "<a:rsmoneyrain:910339595797925898>"
+  },
+  "redemption_tiers": [
+    {
+      "name": "Tier 1",
+      "points_required": 10,
+      "description": "Basic reward description"
+    },
+    {
+      "name": "Tier 2",
+      "points_required": 25,
+      "description": "Better reward description"
+    },
+    {
+      "name": "Tier 3",
+      "points_required": 50,
+      "description": "Premium reward description"
+    }
+  ]
+}
+

@@ -1,0 +1,48 @@
+{
+  "steps": [
+    {
+      "title": "Welcome to Reselling Secrets Membership",
+      "description": "{progress}\n\nHey {member.mention},\n\nThis is a quick walkthrough to make sure you are ready to take advantage of Reselling Secrets membership.\n\nClick **Continue** after completing each step to move on.\n\n_(You will not have full access to the server until completing these steps)_",
+      "image_url": null
+    },
+    {
+      "title": "Step 1: View All Channels",
+      "description": "{progress}\n\nFirst, let's make sure you are able to view all of our channels.\n\nTo enable this, select Reselling Secrets at the top of the server, and make sure **\"Show All Channels\"** is toggled on.\n\n_(Refer to video below for more direction)_",
+      "image_url": "https://i.imgur.com/wLXMuQk.gif"
+    },
+    {
+      "title": "Step 2: Notification Settings",
+      "description": "{progress}\n\nNext, let's make sure your notifications are set up!\n\nSelect Reselling Secrets > Notification Settings > Toggle `Only @mentions`.\n\nThis prevents notification spam while keeping you informed.\n\n_(Refer to video below for more direction)_",
+      "image_url": "https://i.imgur.com/zxMZA99.gif"
+    },
+    {
+      "title": "Step 3: Getting Support",
+      "description": "{progress}\n\nHaving proper support is crucial for your reselling success.\n\n• For general questions, use <#876673398053421156>\n• For staff help, head to <#1034961011305873479>\n\nAfter this, click **Get Full Access** to unlock the entire server.\n\n*Feeling overwhelmed? That's normal. You've got this.* 🚀",
+      "image_url": null
+    },
+    {
+      "title": "Welcome In",
+      "description": "{progress}\n\nCongrats on making it this far!\n\nYour next steps are to go to <#1345504052137562162> and check out:\n1. 🔹 <#1345504052137562162> (server-guide)\n2. 🔹 <#1345505161409335389> (roles)\n3. 🔹 <#1345505344553619536> (0-1k-profit)\n\nThen introduce yourself in <#876673398053421156> and let's start reselling! 🚀",
+      "image_url": null
+    }
+  ],
+  "dms": {
+    "member_granted": {
+      "description": "Hey {member.mention} you made it in🚀\n\nDon't forget to book your free planning call with us if you need help getting started in the server\n\nWe can also show you how to get started making your money back right away👇\n\n[Book your call here](<https://calendly.com/reselling-secrets/30min>)",
+      "footer_text": "Reselling Secrets Staff"
+    },
+    "ticket_open": {
+      "title": "📩 Message Sent from Staff",
+      "description": "<@{staff_user_id}>\n*Founder of Reselling Secrets*\n\nHey {member.mention}, welcome to **Reselling Secrets membership**! 🎉\n\nWe've opened a private onboarding ticket just for you:\n🔗 {ticket.jump_url}\n\nMake sure to complete all onboarding steps to unlock full server access.\n\nWe're excited you're here. Let's build. 🥂",
+      "footer_text": "Reselling Secrets Staff"
+    }
+  },
+  "auto_close_message": "⏰ 24 hours passed. Access granted automatically.",
+  "button_labels": {
+    "get_full_access": "Get Full Access",
+    "close_ticket": "Close Ticket",
+    "next": "Next",
+    "previous": "Previous"
+  }
+}
+

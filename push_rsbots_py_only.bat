@@ -18,11 +18,11 @@ REM Make sure we're on main (best effort; do not fail if already correct)
 git branch -M main >nul 2>&1
 
 echo.
-echo === RS BOTS PY-ONLY PUSH ===
+echo === RS BOTS PUSH (tracked files) ===
 echo Repo: %cd%
 echo.
 
-REM Stage all changes (only whitelisted python files should be tracked)
+REM Stage all changes (only allow-listed files should be tracked)
 git add -A
 if errorlevel 1 (
   echo ERROR: git add failed.
@@ -32,7 +32,7 @@ if errorlevel 1 (
 REM If nothing is staged, exit cleanly
 git diff --cached --quiet
 if not errorlevel 1 (
-  echo No python changes staged. Nothing to push.
+  echo No tracked changes staged. Nothing to push.
   exit /b 0
 )
 
