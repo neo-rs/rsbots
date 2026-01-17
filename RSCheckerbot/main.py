@@ -120,6 +120,24 @@ try:
 except Exception:
     LIFETIME_ROLE_IDS = set()
 ROLES_TO_CHECK = set(DM_CONFIG.get("roles_to_check", []))
+
+# For history/access tracking, only keep numeric role IDs.
+ACCESS_ROLE_IDS: set[int] = set()
+try:
+    for _rid in (ROLES_TO_CHECK or []):
+        if str(_rid).strip().isdigit():
+            ACCESS_ROLE_IDS.add(int(str(_rid).strip()))
+except Exception:
+    ACCESS_ROLE_IDS = set()
+
+# History event filtering: only track changes for these role IDs (keeps member_history.json high-signal).
+HISTORY_RELEVANT_ROLE_IDS: set[int] = set(ACCESS_ROLE_IDS)
+try:
+    for _rid in (ROLE_CANCEL_A, ROLE_CANCEL_B, WELCOME_ROLE_ID, ROLE_TRIGGER, FORMER_MEMBER_ROLE):
+        if str(_rid).strip().isdigit():
+            HISTORY_RELEVANT_ROLE_IDS.add(int(str(_rid).strip()))
+except Exception:
+    pass
 SEND_SPACING_SECONDS = DM_CONFIG.get("send_spacing_seconds", 30.0)
 DAY_GAP_HOURS = DM_CONFIG.get("day_gap_hours", 24)
 DAY7B_DELAY_MIN = DM_CONFIG.get("day7b_delay_min", 30)
@@ -143,6 +161,14 @@ try:
 except Exception:
     CID_TTL_MINUTES = 10.0
 VERBOSE_ROLE_LISTS = bool(LOG_CONTROLS.get("verbose_role_lists", False))
+
+# Member history controls (bounded storage; human-auditable)
+MEMBER_HISTORY_CONFIG = config.get("member_history", {}) if isinstance(config, dict) else {}
+try:
+    MEMBER_HISTORY_MAX_EVENTS_PER_USER = int(MEMBER_HISTORY_CONFIG.get("max_events_per_user", 50))
+except Exception:
+    MEMBER_HISTORY_MAX_EVENTS_PER_USER = 50
+MEMBER_HISTORY_MAX_EVENTS_PER_USER = max(0, MEMBER_HISTORY_MAX_EVENTS_PER_USER)
 
 # Files
 QUEUE_FILE = BASE_DIR / "queue.json"
@@ -425,42 +451,256 @@ def _save_member_history(db: dict) -> None:
 
 STAFF_ALERTS_FILE = BASE_DIR / "staff_alerts.json"
 
-def _touch_join(discord_id: int) -> dict:
-    """Record member join event, return history record"""
-    now = int(datetime.now(timezone.utc).timestamp())
+def _history_now_ts() -> int:
+    return int(datetime.now(timezone.utc).timestamp())
+
+def _history_access_role_ids(member: discord.Member | None) -> list[int]:
+    """Access role IDs present on a member (based on dm_sequence.roles_to_check)."""
+    if not isinstance(member, discord.Member):
+        return []
+    try:
+        role_ids = {int(r.id) for r in (member.roles or [])}
+        return sorted(role_ids.intersection(ACCESS_ROLE_IDS))
+    except Exception:
+        return []
+
+def _history_role_snapshot(member: discord.Member | None) -> tuple[list[int], list[str]]:
+    """Best-effort role snapshot (excluding @everyone)."""
+    if not isinstance(member, discord.Member):
+        return ([], [])
+    ids: list[int] = []
+    names: list[str] = []
+    try:
+        for r in (member.roles or []):
+            try:
+                if getattr(r, "is_default", None) and r.is_default():
+                    continue
+            except Exception:
+                # Fallback: @everyone is typically guild id
+                if member.guild and int(r.id) == int(member.guild.id):
+                    continue
+            ids.append(int(r.id))
+            names.append(str(r.name))
+    except Exception:
+        return ([], [])
+    return (ids, names)
+
+def _history_identity_snapshot(member: discord.Member | None) -> dict:
+    if not isinstance(member, discord.Member):
+        return {}
+    try:
+        return {
+            "last_known_username": str(getattr(member, "name", "") or "").strip(),
+            "last_known_display_name": str(getattr(member, "display_name", "") or "").strip(),
+            "last_known_discriminator": str(getattr(member, "discriminator", "") or "").strip(),
+        }
+    except Exception:
+        return {}
+
+def _ensure_member_history_shape(rec: dict, *, now: int) -> dict:
+    """Normalize a per-user history record in-place (non-destructive)."""
+    if not isinstance(rec, dict):
+        rec = {}
+
+    # Legacy fields (keep for backwards compatibility)
+    if "first_join_ts" not in rec:
+        rec["first_join_ts"] = None
+    if "last_join_ts" not in rec:
+        rec["last_join_ts"] = None
+    if "last_leave_ts" not in rec:
+        rec["last_leave_ts"] = None
+    try:
+        rec["join_count"] = int(rec.get("join_count", 0) or 0)
+    except Exception:
+        rec["join_count"] = 0
+
+    # New structured fields
+    if not isinstance(rec.get("identity"), dict):
+        rec["identity"] = {}
+    if not isinstance(rec.get("discord"), dict):
+        rec["discord"] = {}
+    if not isinstance(rec.get("access"), dict):
+        rec["access"] = {}
+    if not isinstance(rec.get("events"), list):
+        rec["events"] = []
+
+    # Defaults for access tracking
+    acc = rec["access"]
+    if "ever_had_access_role" not in acc:
+        acc["ever_had_access_role"] = False
+    if "first_access_ts" not in acc:
+        acc["first_access_ts"] = None
+    if "last_access_ts" not in acc:
+        acc["last_access_ts"] = None
+    if "ever_had_member_role" not in acc:
+        acc["ever_had_member_role"] = False
+    if "first_member_role_ts" not in acc:
+        acc["first_member_role_ts"] = None
+    if "last_member_role_ts" not in acc:
+        acc["last_member_role_ts"] = None
+
+    # Keep a compact last snapshot
+    disc = rec["discord"]
+    if "last_snapshot_ts" not in disc:
+        disc["last_snapshot_ts"] = None
+    if "last_roles" not in disc:
+        disc["last_roles"] = []
+    if "last_role_names" not in disc:
+        disc["last_role_names"] = []
+
+    return rec
+
+def _history_update_identity_and_snapshot(rec: dict, *, member: discord.Member | None, now: int) -> None:
+    if not isinstance(rec, dict):
+        return
+    rec = _ensure_member_history_shape(rec, now=now)
+    ident = rec.get("identity") if isinstance(rec.get("identity"), dict) else {}
+    snap = _history_identity_snapshot(member)
+    if snap:
+        ident.update({k: v for k, v in snap.items() if v})
+        ident["updated_at"] = datetime.now(timezone.utc).isoformat()
+        rec["identity"] = ident
+
+    if isinstance(member, discord.Member):
+        role_ids, role_names = _history_role_snapshot(member)
+        disc = rec.get("discord") if isinstance(rec.get("discord"), dict) else {}
+        disc["last_snapshot_ts"] = now
+        disc["last_roles"] = role_ids
+        disc["last_role_names"] = role_names
+        rec["discord"] = disc
+
+        # Update access timelines (roles_to_check) and member role timelines (ROLE_CANCEL_A)
+        access_ids = _history_access_role_ids(member)
+        acc = rec.get("access") if isinstance(rec.get("access"), dict) else {}
+        if access_ids:
+            acc["ever_had_access_role"] = True
+            if not acc.get("first_access_ts"):
+                acc["first_access_ts"] = now
+            acc["last_access_ts"] = now
+        try:
+            has_member_role = bool(ROLE_CANCEL_A and int(ROLE_CANCEL_A) in {r.id for r in (member.roles or [])})
+        except Exception:
+            has_member_role = False
+        if has_member_role:
+            acc["ever_had_member_role"] = True
+            if not acc.get("first_member_role_ts"):
+                acc["first_member_role_ts"] = now
+            acc["last_member_role_ts"] = now
+        rec["access"] = acc
+
+def _history_append_event(
+    rec: dict,
+    *,
+    kind: str,
+    now: int,
+    roles_added: list[int] | None = None,
+    roles_removed: list[int] | None = None,
+    note: str = "",
+    max_events: int | None = None,
+    access_role_ids: list[int] | None = None,
+) -> None:
+    if not isinstance(rec, dict):
+        return
+    rec = _ensure_member_history_shape(rec, now=now)
+    events = rec.get("events")
+    if not isinstance(events, list):
+        events = []
+
+    ev = {
+        "ts": int(now),
+        "kind": str(kind or "").strip().lower() or "event",
+        "roles_added": sorted({int(x) for x in (roles_added or []) if str(x).strip().isdigit()}),
+        "roles_removed": sorted({int(x) for x in (roles_removed or []) if str(x).strip().isdigit()}),
+        "access_roles": sorted({int(x) for x in (access_role_ids or []) if str(x).strip().isdigit()}),
+        "note": str(note or "").strip(),
+    }
+
+    # Deduplicate immediate duplicates (role updates can fire rapidly)
+    try:
+        if events:
+            last = events[-1] if isinstance(events[-1], dict) else {}
+            if (
+                isinstance(last, dict)
+                and last.get("kind") == ev["kind"]
+                and last.get("roles_added") == ev["roles_added"]
+                and last.get("roles_removed") == ev["roles_removed"]
+                and abs(int(ev["ts"]) - int(last.get("ts") or 0)) <= 2
+            ):
+                rec["events"] = events
+                return
+    except Exception:
+        pass
+
+    events.append(ev)
+    cap = MEMBER_HISTORY_MAX_EVENTS_PER_USER if max_events is None else int(max_events)
+    cap = max(0, cap)
+    if cap and len(events) > cap:
+        events = events[-cap:]
+    rec["events"] = events
+
+def _touch_join(discord_id: int, member: discord.Member | None = None) -> dict:
+    """Record member join event, return history record (in-place; bounded)."""
+    now = _history_now_ts()
     db = _load_member_history()
     key = str(discord_id)
-    rec = db.get(key, {
-        "first_join_ts": now,
-        "last_join_ts": now,
-        "last_leave_ts": None,
-        "join_count": 0
-    })
+    rec = db.get(key, {})
+    rec = _ensure_member_history_shape(rec, now=now)
+
     rec["last_join_ts"] = now
-    rec["join_count"] = int(rec.get("join_count", 0)) + 1
-    # Only set first_join_ts if this is truly the first join
-    if "first_join_ts" not in rec or rec["first_join_ts"] is None:
+    rec["join_count"] = int(rec.get("join_count", 0) or 0) + 1
+    if rec.get("first_join_ts") is None:
         rec["first_join_ts"] = now
+
+    _history_update_identity_and_snapshot(rec, member=member, now=now)
+    _history_append_event(rec, kind="join", now=now, access_role_ids=_history_access_role_ids(member))
+
     db[key] = rec
     _save_member_history(db)
     return rec
 
-def _touch_leave(discord_id: int) -> dict:
-    """Record member leave event, return history record"""
-    now = int(datetime.now(timezone.utc).timestamp())
+def _touch_leave(discord_id: int, member: discord.Member | None = None) -> dict:
+    """Record member leave event, return history record (in-place; bounded)."""
+    now = _history_now_ts()
     db = _load_member_history()
     key = str(discord_id)
-    rec = db.get(key)
-    if not rec:
-        # User left but we never tracked a join (edge case)
-        rec = {
-            "first_join_ts": None,
-            "last_join_ts": None,
-            "last_leave_ts": now,
-            "join_count": 0
-        }
-    else:
-        rec["last_leave_ts"] = now
+    rec = db.get(key, {})
+    rec = _ensure_member_history_shape(rec, now=now)
+
+    # User left but we never tracked a join (edge case): keep legacy fields as None.
+    rec["last_leave_ts"] = now
+
+    _history_update_identity_and_snapshot(rec, member=member, now=now)
+    _history_append_event(rec, kind="leave", now=now, access_role_ids=_history_access_role_ids(member))
+
+    db[key] = rec
+    _save_member_history(db)
+    return rec
+
+def _touch_role_change(
+    member: discord.Member,
+    *,
+    roles_added: set[int] | None = None,
+    roles_removed: set[int] | None = None,
+    note: str = "",
+) -> dict:
+    """Record a role change event (filtered by caller); updates access timelines."""
+    now = _history_now_ts()
+    db = _load_member_history()
+    key = str(int(member.id))
+    rec = db.get(key, {})
+    rec = _ensure_member_history_shape(rec, now=now)
+
+    _history_update_identity_and_snapshot(rec, member=member, now=now)
+    _history_append_event(
+        rec,
+        kind="role_change",
+        now=now,
+        roles_added=sorted({int(x) for x in (roles_added or set())}),
+        roles_removed=sorted({int(x) for x in (roles_removed or set())}),
+        note=note,
+        access_role_ids=_history_access_role_ids(member),
+    )
+
     db[key] = rec
     _save_member_history(db)
     return rec
@@ -684,10 +924,16 @@ def _backfill_whop_timeline_from_whop_history() -> None:
             if status:
                 whop_timeline["last_status"] = status
             
-            # last_membership_id: from event if available
-            membership_id = event.get("whop_key") or event.get("membership_id")
-            if membership_id:
-                whop_timeline["last_membership_id"] = str(membership_id)
+            # Membership identifiers:
+            # - whop_history.json often contains a human-ish "whop_key" like "R-..." (NOT a Whop API membership id).
+            # - A true Company API membership id is expected to look like "mem_...".
+            whop_key = str(event.get("whop_key") or "").strip()
+            if whop_key:
+                whop_timeline["last_whop_key"] = whop_key
+
+            membership_id = str(event.get("membership_id") or "").strip()
+            if membership_id.startswith("mem_"):
+                whop_timeline["last_membership_id"] = membership_id
             
             # last_user_id: from event if available (though whop_history.json doesn't seem to have this)
             # Keeping for future compatibility
@@ -1580,6 +1826,7 @@ async def sync_whop_memberships():
 
                     # Detailed card -> member-status-logs
                     hist = get_member_history(member.id) or {}
+                    acc = hist.get("access") if isinstance(hist.get("access"), dict) else {}
                     detailed = _build_member_status_detailed_embed(
                         title="⚠️ Cancellation Scheduled",
                         member=member,
@@ -1589,6 +1836,9 @@ async def sync_whop_memberships():
                         member_kv=[
                             ("first_joined", _fmt_ts(hist.get("first_join_ts"), "D") if hist.get("first_join_ts") else "—"),
                             ("join_count", hist.get("join_count") or "—"),
+                            ("ever_had_member_role", "yes" if acc.get("ever_had_member_role") is True else "no"),
+                            ("first_access", _fmt_ts(acc.get("first_access_ts"), "D") if acc.get("first_access_ts") else "—"),
+                            ("last_access", _fmt_ts(acc.get("last_access_ts"), "D") if acc.get("last_access_ts") else "—"),
                         ],
                         discord_kv=[
                             ("reason", "cancel_at_period_end=true"),
@@ -1935,7 +2185,7 @@ async def _ensure_whop_resolution_channels(guild: discord.Guild) -> None:
 async def on_member_join(member: discord.Member):
     if member.guild.id == GUILD_ID and not member.bot:
         # Track join event FIRST (before other logic)
-        rec = _touch_join(member.id)
+        rec = _touch_join(member.id, member)
 
         # Determine join method via invite usage deltas (best-effort).
         used_invite_code = None
@@ -1998,6 +2248,7 @@ async def on_member_join(member: discord.Member):
                 # Detailed card in member-status-logs
                 mid = get_cached_whop_membership_id(member.id)
                 whop_brief = await _fetch_whop_brief_by_membership_id(mid) if mid else {}
+                acc = rec.get("access") if isinstance(rec.get("access"), dict) else {}
                 detailed = _build_member_status_detailed_embed(
                     title="👋 Member Joined",
                     member=member,
@@ -2009,6 +2260,7 @@ async def on_member_join(member: discord.Member):
                         ("first_joined", _fmt_ts(rec.get("first_join_ts"), "D")),
                         ("join_count", rec.get("join_count", 1)),
                         ("returning_member", "true" if rec.get("join_count", 0) > 1 else "false"),
+                        ("ever_had_member_role", "yes" if acc.get("ever_had_member_role") is True else "no"),
                     ],
                     discord_kv=[
                         ("invite_code", used_invite_code or "—"),
@@ -2061,7 +2313,7 @@ async def on_member_join(member: discord.Member):
 async def on_member_remove(member: discord.Member):
     """Track member leave events and log to member-status-logs"""
     if member.guild.id == GUILD_ID and not member.bot:
-        rec = _touch_leave(member.id)
+        rec = _touch_leave(member.id, member)
         
         # Log to member-status-logs channel
         if MEMBER_STATUS_LOGS_CHANNEL_ID:
@@ -2071,6 +2323,7 @@ async def on_member_remove(member: discord.Member):
 
                 mid = get_cached_whop_membership_id(member.id)
                 whop_brief = await _fetch_whop_brief_by_membership_id(mid) if mid else {}
+                acc = rec.get("access") if isinstance(rec.get("access"), dict) else {}
                 detailed = _build_member_status_detailed_embed(
                     title="🚪 Member Left",
                     member=member,
@@ -2081,6 +2334,9 @@ async def on_member_remove(member: discord.Member):
                         ("left_at", _fmt_ts(rec.get("last_leave_ts"), "D") if rec.get("last_leave_ts") else "—"),
                         ("first_joined", _fmt_ts(rec.get("first_join_ts"), "D") if rec.get("first_join_ts") else "—"),
                         ("join_count", rec.get("join_count") or "—"),
+                        ("ever_had_member_role", "yes" if acc.get("ever_had_member_role") is True else "no"),
+                        ("first_access", _fmt_ts(acc.get("first_access_ts"), "D") if acc.get("first_access_ts") else "—"),
+                        ("last_access", _fmt_ts(acc.get("last_access_ts"), "D") if acc.get("last_access_ts") else "—"),
                     ],
                     discord_kv=[
                         ("access_roles_at_leave", access),
@@ -2097,6 +2353,15 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     # Detect all role changes (added and removed)
     roles_added = after_roles - before_roles
     roles_removed = before_roles - after_roles
+
+    # Persist a bounded, high-signal role-change timeline for staff triage.
+    try:
+        relevant_added = {rid for rid in roles_added if int(rid) in HISTORY_RELEVANT_ROLE_IDS}
+        relevant_removed = {rid for rid in roles_removed if int(rid) in HISTORY_RELEVANT_ROLE_IDS}
+        if relevant_added or relevant_removed:
+            _touch_role_change(after, roles_added=relevant_added, roles_removed=relevant_removed, note="member_update")
+    except Exception:
+        pass
     
     # Log general role changes if any occurred (but skip if we'll log them specifically below)
     if roles_added or roles_removed:
@@ -2242,6 +2507,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
                 # Detailed card -> member-status-logs
                 hist = get_member_history(after.id) or {}
+                acc = hist.get("access") if isinstance(hist.get("access"), dict) else {}
                 detailed = _build_member_status_detailed_embed(
                     title=title,
                     member=after,
@@ -2252,6 +2518,9 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                         ("account_created", after.created_at.strftime("%b %d, %Y")),
                         ("first_joined", _fmt_ts(hist.get("first_join_ts"), "D") if hist.get("first_join_ts") else "—"),
                         ("join_count", hist.get("join_count") or "—"),
+                        ("ever_had_member_role", "yes" if acc.get("ever_had_member_role") is True else "no"),
+                        ("first_access", _fmt_ts(acc.get("first_access_ts"), "D") if acc.get("first_access_ts") else "—"),
+                        ("last_access", _fmt_ts(acc.get("last_access_ts"), "D") if acc.get("last_access_ts") else "—"),
                     ],
                     discord_kv=[
                         ("roles_removed", removed_names),
@@ -2320,6 +2589,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                 whop_mid = get_cached_whop_membership_id(after.id)
                 whop_brief = await _fetch_whop_brief_by_membership_id(whop_mid) if whop_mid else {}
                 hist = get_member_history(after.id) or {}
+                acc = hist.get("access") if isinstance(hist.get("access"), dict) else {}
 
                 # Detailed card -> member-status-logs
                 detailed = _build_member_status_detailed_embed(
@@ -2331,6 +2601,9 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                     member_kv=[
                         ("first_joined", _fmt_ts(hist.get("first_join_ts"), "D") if hist.get("first_join_ts") else "—"),
                         ("join_count", hist.get("join_count") or "—"),
+                        ("ever_had_member_role", "yes" if acc.get("ever_had_member_role") is True else "no"),
+                        ("first_access", _fmt_ts(acc.get("first_access_ts"), "D") if acc.get("first_access_ts") else "—"),
+                        ("last_access", _fmt_ts(acc.get("last_access_ts"), "D") if acc.get("last_access_ts") else "—"),
                     ],
                     discord_kv=[
                         ("roles_added", added_names),

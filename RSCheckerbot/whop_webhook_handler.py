@@ -132,13 +132,18 @@ def _get_cached_membership_id_for_discord(discord_id: int | str) -> str:
     if not did:
         return ""
 
+    def _looks_like_membership_id(mid: str) -> bool:
+        # Whop membership IDs from the API are expected to look like "mem_..."
+        s = str(mid or "").strip()
+        return bool(s) and s.startswith("mem_")
+
     # 1) Primary: whop_discord_link.json mapping
     db = _load_discord_link_db()
     by = db.get("by_discord_id") or {}
     rec = by.get(did) if isinstance(by, dict) else None
     if isinstance(rec, dict):
         mid = str(rec.get("membership_id") or "").strip()
-        if mid:
+        if _looks_like_membership_id(mid):
             return mid
 
     # 2) Fallback: member_history.json backfill (whop.last_membership_id)
@@ -148,7 +153,7 @@ def _get_cached_membership_id_for_discord(discord_id: int | str) -> str:
             wh = hist.get("whop") if isinstance(hist, dict) else None
             if isinstance(wh, dict):
                 mid = str(wh.get("last_membership_id") or "").strip()
-                if mid:
+                if _looks_like_membership_id(mid):
                     return mid
     except Exception:
         pass

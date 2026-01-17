@@ -55,6 +55,13 @@ _LABEL_OVERRIDES: dict[str, str] = {
     "access_roles": "Current Roles",
     "account_created": "Discord Account Created",
     "roles_removed": "Roles Removed",
+    # Member history (Discord-side)
+    "ever_had_access_role": "Ever Had Access Role",
+    "first_access": "First Access",
+    "last_access": "Last Access",
+    "ever_had_member_role": "Ever Had Member Role",
+    "first_member_role": "First Member Role",
+    "last_member_role": "Last Member Role",
 }
 
 

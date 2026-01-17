@@ -271,12 +271,21 @@ async def fetch_whop_brief(
     # Total spent (lifetime, best-effort from member record).
     # Fallback: sum succeeded payments for this membership (labeled clearly).
     try:
+        # Whop membership payloads vary:
+        # - membership["member"] may be a dict with {"id": "mber_..."}
+        # - or it may be the string "mber_..."
+        # Prefer the member id whenever present so we can call /members/{mber_...}.
         whop_member_id = ""
-        if isinstance(membership.get("member"), dict):
-            whop_member_id = str(membership["member"].get("id") or "").strip()
+        m = membership.get("member")
+        if isinstance(m, dict):
+            whop_member_id = str(m.get("id") or m.get("member_id") or "").strip()
+        elif isinstance(m, str):
+            whop_member_id = m.strip()
+        if not whop_member_id:
+            whop_member_id = str(membership.get("member_id") or "").strip()
         brief["whop_member_id"] = whop_member_id
         member_rec = None
-        if whop_member_id:
+        if whop_member_id and whop_member_id.startswith("mber_"):
             rec = await client.get_member_by_id(whop_member_id)
             if isinstance(rec, dict):
                 member_rec = rec

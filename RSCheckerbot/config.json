@@ -58,6 +58,10 @@
     "cid_ttl_minutes": 10,
     "verbose_role_lists": false
   },
+
+  "member_history": {
+    "max_events_per_user": 50
+  },
   
   "utm_links": {
     "day_1": "https://dash.resellingsecrets.com/checkout/plan_42Pbxy0i6Y8jX?d2c=true&utm_source=discord&utm_campaign=dm_day_1",
