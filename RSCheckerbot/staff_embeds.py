@@ -116,6 +116,36 @@ def kv_block(
     return ("\n".join(lines)[:1024]) if lines else "—"
 
 
+def _is_blank(v: object) -> bool:
+    if v is None:
+        return True
+    s = str(v).strip()
+    return (not s) or s == "—"
+
+
+def _add_field(embed: discord.Embed, name: str, value: object, *, inline: bool = True) -> None:
+    if _is_blank(value):
+        return
+    embed.add_field(name=str(name)[:256], value=str(value).strip()[:1024], inline=inline)
+
+
+def _pairs_to_dict(pairs: list[tuple[str, object]] | None) -> dict[str, object]:
+    out: dict[str, object] = {}
+    for p in (pairs or []):
+        if not (isinstance(p, tuple) and len(p) == 2):
+            continue
+        k, v = p
+        ks = str(k or "").strip()
+        if ks:
+            out[ks] = v
+    return out
+
+
+def _human_value_for_field(key: str, value: object) -> tuple[str, object]:
+    """Return (human_label, value) for a kv key."""
+    return (_human_label(key), value)
+
+
 def brief_payment_kv(brief: dict | None) -> list[tuple[str, object]]:
     b = brief if isinstance(brief, dict) else {}
     dash = b.get("dashboard_url")
@@ -168,7 +198,10 @@ def build_case_minimal_embed(
     color: int,
     event_kind: str | None = None,
 ) -> discord.Embed:
-    """Minimal staff case embed (for payment-failure / member-cancelation)."""
+    """Minimal staff case embed (for payment-failure / member-cancelation).
+
+    Whop-style layout: compact inline fields + one long \"Payment Issue\" field when needed.
+    """
     b = whop_brief if isinstance(whop_brief, dict) else {}
     kind = str(event_kind or "").strip().lower() or _infer_event_kind(title)
     cancel_at_period_end = _truthy(b.get("cancel_at_period_end"))
@@ -179,36 +212,27 @@ def build_case_minimal_embed(
     else:
         label_overrides["renewal_start"] = "Billing Period Started"
         label_overrides["renewal_end"] = "Access Ends On" if cancel_at_period_end else "Next Billing Date"
-    embed = discord.Embed(
-        title=title,
-        color=color,
-        timestamp=datetime.now(timezone.utc),
-    )
+    embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
     apply_member_header(embed, member)
-    embed.add_field(
-        name="Member Info",
-        value=kv_block(
-            [
-                ("member", member.mention),
-                ("product", b.get("product")),
-                ("member_since", b.get("member_since")),
-                ("renewal_start", b.get("renewal_start")),
-                ("renewal_end", b.get("renewal_end")),
-                ("remaining_days", b.get("remaining_days")),
-                ("dashboard_url", b.get("dashboard_url")),
-                ("manage_url", (b.get("manage_url") if not b.get("dashboard_url") else "")),
-                ("total_spent", b.get("total_spent")),
-                ("last_payment_failure", b.get("last_payment_failure")),
-            ],
-            label_overrides=label_overrides,
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="Discord Access",
-        value=kv_block([("access_roles", access_roles)]),
-        inline=False,
-    )
+
+    # Row 1 (inline x3)
+    _add_field(embed, "Member", member.mention, inline=True)
+    _add_field(embed, "Discord ID", f"`{member.id}`", inline=True)
+    _add_field(embed, _human_label("access_roles"), access_roles, inline=True)
+
+    # Row 2 (inline x3)
+    _add_field(embed, _human_label("status", label_overrides=label_overrides), b.get("status"), inline=True)
+    _add_field(embed, _human_label("product", label_overrides=label_overrides), b.get("product"), inline=True)
+    _add_field(embed, _human_label("total_spent", label_overrides=label_overrides), b.get("total_spent"), inline=True)
+
+    # Row 3 (inline x3)
+    _add_field(embed, _human_label("remaining_days", label_overrides=label_overrides), b.get("remaining_days"), inline=True)
+    _add_field(embed, _human_label("renewal_end", label_overrides=label_overrides), b.get("renewal_end"), inline=True)
+    _add_field(embed, _human_label("dashboard_url", label_overrides=label_overrides), b.get("dashboard_url"), inline=True)
+
+    # Long text: Payment issue
+    _add_field(embed, _human_label("last_payment_failure", label_overrides=label_overrides), b.get("last_payment_failure"), inline=False)
+
     embed.set_footer(text="RSCheckerbot")
     return embed
 
@@ -224,7 +248,10 @@ def build_member_status_detailed_embed(
     whop_brief: dict | None = None,
     event_kind: str | None = None,
 ) -> discord.Embed:
-    """Detailed staff embed for member-status-logs (key:value cards)."""
+    """Detailed staff embed for member-status-logs.
+
+    Whop-style layout: compact inline fields for quick scan, plus one long notes field.
+    """
     b = whop_brief if isinstance(whop_brief, dict) else {}
     kind = str(event_kind or "").strip().lower() or _infer_event_kind(title)
     cancel_at_period_end = _truthy(b.get("cancel_at_period_end"))
@@ -235,41 +262,62 @@ def build_member_status_detailed_embed(
     else:
         label_overrides["renewal_start"] = "Billing Period Started"
         label_overrides["renewal_end"] = "Access Ends On" if cancel_at_period_end else "Next Billing Date"
-    embed = discord.Embed(
-        title=title,
-        color=color,
-        timestamp=datetime.now(timezone.utc),
-    )
+    embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
     apply_member_header(embed, member)
-    embed.add_field(
-        name="Member Info",
-        value=kv_block(
-            [
-                ("member", member.mention),
-                *([p for p in (member_kv or []) if isinstance(p, tuple) and len(p) == 2]),
-            ]
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="Discord Access",
-        value=kv_block(
-            [
-                ("access_roles", access_roles),
-                *([p for p in (discord_kv or []) if isinstance(p, tuple) and len(p) == 2]),
-            ]
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="Payment Info",
-        value=kv_block(
-            brief_payment_kv(whop_brief),
-            keep_blank_keys={"is_first_membership"},
-            label_overrides=label_overrides,
-        ),
-        inline=False,
-    )
+
+    # Header row (inline x3)
+    _add_field(embed, "Member", member.mention, inline=True)
+    _add_field(embed, "Discord ID", f"`{member.id}`", inline=True)
+    _add_field(embed, _human_label("access_roles"), access_roles, inline=True)
+
+    mk = _pairs_to_dict(member_kv)
+    dk = _pairs_to_dict(discord_kv)
+
+    # High-signal member/activity details (inline; order matters)
+    for key in (
+        "account_created",
+        "first_joined",
+        "join_count",
+        "returning_member",
+        "left_at",
+        "ever_had_member_role",
+        "first_access",
+        "last_access",
+        "roles_added",
+        "roles_removed",
+        "reason",
+        "invite_code",
+        "tracked_invite",
+        "source",
+        "access_roles_at_leave",
+        "whop_link",
+        "event",
+    ):
+        v = mk.get(key) if key in mk else dk.get(key)
+        if _is_blank(v):
+            continue
+        name, val = _human_value_for_field(key, v)
+        _add_field(embed, name, val, inline=True)
+
+    # Payment rows (inline x3)
+    _add_field(embed, _human_label("status", label_overrides=label_overrides), b.get("status"), inline=True)
+    _add_field(embed, _human_label("product", label_overrides=label_overrides), b.get("product"), inline=True)
+    _add_field(embed, _human_label("total_spent", label_overrides=label_overrides), b.get("total_spent"), inline=True)
+
+    _add_field(embed, _human_label("remaining_days", label_overrides=label_overrides), b.get("remaining_days"), inline=True)
+    _add_field(embed, _human_label("renewal_end", label_overrides=label_overrides), b.get("renewal_end"), inline=True)
+    _add_field(embed, _human_label("dashboard_url", label_overrides=label_overrides), b.get("dashboard_url"), inline=True)
+
+    _add_field(embed, _human_label("last_success_paid_at", label_overrides=label_overrides), b.get("last_success_paid_at"), inline=True)
+    _add_field(embed, _human_label("cancel_at_period_end", label_overrides=label_overrides), b.get("cancel_at_period_end"), inline=True)
+    _add_field(embed, _human_label("is_first_membership", label_overrides=label_overrides), b.get("is_first_membership"), inline=True)
+
+    _add_field(embed, _human_label("last_payment_method", label_overrides=label_overrides), b.get("last_payment_method"), inline=True)
+    _add_field(embed, _human_label("last_payment_type", label_overrides=label_overrides), b.get("last_payment_type"), inline=True)
+
+    # Long text: Payment issue
+    _add_field(embed, _human_label("last_payment_failure", label_overrides=label_overrides), b.get("last_payment_failure"), inline=False)
+
     embed.set_footer(text="RSCheckerbot • Member Status Tracking")
     return embed
 

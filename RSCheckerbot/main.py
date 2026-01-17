@@ -170,6 +170,26 @@ except Exception:
     MEMBER_HISTORY_MAX_EVENTS_PER_USER = 50
 MEMBER_HISTORY_MAX_EVENTS_PER_USER = max(0, MEMBER_HISTORY_MAX_EVENTS_PER_USER)
 
+# Whop enrichment controls (post-then-edit behavior)
+WHOP_ENRICHMENT_CONFIG = config.get("whop_enrichment", {}) if isinstance(config, dict) else {}
+try:
+    WHOP_LINK_TIMEOUT_SECONDS = int(WHOP_ENRICHMENT_CONFIG.get("link_timeout_seconds", 90))
+except Exception:
+    WHOP_LINK_TIMEOUT_SECONDS = 90
+WHOP_LINK_TIMEOUT_SECONDS = max(5, WHOP_LINK_TIMEOUT_SECONDS)
+try:
+    _retry = WHOP_ENRICHMENT_CONFIG.get("link_retry_seconds", [2, 5, 10, 20, 30, 60])
+    WHOP_LINK_RETRY_SECONDS = [int(x) for x in (_retry or []) if int(x) > 0]
+except Exception:
+    WHOP_LINK_RETRY_SECONDS = [2, 5, 10, 20, 30, 60]
+if not WHOP_LINK_RETRY_SECONDS:
+    WHOP_LINK_RETRY_SECONDS = [5, 15, 30]
+try:
+    PAYMENT_RESUMED_RECENT_HOURS = float(WHOP_ENRICHMENT_CONFIG.get("payment_resumed_recent_hours", 6))
+except Exception:
+    PAYMENT_RESUMED_RECENT_HOURS = 6.0
+PAYMENT_RESUMED_RECENT_HOURS = max(0.5, PAYMENT_RESUMED_RECENT_HOURS)
+
 # Files
 QUEUE_FILE = BASE_DIR / "queue.json"
 REGISTRY_FILE = BASE_DIR / "registry.json"
@@ -813,6 +833,104 @@ async def _fetch_whop_brief_by_membership_id(membership_id: str) -> dict:
         enable_enrichment=bool(WHOP_API_CONFIG.get("enable_enrichment", True)),
     )
 
+
+def _whop_placeholder_brief(state: str) -> dict:
+    """Return a placeholder Whop brief with consistent keys for staff embeds."""
+    st = str(state or "").strip().lower()
+    if st == "pending":
+        dash = "Linking…"
+        spent = "Linking…"
+        status = "—"
+    else:
+        dash = "Not linked yet"
+        spent = "Not linked yet"
+        status = "—"
+    return {
+        "status": status,
+        "product": "—",
+        "member_since": "—",
+        "renewal_start": "—",
+        "renewal_end": "—",
+        "remaining_days": "—",
+        "dashboard_url": dash,
+        "manage_url": "",
+        "total_spent": spent,
+        "last_success_paid_at": "—",
+        "last_payment_failure": "",
+        "cancel_at_period_end": "—",
+        "is_first_membership": "—",
+        "last_payment_method": "—",
+        "last_payment_type": "—",
+        # Internal IDs (unused in embeds)
+        "whop_user_id": "",
+        "whop_member_id": "",
+        "last_success_paid_at_iso": "",
+        "renewal_end_iso": "",
+    }
+
+
+async def _resolve_whop_brief_for_discord_id(discord_id: int) -> tuple[str, dict]:
+    """Resolve (membership_id, whop_brief) for a Discord ID (best-effort)."""
+    try:
+        mid = get_cached_whop_membership_id(discord_id)
+    except Exception:
+        mid = ""
+    mid = str(mid or "").strip()
+    if not mid:
+        return ("", {})
+    brief = await _fetch_whop_brief_by_membership_id(mid)
+    return (mid, brief if isinstance(brief, dict) else {})
+
+
+async def _edit_staff_message(msg: discord.Message, *, embed: discord.Embed) -> None:
+    """Best-effort edit (no pings)."""
+    if not msg:
+        return
+    try:
+        await msg.edit(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except TypeError:
+        # Some discord.py versions don't accept allowed_mentions on edit.
+        with suppress(Exception):
+            await msg.edit(embed=embed)
+    except Exception:
+        return
+
+
+async def _retry_whop_enrich_and_edit(
+    *,
+    discord_id: int,
+    messages: list[discord.Message],
+    make_embed,
+    make_fallback_embed,
+    timeout_seconds: int,
+    retry_seconds: list[int],
+) -> None:
+    """Retry Whop enrichment for a short window, then edit messages."""
+    start = _now()
+    # Try immediately
+    _mid, brief = await _resolve_whop_brief_for_discord_id(discord_id)
+    if isinstance(brief, dict) and brief:
+        e = make_embed(brief)
+        for m in (messages or []):
+            await _edit_staff_message(m, embed=e)
+        return
+
+    for d in (retry_seconds or []):
+        if (_now() - start).total_seconds() >= float(timeout_seconds or 0):
+            break
+        await asyncio.sleep(max(1, int(d)))
+        _mid2, brief2 = await _resolve_whop_brief_for_discord_id(discord_id)
+        if isinstance(brief2, dict) and brief2:
+            e2 = make_embed(brief2)
+            for m in (messages or []):
+                await _edit_staff_message(m, embed=e2)
+            return
+
+    # Timeout: mark as unlinked
+    ef = make_fallback_embed()
+    for m in (messages or []):
+        await _edit_staff_message(m, embed=ef)
+
 def get_member_history(discord_id: int) -> dict:
     """Get member history record (exposed for whop_webhook_handler and support cards)"""
     db = _load_member_history()
@@ -1137,7 +1255,7 @@ async def log_member_status(msg: str, embed: discord.Embed = None, *, channel_na
     if not ch:
         return
 
-    with suppress(Exception):
+    try:
         # Use provided embed or create default one
         if embed is None:
             embed = discord.Embed(
@@ -1147,7 +1265,9 @@ async def log_member_status(msg: str, embed: discord.Embed = None, *, channel_na
             )
             embed.set_footer(text="RSCheckerbot • Member Status Tracking")
         # Mentions should be clickable but MUST NOT ping users.
-        await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        return await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except Exception:
+        return None
 
 # -----------------------------
 # Registry helpers
@@ -2248,32 +2368,87 @@ async def on_member_join(member: discord.Member):
                     source_s = "one_time_invite" if is_tracked else "untracked_or_external"
                 access = _access_roles_plain(member)
 
-                # Detailed card in member-status-logs
-                mid = get_cached_whop_membership_id(member.id)
-                whop_brief = await _fetch_whop_brief_by_membership_id(mid) if mid else {}
                 acc = rec.get("access") if isinstance(rec.get("access"), dict) else {}
-                detailed = _build_member_status_detailed_embed(
-                    title="👋 Member Joined",
-                    member=member,
-                    access_roles=access,
-                    color=0x57F287,
-                    event_kind="active",
-                    member_kv=[
-                        ("account_created", member.created_at.strftime("%b %d, %Y")),
-                        ("first_joined", _fmt_ts(rec.get("first_join_ts"), "D")),
-                        ("join_count", rec.get("join_count", 1)),
-                        ("returning_member", "true" if rec.get("join_count", 0) > 1 else "false"),
-                        ("ever_had_member_role", "yes" if acc.get("ever_had_member_role") is True else "no"),
-                    ],
-                    discord_kv=[
-                        ("invite_code", used_invite_code or "—"),
-                        ("invited_by", inviter_s),
-                        ("tracked_invite", tracked_s),
-                        ("source", source_s),
-                    ],
-                    whop_brief=whop_brief,
-                )
-                await log_member_status("", embed=detailed)
+
+                base_member_kv = [
+                    ("account_created", member.created_at.strftime("%b %d, %Y")),
+                    ("first_joined", _fmt_ts(rec.get("first_join_ts"), "D")),
+                    ("join_count", rec.get("join_count", 1)),
+                    ("returning_member", "true" if rec.get("join_count", 0) > 1 else "false"),
+                    ("ever_had_member_role", "yes" if acc.get("ever_had_member_role") is True else "no"),
+                ]
+                base_discord_kv = [
+                    ("invite_code", used_invite_code or "—"),
+                    ("invited_by", inviter_s),
+                    ("tracked_invite", tracked_s),
+                    ("source", source_s),
+                ]
+
+                # Attempt immediate Whop enrichment; otherwise post placeholder then edit.
+                _mid_now, brief_now = await _resolve_whop_brief_for_discord_id(member.id)
+                if isinstance(brief_now, dict) and brief_now:
+                    detailed = _build_member_status_detailed_embed(
+                        title="👋 Member Joined",
+                        member=member,
+                        access_roles=access,
+                        color=0x57F287,
+                        event_kind="active",
+                        member_kv=base_member_kv,
+                        discord_kv=base_discord_kv,
+                        whop_brief=brief_now,
+                    )
+                    await log_member_status("", embed=detailed)
+                else:
+                    pending = _whop_placeholder_brief("pending")
+                    pending_embed = _build_member_status_detailed_embed(
+                        title="👋 Member Joined",
+                        member=member,
+                        access_roles=access,
+                        color=0x57F287,
+                        event_kind="active",
+                        member_kv=base_member_kv,
+                        discord_kv=base_discord_kv + [("whop_link", "Linking…")],
+                        whop_brief=pending,
+                    )
+                    msg = await log_member_status("", embed=pending_embed)
+
+                    def _final(brief: dict) -> discord.Embed:
+                        return _build_member_status_detailed_embed(
+                            title="👋 Member Joined",
+                            member=member,
+                            access_roles=access,
+                            color=0x57F287,
+                            event_kind="active",
+                            member_kv=base_member_kv,
+                            discord_kv=base_discord_kv,
+                            whop_brief=brief,
+                        )
+
+                    def _fallback() -> discord.Embed:
+                        unlinked = _whop_placeholder_brief("unlinked")
+                        note = f"Not linked yet (joined via {source_s})" if source_s and source_s != "—" else "Not linked yet (joined via invite)"
+                        return _build_member_status_detailed_embed(
+                            title="👋 Member Joined",
+                            member=member,
+                            access_roles=access,
+                            color=0x57F287,
+                            event_kind="active",
+                            member_kv=base_member_kv,
+                            discord_kv=base_discord_kv + [("whop_link", note)],
+                            whop_brief=unlinked,
+                        )
+
+                    if msg:
+                        asyncio.create_task(
+                            _retry_whop_enrich_and_edit(
+                                discord_id=member.id,
+                                messages=[msg],
+                                make_embed=_final,
+                                make_fallback_embed=_fallback,
+                                timeout_seconds=WHOP_LINK_TIMEOUT_SECONDS,
+                                retry_seconds=WHOP_LINK_RETRY_SECONDS,
+                            )
+                        )
         
         guild = member.guild
         current_roles = {r.id for r in member.roles}
@@ -2326,6 +2501,8 @@ async def on_member_remove(member: discord.Member):
 
                 mid = get_cached_whop_membership_id(member.id)
                 whop_brief = await _fetch_whop_brief_by_membership_id(mid) if mid else {}
+                if not (isinstance(whop_brief, dict) and whop_brief):
+                    whop_brief = _whop_placeholder_brief("pending" if mid else "unlinked")
                 acc = rec.get("access") if isinstance(rec.get("access"), dict) else {}
                 detailed = _build_member_status_detailed_embed(
                     title="🚪 Member Left",
@@ -2587,46 +2764,160 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         if only_member_added:
             access = _access_roles_plain(after)
             db_alerts = load_staff_alerts(STAFF_ALERTS_FILE)
-            issue_key = "payment_reactivated"
+            issue_key = "payment_resumed"
             if should_post_alert(db_alerts, after.id, issue_key, cooldown_hours=2.0):
-                whop_mid = get_cached_whop_membership_id(after.id)
-                whop_brief = await _fetch_whop_brief_by_membership_id(whop_mid) if whop_mid else {}
                 hist = get_member_history(after.id) or {}
                 acc = hist.get("access") if isinstance(hist.get("access"), dict) else {}
 
-                # Detailed card -> member-status-logs
-                detailed = _build_member_status_detailed_embed(
-                    title="✅ Payment Reactivated",
-                    member=after,
-                    access_roles=access,
-                    color=0x57F287,
-                    event_kind="active",
-                    member_kv=[
-                        ("first_joined", _fmt_ts(hist.get("first_join_ts"), "D") if hist.get("first_join_ts") else "—"),
-                        ("join_count", hist.get("join_count") or "—"),
-                        ("ever_had_member_role", "yes" if acc.get("ever_had_member_role") is True else "no"),
-                        ("first_access", _fmt_ts(acc.get("first_access_ts"), "D") if acc.get("first_access_ts") else "—"),
-                        ("last_access", _fmt_ts(acc.get("last_access_ts"), "D") if acc.get("last_access_ts") else "—"),
-                    ],
-                    discord_kv=[
-                        ("roles_added", added_names),
-                        ("roles_removed", removed_names or "—"),
-                        ("reason", "member_role_regained"),
-                    ],
-                    whop_brief=whop_brief,
-                )
-                await log_member_status("", embed=detailed)
+                def _is_recent_success(brief: dict) -> bool:
+                    if not isinstance(brief, dict):
+                        return False
+                    st = str(brief.get("status") or "").strip().lower()
+                    if st not in {"active", "trialing"}:
+                        return False
+                    dt = _parse_dt_any(brief.get("last_success_paid_at_iso") or "")
+                    if not dt:
+                        return False
+                    return (_now() - dt) <= timedelta(hours=float(PAYMENT_RESUMED_RECENT_HOURS))
 
-                # Minimal card -> payment-failure channel
-                minimal = _build_case_minimal_embed(
-                    title="✅ Payment Reactivated",
-                    member=after,
-                    access_roles=access,
-                    whop_brief=whop_brief,
-                    color=0x57F287,
-                    event_kind="active",
-                )
-                await log_member_status("", embed=minimal, channel_name=PAYMENT_FAILURE_CHANNEL_NAME)
+                def _title_for(brief: dict) -> str:
+                    return "✅ Payment Resumed" if _is_recent_success(brief) else "✅ Access Restored"
+
+                base_member_kv = [
+                    ("first_joined", _fmt_ts(hist.get("first_join_ts"), "D") if hist.get("first_join_ts") else "—"),
+                    ("join_count", hist.get("join_count") or "—"),
+                    ("ever_had_member_role", "yes" if acc.get("ever_had_member_role") is True else "no"),
+                    ("first_access", _fmt_ts(acc.get("first_access_ts"), "D") if acc.get("first_access_ts") else "—"),
+                    ("last_access", _fmt_ts(acc.get("last_access_ts"), "D") if acc.get("last_access_ts") else "—"),
+                ]
+                base_discord_kv = [
+                    ("roles_added", added_names),
+                    ("roles_removed", removed_names or "—"),
+                    ("reason", "member_role_regained"),
+                ]
+
+                # Try immediate Whop enrichment; otherwise post placeholder then edit.
+                _mid_now, whop_brief_now = await _resolve_whop_brief_for_discord_id(after.id)
+                if isinstance(whop_brief_now, dict) and whop_brief_now:
+                    final_title = _title_for(whop_brief_now)
+                    detailed = _build_member_status_detailed_embed(
+                        title=final_title,
+                        member=after,
+                        access_roles=access,
+                        color=0x57F287,
+                        event_kind="active",
+                        member_kv=base_member_kv,
+                        discord_kv=base_discord_kv + [("event", "payment.resumed" if final_title == "✅ Payment Resumed" else "access.restored")],
+                        whop_brief=whop_brief_now,
+                    )
+                    await log_member_status("", embed=detailed)
+
+                    minimal = _build_case_minimal_embed(
+                        title=final_title,
+                        member=after,
+                        access_roles=access,
+                        whop_brief=whop_brief_now,
+                        color=0x57F287,
+                        event_kind="active",
+                    )
+                    await log_member_status("", embed=minimal, channel_name=PAYMENT_FAILURE_CHANNEL_NAME)
+                else:
+                    pending = _whop_placeholder_brief("pending")
+                    pending_title = "✅ Access Restored"
+
+                    pending_detailed = _build_member_status_detailed_embed(
+                        title=pending_title,
+                        member=after,
+                        access_roles=access,
+                        color=0x57F287,
+                        event_kind="active",
+                        member_kv=base_member_kv,
+                        discord_kv=base_discord_kv + [("whop_link", "Linking…"), ("event", "access.restored")],
+                        whop_brief=pending,
+                    )
+                    msg_detailed = await log_member_status("", embed=pending_detailed)
+
+                    pending_min = _build_case_minimal_embed(
+                        title=pending_title,
+                        member=after,
+                        access_roles=access,
+                        whop_brief=pending,
+                        color=0x57F287,
+                        event_kind="active",
+                    )
+                    msg_min = await log_member_status("", embed=pending_min, channel_name=PAYMENT_FAILURE_CHANNEL_NAME)
+
+                    def _final_detailed(brief: dict) -> discord.Embed:
+                        # helper for retry loop (sync)
+                        final_title2 = _title_for(brief)
+                        return _build_member_status_detailed_embed(
+                            title=final_title2,
+                            member=after,
+                            access_roles=access,
+                            color=0x57F287,
+                            event_kind="active",
+                            member_kv=base_member_kv,
+                            discord_kv=base_discord_kv + [("event", "payment.resumed" if final_title2 == "✅ Payment Resumed" else "access.restored")],
+                            whop_brief=brief,
+                        )
+
+                    def _fallback_detailed() -> discord.Embed:
+                        unlinked = _whop_placeholder_brief("unlinked")
+                        return _build_member_status_detailed_embed(
+                            title=pending_title,
+                            member=after,
+                            access_roles=access,
+                            color=0x57F287,
+                            event_kind="active",
+                            member_kv=base_member_kv,
+                            discord_kv=base_discord_kv + [("whop_link", "Not linked yet"), ("event", "access.restored")],
+                            whop_brief=unlinked,
+                        )
+
+                    def _final_min(brief: dict) -> discord.Embed:
+                        final_title2 = _title_for(brief)
+                        return _build_case_minimal_embed(
+                            title=final_title2,
+                            member=after,
+                            access_roles=access,
+                            whop_brief=brief,
+                            color=0x57F287,
+                            event_kind="active",
+                        )
+
+                    def _fallback_min() -> discord.Embed:
+                        unlinked = _whop_placeholder_brief("unlinked")
+                        return _build_case_minimal_embed(
+                            title=pending_title,
+                            member=after,
+                            access_roles=access,
+                            whop_brief=unlinked,
+                            color=0x57F287,
+                            event_kind="active",
+                        )
+
+                    if msg_detailed:
+                        asyncio.create_task(
+                            _retry_whop_enrich_and_edit(
+                                discord_id=after.id,
+                                messages=[msg_detailed],
+                                make_embed=_final_detailed,
+                                make_fallback_embed=_fallback_detailed,
+                                timeout_seconds=WHOP_LINK_TIMEOUT_SECONDS,
+                                retry_seconds=WHOP_LINK_RETRY_SECONDS,
+                            )
+                        )
+                    if msg_min:
+                        asyncio.create_task(
+                            _retry_whop_enrich_and_edit(
+                                discord_id=after.id,
+                                messages=[msg_min],
+                                make_embed=_final_min,
+                                make_fallback_embed=_fallback_min,
+                                timeout_seconds=WHOP_LINK_TIMEOUT_SECONDS,
+                                retry_seconds=WHOP_LINK_RETRY_SECONDS,
+                            )
+                        )
 
                 record_alert_post(db_alerts, after.id, issue_key)
                 save_staff_alerts(STAFF_ALERTS_FILE, db_alerts)

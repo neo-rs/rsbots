@@ -62,6 +62,13 @@
   "member_history": {
     "max_events_per_user": 50
   },
+
+  "whop_enrichment": {
+    "_comment": "Controls post-then-edit behavior for staff embeds when Whop link is not yet available.",
+    "link_timeout_seconds": 90,
+    "link_retry_seconds": [2, 5, 10, 20, 30, 60],
+    "payment_resumed_recent_hours": 6
+  },
   
   "utm_links": {
     "day_1": "https://dash.resellingsecrets.com/checkout/plan_42Pbxy0i6Y8jX?d2c=true&utm_source=discord&utm_campaign=dm_day_1",
