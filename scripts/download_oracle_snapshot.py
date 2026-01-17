@@ -132,6 +132,84 @@ def _safe_extract(tar_path: Path, dest_dir: Path) -> None:
         tf.extractall(dest_dir)
 
 
+def _chmod_tree_writable(path: Path) -> None:
+    """Best-effort: clear read-only bits so deletes can succeed on Windows/OneDrive."""
+    try:
+        if path.is_file() or path.is_symlink():
+            os.chmod(path, 0o666)
+            return
+    except Exception:
+        pass
+    try:
+        for p in path.rglob("*"):
+            try:
+                os.chmod(p, 0o666 if p.is_file() else 0o777)
+            except Exception:
+                pass
+        try:
+            os.chmod(path, 0o777)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _rmtree_force(path: Path) -> None:
+    """shutil.rmtree with read-only clearing (best-effort)."""
+
+    def _onerror(func, p, exc_info):
+        try:
+            os.chmod(p, 0o777)
+        except Exception:
+            pass
+        try:
+            func(p)
+        except Exception:
+            pass
+
+    _chmod_tree_writable(path)
+    shutil.rmtree(path, onerror=_onerror)
+
+
+def _windows_remove_tree(path: Path) -> tuple[bool, str]:
+    """Windows-only delete fallback using PowerShell and/or cmd rmdir."""
+    p = str(path)
+
+    # PowerShell: Remove-Item -LiteralPath
+    try:
+        ps_path = p.replace("'", "''")  # escape single quotes
+        res = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                f"Remove-Item -LiteralPath '{ps_path}' -Recurse -Force -ErrorAction Stop",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode == 0 and not path.exists():
+            return (True, "powershell")
+    except Exception as e:
+        return (False, f"powershell_error: {e}")
+
+    # cmd.exe: rmdir /s /q
+    try:
+        res2 = subprocess.run(
+            ["cmd", "/c", "rmdir", "/s", "/q", p],
+            capture_output=True,
+            text=True,
+        )
+        if res2.returncode == 0 and not path.exists():
+            return (True, "rmdir")
+        msg = (res2.stderr or res2.stdout or "").strip()
+        return (False, f"rmdir_failed: {msg[:200]}")
+    except Exception as e:
+        return (False, f"rmdir_error: {e}")
+
+
 def _prune_old_snapshots(out_dir: Path, keep: int, current: Path) -> None:
     """Delete older server_full_snapshot_* directories, keeping the newest N (including current)."""
     try:
@@ -150,14 +228,43 @@ def _prune_old_snapshots(out_dir: Path, keep: int, current: Path) -> None:
     keep_set = set(dirs[-keep_n:]) if dirs else set()
     keep_set.add(current)
 
+    deleted = 0
+    failed = 0
     for p in dirs:
         if p in keep_set:
             continue
         try:
-            shutil.rmtree(p)
+            _rmtree_force(p)
             print(f"[cleanup] Deleted old snapshot: {p.name}")
+            deleted += 1
         except Exception as e:
-            print(f"[cleanup] WARNING: Failed to delete {p.name}: {e}")
+            # Windows + OneDrive often locks files. Try OS-native fallbacks.
+            if os.name == "nt":
+                ok, how = _windows_remove_tree(p)
+                if ok:
+                    print(f"[cleanup] Deleted old snapshot: {p.name} ({how})")
+                    deleted += 1
+                    continue
+            failed += 1
+            hint = ""
+            try:
+                if "OneDrive" in str(out_dir):
+                    hint = " (OneDrive may be locking files; close Explorer/preview panes or use --out-dir outside OneDrive)"
+            except Exception:
+                pass
+            print(f"[cleanup] WARNING: Failed to delete {p.name}: {e}{hint}")
+
+    if deleted or failed:
+        print(f"[cleanup] Summary: deleted={deleted} failed={failed} keep={keep_n}")
+
+
+def _latest_snapshot_dir(out_dir: Path) -> Path | None:
+    """Best-effort newest snapshot dir by name."""
+    try:
+        dirs = sorted([p for p in out_dir.glob("server_full_snapshot_*") if p.is_dir()])
+        return dirs[-1] if dirs else None
+    except Exception:
+        return None
 
 
 def main() -> int:
@@ -172,7 +279,24 @@ def main() -> int:
         default=1,
         help="Keep only the newest N server_full_snapshot_* folders after a successful run (default: 1).",
     )
+    ap.add_argument(
+        "--prune-only",
+        action="store_true",
+        help="Only prune old local snapshot folders in --out-dir (no SSH, no download).",
+    )
     args = ap.parse_args()
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.prune_only:
+        current = _latest_snapshot_dir(out_dir)
+        if not current:
+            print(f"[cleanup] No server_full_snapshot_* folders found in: {out_dir}")
+            return 0
+        print(f"[cleanup] Prune-only mode. Keeping newest {args.keep_snapshots} (current={current.name})")
+        _prune_old_snapshots(out_dir, args.keep_snapshots, current)
+        return 0
 
     servers = _load_servers()
     raw = _pick_server(servers, args.server_name)
@@ -191,7 +315,6 @@ def main() -> int:
         raise ValueError("servers.json entry missing key")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = Path(args.out_dir)
     snap_dir = out_dir / f"server_full_snapshot_{ts}"
     snap_dir.mkdir(parents=True, exist_ok=True)
 

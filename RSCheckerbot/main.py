@@ -925,14 +925,17 @@ def _backfill_whop_timeline_from_whop_history() -> None:
                 whop_timeline["last_status"] = status
             
             # Membership identifiers:
-            # - whop_history.json often contains a human-ish "whop_key" like "R-..." (NOT a Whop API membership id).
-            # - A true Company API membership id is expected to look like "mem_...".
+            # - Whop history/workflows often include a humanish "R-..." key (commonly stored as whop_key).
+            # - Some payloads include an API-style "mem_..." id as membership_id.
+            # Both have been observed to work with /memberships/{id}, so keep both if available.
             whop_key = str(event.get("whop_key") or "").strip()
             if whop_key:
                 whop_timeline["last_whop_key"] = whop_key
+                if whop_key.startswith(("mem_", "R-")):
+                    whop_timeline["last_membership_id"] = whop_key
 
             membership_id = str(event.get("membership_id") or "").strip()
-            if membership_id.startswith("mem_"):
+            if membership_id.startswith(("mem_", "R-")):
                 whop_timeline["last_membership_id"] = membership_id
             
             # last_user_id: from event if available (though whop_history.json doesn't seem to have this)

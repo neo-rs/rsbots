@@ -133,9 +133,17 @@ def _get_cached_membership_id_for_discord(discord_id: int | str) -> str:
         return ""
 
     def _looks_like_membership_id(mid: str) -> bool:
-        # Whop membership IDs from the API are expected to look like "mem_..."
+        # Whop membership identifiers we see in the wild include:
+        # - "mem_..." (API-style)
+        # - legacy/humanish "R-..." keys from Whop workflows/history that still work with /memberships/{id}
         s = str(mid or "").strip()
-        return bool(s) and s.startswith("mem_")
+        if not s:
+            return False
+        if s.startswith("mem_"):
+            return True
+        if s.startswith("R-"):
+            return True
+        return False
 
     # 1) Primary: whop_discord_link.json mapping
     db = _load_discord_link_db()

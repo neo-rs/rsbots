@@ -118,6 +118,8 @@ def kv_block(
 
 def brief_payment_kv(brief: dict | None) -> list[tuple[str, object]]:
     b = brief if isinstance(brief, dict) else {}
+    dash = b.get("dashboard_url")
+    manage = b.get("manage_url")
     return [
         ("status", b.get("status")),
         ("product", b.get("product")),
@@ -126,8 +128,9 @@ def brief_payment_kv(brief: dict | None) -> list[tuple[str, object]]:
         ("renewal_start", b.get("renewal_start")),
         ("renewal_end", b.get("renewal_end")),
         ("remaining_days", b.get("remaining_days")),
-        ("dashboard_url", b.get("dashboard_url")),
-        ("manage_url", b.get("manage_url")),
+        ("dashboard_url", dash),
+        # Prefer the staff dashboard; show billing-manage only as fallback.
+        ("manage_url", manage if not dash else ""),
         ("total_spent", b.get("total_spent")),
         ("last_success_paid_at", b.get("last_success_paid_at")),
         ("cancel_at_period_end", b.get("cancel_at_period_end")),
@@ -193,7 +196,7 @@ def build_case_minimal_embed(
                 ("renewal_end", b.get("renewal_end")),
                 ("remaining_days", b.get("remaining_days")),
                 ("dashboard_url", b.get("dashboard_url")),
-                ("manage_url", b.get("manage_url")),
+                ("manage_url", (b.get("manage_url") if not b.get("dashboard_url") else "")),
                 ("total_spent", b.get("total_spent")),
                 ("last_payment_failure", b.get("last_payment_failure")),
             ],
