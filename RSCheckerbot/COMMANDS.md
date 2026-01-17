@@ -7,36 +7,36 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 
 ### Content Management Commands
 
-#### `!editmessages`
+#### `.checker editmessages`
 - **Description**: Edit DM messages via embedded interface
-- **Aliases**: `checker-edit`, `cedit`, `checker-messages`
+- **Aliases**: `editmessage`, `checker-edit`, `cedit`, `checker-messages`
 - **Parameters**: None
-- **Usage**: `!editmessages`
+- **Usage**: `.checker editmessages`
 - **Admin Only**: Yes (requires administrator permissions)
 - **Returns**: Interactive message editor interface
 - **Note**: Command message is auto-deleted
 
-#### `!reloadmessages`
+#### `.checker reloadmessages`
 - **Description**: Reload messages from JSON file
 - **Aliases**: `checker-reload`, `creload`
 - **Parameters**: None
-- **Usage**: `!reloadmessages`
+- **Usage**: `.checker reloadmessages`
 - **Admin Only**: Yes (requires administrator permissions)
 - **Returns**: Confirmation message (auto-deletes after 5 seconds)
 - **Note**: Command message is auto-deleted
 
 ### Data Operations Commands
 
-#### `!cleanup`
+#### `.checker cleanup`
 - **Description**: Manually trigger data cleanup
 - **Aliases**: None
 - **Parameters**: None
-- **Usage**: `!cleanup`
+- **Usage**: `.checker cleanup`
 - **Admin Only**: Yes (requires administrator permissions)
 - **Returns**: Confirmation message (auto-deletes after 5 seconds)
 - **Note**: Command message is auto-deleted
 
-#### `!purgecases`
+#### `.checker purgecases`
 - **Description**: Delete legacy per-user payment case channels under the configured category
 - **Aliases**: `purgecasechannels`, `deletecases`, `deletecasechannels`
 - **Parameters**: 
@@ -48,36 +48,36 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 
 ### Direct Message Controls
 
-#### `!dmenable`
+#### `.checker dmenable`
 - **Description**: Enable DM sequence
 - **Aliases**: None
 - **Parameters**: None
-- **Usage**: `!dmenable`
+- **Usage**: `.checker dmenable`
 - **Admin Only**: Yes (requires administrator permissions)
 - **Returns**: Confirmation message (auto-deletes after 5 seconds)
 - **Note**: Command message is auto-deleted
 
-#### `!dmdisable`
+#### `.checker dmdisable`
 - **Description**: Disable DM sequence
 - **Aliases**: None
 - **Parameters**: None
-- **Usage**: `!dmdisable`
+- **Usage**: `.checker dmdisable`
 - **Admin Only**: Yes (requires administrator permissions)
 - **Returns**: Confirmation message (auto-deletes after 5 seconds)
 - **Note**: Command message is auto-deleted
 
-#### `!dmstatus`
+#### `.checker dmstatus`
 - **Description**: Show DM sequence status
 - **Aliases**: None
 - **Parameters**: None
-- **Usage**: `!dmstatus`
+- **Usage**: `.checker dmstatus`
 - **Admin Only**: Yes (requires administrator permissions)
 - **Returns**: Status message showing ENABLED or DISABLED (auto-deletes after 10 seconds)
 - **Note**: Command message is auto-deleted
 
 ### Member Operations Commands
 
-#### `!whois`
+#### `.checker whois`
 - **Description**: Whop API-first lookup for a Discord user
 - **Aliases**: `whof`
 - **Parameters**: 
@@ -87,7 +87,7 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 - **Returns**: Embed with member info, access roles, Whop membership summary
 - **Note**: Command message is auto-deleted after 30 seconds
 
-#### `!whopmembership`
+#### `.checker whopmembership`
 - **Description**: Direct Whop membership lookup by membership_id
 - **Aliases**: `whopmember`, `whopmem`
 - **Parameters**: 
@@ -99,7 +99,7 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 
 ### Sequence Management Commands
 
-#### `!start`
+#### `.checker start`
 - **Description**: Start checker sequence for a member
 - **Aliases**: None
 - **Parameters**: 
@@ -109,7 +109,7 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 - **Returns**: Confirmation that day_1 is queued
 - **Note**: Only works if user has trigger role and hasn't had sequence before
 
-#### `!cancel`
+#### `.checker cancel`
 - **Description**: Cancel checker sequence for a member
 - **Aliases**: None
 - **Parameters**: 
@@ -119,7 +119,7 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 - **Returns**: Confirmation that sequence is cancelled
 - **Note**: Only works if user is in active queue
 
-#### `!test`
+#### `.checker test`
 - **Description**: Test checker sequence for a member (sends all day messages immediately)
 - **Aliases**: None
 - **Parameters**: 
@@ -129,7 +129,7 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 - **Returns**: Test completion confirmation
 - **Note**: Sends all day messages (day_1 through day_7b) with TEST_INTERVAL_SECONDS delay between each
 
-#### `!relocate`
+#### `.checker relocate`
 - **Description**: Relocate sequence to different day
 - **Aliases**: None
 - **Parameters**: 

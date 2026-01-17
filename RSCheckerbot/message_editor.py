@@ -193,7 +193,13 @@ class DayEditorView(ui.View):
             
             # Get UTM link from config
             utm_links = self.bot_instance.config.get("utm_links", {})
-            join_url = utm_links.get(self.day_key, "https://example.com")
+            join_url = str(utm_links.get(self.day_key) or "").strip()
+            if not join_url:
+                await interaction.response.send_message(
+                    f"❌ Missing `utm_links.{self.day_key}` in config.json (cannot preview).",
+                    ephemeral=True,
+                )
+                return
             
             banner_url = day_data.get("banner_url") or messages.get("banner_url")
             footer_url = day_data.get("footer_url") or messages.get("footer_url")
@@ -222,7 +228,7 @@ class DayEditorView(ui.View):
             )
     
     @ui.button(label="Back", style=discord.ButtonStyle.danger, row=2)
-    async def back(self, interaction: discord.Interaction):
+    async def back(self, interaction: discord.Interaction, button: ui.Button):
         """Go back to day selector"""
         view = DaySelectorView(self.bot_instance, start_day=1, end_day=8)
         embed = view.get_selector_embed()
@@ -434,7 +440,7 @@ class GlobalSettingsView(ui.View):
         await interaction.response.send_modal(modal)
     
     @ui.button(label="Back", style=discord.ButtonStyle.danger, row=1)
-    async def back(self, interaction: discord.Interaction):
+    async def back(self, interaction: discord.Interaction, button: ui.Button):
         """Go back to main menu"""
         view = MessageEditorView(self.bot_instance)
         embed = view.get_main_embed()

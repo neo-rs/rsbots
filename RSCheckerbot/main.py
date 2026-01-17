@@ -2753,7 +2753,7 @@ def cleanup_old_invites():
 # -----------------------------
 # Admin commands
 # -----------------------------
-@bot.command(name="editmessages", aliases=["checker-edit", "cedit", "checker-messages"])
+@bot.command(name="editmessages", aliases=["editmessage", "checker-edit", "cedit", "checker-messages"])
 @commands.has_permissions(administrator=True)
 async def edit_messages(ctx):
     """Edit DM messages via embedded interface"""

@@ -4718,52 +4718,43 @@ echo "CHANGED_END"
             await send(embed=error_embed)
             return
 
-        if len(content) <= 1900:
-            await send(content=f"```markdown\n{content}\n```")
-            return
+        # Discord embed description hard-limit is 4096 chars.
+        # Keep a buffer to avoid edge-case formatting expansion.
+        max_desc = 3900
 
-        lines = content.split("\n")
-        chunks: List[str] = []
-        current_chunk: List[str] = []
-        current_length = 0
+        def _chunk_markdown(text: str, limit: int) -> List[str]:
+            lines = (text or "").split("\n")
+            out: List[str] = []
+            cur: List[str] = []
+            cur_len = 0
+            for line in lines:
+                add_len = len(line) + 1
+                if cur and (cur_len + add_len) > limit:
+                    out.append("\n".join(cur))
+                    cur = [line]
+                    cur_len = add_len
+                else:
+                    cur.append(line)
+                    cur_len += add_len
+            if cur:
+                out.append("\n".join(cur))
+            return out
 
-        for line in lines:
-            line_length = len(line) + 1
-            if current_length + line_length > 1900 and current_chunk:
-                chunks.append("\n".join(current_chunk))
-                current_chunk = [line]
-                current_length = line_length
-            else:
-                current_chunk.append(line)
-                current_length += line_length
+        chunks = _chunk_markdown(content, max_desc)
+        total = max(1, len(chunks))
 
-        if current_chunk:
-            chunks.append("\n".join(current_chunk))
-
-        first_chunk = chunks[0] if chunks else ""
-        embed = discord.Embed(
-            title=f"📋 {bot_info.get('name', bot_key_norm)} Commands",
-            description=f"Showing {len(chunks)} part(s)",
-            color=discord.Color.blue(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        if len(first_chunk) <= 1900:
-            embed.description = f"```markdown\n{first_chunk}\n```"
-        else:
-            embed.add_field(
-                name="Part 1",
-                value=f"```markdown\n{first_chunk[:1020]}\n```",
-                inline=False,
+        # Send as normal embeds (no ```markdown``` fences) so the formatting matches the docs.
+        for i, chunk in enumerate(chunks, start=1):
+            title_suffix = f" ({i}/{total})" if total > 1 else ""
+            embed = discord.Embed(
+                title=f"📋 {bot_info.get('name', bot_key_norm)} Commands{title_suffix}",
+                description=chunk or "(empty)",
+                color=discord.Color.blue(),
+                timestamp=datetime.now(timezone.utc),
             )
-        if who:
-            embed.set_footer(text=who)
-        await send(embed=embed)
-
-        for chunk in chunks[1:]:
-            if len(chunk) <= 1900:
-                await send(content=f"```markdown\n{chunk}\n```")
-            else:
-                await send(content=f"```markdown\n{chunk[:1900]}\n```")
+            if who:
+                embed.set_footer(text=who)
+            await send(embed=embed)
 
     def _build_botconfig_embed(self, bot_name: str, *, triggered_by: Optional[Any] = None) -> discord.Embed:
         """Build the botconfig embed for a bot (RS-only, inspector-based)."""
@@ -5393,8 +5384,9 @@ echo "CHANGED_END"
                     if commands_file.exists():
                         try:
                             content = commands_file.read_text(encoding="utf-8")
-                            # Count command definitions (look for "#### `!" or "#### `/")
-                            command_count = str(content.count("#### `!") + content.count("#### `/"))
+                            # Count command definitions by COMMANDS.md convention:
+                            # each command section begins with a "####" heading line.
+                            command_count = str(len(re.findall(r"^####\s+", content, flags=re.MULTILINE)))
                         except Exception:
                             command_count = "?"
                     

@@ -87,6 +87,54 @@ def _sha256_file(path: Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+def _sha256_bytes(data: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(data)
+    return h.hexdigest()
+
+def _git_show_bytes(rel: str) -> bytes | None:
+    """Return git HEAD blob bytes for a path (or None)."""
+    try:
+        # Fast path: git show HEAD:<path>
+        res = subprocess.run(
+            ["git", "show", f"HEAD:{rel}"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            timeout=20,
+        )
+        if res.returncode != 0:
+            return None
+        return res.stdout
+    except Exception:
+        return None
+
+def _git_eol_info(paths: list[str]) -> dict[str, str]:
+    """Best-effort `git ls-files --eol` info per file."""
+    out: dict[str, str] = {}
+    try:
+        res = subprocess.run(
+            ["git", "ls-files", "--eol", *paths],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if res.returncode != 0:
+            return out
+        for ln in (res.stdout or "").splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            # Example:
+            # i/lf    w/crlf  attr/                  RSCheckerbot/whop_brief.py
+            parts = s.split()
+            if parts:
+                rel = parts[-1]
+                out[rel] = " ".join(parts[:-1]).strip()
+    except Exception:
+        pass
+    return out
+
 
 def _latest_snapshot_dir(out_dir: Path) -> Path | None:
     try:
@@ -113,6 +161,12 @@ def main() -> int:
         "--snapshot-dir",
         default="",
         help="Explicit snapshot folder to compare against (default: newest in --out-dir).",
+    )
+    ap.add_argument(
+        "--hash-mode",
+        choices=["git", "worktree"],
+        default="git",
+        help="How to hash local files: git=hash HEAD content (stable across CRLF/LF), worktree=hash working tree bytes.",
     )
     args = ap.parse_args()
 
@@ -173,7 +227,14 @@ def main() -> int:
 
     # Local hashes
     local_hashes: Dict[str, str] = {}
+    local_hash_source = "git:HEAD" if args.hash_mode == "git" else "worktree"
     for rel in rel_files:
+        if args.hash_mode == "git":
+            b = _git_show_bytes(rel)
+            if b is not None:
+                local_hashes[rel] = _sha256_bytes(b)
+                continue
+        # Fallback to working-tree bytes
         p = (REPO_ROOT / rel)
         if p.exists():
             local_hashes[rel] = _sha256_file(p)
@@ -197,9 +258,11 @@ def main() -> int:
             print(f"{k}: {remote_meta[k]}")
     if snapshot_dir and snapshot_dir.exists():
         print(f"snapshot:    {snapshot_dir}")
+    print(f"local_hash:  {local_hash_source}")
     print()
 
     any_diff = False
+    eol_info = _git_eol_info(rel_files)
     for rel in rel_files:
         rh = remote_hashes.get(rel, "")
         lh = local_hashes.get(rel, "")
@@ -215,15 +278,21 @@ def main() -> int:
             any_diff = True
 
         if remote_vs_snapshot:
-            print(f"- {rel}: live_vs_snapshot={remote_vs_snapshot}  live_vs_local={remote_vs_local}")
+            extra = ""
+            if remote_vs_local == "DIFF" and rel in eol_info:
+                extra = f"  (eol: {eol_info.get(rel)})"
+            print(f"- {rel}: live_vs_snapshot={remote_vs_snapshot}  live_vs_local={remote_vs_local}{extra}")
         else:
-            print(f"- {rel}: live_vs_local={remote_vs_local}")
+            extra = ""
+            if remote_vs_local == "DIFF" and rel in eol_info:
+                extra = f"  (eol: {eol_info.get(rel)})"
+            print(f"- {rel}: live_vs_local={remote_vs_local}{extra}")
     print()
     if any_diff:
         print("NOTE:")
         print("- live_vs_snapshot=DIFF means your downloaded snapshot does NOT match current Oracle live files.")
         print("- live_vs_local=DIFF means Oracle live files do NOT match your local repo files.")
-        print("If you expected an update but see DIFF, your deploy/restart likely didn’t apply (or you downloaded a snapshot earlier/later).")
+        print("If live==snapshot but local DIFF shows eol differences (i/lf vs w/crlf), that is usually just Windows line endings, not a deploy issue.")
     else:
         print("OK: Oracle live files match for the checked paths.")
 
