@@ -42,12 +42,25 @@ def _latest_snapshot_dir(out_dir: Path) -> Path:
     return snaps[0]
 
 
-def _run(cmd: list[str]) -> None:
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.returncode != 0:
-        sys.stdout.write(res.stdout)
-        sys.stderr.write(res.stderr)
-        raise SystemExit(res.returncode)
+def _run(cmd: list[str], *, capture_output: bool = True) -> None:
+    """Run a subprocess command.
+
+    By default we capture output to keep logs readable, but for long-running
+    operations (like snapshot downloads + pruning) we stream output so the
+    operator can see progress and cleanup warnings.
+    """
+    if capture_output:
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            sys.stdout.write(res.stdout)
+            sys.stderr.write(res.stderr)
+            raise SystemExit(res.returncode)
+        return
+
+    # Stream output to console (no capture).
+    res2 = subprocess.run(cmd)
+    if res2.returncode != 0:
+        raise SystemExit(res2.returncode)
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -82,7 +95,8 @@ def main() -> int:
         cmd += ["--out-dir", str(out_dir)]
         if args.no_oracle_server_data:
             cmd += ["--no-oracle-server-data"]
-        _run(cmd)
+        # Stream snapshot output so you can see pruning + warnings.
+        _run(cmd, capture_output=False)
 
     snapshot_dir = Path(args.snapshot_dir).resolve() if args.snapshot_dir else _latest_snapshot_dir(out_dir)
     if not snapshot_dir.exists():
@@ -150,6 +164,59 @@ def main() -> int:
     only_server = sorted(set(rpy) - set(lpy))
     changed = sorted([k for k in set(lpy) & set(rpy) if lpy[k] != rpy[k]])
 
+    # Critical non-.py drift summary (config + systemd).
+    folders = diff.get("folders") or {}
+    root_files = diff.get("root_files") or {}
+
+    def _iter_rel_items(folder: str, info: dict) -> list[tuple[str, str]]:
+        out2: list[tuple[str, str]] = []
+        for key in ("changed", "only_local", "only_remote"):
+            items = info.get(key) or []
+            if not isinstance(items, list):
+                continue
+            for rel in items:
+                if isinstance(rel, str) and rel:
+                    out2.append((folder, rel))
+        return out2
+
+    non_py_items: list[tuple[str, str]] = []
+    for folder, info in folders.items():
+        if isinstance(info, dict):
+            non_py_items.extend(_iter_rel_items(str(folder), info))
+
+    root_items: list[tuple[str, str]] = []
+    if isinstance(root_files, dict):
+        for key in ("changed", "only_local", "only_remote"):
+            items = root_files.get(key) or []
+            if not isinstance(items, list):
+                continue
+            for rel in items:
+                if isinstance(rel, str) and rel:
+                    root_items.append(("(root)", rel))
+
+    def _is_config_json(item: tuple[str, str]) -> bool:
+        _, rel = item
+        return rel.endswith("config.json")
+
+    def _is_messages_json(item: tuple[str, str]) -> bool:
+        _, rel = item
+        return rel.endswith("messages.json")
+
+    def _is_service(item: tuple[str, str]) -> bool:
+        _, rel = item
+        return rel.endswith(".service")
+
+    def _is_other_json(item: tuple[str, str]) -> bool:
+        _, rel = item
+        return rel.endswith(".json") and (not rel.endswith("config.secrets.json")) and (not _is_config_json(item)) and (not _is_messages_json(item))
+
+    config_json_drift = sorted([x for x in non_py_items if _is_config_json(x)])
+    messages_json_drift = sorted([x for x in non_py_items if _is_messages_json(x)])
+    service_drift = sorted([x for x in (non_py_items + root_items) if _is_service(x)])
+    other_json_drift = sorted([x for x in non_py_items if _is_other_json(x)])
+
+    critical_drift = sorted(set(config_json_drift + messages_json_drift + service_drift))
+
     print("Oracle baseline check")
     print(f"snapshot:       {snapshot_dir}")
     print(f"local manifest: {local_manifest}")
@@ -159,6 +226,13 @@ def main() -> int:
     print(f"only local .py:  {len(only_local)}")
     print(f"only server .py: {len(only_server)}")
     print(f"changed .py:     {len(changed)}")
+    print()
+    print("Non-.py drift (high-signal)")
+    print(f"config.json drift:   {len(config_json_drift)}")
+    print(f"messages.json drift: {len(messages_json_drift)}")
+    print(f"*.service drift:     {len(service_drift)}")
+    print(f"other .json drift:   {len(other_json_drift)}")
+    print(f"CRITICAL drift total:{len(critical_drift)}")
     print()
 
     def show(title: str, items: list[tuple[str, str]]) -> None:
@@ -174,7 +248,13 @@ def main() -> int:
     show("CHANGED:", changed)
     show("ONLY LOCAL:", only_local)
     show("ONLY SERVER:", only_server)
+    show("CRITICAL (config/service) DRIFT:", critical_drift)
 
+    if critical_drift:
+        print("WARNING: Critical non-.py drift detected (config/service). See list above.")
+        print()
+
+    # Exit code remains python-only to preserve historical workflow behavior.
     return 0 if (not only_local and not only_server and not changed) else 2
 
 

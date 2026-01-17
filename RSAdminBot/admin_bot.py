@@ -3861,7 +3861,7 @@ TS="$(date +%Y%m%d_%H%M%S)"
 SAFE_BOT="$(echo "$BOT_FOLDER" | tr '/' '_')"
 BACKUP_DIR="$LIVE_ROOT/backups"
 mkdir -p "$BACKUP_DIR"
-BACKUP_TAR="$BACKUP_DIR/${SAFE_BOT}_preupdate_${TS}.tar.gz"
+BACKUP_TAR="$BACKUP_DIR/${{SAFE_BOT}}_preupdate_${{TS}}.tar.gz"
 (cd "$LIVE_ROOT" && tar --ignore-failed-read -czf "$BACKUP_TAR" -T "$TMP_SYNC_LIST") || true
 
 # Copy files (always sync, even if no differences detected)
