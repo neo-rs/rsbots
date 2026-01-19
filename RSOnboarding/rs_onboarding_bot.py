@@ -57,6 +57,8 @@ class RSOnboardingBot:
         self._close_locks = defaultdict(asyncio.Lock)
         self._open_locks = defaultdict(asyncio.Lock)
         self._recent_member_dm: Dict[int, float] = {}
+        # Best-effort cache for RSCheckerbot runtime member_history.json (NOT persisted; no new storage)
+        self._rschecker_member_history_cache: Dict[str, Any] = {"loaded_at": 0.0, "data": {}}
         
         # Stats tracking (similar to RSForwarder)
         self.stats = {
@@ -546,6 +548,19 @@ class RSOnboardingBot:
                 overwrite = log_channel.overwrites_for(me)
                 if overwrite.send_messages is False and not perms.administrator:
                     warnings.append(f"Bot may not be able to send messages in log channel '{log_channel.name}' (check channel permissions)")
+
+        # Check welcome log channel exists and bot can send messages (optional)
+        welcome_log_channel_id = self.config.get("welcome_log_channel_id")
+        if welcome_log_channel_id:
+            welcome_log_channel = guild.get_channel(welcome_log_channel_id)
+            if not welcome_log_channel:
+                warnings.append(f"Welcome log channel not found (ID: {welcome_log_channel_id})")
+            elif isinstance(welcome_log_channel, discord.TextChannel):
+                overwrite = welcome_log_channel.overwrites_for(me)
+                if overwrite.send_messages is False and not perms.administrator:
+                    warnings.append(
+                        f"Bot may not be able to send messages in welcome log channel '{welcome_log_channel.name}' (check channel permissions)"
+                    )
         
         # Check role hierarchy (bot role must be above Welcome/Member roles)
         welcome_role_id = self.config.get("welcome_role_id")
@@ -715,6 +730,60 @@ class RSOnboardingBot:
             return None
         except Exception:
             return None
+
+    def _get_rschecker_whop_link(self, discord_id: int) -> dict:
+        """Best-effort Whop link info from RSCheckerbot cache (no API calls).
+
+        Reads `RSCheckerbot/whop_discord_link.json` and returns the record under
+        `by_discord_id[discord_id]` when present.
+        """
+        try:
+            p = _REPO_ROOT / "RSCheckerbot" / "whop_discord_link.json"
+            if not p.exists() or p.stat().st_size == 0:
+                return {}
+            db = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(db, dict):
+                return {}
+            by = db.get("by_discord_id")
+            if not isinstance(by, dict):
+                return {}
+            rec = by.get(str(int(discord_id)))
+            return rec if isinstance(rec, dict) else {}
+        except Exception:
+            return {}
+
+    def _get_rschecker_member_history(self, discord_id: int) -> dict:
+        """Best-effort member history record from RSCheckerbot runtime JSON (no syncing, no writes).
+
+        Source file: `RSCheckerbot/member_history.json` (runtime; not tracked).
+        This is used only to enrich staff logs (e.g., returning member detection).
+        """
+        try:
+            did = int(discord_id)
+        except Exception:
+            return {}
+
+        try:
+            now = time.time()
+            cache = self._rschecker_member_history_cache if isinstance(self._rschecker_member_history_cache, dict) else {}
+            loaded_at = float(cache.get("loaded_at", 0.0) or 0.0)
+            data = cache.get("data") if isinstance(cache.get("data"), dict) else {}
+            # Reload at most once every 30s (file can be large; keep overhead low).
+            if (now - loaded_at) > 30 or not isinstance(data, dict):
+                p = _REPO_ROOT / "RSCheckerbot" / "member_history.json"
+                if not p.exists() or p.stat().st_size == 0:
+                    self._rschecker_member_history_cache = {"loaded_at": now, "data": {}}
+                    return {}
+                db = json.loads(p.read_text(encoding="utf-8"))
+                if not isinstance(db, dict):
+                    db = {}
+                self._rschecker_member_history_cache = {"loaded_at": now, "data": db}
+                data = db
+
+            rec = data.get(str(did))
+            return rec if isinstance(rec, dict) else {}
+        except Exception:
+            return {}
     
     async def schedule_auto_close(self, member_id: int, guild: discord.Guild):
         """Schedule (or immediately perform) auto-close based on opened_at timestamp"""
@@ -859,6 +928,27 @@ class RSOnboardingBot:
                 welcome_ping_user_id = self.config.get("welcome_ping_user_id")
                 if welcome_log_channel_id:
                     welcome_log_channel = guild.get_channel(welcome_log_channel_id)
+                    if not welcome_log_channel:
+                        # Fallback to API fetch in case channel cache is incomplete
+                        try:
+                            welcome_log_channel = await self.bot.fetch_channel(int(welcome_log_channel_id))
+                        except Exception as e:
+                            try:
+                                print(
+                                    f"{Colors.YELLOW}[Warn] Welcome log channel not found / fetch failed "
+                                    f"(ID: {welcome_log_channel_id}): {e}{Colors.RESET}"
+                                )
+                            except Exception:
+                                pass
+                            await self.log_action(
+                                guild,
+                                f"Welcome log channel not found / fetch failed (ID: {welcome_log_channel_id}): {e}",
+                                log_type="warning",
+                                member=member,
+                                source="open_onboarding_ticket",
+                            )
+                            welcome_log_channel = None
+
                     if welcome_log_channel:
                         try:
                             from datetime import datetime, timezone
@@ -885,6 +975,83 @@ class RSOnboardingBot:
                                 value=f"[Jump to Ticket]({ticket.jump_url})",
                                 inline=True
                             )
+
+                            # High-signal context for staff (account age + join time)
+                            try:
+                                created_at = getattr(member, "created_at", None)
+                                joined_at = getattr(member, "joined_at", None)
+                                created_ts = int(created_at.replace(tzinfo=timezone.utc).timestamp()) if created_at else None
+                                joined_ts = int(joined_at.replace(tzinfo=timezone.utc).timestamp()) if joined_at else None
+                                created_txt = f"<t:{created_ts}:R>" if created_ts else "—"
+                                joined_txt = f"<t:{joined_ts}:R>" if joined_ts else "—"
+                                embed.add_field(
+                                    name="Account",
+                                    value=f"Created: {created_txt}\nJoined: {joined_txt}",
+                                    inline=True,
+                                )
+                            except Exception:
+                                pass
+
+                            # Optional: include cached Whop membership link (from RSCheckerbot) when available
+                            try:
+                                whop_link = self._get_rschecker_whop_link(member.id)
+                                dash = str(whop_link.get("dashboard_url") or "").strip()
+                                if dash or (isinstance(whop_link.get("whop_brief"), dict) and whop_link.get("whop_brief")):
+                                    lines = []
+                                    brief = whop_link.get("whop_brief") if isinstance(whop_link, dict) else None
+                                    if isinstance(brief, dict):
+                                        product = str(brief.get("product") or "").strip()
+                                        status = str(brief.get("status") or "").strip()
+                                        renewal_end = str(brief.get("renewal_end") or "").strip()
+                                        total_spent = str(brief.get("total_spent") or "").strip()
+                                        cancel_end = str(brief.get("cancel_at_period_end") or "").strip()
+                                        if product:
+                                            lines.append(f"product: {product}")
+                                        if status:
+                                            lines.append(f"status: {status}")
+                                        if renewal_end:
+                                            lines.append(f"renewal_end: {renewal_end}")
+                                        if cancel_end:
+                                            lines.append(f"cancel_at_period_end: {cancel_end}")
+                                        if total_spent:
+                                            lines.append(f"total_spent: {total_spent}")
+                                    if dash:
+                                        # dashboard_url may already be markdown; keep as-is.
+                                        lines.append(f"dashboard: {dash}")
+                                    embed.add_field(name="Whop", value=("\n".join(lines)[:1024] or "—"), inline=False)
+                            except Exception:
+                                pass
+
+                            # Optional: returning member detection (RSCheckerbot runtime history)
+                            try:
+                                hist = self._get_rschecker_member_history(member.id)
+                                if isinstance(hist, dict) and hist:
+                                    join_count = int(hist.get("join_count", 0) or 0)
+                                    last_leave_ts = hist.get("last_leave_ts")
+                                    first_join_ts = hist.get("first_join_ts")
+                                    acc = hist.get("access") if isinstance(hist.get("access"), dict) else {}
+                                    returning = bool(join_count > 1 or last_leave_ts)
+
+                                    def _fmt_ts(ts: object, style: str) -> str:
+                                        try:
+                                            return f"<t:{int(ts)}:{style}>"
+                                        except Exception:
+                                            return "—"
+
+                                    embed.add_field(
+                                        name="Returning",
+                                        value=(
+                                            f"{'Yes' if returning else 'No'}\n"
+                                            f"Joins: {join_count if join_count else '—'}\n"
+                                            f"Last left: {_fmt_ts(last_leave_ts, 'R') if last_leave_ts else '—'}\n"
+                                            f"First joined: {_fmt_ts(first_join_ts, 'D') if first_join_ts else '—'}\n"
+                                            f"Ever had Member: {'yes' if acc.get('ever_had_member_role') is True else 'no'}"
+                                        )[:1024],
+                                        inline=False,
+                                    )
+                            except Exception:
+                                pass
+
                             if welcome_ping_user_id:
                                 embed.add_field(
                                     name="Notification",
@@ -895,7 +1062,7 @@ class RSOnboardingBot:
                                 text=f"🎫 RS Onboarding Bot | Tickets: {self.stats['tickets_created']} created, {self.stats['tickets_closed']} closed"
                             )
                             await welcome_log_channel.send(embed=embed)
-                        except Exception:
+                        except Exception as e:
                             # Fallback to plain text if embed fails
                             try:
                                 log_msg = self.config.get(
@@ -908,8 +1075,19 @@ class RSOnboardingBot:
                                     ticket=ticket
                                 )
                                 await welcome_log_channel.send(formatted_msg)
-                            except Exception:
-                                pass
+                            except Exception as fallback_e:
+                                try:
+                                    print(
+                                        f"{Colors.YELLOW}[Warn] Failed to send welcome log message "
+                                        f"to channel {welcome_log_channel_id}: {fallback_e}{Colors.RESET}"
+                                    )
+                                except Exception:
+                                    pass
+                                await self.log_error(
+                                    guild,
+                                    f"Failed to send welcome log message to channel {welcome_log_channel_id}: {fallback_e}",
+                                    context=f"open_onboarding_ticket - welcome_log (embed also failed: {e})",
+                                )
 
                 await self.log_action(
                     guild,

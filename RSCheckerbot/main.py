@@ -2470,12 +2470,37 @@ async def on_member_join(member: discord.Member):
             footer=f"ID: {member.id}",
             color=0x5865F2,
         )
+        try:
+            # Returning member signal: join_count>1 OR we have a recorded leave timestamp.
+            join_count = int(rec.get("join_count", 0) or 0)
+        except Exception:
+            join_count = 0
+        last_leave_ts = rec.get("last_leave_ts")
+        acc = rec.get("access") if isinstance(rec.get("access"), dict) else {}
+        returning = bool(join_count > 1 or last_leave_ts)
+
+        join_embed.add_field(name="Returning", value=("Yes" if returning else "No"), inline=True)
+        join_embed.add_field(name="Joins", value=(str(join_count) if join_count else "—"), inline=True)
+        join_embed.add_field(
+            name="Last left",
+            value=(_fmt_ts(last_leave_ts, "R") if last_leave_ts else "—"),
+            inline=True,
+        )
+        join_embed.add_field(
+            name="History",
+            value=(
+                f"First joined: {_fmt_ts(rec.get('first_join_ts'), 'D')}\n"
+                f"Ever had Member: {'yes' if acc.get('ever_had_member_role') is True else 'no'}"
+            )[:1024],
+            inline=False,
+        )
         join_embed.add_field(name="Welcome", value=("Yes" if has_welcome else "No"), inline=True)
         join_embed.add_field(name="Checked roles", value=checked_note, inline=True)
         join_embed.add_field(name="Next", value="Will verify again in 60s", inline=False)
         if current_role_names and current_role_names != "—":
             join_embed.add_field(name="Current roles", value=current_role_names[:1024], inline=False)
-        await log_role_event(embed=join_embed)
+        # This is a join log (not a role event). Route to the join-logs channel (log_first).
+        await log_first(embed=join_embed)
         asyncio.create_task(check_and_assign_role(member))
 
         # If we detected a tracked invite, mark it used (non-destructive; persists metadata for audit).

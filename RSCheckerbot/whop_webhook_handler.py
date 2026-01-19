@@ -103,6 +103,7 @@ def _cache_discord_membership_link(
     whop_member_id: str = "",
     whop_user_id: str = "",
     dashboard_url: str = "",
+    whop_brief: dict | None = None,
     source_event: str = "",
 ) -> None:
     did = str(discord_id or "").strip()
@@ -120,6 +121,39 @@ def _cache_discord_membership_link(
         rec["whop_user_id"] = str(whop_user_id or "").strip()
     if dashboard_url:
         rec["dashboard_url"] = str(dashboard_url or "").strip()
+    if isinstance(whop_brief, dict) and whop_brief:
+        # Store a sanitized, staff-safe subset (no emails/names).
+        safe = {}
+        for k in (
+            "status",
+            "product",
+            "member_since",
+            "trial_end",
+            "renewal_start",
+            "renewal_end",
+            "renewal_end_iso",
+            "remaining_days",
+            "manage_url",
+            "dashboard_url",
+            "cancel_at_period_end",
+            "is_first_membership",
+            "last_payment_method",
+            "last_payment_type",
+            "last_payment_failure",
+            "last_success_paid_at_iso",
+            "last_success_paid_at",
+            "total_spent",
+        ):
+            try:
+                v = whop_brief.get(k)
+            except Exception:
+                v = None
+            # Keep values small and JSON-safe.
+            if isinstance(v, (int, float, bool)) or v is None:
+                safe[k] = v
+            else:
+                safe[k] = str(v)[:500]
+        rec["whop_brief"] = safe
     rec["updated_at"] = datetime.now(timezone.utc).isoformat()
     rec["source_event"] = str(source_event or "").strip()
     by[did] = rec
@@ -286,6 +320,7 @@ async def _whop_brief_from_event(member: discord.Member, event_data: dict) -> di
                 whop_member_id=str(brief.get("whop_member_id") or "").strip(),
                 whop_user_id=str(brief.get("whop_user_id") or "").strip(),
                 dashboard_url=str(brief.get("dashboard_url") or "").strip(),
+                whop_brief=brief,
                 source_event=str(event_data.get("event_type") or "").strip(),
             )
     except Exception:
