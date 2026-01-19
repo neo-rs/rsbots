@@ -216,7 +216,8 @@ def build_case_minimal_embed(
     apply_member_header(embed, member)
 
     # Row 1 (inline x3)
-    _add_field(embed, "Member", member.mention, inline=True)
+    # Use profile link (clickable) without pings (allowed_mentions is disabled at send time).
+    _add_field(embed, "Member", f"[{str(member)}](https://discord.com/users/{member.id})", inline=True)
     _add_field(embed, "Discord ID", f"`{member.id}`", inline=True)
     _add_field(embed, _human_label("access_roles"), access_roles, inline=True)
 
@@ -266,7 +267,8 @@ def build_member_status_detailed_embed(
     apply_member_header(embed, member)
 
     # Header row (inline x3)
-    _add_field(embed, "Member", member.mention, inline=True)
+    # Use profile link (clickable) without pings (allowed_mentions is disabled at send time).
+    _add_field(embed, "Member", f"[{str(member)}](https://discord.com/users/{member.id})", inline=True)
     _add_field(embed, "Discord ID", f"`{member.id}`", inline=True)
     _add_field(embed, _human_label("access_roles"), access_roles, inline=True)
 

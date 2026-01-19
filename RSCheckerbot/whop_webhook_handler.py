@@ -670,48 +670,6 @@ def _backfill_identity_cache() -> None:
     except Exception as e:
         log.error(f"Identity backfill failed: {e}", exc_info=True)
 
-async def _send_lookup_request(message: discord.Message, event_type: str, email: str, whop_user_id: str = "", membership_id: str = ""):
-    """
-    Posts a 'lookup needed' message into #member-status-logs so staff/bots can resolve identity.
-    Only posts if identity is not already cached.
-    """
-    if not MEMBER_STATUS_LOGS_CHANNEL_ID or not message.guild:
-        return
-    ch = message.guild.get_channel(MEMBER_STATUS_LOGS_CHANNEL_ID)
-    if not ch:
-        return
-
-    email_n = _norm_email(email)
-    cached = _lookup_identity(email_n)
-
-    if cached and cached.get("discord_id"):
-        # already resolved, no lookup needed
-        return
-
-    lines = []
-    lines.append("🔎 **Lookup Needed (Whop → Discord)**")
-    lines.append(f"• Event: `{event_type}`")
-    if email_n:
-        lines.append(f"• Email: `{email_n}`")
-    try:
-        if getattr(message, "jump_url", None):
-            lines.append(f"• Source message: {message.jump_url}")
-    except Exception:
-        pass
-    lines.append("")
-    lines.append("Action:")
-    # Use channel mention format (resolves to actual channel name, no hardcoded text)
-    # WHOP_LOGS_CHANNEL_ID is available as a global from initialize()
-    whop_logs_mention = f"<#{WHOP_LOGS_CHANNEL_ID}>" if WHOP_LOGS_CHANNEL_ID else "Whop logs channel"
-    lines.append(f"• Check {whop_logs_mention} native Whop event (Discord ID field) or forwarder logs")
-    lines.append("• Once found, link it (email ↔ discord_id)")
-    lines.append("")
-    lines.append("Why this happens:")
-    lines.append("• User has not linked Discord to Whop yet, OR the workflow didn't pass discord_user_id")
-    lines.append("• If this was a paid event, treat as urgent: member may have paid but won't be auto-verified")
-
-    await ch.send("\n".join(lines))
-
 def _record_trial_event(email: str, discord_id: str, membership_id: str, trial_days: str, is_first_membership: str, event_type: str) -> dict:
     """
     Store trial activity and detect suspicious patterns.
@@ -1107,14 +1065,6 @@ async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embe
                     f"**Message ID:** {message.id}"
                 )
 
-            # Request a lookup in #member-status-logs
-            await _send_lookup_request(
-                message=message,
-                event_type=event_type,
-                email=email,
-                whop_user_id=event_data.get("user_id", ""),
-                membership_id=event_data.get("membership_id", ""),
-            )
             return
         
         # Get guild and member
@@ -1246,18 +1196,6 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
             if cached_id and cached_id.isdigit():
                 discord_id_str = cached_id
             else:
-                # Still surface this to staff so it doesn't look like the bot is dead,
-                # but do NOT spam member-role-logs / bot-logs.
-                try:
-                    await _send_lookup_request(
-                        message=message,
-                        event_type=f"native:{event_type or 'unknown'}",
-                        email=str(email_value or "").strip(),
-                        whop_user_id="",
-                        membership_id=membership_id_hint,
-                    )
-                except Exception:
-                    pass
                 return
         
         # Extract numeric Discord ID

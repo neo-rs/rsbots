@@ -36,6 +36,32 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 - **Returns**: Confirmation message (auto-deletes after 5 seconds)
 - **Note**: Command message is auto-deleted
 
+#### `.checker report`
+- **Description**: Generate a reporting summary for a date range (from `member-status-logs` derived store) and DM it
+- **Aliases**: `reports`
+- **Parameters**:
+  - `start` (optional): Start date `YYYY-MM-DD`
+  - `end` (optional): End date `YYYY-MM-DD` (inclusive)
+- **Usage**:
+  - `.checker report` (last 7 days)
+  - `.checker report 2026-01-01` (from date → now)
+  - `.checker report 2026-01-01 2026-01-07` (inclusive range)
+- **Admin Only**: Yes (requires administrator permissions)
+- **Returns**: Report embed via DM (to Neo from config + to the invoker), plus a short confirmation (auto-deletes)
+- **Note**: Report reads the bounded runtime `reporting_store.json` (no raw Whop channel ingestion)
+
+#### `.checker backfillstatus`
+- **Description**: One-time scan of `member-status-logs` history into `reporting_store.json` so reports can be generated immediately
+- **Aliases**: `backfill`, `backfilllogs`
+- **Parameters**:
+  - `start`: Start date `YYYY-MM-DD` (recommended)
+  - `end`: End date `YYYY-MM-DD` (recommended, inclusive by date)
+  - `confirm`: Must be exactly `confirm` to run (required)
+- **Usage**:
+  - `.checker backfillstatus 2026-01-01 2026-01-31 confirm`
+- **Admin Only**: Yes (requires administrator permissions)
+- **Returns**: Progress + completion summary, then you can run `.checker report`
+
 #### `.checker purgecases`
 - **Description**: Delete legacy per-user payment case channels under the configured category
 - **Aliases**: `purgecasechannels`, `deletecases`, `deletecasechannels`

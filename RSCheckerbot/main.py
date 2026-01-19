@@ -2,11 +2,16 @@ import os
 import sys
 import json
 import asyncio
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import logging
 from typing import Dict, Optional
 from contextlib import suppress
+try:
+    from zoneinfo import ZoneInfo  # py3.9+
+except Exception:  # pragma: no cover
+    ZoneInfo = None  # type: ignore[assignment]
 
 # Ensure repo root is importable when executed as a script (matches Ubuntu run_bot.sh PYTHONPATH).
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +58,24 @@ from whop_webhook_handler import (
 # Import Whop API client
 from whop_api_client import WhopAPIClient, WhopAPIError
 
+# Reporting store (runtime JSON; persisted only for member-status-logs output)
+try:
+    from reporting_store import (
+        load_store as _report_load_store,
+        save_store as _report_save_store,
+        prune_store as _report_prune_store,
+        record_member_status_post as _report_record_member_status_post,
+        week_keys_between as _report_week_keys_between,
+        summarize_counts as _report_summarize_counts,
+    )
+except Exception:
+    _report_load_store = None
+    _report_save_store = None
+    _report_prune_store = None
+    _report_record_member_status_post = None
+    _report_week_keys_between = None
+    _report_summarize_counts = None
+
 # -----------------------------
 # RSCheckerbot Rules
 # -----------------------------
@@ -74,6 +97,491 @@ def load_config():
     return config
 
 config = load_config()
+
+# -----------------------------
+# Reporting config (validated early; must not crash bot)
+# -----------------------------
+def _load_reporting_config(cfg: dict) -> dict:
+    """Parse reporting config with safe defaults (never raises)."""
+    base = cfg.get("reporting") if isinstance(cfg, dict) else None
+    base = base if isinstance(base, dict) else {}
+
+    def _as_bool(v: object) -> bool:
+        if isinstance(v, bool):
+            return v
+        s = str(v or "").strip().lower()
+        return s in {"1", "true", "yes", "y", "on"}
+
+    def _as_int(v: object) -> int | None:
+        try:
+            s = str(v).strip()
+            if not s:
+                return None
+            return int(s)
+        except Exception:
+            return None
+
+    def _as_str(v: object) -> str:
+        return str(v or "").strip()
+
+    enabled = _as_bool(base.get("enabled", False))
+    dm_user_id = _as_int(base.get("dm_user_id"))
+    tz = _as_str(base.get("timezone") or "America/New_York") or "America/New_York"
+    report_time = _as_str(base.get("report_time_local") or "09:00") or "09:00"
+    weekly_day = _as_str(base.get("weekly_day_local") or "mon").lower() or "mon"
+    retention_weeks = _as_int(base.get("retention_weeks")) or 26
+    reminder_days = base.get("reminder_days_before_cancel")
+
+    if not isinstance(reminder_days, list):
+        reminder_days = [7, 3, 1]
+    cleaned_days: list[int] = []
+    for x in reminder_days:
+        xi = _as_int(x)
+        if isinstance(xi, int) and 0 <= xi <= 365:
+            cleaned_days.append(int(xi))
+    if not cleaned_days:
+        cleaned_days = [7, 3, 1]
+    cleaned_days = sorted(set(cleaned_days), reverse=True)
+
+    # Basic validation; on invalid config, disable reporting but keep bot running.
+    if enabled and (dm_user_id is None or dm_user_id <= 0):
+        print("[Config] reporting.enabled=true but reporting.dm_user_id is missing/invalid; disabling reporting.")
+        enabled = False
+    if retention_weeks < 4 or retention_weeks > 260:
+        print("[Config] reporting.retention_weeks out of range (4..260); using 26.")
+        retention_weeks = 26
+    if weekly_day not in {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}:
+        print("[Config] reporting.weekly_day_local invalid; using 'mon'.")
+        weekly_day = "mon"
+
+    return {
+        "enabled": bool(enabled),
+        "dm_user_id": dm_user_id or 0,
+        "timezone": tz,
+        "report_time_local": report_time,
+        "weekly_day_local": weekly_day,
+        "retention_weeks": int(retention_weeks),
+        "reminder_days_before_cancel": cleaned_days,
+    }
+
+REPORTING_CONFIG = _load_reporting_config(config)
+_REPORTING_STORE: dict | None = None
+_REPORTING_STORE_LOCK: asyncio.Lock = asyncio.Lock()
+
+
+def _tz_now() -> datetime:
+    tz_name = str(REPORTING_CONFIG.get("timezone") or "UTC").strip() or "UTC"
+    if ZoneInfo is None:
+        return datetime.now(timezone.utc)
+    try:
+        return datetime.now(ZoneInfo(tz_name))
+    except Exception:
+        return datetime.now(timezone.utc)
+
+
+def _parse_hhmm(s: str) -> tuple[int, int]:
+    try:
+        txt = str(s or "").strip()
+        if ":" not in txt:
+            return (9, 0)
+        hh, mm = txt.split(":", 1)
+        h = max(0, min(int(hh), 23))
+        m = max(0, min(int(mm), 59))
+        return (h, m)
+    except Exception:
+        return (9, 0)
+
+
+def _weekday_idx(name: str) -> int:
+    m = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+    return int(m.get(str(name or "").strip().lower(), 0))
+
+
+async def _dm_user(user_id: int, *, embed: discord.Embed, content: str = "") -> bool:
+    """DM a user ID (best-effort)."""
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+    try:
+        user = bot.get_user(uid)
+        if user is None:
+            user = await bot.fetch_user(uid)
+        if user is None:
+            return False
+        await user.send(content=content or None, embed=embed)
+        return True
+    except Exception as e:
+        log.warning(f"[Reporting] Failed to DM user {user_id}: {e}")
+        return False
+
+
+def _load_reporting_store_sync() -> dict:
+    global _REPORTING_STORE
+    if _REPORTING_STORE is None:
+        if _report_load_store:
+            _REPORTING_STORE = _report_load_store(BASE_DIR, retention_weeks=int(REPORTING_CONFIG.get("retention_weeks", 26)))
+        else:
+            _REPORTING_STORE = {"meta": {}, "weeks": {}, "members": {}, "unlinked": {}}
+    return _REPORTING_STORE
+
+
+async def _save_reporting_store(store: dict) -> None:
+    global _REPORTING_STORE
+    _REPORTING_STORE = store
+    if _report_save_store:
+        _report_save_store(BASE_DIR, store)
+
+
+def _money_usd(v: object) -> float:
+    try:
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v or "").strip().replace("$", "").replace(",", "")
+        return float(s) if s else 0.0
+    except Exception:
+        return 0.0
+
+
+def _to_int(v: object) -> int | None:
+    try:
+        s = str(v).strip()
+        if not s:
+            return None
+        return int(s)
+    except Exception:
+        return None
+
+
+def _extract_reporting_from_member_status_embed(
+    sent_embed: discord.Embed,
+    *,
+    fallback_ts: int,
+) -> tuple[int, str, int | None, dict]:
+    """Extract (ts, kind, discord_id, whop_brief) from a member-status-logs embed."""
+    # Timestamp
+    ts_i = int(fallback_ts)
+    try:
+        if getattr(sent_embed, "timestamp", None):
+            ts_i = int(sent_embed.timestamp.replace(tzinfo=timezone.utc).timestamp())
+    except Exception:
+        pass
+
+    title = str(getattr(sent_embed, "title", "") or "").strip()
+    desc = str(getattr(sent_embed, "description", "") or "").strip()
+
+    discord_id: int | None = None
+    whop_brief: dict = {}
+
+    # Fields
+    try:
+        for f in (getattr(sent_embed, "fields", None) or []):
+            n = str(getattr(f, "name", "") or "").strip()
+            v = str(getattr(f, "value", "") or "").strip()
+            if not n:
+                continue
+            ln = n.lower()
+            if ln == "discord id" and discord_id is None:
+                m = re.search(r"(\d{17,19})", v)
+                if m:
+                    discord_id = int(m.group(1))
+            elif ln == "total spent":
+                whop_brief["total_spent"] = v
+            elif ln in {"membership", "product"}:
+                whop_brief["product"] = v
+            elif ln == "status":
+                whop_brief["status"] = v
+            elif ln in {"whop dashboard", "dashboard"}:
+                whop_brief["dashboard_url"] = v
+            elif ln in {"cancel at period end", "cancel_at_period_end"}:
+                whop_brief["cancel_at_period_end"] = v
+            elif ln in {"access ends on", "next billing date", "renewal end", "renewal_end"}:
+                # Best-effort: store ISO for reminders
+                whop_brief["renewal_end"] = v
+                m_ts = re.search(r"<t:(\d+):[A-Za-z]>", v)
+                if m_ts:
+                    whop_brief["renewal_end_iso"] = datetime.fromtimestamp(int(m_ts.group(1)), tz=timezone.utc).isoformat()
+                else:
+                    # Fall back to common "Month D, YYYY" format
+                    try:
+                        dt = datetime.strptime(v.replace(" 0", " "), "%B %d, %Y").replace(tzinfo=timezone.utc)
+                        whop_brief["renewal_end_iso"] = dt.isoformat()
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # Fallback discord id from description (e.g., "... (1234567890)")
+    if discord_id is None and desc:
+        m = re.search(r"\((\d{17,19})\)", desc)
+        if m:
+            discord_id = int(m.group(1))
+
+    # Kind inference from title/description (ONLY from member-status-logs outputs)
+    kind = "unknown"
+    t_low = title.lower()
+    d_low = desc.lower()
+    if "payment/onboarding complete" in d_low:
+        kind = "member_role_added"
+    elif "cancellation scheduled" in t_low:
+        kind = "cancellation_scheduled"
+    elif "payment failed" in t_low:
+        kind = "payment_failed"
+    elif "membership deactivated" in t_low or "deactivated" in t_low:
+        kind = "deactivated"
+    elif "member joined" in t_low:
+        kind = "member_joined"
+
+    return (ts_i, kind, discord_id, whop_brief)
+
+
+def _parse_dt_iso_any(v: object) -> datetime | None:
+    try:
+        if v is None or v == "":
+            return None
+        if isinstance(v, (int, float)):
+            return datetime.fromtimestamp(float(v), tz=timezone.utc)
+        s = str(v).strip()
+        if not s:
+            return None
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+async def _compute_total_earned_usd(start_utc: datetime, end_utc: datetime, discord_ids: list[int]) -> tuple[float | None, str]:
+    """Best-effort total earned within range (bounded). Returns (total, note)."""
+    if not whop_api_client:
+        return (None, "Whop API client unavailable")
+    mids: list[str] = []
+    for did in discord_ids:
+        try:
+            mid = str(get_cached_whop_membership_id(int(did)) or "").strip()
+        except Exception:
+            mid = ""
+        if mid and mid not in mids:
+            mids.append(mid)
+    # Hard cap to protect rate limits / runtime.
+    cap = 50
+    if len(mids) > cap:
+        return (None, f"skipped (too many memberships: {len(mids)})")
+
+    total = 0.0
+    for mid in mids:
+        try:
+            pays = await whop_api_client.get_payments_for_membership(mid)
+        except Exception:
+            continue
+        for p in (pays or []):
+            if not isinstance(p, dict):
+                continue
+            st = str(p.get("status") or "").strip().lower()
+            if st not in {"succeeded", "paid", "successful", "success"}:
+                continue
+            ts = p.get("paid_at") or p.get("created_at") or ""
+            dt = _parse_dt_iso_any(ts)
+            if not dt:
+                continue
+            if dt < start_utc or dt > end_utc:
+                continue
+            amt = p.get("usd_total") or p.get("total") or p.get("subtotal") or p.get("amount_after_fees")
+            total += _money_usd(amt)
+    return (total, "")
+
+
+@tasks.loop(seconds=60)
+async def reporting_loop() -> None:
+    """Weekly report + daily reminders (DM Neo)."""
+    try:
+        if not bot.is_ready():
+            return
+        if not REPORTING_CONFIG.get("enabled"):
+            return
+        if not MEMBER_STATUS_LOGS_CHANNEL_ID:
+            return
+        now_local = _tz_now()
+        hh, mm = _parse_hhmm(str(REPORTING_CONFIG.get("report_time_local") or "09:00"))
+        if now_local.hour != hh or now_local.minute != mm:
+            return
+
+        dm_uid = int(REPORTING_CONFIG.get("dm_user_id") or 0)
+        if not dm_uid:
+            return
+
+        weekly_day = _weekday_idx(str(REPORTING_CONFIG.get("weekly_day_local") or "mon"))
+        today_local = now_local.date().isoformat()
+        today_wd = int(now_local.weekday())
+
+        async with _REPORTING_STORE_LOCK:
+            store = _load_reporting_store_sync()
+            meta = store.get("meta") if isinstance(store.get("meta"), dict) else {}
+            store["meta"] = meta
+
+            # Daily reminders (once per day)
+            last_rem = str(meta.get("last_daily_reminder_date") or "")
+            should_daily = last_rem != today_local
+            if should_daily:
+                meta["last_daily_reminder_date"] = today_local
+                await _save_reporting_store(store)
+
+        # Run daily reminders outside lock (will re-lock for per-member reminder writes)
+        if should_daily:
+            await _run_daily_cancel_reminders(dm_uid)
+
+        # Weekly report (once per date, only on weekly day)
+        if today_wd == weekly_day:
+            async with _REPORTING_STORE_LOCK:
+                store = _load_reporting_store_sync()
+                meta = store.get("meta") if isinstance(store.get("meta"), dict) else {}
+                store["meta"] = meta
+                last_weekly = str(meta.get("last_weekly_report_date") or "")
+                should_weekly = last_weekly != today_local
+                if should_weekly:
+                    meta["last_weekly_report_date"] = today_local
+                    await _save_reporting_store(store)
+            if should_weekly:
+                await _run_weekly_report(dm_uid, now_local=now_local)
+    except Exception as e:
+        log.warning(f"[Reporting] reporting_loop error: {e}")
+
+
+async def _run_weekly_report(dm_uid: int, *, now_local: datetime) -> None:
+    # Range: last 7 days ending now (UTC)
+    end_utc = now_local.astimezone(timezone.utc)
+    start_utc = end_utc - timedelta(days=7)
+    e = await _build_report_embed(start_utc, end_utc, title_prefix="RS Weekly Report")
+    await _dm_user(dm_uid, embed=e)
+
+
+async def _build_report_embed(start_utc: datetime, end_utc: datetime, *, title_prefix: str = "RS Report") -> discord.Embed:
+    async with _REPORTING_STORE_LOCK:
+        store = _load_reporting_store_sync()
+        if _report_prune_store:
+            store = _report_prune_store(store, retention_weeks=int(REPORTING_CONFIG.get("retention_weeks", 26)))
+            await _save_reporting_store(store)
+
+    counts: dict[str, int] = {}
+    if _report_week_keys_between and _report_summarize_counts:
+        keys = _report_week_keys_between(int(start_utc.timestamp()), int(end_utc.timestamp()))
+        async with _REPORTING_STORE_LOCK:
+            store = _load_reporting_store_sync()
+            counts = _report_summarize_counts(store, keys)
+
+    # Candidate discord_ids for total earned (only members touched in range)
+    discord_ids: list[int] = []
+    async with _REPORTING_STORE_LOCK:
+        store = _load_reporting_store_sync()
+        members = store.get("members") if isinstance(store.get("members"), dict) else {}
+        for did_s, rec in members.items():
+            if not isinstance(rec, dict):
+                continue
+            did = _to_int(did_s)
+            if not did:
+                continue
+            last_seen = _to_int(rec.get("last_seen_ts"))
+            if last_seen and start_utc.timestamp() <= float(last_seen) <= end_utc.timestamp():
+                discord_ids.append(int(did))
+
+    total_earned, note = await _compute_total_earned_usd(start_utc, end_utc, discord_ids)
+
+    title = f"{title_prefix} ({start_utc.date().isoformat()} → {end_utc.date().isoformat()})"
+    e = discord.Embed(title=title, color=0x5865F2, timestamp=datetime.now(timezone.utc))
+
+    e.add_field(name="New Members (onboarding complete)", value=str(counts.get("new_members", 0)), inline=True)
+    e.add_field(name="New Trials", value=str(counts.get("new_trials", 0)), inline=True)
+    e.add_field(name="Cancelled Members", value=str(counts.get("cancelled_members", 0)), inline=True)
+    e.add_field(name="Churn", value=str(counts.get("churn", 0)), inline=True)
+    e.add_field(name="Payment Failed", value=str(counts.get("payment_failed", 0)), inline=True)
+
+    # Unlinked (lookup-needed) counters (still derived from member-status-logs output)
+    if any(k.startswith("unlinked_") for k in counts.keys()):
+        lines = []
+        for k in ("unlinked_payment_failed", "unlinked_cancelled_members", "unlinked_cancellation_scheduled", "unlinked_new_trials"):
+            if k in counts:
+                lines.append(f"{k}: {counts.get(k, 0)}")
+        if lines:
+            e.add_field(name="Unlinked (email-only) events", value="\n".join(lines)[:1024], inline=False)
+
+    if total_earned is None:
+        e.add_field(name="Total Earned (USD)", value=(note or "N/A")[:1024], inline=False)
+    else:
+        e.add_field(name="Total Earned (USD)", value=f"${total_earned:,.2f}", inline=False)
+
+    e.set_footer(text="RSCheckerbot • Reporting")
+    return e
+
+
+async def _run_daily_cancel_reminders(dm_uid: int) -> None:
+    now_local = _tz_now()
+    today = now_local.date()
+    days = REPORTING_CONFIG.get("reminder_days_before_cancel") or [7, 3, 1]
+    try:
+        days = [int(x) for x in days]
+    except Exception:
+        days = [7, 3, 1]
+
+    rows: list[str] = []
+    to_mark: list[tuple[int, int]] = []  # (discord_id, day)
+
+    async with _REPORTING_STORE_LOCK:
+        store = _load_reporting_store_sync()
+        members = store.get("members") if isinstance(store.get("members"), dict) else {}
+        for did_s, rec in members.items():
+            if not isinstance(rec, dict):
+                continue
+            did = _to_int(did_s)
+            if not did:
+                continue
+            if rec.get("churned_at"):
+                continue
+            end_ts = _to_int(rec.get("cancel_scheduled_end_ts"))
+            if not end_ts:
+                continue
+            end_dt_local = datetime.fromtimestamp(int(end_ts), tz=timezone.utc).astimezone(now_local.tzinfo or timezone.utc)
+            delta_days = (end_dt_local.date() - today).days
+            if delta_days not in days:
+                continue
+            rem = rec.get("reminders") if isinstance(rec.get("reminders"), dict) else {}
+            last = str(rem.get(str(delta_days)) or "")
+            if last == today.isoformat():
+                continue
+
+            # Build a clickable profile link without pings
+            rows.append(f"- [user_{did}](https://discord.com/users/{did}) ends <t:{int(end_ts)}:D> (in {delta_days}d)")
+            to_mark.append((int(did), int(delta_days)))
+
+        # Mark reminders as sent (persist)
+        if to_mark:
+            for did, day in to_mark:
+                rec = members.get(str(did))
+                if not isinstance(rec, dict):
+                    continue
+                rem = rec.get("reminders")
+                if not isinstance(rem, dict):
+                    rem = {}
+                rem[str(day)] = today.isoformat()
+                rec["reminders"] = rem
+                members[str(did)] = rec
+            store["members"] = members
+            if _report_save_store:
+                _report_save_store(BASE_DIR, store)
+            global _REPORTING_STORE
+            _REPORTING_STORE = store
+
+    if not rows:
+        return
+
+    e = discord.Embed(
+        title="Cancellation Reminders",
+        description="\n".join(rows)[:4000],
+        color=0xFEE75C,
+        timestamp=datetime.now(timezone.utc),
+    )
+    e.set_footer(text="RSCheckerbot • Reporting")
+    await _dm_user(dm_uid, embed=e)
 
 # -----------------------------
 # ENV / CONSTANTS
@@ -1255,6 +1763,42 @@ async def log_member_status(msg: str, embed: discord.Embed = None, *, channel_na
     if not ch:
         return
 
+    async def _maybe_capture_for_reporting(sent_embed: discord.Embed, *, sent_channel_id: int) -> None:
+        """Persist only member-status-logs output into the reporting store (bounded)."""
+        if not REPORTING_CONFIG.get("enabled"):
+            return
+        if not MEMBER_STATUS_LOGS_CHANNEL_ID or int(sent_channel_id) != int(MEMBER_STATUS_LOGS_CHANNEL_ID):
+            return
+        if not (_report_load_store and _report_save_store and _report_prune_store and _report_record_member_status_post):
+            return
+
+        ts_i, kind, discord_id, whop_brief = _extract_reporting_from_member_status_embed(
+            sent_embed,
+            fallback_ts=int(datetime.now(timezone.utc).timestamp()),
+        )
+
+        # Load, record, prune, save (bounded)
+        try:
+            async with _REPORTING_STORE_LOCK:
+                global _REPORTING_STORE
+                if _REPORTING_STORE is None:
+                    _REPORTING_STORE = _report_load_store(BASE_DIR, retention_weeks=int(REPORTING_CONFIG.get("retention_weeks", 26)))
+                _REPORTING_STORE = _report_record_member_status_post(
+                    _REPORTING_STORE,
+                    ts=ts_i,
+                    event_kind=kind,
+                    discord_id=discord_id,
+                    email="",
+                    whop_brief=whop_brief or None,
+                )
+                _REPORTING_STORE = _report_prune_store(
+                    _REPORTING_STORE,
+                    retention_weeks=int(REPORTING_CONFIG.get("retention_weeks", 26)),
+                )
+                _report_save_store(BASE_DIR, _REPORTING_STORE)
+        except Exception as e:
+            log.warning(f"[Reporting] failed to persist member-status entry: {e}")
+
     try:
         # Use provided embed or create default one
         if embed is None:
@@ -1265,7 +1809,12 @@ async def log_member_status(msg: str, embed: discord.Embed = None, *, channel_na
             )
             embed.set_footer(text="RSCheckerbot • Member Status Tracking")
         # Mentions should be clickable but MUST NOT ping users.
-        return await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        sent = await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        try:
+            await _maybe_capture_for_reporting(embed, sent_channel_id=int(ch.id))
+        except Exception:
+            pass
+        return sent
     except Exception:
         return None
 
@@ -2246,6 +2795,12 @@ async def on_ready():
             sync_whop_memberships.start()
             log.info(f"[Whop Sync] Membership sync job started (every {sync_interval} hours)")
 
+    # Start reporting loop (weekly report + daily reminders) if enabled
+    if REPORTING_CONFIG.get("enabled"):
+        if not reporting_loop.is_running():
+            reporting_loop.start()
+            log.info("[Reporting] Reporting loop started")
+
 
 async def _ensure_whop_resolution_channels(guild: discord.Guild) -> None:
     """Ensure dispute/resolution channels exist under configured category (best-effort)."""
@@ -3116,6 +3671,181 @@ async def cleanup_data(ctx):
         await ctx.message.delete()
     except Exception:
         pass
+
+
+def _parse_date_ymd(s: str) -> datetime | None:
+    try:
+        txt = str(s or "").strip()
+        if not txt:
+            return None
+        d = datetime.strptime(txt, "%Y-%m-%d").date()
+        # Interpret dates in reporting timezone, then convert to UTC later.
+        if ZoneInfo is None:
+            return datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+        tz_name = str(REPORTING_CONFIG.get("timezone") or "UTC").strip() or "UTC"
+        tz = ZoneInfo(tz_name)
+        return datetime(d.year, d.month, d.day, tzinfo=tz)
+    except Exception:
+        return None
+
+
+@bot.command(name="report", aliases=["reports"])
+@commands.has_permissions(administrator=True)
+async def checker_report(ctx, start: str = "", end: str = ""):
+    """Generate a report for a date range and DM it (Neo + invoker).
+
+    Usage:
+      .checker report
+      .checker report 2026-01-01
+      .checker report 2026-01-01 2026-01-07
+    """
+    try:
+        start_dt = _parse_date_ymd(start) if start else None
+        end_dt = _parse_date_ymd(end) if end else None
+
+        now_local = _tz_now()
+        if start_dt is None and end_dt is None:
+            end_utc = now_local.astimezone(timezone.utc)
+            start_utc = end_utc - timedelta(days=7)
+        else:
+            # If only one date is provided, treat it as start, end = now.
+            if start_dt is None and end_dt is not None:
+                start_dt, end_dt = end_dt, None
+            if start_dt is None:
+                start_dt = now_local
+            if end_dt is None:
+                end_dt = now_local
+            # end is inclusive by date; bump to end-of-day local
+            end_dt = end_dt.replace(hour=23, minute=59, second=59)
+            start_utc = start_dt.astimezone(timezone.utc)
+            end_utc = end_dt.astimezone(timezone.utc)
+
+        e = await _build_report_embed(start_utc, end_utc, title_prefix="RS Manual Report")
+
+        # DM Neo (configured) and also DM the invoker
+        dm_uid = int(REPORTING_CONFIG.get("dm_user_id") or 0)
+        if dm_uid:
+            await _dm_user(dm_uid, embed=e)
+        with suppress(Exception):
+            await ctx.author.send(embed=e)
+        await ctx.send("✅ Report sent (DM).", delete_after=10)
+    except Exception as ex:
+        await ctx.send(f"❌ Report error: {ex}", delete_after=15)
+    finally:
+        with suppress(Exception):
+            await ctx.message.delete()
+
+
+@bot.command(name="backfillstatus", aliases=["backfill", "backfilllogs"])
+@commands.has_permissions(administrator=True)
+async def backfill_member_status_logs(ctx, start: str = "", end: str = "", confirm: str = ""):
+    """One-time backfill: scan member-status-logs history into reporting_store.json.
+
+    Usage:
+      .checker backfillstatus 2026-01-01 2026-01-31 confirm
+    """
+    if str(confirm or "").strip().lower() != "confirm":
+        await ctx.send(
+            "❌ Confirmation required. Usage: `.checker backfillstatus 2026-01-01 2026-01-31 confirm`",
+            delete_after=20,
+        )
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    if not REPORTING_CONFIG.get("enabled"):
+        await ctx.send("❌ Reporting is disabled in config.", delete_after=15)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    if not (MEMBER_STATUS_LOGS_CHANNEL_ID and _report_record_member_status_post and _report_prune_store and _report_save_store):
+        await ctx.send("❌ Reporting store is not available or member-status-logs channel is not set.", delete_after=20)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    ch_raw = bot.get_channel(int(MEMBER_STATUS_LOGS_CHANNEL_ID))
+    if not isinstance(ch_raw, discord.TextChannel):
+        await ctx.send("❌ member-status-logs channel not found / not a text channel.", delete_after=20)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    start_dt = _parse_date_ymd(start) if start else None
+    end_dt = _parse_date_ymd(end) if end else None
+    now_local = _tz_now()
+    if start_dt is None:
+        # Default to first day of current month (reporting tz)
+        start_dt = now_local.replace(day=1, hour=0, minute=0, second=0)
+    if end_dt is None:
+        end_dt = now_local
+    end_dt = end_dt.replace(hour=23, minute=59, second=59)
+
+    start_utc = start_dt.astimezone(timezone.utc)
+    end_utc = end_dt.astimezone(timezone.utc)
+
+    status_msg = await ctx.send(
+        f"⏳ Backfill started for <#{MEMBER_STATUS_LOGS_CHANNEL_ID}> "
+        f"({start_utc.date().isoformat()} → {end_utc.date().isoformat()}).",
+        delete_after=3600,
+    )
+
+    # Fresh store for the scanned window (one-time rebuild)
+    retention = int(REPORTING_CONFIG.get("retention_weeks", 26))
+    store: dict = {
+        "meta": {"version": 1, "retention_weeks": retention, "backfill_range": f"{start_utc.date()}→{end_utc.date()}"},
+        "weeks": {},
+        "members": {},
+        "unlinked": {},
+    }
+
+    scanned = 0
+    captured = 0
+    last_edit = datetime.now(timezone.utc)
+
+    async for m in ch_raw.history(after=start_utc, before=(end_utc + timedelta(seconds=1)), limit=None, oldest_first=True):
+        scanned += 1
+        # Only backfill RSCheckerbot outputs (avoid user chatter / other bots)
+        if not bot.user or m.author.id != bot.user.id:
+            continue
+        if not m.embeds:
+            continue
+        emb = m.embeds[0]
+        fallback_ts = int(m.created_at.replace(tzinfo=timezone.utc).timestamp())
+        ts_i, kind, discord_id, whop_brief = _extract_reporting_from_member_status_embed(emb, fallback_ts=fallback_ts)
+
+        store = _report_record_member_status_post(
+            store,
+            ts=ts_i,
+            event_kind=kind,
+            discord_id=discord_id,
+            email="",
+            whop_brief=whop_brief or None,
+        )
+        captured += 1
+
+        # Update progress occasionally
+        if (captured % 200) == 0:
+            now = datetime.now(timezone.utc)
+            if (now - last_edit).total_seconds() >= 10:
+                last_edit = now
+                with suppress(Exception):
+                    await status_msg.edit(content=f"⏳ Backfill in progress… scanned {scanned}, captured {captured}")
+
+    store = _report_prune_store(store, retention_weeks=retention)
+
+    async with _REPORTING_STORE_LOCK:
+        global _REPORTING_STORE
+        _REPORTING_STORE = store
+        _report_save_store(BASE_DIR, store)
+
+    with suppress(Exception):
+        await status_msg.edit(content=f"✅ Backfill complete — scanned {scanned}, captured {captured}.")
+
+    await ctx.send(f"✅ Backfill complete — scanned {scanned}, captured {captured}. You can now run `.checker report`.", delete_after=25)
+    with suppress(Exception):
+        await ctx.message.delete()
 
 
 @bot.command(name="purgecases", aliases=["purgecasechannels", "deletecases", "deletecasechannels"])

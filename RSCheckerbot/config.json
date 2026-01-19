@@ -63,6 +63,17 @@
     "max_events_per_user": 50
   },
 
+  "reporting": {
+    "_comment": "Reporting + reminders (DM Neo). Runtime data is stored server-side and not synced.",
+    "enabled": true,
+    "dm_user_id": 971528709876113478,
+    "timezone": "America/New_York",
+    "report_time_local": "09:00",
+    "weekly_day_local": "mon",
+    "retention_weeks": 26,
+    "reminder_days_before_cancel": [7, 3, 1]
+  },
+
   "whop_enrichment": {
     "_comment": "Controls post-then-edit behavior for staff embeds when Whop link is not yet available.",
     "link_timeout_seconds": 90,

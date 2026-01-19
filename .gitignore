@@ -115,4 +115,17 @@ venv/
 **/*.sqlite
 **/*.sqlite3
 
+# RS bot runtime JSON (server-owned; never commit / never deploy)
+RSCheckerbot/queue.json
+RSCheckerbot/registry.json
+RSCheckerbot/invites.json
+RSCheckerbot/member_history.json
+RSCheckerbot/staff_alerts.json
+RSCheckerbot/payment_cache.json
+RSCheckerbot/whop_discord_link.json
+RSCheckerbot/whop_identity_cache.json
+RSCheckerbot/whop_webhook_raw_payloads.json
+RSCheckerbot/trial_history.json
+RSCheckerbot/reporting_store.json
 
+RSOnboarding/tickets.json
