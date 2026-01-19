@@ -22,8 +22,8 @@ BOT_TIMEOUT_SECONDS = 12
 BOT_SCRIPTS = [
     ("testcenter", "neonxt/bots/testcenter_bot.py"),
     ("datamanagerbot", "neonxt/bots/datamanagerbot.py"),
-    ("discumbot", "neonxt/bots/discumbot.py"),
-    ("pingbot", "neonxt/bots/pingbot.py"),
+    ("discumbot", "MWDiscumBot/discumbot.py"),
+    ("pingbot", "MWPingBot/pingbot.py"),
 ]
 
 

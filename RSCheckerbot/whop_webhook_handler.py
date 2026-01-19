@@ -693,6 +693,11 @@ async def _send_lookup_request(message: discord.Message, event_type: str, email:
     lines.append(f"• Event: `{event_type}`")
     if email_n:
         lines.append(f"• Email: `{email_n}`")
+    try:
+        if getattr(message, "jump_url", None):
+            lines.append(f"• Source message: {message.jump_url}")
+    except Exception:
+        pass
     lines.append("")
     lines.append("Action:")
     # Use channel mention format (resolves to actual channel name, no hardcoded text)
@@ -1181,6 +1186,28 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
         
         # Merge: embed fields take precedence, content as fallback
         parsed_data = {**content_data, **fields_data}
+
+        # Extract membership status and event type (usable even when Discord ID is missing)
+        membership_status = parsed_data.get("membership_status", "") or fields_data.get("membership status", "")
+        event_type = _determine_event_type_from_message(title, description, content, membership_status)
+
+        # Email can come from parsed content/fields; use best-effort and never crash on missing.
+        email_value = (
+            parsed_data.get("email")
+            or fields_data.get("membership status", {}).get("email", "") if isinstance(fields_data.get("membership status"), dict) else ""
+            or fields_data.get("email")
+            or fields_data.get("Email")
+            or ""
+        )
+
+        # Attempt best-effort membership id hint (do NOT log; only for internal correlation)
+        membership_id_hint = ""
+        try:
+            whop_key = str(parsed_data.get("whop_key") or parsed_data.get("key") or "").strip()
+            if whop_key.startswith(("mem_", "R-")):
+                membership_id_hint = whop_key
+        except Exception:
+            membership_id_hint = ""
         
         # Extract Discord ID
         discord_id_str = None
@@ -1207,6 +1234,27 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
         
         if not discord_id_str or discord_id_str == "No Discord":
             log.info(f"Native Whop message has no Discord ID: {title}")
+            # Still surface this to staff so it doesn't look like the bot is dead.
+            try:
+                await _send_lookup_request(
+                    message=message,
+                    event_type=f"native:{event_type or 'unknown'}",
+                    email=str(email_value or "").strip(),
+                    whop_user_id="",
+                    membership_id=membership_id_hint,
+                )
+            except Exception:
+                pass
+            if _log_other:
+                try:
+                    await _log_other(
+                        f"⚠️ **Whop Native:** No Discord ID in event.\n"
+                        f"• Event: `{event_type or 'unknown'}`\n"
+                        f"• Email: `{str(email_value or '').strip() or '—'}`\n"
+                        f"• Source: {getattr(message, 'jump_url', '') or str(message.id)}"
+                    )
+                except Exception:
+                    pass
             return
         
         # Extract numeric Discord ID
@@ -1228,19 +1276,6 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
             # Still store in DB even if member not found
             member = None
         
-        # Extract membership status and event type
-        membership_status = parsed_data.get("membership_status", "") or fields_data.get("membership status", "")
-        event_type = _determine_event_type_from_message(title, description, content, membership_status)
-        
-        # Email can come from parsed content/fields; use best-effort and never crash on missing.
-        email_value = (
-            parsed_data.get("email")
-            or fields_data.get("membership status", {}).get("email", "") if isinstance(fields_data.get("membership status"), dict) else ""
-            or fields_data.get("email")
-            or fields_data.get("Email")
-            or ""
-        )
-
         # Cache identity mapping for enrichment (email -> discord_id)
         discord_username_value = (
             parsed_data.get("discord_username")
