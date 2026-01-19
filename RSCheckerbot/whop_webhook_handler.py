@@ -1234,28 +1234,31 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
         
         if not discord_id_str or discord_id_str == "No Discord":
             log.info(f"Native Whop message has no Discord ID: {title}")
-            # Still surface this to staff so it doesn't look like the bot is dead.
+            # Best-effort: resolve Discord ID from cached identity (email -> discord_id).
+            # This restores normal routing (payment-failure / cancellation, etc.) when we have a match.
             try:
-                await _send_lookup_request(
-                    message=message,
-                    event_type=f"native:{event_type or 'unknown'}",
-                    email=str(email_value or "").strip(),
-                    whop_user_id="",
-                    membership_id=membership_id_hint,
-                )
+                email_n = _norm_email(str(email_value or "").strip())
+                cached = _lookup_identity(email_n) if email_n else None
+                cached_id = str((cached or {}).get("discord_id") or "").strip() if isinstance(cached, dict) else ""
             except Exception:
-                pass
-            if _log_other:
+                cached_id = ""
+
+            if cached_id and cached_id.isdigit():
+                discord_id_str = cached_id
+            else:
+                # Still surface this to staff so it doesn't look like the bot is dead,
+                # but do NOT spam member-role-logs / bot-logs.
                 try:
-                    await _log_other(
-                        f"⚠️ **Whop Native:** No Discord ID in event.\n"
-                        f"• Event: `{event_type or 'unknown'}`\n"
-                        f"• Email: `{str(email_value or '').strip() or '—'}`\n"
-                        f"• Source: {getattr(message, 'jump_url', '') or str(message.id)}"
+                    await _send_lookup_request(
+                        message=message,
+                        event_type=f"native:{event_type or 'unknown'}",
+                        email=str(email_value or "").strip(),
+                        whop_user_id="",
+                        membership_id=membership_id_hint,
                     )
                 except Exception:
                     pass
-            return
+                return
         
         # Extract numeric Discord ID
         discord_id_match = re.search(r'(\d{17,19})', discord_id_str)
