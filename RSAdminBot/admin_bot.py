@@ -1770,15 +1770,6 @@ class BotSelectView(ui.View):
         if not self.admin_bot.is_admin(interaction.user):
             await interaction.followup.send("❌ You don't have permission to use this command.")
             return
-        # RS-only for config (inspector-based)
-        if not self.admin_bot._is_rs_bot(bot_name):
-            embed = MessageHelper.create_error_embed(
-                title="Unsupported Bot",
-                message=f"`{bot_name}` is not an RS bot. Bot config is only available for RS bots.",
-                footer=f"Triggered by {interaction.user}",
-            )
-            await interaction.followup.send(embed=embed)
-            return
         embed = self.admin_bot._build_botconfig_embed(bot_name, triggered_by=interaction.user)
         await interaction.followup.send(embed=embed)
 
@@ -2967,12 +2958,23 @@ echo "TARGET=$TARGET"
         if not guild or guild.id != test_guild_id:
             return
 
-        # RS-only: rsadminbot + rs_bots group
+        # All bots: rsadminbot + rs_bots + mirror_bots
         bot_groups = self.config.get("bot_groups") or {}
-        rs_keys = ["rsadminbot"] + list(bot_groups.get("rs_bots") or [])
+        raw_keys = ["rsadminbot"] + list(bot_groups.get("rs_bots") or []) + list(bot_groups.get("mirror_bots") or [])
+        # Keep stable ordering + only include known bots
+        all_keys: List[str] = []
+        for x in raw_keys:
+            k = str(x).strip().lower()
+            if not k:
+                continue
+            if k not in self.BOTS:
+                continue
+            if k in all_keys:
+                continue
+            all_keys.append(k)
 
         # Ensure journal channels exist in configured category (do not create categories)
-        channel_map = await self.test_server_organizer.ensure_journal_channels_in_category(rs_keys)
+        channel_map = await self.test_server_organizer.ensure_journal_channels_in_category(all_keys)
         self._journal_channel_ids = channel_map
         try:
             print(f"{Colors.GREEN}[Journal Live] Enabled. Channels: {len(channel_map)} (category_id={cfg.get('category_id')}){Colors.RESET}")
@@ -3066,19 +3068,19 @@ echo "TARGET=$TARGET"
         self._systemd_events_webhook_url = systemd_url
 
         # Start per-bot journal follow tasks
-        self._start_journal_follow_tasks(rs_keys)
+        self._start_journal_follow_tasks(all_keys)
         try:
             print(f"{Colors.GREEN}[Journal Live] Follow tasks started: {len(self._journal_tasks)}{Colors.RESET}")
         except Exception:
             pass
 
-    def _start_journal_follow_tasks(self, rs_keys: List[str]) -> None:
+    def _start_journal_follow_tasks(self, bot_keys: List[str]) -> None:
         cfg = self._get_journal_live_config()
         if not cfg.get("enabled"):
             return
         if not self._should_use_local_exec():
             return
-        for bot_key in rs_keys:
+        for bot_key in bot_keys:
             if bot_key in self._journal_tasks:
                 continue
             info = self.BOTS.get(bot_key) or {}
@@ -4361,6 +4363,9 @@ echo "CHANGED_END"
             journal_map = {}
         if not isinstance(monitor_map, dict):
             monitor_map = {}
+        # If monitor_channels is disabled, don't link to (or recreate) bot-* monitor channels
+        if not bool(self._get_monitor_channels_config().get("enabled")):
+            monitor_map = {}
 
         pages: List[Tuple[str, str, Optional[discord.Embed], Optional[ui.View]]] = []
 
@@ -4375,13 +4380,16 @@ echo "CHANGED_END"
         cmd_body = f"```{cmd_text[:1800]}```"
         pages.append(("rsadminbot_commands", cmd_hash, cmd_embed, None))
 
-        # Bot cards: management commands per RS bot (RS-only list)
+        # Bot cards: management commands per bot (RS + MW)
         rs_keys = self._get_rs_bot_keys()
+        mw_keys = self._get_mw_bot_keys()
+        all_keys = rs_keys + [k for k in mw_keys if k not in rs_keys]
         # Prefer to show all management commands that exist in this running bot
         available_cmds = {c.name for c in list(self.bot.commands) if getattr(c, "name", "")}
 
         def bot_cmds(bot_key: str) -> str:
             lines = []
+            group = self._get_bot_group(bot_key) or ""
             # Common management commands
             for name, fmt in [
                 ("botstatus", "!botstatus {b}"),
@@ -4391,15 +4399,20 @@ echo "CHANGED_END"
                 ("botstop", "!botstop {b}"),
                 ("botrestart", "!botrestart {b}"),
                 ("botupdate", "!botupdate {b}"),
+                ("mwupdate", "!mwupdate {b}"),
                 ("botinfo", "!botinfo {b}"),
                 ("botconfig", "!botconfig {b}"),
             ]:
                 if name in available_cmds:
-                    # Keep RS-only enforcement in botconfig/botinfo; this is just an index.
+                    # Only show the correct update command for the bot group
+                    if name == "botupdate" and group == "mirror_bots":
+                        continue
+                    if name == "mwupdate" and group != "mirror_bots":
+                        continue
                     lines.append(fmt.format(b=bot_key))
             return "\n".join(lines).strip()
 
-        for bot_key in rs_keys:
+        for bot_key in all_keys:
             bot_info = self.BOTS.get(bot_key) or {}
             title = f"{bot_info.get('name', bot_key)} ({bot_key})"
             body = bot_cmds(bot_key)
@@ -5065,35 +5078,109 @@ echo "CHANGED_END"
                 await send(embed=e)
 
     def _build_botconfig_embed(self, bot_name: str, *, triggered_by: Optional[Any] = None) -> discord.Embed:
-        """Build the botconfig embed for a bot (RS-only, inspector-based)."""
+        """Build a botconfig embed for a bot (RS inspector when available; MW file-based summary otherwise)."""
         who = f"Triggered by {triggered_by}" if triggered_by else None
+        bot_key = str(bot_name or "").strip().lower()
 
-        if not self._is_rs_bot(bot_name):
+        if not bot_key or bot_key not in self.BOTS:
             return MessageHelper.create_error_embed(
-                title="Unsupported Bot",
-                message=f"`{bot_name}` is not an RS bot. Bot config is only available for RS bots.",
+                title="Unknown Bot",
+                message=f"Bot not found: `{bot_name}`",
                 footer=who,
             )
 
+        group = self._get_bot_group(bot_key) or ""
+        info = self.BOTS.get(bot_key) or {}
+
+        # Mirror bots are file-based (settings.json + tokens.env + optional routing maps)
+        if group == "mirror_bots":
+            bot_display_name = str(info.get("name") or bot_key)
+            folder = str(info.get("folder") or "").strip() or bot_key
+            service = str(info.get("service") or "").strip()
+            remote_root = str(getattr(self, "remote_root", "") or "/home/rsadmin/bots/mirror-world").strip()
+            config_dir = f"{remote_root}/{folder}/config"
+
+            required = ["settings.json", "tokens.env"]
+            optional: List[str] = []
+            if bot_key == "discumbot":
+                required = ["settings.json", "tokens.env", "channel_map.json", "destination_channels.json"]
+                optional = ["source_channels.json"]
+            elif bot_key == "datamanagerbot":
+                optional = ["keywords.json", "fetchall_mappings.json"]
+
+            files = required + optional
+            checks: Dict[str, bool] = {}
+            try:
+                cmd = "set +e; " + " ; ".join(
+                    f'test -f {shlex.quote(config_dir + "/" + fn)} && echo OK:{fn} || echo MISSING:{fn}'
+                    for fn in files
+                )
+                ok, out, err = self._execute_ssh_command(cmd, timeout=12)
+                text = (out or err or "").splitlines()
+                for ln in text:
+                    ln = (ln or "").strip()
+                    if ln.startswith("OK:"):
+                        checks[ln[3:].strip()] = True
+                    elif ln.startswith("MISSING:"):
+                        checks[ln[8:].strip()] = False
+            except Exception:
+                checks = {}
+
+            lines_req = []
+            for fn in required:
+                state = checks.get(fn)
+                icon = "✅" if state is True else ("❌" if state is False else "❓")
+                label = fn
+                if fn == "tokens.env":
+                    label = "tokens.env (secret)"
+                lines_req.append(f"{icon} {label}")
+
+            lines_opt = []
+            for fn in optional:
+                state = checks.get(fn)
+                icon = "✅" if state is True else ("➖" if state is False else "❓")
+                lines_opt.append(f"{icon} {fn}")
+
+            embed = MessageHelper.create_info_embed(
+                title=f"⚙️ {bot_display_name} Configuration",
+                message="Mirror-World bots use file-based config under `config/` (tokens.env is never shown in Discord).",
+                fields=[
+                    {"name": "Bot", "value": f"`{bot_key}`", "inline": True},
+                    {"name": "Service", "value": f"`{service or '(missing)'}`", "inline": False},
+                    {"name": "Config dir", "value": f"`{config_dir}`", "inline": False},
+                    {"name": "Required files", "value": "\n".join(lines_req)[:1024], "inline": False},
+                ],
+                footer=who,
+            )
+            if lines_opt:
+                embed.add_field(name="Optional files", value="\n".join(lines_opt)[:1024], inline=False)
+            embed.add_field(
+                name="Next",
+                value="After config is in place: `!botrestart <bot>` or restart the service on Oracle.",
+                inline=False,
+            )
+            return embed
+
+        # RS bots: inspector-based config render
         if not INSPECTOR_AVAILABLE or not self.inspector:
             return MessageHelper.create_error_embed(
                 title="Bot Inspector Not Available",
-                message="Bot inspector module is not loaded or initialized.",
+                message="Bot inspector module is not loaded or initialized (RS config view requires it).",
                 footer=who,
             )
 
-        config = self.inspector.get_bot_config(bot_name)
+        config = self.inspector.get_bot_config(bot_key)
         if not config:
             return MessageHelper.create_error_embed(
                 title="Config Not Found",
-                message=f"Bot not found or no config: `{bot_name}`",
+                message=f"Bot not found or no config: `{bot_key}`",
                 footer=who,
             )
 
         # Get bot display name
-        bot_display_name = bot_name
-        if bot_name.lower() in self.BOTS:
-            bot_display_name = self.BOTS[bot_name.lower()]["name"]
+        bot_display_name = bot_key
+        if bot_key in self.BOTS:
+            bot_display_name = self.BOTS[bot_key]["name"]
 
         try:
             embed = discord.Embed(
@@ -7677,6 +7764,22 @@ echo "CHANGED_END"
                 # Total size of bots folder (fast-ish, bounded)
                 bots_du = _cmd("du -sh /home/rsadmin/bots 2>/dev/null | head -n 1 || true", timeout_s=10)
 
+                # Systemd services snapshot (all configured bots)
+                svc_list = sorted({str((v or {}).get("service") or "").strip() for v in (self.BOTS or {}).values() if (v or {}).get("service")})
+                svc_txt = ""
+                if svc_list:
+                    svc_cmd = (
+                        "set +e; "
+                        + "for s in "
+                        + " ".join(shlex.quote(s) for s in svc_list)
+                        + "; do "
+                        + "st=$(systemctl is-active \"$s\" 2>/dev/null || echo unknown); "
+                        + "pid=$(systemctl show \"$s\" -p ExecMainPID --value 2>/dev/null || echo 0); "
+                        + "echo \"$s $st pid=$pid\"; "
+                        + "done"
+                    )
+                    svc_txt = _cmd(svc_cmd, timeout_s=10)
+
                 # Top 10 largest files under /home/rsadmin/bots (xdev avoids scanning mounted volumes)
                 top_files = _cmd(
                     "find /home/rsadmin/bots -xdev -type f -printf '%s\\t%p\\n' 2>/dev/null | sort -nr | head -n 10 | "
@@ -7715,8 +7818,10 @@ echo "CHANGED_END"
                     ],
                     footer=f"Triggered by {ctx.author}",
                 )
-                # Single send path (prevents duplicates when the command channel is also the log channel)
-                await self._log_to_discord(embed, ctx.channel)
+                if svc_txt.strip():
+                    embed.add_field(name="Services (systemd)", value=f"```{_clip(svc_txt, 950)}```", inline=False)
+
+                await ctx.send(embed=embed)
 
                 # Post large-file summary as a second embed (keeps main embed readable)
                 lf_fields = []
@@ -7731,7 +7836,7 @@ echo "CHANGED_END"
                     fields=lf_fields,
                     footer=f"Triggered by {ctx.author}",
                 )
-                await self._log_to_discord(lf_embed, ctx.channel)
+                await ctx.send(embed=lf_embed)
                 if self.logger:
                     try:
                         log_entry = self.logger.log_command(
@@ -8194,25 +8299,6 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
         @commands.check(lambda ctx: self.is_admin(ctx.author))
         async def botinfo(ctx, bot_name: str = None):
             """Get detailed information about a bot (admin only)"""
-            # RS-only: exclude non-RS bots from botinfo
-            if bot_name and not self._is_rs_bot(bot_name):
-                embed = MessageHelper.create_error_embed(
-                    title="Unsupported Bot",
-                    message=f"`{bot_name}` is not an RS bot. Bot info is only available for RS bots.",
-                    footer=f"Triggered by {ctx.author}",
-                )
-                await ctx.send(embed=embed)
-                return
-            
-            if not INSPECTOR_AVAILABLE or not self.inspector:
-                embed = MessageHelper.create_error_embed(
-                    title="Bot Inspector Not Available",
-                    message="Bot inspector module is not loaded or initialized.",
-                    footer=f"Triggered by {ctx.author}",
-                )
-                await ctx.send(embed=embed)
-                return
-            
             if not bot_name:
                 embed = MessageHelper.create_warning_embed(
                     title="Bot Name Required",
@@ -8222,14 +8308,100 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                 )
                 await ctx.send(embed=embed)
                 return
+
+            bot_key = str(bot_name or "").strip().lower()
+            if bot_key not in self.BOTS:
+                embed = MessageHelper.create_error_embed(
+                    title="Bot Not Found",
+                    message=f"Bot not found: `{bot_key}`",
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
+                return
+
+            group = self._get_bot_group(bot_key) or ""
+            if group == "mirror_bots":
+                info = self.BOTS.get(bot_key) or {}
+                folder = str(info.get("folder") or "").strip() or bot_key
+                script = str(info.get("script") or "").strip()
+                service = str(info.get("service") or "").strip()
+                remote_root = str(getattr(self, "remote_root", "") or "/home/rsadmin/bots/mirror-world").strip()
+                config_dir = f"{remote_root}/{folder}/config"
+
+                exists = False
+                state = ""
+                pid = 0
+                try:
+                    if self.service_manager and service:
+                        exists, state, _ = self.service_manager.get_status(service, bot_name=bot_key)
+                        pid = int(self.service_manager.get_pid(service) or 0)
+                except Exception:
+                    exists = False
+
+                # Non-secret config presence (do not read tokens.env)
+                required = ["settings.json", "tokens.env"]
+                if bot_key == "discumbot":
+                    required = ["settings.json", "tokens.env", "channel_map.json", "destination_channels.json"]
+                checks: Dict[str, bool] = {}
+                try:
+                    cmd = "set +e; " + " ; ".join(
+                        f'test -f {shlex.quote(config_dir + "/" + fn)} && echo OK:{fn} || echo MISSING:{fn}'
+                        for fn in required
+                    )
+                    ok, out, err = self._execute_ssh_command(cmd, timeout=10)
+                    for ln in (out or err or "").splitlines():
+                        ln = (ln or "").strip()
+                        if ln.startswith("OK:"):
+                            checks[ln[3:].strip()] = True
+                        elif ln.startswith("MISSING:"):
+                            checks[ln[8:].strip()] = False
+                except Exception:
+                    checks = {}
+
+                cfg_lines = []
+                for fn in required:
+                    state2 = checks.get(fn)
+                    icon = "✅" if state2 is True else ("❌" if state2 is False else "❓")
+                    label = fn
+                    if fn == "tokens.env":
+                        label = "tokens.env (secret)"
+                    cfg_lines.append(f"{icon} {label}")
+
+                status_icon = "✅" if exists and state == "active" else "⚠️"
+                embed = MessageHelper.create_info_embed(
+                    title=f"📊 {info.get('name', bot_key)} Information",
+                    message="Mirror-World bot status + config presence (no secrets).",
+                    fields=[
+                        {"name": "Service", "value": f"`{service or '(missing)'}`", "inline": False},
+                        {"name": "Status", "value": f"{status_icon} `{state or 'unknown'}`", "inline": True},
+                        {"name": "PID", "value": str(pid or 0), "inline": True},
+                        {"name": "Folder", "value": f"`{folder}`", "inline": True},
+                        {"name": "Entrypoint", "value": f"`{script or '(unknown)'}`", "inline": True},
+                        {"name": "Config dir", "value": f"`{config_dir}`", "inline": False},
+                        {"name": "Config files", "value": "\n".join(cfg_lines)[:1024], "inline": False},
+                    ],
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
+                return
+
+            # RS bots: inspector-based (rich) info
+            if not INSPECTOR_AVAILABLE or not self.inspector:
+                embed = MessageHelper.create_error_embed(
+                    title="Bot Inspector Not Available",
+                    message="Bot inspector module is not loaded or initialized (RS botinfo requires it).",
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
+                return
             
             try:
-                bot_info = self.inspector.get_bot_info(bot_name)
+                bot_info = self.inspector.get_bot_info(bot_key)
                 
                 if not bot_info:
                     embed = MessageHelper.create_error_embed(
                         title="Bot Not Found",
-                        message=f"Bot not found: `{bot_name}`",
+                        message=f"Bot not found: `{bot_key}`",
                         footer=f"Triggered by {ctx.author}",
                     )
                     await ctx.send(embed=embed)
@@ -8379,32 +8551,14 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
         @commands.check(lambda ctx: self.is_admin(ctx.author))
         async def botconfig(ctx, bot_name: str = None):
             """Get config.json for a bot in user-friendly format (admin only)"""
-            # RS-only: exclude non-RS bots from botconfig
-            if bot_name and not self._is_rs_bot(bot_name):
-                embed = MessageHelper.create_error_embed(
-                    title="Unsupported Bot",
-                    message=f"`{bot_name}` is not an RS bot. Bot config is only available for RS bots.",
-                    footer=f"Triggered by {ctx.author}",
-                )
-                await ctx.send(embed=embed)
-                return
-            
-            if not INSPECTOR_AVAILABLE or not self.inspector:
-                embed = MessageHelper.create_error_embed(
-                    title="Bot Inspector Not Available",
-                    message="Bot inspector module is not loaded or initialized.",
-                    footer=f"Triggered by {ctx.author}",
-                )
-                await ctx.send(embed=embed)
-                return
-            
             if not bot_name:
                 embed = MessageHelper.create_info_embed(
                     title="Select a Bot",
-                    message="Pick an RS bot to view its config.",
+                    message="Pick a bot to view its config summary.",
                     footer=f"Triggered by {ctx.author}",
                 )
-                view = BotSelectView(self, "config", "Config", bot_keys=self._get_rs_bot_keys())
+                keys = self._get_rs_bot_keys() + [k for k in self._get_mw_bot_keys() if k not in self._get_rs_bot_keys()]
+                view = BotSelectView(self, "config", "Config", bot_keys=keys)
                 await ctx.send(embed=embed, view=view)
                 return
             

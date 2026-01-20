@@ -40,7 +40,7 @@
     "heartbeat_seconds": 0
   },
   "monitor_channels": {
-    "enabled": true,
+    "enabled": false,
     "test_server_guild_id": 1451275225512546497,
     "category_name": "RS Bots Terminal Logs",
     "channel_prefix": "bot-",
