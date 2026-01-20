@@ -75,6 +75,42 @@ DISCORD_LINK_FILE = BASE_DIR / "whop_discord_link.json"
 STAFF_ALERTS_FILE = BASE_DIR / "staff_alerts.json"
 PAYMENT_CACHE_FILE = BASE_DIR / "payment_cache.json"
 
+def _extract_discord_id_from_whop_member_record(rec: dict) -> str:
+    """Best-effort extract of Discord user ID from Whop /members/{mber_...} record.
+
+    Safety: only returns an ID if it appears under a key-path containing 'discord'
+    (avoids accidentally grabbing unrelated numeric IDs).
+    """
+    if not isinstance(rec, dict):
+        return ""
+
+    def _as_discord_id(v: object) -> str:
+        m = re.search(r"\b(\d{17,19})\b", str(v or ""))
+        return m.group(1) if m else ""
+
+    def _walk(obj: object, *, discord_context: bool, depth: int) -> str:
+        if depth > 6:
+            return ""
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                k_low = str(k or "").lower()
+                ctx = discord_context or ("discord" in k_low)
+                if ctx:
+                    cand = _as_discord_id(v)
+                    if cand:
+                        return cand
+                cand2 = _walk(v, discord_context=ctx, depth=depth + 1)
+                if cand2:
+                    return cand2
+        elif isinstance(obj, list):
+            for it in obj:
+                cand3 = _walk(it, discord_context=discord_context, depth=depth + 1)
+                if cand3:
+                    return cand3
+        return ""
+
+    return _walk(rec, discord_context=False, depth=0)
+
 
 def _norm_email(s: str) -> str:
     """Normalize email address for consistent storage/lookup"""
@@ -1193,17 +1229,55 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
         
         if not discord_id_str or discord_id_str == "No Discord":
             log.info(f"Native Whop message has no Discord ID: {title}")
-            # Best-effort: resolve Discord ID from cached identity (email -> discord_id).
-            # This restores normal routing (payment-failure / cancellation, etc.) when we have a match.
-            try:
-                email_n = _norm_email(str(email_value or "").strip())
-                cached = _lookup_identity(email_n) if email_n else None
-                cached_id = str((cached or {}).get("discord_id") or "").strip() if isinstance(cached, dict) else ""
-            except Exception:
-                cached_id = ""
+            resolved_id = ""
 
-            if cached_id and cached_id.isdigit():
-                discord_id_str = cached_id
+            # Best-effort #1 (preferred): if we have a membership id hint, resolve via Whop API
+            # to discover the connected Discord ID. This avoids "lookup needed" spam and keeps routing correct.
+            if membership_id_hint and _whop_api_client:
+                try:
+                    membership = await _whop_api_client.get_membership_by_id(str(membership_id_hint).strip())
+                except Exception:
+                    membership = None
+
+                whop_member_id = ""
+                if isinstance(membership, dict):
+                    m = membership.get("member")
+                    if isinstance(m, dict):
+                        whop_member_id = str(m.get("id") or m.get("member_id") or "").strip()
+                    elif isinstance(m, str):
+                        whop_member_id = m.strip()
+                    if not whop_member_id:
+                        whop_member_id = str(membership.get("member_id") or "").strip()
+
+                member_rec = None
+                if whop_member_id and whop_member_id.startswith("mber_") and _whop_api_client:
+                    with suppress(Exception):
+                        member_rec = await _whop_api_client.get_member_by_id(whop_member_id)
+
+                if isinstance(member_rec, dict):
+                    resolved_id = _extract_discord_id_from_whop_member_record(member_rec)
+                    if resolved_id and resolved_id.isdigit():
+                        with suppress(Exception):
+                            _cache_discord_membership_link(
+                                discord_id=str(resolved_id),
+                                membership_id=str(membership_id_hint).strip(),
+                                whop_member_id=str(whop_member_id or "").strip(),
+                                source_event="native.resolve.discord_id",
+                            )
+
+            # Best-effort #2: resolve Discord ID from cached identity (email -> discord_id).
+            if not resolved_id:
+                try:
+                    email_n = _norm_email(str(email_value or "").strip())
+                    cached = _lookup_identity(email_n) if email_n else None
+                    cached_id = str((cached or {}).get("discord_id") or "").strip() if isinstance(cached, dict) else ""
+                except Exception:
+                    cached_id = ""
+                if cached_id and cached_id.isdigit():
+                    resolved_id = cached_id
+
+            if resolved_id and str(resolved_id).isdigit():
+                discord_id_str = str(resolved_id).strip()
             else:
                 return
         
