@@ -21,8 +21,10 @@ log = logging.getLogger("rs-checker")
 # Canonical shared helpers (single source of truth)
 from rschecker_utils import load_json as _load_json
 from rschecker_utils import save_json as _save_json
-from rschecker_utils import fmt_money
+from rschecker_utils import fmt_money, usd_amount
 from rschecker_utils import access_roles_plain, coerce_role_ids
+from rschecker_utils import fmt_date_any as _fmt_date_any
+from rschecker_utils import parse_dt_any as _parse_dt_any
 from staff_embeds import build_case_minimal_embed, build_member_status_detailed_embed
 from whop_brief import fetch_whop_brief
 from staff_channels import PAYMENT_FAILURE_CHANNEL_NAME, MEMBER_CANCELLATION_CHANNEL_NAME
@@ -54,7 +56,7 @@ LIFETIME_ROLE_IDS: set[int] = set()
 _log_other = None
 _log_member_status = None
 _fmt_user = None
-_get_member_history = None
+_record_member_whop_summary = None
 
 # Identity tracking and trial abuse detection
 MEMBER_STATUS_LOGS_CHANNEL_ID = None
@@ -72,7 +74,6 @@ IDENTITY_CACHE_FILE = BASE_DIR / "whop_identity_cache.json"
 TRIAL_CACHE_FILE = BASE_DIR / "trial_history.json"
 IDENTITY_CONFLICTS_FILE = BASE_DIR / "identity_conflicts.jsonl"
 RESOLUTION_ALERT_STATE_FILE = BASE_DIR / "whop_resolution_alert_state.json"
-DISCORD_LINK_FILE = BASE_DIR / "whop_discord_link.json"
 STAFF_ALERTS_FILE = BASE_DIR / "staff_alerts.json"
 PAYMENT_CACHE_FILE = BASE_DIR / "payment_cache.json"
 
@@ -83,144 +84,6 @@ def _norm_email(s: str) -> str:
     """Normalize email address for consistent storage/lookup"""
     return (s or "").strip().lower()
 
-
-def _load_discord_link_db() -> dict:
-    db = _load_json(DISCORD_LINK_FILE)
-    if not isinstance(db, dict):
-        return {}
-    if "by_discord_id" not in db or not isinstance(db.get("by_discord_id"), dict):
-        db["by_discord_id"] = {}
-    return db
-
-
-def _save_discord_link_db(db: dict) -> None:
-    if not isinstance(db, dict):
-        return
-    _save_json(DISCORD_LINK_FILE, db)
-
-
-def _cache_discord_membership_link(
-    discord_id: str,
-    membership_id: str,
-    *,
-    whop_member_id: str = "",
-    whop_user_id: str = "",
-    dashboard_url: str = "",
-    whop_brief: dict | None = None,
-    source_event: str = "",
-) -> None:
-    did = str(discord_id or "").strip()
-    mid = str(membership_id or "").strip()
-    if not did.isdigit() or not mid:
-        return
-    db = _load_discord_link_db()
-    by = db.get("by_discord_id") or {}
-    prev = by.get(did) if isinstance(by, dict) else None
-    rec = prev if isinstance(prev, dict) else {}
-    rec["membership_id"] = mid
-    if whop_member_id:
-        rec["whop_member_id"] = str(whop_member_id or "").strip()
-    if whop_user_id:
-        rec["whop_user_id"] = str(whop_user_id or "").strip()
-    if dashboard_url:
-        rec["dashboard_url"] = str(dashboard_url or "").strip()
-    if isinstance(whop_brief, dict) and whop_brief:
-        # Store a sanitized, staff-safe subset (no emails/names).
-        safe = {}
-        for k in (
-            "status",
-            "product",
-            "member_since",
-            "trial_end",
-            "renewal_start",
-            "renewal_end",
-            "renewal_end_iso",
-            "remaining_days",
-            "manage_url",
-            "dashboard_url",
-            "cancel_at_period_end",
-            "is_first_membership",
-            "last_payment_method",
-            "last_payment_type",
-            "last_payment_failure",
-            "last_success_paid_at_iso",
-            "last_success_paid_at",
-            "total_spent",
-        ):
-            try:
-                v = whop_brief.get(k)
-            except Exception:
-                v = None
-            # Keep values small and JSON-safe.
-            if isinstance(v, (int, float, bool)) or v is None:
-                safe[k] = v
-            else:
-                safe[k] = str(v)[:500]
-        rec["whop_brief"] = safe
-    rec["updated_at"] = datetime.now(timezone.utc).isoformat()
-    rec["source_event"] = str(source_event or "").strip()
-    by[did] = rec
-    db["by_discord_id"] = by
-    _save_discord_link_db(db)
-
-
-def _get_cached_membership_id_for_discord(discord_id: int | str) -> str:
-    did = str(discord_id or "").strip()
-    if not did:
-        return ""
-
-    def _looks_like_membership_id(mid: str) -> bool:
-        # Whop membership identifiers we see in the wild include:
-        # - "mem_..." (API-style)
-        # - legacy/humanish "R-..." keys from Whop workflows/history that still work with /memberships/{id}
-        s = str(mid or "").strip()
-        if not s:
-            return False
-        if s.startswith("mem_"):
-            return True
-        if s.startswith("R-"):
-            return True
-        return False
-
-    # 1) Primary: whop_discord_link.json mapping
-    db = _load_discord_link_db()
-    by = db.get("by_discord_id") or {}
-    rec = by.get(did) if isinstance(by, dict) else None
-    if isinstance(rec, dict):
-        mid = str(rec.get("membership_id") or "").strip()
-        if _looks_like_membership_id(mid):
-            return mid
-
-    # 2) Fallback: member_history.json backfill (whop.last_membership_id)
-    try:
-        if _get_member_history and did.isdigit():
-            hist = _get_member_history(int(did)) or {}
-            wh = hist.get("whop") if isinstance(hist, dict) else None
-            if isinstance(wh, dict):
-                mid = str(wh.get("last_membership_id") or "").strip()
-                if _looks_like_membership_id(mid):
-                    return mid
-    except Exception:
-        pass
-
-    return ""
-
-
-def get_cached_whop_membership_id(discord_id: int | str) -> str:
-    """Public helper for other modules (single source of truth for the link DB)."""
-    return _get_cached_membership_id_for_discord(discord_id)
-
-def set_cached_whop_membership_id(discord_id: int | str, membership_id: str, *, source_event: str = "") -> None:
-    """Public helper to update the Discord -> membership link (single writer).
-
-    Used by sync jobs to repair stale links (e.g., user has multiple memberships).
-    """
-    did = str(discord_id or "").strip()
-    mid = str(membership_id or "").strip()
-    if not did.isdigit() or not mid:
-        return
-    with suppress(Exception):
-        _cache_discord_membership_link(discord_id=did, membership_id=mid, source_event=source_event or "set_cached_whop_membership_id")
 
 
 def _load_resolution_state() -> dict:
@@ -308,39 +171,198 @@ def _has_lifetime_role(member: discord.Member) -> bool:
 
 
 def _membership_id_from_event(member: discord.Member, event_data: dict) -> str:
-    """Prefer membership_id from webhook payload; fallback to cached link DB."""
+    """Prefer membership_id from webhook payload (no cache fallback)."""
     mid = _safe_get(event_data, "membership_id", "membership.id", default="").strip()
     if mid == "—":
         mid = ""
-    if not mid:
-        mid = _get_cached_membership_id_for_discord(member.id)
     return (mid or "").strip()
 
 
-async def _whop_brief_from_event(member: discord.Member, event_data: dict) -> dict:
-    mid = _membership_id_from_event(member, event_data)
-    if not mid:
-        return {}
-    brief = await fetch_whop_brief(
-        _whop_api_client,
-        mid,
-        enable_enrichment=bool(_whop_api_config.get("enable_enrichment", True)),
-    )
-    # Keep link cache enriched so other bots (e.g., SuccessBot) can build dashboard URLs.
+def _pick_first(*vals: object) -> str:
+    for v in vals:
+        s = str(v or "").strip()
+        if s and s != "—":
+            return s
+    return ""
+
+
+def _parse_bullet_kv(text: str) -> dict[str, str]:
+    """Parse bullet lines like '• Key: Value' into a dict."""
+    out: dict[str, str] = {}
+    if not text:
+        return out
+    for raw in str(text).splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        line = line.lstrip("•").strip()
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        key = str(k or "").strip().lower()
+        val = str(v or "").strip()
+        if key and val:
+            out[key] = val
+    return out
+
+
+def _flatten_field_kv(fields_data: dict) -> dict[str, str]:
+    """Flatten embed fields (Identity/Membership/Plan/Actions) into a single key map."""
+    out: dict[str, str] = {}
+    for _name, value in (fields_data or {}).items():
+        try:
+            if isinstance(value, str):
+                out.update(_parse_bullet_kv(value))
+        except Exception:
+            continue
+    return out
+
+
+def _parse_renewal_window(raw: str) -> tuple[str, str]:
+    """Parse 'start → end' or 'start -> end' into (start, end)."""
+    s = str(raw or "").strip()
+    if not s:
+        return ("", "")
+    if "→" in s:
+        a, b = s.split("→", 1)
+    elif "->" in s:
+        a, b = s.split("->", 1)
+    else:
+        return ("", "")
+    return (str(a).strip(), str(b).strip())
+
+
+def _build_whop_summary(event_data: dict, *, extra_kv: dict | None = None) -> dict:
+    """Build a staff-safe Whop summary from webhook data (no cache lookups)."""
+    extra = extra_kv if isinstance(extra_kv, dict) else {}
+
+    def _val(*keys: str) -> str:
+        for key in keys:
+            v = _safe_get(event_data, key, default="").strip()
+            if v:
+                return v
+            k_low = key.lower()
+            v2 = str(extra.get(k_low) or "").strip()
+            if v2:
+                return v2
+            k_spaced = k_low.replace("_", " ")
+            v3 = str(extra.get(k_spaced) or "").strip()
+            if v3:
+                return v3
+        return ""
+
+    status = _val("membership.status", "status", "membership_status")
+    product = _val("product.title", "product", "plan", "product_name")
+    total_spent_raw = _val("total_spent", "total_spent_usd", "total_spent_cents", "total_spend", "total_spend_usd", "total_spend_cents")
+    total_spent_val = ""
+    if total_spent_raw:
+        amt = usd_amount(total_spent_raw)
+        total_spent_val = fmt_money(amt, "usd") if amt > 0 else str(total_spent_raw).strip()
+
+    renewal_start_raw = _val("renewal_period_start", "renewal_start", "renewal_start_at")
+    renewal_end_raw = _val("renewal_period_end", "renewal_end", "access_ends_at", "trial_end", "trial_ends_at")
+    window_raw = _val("renewal_window", "renewal window")
+    if window_raw and (not renewal_start_raw or not renewal_end_raw):
+        ws, we = _parse_renewal_window(window_raw)
+        renewal_start_raw = renewal_start_raw or ws
+        renewal_end_raw = renewal_end_raw or we
+
+    renewal_end_iso = ""
+    renewal_end_fmt = ""
+    remaining_days: int | str = ""
     try:
-        if isinstance(brief, dict):
-            _cache_discord_membership_link(
-                discord_id=str(member.id),
-                membership_id=mid,
-                whop_member_id=str(brief.get("whop_member_id") or "").strip(),
-                whop_user_id=str(brief.get("whop_user_id") or "").strip(),
-                dashboard_url=str(brief.get("dashboard_url") or "").strip(),
-                whop_brief=brief,
-                source_event=str(event_data.get("event_type") or "").strip(),
-            )
+        dt_end = _parse_dt_any(renewal_end_raw)
+        if dt_end:
+            renewal_end_iso = dt_end.isoformat().replace("+00:00", "Z")
+            renewal_end_fmt = _fmt_date_any(renewal_end_iso)
+            delta = (dt_end - datetime.now(timezone.utc)).total_seconds()
+            remaining_days = max(0, int((delta / 86400.0) + 0.999))
     except Exception:
         pass
-    return brief
+
+    trial_days = _val("trial_days", "trial_period_days", "trial_days_remaining")
+    pricing = _val("pricing", "price", "plan_price")
+    plan_is_renewal = _val("plan_is_renewal", "plan is renewal", "plan_is_renewal?")
+    first_membership = _val("first_membership", "first membership", "is_first_membership")
+    manage_url = _val("manage_url", "manage", "billing_manage")
+    dashboard_url = _val("dashboard_url", "dashboard")
+    cancel_at_period_end = _val("cancel_at_period_end", "cancel at period end", "cancel_at_period", "cancel_at_period_end?")
+    is_first_membership = _val("is_first_membership", "first membership", "first_membership")
+    last_payment_failure = _val("failure_reason", "last_payment_failure", "payment_failure", "failure message")
+
+    return {
+        "status": status,
+        "product": product,
+        "member_since": _val("created_at", "member_since"),
+        "trial_end": _val("trial_end", "trial_ends_at", "trial_end_at"),
+        "trial_days": trial_days,
+        "renewal_start": _fmt_date_any(renewal_start_raw) if renewal_start_raw else "",
+        "renewal_end": renewal_end_fmt or (_fmt_date_any(renewal_end_raw) if renewal_end_raw else ""),
+        "renewal_end_iso": renewal_end_iso,
+        "remaining_days": remaining_days,
+        "manage_url": manage_url,
+        "dashboard_url": dashboard_url,
+        "cancel_at_period_end": cancel_at_period_end,
+        "is_first_membership": is_first_membership or first_membership,
+        "plan_is_renewal": plan_is_renewal,
+        "pricing": pricing,
+        "last_payment_method": "",
+        "last_payment_type": "",
+        "last_payment_failure": last_payment_failure,
+        "last_success_paid_at_iso": "",
+        "last_success_paid_at": "—",
+        "total_spent": total_spent_val,
+    }
+
+
+def _record_whop_summary_if_possible(*, member_id: int, summary: dict, event_data: dict) -> None:
+    if not _record_member_whop_summary:
+        return
+    if not isinstance(summary, dict) or not summary:
+        return
+    try:
+        membership_id = _safe_get(event_data or {}, "membership_id", "membership.id", default="").strip()
+        whop_key = _safe_get(event_data or {}, "whop_key", "key", default="").strip()
+        event_type = str((event_data or {}).get("event_type") or "").strip()
+        _record_member_whop_summary(
+            int(member_id),
+            summary,
+            event_type=event_type,
+            membership_id=membership_id,
+            whop_key=whop_key,
+        )
+    except Exception:
+        return
+
+async def _whop_brief_from_event(member: discord.Member, event_data: dict) -> dict:
+    # Prefer whop summary derived from webhook/member-logs payloads.
+    summary = {}
+    try:
+        if isinstance(event_data, dict):
+            summary = event_data.get("_whop_summary") or {}
+    except Exception:
+        summary = {}
+    if not isinstance(summary, dict):
+        summary = {}
+    if not summary and isinstance(event_data, dict):
+        try:
+            summary = _build_whop_summary(event_data)
+        except Exception:
+            summary = {}
+    if (not summary) and _whop_api_client:
+        mid = _membership_id_from_event(member, event_data)
+        if mid:
+            try:
+                summary = await fetch_whop_brief(
+                    _whop_api_client,
+                    mid,
+                    enable_enrichment=bool(_whop_api_config.get("enable_enrichment", True)),
+                )
+            except Exception:
+                summary = {}
+    if summary:
+        _record_whop_summary_if_possible(member_id=int(member.id), summary=summary, event_data=event_data)
+    return summary
 
 
 def _looks_like_dispute(payment: dict) -> bool:
@@ -817,7 +839,8 @@ def _safe_get(event_data: dict, *keys: str, default: str = "—") -> str:
 
 
 def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_role_id, role_cancel_a, role_cancel_b,
-               log_other_func, log_member_status_func, fmt_user_func, member_status_logs_channel_id=None, get_member_history_func=None,
+               log_other_func, log_member_status_func, fmt_user_func, member_status_logs_channel_id=None,
+               record_member_whop_summary_func=None,
                whop_api_key=None, whop_api_config=None,
                dispute_channel_id=None, resolution_channel_id=None,
                support_ping_role_id=None, support_ping_role_name=None,
@@ -836,7 +859,7 @@ def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_r
         log_member_status_func: Function to log to member status channel (canonical owner)
         fmt_user_func: Function to format user display (canonical owner)
         member_status_logs_channel_id: Channel ID for member status logs (lookup requests, trial alerts)
-        get_member_history_func: Function to get member history record (canonical owner)
+        record_member_whop_summary_func: Function to persist a Whop summary into member_history
         whop_api_key: Whop API key (optional, from config.secrets.json)
         whop_api_config: Whop API configuration dict (optional, from config.json)
     """
@@ -844,7 +867,7 @@ def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_r
     global WHOP_SUPPORT_PING_ROLE_ID, WHOP_SUPPORT_PING_ROLE_NAME
     global ROLE_TRIGGER, WELCOME_ROLE_ID, ROLE_CANCEL_A, ROLE_CANCEL_B
     global LIFETIME_ROLE_IDS
-    global _log_other, _log_member_status, _fmt_user, _get_member_history
+    global _log_other, _log_member_status, _fmt_user, _record_member_whop_summary
     global MEMBER_STATUS_LOGS_CHANNEL_ID, EXPECTED_ROLES, _whop_api_client, _whop_api_config
     
     WHOP_WEBHOOK_CHANNEL_ID = webhook_channel_id
@@ -868,7 +891,7 @@ def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_r
     _log_other = log_other_func
     _log_member_status = log_member_status_func
     _fmt_user = fmt_user_func
-    _get_member_history = get_member_history_func
+    _record_member_whop_summary = record_member_whop_summary_func
     MEMBER_STATUS_LOGS_CHANNEL_ID = member_status_logs_channel_id
     
     # Load expected roles config
@@ -989,14 +1012,13 @@ async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embe
         is_first = event_data.get("is_first_membership", "")
         membership_id_val = event_data.get("membership_id", "")
 
-        # Persist Discord -> membership_id link when available (prevents incorrect API lookups later)
-        if discord_user_id and membership_id_val:
-            with suppress(Exception):
-                _cache_discord_membership_link(
-                    discord_id=discord_user_id,
-                    membership_id=membership_id_val,
-                    source_event=event_type,
-                )
+        # Build a staff-safe summary from webhook data (used for embeds + history).
+        try:
+            summary = _build_whop_summary(event_data)
+            if summary:
+                event_data["_whop_summary"] = summary
+        except Exception:
+            pass
 
         # Consider trial tracking for activation/pending events
         if event_type in ("membership.activated.pending", "membership.activated", "payment.succeeded.activation", "payment.succeeded.renewal"):
@@ -1151,6 +1173,12 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
         
         # Merge: embed fields take precedence, content as fallback
         parsed_data = {**content_data, **fields_data}
+        flat_kv = _flatten_field_kv(fields_data)
+        summary_from_native = {}
+        try:
+            summary_from_native = _build_whop_summary(parsed_data, extra_kv=flat_kv)
+        except Exception:
+            summary_from_native = {}
 
         # Extract membership status and event type (usable even when Discord ID is missing)
         membership_status = parsed_data.get("membership_status", "") or fields_data.get("membership status", "")
@@ -1236,13 +1264,7 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                 if isinstance(member_rec, dict):
                     resolved_id = extract_discord_id_from_whop_member_record(member_rec)
                     if resolved_id and resolved_id.isdigit():
-                        with suppress(Exception):
-                            _cache_discord_membership_link(
-                                discord_id=str(resolved_id),
-                                membership_id=str(membership_id_hint).strip(),
-                                whop_member_id=str(whop_member_id or "").strip(),
-                                source_event="native.resolve.discord_id",
-                            )
+                        pass
 
             # Best-effort #2: resolve Discord ID from cached identity (email -> discord_id).
             if not resolved_id:
@@ -1298,6 +1320,8 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                     "amount": "N/A",
                     "failure_reason": "Payment failed",
                 }
+                if isinstance(summary_from_native, dict) and summary_from_native:
+                    event_data["_whop_summary"] = summary_from_native
                 await handle_payment_failed(member, event_data)
 
             # Check for payment received / succeeded (native cards)
@@ -1311,6 +1335,8 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                 }
                 if membership_id_hint:
                     event_data["membership_id"] = membership_id_hint
+                if isinstance(summary_from_native, dict) and summary_from_native:
+                    event_data["_whop_summary"] = summary_from_native
                 if is_renewal:
                     await handle_payment_renewal(member, event_data)
                 else:
@@ -1324,6 +1350,8 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                     "email": email_value,
                     "cancellation_reason": "Whop native cancel action",
                 }
+                if isinstance(summary_from_native, dict) and summary_from_native:
+                    event_data["_whop_summary"] = summary_from_native
                 await handle_membership_deactivated(member, event_data)
 
             # Check for membership status changes
@@ -1338,6 +1366,8 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                         "email": email_value,
                         "status": "active",
                     }
+                    if isinstance(summary_from_native, dict) and summary_from_native:
+                        event_data["_whop_summary"] = summary_from_native
                     await handle_membership_activated(member, event_data)
 
             else:
@@ -1434,8 +1464,6 @@ async def _verify_webhook_with_api(member: discord.Member, event_data: dict, eve
             membership_id = _safe_get(event_data, "membership_id", "membership.id", default="").strip()
             if membership_id == "—":
                 membership_id = ""
-            if not membership_id:
-                membership_id = _get_cached_membership_id_for_discord(member.id)
             if not membership_id:
                 return  # Can't verify without membership_id
 
@@ -1544,10 +1572,6 @@ async def handle_membership_deactivated(
             membership_id = ""
         if membership_id:
             membership_id_source = "event"
-        if not membership_id:
-            membership_id = _get_cached_membership_id_for_discord(member.id)
-            if membership_id:
-                membership_id_source = "cache"
     except Exception:
         membership_id = ""
         membership_id_source = ""

@@ -3,11 +3,51 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import discord
 
 log = logging.getLogger("rs-checker")
+
+def fmt_date_any(ts_str: str | int | float | None) -> str:
+    """Human-friendly date like 'January 8, 2026' (best-effort)."""
+    try:
+        if ts_str is None:
+            return "—"
+        if isinstance(ts_str, (int, float)):
+            dt = datetime.fromtimestamp(float(ts_str), tz=timezone.utc)
+        else:
+            s = str(ts_str).strip()
+            if not s:
+                return "—"
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        out = dt.astimezone(timezone.utc).strftime("%B %d, %Y")
+        return out.replace(" 0", " ")
+    except Exception:
+        return "—"
+
+
+def parse_dt_any(ts_str: str | int | float | None) -> datetime | None:
+    """Parse ISO/unix-ish timestamps into UTC datetime (best-effort)."""
+    if ts_str is None or ts_str == "":
+        return None
+    try:
+        if isinstance(ts_str, (int, float)):
+            return datetime.fromtimestamp(float(ts_str), tz=timezone.utc)
+        s = str(ts_str).strip()
+        if not s:
+            return None
+        # ISO-ish path
+        if "T" in s or "-" in s:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        # Unix-ish path (strings like "1700000000" or "1700000000.0")
+        return datetime.fromtimestamp(float(s), tz=timezone.utc)
+    except Exception:
+        return None
 
 def usd_amount(v: object) -> float:
     """Parse a USD-ish amount from strings like '$0', '0', '74,860.00', '$1.23'.

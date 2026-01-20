@@ -41,10 +41,13 @@ _LABEL_OVERRIDES: dict[str, str] = {
     "renewal_start": "Billing Period Started",
     "renewal_end": "Next Billing Date",
     "trial_end": "Trial Ends",
+    "trial_days": "Trial Days",
     "remaining_days": "Remaining Days",
     "dashboard_url": "Whop Dashboard",
     "manage_url": "Whop Billing Manage",
     "total_spent": "Total Spent",
+    "plan_is_renewal": "Plan Is Renewal",
+    "pricing": "Pricing",
     "last_success_paid_at": "Last Successful Payment",
     "last_payment_failure": "Payment Issue",
     "cancel_at_period_end": "Cancel At Period End",
@@ -155,6 +158,9 @@ def brief_payment_kv(brief: dict | None) -> list[tuple[str, object]]:
         ("product", b.get("product")),
         ("member_since", b.get("member_since")),
         ("trial_end", b.get("trial_end")),
+        ("trial_days", b.get("trial_days")),
+        ("plan_is_renewal", b.get("plan_is_renewal")),
+        ("pricing", b.get("pricing")),
         ("renewal_start", b.get("renewal_start")),
         ("renewal_end", b.get("renewal_end")),
         ("remaining_days", b.get("remaining_days")),
@@ -212,6 +218,12 @@ def build_case_minimal_embed(
     else:
         label_overrides["renewal_start"] = "Billing Period Started"
         label_overrides["renewal_end"] = "Access Ends On" if cancel_at_period_end else "Next Billing Date"
+    # Clarify what "Total Spent" means (lifetime vs membership-only fallback).
+    spent = b.get("total_spent")
+    if isinstance(spent, str) and "(membership)" in spent:
+        label_overrides["total_spent"] = "Total Spent (membership)"
+    elif not _is_blank(spent):
+        label_overrides["total_spent"] = "Total Spent (lifetime)"
     embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
     apply_member_header(embed, member)
 
@@ -230,6 +242,11 @@ def build_case_minimal_embed(
     _add_field(embed, _human_label("remaining_days", label_overrides=label_overrides), b.get("remaining_days"), inline=True)
     _add_field(embed, _human_label("renewal_end", label_overrides=label_overrides), b.get("renewal_end"), inline=True)
     _add_field(embed, _human_label("dashboard_url", label_overrides=label_overrides), b.get("dashboard_url"), inline=True)
+
+    # Optional plan/trial details
+    _add_field(embed, _human_label("trial_days", label_overrides=label_overrides), b.get("trial_days"), inline=True)
+    _add_field(embed, _human_label("plan_is_renewal", label_overrides=label_overrides), b.get("plan_is_renewal"), inline=True)
+    _add_field(embed, _human_label("pricing", label_overrides=label_overrides), b.get("pricing"), inline=True)
 
     # Long text: Payment issue
     _add_field(embed, _human_label("last_payment_failure", label_overrides=label_overrides), b.get("last_payment_failure"), inline=False)
@@ -263,6 +280,12 @@ def build_member_status_detailed_embed(
     else:
         label_overrides["renewal_start"] = "Billing Period Started"
         label_overrides["renewal_end"] = "Access Ends On" if cancel_at_period_end else "Next Billing Date"
+    # Clarify what "Total Spent" means (lifetime vs membership-only fallback).
+    spent = b.get("total_spent")
+    if isinstance(spent, str) and "(membership)" in spent:
+        label_overrides["total_spent"] = "Total Spent (membership)"
+    elif not _is_blank(spent):
+        label_overrides["total_spent"] = "Total Spent (lifetime)"
     embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
     apply_member_header(embed, member)
 
@@ -305,6 +328,10 @@ def build_member_status_detailed_embed(
     _add_field(embed, _human_label("status", label_overrides=label_overrides), b.get("status"), inline=True)
     _add_field(embed, _human_label("product", label_overrides=label_overrides), b.get("product"), inline=True)
     _add_field(embed, _human_label("total_spent", label_overrides=label_overrides), b.get("total_spent"), inline=True)
+
+    _add_field(embed, _human_label("trial_days", label_overrides=label_overrides), b.get("trial_days"), inline=True)
+    _add_field(embed, _human_label("plan_is_renewal", label_overrides=label_overrides), b.get("plan_is_renewal"), inline=True)
+    _add_field(embed, _human_label("pricing", label_overrides=label_overrides), b.get("pricing"), inline=True)
 
     _add_field(embed, _human_label("remaining_days", label_overrides=label_overrides), b.get("remaining_days"), inline=True)
     _add_field(embed, _human_label("renewal_end", label_overrides=label_overrides), b.get("renewal_end"), inline=True)

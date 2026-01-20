@@ -40,6 +40,8 @@ from rschecker_utils import (
     coerce_role_ids,
     usd_amount,
     extract_discord_id_from_whop_member_record,
+    fmt_date_any as _fmt_date_any,
+    parse_dt_any as _parse_dt_any,
 )
 from staff_embeds import (
     apply_member_header as _apply_member_header,
@@ -64,8 +66,6 @@ from staff_alerts_store import (
 from whop_webhook_handler import (
     initialize as init_whop_handler,
     handle_whop_webhook_message,
-    get_cached_whop_membership_id,
-    set_cached_whop_membership_id,
 )
 
 # Import Whop API client
@@ -768,6 +768,39 @@ cid_cache: Dict[int, Dict[str, str]] = {}  # user_id -> {"cid": str, "expires_at
 # Role update batching (reduce spam from rapid add/remove sequences)
 pending_role_updates: Dict[int, Dict[str, object]] = {}  # user_id -> {"added": set[int], "removed": set[int], "member": discord.Member, "task": asyncio.Task}
 
+# Suppress member-update log spam for known automated role changes (startup/sync).
+# user_id -> monotonic expiry timestamp
+_member_update_log_suppress: Dict[int, float] = {}
+
+def _suppress_member_update_logs(user_id: int, *, seconds: float = 180.0) -> None:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return
+    try:
+        ttl = float(seconds)
+    except Exception:
+        ttl = 180.0
+    ttl = max(5.0, ttl)
+    _member_update_log_suppress[uid] = time.monotonic() + ttl
+
+def _member_update_logs_suppressed(user_id: int) -> bool:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+    exp = _member_update_log_suppress.get(uid)
+    if not exp:
+        return False
+    try:
+        if time.monotonic() < float(exp):
+            return True
+    except Exception:
+        return False
+    with suppress(Exception):
+        _member_update_log_suppress.pop(uid, None)
+    return False
+
 # -----------------------------
 # Utils: persistence/time
 # -----------------------------
@@ -808,26 +841,6 @@ def _should_post_boot() -> bool:
             except Exception:
                 pass
         state["last_boot_post_iso"] = _now().isoformat()
-        save_json(BOOT_STATE_FILE, state)
-        return True
-    except Exception:
-        return True
-
-def _should_post_sync_report() -> bool:
-    """Throttle sync DM reports to avoid spam."""
-    try:
-        if BOOT_POST_MIN_HOURS <= 0:
-            return True
-        state = load_json(BOOT_STATE_FILE)
-        last_iso = str(state.get("last_sync_report_iso") or "").strip()
-        if last_iso:
-            try:
-                last_dt = datetime.fromisoformat(last_iso.replace("Z", "+00:00"))
-                if (_now() - last_dt) < timedelta(hours=BOOT_POST_MIN_HOURS):
-                    return False
-            except Exception:
-                pass
-        state["last_sync_report_iso"] = _now().isoformat()
         save_json(BOOT_STATE_FILE, state)
         return True
     except Exception:
@@ -1234,44 +1247,6 @@ def _fmt_discord_ts_any(ts_str: str | int | float | None, style: str = "D") -> s
     except Exception:
         return "—"
 
-def _fmt_date_any(ts_str: str | int | float | None) -> str:
-    """Human-friendly date like 'January 8, 2026' (best-effort)."""
-    try:
-        if ts_str is None:
-            return "—"
-        if isinstance(ts_str, (int, float)):
-            dt = datetime.fromtimestamp(float(ts_str), tz=timezone.utc)
-        else:
-            s = str(ts_str).strip()
-            if not s:
-                return "—"
-            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        out = dt.astimezone(timezone.utc).strftime("%B %d, %Y")
-        return out.replace(" 0", " ")
-    except Exception:
-        return "—"
-
-def _parse_dt_any(ts_str: str | int | float | None) -> datetime | None:
-    """Parse ISO/unix-ish timestamps into UTC datetime (best-effort)."""
-    if ts_str is None or ts_str == "":
-        return None
-    try:
-        if isinstance(ts_str, (int, float)):
-            return datetime.fromtimestamp(float(ts_str), tz=timezone.utc)
-        s = str(ts_str).strip()
-        if not s:
-            return None
-        # ISO-ish path
-        if "T" in s or "-" in s:
-            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)
-        # Unix-ish path (strings like "1700000000" or "1700000000.0")
-        return datetime.fromtimestamp(float(s), tz=timezone.utc)
-    except Exception:
-        return None
-
 def _has_lifetime_role(member: discord.Member) -> bool:
     """True if member has any configured lifetime role IDs."""
     if not LIFETIME_ROLE_IDS:
@@ -1348,11 +1323,12 @@ def _whop_placeholder_brief(state: str) -> dict:
 
 async def _resolve_whop_brief_for_discord_id(discord_id: int) -> tuple[str, dict]:
     """Resolve (membership_id, whop_brief) for a Discord ID (best-effort)."""
-    try:
-        mid = get_cached_whop_membership_id(discord_id)
-    except Exception:
-        mid = ""
-    mid = str(mid or "").strip()
+    # Prefer the last webhook-derived summary from member_history.
+    summary = _whop_summary_for_member(int(discord_id))
+    if isinstance(summary, dict) and summary:
+        return ("", summary)
+    # Fallback: use the last membership_id from member_history for API lookup.
+    mid = str(_membership_id_from_history(int(discord_id)) or "").strip()
     if not mid:
         return ("", {})
     brief = await _fetch_whop_brief_by_membership_id(mid)
@@ -1412,6 +1388,69 @@ def get_member_history(discord_id: int) -> dict:
     """Get member history record (exposed for whop_webhook_handler and support cards)"""
     db = _load_member_history()
     return db.get(str(discord_id), {})
+
+
+def record_member_whop_summary(
+    discord_id: int,
+    summary: dict,
+    *,
+    event_type: str = "",
+    membership_id: str = "",
+    whop_key: str = "",
+) -> None:
+    """Persist a staff-safe Whop summary into member_history (no PII)."""
+    try:
+        did = int(discord_id)
+    except Exception:
+        return
+    try:
+        now = _history_now_ts()
+        db = _load_member_history()
+        key = str(did)
+        rec = db.get(key, {})
+        rec = _ensure_member_history_shape(rec, now=now)
+        wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+        if isinstance(summary, dict) and summary:
+            wh["last_summary"] = summary
+            st = str(summary.get("status") or "").strip().lower()
+            if st:
+                wh["last_status"] = st
+        if event_type:
+            wh["last_event_type"] = str(event_type).strip()
+        wh["last_event_ts"] = int(now)
+        if membership_id and str(membership_id).strip().startswith(("mem_", "R-")):
+            wh["last_membership_id"] = str(membership_id).strip()
+        if whop_key and str(whop_key).strip().startswith(("mem_", "R-")):
+            wh["last_whop_key"] = str(whop_key).strip()
+        rec["whop"] = wh
+        db[key] = rec
+        _save_member_history(db)
+    except Exception:
+        return
+
+
+def _whop_summary_for_member(discord_id: int) -> dict:
+    try:
+        hist = get_member_history(int(discord_id)) or {}
+        wh = hist.get("whop") if isinstance(hist, dict) else None
+        if isinstance(wh, dict) and isinstance(wh.get("last_summary"), dict):
+            return wh.get("last_summary") or {}
+    except Exception:
+        return {}
+    return {}
+
+
+def _membership_id_from_history(discord_id: int) -> str:
+    try:
+        hist = get_member_history(int(discord_id)) or {}
+        wh = hist.get("whop") if isinstance(hist, dict) else None
+        if isinstance(wh, dict):
+            mid = str(wh.get("last_membership_id") or wh.get("last_whop_key") or "").strip()
+            if mid.startswith(("mem_", "R-")):
+                return mid
+    except Exception:
+        return ""
+    return ""
 
 def _backfill_whop_timeline_from_whop_history() -> None:
     """Backfill Whop lifecycle timeline from whop_history.json.
@@ -2189,7 +2228,7 @@ async def check_onboarding_ticket(user_id: int, guild: discord.Guild, delay_seco
 # -----------------------------
 # 60-second fallback checker
 # -----------------------------
-async def check_and_assign_role(member: discord.Member):
+async def check_and_assign_role(member: discord.Member, *, silent: bool = False):
     if member.bot or member.id in pending_checks:
         return
     pending_checks.add(member.id)
@@ -2207,33 +2246,39 @@ async def check_and_assign_role(member: discord.Member):
         if not has_any:
             trigger_role = guild.get_role(ROLE_TO_ASSIGN)
             if trigger_role is None:
-                err = _make_dyno_embed(
-                    member=member,
-                    description=f"{member.mention} trigger role missing",
-                    footer=f"ID: {member.id}",
-                    color=0xED4245,
-                )
-                err.add_field(name="Missing role", value=_fmt_role(ROLE_TO_ASSIGN, guild)[:1024], inline=False)
-                await log_role_event(embed=err)
+                if silent:
+                    log.warning(f"[RoleCheck] Trigger role missing for {member} ({member.id})")
+                else:
+                    err = _make_dyno_embed(
+                        member=member,
+                        description=f"{member.mention} trigger role missing",
+                        footer=f"ID: {member.id}",
+                        color=0xED4245,
+                    )
+                    err.add_field(name="Missing role", value=_fmt_role(ROLE_TO_ASSIGN, guild)[:1024], inline=False)
+                    await log_role_event(embed=err)
                 return
             try:
                 roles_to_add = [trigger_role]
                 roles_to_add_names = [trigger_role.name]
                 
+                if silent:
+                    _suppress_member_update_logs(member.id, seconds=300.0)
                 await member.add_roles(*roles_to_add, reason="No valid roles after 60s")
 
                 assigned = ", ".join([str(x) for x in roles_to_add_names if str(x).strip()]) or "—"
-                e = _make_dyno_embed(
-                    member=member,
-                    description=f"{member.mention} was given the {assigned} role",
-                    footer=f"ID: {member.id}",
-                    color=0x57F287,
-                )
-                e.add_field(name="Reason", value="No checked roles after 60s", inline=False)
-                e.add_field(name="Checked roles", value=str(len(ROLES_TO_CHECK)), inline=True)
-                await log_role_event(embed=e)
+                if not silent:
+                    e = _make_dyno_embed(
+                        member=member,
+                        description=f"{member.mention} was given the {assigned} role",
+                        footer=f"ID: {member.id}",
+                        color=0x57F287,
+                    )
+                    e.add_field(name="Reason", value="No checked roles after 60s", inline=False)
+                    e.add_field(name="Checked roles", value=str(len(ROLES_TO_CHECK)), inline=True)
+                    await log_role_event(embed=e)
                 
-                if not has_sequence_before(member.id):
+                if (not silent) and (not has_sequence_before(member.id)):
                     enqueue_first_day(member.id)
                     enq = _make_dyno_embed(
                         member=member,
@@ -2243,19 +2288,23 @@ async def check_and_assign_role(member: discord.Member):
                     )
                     await log_first(embed=enq)
             except Exception as e:
-                await log_role_event(f"⚠️ **Failed to assign roles** to {_fmt_user(member)}\n   ❌ Error: `{e}`")
+                if silent:
+                    log.warning(f"[RoleCheck] Failed to assign roles to {member} ({member.id}): {e}")
+                else:
+                    await log_role_event(f"⚠️ **Failed to assign roles** to {_fmt_user(member)}\n   ❌ Error: `{e}`")
         else:
             # User has checked roles - keep log compact (avoid dumping full role lists).
             user_has_names = _fmt_role_list(set(user_has_checked), guild)
-            sk = _make_dyno_embed(
-                member=member,
-                description=f"{member.mention} has checked roles; no trigger role needed",
-                footer=f"ID: {member.id}",
-                color=0x5865F2,
-            )
-            sk.add_field(name="Has", value=user_has_names[:1024] or "—", inline=False)
-            sk.add_field(name="Checked roles", value=str(len(ROLES_TO_CHECK)), inline=True)
-            await log_role_event(embed=sk)
+            if not silent:
+                sk = _make_dyno_embed(
+                    member=member,
+                    description=f"{member.mention} has checked roles; no trigger role needed",
+                    footer=f"ID: {member.id}",
+                    color=0x5865F2,
+                )
+                sk.add_field(name="Has", value=user_has_names[:1024] or "—", inline=False)
+                sk.add_field(name="Checked roles", value=str(len(ROLES_TO_CHECK)), inline=True)
+                await log_role_event(embed=sk)
     finally:
         pending_checks.discard(member.id)
 
@@ -2496,6 +2545,24 @@ async def sync_whop_memberships():
             for m2 in (candidates or []):
                 if not isinstance(m2, dict):
                     continue
+                # Safety: some /memberships listings can be broader than intended.
+                # Only consider memberships that clearly belong to the same Whop user.
+                u2_id = ""
+                u2 = m2.get("user")
+                if isinstance(u2, str):
+                    u2_id = u2.strip()
+                elif isinstance(u2, dict):
+                    u2_id = str(u2.get("id") or u2.get("user_id") or "").strip()
+                if not u2_id:
+                    m2m = m2.get("member")
+                    if isinstance(m2m, dict):
+                        u3 = m2m.get("user")
+                        if isinstance(u3, str):
+                            u2_id = u3.strip()
+                        elif isinstance(u3, dict):
+                            u2_id = str(u3.get("id") or u3.get("user_id") or "").strip()
+                if not u2_id or u2_id != whop_user_id:
+                    continue
                 mid2 = str(m2.get("id") or m2.get("membership_id") or "").strip()
                 if not mid2 or mid2 == mid:
                     continue
@@ -2521,7 +2588,7 @@ async def sync_whop_memberships():
     for member in members_to_check:
         try:
             # Check membership status via API (membership_id-based; avoids mismatched users)
-            membership_id = get_cached_whop_membership_id(member.id)
+            membership_id = _membership_id_from_history(member.id)
             if not membership_id:
                 continue
             verification = await whop_api_client.verify_membership_status(membership_id, "active")
@@ -2541,7 +2608,9 @@ async def sync_whop_memberships():
                     issue_key = f"cancel_scheduled:{membership_id}:{renewal_end_key}"
 
                     access = _access_roles_plain(member)
-                    whop_brief = await _fetch_whop_brief_by_membership_id(membership_id)
+                    whop_brief = _whop_summary_for_member(member.id)
+                    if not (isinstance(whop_brief, dict) and whop_brief):
+                        whop_brief = await _fetch_whop_brief_by_membership_id(membership_id)
                     # Noise control: only log Cancellation Scheduled for paying members (>$1) and active status.
                     # (Trials/$0 are extremely noisy and do not match reporting requirements.)
                     if status_now != "active" or float(usd_amount(whop_brief.get("total_spent"))) <= 1.0:
@@ -2597,6 +2666,10 @@ async def sync_whop_memberships():
                     if _has_lifetime_role(member):
                         continue
 
+                    # Fail-closed: only attempt "relink to active membership" when we can strongly
+                    # verify the membership belongs to this Discord ID.
+                    link_verified = False
+
                     # Guardrail: ensure the cached membership_id actually belongs to this Discord ID.
                     # If it doesn't, do not remove roles (prevents accidental removals from stale/bad links).
                     try:
@@ -2617,17 +2690,21 @@ async def sync_whop_memberships():
                                 if not sync_silent:
                                     await log_other(
                                         f"⚠️ **Whop Sync skipped removal (mismatch)** {_fmt_user(member)}\n"
-                                        f"   cached_membership_id: `{membership_id}`\n"
+                                        f"   membership_id: `{membership_id}`\n"
                                         f"   whop_member_id: `{whop_member_id}`\n"
                                         f"   whop_discord_id: `{did}`"
                                     )
                                 continue
+                            if did and did.isdigit() and int(did) == int(member.id):
+                                link_verified = True
                     except Exception:
                         pass
 
                     # Guardrail #2: user can have multiple memberships; the cached membership_id might be an old canceled one.
                     # If the Whop user currently has an ACTIVE/TRIALING entitled membership for the same product, keep access and relink.
                     try:
+                        if not link_verified:
+                            raise RuntimeError("link_not_verified")
                         now_dt = _now()
                         mid2, m2 = await _find_entitled_membership_for_same_user(
                             membership_data=membership_data if isinstance(membership_data, dict) else None,
@@ -2637,7 +2714,12 @@ async def sync_whop_memberships():
                         )
                         if mid2 and isinstance(m2, dict):
                             st2 = str(m2.get("status") or "").strip().lower()
-                            set_cached_whop_membership_id(member.id, mid2, source_event="sync.relink_active_membership")
+                            record_member_whop_summary(
+                                member.id,
+                                {},
+                                event_type="sync.relink_active_membership",
+                                membership_id=mid2,
+                            )
                             relinked_count += 1
                             if not sync_silent:
                                 await log_other(
@@ -2688,11 +2770,27 @@ async def sync_whop_memberships():
     if auto_heal_enabled:
         healed = 0
         try:
-            link_db = load_json(BASE_DIR / "whop_discord_link.json")
-            by = link_db.get("by_discord_id") if isinstance(link_db, dict) else None
-            ids = [k for k in (by.keys() if isinstance(by, dict) else []) if str(k).isdigit()]
+            hist_db = _load_member_history()
+            ids = [k for k in (hist_db.keys() if isinstance(hist_db, dict) else []) if str(k).isdigit()]
         except Exception:
             ids = []
+
+        # Compute duplicate membership_ids once; skip them (fail-closed).
+        dup_mids: set[str] = set()
+        try:
+            if isinstance(hist_db, dict):
+                counts: dict[str, int] = {}
+                for _did, _rec in hist_db.items():
+                    if not isinstance(_rec, dict):
+                        continue
+                    wh = _rec.get("whop") if isinstance(_rec.get("whop"), dict) else None
+                    _mid = str((wh or {}).get("last_membership_id") or "").strip()
+                    if not _mid:
+                        continue
+                    counts[_mid] = counts.get(_mid, 0) + 1
+                dup_mids = {m for m, c in counts.items() if c > 1}
+        except Exception:
+            dup_mids = set()
 
         for did in ids:
             try:
@@ -2706,8 +2804,10 @@ async def sync_whop_memberships():
                 continue
 
             # Resolve current best membership for this Discord ID.
-            mid = str(get_cached_whop_membership_id(uid) or "").strip()
+            mid = str(_membership_id_from_history(uid) or "").strip()
             if not mid:
+                continue
+            if dup_mids and mid in dup_mids:
                 continue
             try:
                 mdata = await whop_api_client.get_membership_by_id(mid)
@@ -2745,7 +2845,9 @@ async def sync_whop_memberships():
                 continue
 
             # Check paid threshold using Whop brief (total_spent best-effort).
-            brief = await _fetch_whop_brief_by_membership_id(mid_active)
+            brief = _whop_summary_for_member(mbr.id)
+            if not (isinstance(brief, dict) and brief):
+                brief = await _fetch_whop_brief_by_membership_id(mid_active)
             spent = float(usd_amount((brief or {}).get("total_spent")))
             if spent <= float(auto_heal_min_spent):
                 continue
@@ -2756,8 +2858,15 @@ async def sync_whop_memberships():
                 continue
 
             try:
+                # Prevent startup/sync-driven role adds from spamming member-status channels.
+                _suppress_member_update_logs(mbr.id, seconds=300.0)
                 await mbr.add_roles(member_role, reason="Whop auto-heal: active+entitled membership")
-                set_cached_whop_membership_id(mbr.id, mid_active, source_event="sync.auto_heal_add_member_role")
+                record_member_whop_summary(
+                    mbr.id,
+                    {},
+                    event_type="sync.auto_heal_add_member_role",
+                    membership_id=mid_active,
+                )
                 healed += 1
                 if not sync_silent:
                     await log_other(
@@ -2813,6 +2922,9 @@ async def sync_whop_memberships_error(error):
 @bot.event
 async def on_ready():
     global queue_state, registry, invite_usage_cache, whop_api_client
+    startup_notes: list[str] = []
+    startup_kv: list[tuple[str, object]] = []
+    post_startup_report = _should_post_boot()
     
     # Comprehensive startup logging
     log.info("="*60)
@@ -2825,6 +2937,16 @@ async def on_ready():
     
     # Backfill Whop timeline from whop_history.json (before initializing whop handler)
     _backfill_whop_timeline_from_whop_history()
+    # Remove deprecated link cache file (no longer used).
+    try:
+        link_path = BASE_DIR / "whop_discord_link.json"
+        if link_path.exists():
+            link_path.unlink()
+            if post_startup_report:
+                startup_kv.append(("removed_whop_discord_link_json", "yes"))
+    except Exception as e:
+        if post_startup_report:
+            startup_kv.append(("whop_discord_link_remove_error", str(e)[:120]))
     
     guild = bot.get_guild(GUILD_ID)
     if guild:
@@ -2922,13 +3044,16 @@ async def on_ready():
     registry_count = len(registry)
     log.info(f"[Queue] Active entries: {queue_count}")
     log.info(f"[Registry] Registered users: {registry_count}")
+    if post_startup_report:
+        startup_kv.append(("queue_entries", queue_count))
+        startup_kv.append(("registry_users", registry_count))
     
     if not scheduler_loop.is_running():
         scheduler_loop.start()
         log.info("[Scheduler] Started and state restored")
 
-    if _should_post_boot():
-        await log_other("🟢 [BOOT] Scheduler started and state restored.")
+    if post_startup_report:
+        startup_notes.append("Scheduler started and state restored.")
     
     # Cleanup old data on startup
     cleanup_old_data()
@@ -2939,15 +3064,12 @@ async def on_ready():
         scheduled = 0
         for m in guild.members:
             if not m.bot and not any(r.id in ROLES_TO_CHECK for r in m.roles):
-                asyncio.create_task(check_and_assign_role(m))
+                asyncio.create_task(check_and_assign_role(m, silent=True))
                 scheduled += 1
         if scheduled:
             log.info(f"[Boot Check] Scheduled fallback role checks for {scheduled} member(s)")
-            await log_role_event(
-                f"🔍 **Boot Check Scheduled**\n"
-                f"   📋 Scheduled fallback role checks for **{scheduled}** member(s)\n"
-                f"   ⏱️ Will check in 60s if they need trigger role assigned"
-            )
+            if post_startup_report:
+                startup_kv.append(("boot_check_scheduled", scheduled))
 
     # Start HTTP server for invite tracking
     asyncio.create_task(init_http_server())
@@ -2988,7 +3110,7 @@ async def on_ready():
             log_member_status_func=log_member_status,
             fmt_user_func=_fmt_user,
             member_status_logs_channel_id=MEMBER_STATUS_LOGS_CHANNEL_ID,
-            get_member_history_func=get_member_history,
+            record_member_whop_summary_func=record_member_whop_summary,
             whop_api_key=WHOP_API_KEY,
             whop_api_config=WHOP_API_CONFIG,
             dispute_channel_id=WHOP_DISPUTE_CHANNEL_ID,
@@ -3027,6 +3149,78 @@ async def on_ready():
         if not reporting_loop.is_running():
             reporting_loop.start()
             log.info("[Reporting] Reporting loop started")
+
+    # One single startup report (anti-spam): file health + cache poisoning detection.
+    if post_startup_report and LOG_OTHER_CHANNEL_ID:
+        try:
+            def _as_hours(delta: timedelta) -> float:
+                try:
+                    return float(delta.total_seconds() / 3600.0)
+                except Exception:
+                    return 0.0
+
+            # Stale-file threshold (hours)
+            try:
+                stale_hours = float(LOG_CONTROLS.get("startup_stale_hours", 24))
+            except Exception:
+                stale_hours = 24.0
+            stale_hours = max(0.0, stale_hours)
+
+            # Collect runtime file health
+            runtime_files: list[tuple[str, Path]] = [
+                ("member_history.json", MEMBER_HISTORY_FILE),
+                ("payment_cache.json", PAYMENT_CACHE_FILE),
+                ("staff_alerts.json", STAFF_ALERTS_FILE),
+                ("reporting_store.json", BASE_DIR / "reporting_store.json"),
+            ]
+            stale: list[str] = []
+            tmp_leftovers: list[str] = []
+            for label, p in runtime_files:
+                try:
+                    tmp = Path(str(p) + ".tmp")
+                    if tmp.exists():
+                        tmp_leftovers.append(tmp.name)
+                except Exception:
+                    pass
+                try:
+                    if not p.exists():
+                        continue
+                    age = _now() - datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
+                    if stale_hours > 0 and age > timedelta(hours=stale_hours):
+                        stale.append(f"{label} ({_as_hours(age):.1f}h)")
+                except Exception:
+                    continue
+
+            e = discord.Embed(
+                title="RSCheckerbot • Startup Health",
+                description="Startup completed. This is the only startup message (anti-spam).",
+                color=0x5865F2,
+                timestamp=_now(),
+            )
+
+            # High-signal facts
+            if startup_notes:
+                e.add_field(name="Startup", value=("\n".join(f"- {x}" for x in startup_notes)[:1024] or "—"), inline=False)
+
+            if stale:
+                e.add_field(name=f"Stale files (> {stale_hours:.0f}h)", value=(", ".join(stale)[:1024] or "—"), inline=False)
+            if tmp_leftovers:
+                e.add_field(name="Tmp leftovers", value=(", ".join(tmp_leftovers)[:1024] or "—"), inline=False)
+
+            # Add any collected key/values (small)
+            if startup_kv:
+                lines = []
+                for k, v in startup_kv:
+                    ks = str(k or "").strip()
+                    if not ks:
+                        continue
+                    lines.append(f"{ks}: {v}")
+                if lines:
+                    e.add_field(name="Notes", value=("\n".join(lines)[:1024] or "—"), inline=False)
+
+            await log_other(embed=e)
+        except Exception:
+            pass
 
 
 async def _ensure_whop_resolution_channels(guild: discord.Guild) -> None:
@@ -3306,8 +3500,11 @@ async def on_member_remove(member: discord.Member):
             if ch:
                 access = _access_roles_plain(member)
 
-                mid = get_cached_whop_membership_id(member.id)
-                whop_brief = await _fetch_whop_brief_by_membership_id(mid) if mid else {}
+                mid = ""
+                whop_brief = _whop_summary_for_member(member.id)
+                if not (isinstance(whop_brief, dict) and whop_brief):
+                    mid = _membership_id_from_history(member.id)
+                    whop_brief = await _fetch_whop_brief_by_membership_id(mid) if mid else {}
                 if not (isinstance(whop_brief, dict) and whop_brief):
                     whop_brief = _whop_placeholder_brief("pending" if mid else "unlinked")
                 acc = rec.get("access") if isinstance(rec.get("access"), dict) else {}
@@ -3336,6 +3533,7 @@ async def on_member_remove(member: discord.Member):
 async def on_member_update(before: discord.Member, after: discord.Member):
     before_roles = {r.id for r in before.roles}
     after_roles = {r.id for r in after.roles}
+    suppress_logs = _member_update_logs_suppressed(after.id)
     
     # Detect all role changes (added and removed)
     roles_added = after_roles - before_roles
@@ -3405,6 +3603,9 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
     if ROLE_TRIGGER not in before_roles and ROLE_TRIGGER in after_roles:
         guild = after.guild
+        if suppress_logs:
+            # Startup/sync-driven role changes should not enqueue DM sequences or spam channels.
+            return
         
         if has_sequence_before(after.id):
             await log_other(f"⏭️ Skipped DM sequence for {_fmt_user(after)} — sequence previously run")
@@ -3456,6 +3657,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         asyncio.create_task(check_and_assign_role(after))
 
     if (ROLE_CANCEL_A in before_roles) and (ROLE_CANCEL_A not in after_roles):
+        # Sync-driven removals (if enabled) can create noisy staff cards; suppress when flagged.
         if _has_lifetime_role(after):
             role_obj = after.guild.get_role(ROLE_CANCEL_A) if after.guild else None
             role_name = str(role_obj.name) if role_obj else "Member"
@@ -3466,7 +3668,8 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                 footer=f"ID: {after.id} • CID: {cid}",
                 color=0x57F287,
             )
-            await log_role_event(embed=e)
+            if not suppress_logs:
+                await log_role_event(embed=e)
             return
         # Show all roles removed in this update (not just Member role)
         all_removed_in_update = before_roles - after_roles
@@ -3479,8 +3682,10 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         only_member_removed = len(all_removed_in_update) == 1 or (len(all_removed_in_update) == 2 and ROLE_CANCEL_B in all_removed_in_update)
         if only_member_removed:
             # Determine whether this is a payment failure (past_due/unpaid) vs cancellation.
-            whop_mid = get_cached_whop_membership_id(after.id)
-            whop_brief = await _fetch_whop_brief_by_membership_id(whop_mid) if whop_mid else {}
+            whop_brief = _whop_summary_for_member(after.id)
+            if not (isinstance(whop_brief, dict) and whop_brief):
+                whop_mid = _membership_id_from_history(after.id)
+                whop_brief = await _fetch_whop_brief_by_membership_id(whop_mid) if whop_mid else {}
             whop_status = str((whop_brief.get("status") or "")).strip().lower()
             is_payment_failed = whop_status in ("past_due", "unpaid") or bool(whop_brief.get("last_payment_failure"))
             event_kind = "payment_failed" if is_payment_failed else "deactivated"
@@ -3550,12 +3755,14 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             value=f"Will mark as Former Member in {FORMER_MEMBER_DELAY_SECONDS}s if not regained",
             inline=False,
         )
-        await log_role_event(embed=removed_embed)
+        if not suppress_logs:
+            await log_role_event(embed=removed_embed)
         
         # If Member role was removed and user has active DM sequence, cancel it
         if str(after.id) in queue_state:
             mark_cancelled(after.id, "member_role_removed_payment")
-            await log_other(f"🛑 Cancelled DM sequence for {_fmt_user(after)} — Member role removed (likely payment cancellation)")
+            if not suppress_logs:
+                await log_other(f"🛑 Cancelled DM sequence for {_fmt_user(after)} — Member role removed (likely payment cancellation)")
         
         asyncio.create_task(delayed_assign_former_member(after))
 
@@ -3570,6 +3777,8 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         # If Member role was the ONLY role added, likely payment reactivation
         only_member_added = len(all_added_in_update) == 1
         if only_member_added:
+            if suppress_logs:
+                return
             access = _access_roles_plain(after)
             issue_key = "payment_resumed"
             if await should_post_and_record_alert(
@@ -3593,7 +3802,16 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                     return (_now() - dt) <= timedelta(hours=float(PAYMENT_RESUMED_RECENT_HOURS))
 
                 def _title_for(brief: dict) -> str:
-                    return "✅ Payment Resumed" if _is_recent_success(brief) else "✅ Access Restored"
+                    if not isinstance(brief, dict):
+                        return "⚠️ Member role added (Whop not linked)"
+                    st = str(brief.get("status") or "").strip().lower()
+                    if st in {"active", "trialing"}:
+                        return "✅ Payment Resumed" if _is_recent_success(brief) else "✅ Access Restored"
+                    if st in {"past_due", "unpaid"}:
+                        return "⚠️ Member role added (payment past due)"
+                    if st in {"canceled", "cancelled", "expired", "inactive"}:
+                        return "⚠️ Member role added (Whop canceled)"
+                    return "⚠️ Member role added (Whop status unclear)"
 
                 base_member_kv = [
                     ("first_joined", _fmt_ts(hist.get("first_join_ts"), "D") if hist.get("first_join_ts") else "—"),
@@ -4722,8 +4940,10 @@ async def whois_member(ctx, member: discord.Member):
         embed.add_field(name="Member", value=member.mention, inline=True)
         embed.add_field(name="Access", value=access or "—", inline=True)
 
-        mid = get_cached_whop_membership_id(member.id)
-        brief = await _fetch_whop_brief_by_membership_id(mid) if mid else {}
+        brief = _whop_summary_for_member(member.id)
+        if not (isinstance(brief, dict) and brief):
+            mid = _membership_id_from_history(member.id)
+            brief = await _fetch_whop_brief_by_membership_id(mid) if mid else {}
         lines: list[str] = []
         if brief:
             if brief.get("product") and brief["product"] != "—":

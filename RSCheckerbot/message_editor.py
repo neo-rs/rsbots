@@ -15,12 +15,16 @@ if TYPE_CHECKING:
     from main import RSCheckerBot
 
 
-class MessageEditorView(ui.View):
-    """View for editing messages via Discord interface"""
-    
+class _BotView(ui.View):
+    """Base view holding a reference to the bot instance (single source of truth)."""
+
     def __init__(self, bot_instance: "RSCheckerBot"):
         super().__init__(timeout=None)
         self.bot_instance = bot_instance
+
+
+class MessageEditorView(_BotView):
+    """View for editing messages via Discord interface"""
     
     def get_main_embed(self) -> discord.Embed:
         """Get main editor embed"""
@@ -394,12 +398,8 @@ class MainImageURLModal(ui.Modal, title="Edit Main Image URL"):
             )
 
 
-class GlobalSettingsView(ui.View):
+class GlobalSettingsView(_BotView):
     """View for editing global settings"""
-    
-    def __init__(self, bot_instance: "RSCheckerBot"):
-        super().__init__(timeout=None)
-        self.bot_instance = bot_instance
     
     def get_main_embed(self) -> discord.Embed:
         """Get main settings embed"""

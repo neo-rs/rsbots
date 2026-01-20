@@ -91,7 +91,8 @@ RSAdminBot/original_files/**
 
 # Never include local server snapshots
 Oraclserver-files/**
-
+# Never include downloaded runtime data (may contain PII; analysis-only)
+OracleServerData/**
 # Secrets / local-only scratchpads (do not commit)
 rs-bot-tokens.txt
 .tmp/

@@ -275,6 +275,41 @@ Notes:
    }
    ```
 
+---
+
+## Whop Data Sources and Reporting Fields (RSCheckerbot)
+
+### Sources of truth (canonical)
+- **Whop member-logs channel** (native Whop integration posts):
+  - Used for **event visibility** and staff-facing summaries.
+  - Parsed into **staff-safe summaries** stored under `member_history.json -> whop.last_summary`.
+  - Not a durable ledger; do not depend on it for authoritative state.
+- **Whop API**:
+  - Used for **authoritative status** and details when membership_id is present.
+  - Required for disputes/resolution details and payment failure reasons.
+
+### Deprecated / removed
+- `whop_discord_link.json` is deprecated and should not be created or used.
+
+### Allowed reporting fields (staff-safe)
+- Membership: `status`, `product`, `membership_id`, `first_membership`, `cancel_at_period_end`
+- Billing/renewal: `renewal_start`, `renewal_end`, `plan_is_renewal`, `pricing`, `trial_days`
+- Payments: `total_spent`, `payment_failure_reason`
+- Actions/links: `dashboard_url`, `manage_url`, `checkout_url`
+- Disputes/resolution: `dispute_status`, `resolution_status`, `resolution_notes` (when provided by API)
+
+### Required Whop API scopes for RSCheckerbot reporting
+Minimum scopes for the fields above:
+- `Read memberships`, `Update memberships`
+- `Read members`, `Read member emails`, `Read member payment methods`
+- `Read payments`, `Export payments`, `Manage payments`
+- `payment:dispute`, `payment:resolution_center`, `Export disputes`, `Read disputes`
+- `Export resolution center cases`, `Read resolution center cases`
+- `Read changes to memberships`, `Read changes to payments`, `Read changes to refunds`, `Read changes to disputes`, `Read changes to resolution center cases`
+
+Out-of-scope for RSCheckerbot reporting (do not use unless explicitly required):
+- `webhook_receive:setup_intents`, `webhook_receive:withdrawals`, `webhook_receive:payout_methods`, `webhook_receive:verifications`
+
 ## 📚 COMMANDS DOCUMENTATION MAINTENANCE (MANDATORY)
 
 ### Automatic COMMANDS.md Updates

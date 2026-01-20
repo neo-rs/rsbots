@@ -55,7 +55,6 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 BOT_RUNTIME_FILES = {
     "RSCheckerbot": [
         "member_history.json",
-        "whop_discord_link.json",
         "whop_identity_cache.json",
         "trial_history.json",
         "identity_conflicts.jsonl",
@@ -168,6 +167,51 @@ def check_file_exists(remote_path: str) -> tuple[bool, str]:
     return ("EXISTS" in (stdout or "")), ""
 
 
+def get_file_meta(remote_path: str) -> tuple[bool, dict, str]:
+    """Return (exists, meta, err) for a remote file (or local when LOCAL_MODE is True).
+
+    meta keys:
+      - size_bytes (int)
+      - mtime_unix (int)
+      - mtime_iso (str)
+    """
+    if LOCAL_MODE:
+        try:
+            p = Path(remote_path)
+            if not p.is_file():
+                return False, {}, ""
+            st = p.stat()
+            mtime = int(st.st_mtime)
+            return True, {
+                "size_bytes": int(st.st_size),
+                "mtime_unix": mtime,
+                "mtime_iso": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
+            }, ""
+        except Exception as e:
+            return False, {}, f"local_stat_failed: {e}"
+
+    # GNU stat: size + mtime epoch seconds
+    cmd = f"stat -c '%s %Y' {shlex.quote(remote_path)} 2>/dev/null || echo 'MISSING'"
+    code, stdout, stderr = run_ssh_command(cmd)
+    if code != 0:
+        err = (stderr or stdout or "").strip()
+        return False, {}, (err[:300] if err else "ssh_failed")
+    out = (stdout or "").strip()
+    if not out or out == "MISSING":
+        return False, {}, ""
+    try:
+        size_s, mtime_s = out.split(None, 1)
+        size_i = int(size_s)
+        mtime_i = int(mtime_s)
+        return True, {
+            "size_bytes": size_i,
+            "mtime_unix": mtime_i,
+            "mtime_iso": datetime.fromtimestamp(mtime_i, tz=timezone.utc).isoformat(),
+        }, ""
+    except Exception:
+        return True, {"raw": out[:200]}, ""
+
+
 def sync_bot_data(bot_name: str, files: list[str]) -> dict:
     """Sync runtime data files for a single bot"""
     bot_output_dir = OUTPUT_DIR / bot_name
@@ -190,8 +234,9 @@ def sync_bot_data(bot_name: str, files: list[str]) -> dict:
         # Create subdirectories if needed
         local_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Check if file exists
-        exists, check_err = check_file_exists(remote_path)
+        # Check if file exists + capture remote metadata
+        exists, meta, meta_err = get_file_meta(remote_path)
+        check_err = meta_err
         if check_err:
             results["errors"].append({"file": file_path, "remote_path": remote_path, "error": check_err})
             print(f"  [ERR]  {file_path} - Check failed ({check_err})")
@@ -208,10 +253,13 @@ def sync_bot_data(bot_name: str, files: list[str]) -> dict:
             results["downloaded"].append({
                 "file": file_path,
                 "size": file_size,
+                "remote_meta": meta,
                 "remote_path": remote_path,
                 "local_path": str(local_path),
             })
-            print(f"  [OK]   {file_path} ({file_size:,} bytes)")
+            m_iso = str((meta or {}).get("mtime_iso") or "")
+            m_s = f", mtime={m_iso}" if m_iso else ""
+            print(f"  [OK]   {file_path} ({file_size:,} bytes{m_s})")
         else:
             results["errors"].append({"file": file_path, "remote_path": remote_path, "error": dl_err})
             print(f"  [ERR]  {file_path} - Download failed ({dl_err})")

@@ -7,11 +7,6 @@ from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
 def _parse_iso(dt_str: str) -> datetime | None:
     try:
         s = (dt_str or "").strip()
@@ -64,7 +59,7 @@ def should_post_alert(db: dict, discord_id: int, issue_key: str, cooldown_hours:
     last_dt = _parse_iso(last_iso)
     if not last_dt:
         return True
-    return (_now() - last_dt) >= timedelta(hours=cooldown_hours)
+    return (datetime.now(timezone.utc) - last_dt) >= timedelta(hours=cooldown_hours)
 
 
 def record_alert_post(db: dict, discord_id: int, issue_key: str) -> None:
@@ -79,7 +74,7 @@ def record_alert_post(db: dict, discord_id: int, issue_key: str) -> None:
     last = rec.get("last")
     if not isinstance(last, dict):
         last = {}
-    last[issue_key] = _now().isoformat()
+    last[issue_key] = datetime.now(timezone.utc).isoformat()
     rec["last"] = last
 
 
