@@ -209,6 +209,18 @@ def get_cached_whop_membership_id(discord_id: int | str) -> str:
     """Public helper for other modules (single source of truth for the link DB)."""
     return _get_cached_membership_id_for_discord(discord_id)
 
+def set_cached_whop_membership_id(discord_id: int | str, membership_id: str, *, source_event: str = "") -> None:
+    """Public helper to update the Discord -> membership link (single writer).
+
+    Used by sync jobs to repair stale links (e.g., user has multiple memberships).
+    """
+    did = str(discord_id or "").strip()
+    mid = str(membership_id or "").strip()
+    if not did.isdigit() or not mid:
+        return
+    with suppress(Exception):
+        _cache_discord_membership_link(discord_id=did, membership_id=mid, source_event=source_event or "set_cached_whop_membership_id")
+
 
 def _load_resolution_state() -> dict:
     try:

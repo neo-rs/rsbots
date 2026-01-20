@@ -64,6 +64,7 @@ from whop_webhook_handler import (
     initialize as init_whop_handler,
     handle_whop_webhook_message,
     get_cached_whop_membership_id,
+    set_cached_whop_membership_id,
 )
 
 # Import Whop API client
@@ -2419,6 +2420,10 @@ async def sync_whop_memberships():
 
                     access = _access_roles_plain(member)
                     whop_brief = await _fetch_whop_brief_by_membership_id(membership_id)
+                    # Noise control: only log Cancellation Scheduled for paying members (>$1) and active status.
+                    # (Trials/$0 are extremely noisy and do not match reporting requirements.)
+                    if status_now != "active" or float(usd_amount(whop_brief.get("total_spent"))) <= 1.0:
+                        continue
 
                     # Detailed card -> member-status-logs
                     hist = get_member_history(member.id) or {}
@@ -2489,6 +2494,63 @@ async def sync_whop_memberships():
                                     f"   whop_member_id: `{whop_member_id}`\n"
                                     f"   whop_discord_id: `{did}`"
                                 )
+                                continue
+                    except Exception:
+                        pass
+
+                    # Guardrail #2: user can have multiple memberships; the cached membership_id might be an old canceled one.
+                    # If the Whop user currently has an ACTIVE/TRIALING membership for the same product, keep access and relink.
+                    try:
+                        product_title = ""
+                        if isinstance(membership_data, dict) and isinstance(membership_data.get("product"), dict):
+                            product_title = str(membership_data["product"].get("title") or "").strip()
+
+                        # Prefer user_id from membership payload; fallback to whop_brief enrichment.
+                        whop_user_id = ""
+                        if isinstance(membership_data, dict):
+                            u = membership_data.get("user")
+                            if isinstance(u, str):
+                                whop_user_id = u.strip()
+                            elif isinstance(u, dict):
+                                whop_user_id = str(u.get("id") or u.get("user_id") or "").strip()
+                        if not whop_user_id:
+                            btmp = await _fetch_whop_brief_by_membership_id(membership_id)
+                            whop_user_id = str((btmp or {}).get("whop_user_id") or "").strip()
+
+                        if whop_user_id:
+                            candidates = await whop_api_client.get_user_memberships(whop_user_id)
+                            kept = False
+                            for m2 in (candidates or []):
+                                if not isinstance(m2, dict):
+                                    continue
+                                mid2 = str(m2.get("id") or m2.get("membership_id") or "").strip()
+                                if not mid2 or mid2 == membership_id:
+                                    continue
+                                st2 = str(m2.get("status") or "").strip().lower()
+                                if st2 not in ("active", "trialing"):
+                                    continue
+                                if product_title and isinstance(m2.get("product"), dict):
+                                    t2 = str(m2["product"].get("title") or "").strip()
+                                    if t2 and t2 != product_title:
+                                        continue
+                                entitled2, _until2, _why2 = await whop_api_client.is_entitled_until_end(
+                                    mid2,
+                                    m2,
+                                    cache_path=str(PAYMENT_CACHE_FILE),
+                                    monthly_days=30,
+                                    grace_days=3,
+                                    now=_now(),
+                                )
+                                if entitled2:
+                                    set_cached_whop_membership_id(member.id, mid2, source_event="sync.relink_active_membership")
+                                    await log_other(
+                                        f"✅ **Whop Sync kept access (newer active membership)** {_fmt_user(member)}\n"
+                                        f"   old_membership_id: `{membership_id}` (status `{actual_status}`)\n"
+                                        f"   new_membership_id: `{mid2}` (status `{st2}`)"
+                                    )
+                                    kept = True
+                                    break
+                            if kept:
                                 continue
                     except Exception:
                         pass
