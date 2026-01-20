@@ -40,6 +40,9 @@ reqs=(
   "$ROOT_DIR/RSCheckerbot/requirements.txt"
   "$ROOT_DIR/RSMentionPinger/requirements.txt"
   "$ROOT_DIR/RSuccessBot/requirements.txt"
+  "$ROOT_DIR/MWDataManagerBot/requirements.txt"
+  "$ROOT_DIR/MWPingBot/requirements.txt"
+  "$ROOT_DIR/MWDiscumBot/requirements.txt"
 )
 
 args=()

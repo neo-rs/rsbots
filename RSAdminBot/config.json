@@ -52,6 +52,10 @@
   "local_exec": {
     "enabled": true
   },
+  "code_checkouts": {
+    "rsbots_code_root": "/home/rsadmin/bots/rsbots-code",
+    "mwbots_code_root": "/home/rsadmin/bots/mwbots-code"
+  },
   "oraclefiles_sync": {
     "enabled": true,
     "periodic_enabled": false,

@@ -7,6 +7,9 @@
 # Allow helper scripts at repo root
 !/push_rsbots_py_only.bat
 !/oracle_baseline_check.bat
+!/push_mwbots_py_only.bat
+!/oracle_tools_menu_mwbots.bat
+!/oracle_baseline_check_mwbots.bat
 
 # Allow canonical docs at repo root
 !/CANONICAL_RULES.md

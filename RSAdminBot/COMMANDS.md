@@ -94,6 +94,15 @@ RSAdminBot is the central administrative bot for managing all RS bots on the Ora
 - **Admin Only**: Yes
 - **Returns**: Git commit info, files synced, restart status
 
+#### `!mwupdate`
+- **Description**: Update a Mirror-World bot by pulling python-only code from GitHub and restarting it
+- **Aliases**: `mwbots`
+- **Parameters**:
+  - `bot_name` (optional): Mirror-World bot name to update. If omitted, shows interactive dropdown (MW bots only)
+- **Usage**: `!mwupdate` or `!mwupdate datamanagerbot`
+- **Admin Only**: Yes
+- **Returns**: Git commit info, files synced, restart status
+
 #### `!botsync`
 - **Description**: Sync local bot files directly to Oracle server via rsync
 - **Aliases**: `syncbot`
@@ -406,11 +415,11 @@ RSAdminBot is the central administrative bot for managing all RS bots on the Ora
 
 ## Command Summary
 
-- **Total Commands**: 43
-- **Admin Commands**: 42
+- **Total Commands**: 44
+- **Admin Commands**: 43
 - **Public Commands**: 1 (`!ping`)
-- **Commands with Aliases**: 8
-- **Interactive Commands**: 7 (use dropdown menus when bot_name omitted)
+- **Commands with Aliases**: 9
+- **Interactive Commands**: 8 (use dropdown menus when bot_name omitted)
 
 ## Notes
 

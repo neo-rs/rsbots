@@ -25,6 +25,9 @@ units=(
   "mirror-world-rscheckerbot.service"
   "mirror-world-rsmentionpinger.service"
   "mirror-world-rssuccessbot.service"
+  "mirror-world-datamanagerbot.service"
+  "mirror-world-pingbot.service"
+  "mirror-world-discumbot.service"
 )
 
 echo "Bootstrapping shared venv..."
@@ -52,11 +55,17 @@ for unit in "${units[@]}"; do
   sudo systemctl enable "$unit" >/dev/null
 done
 
-echo "Restarting services (non-admin bots first, then RSAdminBot)..."
+echo "Restarting RS services (non-admin bots first, then RSAdminBot)..."
 for unit in "mirror-world-rsforwarder.service" "mirror-world-rsonboarding.service" "mirror-world-rscheckerbot.service" "mirror-world-rsmentionpinger.service" "mirror-world-rssuccessbot.service"; do
   sudo systemctl restart "$unit" || true
 done
 sudo systemctl restart "mirror-world-rsadminbot.service" || true
+
+echo "NOTE: MW bot services were installed/enabled but NOT restarted by this script."
+echo "      Copy MW secrets (.env/tokens.env/channel_map.json) first, then start them:"
+echo "        sudo systemctl restart mirror-world-datamanagerbot.service"
+echo "        sudo systemctl restart mirror-world-pingbot.service"
+echo "        sudo systemctl restart mirror-world-discumbot.service"
 
 echo "Done. Current status summary:"
 for unit in "${units[@]}"; do

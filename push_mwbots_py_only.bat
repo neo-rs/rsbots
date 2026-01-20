@@ -1,0 +1,83 @@
+@echo off
+setlocal enabledelayedexpansion
+
+REM Push MW bots updates to GitHub (MWBots repo).
+REM - Runs inside the ./MWBots folder (separate repo).
+REM - Assumes MWBots repo has origin pointing to neo-rs/MWBots
+REM - MWBots/.gitignore must exclude secrets + runtime files
+
+cd /d "%~dp0MWBots"
+
+REM Basic sanity checks
+git rev-parse --is-inside-work-tree >nul 2>&1
+if errorlevel 1 (
+  echo ERROR: Not inside a git repository. Expected: %~dp0MWBots
+  exit /b 1
+)
+
+REM Make sure we're on main (best effort; do not fail if already correct)
+git branch -M main >nul 2>&1
+
+echo.
+echo === MW BOTS PUSH (tracked files) ===
+echo Repo: %cd%
+echo.
+
+REM Stage all changes (only allow-listed files should be tracked)
+git add -A
+if errorlevel 1 (
+  echo ERROR: git add failed.
+  exit /b 1
+)
+
+REM If nothing is staged, exit cleanly
+git diff --cached --quiet
+if not errorlevel 1 (
+  echo No tracked changes staged. Nothing to push.
+  exit /b 0
+)
+
+echo.
+echo === STAGED CHANGES (what will be committed) ===
+echo --- files (name-status)
+git --no-pager diff --cached --name-status
+echo.
+echo --- diffstat
+git --no-pager diff --cached --stat
+echo.
+
+for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set TS=%%i
+
+echo.
+echo Changes staged. Committing...
+git commit -m "mwbots py update: %TS%"
+if errorlevel 1 (
+  echo ERROR: git commit failed.
+  echo NOTE: If this is your first commit on this machine, set git user.name/user.email.
+  exit /b 1
+)
+
+for /f %%i in ('git rev-parse --short HEAD') do set SHA=%%i
+echo.
+echo === COMMIT CREATED ===
+echo Commit: %SHA%
+echo --- commit summary (name-status + stat)
+git --no-pager show -1 --name-status --stat --pretty=oneline
+echo.
+
+echo.
+echo Pushing to origin/main...
+git push
+if errorlevel 1 (
+  echo ERROR: git push failed.
+  exit /b 1
+)
+
+echo.
+echo === PUSH COMPLETE ===
+echo Pushed commit: %SHA% to origin/main
+
+echo.
+echo DONE.
+exit /b 0
+

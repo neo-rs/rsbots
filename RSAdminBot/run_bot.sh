@@ -113,9 +113,21 @@ case "$BOT_KEY" in
     cd "$ROOT_DIR/RSuccessBot"
     exec "$PY" -u "bot_runner.py"
     ;;
+  datamanagerbot)
+    cd "$ROOT_DIR/MWDataManagerBot"
+    exec "$PY" -u "datamanagerbot.py"
+    ;;
+  pingbot)
+    cd "$ROOT_DIR/MWPingBot"
+    exec "$PY" -u "pingbot.py"
+    ;;
+  discumbot)
+    cd "$ROOT_DIR/MWDiscumBot"
+    exec "$PY" -u "discumbot.py"
+    ;;
   *)
     echo "ERROR: Unknown bot_key: $BOT_KEY"
-    echo "Valid bot_key values: rsadminbot rsforwarder rsonboarding rscheckerbot rsmentionpinger rssuccessbot"
+    echo "Valid bot_key values: rsadminbot rsforwarder rsonboarding rscheckerbot rsmentionpinger rssuccessbot datamanagerbot pingbot discumbot"
     exit 1
     ;;
 esac

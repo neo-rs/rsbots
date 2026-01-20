@@ -962,14 +962,34 @@ class BotSelectView(ui.View):
                 description=f"{action_display} all bots"
             ))
 
-        # Add "All RS Bots" option for update action (python-only).
-        # This is RS-only (rsadminbot excluded because it must be updated via !selfupdate).
+        # Add group-scoped "All ..." options for update action (python-only).
         if self.action in ["update"]:
-            options.insert(0, discord.SelectOption(
-                label="📦 All RS Bots",
-                value="all_rs_bots",
-                description="Update all RS bots from GitHub (python-only) and restart services"
-            ))
+            groups = set()
+            for k in keys:
+                g = admin_bot_instance._get_bot_group(str(k).strip().lower()) or ""
+                if g:
+                    groups.add(g)
+
+            # RS update dropdown (rsadminbot excluded by handler; still allowed in selection list).
+            if "rs_bots" in groups and groups.issubset({"rs_bots", "rsadminbot"}):
+                options.insert(
+                    0,
+                    discord.SelectOption(
+                        label="📦 All RS Bots",
+                        value="all_rs_bots",
+                        description="Update all RS bots from GitHub (python-only) and restart services",
+                    ),
+                )
+            # MW update dropdown
+            elif groups == {"mirror_bots"}:
+                options.insert(
+                    0,
+                    discord.SelectOption(
+                        label="📦 All MW Bots",
+                        value="all_mw_bots",
+                        description="Update all MW bots from GitHub (python-only) and restart services",
+                    ),
+                )
         
         select = ui.Select(
             placeholder=f"Select bot to {action_display.lower()}...",
@@ -1002,6 +1022,8 @@ class BotSelectView(ui.View):
         elif self.action == "update":
             if bot_name == "all_rs_bots":
                 await self._handle_update_all_rs_bots(interaction)
+            elif bot_name == "all_mw_bots":
+                await self._handle_update_all_mw_bots(interaction)
             else:
                 bot_info = self.admin_bot.BOTS[bot_name]
                 await self._handle_update(interaction, bot_name, bot_info)
@@ -1574,18 +1596,30 @@ class BotSelectView(ui.View):
     async def _handle_update(self, interaction, bot_name, bot_info):
         """Handle bot update (GitHub python-only) from the dropdown."""
         bot_key = (bot_name or "").strip().lower()
-        # RS-only: exclude non-RS bots from updates.
-        if not self.admin_bot._is_rs_bot(bot_key):
-            await interaction.followup.send(f"❌ `{bot_key}` is not an RS bot. Updates are only available for RS bots.")
-            return
-        if bot_key == "rsadminbot":
+        group = self.admin_bot._get_bot_group(bot_key) or ""
+
+        if bot_key == "rsadminbot" or group == "rsadminbot":
             await interaction.followup.send("ℹ️ Use `!selfupdate` to update RSAdminBot.")
             return
-        await interaction.followup.send(
-            f"📦 **Updating {bot_info['name']} from GitHub (python-only)...**\n"
-            "```\nPulling + copying *.py from /home/rsadmin/bots/rsbots-code\n```"
-        )
-        ok, result = self.admin_bot._botupdate_one_py_only(bot_key)
+
+        if group == "rs_bots":
+            code_root = self.admin_bot._get_update_code_root_for_group("rs_bots")
+            await interaction.followup.send(
+                f"📦 **Updating {bot_info['name']} from GitHub (python-only)...**\n"
+                f"```\nPulling + copying tracked files from {code_root}\n```"
+            )
+            ok, result = self.admin_bot._botupdate_one_py_only(bot_key)
+        elif group == "mirror_bots":
+            code_root = self.admin_bot._get_update_code_root_for_group("mirror_bots")
+            await interaction.followup.send(
+                f"📦 **Updating {bot_info['name']} from GitHub (python-only)...**\n"
+                f"```\nPulling + copying tracked files from {code_root}\n```"
+            )
+            ok, result = self.admin_bot._mwupdate_one_py_only(bot_key)
+        else:
+            await interaction.followup.send(f"❌ `{bot_key}` is not in an updatable bot group.")
+            return
+
         if not ok:
             await interaction.followup.send(f"❌ Update failed:\n```{str(result.get('error') or 'unknown error')[:900]}```")
             return
@@ -1605,10 +1639,11 @@ class BotSelectView(ui.View):
             await interaction.followup.send("❌ No RS bots configured.")
             return
 
+        code_root = self.admin_bot._get_update_code_root_for_group("rs_bots")
         status_msg = await interaction.followup.send(
             embed=MessageHelper.create_info_embed(
                 title="Updating All RS Bots (python-only)",
-                message="Pulling + copying *.py from /home/rsadmin/bots/rsbots-code and restarting each service.",
+                message=f"Pulling + copying tracked files from {code_root} and restarting each service.",
                 fields=[
                     {"name": "Bots", "value": str(len(rs_keys)), "inline": True},
                     {"name": "Note", "value": "RSAdminBot is excluded (use !selfupdate).", "inline": False},
@@ -1637,6 +1672,55 @@ class BotSelectView(ui.View):
         await status_msg.edit(
             embed=MessageHelper.create_info_embed(
                 title="RS Bots Update Complete",
+                message=f"✅ OK: {ok_count} | ❌ Failed: {fail_count}\n```{msg}```",
+                footer=f"Triggered by {interaction.user}",
+            )
+        )
+
+    async def _handle_update_all_mw_bots(self, interaction) -> None:
+        """Update all Mirror-World bots (python-only) from the dropdown."""
+        ssh_ok, error_msg = self.admin_bot._check_ssh_available()
+        if not ssh_ok:
+            await interaction.followup.send(f"❌ SSH not configured: {error_msg}")
+            return
+
+        mw_keys = [k for k in self.admin_bot._get_mw_bot_keys() if k in self.admin_bot.BOTS]
+        if not mw_keys:
+            await interaction.followup.send("❌ No Mirror-World bots configured.")
+            return
+
+        code_root = self.admin_bot._get_update_code_root_for_group("mirror_bots")
+        status_msg = await interaction.followup.send(
+            embed=MessageHelper.create_info_embed(
+                title="Updating All MW Bots (python-only)",
+                message=f"Pulling + copying tracked files from {code_root} and restarting each service.",
+                fields=[
+                    {"name": "Bots", "value": str(len(mw_keys)), "inline": True},
+                ],
+                footer=f"Triggered by {interaction.user}",
+            )
+        )
+
+        ok_count = 0
+        fail_count = 0
+        lines: List[str] = []
+        for bot_key in mw_keys:
+            ok, result = self.admin_bot._mwupdate_one_py_only(bot_key)
+            if ok:
+                ok_count += 1
+                lines.append(f"✅ {bot_key}: changed={result.get('changed_count')} restart={result.get('restart')}")
+            else:
+                fail_count += 1
+                err = str(result.get("error") or "update failed")[:120]
+                lines.append(f"❌ {bot_key}: {err}")
+
+        msg = "\n".join(lines)
+        if len(msg) > 1800:
+            msg = "…(truncated)…\n" + msg[-1800:]
+
+        await status_msg.edit(
+            embed=MessageHelper.create_info_embed(
+                title="MW Bots Update Complete",
                 message=f"✅ OK: {ok_count} | ❌ Failed: {fail_count}\n```{msg}```",
                 footer=f"Triggered by {interaction.user}",
             )
@@ -1885,19 +1969,19 @@ class RSAdminBot:
         "datamanagerbot": {
             "name": "DataManager Bot",
             "service": "mirror-world-datamanagerbot.service",
-            "folder": "neonxt/bots",
+            "folder": "MWDataManagerBot",
             "script": "datamanagerbot.py"  # For pkill command
         },
         "discumbot": {
             "name": "Discum Bot",
             "service": "mirror-world-discumbot.service",
-            "folder": "neonxt/bots",
+            "folder": "MWDiscumBot",
             "script": "discumbot.py"  # For pkill command
         },
         "pingbot": {
             "name": "Ping Bot",
             "service": "mirror-world-pingbot.service",
-            "folder": "neonxt/bots",
+            "folder": "MWPingBot",
             "script": "pingbot.py"  # For pkill command
         },
         "rsforwarder": {
@@ -3765,15 +3849,15 @@ echo \"CHANGED_END\"
             # On error, assume content doesn't exist (will send to be safe)
         return False
     
-    def _github_py_only_update(self, bot_folder: str) -> Tuple[bool, Dict[str, Any]]:
+    def _github_py_only_update(self, bot_folder: str, *, code_root: Optional[str] = None) -> Tuple[bool, Dict[str, Any]]:
         """Pull python-only bot code from the server-side GitHub checkout and overwrite live code files.
 
-        This is the canonical update path for `!selfupdate` and `!botupdate` when using GitHub as source of truth.
+        This is the canonical update path for `!selfupdate`, `!botupdate`, and `!mwupdate` when using GitHub as source of truth.
 
         Server expectations:
-        - Git repo exists at: /home/rsadmin/bots/rsbots-code
+        - Git repo exists at: code_root (configured by RSAdminBot/config.json)
         - Live bot tree exists at: self.remote_root (typically /home/rsadmin/bots/mirror-world)
-        - GitHub repo contains bot code under the RS bot folders
+        - GitHub repo contains bot code under the target bot folder path
 
         Safety:
         - Never deletes first; overwrite-in-place only
@@ -3787,7 +3871,13 @@ echo \"CHANGED_END\"
             if not folder:
                 return False, {"error": "bot_folder required"}
 
-            code_root = "/home/rsadmin/bots/rsbots-code"
+            checkouts = self.config.get("code_checkouts") if isinstance(self.config, dict) else {}
+            if not isinstance(checkouts, dict):
+                checkouts = {}
+            default_code_root = "/home/rsadmin/bots/rsbots-code"
+            code_root = str(code_root or checkouts.get("rsbots_code_root") or default_code_root).strip()
+            if not code_root:
+                return False, {"error": "code_root not configured (set config.code_checkouts.rsbots_code_root)"}
             live_root = str(getattr(self, "remote_root", "") or "/home/rsadmin/bots/mirror-world")
 
             cmd = f"""
@@ -3814,9 +3904,13 @@ git fetch origin
 git pull --ff-only origin main
 NEW="$(git rev-parse HEAD)"
 
-# Get list of Python files in git repo
+# Get list of tracked files in git repo (folder-scoped)
+TMP_ALL_LIST="/tmp/mw_tracked_${{BOT_FOLDER}}.txt"
+git ls-files "$BOT_FOLDER" 2>/dev/null > "$TMP_ALL_LIST" || true
+
+# Python file count (sanity)
 TMP_PY_LIST="/tmp/mw_pyonly_${{BOT_FOLDER}}.txt"
-git ls-files "$BOT_FOLDER" 2>/dev/null | grep -E \"\\\\.py$\" > "$TMP_PY_LIST" || true
+grep -E \"\\\\.py$\" "$TMP_ALL_LIST" > "$TMP_PY_LIST" || true
 PY_COUNT="$(wc -l < "$TMP_PY_LIST" | tr -d \" \")"
 if [ "$PY_COUNT" = "" ]; then PY_COUNT="0"; fi
 if [ "$PY_COUNT" = "0" ]; then
@@ -3825,13 +3919,11 @@ if [ "$PY_COUNT" = "0" ]; then
   exit 3
 fi
 
-# Build the full sync list: python files + key json/docs (if tracked)
+# Build the sync list (tracked, safe, non-secret):
+# - include: .py/.md/.json/.txt + requirements.txt
+# - exclude: config.secrets.json (even if tracked by mistake)
 TMP_SYNC_LIST="/tmp/mw_sync_${{BOT_FOLDER}}.txt"
-cat "$TMP_PY_LIST" > "$TMP_SYNC_LIST" || true
-git ls-files "$BOT_FOLDER/COMMANDS.md" 2>/dev/null >> "$TMP_SYNC_LIST" || true
-git ls-files "$BOT_FOLDER/config.json" 2>/dev/null >> "$TMP_SYNC_LIST" || true
-git ls-files "$BOT_FOLDER/messages.json" 2>/dev/null >> "$TMP_SYNC_LIST" || true
-git ls-files "$BOT_FOLDER/vouch_config.json" 2>/dev/null >> "$TMP_SYNC_LIST" || true
+grep -E \"(\\\\.py$|\\\\.md$|\\\\.json$|\\\\.txt$|(^|/)requirements\\\\.txt$)\" "$TMP_ALL_LIST" | grep -v -E \"(^|/)config\\\\.secrets\\\\.json$\" > "$TMP_SYNC_LIST" || true
 sort -u "$TMP_SYNC_LIST" -o "$TMP_SYNC_LIST" || true
 SYNC_COUNT="$(wc -l < "$TMP_SYNC_LIST" | tr -d \" \")"
 if [ "$SYNC_COUNT" = "" ]; then SYNC_COUNT="0"; fi
@@ -3920,22 +4012,26 @@ echo "CHANGED_END"
         except Exception as e:
             return False, {"error": f"github py-only update failed: {str(e)[:300]}"}
 
-    def _botupdate_one_py_only(self, bot_key: str) -> Tuple[bool, Dict[str, Any]]:
-        """Update a single RS bot from rsbots-code (python-only) and restart the service.
-
-        This is the shared implementation used by:
-        - !botupdate (single bot)
-        - BotSelectView update dropdown
-        - "All RS Bots" update dropdown option
-        """
+    def _update_one_py_only_from_checkout(
+        self,
+        bot_key: str,
+        *,
+        allowed_group: str,
+        code_root: str,
+        allow_rsadminbot: bool,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """Update a single bot from a configured GitHub checkout (python-only) and restart the service."""
         key = (bot_key or "").strip().lower()
         if not key:
             return False, {"error": "bot_key required"}
         if key not in self.BOTS:
             return False, {"error": f"Unknown bot: {key}"}
-        if not self._is_rs_bot(key):
-            return False, {"error": f"{key} is not an RS bot (updates are RS-only)"}
-        if key == "rsadminbot":
+
+        group = self._get_bot_group(key) or ""
+        if group != allowed_group:
+            return False, {"error": f"{key} is not in group {allowed_group} (updates are group-scoped)"}
+
+        if key == "rsadminbot" and not allow_rsadminbot:
             return False, {"error": "RSAdminBot must be updated via !selfupdate"}
 
         info = self.BOTS.get(key) or {}
@@ -3943,8 +4039,10 @@ echo "CHANGED_END"
         service = str(info.get("service") or "").strip()
         if not folder:
             return False, {"error": f"Missing folder mapping for bot: {key}"}
+        if not code_root:
+            return False, {"error": f"Missing code_root for group: {allowed_group}"}
 
-        ok, stats = self._github_py_only_update(folder)
+        ok, stats = self._github_py_only_update(folder, code_root=code_root)
         if not ok:
             return False, {"error": str((stats or {}).get("error") or "update failed")[:900]}
 
@@ -3973,6 +4071,7 @@ echo "CHANGED_END"
         summary = f"✅ **{info.get('name', key)} updated from GitHub (python-only)**\n```"
         if old or new:
             summary += f"\nGit: {old[:12]} -> {new[:12]}"
+        summary += f"\nCode root: {code_root}"
         if sync_count:
             summary += f"\nPython copied: {py_count} | Total copied: {sync_count} | Changed: {changed_count}"
         else:
@@ -3990,6 +4089,7 @@ echo "CHANGED_END"
             "service": service,
             "old": old,
             "new": new,
+            "code_root": code_root,
             "py_count": py_count,
             "changed_count": changed_count,
             "restart": "OK" if restart_ok else "FAILED",
@@ -3997,6 +4097,26 @@ echo "CHANGED_END"
             "restart_err": restart_err,
             "summary": summary[:1900],
         }
+
+    def _botupdate_one_py_only(self, bot_key: str) -> Tuple[bool, Dict[str, Any]]:
+        """Update a single RS bot from rsbots-code (python-only) and restart the service."""
+        code_root = self._get_update_code_root_for_group("rs_bots")
+        return self._update_one_py_only_from_checkout(
+            bot_key,
+            allowed_group="rs_bots",
+            code_root=code_root,
+            allow_rsadminbot=False,
+        )
+
+    def _mwupdate_one_py_only(self, bot_key: str) -> Tuple[bool, Dict[str, Any]]:
+        """Update a single Mirror-World bot from mwbots-code (python-only) and restart the service."""
+        code_root = self._get_update_code_root_for_group("mirror_bots")
+        return self._update_one_py_only_from_checkout(
+            bot_key,
+            allowed_group="mirror_bots",
+            code_root=code_root,
+            allow_rsadminbot=False,
+        )
     
     # Legacy Phase 4 file sync / tree compare / auto-sync removed.
     # Legacy helper functions (_should_exclude_file, _is_unimportant_remote_file, _count_files_recursive) removed.
@@ -4659,6 +4779,32 @@ echo "CHANGED_END"
             if k in self.BOTS and k not in out:
                 out.append(k)
         return out
+
+    def _get_mw_bot_keys(self) -> List[str]:
+        """Return Mirror-World-only bot keys (bot_groups.mirror_bots)."""
+        bot_groups = self.config.get("bot_groups") or {}
+        mw_keys = list(bot_groups.get("mirror_bots") or [])
+        out: List[str] = []
+        for k in mw_keys:
+            k = str(k).strip().lower()
+            if not k:
+                continue
+            if k in self.BOTS and k not in out:
+                out.append(k)
+        return out
+
+    def _get_update_code_root_for_group(self, bot_group: str) -> str:
+        """Return the configured GitHub checkout root used for python-only updates."""
+        cfg = self.config.get("code_checkouts") if isinstance(self.config, dict) else {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+
+        group = str(bot_group or "").strip().lower()
+        if group in ("rsadminbot", "rs_bots"):
+            return str(cfg.get("rsbots_code_root") or "/home/rsadmin/bots/rsbots-code").strip()
+        if group == "mirror_bots":
+            return str(cfg.get("mwbots_code_root") or "/home/rsadmin/bots/mwbots-code").strip()
+        return ""
 
     async def _commands_send_for_bot(
         self,
@@ -6700,6 +6846,43 @@ echo "CHANGED_END"
                         f"Python copied: {py_count} | Files synced: {changed_count} | Restart: {'OK' if restart_ok else 'FAILED'}"
                     ),
                 )
+
+        @self.bot.command(name="mwupdate", aliases=["mwbots"])
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def mwupdate(ctx, bot_name: str = None):
+            """Update a Mirror-World bot by pulling python-only code from GitHub and restarting it (admin only)."""
+            if bot_name:
+                bot_name = bot_name.lower()
+                if self._get_bot_group(bot_name) != "mirror_bots":
+                    await ctx.send(f"❌ `{bot_name}` is not a Mirror-World bot.\nUse `!botlist` to see available bots.")
+                    return
+
+            ssh_ok, error_msg = self._check_ssh_available()
+            if not ssh_ok:
+                await ctx.send(f"❌ SSH not configured: {error_msg}")
+                return
+
+            if not bot_name:
+                view = BotSelectView(self, "update", "Update", bot_keys=self._get_mw_bot_keys())
+                embed = discord.Embed(
+                    title="📦 Select MW Bot to Update",
+                    description="Choose a Mirror-World bot from the dropdown menu below:",
+                    color=discord.Color.blue(),
+                )
+                await ctx.send(embed=embed, view=view)
+                return
+
+            if bot_name not in self.BOTS:
+                await ctx.send(f"❌ Unknown bot: {bot_name}\nUse `!botlist` to see available bots")
+                return
+
+            bot_info = self.BOTS[bot_name]
+            await self._log_to_discord(f"📦 **Updating {bot_info.get('name', bot_name)} (MWBots GitHub python-only)**")
+            ok, result = self._mwupdate_one_py_only(bot_name)
+            if not ok:
+                await ctx.send(f"❌ Update failed:\n```{str(result.get('error') or 'unknown error')[:900]}```")
+                return
+            await ctx.send(str(result.get("summary") or "")[:1900])
 
         @self.bot.command(name="botsync", aliases=["syncbot"])
         @commands.check(lambda ctx: self.is_admin(ctx.author))
