@@ -458,7 +458,9 @@ async def _post_resolution_or_dispute_alert(
 
     # Mention member for quick reference in staff alerts
     embed.add_field(name="Support", value=sup or "(configure support role to ping)", inline=False)
-    embed.add_field(name="Discord", value=getattr(member, "mention", f"<@{member.id}>"), inline=False)
+    mention = getattr(member, "mention", f"<@{member.id}>")
+    name = str(getattr(member, "display_name", "") or str(member))
+    embed.add_field(name="Discord", value=f"{name}\n{mention}", inline=False)
     embed.add_field(name="Discord User ID", value=f"`{member.id}`", inline=True)
     if whop_email:
         embed.add_field(name="Email (API)", value=f"`{whop_email}`", inline=True)

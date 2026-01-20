@@ -1336,11 +1336,11 @@ async def _resolve_whop_brief_for_discord_id(discord_id: int) -> tuple[str, dict
 
 
 async def _edit_staff_message(msg: discord.Message, *, embed: discord.Embed) -> None:
-    """Best-effort edit (no pings)."""
+    """Best-effort edit (user mentions allowed; no role/everyone)."""
     if not msg:
         return
     try:
-        await msg.edit(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        await msg.edit(embed=embed, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
     except TypeError:
         # Some discord.py versions don't accept allowed_mentions on edit.
         with suppress(Exception):
@@ -1818,8 +1818,8 @@ async def log_member_status(msg: str, embed: discord.Embed = None, *, channel_na
                 timestamp=datetime.now(timezone.utc),
             )
             embed.set_footer(text="RSCheckerbot • Member Status Tracking")
-        # Mentions should be clickable but MUST NOT ping users.
-        sent = await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        # Allow user mentions for clickable member references (no role/everyone mentions).
+        sent = await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
         try:
             await _maybe_capture_for_reporting(embed, sent_channel_id=int(ch.id))
         except Exception:
@@ -4536,6 +4536,10 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
             val = membership.get(key)
             if isinstance(val, str) and val.strip():
                 return val.strip()
+            if isinstance(val, dict):
+                inner_id = str(val.get("id") or val.get("membership_id") or "").strip()
+                if inner_id:
+                    return inner_id
         return ""
 
     def _extract_email_from_membership(membership: dict) -> str:
@@ -4567,7 +4571,32 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
         for k in keys:
             v = membership.get(k)
             if isinstance(v, dict):
-                for sk in ("created_at", "updated_at", "timestamp", "time", "date", "epoch", "seconds", "unix"):
+                sec = v.get("seconds") or v.get("_seconds") or v.get("epoch_seconds") or v.get("unix")
+                nanos = v.get("nanos") or v.get("nanoseconds") or v.get("_nanoseconds")
+                if sec is not None:
+                    with suppress(Exception):
+                        base = float(sec)
+                        frac = float(nanos or 0) / 1_000_000_000.0
+                        return datetime.fromtimestamp(base + frac, tz=timezone.utc)
+                for sk in (
+                    "created_at",
+                    "created",
+                    "created_on",
+                    "updated_at",
+                    "updated",
+                    "timestamp",
+                    "time",
+                    "date",
+                    "epoch",
+                    "seconds",
+                    "unix",
+                    "iso",
+                    "iso8601",
+                    "activated_at",
+                    "activated",
+                    "start",
+                    "end",
+                ):
                     dt = _parse_dt_any(v.get(sk))
                     if dt:
                         return dt
@@ -4713,6 +4742,16 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
     page = 1
     seen_memberships: set[str] = set()
 
+    def _normalize_membership(rec: dict) -> dict:
+        if not isinstance(rec, dict):
+            return {}
+        for key in ("membership", "data", "item", "record"):
+            inner = rec.get(key)
+            if isinstance(inner, dict):
+                if any(k in inner for k in ("status", "created_at", "renewal_period_end", "id")):
+                    return inner
+        return rec
+
     try:
         await _progress("page 1", force=True)
         while True:
@@ -4729,6 +4768,7 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
 
                 if not isinstance(membership, dict):
                     continue
+                membership = _normalize_membership(membership)
 
                 membership_id = _membership_id_from_membership(membership)
                 if membership_id:
@@ -4738,12 +4778,12 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
                     new_on_page += 1
 
                 status_l = str(membership.get("status") or "").strip().lower()
-                created_dt = _pick_dt(membership, ["created_at", "createdAt", "started_at", "starts_at", "timestamps", "dates"])
-                activated_dt = _pick_dt(membership, ["activated_at", "activatedAt", "current_period_start", "current_period_start_at", "starts_at", "started_at", "timestamps", "dates"])
-                updated_dt = _pick_dt(membership, ["updated_at", "updatedAt", "timestamps", "dates"])
-                trial_end_dt = _pick_dt(membership, ["trial_end", "trial_end_at", "trial_ends_at", "timestamps", "dates"])
-                failure_dt = _pick_dt(membership, ["last_payment_failure", "last_payment_failed_at", "payment_failed_at", "last_failed_payment_at", "timestamps", "dates"])
-                cancel_dt = _pick_dt(membership, ["cancel_at", "cancel_at_period_end_at", "cancellation_scheduled_at", "cancelled_at", "canceled_at", "updated_at", "timestamps", "dates"])
+                created_dt = _pick_dt(membership, ["created_at", "createdAt", "created_on", "created", "started_at", "starts_at", "start_at", "member", "user", "timestamps", "dates"])
+                activated_dt = _pick_dt(membership, ["activated_at", "activatedAt", "current_period_start", "current_period_start_at", "starts_at", "started_at", "member", "user", "timestamps", "dates"])
+                updated_dt = _pick_dt(membership, ["updated_at", "updatedAt", "updated_on", "member", "user", "timestamps", "dates"])
+                trial_end_dt = _pick_dt(membership, ["trial_end", "trial_end_at", "trial_ends_at", "trial_end_on", "member", "user", "timestamps", "dates"])
+                failure_dt = _pick_dt(membership, ["last_payment_failure", "last_payment_failed_at", "payment_failed_at", "last_failed_payment_at", "member", "user", "timestamps", "dates"])
+                cancel_dt = _pick_dt(membership, ["cancel_at", "cancel_at_period_end_at", "cancellation_scheduled_at", "cancelled_at", "canceled_at", "updated_at", "member", "user", "timestamps", "dates"])
 
                 trial_days_raw = (
                     membership.get("trial_days")
@@ -4939,11 +4979,19 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
     )
 
     # Report embed (from scan totals)
+    warn_note = ""
+    if scanned == 0:
+        warn_note = "\n⚠️ No memberships returned by the API. Check `whop_api.company_id` and API scopes."
+    elif included == 0:
+        warn_note = "\n⚠️ Memberships returned, but no events matched the date range. Verify date fields."
+
     e = discord.Embed(
         title=f"RS Whop Scan Report ({start_local.date().isoformat()} → {end_local.date().isoformat()})",
         description=(
             "Source: Whop API (deduped per membership per day/event) • Timezone: `America/Denver`"
+            + f"\nScanned: {scanned} memberships • Included: {included} • API calls: {api_calls}"
             + (" • Output: anonymized sample CSV" if sample_csv else "")
+            + warn_note
             + (f"\n⚠️ Store not saved: {save_warning}" if save_warning else "")
         ),
         color=0x5865F2,
