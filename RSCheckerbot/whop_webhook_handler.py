@@ -1153,9 +1153,18 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
         # Attempt best-effort membership id hint (do NOT log; only for internal correlation)
         membership_id_hint = ""
         try:
-            whop_key = str(parsed_data.get("whop_key") or parsed_data.get("key") or "").strip()
-            if whop_key.startswith(("mem_", "R-")):
-                membership_id_hint = whop_key
+            mid_candidate = str(
+                parsed_data.get("membership_id")
+                or parsed_data.get("membership id")
+                or fields_data.get("membership id")
+                or ""
+            ).strip()
+            if mid_candidate.startswith(("mem_", "R-")):
+                membership_id_hint = mid_candidate
+            if not membership_id_hint:
+                whop_key = str(parsed_data.get("whop_key") or parsed_data.get("key") or "").strip()
+                if whop_key.startswith(("mem_", "R-")):
+                    membership_id_hint = whop_key
         except Exception:
             membership_id_hint = ""
         
@@ -1237,6 +1246,22 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                     "failure_reason": "Payment failed",
                 }
                 await handle_payment_failed(member, event_data)
+
+            # Check for payment received / succeeded (native cards)
+            elif "payment received" in title.lower() or "payment received" in description.lower() or "payment succeeded" in title.lower() or "payment succeeded" in description.lower():
+                is_renewal = ("renewal" in title.lower()) or ("renewal" in description.lower()) or ("renewal" in (message.content or "").lower())
+                evt = "payment.succeeded.renewal" if is_renewal else "payment.succeeded.activation"
+                event_data = {
+                    "event_type": evt,
+                    "discord_user_id": str(discord_user_id),
+                    "email": email_value,
+                }
+                if membership_id_hint:
+                    event_data["membership_id"] = membership_id_hint
+                if is_renewal:
+                    await handle_payment_renewal(member, event_data)
+                else:
+                    await handle_payment_activation(member, event_data)
 
             # Check for cancel action
             elif "performing cancel" in description.lower() or "removeallroles" in description.lower():

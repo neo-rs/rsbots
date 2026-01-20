@@ -50,6 +50,19 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 - **Returns**: Report embed via DM (to Neo from config + to the invoker), plus a short confirmation (auto-deletes)
 - **Note**: Report reads the bounded runtime `reporting_store.json` (no raw Whop channel ingestion)
 
+#### `.checker whopscanreport`
+- **Description**: One-time scan of Whop channels to rebuild `reporting_store.json` and DM a report + downloadable CSV
+- **Aliases**: `whopreportscan`, `scanwhopreport`
+- **Parameters**:
+  - `start`: Start date `YYYY-MM-DD` (required)
+  - `end`: End date `YYYY-MM-DD` (required, inclusive)
+  - `confirm`: Must be exactly `confirm` to run (required)
+- **Usage**:
+  - `.checker whopscanreport 2026-01-01 2026-01-31 confirm`
+- **Admin Only**: Yes (requires administrator permissions)
+- **Returns**: Live progress message, then DM report embed + CSV (to Neo from config + to the invoker)
+- **Note**: Uses Mountain Time (America/Denver) day boundaries for dedupe per membership per day/event
+
 #### `.checker backfillstatus`
 - **Description**: One-time scan of `member-status-logs` history into `reporting_store.json` so reports can be generated immediately
 - **Aliases**: `backfill`, `backfilllogs`
