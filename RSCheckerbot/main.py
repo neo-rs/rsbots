@@ -812,6 +812,46 @@ def _should_post_boot() -> bool:
     except Exception:
         return True
 
+def _should_post_sync_report() -> bool:
+    """Throttle sync DM reports to avoid spam."""
+    try:
+        if BOOT_POST_MIN_HOURS <= 0:
+            return True
+        state = load_json(BOOT_STATE_FILE)
+        last_iso = str(state.get("last_sync_report_iso") or "").strip()
+        if last_iso:
+            try:
+                last_dt = datetime.fromisoformat(last_iso.replace("Z", "+00:00"))
+                if (_now() - last_dt) < timedelta(hours=BOOT_POST_MIN_HOURS):
+                    return False
+            except Exception:
+                pass
+        state["last_sync_report_iso"] = _now().isoformat()
+        save_json(BOOT_STATE_FILE, state)
+        return True
+    except Exception:
+        return True
+
+def _should_post_sync_report() -> bool:
+    """Throttle sync DM reports to avoid spam."""
+    try:
+        if BOOT_POST_MIN_HOURS <= 0:
+            return True
+        state = load_json(BOOT_STATE_FILE)
+        last_iso = str(state.get("last_sync_report_iso") or "").strip()
+        if last_iso:
+            try:
+                last_dt = datetime.fromisoformat(last_iso.replace("Z", "+00:00"))
+                if (_now() - last_dt) < timedelta(hours=BOOT_POST_MIN_HOURS):
+                    return False
+            except Exception:
+                pass
+        state["last_sync_report_iso"] = _now().isoformat()
+        save_json(BOOT_STATE_FILE, state)
+        return True
+    except Exception:
+        return True
+
 async def _flush_role_update(user_id: int) -> None:
     """Flush a batched role update after a short debounce window."""
     await asyncio.sleep(max(0.2, ROLE_UPDATE_BATCH_SECONDS))
@@ -2385,6 +2425,9 @@ async def sync_whop_memberships():
     log.info("Starting Whop membership sync...")
     synced_count = 0
     error_count = 0
+    relinked_count = 0
+    would_remove_count = 0
+    auto_healed_count = 0
     
     # Get all members with Member role
     member_role = guild.get_role(ROLE_CANCEL_A)
@@ -2394,6 +2437,76 @@ async def sync_whop_memberships():
     
     members_to_check = [m for m in guild.members if member_role in m.roles]
     log.info(f"Checking {len(members_to_check)} members with Member role...")
+
+    auto_heal_enabled = bool(WHOP_API_CONFIG.get("auto_heal_add_members_role", False))
+    enforce_removals = bool(WHOP_API_CONFIG.get("enforce_role_removals", True))
+    post_cancel_cards = bool(WHOP_API_CONFIG.get("post_cancellation_scheduled_cards", False))
+    try:
+        auto_heal_min_spent = float(WHOP_API_CONFIG.get("auto_heal_min_total_spent_usd", 1.0))
+    except Exception:
+        auto_heal_min_spent = 1.0
+
+    async def _find_entitled_membership_for_same_user(
+        *,
+        membership_data: dict | None,
+        membership_id: str,
+        require_active: bool,
+        now_dt: datetime,
+    ) -> tuple[str, dict]:
+        """Find an entitled membership for the same Whop user (handles multi-membership users).
+
+        Returns (membership_id, membership_dict) or ("", {}).
+        """
+        if not isinstance(membership_data, dict):
+            return ("", {})
+        mid = str(membership_id or "").strip()
+        if not mid:
+            return ("", {})
+
+        product_title = ""
+        if isinstance(membership_data.get("product"), dict):
+            product_title = str(membership_data["product"].get("title") or "").strip()
+
+        whop_user_id = ""
+        u = membership_data.get("user")
+        if isinstance(u, str):
+            whop_user_id = u.strip()
+        elif isinstance(u, dict):
+            whop_user_id = str(u.get("id") or u.get("user_id") or "").strip()
+        if not whop_user_id:
+            btmp = await _fetch_whop_brief_by_membership_id(mid)
+            whop_user_id = str((btmp or {}).get("whop_user_id") or "").strip()
+        if not whop_user_id:
+            return ("", {})
+
+        candidates = await whop_api_client.get_user_memberships(whop_user_id)
+        # Prefer active, then trialing (unless require_active).
+        status_sets = (("active",),) if require_active else (("active",), ("trialing",))
+        for desired in status_sets:
+            for m2 in (candidates or []):
+                if not isinstance(m2, dict):
+                    continue
+                mid2 = str(m2.get("id") or m2.get("membership_id") or "").strip()
+                if not mid2 or mid2 == mid:
+                    continue
+                st2 = str(m2.get("status") or "").strip().lower()
+                if st2 not in desired:
+                    continue
+                if product_title and isinstance(m2.get("product"), dict):
+                    t2 = str(m2["product"].get("title") or "").strip()
+                    if t2 and t2 != product_title:
+                        continue
+                entitled2, _until2, _why2 = await whop_api_client.is_entitled_until_end(
+                    mid2,
+                    m2,
+                    cache_path=str(PAYMENT_CACHE_FILE),
+                    monthly_days=30,
+                    grace_days=3,
+                    now=now_dt,
+                )
+                if entitled2:
+                    return (mid2, m2)
+        return ("", {})
     
     for member in members_to_check:
         try:
@@ -2410,6 +2523,9 @@ async def sync_whop_memberships():
                 status_now = str(membership_data.get("status") or "").strip().lower()
                 cape_now = membership_data.get("cancel_at_period_end")
                 if cape_now is True and status_now in ("active", "trialing"):
+                    if not post_cancel_cards:
+                        # Startup/6h sync is allowed to stay silent (report-only mode).
+                        continue
                     # Only emit this alert once per membership per renewal_end per day (prevents spam).
                     renewal_end_key = str(membership_data.get("renewal_period_end") or "").strip()
                     issue_key = f"cancel_scheduled:{membership_id}:{renewal_end_key}"
@@ -2499,59 +2615,25 @@ async def sync_whop_memberships():
                         pass
 
                     # Guardrail #2: user can have multiple memberships; the cached membership_id might be an old canceled one.
-                    # If the Whop user currently has an ACTIVE/TRIALING membership for the same product, keep access and relink.
+                    # If the Whop user currently has an ACTIVE/TRIALING entitled membership for the same product, keep access and relink.
                     try:
-                        product_title = ""
-                        if isinstance(membership_data, dict) and isinstance(membership_data.get("product"), dict):
-                            product_title = str(membership_data["product"].get("title") or "").strip()
-
-                        # Prefer user_id from membership payload; fallback to whop_brief enrichment.
-                        whop_user_id = ""
-                        if isinstance(membership_data, dict):
-                            u = membership_data.get("user")
-                            if isinstance(u, str):
-                                whop_user_id = u.strip()
-                            elif isinstance(u, dict):
-                                whop_user_id = str(u.get("id") or u.get("user_id") or "").strip()
-                        if not whop_user_id:
-                            btmp = await _fetch_whop_brief_by_membership_id(membership_id)
-                            whop_user_id = str((btmp or {}).get("whop_user_id") or "").strip()
-
-                        if whop_user_id:
-                            candidates = await whop_api_client.get_user_memberships(whop_user_id)
-                            kept = False
-                            for m2 in (candidates or []):
-                                if not isinstance(m2, dict):
-                                    continue
-                                mid2 = str(m2.get("id") or m2.get("membership_id") or "").strip()
-                                if not mid2 or mid2 == membership_id:
-                                    continue
-                                st2 = str(m2.get("status") or "").strip().lower()
-                                if st2 not in ("active", "trialing"):
-                                    continue
-                                if product_title and isinstance(m2.get("product"), dict):
-                                    t2 = str(m2["product"].get("title") or "").strip()
-                                    if t2 and t2 != product_title:
-                                        continue
-                                entitled2, _until2, _why2 = await whop_api_client.is_entitled_until_end(
-                                    mid2,
-                                    m2,
-                                    cache_path=str(PAYMENT_CACHE_FILE),
-                                    monthly_days=30,
-                                    grace_days=3,
-                                    now=_now(),
-                                )
-                                if entitled2:
-                                    set_cached_whop_membership_id(member.id, mid2, source_event="sync.relink_active_membership")
-                                    await log_other(
-                                        f"✅ **Whop Sync kept access (newer active membership)** {_fmt_user(member)}\n"
-                                        f"   old_membership_id: `{membership_id}` (status `{actual_status}`)\n"
-                                        f"   new_membership_id: `{mid2}` (status `{st2}`)"
-                                    )
-                                    kept = True
-                                    break
-                            if kept:
-                                continue
+                        now_dt = _now()
+                        mid2, m2 = await _find_entitled_membership_for_same_user(
+                            membership_data=membership_data if isinstance(membership_data, dict) else None,
+                            membership_id=membership_id,
+                            require_active=False,
+                            now_dt=now_dt,
+                        )
+                        if mid2 and isinstance(m2, dict):
+                            st2 = str(m2.get("status") or "").strip().lower()
+                            set_cached_whop_membership_id(member.id, mid2, source_event="sync.relink_active_membership")
+                            relinked_count += 1
+                            await log_other(
+                                f"✅ **Whop Sync kept access (newer active membership)** {_fmt_user(member)}\n"
+                                f"   old_membership_id: `{membership_id}` (status `{actual_status}`)\n"
+                                f"   new_membership_id: `{mid2}` (status `{st2}`)"
+                            )
+                            continue
                     except Exception:
                         pass
 
@@ -2564,6 +2646,15 @@ async def sync_whop_memberships():
                         now=_now(),
                     )
                     if entitled:
+                        continue
+                    if not enforce_removals:
+                        would_remove_count += 1
+                        await log_other(
+                            f"⚠️ **Whop Sync would remove role (enforcement disabled)** {_fmt_user(member)}\n"
+                            f"   API Status: `{actual_status}`\n"
+                            f"   membership_id: `{membership_id}`\n"
+                            f"   Removed: {_fmt_role(ROLE_CANCEL_A, guild)}"
+                        )
                         continue
                     await member.remove_roles(
                         member_role, 
@@ -2578,6 +2669,114 @@ async def sync_whop_memberships():
         except Exception as e:
             error_count += 1
             log.error(f"Error syncing member {member.id}: {e}")
+
+    # Auto-heal: add Member role for users missing it, when Whop shows active+entitled access and paid (>$1).
+    if auto_heal_enabled:
+        healed = 0
+        try:
+            link_db = load_json(BASE_DIR / "whop_discord_link.json")
+            by = link_db.get("by_discord_id") if isinstance(link_db, dict) else None
+            ids = [k for k in (by.keys() if isinstance(by, dict) else []) if str(k).isdigit()]
+        except Exception:
+            ids = []
+
+        for did in ids:
+            try:
+                uid = int(str(did))
+            except Exception:
+                continue
+            mbr = guild.get_member(uid)
+            if not mbr or mbr.bot:
+                continue
+            if member_role in mbr.roles:
+                continue
+
+            # Resolve current best membership for this Discord ID.
+            mid = str(get_cached_whop_membership_id(uid) or "").strip()
+            if not mid:
+                continue
+            try:
+                mdata = await whop_api_client.get_membership_by_id(mid)
+            except Exception:
+                mdata = None
+            if not isinstance(mdata, dict):
+                continue
+
+            now_dt = _now()
+            # Prefer active entitled memberships.
+            mid_active, m_active = await _find_entitled_membership_for_same_user(
+                membership_data=mdata,
+                membership_id=mid,
+                require_active=True,
+                now_dt=now_dt,
+            )
+            if not mid_active or not isinstance(m_active, dict):
+                # Fallback: if the cached membership itself is active+entitled, allow it.
+                st0 = str(mdata.get("status") or "").strip().lower()
+                ent0, _until0, _why0 = await whop_api_client.is_entitled_until_end(
+                    mid,
+                    mdata,
+                    cache_path=str(PAYMENT_CACHE_FILE),
+                    monthly_days=30,
+                    grace_days=3,
+                    now=now_dt,
+                )
+                if st0 == "active" and ent0:
+                    mid_active, m_active = (mid, mdata)
+                else:
+                    continue
+
+            end_dt = whop_api_client.access_end_dt_from_membership(m_active)
+            if not end_dt or end_dt <= now_dt:
+                continue
+
+            # Check paid threshold using Whop brief (total_spent best-effort).
+            brief = await _fetch_whop_brief_by_membership_id(mid_active)
+            spent = float(usd_amount((brief or {}).get("total_spent")))
+            if spent <= float(auto_heal_min_spent):
+                continue
+
+            # Only add if Whop says active (no trial-only auto-heal).
+            st_final = str(m_active.get("status") or "").strip().lower()
+            if st_final != "active":
+                continue
+
+            try:
+                await mbr.add_roles(member_role, reason="Whop auto-heal: active+entitled membership")
+                set_cached_whop_membership_id(mbr.id, mid_active, source_event="sync.auto_heal_add_member_role")
+                healed += 1
+                await log_other(
+                    f"✅ **Auto-heal added Members role** {_fmt_user(mbr)}\n"
+                    f"   membership_id: `{mid_active}`\n"
+                    f"   total_spent: `${spent:.2f}`"
+                )
+            except Exception:
+                continue
+
+        if healed:
+            await log_other(f"✅ **Whop Auto-heal complete** — added Members role for {healed} user(s)")
+        auto_healed_count = healed
+
+    # Optional: DM a sync summary report (throttled).
+    if bool(WHOP_API_CONFIG.get("startup_scan_dm_report", False)) and _should_post_sync_report():
+        dm_uid = int(REPORTING_CONFIG.get("dm_user_id") or 0)
+        if dm_uid:
+            try:
+                e = discord.Embed(
+                    title="RSCheckerbot • Whop Startup Scan",
+                    description="Summary of the startup/6-hour Whop sync sweep (audit-first).",
+                    color=0x5865F2,
+                    timestamp=datetime.now(timezone.utc),
+                )
+                e.add_field(name="Members checked", value=str(len(members_to_check)), inline=True)
+                e.add_field(name="Relinked to active membership", value=str(relinked_count), inline=True)
+                e.add_field(name="Auto-heal added Members", value=str(auto_healed_count), inline=True)
+                e.add_field(name="Would remove (enforcement disabled)", value=str(would_remove_count), inline=True)
+                e.add_field(name="Removed", value=str(synced_count), inline=True)
+                e.add_field(name="Cancellation Scheduled cards", value="on" if post_cancel_cards else "off", inline=True)
+                await _dm_user(dm_uid, embed=e)
+            except Exception:
+                pass
     
     log.info(f"Sync complete: {synced_count} roles updated, {error_count} errors")
     if synced_count > 0 or error_count > 0:
@@ -3844,10 +4043,19 @@ async def _report_scan_whop(ctx, start: str, end: str) -> None:
         await ctx.send("❌ One or both Whop channels not found / not text channels.", delete_after=20)
         return
 
-    status_msg = await ctx.send(
-        f"🔍 **Scanning Whop logs for report...**\n"
-        f"```\nRange (MT): {start_local.date().isoformat()} → {end_local.date().isoformat()}\nInitializing...\n```"
-    )
+    quiet_here = bool(MEMBER_STATUS_LOGS_CHANNEL_ID and getattr(ctx, "channel", None) and int(getattr(ctx.channel, "id", 0)) == int(MEMBER_STATUS_LOGS_CHANNEL_ID))
+    status_msg = None
+    if quiet_here:
+        with suppress(Exception):
+            status_msg = await ctx.author.send(
+                f"🔍 **Scanning Whop logs for report...**\n"
+                f"```\nRange (MT): {start_local.date().isoformat()} → {end_local.date().isoformat()}\nInitializing...\n```"
+            )
+    else:
+        status_msg = await ctx.send(
+            f"🔍 **Scanning Whop logs for report...**\n"
+            f"```\nRange (MT): {start_local.date().isoformat()} → {end_local.date().isoformat()}\nInitializing...\n```"
+        )
 
     started_at = time.time()
     last_edit = 0.0
@@ -3917,6 +4125,8 @@ async def _report_scan_whop(ctx, start: str, end: str) -> None:
     async def _progress(stage: str, *, force: bool = False) -> None:
         nonlocal last_edit
         now = time.time()
+        if not status_msg:
+            return
         if not force and (now - last_edit) < 2.0:
             return
         last_edit = now
@@ -4192,7 +4402,8 @@ async def _report_scan_whop(ctx, start: str, end: str) -> None:
             await user.send(embed=e, file=f)
 
     with suppress(Exception):
-        await status_msg.edit(content="✅ Scan complete. Report sent via DM (with CSV).")
+        if status_msg:
+            await status_msg.edit(content="✅ Scan complete. Report sent via DM (with CSV).")
     return
 
 
@@ -4223,11 +4434,20 @@ async def _report_scan_member_status(ctx, start: str, end: str) -> None:
     start_utc = start_dt.astimezone(timezone.utc)
     end_utc = end_dt.astimezone(timezone.utc)
 
-    status_msg = await ctx.send(
-        f"⏳ Backfill started for <#{MEMBER_STATUS_LOGS_CHANNEL_ID}> "
-        f"({start_utc.date().isoformat()} → {end_utc.date().isoformat()}).",
-        delete_after=3600,
-    )
+    quiet_here = bool(MEMBER_STATUS_LOGS_CHANNEL_ID and getattr(ctx, "channel", None) and int(getattr(ctx.channel, "id", 0)) == int(MEMBER_STATUS_LOGS_CHANNEL_ID))
+    status_msg = None
+    if quiet_here:
+        with suppress(Exception):
+            status_msg = await ctx.author.send(
+                f"⏳ Backfill started for <#{MEMBER_STATUS_LOGS_CHANNEL_ID}> "
+                f"({start_utc.date().isoformat()} → {end_utc.date().isoformat()})."
+            )
+    else:
+        status_msg = await ctx.send(
+            f"⏳ Backfill started for <#{MEMBER_STATUS_LOGS_CHANNEL_ID}> "
+            f"({start_utc.date().isoformat()} → {end_utc.date().isoformat()}).",
+            delete_after=3600,
+        )
 
     # Fresh store for the scanned window (one-time rebuild)
     retention = int(REPORTING_CONFIG.get("retention_weeks", 26))
@@ -4269,7 +4489,8 @@ async def _report_scan_member_status(ctx, start: str, end: str) -> None:
             if (now - last_edit).total_seconds() >= 10:
                 last_edit = now
                 with suppress(Exception):
-                    await status_msg.edit(content=f"⏳ Backfill in progress… scanned {scanned}, captured {captured}")
+                    if status_msg:
+                        await status_msg.edit(content=f"⏳ Backfill in progress… scanned {scanned}, captured {captured}")
 
     store = _report_prune_store(store, retention_weeks=retention)
 
@@ -4279,9 +4500,29 @@ async def _report_scan_member_status(ctx, start: str, end: str) -> None:
         _report_save_store(BASE_DIR, store)
 
     with suppress(Exception):
-        await status_msg.edit(content=f"✅ Backfill complete — scanned {scanned}, captured {captured}.")
+        if status_msg:
+            await status_msg.edit(content=f"✅ Backfill complete — scanned {scanned}, captured {captured}. Building report…")
 
-    await ctx.send(f"✅ Backfill complete — scanned {scanned}, captured {captured}. You can now run `.checker report`.", delete_after=25)
+    # DM report (Neo + invoker). Avoid channel spam (especially in member-status-logs).
+    try:
+        e = await _build_report_embed(start_utc, end_utc, title_prefix="RS Backfill Report (member-status-logs)")
+        dm_uid = int(REPORTING_CONFIG.get("dm_user_id") or 0)
+        targets: list[int] = []
+        if dm_uid:
+            targets.append(dm_uid)
+        if ctx.author and getattr(ctx.author, "id", None):
+            targets.append(int(ctx.author.id))
+        targets = list(dict.fromkeys([int(x) for x in targets if int(x) > 0]))
+        for uid in targets:
+            await _dm_user(uid, embed=e)
+    except Exception:
+        pass
+
+    if not quiet_here:
+        await ctx.send(
+            f"✅ Backfill complete — scanned {scanned}, captured {captured}. Report sent via DM.",
+            delete_after=25,
+        )
     return
 
 
