@@ -4143,6 +4143,321 @@ def _parse_date_ymd(s: str) -> datetime | None:
         return None
 
 
+def _whop_report_norm_bool(v: object) -> bool:
+    s = str(v or "").strip().lower()
+    return s in {"true", "yes", "1", "y"}
+
+
+def _whop_report_normalize_membership(rec: dict) -> dict:
+    if not isinstance(rec, dict):
+        return {}
+    for key in ("membership", "data", "item", "record"):
+        inner = rec.get(key)
+        if isinstance(inner, dict):
+            if any(k in inner for k in ("status", "created_at", "renewal_period_end", "id")):
+                return inner
+    return rec
+
+
+def _whop_report_membership_id(membership: dict) -> str:
+    if not isinstance(membership, dict):
+        return ""
+    for key in ("id", "membership_id", "membershipId", "membership", "whop_key", "key"):
+        val = membership.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        if isinstance(val, dict):
+            inner_id = str(val.get("id") or val.get("membership_id") or "").strip()
+            if inner_id:
+                return inner_id
+    return ""
+
+
+def _whop_report_extract_email(membership: dict) -> str:
+    if not isinstance(membership, dict):
+        return ""
+    for key in ("email", "user_email"):
+        val = membership.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    user = membership.get("user")
+    if isinstance(user, dict):
+        em = str(user.get("email") or "").strip()
+        if em:
+            return em
+    member = membership.get("member")
+    if isinstance(member, dict):
+        em = str(member.get("email") or "").strip()
+        if em:
+            return em
+    return ""
+
+
+def _whop_report_extract_discord_id(membership: dict) -> int | None:
+    raw = extract_discord_id_from_whop_member_record(membership) if isinstance(membership, dict) else ""
+    return int(raw) if str(raw or "").strip().isdigit() else None
+
+
+def _whop_report_extract_user_id(membership: dict) -> str:
+    if not isinstance(membership, dict):
+        return ""
+    u = membership.get("user")
+    if isinstance(u, str):
+        return u.strip()
+    if isinstance(u, dict):
+        return str(u.get("id") or u.get("user_id") or "").strip()
+    m = membership.get("member")
+    if isinstance(m, dict):
+        u2 = m.get("user")
+        if isinstance(u2, str):
+            return u2.strip()
+        if isinstance(u2, dict):
+            return str(u2.get("id") or u2.get("user_id") or "").strip()
+    return ""
+
+
+def _whop_report_pick_dt(membership: dict, keys: list[str]) -> datetime | None:
+    if not isinstance(membership, dict):
+        return None
+    for k in keys:
+        v = membership.get(k)
+        if isinstance(v, dict):
+            sec = v.get("seconds") or v.get("_seconds") or v.get("epoch_seconds") or v.get("unix")
+            nanos = v.get("nanos") or v.get("nanoseconds") or v.get("_nanoseconds")
+            if sec is not None:
+                with suppress(Exception):
+                    base = float(sec)
+                    frac = float(nanos or 0) / 1_000_000_000.0
+                    return datetime.fromtimestamp(base + frac, tz=timezone.utc)
+            for sk in (
+                "created_at",
+                "created",
+                "created_on",
+                "updated_at",
+                "updated",
+                "timestamp",
+                "time",
+                "date",
+                "epoch",
+                "seconds",
+                "unix",
+                "iso",
+                "iso8601",
+                "activated_at",
+                "activated",
+                "start",
+                "end",
+            ):
+                dt = _parse_dt_any(v.get(sk))
+                if dt:
+                    return dt
+        dt = _parse_dt_any(v)
+        if dt:
+            return dt
+    return None
+
+
+def _whop_report_day_key(dt: datetime, scan_tz: timezone | ZoneInfo) -> str:
+    return dt.astimezone(scan_tz).date().isoformat()
+
+
+def _whop_report_brief_from_membership(membership: dict, *, api_client: WhopAPIClient | None) -> dict:
+    if not isinstance(membership, dict):
+        return {}
+    status = str(membership.get("status") or "").strip()
+    product = ""
+    if isinstance(membership.get("product"), dict):
+        product = str(membership["product"].get("title") or "").strip()
+    renewal_end_iso = str(membership.get("renewal_period_end") or "").strip()
+    renewal_end_dt = _parse_dt_any(renewal_end_iso) if renewal_end_iso else None
+    remaining_days: int | str = ""
+    if renewal_end_dt:
+        delta = (renewal_end_dt - datetime.now(timezone.utc)).total_seconds()
+        remaining_days = max(0, int((delta / 86400.0) + 0.999))
+    total_raw = (
+        membership.get("total_spent")
+        or membership.get("total_spent_usd")
+        or membership.get("total_spend")
+        or membership.get("total_spend_usd")
+    )
+    total_spent = ""
+    if str(total_raw or "").strip():
+        amt = usd_amount(total_raw)
+        total_spent = f"${amt:.2f}" if amt else str(total_raw).strip()
+    manage_url_raw = str(membership.get("manage_url") or "").strip()
+    manage_url = f"[Open]({manage_url_raw})" if manage_url_raw else ""
+    user_id = _whop_report_extract_user_id(membership)
+    dash = ""
+    if user_id and api_client and getattr(api_client, "company_id", ""):
+        dash = f"[Open](https://whop.com/dashboard/{str(api_client.company_id).strip()}/users/{user_id}/)"
+    trial_days = (
+        membership.get("trial_days")
+        or membership.get("trial_period_days")
+        or ((membership.get("plan") or {}).get("trial_days") if isinstance(membership.get("plan"), dict) else None)
+    )
+    plan_is_renewal = (
+        membership.get("plan_is_renewal")
+        or membership.get("is_renewal")
+        or ((membership.get("plan") or {}).get("is_renewal") if isinstance(membership.get("plan"), dict) else None)
+    )
+    pricing = (
+        membership.get("pricing")
+        or ((membership.get("plan") or {}).get("price") if isinstance(membership.get("plan"), dict) else None)
+    )
+    return {
+        "status": status or "—",
+        "product": product or "—",
+        "member_since": _fmt_date_any(membership.get("created_at")),
+        "trial_end": _fmt_date_any(membership.get("trial_end") or membership.get("trial_ends_at") or membership.get("trial_end_at")),
+        "trial_days": str(trial_days).strip() if str(trial_days or "").strip() else "",
+        "plan_is_renewal": str(plan_is_renewal).strip() if str(plan_is_renewal or "").strip() else "",
+        "pricing": str(pricing).strip() if str(pricing or "").strip() else "",
+        "renewal_start": _fmt_date_any(membership.get("renewal_period_start")),
+        "renewal_end": _fmt_date_any(membership.get("renewal_period_end")),
+        "renewal_end_iso": renewal_end_iso or "",
+        "remaining_days": remaining_days,
+        "manage_url": manage_url,
+        "dashboard_url": dash,
+        "cancel_at_period_end": "yes" if membership.get("cancel_at_period_end") is True else ("no" if membership.get("cancel_at_period_end") is False else "—"),
+        "is_first_membership": "true" if membership.get("is_first_membership") is True else ("false" if membership.get("is_first_membership") is False else "—"),
+        "total_spent": total_spent,
+        "last_payment_failure": str(membership.get("last_payment_failure") or "").strip(),
+    }
+
+
+def _whop_report_compute_events(
+    membership: dict,
+    *,
+    start_utc: datetime,
+    end_utc: datetime,
+    api_client: WhopAPIClient | None,
+) -> tuple[list[tuple[str, datetime]], dict, dict]:
+    status_l = str(membership.get("status") or "").strip().lower()
+    created_dt = _whop_report_pick_dt(membership, ["created_at", "createdAt", "created_on", "created", "started_at", "starts_at", "start_at", "member", "user", "timestamps", "dates"])
+    activated_dt = _whop_report_pick_dt(membership, ["activated_at", "activatedAt", "current_period_start", "current_period_start_at", "starts_at", "started_at", "member", "user", "timestamps", "dates"])
+    updated_dt = _whop_report_pick_dt(membership, ["updated_at", "updatedAt", "updated_on", "member", "user", "timestamps", "dates"])
+    trial_end_dt = _whop_report_pick_dt(membership, ["trial_end", "trial_end_at", "trial_ends_at", "trial_end_on", "member", "user", "timestamps", "dates"])
+    failure_dt = _whop_report_pick_dt(membership, ["last_payment_failure", "last_payment_failed_at", "payment_failed_at", "last_failed_payment_at", "member", "user", "timestamps", "dates"])
+    cancel_dt = _whop_report_pick_dt(membership, ["cancel_at", "cancel_at_period_end_at", "cancellation_scheduled_at", "cancelled_at", "canceled_at", "updated_at", "member", "user", "timestamps", "dates"])
+
+    trial_days_raw = (
+        membership.get("trial_days")
+        or membership.get("trial_period_days")
+        or ((membership.get("plan") or {}).get("trial_days") if isinstance(membership.get("plan"), dict) else None)
+    )
+    try:
+        trial_days = int(str(trial_days_raw).strip())
+    except Exception:
+        trial_days = 0
+
+    is_trial = bool(
+        status_l in {"trialing", "trial", "pending"}
+        or trial_end_dt is not None
+        or int(trial_days) > 0
+    )
+
+    brief = _whop_report_brief_from_membership(membership, api_client=api_client)
+    spent = usd_amount(brief.get("total_spent"))
+
+    def _in_range(dt: datetime | None) -> bool:
+        return bool(dt and start_utc <= dt <= end_utc)
+
+    buckets: list[tuple[str, datetime]] = []
+    if is_trial:
+        trial_dt = created_dt or activated_dt
+        if _in_range(trial_dt):
+            buckets.append(("new_trial", trial_dt))
+    else:
+        member_dt = activated_dt or created_dt
+        if _in_range(member_dt):
+            buckets.append(("new_member", member_dt))
+
+    failure_dt = failure_dt or (updated_dt if status_l in {"past_due", "unpaid", "payment_failed"} else None)
+    if _in_range(failure_dt):
+        buckets.append(("payment_failed", failure_dt))
+
+    if _whop_report_norm_bool(membership.get("cancel_at_period_end")) and status_l in {"active", "trialing"} and float(spent) > 1.0:
+        if _in_range(cancel_dt):
+            buckets.append(("cancellation_scheduled", cancel_dt))
+
+    info = {
+        "status_l": status_l,
+        "created_dt": created_dt,
+        "activated_dt": activated_dt,
+        "updated_dt": updated_dt,
+        "trial_end_dt": trial_end_dt,
+        "failure_dt": failure_dt,
+        "cancel_dt": cancel_dt,
+        "trial_days": trial_days,
+        "is_trial": is_trial,
+        "spent": spent,
+        "cancel_at_period_end": membership.get("cancel_at_period_end"),
+    }
+    return (buckets, brief, info)
+
+
+def _whop_report_collect_date_fields(membership: dict) -> list[str]:
+    if not isinstance(membership, dict):
+        return []
+    keys = [
+        "created_at",
+        "createdAt",
+        "created_on",
+        "created",
+        "activated_at",
+        "activatedAt",
+        "updated_at",
+        "updatedAt",
+        "trial_end",
+        "trial_end_at",
+        "trial_ends_at",
+        "renewal_period_start",
+        "renewal_period_end",
+        "cancel_at",
+        "cancel_at_period_end_at",
+        "cancellation_scheduled_at",
+        "canceled_at",
+        "cancelled_at",
+        "last_payment_failure",
+        "last_payment_failed_at",
+        "payment_failed_at",
+    ]
+    found: list[str] = []
+    for k in keys:
+        v = membership.get(k)
+        if v not in (None, "", {}):
+            found.append(f"{k}={v}")
+    for nested_key in ("member", "user", "timestamps", "dates"):
+        nested = membership.get(nested_key)
+        if isinstance(nested, dict):
+            for k in keys:
+                v = nested.get(k)
+                if v not in (None, "", {}):
+                    found.append(f"{nested_key}.{k}={v}")
+    return found
+
+
+async def _whop_report_find_membership_for_discord_id(discord_id: int, *, max_pages: int = 8) -> dict:
+    if not whop_api_client:
+        return {}
+    page = 1
+    per_page = 100
+    while page <= max_pages:
+        batch = await whop_api_client.list_memberships(page=page, per_page=per_page)
+        if not batch:
+            break
+        for rec in batch:
+            if not isinstance(rec, dict):
+                continue
+            membership = _whop_report_normalize_membership(rec)
+            did = _whop_report_extract_discord_id(membership)
+            if did and int(did) == int(discord_id):
+                return membership
+        if len(batch) < per_page:
+            break
+        page += 1
+    return {}
+
 def _report_mode_label(mode: str) -> str:
     m = str(mode or "").strip().lower()
     if m == "scan_whop":
@@ -4347,6 +4662,12 @@ async def _start_report_interactive(ctx: commands.Context) -> None:
 
 async def _run_report_with_tokens(ctx: commands.Context, tokens: list[str]) -> None:
     try:
+        if tokens and tokens[0].lower() == "debug":
+            target = tokens[1] if len(tokens) >= 2 else ""
+            start_s = tokens[2] if len(tokens) >= 3 else ""
+            end_s = tokens[3] if len(tokens) >= 4 else ""
+            await _report_debug_whop(ctx, target=target, start=start_s, end=end_s)
+            return
         if tokens and tokens[0].lower() == "scan":
             if len(tokens) not in {5, 6}:
                 await ctx.send(
@@ -4447,6 +4768,7 @@ async def checker_report(ctx, arg1: str = "", arg2: str = "", arg3: str = "", ar
       .checker report 2026-01-01 2026-01-07
       .checker report scan whop 2026-01-01 2026-01-31 confirm
       .checker report scan memberstatus 2026-01-01 2026-01-31 confirm
+      .checker report debug <discord_id|membership_id> [YYYY-MM-DD YYYY-MM-DD]
 
     Tip: run without arguments to open the interactive picker.
     """
@@ -4525,172 +4847,6 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
     # Dedup: (bucket, identity, day_key)
     seen: set[tuple[str, str, str]] = set()
 
-    def _norm_bool(v: object) -> bool:
-        s = str(v or "").strip().lower()
-        return s in {"true", "yes", "1", "y"}
-
-    def _membership_id_from_membership(membership: dict) -> str:
-        if not isinstance(membership, dict):
-            return ""
-        for key in ("id", "membership_id", "membershipId", "membership", "whop_key", "key"):
-            val = membership.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-            if isinstance(val, dict):
-                inner_id = str(val.get("id") or val.get("membership_id") or "").strip()
-                if inner_id:
-                    return inner_id
-        return ""
-
-    def _extract_email_from_membership(membership: dict) -> str:
-        if not isinstance(membership, dict):
-            return ""
-        for key in ("email", "user_email"):
-            val = membership.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-        user = membership.get("user")
-        if isinstance(user, dict):
-            em = str(user.get("email") or "").strip()
-            if em:
-                return em
-        member = membership.get("member")
-        if isinstance(member, dict):
-            em = str(member.get("email") or "").strip()
-            if em:
-                return em
-        return ""
-
-    def _extract_discord_id_from_membership(membership: dict) -> int | None:
-        raw = extract_discord_id_from_whop_member_record(membership) if isinstance(membership, dict) else ""
-        return int(raw) if str(raw or "").strip().isdigit() else None
-
-    def _pick_dt(membership: dict, keys: list[str]) -> datetime | None:
-        if not isinstance(membership, dict):
-            return None
-        for k in keys:
-            v = membership.get(k)
-            if isinstance(v, dict):
-                sec = v.get("seconds") or v.get("_seconds") or v.get("epoch_seconds") or v.get("unix")
-                nanos = v.get("nanos") or v.get("nanoseconds") or v.get("_nanoseconds")
-                if sec is not None:
-                    with suppress(Exception):
-                        base = float(sec)
-                        frac = float(nanos or 0) / 1_000_000_000.0
-                        return datetime.fromtimestamp(base + frac, tz=timezone.utc)
-                for sk in (
-                    "created_at",
-                    "created",
-                    "created_on",
-                    "updated_at",
-                    "updated",
-                    "timestamp",
-                    "time",
-                    "date",
-                    "epoch",
-                    "seconds",
-                    "unix",
-                    "iso",
-                    "iso8601",
-                    "activated_at",
-                    "activated",
-                    "start",
-                    "end",
-                ):
-                    dt = _parse_dt_any(v.get(sk))
-                    if dt:
-                        return dt
-            dt = _parse_dt_any(v)
-            if dt:
-                return dt
-        return None
-
-    def _in_range(dt: datetime | None) -> bool:
-        return bool(dt and start_utc <= dt <= end_utc)
-
-    def _day_key(dt: datetime) -> str:
-        return dt.astimezone(scan_tz).date().isoformat()
-
-    def _extract_user_id(membership: dict) -> str:
-        if not isinstance(membership, dict):
-            return ""
-        u = membership.get("user")
-        if isinstance(u, str):
-            return u.strip()
-        if isinstance(u, dict):
-            return str(u.get("id") or u.get("user_id") or "").strip()
-        m = membership.get("member")
-        if isinstance(m, dict):
-            u2 = m.get("user")
-            if isinstance(u2, str):
-                return u2.strip()
-            if isinstance(u2, dict):
-                return str(u2.get("id") or u2.get("user_id") or "").strip()
-        return ""
-
-    def _brief_from_membership(membership: dict) -> dict:
-        if not isinstance(membership, dict):
-            return {}
-        status = str(membership.get("status") or "").strip()
-        product = ""
-        if isinstance(membership.get("product"), dict):
-            product = str(membership["product"].get("title") or "").strip()
-        renewal_end_iso = str(membership.get("renewal_period_end") or "").strip()
-        renewal_end_dt = _parse_dt_any(renewal_end_iso) if renewal_end_iso else None
-        remaining_days: int | str = ""
-        if renewal_end_dt:
-            delta = (renewal_end_dt - datetime.now(timezone.utc)).total_seconds()
-            remaining_days = max(0, int((delta / 86400.0) + 0.999))
-        total_raw = (
-            membership.get("total_spent")
-            or membership.get("total_spent_usd")
-            or membership.get("total_spend")
-            or membership.get("total_spend_usd")
-        )
-        total_spent = ""
-        if str(total_raw or "").strip():
-            amt = usd_amount(total_raw)
-            total_spent = f"${amt:.2f}" if amt else str(total_raw).strip()
-        manage_url_raw = str(membership.get("manage_url") or "").strip()
-        manage_url = f"[Open]({manage_url_raw})" if manage_url_raw else ""
-        user_id = _extract_user_id(membership)
-        dash = ""
-        if user_id and getattr(whop_api_client, "company_id", ""):
-            dash = f"[Open](https://whop.com/dashboard/{str(whop_api_client.company_id).strip()}/users/{user_id}/)"
-        trial_days = (
-            membership.get("trial_days")
-            or membership.get("trial_period_days")
-            or ((membership.get("plan") or {}).get("trial_days") if isinstance(membership.get("plan"), dict) else None)
-        )
-        plan_is_renewal = (
-            membership.get("plan_is_renewal")
-            or membership.get("is_renewal")
-            or ((membership.get("plan") or {}).get("is_renewal") if isinstance(membership.get("plan"), dict) else None)
-        )
-        pricing = (
-            membership.get("pricing")
-            or ((membership.get("plan") or {}).get("price") if isinstance(membership.get("plan"), dict) else None)
-        )
-        return {
-            "status": status or "—",
-            "product": product or "—",
-            "member_since": _fmt_date_any(membership.get("created_at")),
-            "trial_end": _fmt_date_any(membership.get("trial_end") or membership.get("trial_ends_at") or membership.get("trial_end_at")),
-            "trial_days": str(trial_days).strip() if str(trial_days or "").strip() else "",
-            "plan_is_renewal": str(plan_is_renewal).strip() if str(plan_is_renewal or "").strip() else "",
-            "pricing": str(pricing).strip() if str(pricing or "").strip() else "",
-            "renewal_start": _fmt_date_any(membership.get("renewal_period_start")),
-            "renewal_end": _fmt_date_any(membership.get("renewal_period_end")),
-            "renewal_end_iso": renewal_end_iso or "",
-            "remaining_days": remaining_days,
-            "manage_url": manage_url,
-            "dashboard_url": dash,
-            "cancel_at_period_end": "yes" if membership.get("cancel_at_period_end") is True else ("no" if membership.get("cancel_at_period_end") is False else "—"),
-            "is_first_membership": "true" if membership.get("is_first_membership") is True else ("false" if membership.get("is_first_membership") is False else "—"),
-            "total_spent": total_spent,
-            "last_payment_failure": str(membership.get("last_payment_failure") or "").strip(),
-        }
-
     def _rate() -> float:
         dt = max(1e-6, time.time() - started_at)
         return float(scanned) / dt
@@ -4742,16 +4898,6 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
     page = 1
     seen_memberships: set[str] = set()
 
-    def _normalize_membership(rec: dict) -> dict:
-        if not isinstance(rec, dict):
-            return {}
-        for key in ("membership", "data", "item", "record"):
-            inner = rec.get(key)
-            if isinstance(inner, dict):
-                if any(k in inner for k in ("status", "created_at", "renewal_period_end", "id")):
-                    return inner
-        return rec
-
     try:
         await _progress("page 1", force=True)
         while True:
@@ -4768,65 +4914,28 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
 
                 if not isinstance(membership, dict):
                     continue
-                membership = _normalize_membership(membership)
+                membership = _whop_report_normalize_membership(membership)
 
-                membership_id = _membership_id_from_membership(membership)
+                membership_id = _whop_report_membership_id(membership)
                 if membership_id:
                     if membership_id in seen_memberships:
                         continue
                     seen_memberships.add(membership_id)
                     new_on_page += 1
 
-                status_l = str(membership.get("status") or "").strip().lower()
-                created_dt = _pick_dt(membership, ["created_at", "createdAt", "created_on", "created", "started_at", "starts_at", "start_at", "member", "user", "timestamps", "dates"])
-                activated_dt = _pick_dt(membership, ["activated_at", "activatedAt", "current_period_start", "current_period_start_at", "starts_at", "started_at", "member", "user", "timestamps", "dates"])
-                updated_dt = _pick_dt(membership, ["updated_at", "updatedAt", "updated_on", "member", "user", "timestamps", "dates"])
-                trial_end_dt = _pick_dt(membership, ["trial_end", "trial_end_at", "trial_ends_at", "trial_end_on", "member", "user", "timestamps", "dates"])
-                failure_dt = _pick_dt(membership, ["last_payment_failure", "last_payment_failed_at", "payment_failed_at", "last_failed_payment_at", "member", "user", "timestamps", "dates"])
-                cancel_dt = _pick_dt(membership, ["cancel_at", "cancel_at_period_end_at", "cancellation_scheduled_at", "cancelled_at", "canceled_at", "updated_at", "member", "user", "timestamps", "dates"])
-
-                trial_days_raw = (
-                    membership.get("trial_days")
-                    or membership.get("trial_period_days")
-                    or ((membership.get("plan") or {}).get("trial_days") if isinstance(membership.get("plan"), dict) else None)
+                buckets, brief, info = _whop_report_compute_events(
+                    membership,
+                    start_utc=start_utc,
+                    end_utc=end_utc,
+                    api_client=whop_api_client,
                 )
-                try:
-                    trial_days = int(str(trial_days_raw).strip())
-                except Exception:
-                    trial_days = 0
-
-                is_trial = bool(
-                    status_l in {"trialing", "trial", "pending"}
-                    or trial_end_dt is not None
-                    or int(trial_days) > 0
-                )
-
-                brief = _brief_from_membership(membership)
-                spent = usd_amount(brief.get("total_spent"))
-
-                buckets: list[tuple[str, datetime]] = []
-                if is_trial:
-                    trial_dt = created_dt or activated_dt
-                    if _in_range(trial_dt):
-                        buckets.append(("new_trial", trial_dt))
-                else:
-                    member_dt = activated_dt or created_dt
-                    if _in_range(member_dt):
-                        buckets.append(("new_member", member_dt))
-
-                failure_dt = failure_dt or (updated_dt if status_l in {"past_due", "unpaid", "payment_failed"} else None)
-                if _in_range(failure_dt):
-                    buckets.append(("payment_failed", failure_dt))
-
-                if _norm_bool(membership.get("cancel_at_period_end")) and status_l in {"active", "trialing"} and float(spent) > 1.0:
-                    if _in_range(cancel_dt):
-                        buckets.append(("cancellation_scheduled", cancel_dt))
 
                 if not buckets:
                     continue
 
-                discord_id = _extract_discord_id_from_membership(membership)
-                email = _extract_email_from_membership(membership)
+                status_l = str(info.get("status_l") or "").strip().lower()
+                discord_id = _whop_report_extract_discord_id(membership)
+                email = _whop_report_extract_email(membership)
                 if not email and not discord_id:
                     email = membership_id
 
@@ -4839,7 +4948,7 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
                 for bucket, ev_dt in buckets:
                     if not ev_dt:
                         continue
-                    day_key = _day_key(ev_dt)
+                    day_key = _whop_report_day_key(ev_dt, scan_tz)
                     key = (bucket, ident, day_key)
                     if key in seen:
                         dupes += 1
@@ -5027,6 +5136,123 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
         if status_msg:
             await status_msg.edit(content="✅ Scan complete. Report sent via DM (with CSV).")
     return
+
+
+async def _report_debug_whop(ctx, *, target: str, start: str = "", end: str = "") -> None:
+    """Debug a Whop membership record and show parsed report fields."""
+    if not REPORTING_CONFIG.get("enabled"):
+        await ctx.send("❌ Reporting is disabled in config.", delete_after=15)
+        return
+    if not whop_api_client or not getattr(whop_api_client, "list_memberships", None):
+        await ctx.send("❌ Whop API is not configured for reporting.", delete_after=20)
+        return
+
+    target_s = str(target or "").strip()
+    if not target_s:
+        await ctx.send("❌ Debug usage: `.checker report debug <discord_id|membership_id> [YYYY-MM-DD YYYY-MM-DD]`", delete_after=20)
+        return
+
+    start_dt = _parse_date_ymd(start) if start else None
+    end_dt = _parse_date_ymd(end) if end else None
+    now_local = _tz_now()
+    if start_dt is None and end_dt is None:
+        end_utc = now_local.astimezone(timezone.utc)
+        start_utc = end_utc - timedelta(days=30)
+    else:
+        if start_dt is None and end_dt is not None:
+            start_dt, end_dt = end_dt, None
+        if start_dt is None:
+            start_dt = now_local
+        if end_dt is None:
+            end_dt = now_local
+        end_dt = end_dt.replace(hour=23, minute=59, second=59)
+        start_utc = start_dt.astimezone(timezone.utc)
+        end_utc = end_dt.astimezone(timezone.utc)
+
+    membership_id = ""
+    discord_id: int | None = None
+    if target_s.startswith("mem_") or target_s.startswith("R-"):
+        membership_id = target_s
+    elif target_s.isdigit() and 17 <= len(target_s) <= 19:
+        discord_id = int(target_s)
+        membership_id = str(_membership_id_from_history(discord_id) or "").strip()
+    else:
+        membership_id = target_s
+
+    membership: dict = {}
+    if membership_id:
+        membership = await whop_api_client.get_membership_by_id(membership_id) or {}
+    if (not membership) and discord_id:
+        try:
+            max_pages = int(WHOP_API_CONFIG.get("report_debug_max_pages") or 8)
+        except Exception:
+            max_pages = 8
+        if max_pages <= 0:
+            max_pages = 8
+        membership = await _whop_report_find_membership_for_discord_id(discord_id, max_pages=max_pages)
+        if membership:
+            membership_id = _whop_report_membership_id(membership)
+
+    if not membership:
+        await ctx.send("❌ Debug: membership not found. Try a membership_id (`mem_...`) or check member_history link.", delete_after=25)
+        return
+
+    membership = _whop_report_normalize_membership(membership)
+    membership_id = _whop_report_membership_id(membership) or membership_id
+    discord_id = _whop_report_extract_discord_id(membership) or discord_id
+    email = _whop_report_extract_email(membership)
+
+    buckets, brief, info = _whop_report_compute_events(
+        membership,
+        start_utc=start_utc,
+        end_utc=end_utc,
+        api_client=whop_api_client,
+    )
+
+    def _fmt_dt(dt: datetime | None) -> str:
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if dt else "—"
+
+    dates_block = "\n".join(
+        [
+            f"created: {_fmt_dt(info.get('created_dt'))}",
+            f"activated: {_fmt_dt(info.get('activated_dt'))}",
+            f"updated: {_fmt_dt(info.get('updated_dt'))}",
+            f"trial_end: {_fmt_dt(info.get('trial_end_dt'))}",
+            f"payment_failed: {_fmt_dt(info.get('failure_dt'))}",
+            f"cancel_at: {_fmt_dt(info.get('cancel_dt'))}",
+        ]
+    )[:1024]
+
+    raw_dates = _whop_report_collect_date_fields(membership)
+    raw_block = ("\n".join(raw_dates)[:1024]) if raw_dates else "—"
+
+    bucket_lines = [f"{b} @ {_fmt_dt(dt)}" for b, dt in buckets] if buckets else ["—"]
+
+    product = str((membership.get("product") or {}).get("title") or "").strip() if isinstance(membership.get("product"), dict) else ""
+    status_l = str(info.get("status_l") or "").strip() or "—"
+
+    e = discord.Embed(
+        title="RS Whop Debug",
+        description=f"Target: `{target_s}`\nRange: {start_utc.date().isoformat()} → {end_utc.date().isoformat()}",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    e.add_field(name="Membership ID", value=membership_id or "—", inline=True)
+    e.add_field(name="Discord ID", value=str(discord_id or "—"), inline=True)
+    e.add_field(name="Email", value=email or "—", inline=True)
+    e.add_field(name="Status", value=status_l, inline=True)
+    e.add_field(name="Product", value=product or "—", inline=True)
+    e.add_field(name="Trial Days", value=str(info.get("trial_days") or "0"), inline=True)
+    e.add_field(name="Is Trial", value="yes" if info.get("is_trial") else "no", inline=True)
+    e.add_field(name="Cancel At Period End", value=str(info.get("cancel_at_period_end") or "—"), inline=True)
+    e.add_field(name="Total Spent", value=str(brief.get("total_spent") or "—"), inline=True)
+    e.add_field(name="Parsed Dates", value=dates_block or "—", inline=False)
+    e.add_field(name="Raw Date Fields", value=raw_block, inline=False)
+    e.add_field(name="Computed Buckets", value="\n".join(bucket_lines)[:1024], inline=False)
+    e.set_footer(text="RSCheckerbot • Reporting Debug")
+
+    await _dm_user(int(ctx.author.id), embed=e)
+    await ctx.send("✅ Debug report sent via DM.", delete_after=20)
 
 
 async def _report_scan_member_status(ctx, start: str, end: str) -> None:
