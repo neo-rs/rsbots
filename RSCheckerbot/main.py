@@ -4156,15 +4156,47 @@ def _whop_report_normalize_membership(rec: dict) -> dict:
 def _whop_report_membership_id(membership: dict) -> str:
     if not isinstance(membership, dict):
         return ""
+    def _find_mem_id(obj: object, *, depth: int) -> str:
+        if depth > 5:
+            return ""
+        if isinstance(obj, str):
+            m = re.search(r"(mem_[A-Za-z0-9]+|R-[A-Za-z0-9-]+)", obj)
+            return m.group(1) if m else ""
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(k, str) and k.lower() in {"id", "membership_id", "membershipid", "whop_key", "key"}:
+                    if isinstance(v, (int, float)):
+                        s = str(v).strip()
+                        if s:
+                            return s
+                    if isinstance(v, str):
+                        m = re.search(r"(mem_[A-Za-z0-9]+|R-[A-Za-z0-9-]+)", v)
+                        if m:
+                            return m.group(1)
+                found = _find_mem_id(v, depth=depth + 1)
+                if found:
+                    return found
+        if isinstance(obj, list):
+            for it in obj:
+                found = _find_mem_id(it, depth=depth + 1)
+                if found:
+                    return found
+        return ""
+
     for key in ("id", "membership_id", "membershipId", "membership", "whop_key", "key"):
         val = membership.get(key)
+        if isinstance(val, (int, float)):
+            s = str(val).strip()
+            if s:
+                return s
         if isinstance(val, str) and val.strip():
-            return val.strip()
+            m = re.search(r"(mem_[A-Za-z0-9]+|R-[A-Za-z0-9-]+)", val)
+            return m.group(1) if m else val.strip()
         if isinstance(val, dict):
             inner_id = str(val.get("id") or val.get("membership_id") or "").strip()
             if inner_id:
                 return inner_id
-    return ""
+    return _find_mem_id(membership, depth=0)
 
 
 def _whop_report_extract_email(membership: dict) -> str:
@@ -4994,15 +5026,10 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
                     and membership_id
                     and detail_fetches < detail_limit
                     and (
-                        not detail_missing_only
-                        or not any(
-                            [
-                                info.get("created_dt"),
-                                info.get("activated_dt"),
-                                info.get("trial_end_dt"),
-                                info.get("failure_dt"),
-                                info.get("cancel_dt"),
-                            ]
+                        (not detail_missing_only)
+                        or any(
+                            info.get(k) is None
+                            for k in ("created_dt", "activated_dt", "updated_dt", "trial_end_dt", "failure_dt", "cancel_dt")
                         )
                     )
                 ):

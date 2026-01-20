@@ -37,7 +37,7 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 - **Note**: Command message is auto-deleted
 
 #### `.checker report`
-- **Description**: Generate a reporting summary for a date range (from `reporting_store.json`) and DM it, or run a one-time scan to rebuild the store + DM a downloadable CSV
+- **Description**: Generate a reporting summary for a date range (from `reporting_store.json`) and DM it, or run a one-time scan to rebuild the store + DM a downloadable CSV, or run a Whop debug report for a specific membership/Discord ID
 - **Aliases**: `reports`
 - **Parameters**:
   - `start` (optional): Start date `YYYY-MM-DD`
@@ -46,21 +46,27 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
   - `source` (scan mode): `whop` or `memberstatus`
   - `confirm` (scan mode): Must be exactly `confirm`
   - `sample` (optional, scan whop only): Anonymize CSV output (no real Discord IDs / membership IDs / emails / URLs)
+  - `debug` (optional): Literal word `debug` to run Whop debug
+  - `target` (debug mode): Whop membership ID (`mem_...`) or Discord ID
 - **Usage**:
-  - `.checker report` (last 7 days)
+  - `.checker report` (interactive picker; default last 7 days)
   - `.checker report 2026-01-01` (from date → now)
   - `.checker report 2026-01-01 2026-01-07` (inclusive range)
-  - `.checker report scan whop 2026-01-01 2026-01-31 confirm` (one-time scan Whop channels + CSV)
+  - `.checker report scan whop 2026-01-01 2026-01-31 confirm` (one-time scan Whop API + CSV)
   - `.checker report scan whop 2026-01-01 2026-01-31 confirm sample` (same scan, but CSV is anonymized sample output)
   - `.checker report scan memberstatus 2026-01-01 2026-01-31 confirm` (one-time scan `member-status-logs` history)
+  - `.checker report debug mem_abc123 2026-01-01 2026-01-31` (Whop debug for a specific membership)
+  - `.checker report debug 1281616986660405304` (Whop debug for a specific Discord ID)
 - **Admin Only**: Yes (requires administrator permissions)
 - **Returns**:
   - Normal mode: Report embed via DM (to Neo from config + to the invoker), plus a short confirmation (auto-deletes)
   - Scan mode: Live progress message, then DM report embed + downloadable CSV (to Neo from config + to the invoker)
+  - Debug mode: DM debug embed with parsed date fields and computed buckets
 - **Notes**:
   - Normal mode reads the bounded runtime `reporting_store.json`
   - Scan mode overwrites/rebuilds the reporting store for that scanned window
   - `scan whop` uses Mountain Time (`America/Denver`) day boundaries for dedupe per membership per day/event
+  - Interactive picker exposes Manual / Scan / Debug options in a dropdown
   - If you see `Permission denied` for `reporting_store.json.tmp`, the bot service user cannot write to the `RSCheckerbot/` folder on the server (common cause: stale root-owned `.tmp` file). Fix ownership/permissions and retry.
 
 #### `.checker purgecases`
