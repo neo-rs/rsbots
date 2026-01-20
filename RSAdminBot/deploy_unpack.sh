@@ -132,13 +132,17 @@ preserve_and_replace_folder() {
 
   # Copy code from archive (deterministic, no rsync required)
   if [ -d "$src_folder" ]; then
-    (cd "$src_folder" && tar -cf - .) | (cd "$dst_folder" && tar -xf -)
+    (cd "$src_folder" && env -u TAR_OPTIONS /bin/tar -cf - .) | (cd "$dst_folder" && env -u TAR_OPTIONS /bin/tar -xf -)
   fi
 
   # Restore preserved runtime/secrets
   if [ -f "$preserve_tar" ]; then
-    tar -xf "$preserve_tar" -C "$dst_folder"
+    env -u TAR_OPTIONS /bin/tar -xf "$preserve_tar" -C "$dst_folder"
   fi
+
+  # Deploy is typically run via sudo, which makes the new folder root-owned.
+  # Fix ownership so runtime updates (selfupdate/botupdate) can write as rsadmin.
+  chown -R rsadmin:rsadmin "$dst_folder" >/dev/null 2>&1 || true
 
   rm -rf "$preserve_dir"
 }
@@ -162,7 +166,7 @@ done
 if [ -d "$SRC_DIR/systemd" ]; then
   rm -rf "$ROOT_DIR/systemd"
   mkdir -p "$ROOT_DIR/systemd"
-  (cd "$SRC_DIR/systemd" && tar -cf - .) | (cd "$ROOT_DIR/systemd" && tar -xf -)
+  (cd "$SRC_DIR/systemd" && env -u TAR_OPTIONS /bin/tar -cf - .) | (cd "$ROOT_DIR/systemd" && env -u TAR_OPTIONS /bin/tar -xf -)
 fi
 
 # Canonical Oracle server list (safe, non-secret). Do NOT deploy private keys.

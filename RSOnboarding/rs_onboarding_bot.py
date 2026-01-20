@@ -1031,6 +1031,8 @@ class RSOnboardingBot:
                                     first_join_ts = hist.get("first_join_ts")
                                     acc = hist.get("access") if isinstance(hist.get("access"), dict) else {}
                                     returning = bool(join_count > 1 or last_leave_ts)
+                                    has_join_signal = bool(join_count or last_leave_ts or first_join_ts)
+                                    returning_label = "Unknown" if not has_join_signal else ("Yes" if returning else "No")
 
                                     def _fmt_ts(ts: object, style: str) -> str:
                                         try:
@@ -1041,7 +1043,7 @@ class RSOnboardingBot:
                                     embed.add_field(
                                         name="Returning",
                                         value=(
-                                            f"{'Yes' if returning else 'No'}\n"
+                                            f"{returning_label}\n"
                                             f"Joins: {join_count if join_count else '—'}\n"
                                             f"Last left: {_fmt_ts(last_leave_ts, 'R') if last_leave_ts else '—'}\n"
                                             f"First joined: {_fmt_ts(first_join_ts, 'D') if first_join_ts else '—'}\n"

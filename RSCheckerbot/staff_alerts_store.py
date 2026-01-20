@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -35,7 +37,15 @@ def save_staff_alerts(path: Path, db: dict) -> None:
         p = Path(path)
         if not isinstance(db, dict):
             return
-        p.write_text(json.dumps(db, indent=2, ensure_ascii=False), encoding="utf-8")
+        # Atomic write (same-folder temp -> replace) to avoid truncated JSON on crash.
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(db, indent=2, ensure_ascii=False), encoding="utf-8")
+        try:
+            os.replace(tmp, p)
+        except Exception:
+            with suppress(Exception):
+                tmp.unlink(missing_ok=True)  # type: ignore[arg-type]
     except Exception:
         pass
 
@@ -71,4 +81,31 @@ def record_alert_post(db: dict, discord_id: int, issue_key: str) -> None:
         last = {}
     last[issue_key] = _now().isoformat()
     rec["last"] = last
+
+
+# Shared lock for staff_alerts.json (prevents load→await→save lost updates)
+STAFF_ALERTS_LOCK: asyncio.Lock = asyncio.Lock()
+
+
+async def should_post_and_record_alert(
+    path: Path,
+    *,
+    discord_id: int,
+    issue_key: str,
+    cooldown_hours: float = 6.0,
+) -> bool:
+    """Atomically (within-process) check cooldown and record the alert post.
+
+    This prevents the common race where multiple coroutines:
+      1) load staff_alerts.json
+      2) await network/Discord
+      3) save, overwriting each other's updates
+    """
+    async with STAFF_ALERTS_LOCK:
+        db = load_staff_alerts(path)
+        if not should_post_alert(db, discord_id, issue_key, cooldown_hours=cooldown_hours):
+            return False
+        record_alert_post(db, discord_id, issue_key)
+        save_staff_alerts(path, db)
+        return True
 

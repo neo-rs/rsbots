@@ -3959,10 +3959,11 @@ SAFE_BOT="$(echo "$BOT_FOLDER" | tr '/' '_')"
 BACKUP_DIR="$LIVE_ROOT/backups"
 mkdir -p "$BACKUP_DIR"
 BACKUP_TAR="$BACKUP_DIR/${{SAFE_BOT}}_preupdate_${{TS}}.tar.gz"
-(cd "$LIVE_ROOT" && tar --ignore-failed-read -czf "$BACKUP_TAR" -T "$TMP_SYNC_LIST") || true
+(cd "$LIVE_ROOT" && env -u TAR_OPTIONS /bin/tar --ignore-failed-read -czf "$BACKUP_TAR" -T "$TMP_SYNC_LIST") || true
 
-# Copy files (always sync, even if no differences detected)
-tar -cf - -T "$TMP_SYNC_LIST" | (cd "$LIVE_ROOT" && tar -xf -)
+# Copy files (always sync, even if no differences detected).
+# Explicitly ignore TAR_OPTIONS and force overwrite to avoid host-level tar defaults like --keep-old-files.
+env -u TAR_OPTIONS /bin/tar -cf - -T "$TMP_SYNC_LIST" | (cd "$LIVE_ROOT" && env -u TAR_OPTIONS /bin/tar -xf - --overwrite)
 
 # Use actual changed count for reporting (more accurate than git diff)
 CHANGED_COUNT="$ACTUAL_CHANGED_COUNT"

@@ -7,8 +7,10 @@ Canonical Owner: This module owns all Whop API interactions.
 """
 
 import aiohttp
+import asyncio
 import logging
 import json
+import os
 from contextlib import suppress
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -16,6 +18,9 @@ from typing import Dict, Optional, List
 from aiohttp import ContentTypeError
 
 log = logging.getLogger("rs-checker")
+
+# Shared lock for payment_cache.json read/write (prevents lost updates within-process).
+_PAYMENT_CACHE_LOCK: asyncio.Lock = asyncio.Lock()
 
 
 class WhopAPIError(Exception):
@@ -102,9 +107,12 @@ class WhopAPIClient:
         cache: dict = {}
         cache_file = Path(cache_path) if cache_path else None
         if cache_file:
-            with suppress(Exception):
-                if cache_file.exists():
-                    cache = json.loads(cache_file.read_text(encoding="utf-8") or "{}")
+            try:
+                async with _PAYMENT_CACHE_LOCK:
+                    if cache_file.exists():
+                        cache = json.loads(cache_file.read_text(encoding="utf-8") or "{}")
+            except Exception:
+                cache = {}
 
             rec = cache.get(mid) if isinstance(cache, dict) else None
             if isinstance(rec, dict):
@@ -132,14 +140,26 @@ class WhopAPIClient:
         # Cache write (best-effort)
         if cache_file:
             try:
-                if not isinstance(cache, dict):
-                    cache = {}
-                cache[mid] = {
-                    "last_success_paid_at": (success_dt.isoformat().replace("+00:00", "Z") if success_dt else ""),
-                    "fetched_at": now.isoformat().replace("+00:00", "Z"),
-                }
-                cache_file.parent.mkdir(parents=True, exist_ok=True)
-                cache_file.write_text(json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8")
+                async with _PAYMENT_CACHE_LOCK:
+                    latest: dict = {}
+                    with suppress(Exception):
+                        if cache_file.exists():
+                            latest = json.loads(cache_file.read_text(encoding="utf-8") or "{}")
+                    if not isinstance(latest, dict):
+                        latest = {}
+                    latest[mid] = {
+                        "last_success_paid_at": (success_dt.isoformat().replace("+00:00", "Z") if success_dt else ""),
+                        "fetched_at": now.isoformat().replace("+00:00", "Z"),
+                    }
+                    cache_file.parent.mkdir(parents=True, exist_ok=True)
+                    # Atomic write (same-folder temp -> replace) to avoid truncated JSON on crash.
+                    tmp = cache_file.with_suffix(cache_file.suffix + ".tmp")
+                    tmp.write_text(json.dumps(latest, indent=2, ensure_ascii=False), encoding="utf-8")
+                    try:
+                        os.replace(tmp, cache_file)
+                    except Exception:
+                        with suppress(Exception):
+                            tmp.unlink(missing_ok=True)  # type: ignore[arg-type]
             except Exception:
                 pass
 

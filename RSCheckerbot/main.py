@@ -57,6 +57,7 @@ from staff_alerts_store import (
     save_staff_alerts,
     should_post_alert,
     record_alert_post,
+    should_post_and_record_alert,
 )
 
 # Import Whop webhook handler
@@ -937,7 +938,10 @@ def _load_member_history() -> dict:
 def _save_member_history(db: dict) -> None:
     """Save member history to JSON file"""
     try:
-        MEMBER_HISTORY_FILE.write_text(json.dumps(db, indent=2, ensure_ascii=False), encoding="utf-8")
+        if not isinstance(db, dict):
+            return
+        # Atomic write (tmp + replace) to avoid truncated JSON on crash.
+        save_json(MEMBER_HISTORY_FILE, db)
     except Exception:
         pass
 
@@ -1479,14 +1483,16 @@ def _backfill_whop_timeline_from_whop_history() -> None:
             
             # Get or create member record
             key = str(discord_id)
-            if key not in member_history:
-                member_history[key] = {}
-            
+            rec = member_history.get(key, {})
+            # Ensure join/leave/access fields always exist, even when this record is created via Whop backfill.
+            rec = _ensure_member_history_shape(rec, now=event_ts)
+
             # Get or create whop timeline sub-object
-            if "whop" not in member_history[key]:
-                member_history[key]["whop"] = {}
-            
-            whop_timeline = member_history[key]["whop"]
+            if not isinstance(rec.get("whop"), dict):
+                rec["whop"] = {}
+
+            member_history[key] = rec
+            whop_timeline = rec["whop"]
             
             # Get status (normalize to lowercase)
             status = (event.get("membership_status", "") or "").strip().lower()
@@ -2439,8 +2445,12 @@ async def sync_whop_memberships():
     log.info(f"Checking {len(members_to_check)} members with Member role...")
 
     auto_heal_enabled = bool(WHOP_API_CONFIG.get("auto_heal_add_members_role", False))
-    enforce_removals = bool(WHOP_API_CONFIG.get("enforce_role_removals", True))
-    post_cancel_cards = bool(WHOP_API_CONFIG.get("post_cancellation_scheduled_cards", False))
+    # Safety defaults:
+    # - Role removals are dangerous; default to disabled unless explicitly enabled.
+    # - Sync logging can be noisy; default to silent unless explicitly disabled.
+    enforce_removals = bool(WHOP_API_CONFIG.get("enforce_role_removals", False))
+    sync_silent = bool(WHOP_API_CONFIG.get("sync_silent", True))
+    post_cancel_cards = bool(WHOP_API_CONFIG.get("post_cancellation_scheduled_cards", False)) and (not sync_silent)
     try:
         auto_heal_min_spent = float(WHOP_API_CONFIG.get("auto_heal_min_total_spent_usd", 1.0))
     except Exception:
@@ -2530,15 +2540,18 @@ async def sync_whop_memberships():
                     renewal_end_key = str(membership_data.get("renewal_period_end") or "").strip()
                     issue_key = f"cancel_scheduled:{membership_id}:{renewal_end_key}"
 
-                    db_alerts = load_staff_alerts(STAFF_ALERTS_FILE)
-                    if not should_post_alert(db_alerts, member.id, issue_key, cooldown_hours=24.0):
-                        continue
-
                     access = _access_roles_plain(member)
                     whop_brief = await _fetch_whop_brief_by_membership_id(membership_id)
                     # Noise control: only log Cancellation Scheduled for paying members (>$1) and active status.
                     # (Trials/$0 are extremely noisy and do not match reporting requirements.)
                     if status_now != "active" or float(usd_amount(whop_brief.get("total_spent"))) <= 1.0:
+                        continue
+                    if not await should_post_and_record_alert(
+                        STAFF_ALERTS_FILE,
+                        discord_id=member.id,
+                        issue_key=issue_key,
+                        cooldown_hours=24.0,
+                    ):
                         continue
 
                     # Detailed card -> member-status-logs
@@ -2574,9 +2587,6 @@ async def sync_whop_memberships():
                         event_kind="cancellation_scheduled",
                     )
                     await log_member_status("", embed=minimal, channel_name=MEMBER_CANCELLATION_CHANNEL_NAME)
-
-                    record_alert_post(db_alerts, member.id, issue_key)
-                    save_staff_alerts(STAFF_ALERTS_FILE, db_alerts)
             
             if not verification["matches"]:
                 actual_status = verification["actual_status"]
@@ -2604,12 +2614,13 @@ async def sync_whop_memberships():
                             rec = await whop_api_client.get_member_by_id(whop_member_id)
                             did = extract_discord_id_from_whop_member_record(rec) if isinstance(rec, dict) else ""
                             if did and did.isdigit() and int(did) != int(member.id):
-                                await log_other(
-                                    f"⚠️ **Whop Sync skipped removal (mismatch)** {_fmt_user(member)}\n"
-                                    f"   cached_membership_id: `{membership_id}`\n"
-                                    f"   whop_member_id: `{whop_member_id}`\n"
-                                    f"   whop_discord_id: `{did}`"
-                                )
+                                if not sync_silent:
+                                    await log_other(
+                                        f"⚠️ **Whop Sync skipped removal (mismatch)** {_fmt_user(member)}\n"
+                                        f"   cached_membership_id: `{membership_id}`\n"
+                                        f"   whop_member_id: `{whop_member_id}`\n"
+                                        f"   whop_discord_id: `{did}`"
+                                    )
                                 continue
                     except Exception:
                         pass
@@ -2628,11 +2639,12 @@ async def sync_whop_memberships():
                             st2 = str(m2.get("status") or "").strip().lower()
                             set_cached_whop_membership_id(member.id, mid2, source_event="sync.relink_active_membership")
                             relinked_count += 1
-                            await log_other(
-                                f"✅ **Whop Sync kept access (newer active membership)** {_fmt_user(member)}\n"
-                                f"   old_membership_id: `{membership_id}` (status `{actual_status}`)\n"
-                                f"   new_membership_id: `{mid2}` (status `{st2}`)"
-                            )
+                            if not sync_silent:
+                                await log_other(
+                                    f"✅ **Whop Sync kept access (newer active membership)** {_fmt_user(member)}\n"
+                                    f"   old_membership_id: `{membership_id}` (status `{actual_status}`)\n"
+                                    f"   new_membership_id: `{mid2}` (status `{st2}`)"
+                                )
                             continue
                     except Exception:
                         pass
@@ -2649,22 +2661,24 @@ async def sync_whop_memberships():
                         continue
                     if not enforce_removals:
                         would_remove_count += 1
-                        await log_other(
-                            f"⚠️ **Whop Sync would remove role (enforcement disabled)** {_fmt_user(member)}\n"
-                            f"   API Status: `{actual_status}`\n"
-                            f"   membership_id: `{membership_id}`\n"
-                            f"   Removed: {_fmt_role(ROLE_CANCEL_A, guild)}"
-                        )
+                        if not sync_silent:
+                            await log_other(
+                                f"⚠️ **Whop Sync would remove role (enforcement disabled)** {_fmt_user(member)}\n"
+                                f"   API Status: `{actual_status}`\n"
+                                f"   membership_id: `{membership_id}`\n"
+                                f"   Removed: {_fmt_role(ROLE_CANCEL_A, guild)}"
+                            )
                         continue
                     await member.remove_roles(
                         member_role, 
                         reason=f"Whop sync: Status is {actual_status}"
                     )
-                    await log_other(
-                        f"🔄 **Sync Removed Role:** {_fmt_user(member)}\n"
-                        f"   API Status: `{actual_status}`\n"
-                        f"   Removed: {_fmt_role(ROLE_CANCEL_A, guild)}"
-                    )
+                    if not sync_silent:
+                        await log_other(
+                            f"🔄 **Sync Removed Role:** {_fmt_user(member)}\n"
+                            f"   API Status: `{actual_status}`\n"
+                            f"   Removed: {_fmt_role(ROLE_CANCEL_A, guild)}"
+                        )
                     synced_count += 1
         except Exception as e:
             error_count += 1
@@ -2745,20 +2759,21 @@ async def sync_whop_memberships():
                 await mbr.add_roles(member_role, reason="Whop auto-heal: active+entitled membership")
                 set_cached_whop_membership_id(mbr.id, mid_active, source_event="sync.auto_heal_add_member_role")
                 healed += 1
-                await log_other(
-                    f"✅ **Auto-heal added Members role** {_fmt_user(mbr)}\n"
-                    f"   membership_id: `{mid_active}`\n"
-                    f"   total_spent: `${spent:.2f}`"
-                )
+                if not sync_silent:
+                    await log_other(
+                        f"✅ **Auto-heal added Members role** {_fmt_user(mbr)}\n"
+                        f"   membership_id: `{mid_active}`\n"
+                        f"   total_spent: `${spent:.2f}`"
+                    )
             except Exception:
                 continue
 
-        if healed:
+        if healed and (not sync_silent):
             await log_other(f"✅ **Whop Auto-heal complete** — added Members role for {healed} user(s)")
         auto_healed_count = healed
 
     # Optional: DM a sync summary report (throttled).
-    if bool(WHOP_API_CONFIG.get("startup_scan_dm_report", False)) and _should_post_sync_report():
+    if (not sync_silent) and bool(WHOP_API_CONFIG.get("startup_scan_dm_report", False)) and _should_post_sync_report():
         dm_uid = int(REPORTING_CONFIG.get("dm_user_id") or 0)
         if dm_uid:
             try:
@@ -2779,7 +2794,7 @@ async def sync_whop_memberships():
                 pass
     
     log.info(f"Sync complete: {synced_count} roles updated, {error_count} errors")
-    if synced_count > 0 or error_count > 0:
+    if (not sync_silent) and (synced_count > 0 or error_count > 0):
         await log_other(
             f"🔄 **Whop Sync Complete**\n"
             f"   Members checked: {len(members_to_check)}\n"
@@ -3470,9 +3485,13 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             is_payment_failed = whop_status in ("past_due", "unpaid") or bool(whop_brief.get("last_payment_failure"))
             event_kind = "payment_failed" if is_payment_failed else "deactivated"
             access = _access_roles_plain(after)
-            db_alerts = load_staff_alerts(STAFF_ALERTS_FILE)
             issue_key = f"payment_failed:{whop_status}" if is_payment_failed else "payment_cancellation_detected"
-            if should_post_alert(db_alerts, after.id, issue_key, cooldown_hours=6.0):
+            if await should_post_and_record_alert(
+                STAFF_ALERTS_FILE,
+                discord_id=after.id,
+                issue_key=issue_key,
+                cooldown_hours=6.0,
+            ):
                 dest = PAYMENT_FAILURE_CHANNEL_NAME if is_payment_failed else MEMBER_CANCELLATION_CHANNEL_NAME
                 title = "💳 Payment Failed — Action Needed" if is_payment_failed else "💳 Payment Cancellation Detected"
                 color = 0xED4245 if is_payment_failed else 0xFF0000
@@ -3512,9 +3531,6 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                     event_kind=event_kind,
                 )
                 await log_member_status("", embed=minimal, channel_name=dest)
-
-                record_alert_post(db_alerts, after.id, issue_key)
-                save_staff_alerts(STAFF_ALERTS_FILE, db_alerts)
         
         role_obj = after.guild.get_role(ROLE_CANCEL_A) if after.guild else None
         role_name = str(role_obj.name) if role_obj else "Member"
@@ -3555,9 +3571,13 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         only_member_added = len(all_added_in_update) == 1
         if only_member_added:
             access = _access_roles_plain(after)
-            db_alerts = load_staff_alerts(STAFF_ALERTS_FILE)
             issue_key = "payment_resumed"
-            if should_post_alert(db_alerts, after.id, issue_key, cooldown_hours=2.0):
+            if await should_post_and_record_alert(
+                STAFF_ALERTS_FILE,
+                discord_id=after.id,
+                issue_key=issue_key,
+                cooldown_hours=2.0,
+            ):
                 hist = get_member_history(after.id) or {}
                 acc = hist.get("access") if isinstance(hist.get("access"), dict) else {}
 
@@ -3710,9 +3730,6 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                                 retry_seconds=WHOP_LINK_RETRY_SECONDS,
                             )
                         )
-
-                record_alert_post(db_alerts, after.id, issue_key)
-                save_staff_alerts(STAFF_ALERTS_FILE, db_alerts)
         
         if has_former_member_role(after):
             role = after.guild.get_role(FORMER_MEMBER_ROLE)
@@ -3910,7 +3927,7 @@ def _parse_date_ymd(s: str) -> datetime | None:
 
 @bot.command(name="report", aliases=["reports"])
 @commands.has_permissions(administrator=True)
-async def checker_report(ctx, arg1: str = "", arg2: str = "", arg3: str = "", arg4: str = "", arg5: str = ""):
+async def checker_report(ctx, arg1: str = "", arg2: str = "", arg3: str = "", arg4: str = "", arg5: str = "", arg6: str = ""):
     """Generate a report for a date range and DM it (Neo + invoker).
 
     Usage:
@@ -3921,9 +3938,9 @@ async def checker_report(ctx, arg1: str = "", arg2: str = "", arg3: str = "", ar
       .checker report scan memberstatus 2026-01-01 2026-01-31 confirm
     """
     try:
-        tokens = [str(x).strip() for x in [arg1, arg2, arg3, arg4, arg5] if str(x or "").strip()]
+        tokens = [str(x).strip() for x in [arg1, arg2, arg3, arg4, arg5, arg6] if str(x or "").strip()]
         if tokens and tokens[0].lower() == "scan":
-            if len(tokens) != 5:
+            if len(tokens) not in {5, 6}:
                 await ctx.send(
                     "❌ Scan usage: `.checker report scan whop YYYY-MM-DD YYYY-MM-DD confirm` "
                     "or `.checker report scan memberstatus YYYY-MM-DD YYYY-MM-DD confirm`",
@@ -3935,12 +3952,15 @@ async def checker_report(ctx, arg1: str = "", arg2: str = "", arg3: str = "", ar
             start_s = tokens[2]
             end_s = tokens[3]
             confirm = tokens[4].lower()
+            sample_csv = False
+            if len(tokens) == 6:
+                sample_csv = tokens[5].lower() in {"sample", "samplecsv", "anonymize", "anon"}
             if confirm != "confirm":
                 await ctx.send("❌ Confirmation required. Add `confirm` at the end.", delete_after=20)
                 return
 
             if source in {"whop", "whoplogs", "whop-log", "whop-logs"}:
-                await _report_scan_whop(ctx, start=start_s, end=end_s)
+                await _report_scan_whop(ctx, start=start_s, end=end_s, sample_csv=sample_csv)
                 return
             if source in {"memberstatus", "member-status", "status", "memberstatuslogs", "member-status-logs"}:
                 await _report_scan_member_status(ctx, start=start_s, end=end_s)
@@ -3990,13 +4010,25 @@ async def checker_report(ctx, arg1: str = "", arg2: str = "", arg3: str = "", ar
             delete_after=25,
         )
     except Exception as ex:
-        await ctx.send(f"❌ Report error: {ex}", delete_after=15)
+        if isinstance(ex, PermissionError):
+            store_path = BASE_DIR / "reporting_store.json"
+            tmp_path = store_path.with_suffix(store_path.suffix + ".tmp")
+            await ctx.send(
+                "❌ Report error: permission denied writing the reporting store.\n"
+                f"- store: `{store_path}`\n"
+                f"- temp: `{tmp_path}`\n"
+                "Fix: ensure the bot service user can write to the RSCheckerbot folder "
+                "(common cause: stale root-owned `.tmp` file).",
+                delete_after=30,
+            )
+        else:
+            await ctx.send(f"❌ Report error: {ex}", delete_after=15)
     finally:
         with suppress(Exception):
             await ctx.message.delete()
 
 
-async def _report_scan_whop(ctx, start: str, end: str) -> None:
+async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = False) -> None:
     """One-time scan of Whop channels to rebuild reporting_store.json and output report + CSV."""
 
     if not REPORTING_CONFIG.get("enabled"):
@@ -4334,12 +4366,46 @@ async def _report_scan_whop(ctx, start: str, end: str) -> None:
             await status_msg.edit(content=f"❌ Scan failed: `{e}`")
         return
 
-    # Prune + save store
+    # Prune store (best-effort: saving can fail on misconfigured server permissions)
     store = _report_prune_store(store, retention_weeks=retention)
-    async with _REPORTING_STORE_LOCK:
-        global _REPORTING_STORE
-        _REPORTING_STORE = store
-        _report_save_store(BASE_DIR, store)
+    save_warning = ""
+    if not sample_csv:
+        try:
+            async with _REPORTING_STORE_LOCK:
+                global _REPORTING_STORE
+                _REPORTING_STORE = store
+                _report_save_store(BASE_DIR, store)
+        except PermissionError as e:
+            save_warning = str(e)[:240]
+        except Exception:
+            save_warning = "Failed to save reporting_store.json (unknown error)"
+
+    # Optional: anonymized sample output (no real IDs/URLs/emails).
+    if sample_csv:
+        mem_map: dict[str, str] = {}
+        did_map: dict[str, str] = {}
+        email_map: dict[str, str] = {}
+
+        def _map(d: dict, key: str, mp: dict[str, str], prefix: str) -> str:
+            raw = str(d.get(key) or "").strip()
+            if not raw:
+                return ""
+            if raw not in mp:
+                mp[raw] = f"{prefix}{len(mp) + 1:04d}"
+            return mp[raw]
+
+        anon_rows: list[dict] = []
+        for r in (csv_rows or [])[:200]:
+            rr = dict(r)
+            rr["membership_id"] = _map(rr, "membership_id", mem_map, "mem_SAMPLE_")
+            rr["discord_id"] = _map(rr, "discord_id", did_map, "discord_SAMPLE_")
+            rr["email"] = _map(rr, "email", email_map, "email_SAMPLE_")
+            rr["dashboard_url"] = ""
+            rr["source_channel_id"] = ""
+            rr["source_message_id"] = ""
+            rr["source_jump_url"] = ""
+            anon_rows.append(rr)
+        csv_rows = anon_rows
 
     # Build CSV attachment
     csv_buf = io.StringIO()
@@ -4362,16 +4428,25 @@ async def _report_scan_whop(ctx, start: str, end: str) -> None:
     ]
     w = csv.DictWriter(csv_buf, fieldnames=fieldnames)
     w.writeheader()
-    for r in csv_rows:
+    for r in (csv_rows or []):
         with suppress(Exception):
             w.writerow(r)
     csv_bytes = csv_buf.getvalue().encode("utf-8", errors="ignore")
-    fname = f"rs_whop_report_{start_local.date().isoformat()}_{end_local.date().isoformat()}.csv"
+
+    fname = (
+        f"rs_whop_report_SAMPLE_{start_local.date().isoformat()}_{end_local.date().isoformat()}.csv"
+        if sample_csv
+        else f"rs_whop_report_{start_local.date().isoformat()}_{end_local.date().isoformat()}.csv"
+    )
 
     # Report embed (from scan totals)
     e = discord.Embed(
         title=f"RS Whop Scan Report ({start_local.date().isoformat()} → {end_local.date().isoformat()})",
-        description="Source: Whop channels (deduped per membership per day/event) • Timezone: `America/Denver`",
+        description=(
+            "Source: Whop channels (deduped per membership per day/event) • Timezone: `America/Denver`"
+            + (" • Output: anonymized sample CSV" if sample_csv else "")
+            + (f"\n⚠️ Store not saved: {save_warning}" if save_warning else "")
+        ),
         color=0x5865F2,
         timestamp=datetime.now(timezone.utc),
     )
@@ -4494,14 +4569,21 @@ async def _report_scan_member_status(ctx, start: str, end: str) -> None:
 
     store = _report_prune_store(store, retention_weeks=retention)
 
+    save_warning = ""
     async with _REPORTING_STORE_LOCK:
         global _REPORTING_STORE
         _REPORTING_STORE = store
-        _report_save_store(BASE_DIR, store)
+        try:
+            _report_save_store(BASE_DIR, store)
+        except PermissionError as e:
+            save_warning = str(e)[:240]
+        except Exception:
+            save_warning = "Failed to save reporting_store.json (unknown error)"
 
     with suppress(Exception):
         if status_msg:
-            await status_msg.edit(content=f"✅ Backfill complete — scanned {scanned}, captured {captured}. Building report…")
+            warn = f"\n⚠️ Store not saved: {save_warning}" if save_warning else ""
+            await status_msg.edit(content=f"✅ Backfill complete — scanned {scanned}, captured {captured}. Building report…{warn}")
 
     # DM report (Neo + invoker). Avoid channel spam (especially in member-status-logs).
     try:

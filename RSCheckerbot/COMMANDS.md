@@ -45,11 +45,13 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
   - `scan` (optional): Literal word `scan` to run a one-time rebuild
   - `source` (scan mode): `whop` or `memberstatus`
   - `confirm` (scan mode): Must be exactly `confirm`
+  - `sample` (optional, scan whop only): Anonymize CSV output (no real Discord IDs / membership IDs / emails / URLs)
 - **Usage**:
   - `.checker report` (last 7 days)
   - `.checker report 2026-01-01` (from date → now)
   - `.checker report 2026-01-01 2026-01-07` (inclusive range)
   - `.checker report scan whop 2026-01-01 2026-01-31 confirm` (one-time scan Whop channels + CSV)
+  - `.checker report scan whop 2026-01-01 2026-01-31 confirm sample` (same scan, but CSV is anonymized sample output)
   - `.checker report scan memberstatus 2026-01-01 2026-01-31 confirm` (one-time scan `member-status-logs` history)
 - **Admin Only**: Yes (requires administrator permissions)
 - **Returns**:
@@ -59,6 +61,7 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
   - Normal mode reads the bounded runtime `reporting_store.json`
   - Scan mode overwrites/rebuilds the reporting store for that scanned window
   - `scan whop` uses Mountain Time (`America/Denver`) day boundaries for dedupe per membership per day/event
+  - If you see `Permission denied` for `reporting_store.json.tmp`, the bot service user cannot write to the `RSCheckerbot/` folder on the server (common cause: stale root-owned `.tmp` file). Fix ownership/permissions and retry.
 
 #### `.checker purgecases`
 - **Description**: Delete legacy per-user payment case channels under the configured category

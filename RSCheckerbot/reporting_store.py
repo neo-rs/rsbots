@@ -106,9 +106,22 @@ def save_store(base_dir: Path, store: dict) -> None:
     # Atomic write (same-folder temp -> replace)
     tmp = p.with_suffix(p.suffix + ".tmp")
     data = json.dumps(store, indent=2, ensure_ascii=False)
-    tmp.write_text(data, encoding="utf-8")
+    try:
+        tmp.write_text(data, encoding="utf-8")
+    except PermissionError as e:
+        raise PermissionError(
+            f"[Reporting] Permission denied writing temp file: {tmp}. "
+            f"Fix folder/file ownership/permissions for: {p.parent} "
+            f"(common cause: stale root-owned {tmp.name})."
+        ) from e
     try:
         os.replace(tmp, p)
+    except PermissionError as e:
+        raise PermissionError(
+            f"[Reporting] Permission denied replacing store file: {p}. "
+            f"Fix folder/file ownership/permissions for: {p.parent} "
+            f"(common cause: root-owned {p.name} or {tmp.name})."
+        ) from e
     except Exception:
         # Best-effort cleanup
         try:

@@ -31,6 +31,7 @@ from staff_alerts_store import (
     save_staff_alerts,
     should_post_alert,
     record_alert_post,
+    should_post_and_record_alert,
 )
 
 # Import Whop API client (required; do not silently disable modules)
@@ -1515,7 +1516,12 @@ async def handle_membership_deactivated(
     title_override: str | None = None,
     color_override: int | None = None,
 ):
-    """Handle membership deactivation - remove Member and Welcome roles and log staff embeds."""
+    """Handle membership deactivation - log + alert only (no role removals).
+
+    Role removals are owned by the periodic/startup Whop sync in RSCheckerbot/main.py.
+    This handler must fail-closed: if membership_id is missing/uncertain or API checks fail,
+    leave roles untouched and alert staff for verification.
+    """
     guild = member.guild
     
     member_role = guild.get_role(ROLE_CANCEL_A)
@@ -1526,15 +1532,28 @@ async def handle_membership_deactivated(
 
     # If Whop reports "deactivated/canceled" but cancel_at_period_end=true, access continues
     # until the end of the current billing period. In that case, do not remove roles early.
-    still_entitled = False
+    still_entitled: bool | None = None
+    entitlement_checked = False
+    entitlement_error = ""
     lifetime_protected = _has_lifetime_role(member)
+    membership_id = ""
+    membership_id_source = ""
     try:
         membership_id = _safe_get(event_data or {}, "membership_id", "membership.id", default="").strip()
         if membership_id == "—":
             membership_id = ""
+        if membership_id:
+            membership_id_source = "event"
         if not membership_id:
             membership_id = _get_cached_membership_id_for_discord(member.id)
-        if membership_id and _whop_api_client:
+            if membership_id:
+                membership_id_source = "cache"
+    except Exception:
+        membership_id = ""
+        membership_id_source = ""
+
+    if membership_id and _whop_api_client:
+        try:
             m = await _whop_api_client.get_membership_by_id(membership_id)
             entitled, _until_dt, _why = await _whop_api_client.is_entitled_until_end(
                 membership_id,
@@ -1545,29 +1564,44 @@ async def handle_membership_deactivated(
                 now=datetime.now(timezone.utc),
             )
             still_entitled = bool(entitled)
-    except Exception:
-        still_entitled = False
+            entitlement_checked = True
+        except Exception as e:
+            still_entitled = None
+            entitlement_checked = False
+            entitlement_error = str(e)[:180]
+    else:
+        # Fail-closed: without a membership_id or API client, we cannot safely conclude entitlement.
+        still_entitled = None
     
-    roles_to_remove = []
-    if (not lifetime_protected) and (not still_entitled):
+    roles_would_remove: list[discord.Role] = []
+    if (not lifetime_protected) and (still_entitled is False):
         if member_role and member_role in member.roles:
-            roles_to_remove.append(member_role)
+            roles_would_remove.append(member_role)
         if welcome_role and welcome_role in member.roles:
-            roles_to_remove.append(welcome_role)
-    
-    if roles_to_remove:
-        await member.remove_roles(*roles_to_remove, reason="Whop: Membership deactivated")
-        log.info(f"Removed roles from {member} for membership deactivation")
+            roles_would_remove.append(welcome_role)
     
     if _log_member_status:
         whop_brief = await _whop_brief_from_event(member, event_data)
         access = _access_roles_compact(member)
-        title = title_override or ("Lifetime Access — No Role Removal" if lifetime_protected else ("⚠️ Cancellation Scheduled" if still_entitled else "🟧 Membership Deactivated"))
+        # still_entitled:
+        # - True  => cancellation scheduled (access continues)
+        # - False => deactivated and not entitled
+        # - None  => unverified (missing membership_id / API unavailable / API error)
+        if title_override:
+            title = title_override
+        elif lifetime_protected:
+            title = "Lifetime Access — No Role Removal"
+        elif still_entitled is True:
+            title = "⚠️ Cancellation Scheduled"
+        elif still_entitled is False:
+            title = "🟧 Membership Deactivated"
+        else:
+            title = "🟧 Membership Deactivated (Unverified)"
         color = int(color_override) if isinstance(color_override, int) else 0xFEE75C
         kind = (
             "payment_failed"
             if ("payment failed" in title.lower() or dest == PAYMENT_FAILURE_CHANNEL_NAME)
-            else ("cancellation_scheduled" if still_entitled else "deactivated")
+            else ("cancellation_scheduled" if still_entitled is True else "deactivated")
         )
         detailed = build_member_status_detailed_embed(
             title=title,
@@ -1577,8 +1611,12 @@ async def handle_membership_deactivated(
             event_kind=kind,
             discord_kv=[
                 ("event", "membership.deactivated"),
-                ("roles_removed", ", ".join([r.name for r in roles_to_remove]) if roles_to_remove else "—"),
+                ("role_removal", "disabled (sync-only)"),
+                ("roles_would_remove", ", ".join([r.name for r in roles_would_remove]) if roles_would_remove else "—"),
                 ("lifetime_role_protected", "true" if lifetime_protected else "false"),
+                ("membership_id_source", membership_id_source or "—"),
+                ("entitlement_checked", "true" if entitlement_checked else "false"),
+                ("entitlement_error", entitlement_error or "—"),
             ],
             whop_brief=whop_brief,
         )
@@ -1594,11 +1632,13 @@ async def handle_membership_deactivated(
             event_kind=kind,
         )
         issue_key = f"whop.deactivated:{_membership_id_from_event(member, event_data)}"
-        db_alerts = load_staff_alerts(STAFF_ALERTS_FILE)
-        if should_post_alert(db_alerts, member.id, issue_key, cooldown_hours=6.0):
+        if await should_post_and_record_alert(
+            STAFF_ALERTS_FILE,
+            discord_id=member.id,
+            issue_key=issue_key,
+            cooldown_hours=6.0,
+        ):
             await _log_member_status("", embed=minimal, channel_name=dest)
-            record_alert_post(db_alerts, member.id, issue_key)
-            save_staff_alerts(STAFF_ALERTS_FILE, db_alerts)
     
     # Verify with API after processing
     await _verify_webhook_with_api(member, event_data, "membership.deactivated")
@@ -1697,15 +1737,17 @@ async def handle_payment_failed(member: discord.Member, event_data: dict):
             event_kind="payment_failed",
         )
         issue_key = f"whop.payment_failed:{_membership_id_from_event(member, event_data)}"
-        db_alerts = load_staff_alerts(STAFF_ALERTS_FILE)
-        if should_post_alert(db_alerts, member.id, issue_key, cooldown_hours=2.0):
+        if await should_post_and_record_alert(
+            STAFF_ALERTS_FILE,
+            discord_id=member.id,
+            issue_key=issue_key,
+            cooldown_hours=2.0,
+        ):
             await _log_member_status("", embed=minimal, channel_name=PAYMENT_FAILURE_CHANNEL_NAME)
-            record_alert_post(db_alerts, member.id, issue_key)
-            save_staff_alerts(STAFF_ALERTS_FILE, db_alerts)
 
 
 async def handle_payment_refunded(member: discord.Member, event_data: dict):
-    """Handle payment refund - remove Member role"""
+    """Handle payment refund - treat as deactivation (log-only; no removals)."""
     await handle_membership_deactivated(member, event_data)
 
 
