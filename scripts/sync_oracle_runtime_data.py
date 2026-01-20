@@ -55,9 +55,16 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 BOT_RUNTIME_FILES = {
     "RSCheckerbot": [
         "member_history.json",
+        "whop_discord_link.json",
         "whop_identity_cache.json",
         "trial_history.json",
+        "identity_conflicts.jsonl",
         "whop_webhook_raw_payloads.json",
+        "whop_resolution_alert_state.json",
+        "staff_alerts.json",
+        "payment_cache.json",
+        "boot_state.json",
+        "reporting_store.json",
         "registry.json",
         "queue.json",
         "invites.json",
