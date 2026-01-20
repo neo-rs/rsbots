@@ -32,7 +32,15 @@ from discord.ext import commands, tasks
 from aiohttp import web
 import aiohttp
 
-from rschecker_utils import load_json, save_json, roles_plain, access_roles_plain, coerce_role_ids
+from rschecker_utils import (
+    load_json,
+    save_json,
+    roles_plain,
+    access_roles_plain,
+    coerce_role_ids,
+    usd_amount,
+    extract_discord_id_from_whop_member_record,
+)
 from staff_embeds import (
     apply_member_header as _apply_member_header,
     build_case_minimal_embed as _build_case_minimal_embed,
@@ -2458,6 +2466,33 @@ async def sync_whop_memberships():
                     if _has_lifetime_role(member):
                         continue
 
+                    # Guardrail: ensure the cached membership_id actually belongs to this Discord ID.
+                    # If it doesn't, do not remove roles (prevents accidental removals from stale/bad links).
+                    try:
+                        mobj = membership_data if isinstance(membership_data, dict) else None
+                        whop_member_id = ""
+                        if isinstance(mobj, dict):
+                            mref = mobj.get("member")
+                            if isinstance(mref, dict):
+                                whop_member_id = str(mref.get("id") or mref.get("member_id") or "").strip()
+                            elif isinstance(mref, str):
+                                whop_member_id = mref.strip()
+                            if not whop_member_id:
+                                whop_member_id = str(mobj.get("member_id") or "").strip()
+                        if whop_member_id and whop_member_id.startswith("mber_"):
+                            rec = await whop_api_client.get_member_by_id(whop_member_id)
+                            did = extract_discord_id_from_whop_member_record(rec) if isinstance(rec, dict) else ""
+                            if did and did.isdigit() and int(did) != int(member.id):
+                                await log_other(
+                                    f"⚠️ **Whop Sync skipped removal (mismatch)** {_fmt_user(member)}\n"
+                                    f"   cached_membership_id: `{membership_id}`\n"
+                                    f"   whop_member_id: `{whop_member_id}`\n"
+                                    f"   whop_discord_id: `{did}`"
+                                )
+                                continue
+                    except Exception:
+                        pass
+
                     entitled, _until_dt, _reason = await whop_api_client.is_entitled_until_end(
                         membership_id,
                         membership_data if isinstance(membership_data, dict) else None,
@@ -3769,18 +3804,6 @@ async def _report_scan_whop(ctx, start: str, end: str) -> None:
         s = str(v or "").strip().lower()
         return s in {"true", "yes", "1", "y"}
 
-    def _usd_amount(v: object) -> float:
-        try:
-            if v is None or v == "":
-                return 0.0
-            if isinstance(v, (int, float)):
-                return float(v)
-            s = str(v).strip().replace("$", "").replace(",", "")
-            cleaned = "".join(ch for ch in s if ch.isdigit() or ch in ".-")
-            return float(cleaned) if cleaned else 0.0
-        except Exception:
-            return 0.0
-
     def _extract_membership_id(*texts: str) -> str:
         for t in texts:
             m = re.search(r"(mem_[A-Za-z0-9]+)", t or "")
@@ -3953,7 +3976,7 @@ async def _report_scan_whop(ctx, start: str, end: str) -> None:
             if cancel_hint and isinstance(brief, dict) and brief:
                 st = str(brief.get("status") or "").strip().lower()
                 cape = brief.get("cancel_at_period_end")
-                spent = _usd_amount(brief.get("total_spent"))
+                spent = usd_amount(brief.get("total_spent"))
                 if _norm_bool(cape) and st in {"active", "trialing"} and float(spent) > 1.0:
                     buckets.append("cancellation_scheduled")
 

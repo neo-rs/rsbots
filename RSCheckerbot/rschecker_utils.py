@@ -9,6 +9,66 @@ import discord
 
 log = logging.getLogger("rs-checker")
 
+def usd_amount(v: object) -> float:
+    """Parse a USD-ish amount from strings like '$0', '0', '74,860.00', '$1.23'.
+
+    Returns 0.0 on blanks/invalid values.
+    """
+    try:
+        if v is None or v == "":
+            return 0.0
+        if isinstance(v, bool):
+            return 0.0
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).strip()
+        if not s:
+            return 0.0
+        s = s.replace("$", "").replace(",", "")
+        cleaned = "".join(ch for ch in s if ch.isdigit() or ch in ".-")
+        return float(cleaned) if cleaned else 0.0
+    except Exception:
+        return 0.0
+
+
+def extract_discord_id_from_whop_member_record(rec: dict) -> str:
+    """Best-effort extract of Discord user ID from Whop /members/{mber_...} record.
+
+    Safety: only returns an ID if it appears under a key-path containing 'discord'
+    (avoids accidentally grabbing unrelated numeric IDs).
+    """
+    import re
+
+    if not isinstance(rec, dict):
+        return ""
+
+    def _as_discord_id(v: object) -> str:
+        m = re.search(r"\b(\d{17,19})\b", str(v or ""))
+        return m.group(1) if m else ""
+
+    def _walk(obj: object, *, discord_context: bool, depth: int) -> str:
+        if depth > 6:
+            return ""
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                k_low = str(k or "").lower()
+                ctx = discord_context or ("discord" in k_low)
+                if ctx:
+                    cand = _as_discord_id(v)
+                    if cand:
+                        return cand
+                cand2 = _walk(v, discord_context=ctx, depth=depth + 1)
+                if cand2:
+                    return cand2
+        elif isinstance(obj, list):
+            for it in obj:
+                cand3 = _walk(it, discord_context=discord_context, depth=depth + 1)
+                if cand3:
+                    return cand3
+        return ""
+
+    return _walk(rec, discord_context=False, depth=0)
+
 
 def load_json(path: Path) -> dict:
     """Load JSON from disk; return {} on missing/empty/invalid."""

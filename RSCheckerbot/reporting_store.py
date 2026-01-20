@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+from rschecker_utils import usd_amount
+
 
 # Runtime JSON store (server-owned; NEVER synced to GitHub)
 STORE_FILENAME = "reporting_store.json"
@@ -65,25 +67,6 @@ def _safe_int(v: object) -> Optional[int]:
         return int(s)
     except Exception:
         return None
-
-
-def _usd_amount(v: object) -> float:
-    """Parse a USD-ish amount from strings like '$0', '0', '74,860.00', '$1.23'."""
-    try:
-        if v is None or v == "":
-            return 0.0
-        if isinstance(v, (int, float)):
-            return float(v)
-        s = str(v).strip()
-        if not s:
-            return 0.0
-        # Strip currency symbols and separators.
-        s = s.replace("$", "").replace(",", "")
-        # Keep only digits, dot, minus
-        cleaned = "".join(ch for ch in s if ch.isdigit() or ch in ".-")
-        return float(cleaned) if cleaned else 0.0
-    except Exception:
-        return 0.0
 
 
 def _ensure_store_shape(store: dict, *, retention_weeks: int) -> dict:
@@ -308,7 +291,7 @@ def record_member_status_post(
 
         if kind in {"cancellation_scheduled"}:
             # Only count cancellation scheduled for paying members (>$1 total spent).
-            total_spent_usd = _usd_amount(b.get("total_spent"))
+            total_spent_usd = usd_amount(b.get("total_spent"))
             if float(total_spent_usd) > 1.0:
                 bump("cancellation_scheduled")
             # For reminders: remember access end (renewal_end_iso) when present.

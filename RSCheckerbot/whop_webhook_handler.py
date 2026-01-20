@@ -75,41 +75,7 @@ DISCORD_LINK_FILE = BASE_DIR / "whop_discord_link.json"
 STAFF_ALERTS_FILE = BASE_DIR / "staff_alerts.json"
 PAYMENT_CACHE_FILE = BASE_DIR / "payment_cache.json"
 
-def _extract_discord_id_from_whop_member_record(rec: dict) -> str:
-    """Best-effort extract of Discord user ID from Whop /members/{mber_...} record.
-
-    Safety: only returns an ID if it appears under a key-path containing 'discord'
-    (avoids accidentally grabbing unrelated numeric IDs).
-    """
-    if not isinstance(rec, dict):
-        return ""
-
-    def _as_discord_id(v: object) -> str:
-        m = re.search(r"\b(\d{17,19})\b", str(v or ""))
-        return m.group(1) if m else ""
-
-    def _walk(obj: object, *, discord_context: bool, depth: int) -> str:
-        if depth > 6:
-            return ""
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                k_low = str(k or "").lower()
-                ctx = discord_context or ("discord" in k_low)
-                if ctx:
-                    cand = _as_discord_id(v)
-                    if cand:
-                        return cand
-                cand2 = _walk(v, discord_context=ctx, depth=depth + 1)
-                if cand2:
-                    return cand2
-        elif isinstance(obj, list):
-            for it in obj:
-                cand3 = _walk(it, discord_context=discord_context, depth=depth + 1)
-                if cand3:
-                    return cand3
-        return ""
-
-    return _walk(rec, discord_context=False, depth=0)
+from rschecker_utils import extract_discord_id_from_whop_member_record
 
 
 def _norm_email(s: str) -> str:
@@ -1255,7 +1221,7 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                         member_rec = await _whop_api_client.get_member_by_id(whop_member_id)
 
                 if isinstance(member_rec, dict):
-                    resolved_id = _extract_discord_id_from_whop_member_record(member_rec)
+                    resolved_id = extract_discord_id_from_whop_member_record(member_rec)
                     if resolved_id and resolved_id.isdigit():
                         with suppress(Exception):
                             _cache_discord_membership_link(
