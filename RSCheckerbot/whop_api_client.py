@@ -332,6 +332,49 @@ class WhopAPIClient:
         except WhopAPIError as e:
             log.warning(f"Failed to get memberships for user {user_id}: {e}")
             return []
+
+    async def list_memberships(
+        self,
+        *,
+        page: int = 1,
+        per_page: int = 100,
+        params: Optional[Dict] = None,
+    ) -> List[Dict]:
+        """
+        List memberships for the company (company-scoped).
+
+        Args:
+            page: Page number (best-effort; API may ignore if unsupported)
+            per_page: Page size (best-effort; API may ignore if unsupported)
+            params: Additional query params to pass through
+
+        Returns:
+            List of membership dicts (may be empty)
+        """
+        try:
+            q = {"company_id": self.company_id}
+            try:
+                if int(page) > 0:
+                    q["page"] = int(page)
+            except Exception:
+                pass
+            try:
+                if int(per_page) > 0:
+                    q["per_page"] = int(per_page)
+            except Exception:
+                pass
+            if isinstance(params, dict):
+                q.update(params)
+            response = await self._request(
+                "GET",
+                "/memberships",
+                params=q,
+            )
+            data = response.get("data", []) if isinstance(response, dict) else response
+            return data if isinstance(data, list) else []
+        except WhopAPIError as e:
+            log.warning(f"Failed to list memberships (page {page}): {e}")
+            return []
     
     async def get_payments_for_membership(self, membership_id: str) -> List[Dict]:
         """

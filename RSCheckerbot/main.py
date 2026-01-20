@@ -4247,7 +4247,7 @@ async def checker_report(ctx, arg1: str = "", arg2: str = "", arg3: str = "", ar
 
 
 async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = False) -> None:
-    """One-time scan of Whop channels to rebuild reporting_store.json and output report + CSV."""
+    """One-time scan of Whop API memberships to rebuild reporting_store.json and output report + CSV."""
 
     if not REPORTING_CONFIG.get("enabled"):
         await ctx.send("❌ Reporting is disabled in config.", delete_after=15)
@@ -4257,8 +4257,8 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
         await ctx.send("❌ Reporting store module is not available.", delete_after=20)
         return
 
-    if not WHOP_LOGS_CHANNEL_ID or not WHOP_WEBHOOK_CHANNEL_ID:
-        await ctx.send("❌ Whop channel IDs are not configured.", delete_after=20)
+    if not whop_api_client or not getattr(whop_api_client, "list_memberships", None):
+        await ctx.send("❌ Whop API is not configured for reporting.", delete_after=20)
         return
 
     # Mountain Time (boss): use America/Denver for day boundaries during dedupe.
@@ -4287,23 +4287,18 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
     start_utc = start_local.astimezone(timezone.utc)
     end_utc = end_local.astimezone(timezone.utc)
 
-    ch_a = bot.get_channel(int(WHOP_LOGS_CHANNEL_ID))
-    ch_b = bot.get_channel(int(WHOP_WEBHOOK_CHANNEL_ID))
-    if not isinstance(ch_a, discord.TextChannel) or not isinstance(ch_b, discord.TextChannel):
-        await ctx.send("❌ One or both Whop channels not found / not text channels.", delete_after=20)
-        return
-
     quiet_here = bool(MEMBER_STATUS_LOGS_CHANNEL_ID and getattr(ctx, "channel", None) and int(getattr(ctx.channel, "id", 0)) == int(MEMBER_STATUS_LOGS_CHANNEL_ID))
     status_msg = None
+    scan_label = "Whop API"
     if quiet_here:
         with suppress(Exception):
             status_msg = await ctx.author.send(
-                f"🔍 **Scanning Whop logs for report...**\n"
+                f"🔍 **Scanning {scan_label} for report...**\n"
                 f"```\nRange (MT): {start_local.date().isoformat()} → {end_local.date().isoformat()}\nInitializing...\n```"
             )
     else:
         status_msg = await ctx.send(
-            f"🔍 **Scanning Whop logs for report...**\n"
+            f"🔍 **Scanning {scan_label} for report...**\n"
             f"```\nRange (MT): {start_local.date().isoformat()} → {end_local.date().isoformat()}\nInitializing...\n```"
         )
 
@@ -4317,56 +4312,142 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
     # Dedup: (bucket, identity, day_key)
     seen: set[tuple[str, str, str]] = set()
 
-    # Cache membership_id -> whop brief (avoid rate limits)
-    brief_cache: dict[str, dict] = {}
-
     def _norm_bool(v: object) -> bool:
         s = str(v or "").strip().lower()
         return s in {"true", "yes", "1", "y"}
 
-    def _extract_membership_id(*texts: str) -> str:
-        for t in texts:
-            m = re.search(r"(mem_[A-Za-z0-9]+)", t or "")
-            if m:
-                return m.group(1)
-        for t in texts:
-            m = re.search(r"(R-[A-Za-z0-9-]+)", t or "")
-            if m:
-                return m.group(1)
+    def _membership_id_from_membership(membership: dict) -> str:
+        if not isinstance(membership, dict):
+            return ""
+        for key in ("id", "membership_id", "membershipId", "membership"):
+            val = membership.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
         return ""
 
-    def _extract_discord_id(text: str) -> str:
-        if not text:
+    def _extract_email_from_membership(membership: dict) -> str:
+        if not isinstance(membership, dict):
             return ""
-        m = re.search(r"Discord ID[:\\s]+(\\d{17,19})", text, re.IGNORECASE)
-        if m:
-            return m.group(1)
+        for key in ("email", "user_email"):
+            val = membership.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        user = membership.get("user")
+        if isinstance(user, dict):
+            em = str(user.get("email") or "").strip()
+            if em:
+                return em
+        member = membership.get("member")
+        if isinstance(member, dict):
+            em = str(member.get("email") or "").strip()
+            if em:
+                return em
         return ""
 
-    def _extract_email(text: str) -> str:
-        if not text:
-            return ""
-        m = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,})", text)
-        return (m.group(1) if m else "").strip()
+    def _extract_discord_id_from_membership(membership: dict) -> int | None:
+        raw = extract_discord_id_from_whop_member_record(membership) if isinstance(membership, dict) else ""
+        return int(raw) if str(raw or "").strip().isdigit() else None
 
-    async def _get_brief(mid: str) -> dict:
-        nonlocal api_calls
-        k = str(mid or "").strip()
-        if not k:
+    def _pick_dt(membership: dict, keys: list[str]) -> datetime | None:
+        if not isinstance(membership, dict):
+            return None
+        for k in keys:
+            v = membership.get(k)
+            if isinstance(v, dict):
+                for sk in ("created_at", "updated_at", "timestamp", "time", "date"):
+                    dt = _parse_dt_any(v.get(sk))
+                    if dt:
+                        return dt
+            dt = _parse_dt_any(v)
+            if dt:
+                return dt
+        return None
+
+    def _in_range(dt: datetime | None) -> bool:
+        return bool(dt and start_utc <= dt <= end_utc)
+
+    def _day_key(dt: datetime) -> str:
+        return dt.astimezone(scan_tz).date().isoformat()
+
+    def _extract_user_id(membership: dict) -> str:
+        if not isinstance(membership, dict):
+            return ""
+        u = membership.get("user")
+        if isinstance(u, str):
+            return u.strip()
+        if isinstance(u, dict):
+            return str(u.get("id") or u.get("user_id") or "").strip()
+        m = membership.get("member")
+        if isinstance(m, dict):
+            u2 = m.get("user")
+            if isinstance(u2, str):
+                return u2.strip()
+            if isinstance(u2, dict):
+                return str(u2.get("id") or u2.get("user_id") or "").strip()
+        return ""
+
+    def _brief_from_membership(membership: dict) -> dict:
+        if not isinstance(membership, dict):
             return {}
-        if k in brief_cache:
-            return brief_cache[k]
-        if not whop_api_client:
-            brief_cache[k] = {}
-            return {}
-        try:
-            api_calls += 1
-            brief = await _fetch_whop_brief_by_membership_id(k)
-            brief_cache[k] = brief if isinstance(brief, dict) else {}
-            return brief_cache[k]
-        except Exception:
-            brief_cache[k] = {}
-            return {}
+        status = str(membership.get("status") or "").strip()
+        product = ""
+        if isinstance(membership.get("product"), dict):
+            product = str(membership["product"].get("title") or "").strip()
+        renewal_end_iso = str(membership.get("renewal_period_end") or "").strip()
+        renewal_end_dt = _parse_dt_any(renewal_end_iso) if renewal_end_iso else None
+        remaining_days: int | str = ""
+        if renewal_end_dt:
+            delta = (renewal_end_dt - datetime.now(timezone.utc)).total_seconds()
+            remaining_days = max(0, int((delta / 86400.0) + 0.999))
+        total_raw = (
+            membership.get("total_spent")
+            or membership.get("total_spent_usd")
+            or membership.get("total_spend")
+            or membership.get("total_spend_usd")
+        )
+        total_spent = ""
+        if str(total_raw or "").strip():
+            amt = usd_amount(total_raw)
+            total_spent = f"${amt:.2f}" if amt else str(total_raw).strip()
+        manage_url_raw = str(membership.get("manage_url") or "").strip()
+        manage_url = f"[Open]({manage_url_raw})" if manage_url_raw else ""
+        user_id = _extract_user_id(membership)
+        dash = ""
+        if user_id and getattr(whop_api_client, "company_id", ""):
+            dash = f"[Open](https://whop.com/dashboard/{str(whop_api_client.company_id).strip()}/users/{user_id}/)"
+        trial_days = (
+            membership.get("trial_days")
+            or membership.get("trial_period_days")
+            or ((membership.get("plan") or {}).get("trial_days") if isinstance(membership.get("plan"), dict) else None)
+        )
+        plan_is_renewal = (
+            membership.get("plan_is_renewal")
+            or membership.get("is_renewal")
+            or ((membership.get("plan") or {}).get("is_renewal") if isinstance(membership.get("plan"), dict) else None)
+        )
+        pricing = (
+            membership.get("pricing")
+            or ((membership.get("plan") or {}).get("price") if isinstance(membership.get("plan"), dict) else None)
+        )
+        return {
+            "status": status or "—",
+            "product": product or "—",
+            "member_since": _fmt_date_any(membership.get("created_at")),
+            "trial_end": _fmt_date_any(membership.get("trial_end") or membership.get("trial_ends_at") or membership.get("trial_end_at")),
+            "trial_days": str(trial_days).strip() if str(trial_days or "").strip() else "",
+            "plan_is_renewal": str(plan_is_renewal).strip() if str(plan_is_renewal or "").strip() else "",
+            "pricing": str(pricing).strip() if str(pricing or "").strip() else "",
+            "renewal_start": _fmt_date_any(membership.get("renewal_period_start")),
+            "renewal_end": _fmt_date_any(membership.get("renewal_period_end")),
+            "renewal_end_iso": renewal_end_iso or "",
+            "remaining_days": remaining_days,
+            "manage_url": manage_url,
+            "dashboard_url": dash,
+            "cancel_at_period_end": "yes" if membership.get("cancel_at_period_end") is True else ("no" if membership.get("cancel_at_period_end") is False else "—"),
+            "is_first_membership": "true" if membership.get("is_first_membership") is True else ("false" if membership.get("is_first_membership") is False else "—"),
+            "total_spent": total_spent,
+            "last_payment_failure": str(membership.get("last_payment_failure") or "").strip(),
+        }
 
     def _rate() -> float:
         dt = max(1e-6, time.time() - started_at)
@@ -4383,14 +4464,14 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
         rate = _rate()
         await status_msg.edit(
             content=(
-                f"🔍 **Scanning Whop logs for report...**\n"
+                f"🔍 **Scanning Whop API for report...**\n"
                 f"```\n"
                 f"Stage: {stage}\n"
-                f"Scanned: {scanned}\n"
+                f"Memberships scanned: {scanned}\n"
                 f"Included (deduped): {included}\n"
                 f"Dupes skipped: {dupes}\n"
                 f"Whop API calls: {api_calls}\n"
-                f"Rate: {rate:.1f} msg/s\n"
+                f"Rate: {rate:.1f} memberships/s\n"
                 f"```"
             )[:1900]
         )
@@ -4400,7 +4481,7 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
     store = _report_load_store(BASE_DIR, retention_weeks=retention)
     if isinstance(store.get("meta"), dict):
         store["meta"]["version"] = int(store["meta"].get("version") or 1)
-        store["meta"]["scan_source"] = "report.scan.whop"
+        store["meta"]["scan_source"] = "report.scan.whop.api"
         store["meta"]["scan_range_mt"] = f"{start_local.date().isoformat()}→{end_local.date().isoformat()}"
     store["weeks"] = {}
     store["members"] = {}
@@ -4410,175 +4491,162 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
     csv_rows: list[dict] = []
     totals = {"new_members": 0, "new_trials": 0, "payment_failed": 0, "cancellation_scheduled": 0}
 
-    async def _scan_channel(ch: discord.TextChannel, stage: str) -> None:
-        nonlocal scanned, included, dupes, store
-        async for m in ch.history(after=start_utc, before=(end_utc + timedelta(seconds=1)), limit=None, oldest_first=True):
-            scanned += 1
-            if (scanned % 50) == 0:
-                with suppress(Exception):
-                    await _progress(stage)
-
-            if not m.embeds and not (m.content or ""):
-                continue
-
-            created_at = m.created_at
-            if getattr(created_at, "tzinfo", None) is None:
-                created_at = created_at.replace(tzinfo=timezone.utc)
-            day_key = created_at.astimezone(scan_tz).date().isoformat()
-            ts_i = int(created_at.astimezone(timezone.utc).timestamp())
-
-            embed = m.embeds[0] if m.embeds else None
-            title = str(getattr(embed, "title", "") or "").strip() if embed else ""
-            desc = str(getattr(embed, "description", "") or "").strip() if embed else ""
-            content = str(m.content or "").strip()
-
-            # Workflow JSON (EVENT_DATA) when present
-            event_data = None
-            event_type = ""
-            jm = None
-            try:
-                jm = re.search(r"EVENT_DATA:(\\{.*\\})", desc, re.DOTALL)
-            except Exception:
-                jm = None
-            if jm:
-                with suppress(Exception):
-                    event_data = json.loads(jm.group(1))
-            if isinstance(event_data, dict):
-                event_type = str(event_data.get("event_type") or "").strip()
-
-            title_l = title.lower()
-            desc_l = desc.lower()
-            content_l = content.lower()
-
-            membership_id = ""
-            discord_id_s = ""
-            email = ""
-
-            if isinstance(event_data, dict):
-                membership_id = str(event_data.get("membership_id") or event_data.get("whop_key") or event_data.get("key") or "").strip()
-                discord_id_s = str(event_data.get("discord_user_id") or "").strip()
-                email = str(event_data.get("email") or "").strip()
-
-            # Native fallback extraction from embed fields / content
-            if not membership_id:
-                membership_id = _extract_membership_id(title, desc, content)
-            if not discord_id_s:
-                discord_id_s = _extract_discord_id(desc) or _extract_discord_id(content)
-            if not email:
-                email = _extract_email(desc) or _extract_email(content)
-
-            # Determine primary event buckets from message
-            buckets: list[str] = []
-
-            if event_type in {"payment.failed", "membership.deactivated.payment_failure"} or "payment.failed" in event_type:
-                buckets.append("payment_failed")
-            elif event_type == "membership.activated.pending":
-                buckets.append("new_trial")
-            elif event_type in {"payment.succeeded.activation", "membership.activated"}:
-                buckets.append("new_member")
-            else:
-                if "payment failed" in title_l or "payment failed" in desc_l:
-                    buckets.append("payment_failed")
-                if "activated (pending)" in title_l or ("activated" in title_l and "pending" in title_l):
-                    buckets.append("new_trial")
-                if ("payment received" in title_l or "payment received" in desc_l or "payment succeeded" in title_l or "payment succeeded" in desc_l):
-                    # Best-effort: avoid counting renewals as new members
-                    if "renewal" not in title_l and "renewal" not in desc_l and "renewal" not in content_l:
-                        buckets.append("new_member")
-                if "membership was generated" in title_l:
-                    buckets.append("new_member")
-
-            # Cancellation scheduled is derived: only consider when message indicates cancellation-ish.
-            cancel_hint = ("cancel" in title_l) or ("cancel" in desc_l) or ("removeallroles" in desc_l) or ("cancellation" in event_type.lower())
-
-            # Fetch Whop brief for details when we have a membership id
-            brief = await _get_brief(membership_id) if membership_id else {}
-
-            # Derived cancellation_scheduled (active/trialing + cancel_at_period_end)
-            if cancel_hint and isinstance(brief, dict) and brief:
-                st = str(brief.get("status") or "").strip().lower()
-                cape = brief.get("cancel_at_period_end")
-                spent = usd_amount(brief.get("total_spent"))
-                if _norm_bool(cape) and st in {"active", "trialing"} and float(spent) > 1.0:
-                    buckets.append("cancellation_scheduled")
-
-            # Nothing actionable for reporting
-            if not buckets:
-                continue
-
-            # Identity key (dedupe prefers membership_id)
-            ident = (membership_id or "").strip() or (discord_id_s or "").strip() or (email or "").strip()
-            if not ident:
-                continue
-
-            discord_id = int(discord_id_s) if str(discord_id_s).strip().isdigit() else None
-
-            for bucket in buckets:
-                key = (bucket, ident, day_key)
-                if key in seen:
-                    dupes += 1
-                    continue
-                seen.add(key)
-
-                # Map bucket -> event_kind stored
-                event_kind = "unknown"
-                if bucket == "payment_failed":
-                    event_kind = "payment_failed"
-                elif bucket == "new_trial":
-                    # Prefer pending kind (counts as new trial) unless we know status trialing
-                    st = str((brief or {}).get("status") or "").strip().lower()
-                    event_kind = "trialing" if st == "trialing" else "membership_activated_pending"
-                elif bucket == "new_member":
-                    # Count activation events as New Members (as requested).
-                    event_kind = "member_role_added"
-                elif bucket == "cancellation_scheduled":
-                    event_kind = "cancellation_scheduled"
-
-                store = _report_record_member_status_post(
-                    store,
-                    ts=ts_i,
-                    event_kind=event_kind,
-                    discord_id=discord_id,
-                    email=email or "",
-                    whop_brief=brief if isinstance(brief, dict) and brief else None,
-                )
-                included += 1
-
-                # Track totals (matches report embed labels)
-                if bucket == "payment_failed":
-                    totals["payment_failed"] += 1
-                elif bucket == "new_trial":
-                    totals["new_trials"] += 1
-                elif bucket == "new_member":
-                    totals["new_members"] += 1
-                elif bucket == "cancellation_scheduled":
-                    totals["cancellation_scheduled"] += 1
-
-                csv_rows.append(
-                    {
-                        "day_mt": day_key,
-                        "event_bucket": bucket,
-                        "membership_id": membership_id,
-                        "discord_id": str(discord_id or ""),
-                        "email": email or "",
-                        "product": str((brief or {}).get("product") or ""),
-                        "status": str((brief or {}).get("status") or ""),
-                        "total_spent": str((brief or {}).get("total_spent") or ""),
-                        "cancel_at_period_end": str((brief or {}).get("cancel_at_period_end") or ""),
-                        "renewal_end_iso": str((brief or {}).get("renewal_end_iso") or ""),
-                        "dashboard_url": str((brief or {}).get("dashboard_url") or ""),
-                        "source_channel_id": str(getattr(ch, "id", "")),
-                        "source_message_id": str(getattr(m, "id", "")),
-                        "source_jump_url": str(getattr(m, "jump_url", "")),
-                        "event_type": event_type,
-                    }
-                )
+    try:
+        per_page = int(WHOP_API_CONFIG.get("report_page_size") or WHOP_API_CONFIG.get("page_size") or 100)
+    except Exception:
+        per_page = 100
+    if per_page <= 0:
+        per_page = 100
+    page = 1
+    seen_memberships: set[str] = set()
 
     try:
-        await _progress("whop-logs", force=True)
-        await _scan_channel(ch_a, "whop-logs")
-        await _progress("whop-membership-logs", force=True)
-        await _scan_channel(ch_b, "whop-membership-logs")
+        await _progress("page 1", force=True)
+        while True:
+            api_calls += 1
+            batch = await whop_api_client.list_memberships(page=page, per_page=per_page)
+            if not batch:
+                break
+            new_on_page = 0
+            for membership in batch:
+                scanned += 1
+                if (scanned % 50) == 0:
+                    with suppress(Exception):
+                        await _progress(f"page {page}")
+
+                if not isinstance(membership, dict):
+                    continue
+
+                membership_id = _membership_id_from_membership(membership)
+                if membership_id:
+                    if membership_id in seen_memberships:
+                        continue
+                    seen_memberships.add(membership_id)
+                    new_on_page += 1
+
+                status_l = str(membership.get("status") or "").strip().lower()
+                created_dt = _pick_dt(membership, ["created_at", "createdAt", "started_at", "starts_at"])
+                activated_dt = _pick_dt(membership, ["activated_at", "activatedAt", "current_period_start", "current_period_start_at", "starts_at", "started_at"])
+                updated_dt = _pick_dt(membership, ["updated_at", "updatedAt"])
+                trial_end_dt = _pick_dt(membership, ["trial_end", "trial_end_at", "trial_ends_at"])
+                failure_dt = _pick_dt(membership, ["last_payment_failure", "last_payment_failed_at", "payment_failed_at", "last_failed_payment_at"])
+                cancel_dt = _pick_dt(membership, ["cancel_at", "cancel_at_period_end_at", "cancellation_scheduled_at", "cancelled_at", "canceled_at", "updated_at"])
+
+                trial_days_raw = (
+                    membership.get("trial_days")
+                    or membership.get("trial_period_days")
+                    or ((membership.get("plan") or {}).get("trial_days") if isinstance(membership.get("plan"), dict) else None)
+                )
+                try:
+                    trial_days = int(str(trial_days_raw).strip())
+                except Exception:
+                    trial_days = 0
+
+                is_trial = bool(
+                    status_l in {"trialing", "trial", "pending"}
+                    or trial_end_dt is not None
+                    or int(trial_days) > 0
+                )
+
+                brief = _brief_from_membership(membership)
+                spent = usd_amount(brief.get("total_spent"))
+
+                buckets: list[tuple[str, datetime]] = []
+                if is_trial:
+                    trial_dt = created_dt or activated_dt
+                    if _in_range(trial_dt):
+                        buckets.append(("new_trial", trial_dt))
+                else:
+                    member_dt = activated_dt or created_dt
+                    if _in_range(member_dt):
+                        buckets.append(("new_member", member_dt))
+
+                failure_dt = failure_dt or (updated_dt if status_l in {"past_due", "unpaid", "payment_failed"} else None)
+                if _in_range(failure_dt):
+                    buckets.append(("payment_failed", failure_dt))
+
+                if _norm_bool(membership.get("cancel_at_period_end")) and status_l in {"active", "trialing"} and float(spent) > 1.0:
+                    if _in_range(cancel_dt):
+                        buckets.append(("cancellation_scheduled", cancel_dt))
+
+                if not buckets:
+                    continue
+
+                discord_id = _extract_discord_id_from_membership(membership)
+                email = _extract_email_from_membership(membership)
+                if not email and not discord_id:
+                    email = membership_id
+
+                ident = (membership_id or "").strip() or (str(discord_id or "").strip()) or (email or "")
+                if not ident:
+                    continue
+
+                event_type = f"api.membership.{status_l}" if status_l else "api.membership"
+
+                for bucket, ev_dt in buckets:
+                    if not ev_dt:
+                        continue
+                    day_key = _day_key(ev_dt)
+                    key = (bucket, ident, day_key)
+                    if key in seen:
+                        dupes += 1
+                        continue
+                    seen.add(key)
+
+                    event_kind = "unknown"
+                    if bucket == "payment_failed":
+                        event_kind = "payment_failed"
+                    elif bucket == "new_trial":
+                        event_kind = "trialing" if status_l == "trialing" else "membership_activated_pending"
+                    elif bucket == "new_member":
+                        event_kind = "member_role_added"
+                    elif bucket == "cancellation_scheduled":
+                        event_kind = "cancellation_scheduled"
+
+                    store = _report_record_member_status_post(
+                        store,
+                        ts=int(ev_dt.astimezone(timezone.utc).timestamp()),
+                        event_kind=event_kind,
+                        discord_id=discord_id,
+                        email=email or "",
+                        whop_brief=brief if isinstance(brief, dict) and brief else None,
+                    )
+                    included += 1
+
+                    if bucket == "payment_failed":
+                        totals["payment_failed"] += 1
+                    elif bucket == "new_trial":
+                        totals["new_trials"] += 1
+                    elif bucket == "new_member":
+                        totals["new_members"] += 1
+                    elif bucket == "cancellation_scheduled":
+                        totals["cancellation_scheduled"] += 1
+
+                    csv_rows.append(
+                        {
+                            "day_mt": day_key,
+                            "event_bucket": bucket,
+                            "membership_id": membership_id,
+                            "discord_id": str(discord_id or ""),
+                            "email": email or "",
+                            "product": str((brief or {}).get("product") or ""),
+                            "status": str((brief or {}).get("status") or ""),
+                            "total_spent": str((brief or {}).get("total_spent") or ""),
+                            "cancel_at_period_end": str((brief or {}).get("cancel_at_period_end") or ""),
+                            "renewal_end_iso": str((brief or {}).get("renewal_end_iso") or ""),
+                            "dashboard_url": str((brief or {}).get("dashboard_url") or ""),
+                            "source_channel_id": "",
+                            "source_message_id": "",
+                            "source_jump_url": "",
+                            "event_type": event_type,
+                        }
+                    )
+
+            if new_on_page == 0 and page > 1:
+                break
+            if len(batch) < int(per_page):
+                break
+            page += 1
     except Exception as e:
         with suppress(Exception):
             await status_msg.edit(content=f"❌ Scan failed: `{e}`")
@@ -4661,7 +4729,7 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
     e = discord.Embed(
         title=f"RS Whop Scan Report ({start_local.date().isoformat()} → {end_local.date().isoformat()})",
         description=(
-            "Source: Whop channels (deduped per membership per day/event) • Timezone: `America/Denver`"
+            "Source: Whop API (deduped per membership per day/event) • Timezone: `America/Denver`"
             + (" • Output: anonymized sample CSV" if sample_csv else "")
             + (f"\n⚠️ Store not saved: {save_warning}" if save_warning else "")
         ),

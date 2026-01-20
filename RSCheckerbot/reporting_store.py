@@ -337,14 +337,25 @@ def record_member_status_post(
         def bumpu(metric: str) -> None:
             _flag_and_bump(flagsu, metric=metric, week_key=week_key, bump_fn=lambda: _bump(store, week_key=week_key, metric=metric))
 
+        def bump_main(metric: str) -> None:
+            _flag_and_bump(flagsu, metric=metric, week_key=week_key, bump_fn=lambda: _bump(store, week_key=week_key, metric=metric))
+
         if kind in {"payment_failed"}:
             bumpu("unlinked_payment_failed")
+            bump_main("payment_failed")
         if kind in {"deactivated", "canceled", "cancelled"}:
             bumpu("unlinked_cancelled_members")
+            bump_main("cancelled_members")
         if kind in {"cancellation_scheduled"}:
-            bumpu("unlinked_cancellation_scheduled")
+            total_spent_usd = usd_amount(b.get("total_spent"))
+            if float(total_spent_usd) > 1.0:
+                bumpu("unlinked_cancellation_scheduled")
+                bump_main("cancellation_scheduled")
         if kind in {"trial", "trialing", "membership_activated_pending"}:
             bumpu("unlinked_new_trials")
+            bump_main("new_trials")
+        if kind in {"onboarding_completed", "member_granted", "member_role_added"}:
+            bump_main("new_members")
 
         store.get("unlinked", {})[email_s] = recu
 
