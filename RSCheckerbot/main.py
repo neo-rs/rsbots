@@ -3446,13 +3446,20 @@ async def on_message(message: discord.Message):
     # Process commands first (canonical pattern)
     await bot.process_commands(message)
     
-    # Check if this is a Whop message (from either channel)
-    if message.author.bot:
+    # Prevent self-loops
+    if bot.user and message.author and message.author.id == bot.user.id:
+        return
+
+    # Check if this is a Whop message (from either channel).
+    # IMPORTANT: workflow posts can be webhook messages (author.bot == False), so we gate by channel ID
+    # and require either bot-author OR webhook_id to avoid parsing random user chatter.
+    is_bot_or_webhook = bool(getattr(message.author, "bot", False)) or (getattr(message, "webhook_id", None) is not None)
+    if is_bot_or_webhook:
         # Check workflow webhook channel
         if (WHOP_WEBHOOK_CHANNEL_ID and message.channel.id == WHOP_WEBHOOK_CHANNEL_ID):
             await handle_whop_webhook_message(message)
             return
-        
+
         # Check native Whop logs channel
         if (WHOP_LOGS_CHANNEL_ID and message.channel.id == WHOP_LOGS_CHANNEL_ID):
             # Channel ID is the source of truth (do not gate on bot/app name).
@@ -3607,15 +3614,47 @@ def _parse_date_ymd(s: str) -> datetime | None:
 
 @bot.command(name="report", aliases=["reports"])
 @commands.has_permissions(administrator=True)
-async def checker_report(ctx, start: str = "", end: str = ""):
+async def checker_report(ctx, arg1: str = "", arg2: str = "", arg3: str = "", arg4: str = "", arg5: str = ""):
     """Generate a report for a date range and DM it (Neo + invoker).
 
     Usage:
       .checker report
       .checker report 2026-01-01
       .checker report 2026-01-01 2026-01-07
+      .checker report scan whop 2026-01-01 2026-01-31 confirm
+      .checker report scan memberstatus 2026-01-01 2026-01-31 confirm
     """
     try:
+        tokens = [str(x).strip() for x in [arg1, arg2, arg3, arg4, arg5] if str(x or "").strip()]
+        if tokens and tokens[0].lower() == "scan":
+            if len(tokens) != 5:
+                await ctx.send(
+                    "❌ Scan usage: `.checker report scan whop YYYY-MM-DD YYYY-MM-DD confirm` "
+                    "or `.checker report scan memberstatus YYYY-MM-DD YYYY-MM-DD confirm`",
+                    delete_after=25,
+                )
+                return
+
+            source = tokens[1].lower()
+            start_s = tokens[2]
+            end_s = tokens[3]
+            confirm = tokens[4].lower()
+            if confirm != "confirm":
+                await ctx.send("❌ Confirmation required. Add `confirm` at the end.", delete_after=20)
+                return
+
+            if source in {"whop", "whoplogs", "whop-log", "whop-logs"}:
+                await _report_scan_whop(ctx, start=start_s, end=end_s)
+                return
+            if source in {"memberstatus", "member-status", "status", "memberstatuslogs", "member-status-logs"}:
+                await _report_scan_member_status(ctx, start=start_s, end=end_s)
+                return
+
+            await ctx.send("❌ Unknown scan source. Use `whop` or `memberstatus`.", delete_after=20)
+            return
+
+        start = tokens[0] if len(tokens) >= 1 else ""
+        end = tokens[1] if len(tokens) >= 2 else ""
         start_dt = _parse_date_ymd(start) if start else None
         end_dt = _parse_date_ymd(end) if end else None
 
@@ -3638,13 +3677,22 @@ async def checker_report(ctx, start: str = "", end: str = ""):
 
         e = await _build_report_embed(start_utc, end_utc, title_prefix="RS Manual Report")
 
-        # DM Neo (configured) and also DM the invoker
+        # DM Neo (configured) and the invoker, but avoid duplicate DM when invoker is Neo.
         dm_uid = int(REPORTING_CONFIG.get("dm_user_id") or 0)
+        targets: list[int] = []
         if dm_uid:
-            await _dm_user(dm_uid, embed=e)
-        with suppress(Exception):
-            await ctx.author.send(embed=e)
-        await ctx.send("✅ Report sent (DM).", delete_after=10)
+            targets.append(dm_uid)
+        if ctx.author and getattr(ctx.author, "id", None):
+            targets.append(int(ctx.author.id))
+        targets = list(dict.fromkeys([int(x) for x in targets if int(x) > 0]))
+        for uid in targets:
+            await _dm_user(uid, embed=e)
+
+        await ctx.send(
+            "✅ Report sent (DM). If you need to rebuild data + get a downloadable CSV, use: "
+            "`.checker report scan whop YYYY-MM-DD YYYY-MM-DD confirm`",
+            delete_after=25,
+        )
     except Exception as ex:
         await ctx.send(f"❌ Report error: {ex}", delete_after=15)
     finally:
@@ -3652,39 +3700,19 @@ async def checker_report(ctx, start: str = "", end: str = ""):
             await ctx.message.delete()
 
 
-@bot.command(name="whopscanreport", aliases=["whopreportscan", "scanwhopreport"])
-@commands.has_permissions(administrator=True)
-async def whop_scan_report(ctx, start: str = "", end: str = "", confirm: str = ""):
-    """One-time scan of Whop channels to rebuild reporting_store.json and output report + CSV.
-
-    Usage:
-      .checker whopscanreport 2026-01-01 2026-01-31 confirm
-    """
-    if str(confirm or "").strip().lower() != "confirm":
-        await ctx.send(
-            "❌ Confirmation required. Use: `.checker whopscanreport 2026-01-01 2026-01-31 confirm`",
-            delete_after=25,
-        )
-        with suppress(Exception):
-            await ctx.message.delete()
-        return
+async def _report_scan_whop(ctx, start: str, end: str) -> None:
+    """One-time scan of Whop channels to rebuild reporting_store.json and output report + CSV."""
 
     if not REPORTING_CONFIG.get("enabled"):
         await ctx.send("❌ Reporting is disabled in config.", delete_after=15)
-        with suppress(Exception):
-            await ctx.message.delete()
         return
 
     if not (_report_load_store and _report_record_member_status_post and _report_prune_store and _report_save_store):
         await ctx.send("❌ Reporting store module is not available.", delete_after=20)
-        with suppress(Exception):
-            await ctx.message.delete()
         return
 
     if not WHOP_LOGS_CHANNEL_ID or not WHOP_WEBHOOK_CHANNEL_ID:
         await ctx.send("❌ Whop channel IDs are not configured.", delete_after=20)
-        with suppress(Exception):
-            await ctx.message.delete()
         return
 
     # Mountain Time (boss): use America/Denver for day boundaries during dedupe.
@@ -3707,8 +3735,6 @@ async def whop_scan_report(ctx, start: str = "", end: str = "", confirm: str = "
     end_local = _parse_day_local(end)
     if start_local is None or end_local is None:
         await ctx.send("❌ Bad date(s). Use YYYY-MM-DD YYYY-MM-DD, e.g. `2026-01-01 2026-01-31`.", delete_after=20)
-        with suppress(Exception):
-            await ctx.message.delete()
         return
 
     end_local = end_local.replace(hour=23, minute=59, second=59)
@@ -3719,8 +3745,6 @@ async def whop_scan_report(ctx, start: str = "", end: str = "", confirm: str = "
     ch_b = bot.get_channel(int(WHOP_WEBHOOK_CHANNEL_ID))
     if not isinstance(ch_a, discord.TextChannel) or not isinstance(ch_b, discord.TextChannel):
         await ctx.send("❌ One or both Whop channels not found / not text channels.", delete_after=20)
-        with suppress(Exception):
-            await ctx.message.delete()
         return
 
     status_msg = await ctx.send(
@@ -3831,7 +3855,7 @@ async def whop_scan_report(ctx, start: str = "", end: str = "", confirm: str = "
     store = _report_load_store(BASE_DIR, retention_weeks=retention)
     if isinstance(store.get("meta"), dict):
         store["meta"]["version"] = int(store["meta"].get("version") or 1)
-        store["meta"]["scan_source"] = "whopscanreport"
+        store["meta"]["scan_source"] = "report.scan.whop"
         store["meta"]["scan_range_mt"] = f"{start_local.date().isoformat()}→{end_local.date().isoformat()}"
     store["weeks"] = {}
     store["members"] = {}
@@ -4013,8 +4037,6 @@ async def whop_scan_report(ctx, start: str = "", end: str = "", confirm: str = "
     except Exception as e:
         with suppress(Exception):
             await status_msg.edit(content=f"❌ Scan failed: `{e}`")
-        with suppress(Exception):
-            await ctx.message.delete()
         return
 
     # Prune + save store
@@ -4066,69 +4088,51 @@ async def whop_scan_report(ctx, start: str = "", end: str = "", confirm: str = "
 
     file_obj = discord.File(fp=io.BytesIO(csv_bytes), filename=fname)
 
-    # DM Neo (configured) and also DM the invoker
+    # DM Neo (configured) and the invoker, but avoid duplicate send when invoker is Neo.
     dm_uid = int(REPORTING_CONFIG.get("dm_user_id") or 0)
+    targets: list[int] = []
     if dm_uid:
-        with suppress(Exception):
-            user = bot.get_user(dm_uid) or await bot.fetch_user(dm_uid)
-            if user:
-                await user.send(embed=e, file=file_obj)
+        targets.append(dm_uid)
+    if ctx.author and getattr(ctx.author, "id", None):
+        targets.append(int(ctx.author.id))
+    targets = list(dict.fromkeys([int(x) for x in targets if int(x) > 0]))
 
-    # Need a new file object for second send
-    file_obj2 = discord.File(fp=io.BytesIO(csv_bytes), filename=fname)
-    with suppress(Exception):
-        await ctx.author.send(embed=e, file=file_obj2)
+    for uid in targets:
+        with suppress(Exception):
+            user = bot.get_user(uid) or await bot.fetch_user(uid)
+            if not user:
+                continue
+            # New file object per send
+            f = discord.File(fp=io.BytesIO(csv_bytes), filename=fname)
+            await user.send(embed=e, file=f)
 
     with suppress(Exception):
         await status_msg.edit(content="✅ Scan complete. Report sent via DM (with CSV).")
-    with suppress(Exception):
-        await ctx.message.delete()
+    return
 
 
-@bot.command(name="backfillstatus", aliases=["backfill", "backfilllogs"])
-@commands.has_permissions(administrator=True)
-async def backfill_member_status_logs(ctx, start: str = "", end: str = "", confirm: str = ""):
-    """One-time backfill: scan member-status-logs history into reporting_store.json.
-
-    Usage:
-      .checker backfillstatus 2026-01-01 2026-01-31 confirm
-    """
-    if str(confirm or "").strip().lower() != "confirm":
-        await ctx.send(
-            "❌ Confirmation required. Usage: `.checker backfillstatus 2026-01-01 2026-01-31 confirm`",
-            delete_after=20,
-        )
-        with suppress(Exception):
-            await ctx.message.delete()
-        return
+async def _report_scan_member_status(ctx, start: str, end: str) -> None:
+    """One-time scan: member-status-logs history into reporting_store.json (then use `.checker report`)."""
 
     if not REPORTING_CONFIG.get("enabled"):
         await ctx.send("❌ Reporting is disabled in config.", delete_after=15)
-        with suppress(Exception):
-            await ctx.message.delete()
         return
 
     if not (MEMBER_STATUS_LOGS_CHANNEL_ID and _report_record_member_status_post and _report_prune_store and _report_save_store):
         await ctx.send("❌ Reporting store is not available or member-status-logs channel is not set.", delete_after=20)
-        with suppress(Exception):
-            await ctx.message.delete()
         return
 
     ch_raw = bot.get_channel(int(MEMBER_STATUS_LOGS_CHANNEL_ID))
     if not isinstance(ch_raw, discord.TextChannel):
         await ctx.send("❌ member-status-logs channel not found / not a text channel.", delete_after=20)
-        with suppress(Exception):
-            await ctx.message.delete()
         return
 
     start_dt = _parse_date_ymd(start) if start else None
     end_dt = _parse_date_ymd(end) if end else None
     now_local = _tz_now()
-    if start_dt is None:
-        # Default to first day of current month (reporting tz)
-        start_dt = now_local.replace(day=1, hour=0, minute=0, second=0)
-    if end_dt is None:
-        end_dt = now_local
+    if start_dt is None or end_dt is None:
+        await ctx.send("❌ Provide start+end dates (YYYY-MM-DD YYYY-MM-DD).", delete_after=20)
+        return
     end_dt = end_dt.replace(hour=23, minute=59, second=59)
 
     start_utc = start_dt.astimezone(timezone.utc)
@@ -4193,8 +4197,7 @@ async def backfill_member_status_logs(ctx, start: str = "", end: str = "", confi
         await status_msg.edit(content=f"✅ Backfill complete — scanned {scanned}, captured {captured}.")
 
     await ctx.send(f"✅ Backfill complete — scanned {scanned}, captured {captured}. You can now run `.checker report`.", delete_after=25)
-    with suppress(Exception):
-        await ctx.message.delete()
+    return
 
 
 @bot.command(name="purgecases", aliases=["purgecasechannels", "deletecases", "deletecasechannels"])

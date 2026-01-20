@@ -37,43 +37,28 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 - **Note**: Command message is auto-deleted
 
 #### `.checker report`
-- **Description**: Generate a reporting summary for a date range (from `member-status-logs` derived store) and DM it
+- **Description**: Generate a reporting summary for a date range (from `reporting_store.json`) and DM it, or run a one-time scan to rebuild the store + DM a downloadable CSV
 - **Aliases**: `reports`
 - **Parameters**:
   - `start` (optional): Start date `YYYY-MM-DD`
   - `end` (optional): End date `YYYY-MM-DD` (inclusive)
+  - `scan` (optional): Literal word `scan` to run a one-time rebuild
+  - `source` (scan mode): `whop` or `memberstatus`
+  - `confirm` (scan mode): Must be exactly `confirm`
 - **Usage**:
   - `.checker report` (last 7 days)
   - `.checker report 2026-01-01` (from date → now)
   - `.checker report 2026-01-01 2026-01-07` (inclusive range)
+  - `.checker report scan whop 2026-01-01 2026-01-31 confirm` (one-time scan Whop channels + CSV)
+  - `.checker report scan memberstatus 2026-01-01 2026-01-31 confirm` (one-time scan `member-status-logs` history)
 - **Admin Only**: Yes (requires administrator permissions)
-- **Returns**: Report embed via DM (to Neo from config + to the invoker), plus a short confirmation (auto-deletes)
-- **Note**: Report reads the bounded runtime `reporting_store.json` (no raw Whop channel ingestion)
-
-#### `.checker whopscanreport`
-- **Description**: One-time scan of Whop channels to rebuild `reporting_store.json` and DM a report + downloadable CSV
-- **Aliases**: `whopreportscan`, `scanwhopreport`
-- **Parameters**:
-  - `start`: Start date `YYYY-MM-DD` (required)
-  - `end`: End date `YYYY-MM-DD` (required, inclusive)
-  - `confirm`: Must be exactly `confirm` to run (required)
-- **Usage**:
-  - `.checker whopscanreport 2026-01-01 2026-01-31 confirm`
-- **Admin Only**: Yes (requires administrator permissions)
-- **Returns**: Live progress message, then DM report embed + CSV (to Neo from config + to the invoker)
-- **Note**: Uses Mountain Time (America/Denver) day boundaries for dedupe per membership per day/event
-
-#### `.checker backfillstatus`
-- **Description**: One-time scan of `member-status-logs` history into `reporting_store.json` so reports can be generated immediately
-- **Aliases**: `backfill`, `backfilllogs`
-- **Parameters**:
-  - `start`: Start date `YYYY-MM-DD` (recommended)
-  - `end`: End date `YYYY-MM-DD` (recommended, inclusive by date)
-  - `confirm`: Must be exactly `confirm` to run (required)
-- **Usage**:
-  - `.checker backfillstatus 2026-01-01 2026-01-31 confirm`
-- **Admin Only**: Yes (requires administrator permissions)
-- **Returns**: Progress + completion summary, then you can run `.checker report`
+- **Returns**:
+  - Normal mode: Report embed via DM (to Neo from config + to the invoker), plus a short confirmation (auto-deletes)
+  - Scan mode: Live progress message, then DM report embed + downloadable CSV (to Neo from config + to the invoker)
+- **Notes**:
+  - Normal mode reads the bounded runtime `reporting_store.json`
+  - Scan mode overwrites/rebuilds the reporting store for that scanned window
+  - `scan whop` uses Mountain Time (`America/Denver`) day boundaries for dedupe per membership per day/event
 
 #### `.checker purgecases`
 - **Description**: Delete legacy per-user payment case channels under the configured category
@@ -183,10 +168,10 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 
 ## Command Summary
 
-- **Total Commands**: 12
-- **Admin Commands**: 12 (all commands require administrator permissions)
+- **Total Commands**: 14
+- **Admin Commands**: 14 (all commands require administrator permissions)
 - **Public Commands**: 0
-- **Commands with Aliases**: 5
+- **Commands with Aliases**: 6
 - **Command Prefix**: `.checker` (dot prefix)
 
 ## Notes
