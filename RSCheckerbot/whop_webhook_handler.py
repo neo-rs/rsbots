@@ -456,9 +456,9 @@ async def _post_resolution_or_dispute_alert(
     except Exception:
         pass
 
-    # Do NOT mention member (requested); provide only identifying text + ID
+    # Mention member for quick reference in staff alerts
     embed.add_field(name="Support", value=sup or "(configure support role to ping)", inline=False)
-    embed.add_field(name="Discord", value=f"[{str(member)}](https://discord.com/users/{member.id})", inline=False)
+    embed.add_field(name="Discord", value=getattr(member, "mention", f"<@{member.id}>"), inline=False)
     embed.add_field(name="Discord User ID", value=f"`{member.id}`", inline=True)
     if whop_email:
         embed.add_field(name="Email (API)", value=f"`{whop_email}`", inline=True)

@@ -431,10 +431,10 @@ async def _build_report_embed(start_utc: datetime, end_utc: datetime, *, title_p
         timestamp=datetime.now(timezone.utc),
     )
 
-    e.add_field(name="New Members", value=str(counts.get("new_members", 0)), inline=True)
-    e.add_field(name="New Trials", value=str(counts.get("new_trials", 0)), inline=True)
-    e.add_field(name="Payment Failed", value=str(counts.get("payment_failed", 0)), inline=True)
-    e.add_field(name="Cancellation Scheduled", value=str(counts.get("cancellation_scheduled", 0)), inline=True)
+    e.add_field(name="New Members", value=str(counts.get("new_members", 0)), inline=False)
+    e.add_field(name="New Trials", value=str(counts.get("new_trials", 0)), inline=False)
+    e.add_field(name="Payment Failed", value=str(counts.get("payment_failed", 0)), inline=False)
+    e.add_field(name="Cancellation Scheduled", value=str(counts.get("cancellation_scheduled", 0)), inline=False)
 
     e.set_footer(text="RSCheckerbot • Reporting")
     return e
@@ -476,7 +476,7 @@ async def _run_daily_cancel_reminders(dm_uid: int) -> None:
                 continue
 
             # Build a clickable profile link without pings
-            rows.append(f"- [user_{did}](https://discord.com/users/{did}) ends <t:{int(end_ts)}:D> (in {delta_days}d)")
+            rows.append(f"- <@{did}> ends <t:{int(end_ts)}:D> (in {delta_days}d)")
             to_mark.append((int(did), int(delta_days)))
 
         # Mark reminders as sent (persist)
@@ -4143,20 +4143,210 @@ def _parse_date_ymd(s: str) -> datetime | None:
         return None
 
 
-@bot.command(name="report", aliases=["reports"])
-@commands.has_permissions(administrator=True)
-async def checker_report(ctx, arg1: str = "", arg2: str = "", arg3: str = "", arg4: str = "", arg5: str = "", arg6: str = ""):
-    """Generate a report for a date range and DM it (Neo + invoker).
+def _report_mode_label(mode: str) -> str:
+    m = str(mode or "").strip().lower()
+    if m == "scan_whop":
+        return "Scan Whop API + CSV"
+    if m == "scan_memberstatus":
+        return "Scan member-status logs"
+    return "Manual report (DM only)"
 
-    Usage:
-      .checker report
-      .checker report 2026-01-01
-      .checker report 2026-01-01 2026-01-07
-      .checker report scan whop 2026-01-01 2026-01-31 confirm
-      .checker report scan memberstatus 2026-01-01 2026-01-31 confirm
-    """
+
+class _ReportDatesModal(discord.ui.Modal):
+    def __init__(self, view: "_ReportOptionsView"):
+        super().__init__(title="Report Date Range")
+        self._view = view
+        self.start_input = discord.ui.TextInput(
+            label="Start date (YYYY-MM-DD)",
+            required=False,
+            default=str(view.start or ""),
+            placeholder="2026-01-01",
+        )
+        self.end_input = discord.ui.TextInput(
+            label="End date (YYYY-MM-DD)",
+            required=False,
+            default=str(view.end or ""),
+            placeholder="2026-01-07",
+        )
+        self.add_item(self.start_input)
+        self.add_item(self.end_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        self._view.start = str(self.start_input.value or "").strip()
+        self._view.end = str(self.end_input.value or "").strip()
+        await self._view.refresh_message()
+        with suppress(Exception):
+            await interaction.response.send_message("✅ Report dates updated.", ephemeral=True)
+
+
+class _ReportTypeSelect(discord.ui.Select):
+    def __init__(self, view: "_ReportOptionsView"):
+        options = [
+            discord.SelectOption(label="Manual report (DM)", value="manual"),
+            discord.SelectOption(label="Scan Whop API + CSV", value="scan_whop"),
+            discord.SelectOption(label="Scan member-status logs", value="scan_memberstatus"),
+        ]
+        super().__init__(placeholder="Report type", min_values=1, max_values=1, options=options)
+        self._view = view
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self._view.mode = str(self.values[0] or "manual")
+        self._view.sample_csv = False if self._view.mode != "scan_whop" else self._view.sample_csv
+        self._view.sync_buttons()
+        await interaction.response.edit_message(embed=self._view.build_embed(), view=self._view)
+
+
+class _ReportOptionsView(discord.ui.View):
+    def __init__(self, ctx: commands.Context):
+        try:
+            timeout_s = int(REPORTING_CONFIG.get("interactive_timeout_sec") or 900)
+        except Exception:
+            timeout_s = 900
+        if timeout_s <= 0:
+            timeout_s = 900
+        super().__init__(timeout=timeout_s)
+        self.ctx = ctx
+        self.author_id = int(getattr(ctx.author, "id", 0) or 0)
+        self.mode = "manual"
+        self.start = ""
+        self.end = ""
+        self.sample_csv = False
+        self.message: discord.Message | None = None
+
+        self.type_select = _ReportTypeSelect(self)
+        self.add_item(self.type_select)
+
+        self.sample_button = discord.ui.Button(
+            label="Sample CSV: Off",
+            style=discord.ButtonStyle.secondary,
+        )
+        self.sample_button.callback = self._toggle_sample  # type: ignore[assignment]
+        self.add_item(self.sample_button)
+
+        self.dates_button = discord.ui.Button(
+            label="Set dates",
+            style=discord.ButtonStyle.primary,
+        )
+        self.dates_button.callback = self._set_dates  # type: ignore[assignment]
+        self.add_item(self.dates_button)
+
+        self.run_button = discord.ui.Button(
+            label="Run report",
+            style=discord.ButtonStyle.success,
+        )
+        self.run_button.callback = self._run_report  # type: ignore[assignment]
+        self.add_item(self.run_button)
+
+        self.cancel_button = discord.ui.Button(
+            label="Cancel",
+            style=discord.ButtonStyle.danger,
+        )
+        self.cancel_button.callback = self._cancel  # type: ignore[assignment]
+        self.add_item(self.cancel_button)
+
+        self.sync_buttons()
+
+    def sync_buttons(self) -> None:
+        if getattr(self, "sample_button", None):
+            self.sample_button.label = f"Sample CSV: {'On' if self.sample_csv else 'Off'}"
+            self.sample_button.disabled = self.mode != "scan_whop"
+
+    def build_embed(self) -> discord.Embed:
+        tz_name = str(REPORTING_CONFIG.get("timezone") or "UTC").strip() or "UTC"
+        mode_label = _report_mode_label(self.mode)
+        if not self.start and not self.end:
+            range_label = "Last 7 days (auto)"
+        elif self.start and not self.end:
+            range_label = f"{self.start} → now"
+        elif not self.start and self.end:
+            range_label = f"{self.end} → now"
+        else:
+            range_label = f"{self.start} → {self.end}"
+
+        if self.mode != "manual" and (not self.start or not self.end):
+            range_label = f"{range_label} (required for scan)"
+
+        desc = (
+            "Pick a report type and date range.\n"
+            f"Type: {mode_label}\n"
+            f"Date range: {range_label}\n"
+            f"Sample CSV: {'yes' if self.sample_csv else 'no'}\n"
+            f"Timezone: {tz_name}"
+        )
+        return discord.Embed(
+            title="RSCheckerbot Report Builder",
+            description=desc,
+            color=0x5865F2,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+    async def refresh_message(self) -> None:
+        self.sync_buttons()
+        if self.message:
+            await self.message.edit(embed=self.build_embed(), view=self)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        uid = int(getattr(interaction.user, "id", 0) or 0)
+        if uid and self.author_id and uid != self.author_id:
+            await interaction.response.send_message("❌ Only the report requester can use this.", ephemeral=True)
+            return False
+        return True
+
+    async def _toggle_sample(self, interaction: discord.Interaction) -> None:
+        if self.mode != "scan_whop":
+            await interaction.response.send_message("Sample CSV is only for Whop API scans.", ephemeral=True)
+            return
+        self.sample_csv = not self.sample_csv
+        self.sync_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _set_dates(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(_ReportDatesModal(self))
+
+    async def _run_report(self, interaction: discord.Interaction) -> None:
+        if self.mode != "manual" and (not self.start or not self.end):
+            await interaction.response.send_message("❌ Start and end dates are required for scans.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await self._disable()
+        tokens: list[str] = []
+        if self.mode == "manual":
+            if self.start:
+                tokens.append(self.start)
+            if self.end:
+                tokens.append(self.end)
+        elif self.mode == "scan_whop":
+            tokens = ["scan", "whop", self.start, self.end, "confirm"]
+            if self.sample_csv:
+                tokens.append("sample")
+        elif self.mode == "scan_memberstatus":
+            tokens = ["scan", "memberstatus", self.start, self.end, "confirm"]
+        await _run_report_with_tokens(self.ctx, tokens)
+
+    async def _cancel(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        await self._disable(cancelled=True)
+
+    async def _disable(self, *, cancelled: bool = False) -> None:
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            if cancelled:
+                embed = self.build_embed()
+                embed.title = "RSCheckerbot Report Builder (cancelled)"
+                await self.message.edit(embed=embed, view=self)
+            else:
+                await self.message.edit(view=self)
+
+
+async def _start_report_interactive(ctx: commands.Context) -> None:
+    view = _ReportOptionsView(ctx)
+    msg = await ctx.send(embed=view.build_embed(), view=view)
+    view.message = msg
+
+
+async def _run_report_with_tokens(ctx: commands.Context, tokens: list[str]) -> None:
     try:
-        tokens = [str(x).strip() for x in [arg1, arg2, arg3, arg4, arg5, arg6] if str(x or "").strip()]
         if tokens and tokens[0].lower() == "scan":
             if len(tokens) not in {5, 6}:
                 await ctx.send(
@@ -4244,6 +4434,29 @@ async def checker_report(ctx, arg1: str = "", arg2: str = "", arg3: str = "", ar
     finally:
         with suppress(Exception):
             await ctx.message.delete()
+
+
+@bot.command(name="report", aliases=["reports"])
+@commands.has_permissions(administrator=True)
+async def checker_report(ctx, arg1: str = "", arg2: str = "", arg3: str = "", arg4: str = "", arg5: str = "", arg6: str = ""):
+    """Generate a report for a date range and DM it (Neo + invoker).
+
+    Usage:
+      .checker report
+      .checker report 2026-01-01
+      .checker report 2026-01-01 2026-01-07
+      .checker report scan whop 2026-01-01 2026-01-31 confirm
+      .checker report scan memberstatus 2026-01-01 2026-01-31 confirm
+
+    Tip: run without arguments to open the interactive picker.
+    """
+    tokens = [str(x).strip() for x in [arg1, arg2, arg3, arg4, arg5, arg6] if str(x or "").strip()]
+    if not tokens:
+        await _start_report_interactive(ctx)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+    await _run_report_with_tokens(ctx, tokens)
 
 
 async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = False) -> None:
@@ -4736,10 +4949,10 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
         color=0x5865F2,
         timestamp=datetime.now(timezone.utc),
     )
-    e.add_field(name="New Members", value=str(totals["new_members"]), inline=True)
-    e.add_field(name="New Trials", value=str(totals["new_trials"]), inline=True)
-    e.add_field(name="Payment Failed", value=str(totals["payment_failed"]), inline=True)
-    e.add_field(name="Cancellation Scheduled", value=str(totals["cancellation_scheduled"]), inline=True)
+    e.add_field(name="New Members", value=str(totals["new_members"]), inline=False)
+    e.add_field(name="New Trials", value=str(totals["new_trials"]), inline=False)
+    e.add_field(name="Payment Failed", value=str(totals["payment_failed"]), inline=False)
+    e.add_field(name="Cancellation Scheduled", value=str(totals["cancellation_scheduled"]), inline=False)
     e.set_footer(text="RSCheckerbot • Reporting")
 
     file_obj = discord.File(fp=io.BytesIO(csv_bytes), filename=fname)
