@@ -3982,20 +3982,14 @@ async def on_message(message: discord.Message):
         return
 
     # Check if this is a Whop message (from either channel).
-    # IMPORTANT: workflow posts can be webhook messages (author.bot == False), so we gate by channel ID
-    # and require either bot-author OR webhook_id to avoid parsing random user chatter.
-    is_bot_or_webhook = bool(getattr(message.author, "bot", False)) or (getattr(message, "webhook_id", None) is not None)
-    if is_bot_or_webhook:
-        # Check workflow webhook channel
-        if (WHOP_WEBHOOK_CHANNEL_ID and message.channel.id == WHOP_WEBHOOK_CHANNEL_ID):
-            await handle_whop_webhook_message(message)
-            return
+    # Channel ID is the source of truth; Whop app messages may not be flagged as bot/webhook.
+    if (WHOP_WEBHOOK_CHANNEL_ID and message.channel.id == WHOP_WEBHOOK_CHANNEL_ID):
+        await handle_whop_webhook_message(message)
+        return
 
-        # Check native Whop logs channel
-        if (WHOP_LOGS_CHANNEL_ID and message.channel.id == WHOP_LOGS_CHANNEL_ID):
-            # Channel ID is the source of truth (do not gate on bot/app name).
-            await handle_whop_webhook_message(message)
-            return
+    if (WHOP_LOGS_CHANNEL_ID and message.channel.id == WHOP_LOGS_CHANNEL_ID):
+        await handle_whop_webhook_message(message)
+        return
     
     # Message processing continues here if needed for other handlers
     # (Currently no other message handlers, but this preserves extensibility)
@@ -4464,6 +4458,8 @@ def _report_mode_label(mode: str) -> str:
         return "Scan Whop API + CSV"
     if m == "scan_memberstatus":
         return "Scan member-status logs"
+    if m == "debug_whop":
+        return "Whop Debug (membership/discord)"
     return "Manual report (DM only)"
 
 
@@ -4494,12 +4490,32 @@ class _ReportDatesModal(discord.ui.Modal):
             await interaction.response.send_message("✅ Report dates updated.", ephemeral=True)
 
 
+class _ReportTargetModal(discord.ui.Modal):
+    def __init__(self, view: "_ReportOptionsView"):
+        super().__init__(title="Whop Debug Target")
+        self._view = view
+        self.target_input = discord.ui.TextInput(
+            label="Membership ID or Discord ID",
+            required=True,
+            default=str(view.target or ""),
+            placeholder="mem_... or 1281616986660405304",
+        )
+        self.add_item(self.target_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        self._view.target = str(self.target_input.value or "").strip()
+        await self._view.refresh_message()
+        with suppress(Exception):
+            await interaction.response.send_message("✅ Debug target updated.", ephemeral=True)
+
+
 class _ReportTypeSelect(discord.ui.Select):
     def __init__(self, view: "_ReportOptionsView"):
         options = [
             discord.SelectOption(label="Manual report (DM)", value="manual"),
             discord.SelectOption(label="Scan Whop API + CSV", value="scan_whop"),
             discord.SelectOption(label="Scan member-status logs", value="scan_memberstatus"),
+            discord.SelectOption(label="Whop Debug (membership/discord)", value="debug_whop"),
         ]
         super().__init__(placeholder="Report type", min_values=1, max_values=1, options=options)
         self._view = view
@@ -4526,6 +4542,7 @@ class _ReportOptionsView(discord.ui.View):
         self.start = ""
         self.end = ""
         self.sample_csv = False
+        self.target = ""
         self.message: discord.Message | None = None
 
         self.type_select = _ReportTypeSelect(self)
@@ -4544,6 +4561,13 @@ class _ReportOptionsView(discord.ui.View):
         )
         self.dates_button.callback = self._set_dates  # type: ignore[assignment]
         self.add_item(self.dates_button)
+
+        self.target_button = discord.ui.Button(
+            label="Set target",
+            style=discord.ButtonStyle.primary,
+        )
+        self.target_button.callback = self._set_target  # type: ignore[assignment]
+        self.add_item(self.target_button)
 
         self.run_button = discord.ui.Button(
             label="Run report",
@@ -4565,6 +4589,8 @@ class _ReportOptionsView(discord.ui.View):
         if getattr(self, "sample_button", None):
             self.sample_button.label = f"Sample CSV: {'On' if self.sample_csv else 'Off'}"
             self.sample_button.disabled = self.mode != "scan_whop"
+        if getattr(self, "target_button", None):
+            self.target_button.disabled = self.mode != "debug_whop"
 
     def build_embed(self) -> discord.Embed:
         tz_name = str(REPORTING_CONFIG.get("timezone") or "UTC").strip() or "UTC"
@@ -4578,14 +4604,23 @@ class _ReportOptionsView(discord.ui.View):
         else:
             range_label = f"{self.start} → {self.end}"
 
-        if self.mode != "manual" and (not self.start or not self.end):
+        if self.mode in {"scan_whop", "scan_memberstatus"} and (not self.start or not self.end):
             range_label = f"{range_label} (required for scan)"
+
+        target_label = "—"
+        if self.mode == "debug_whop":
+            target_label = self.target or "— (required)"
+
+        sample_label = "yes" if self.sample_csv else "no"
+        if self.mode != "scan_whop":
+            sample_label = "n/a"
 
         desc = (
             "Pick a report type and date range.\n"
             f"Type: {mode_label}\n"
             f"Date range: {range_label}\n"
-            f"Sample CSV: {'yes' if self.sample_csv else 'no'}\n"
+            f"Debug target: {target_label}\n"
+            f"Sample CSV: {sample_label}\n"
             f"Timezone: {tz_name}"
         )
         return discord.Embed(
@@ -4618,9 +4653,18 @@ class _ReportOptionsView(discord.ui.View):
     async def _set_dates(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(_ReportDatesModal(self))
 
+    async def _set_target(self, interaction: discord.Interaction) -> None:
+        if self.mode != "debug_whop":
+            await interaction.response.send_message("Select Whop Debug first.", ephemeral=True)
+            return
+        await interaction.response.send_modal(_ReportTargetModal(self))
+
     async def _run_report(self, interaction: discord.Interaction) -> None:
-        if self.mode != "manual" and (not self.start or not self.end):
+        if self.mode in {"scan_whop", "scan_memberstatus"} and (not self.start or not self.end):
             await interaction.response.send_message("❌ Start and end dates are required for scans.", ephemeral=True)
+            return
+        if self.mode == "debug_whop" and not self.target:
+            await interaction.response.send_message("❌ Debug target is required.", ephemeral=True)
             return
         await interaction.response.defer()
         await self._disable()
@@ -4636,6 +4680,12 @@ class _ReportOptionsView(discord.ui.View):
                 tokens.append("sample")
         elif self.mode == "scan_memberstatus":
             tokens = ["scan", "memberstatus", self.start, self.end, "confirm"]
+        elif self.mode == "debug_whop":
+            tokens = ["debug", self.target]
+            if self.start:
+                tokens.append(self.start)
+            if self.end:
+                tokens.append(self.end)
         await _run_report_with_tokens(self.ctx, tokens)
 
     async def _cancel(self, interaction: discord.Interaction) -> None:
@@ -4888,6 +4938,7 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
     # Detailed CSV rows (only included/deduped events)
     csv_rows: list[dict] = []
     totals = {"new_members": 0, "new_trials": 0, "payment_failed": 0, "cancellation_scheduled": 0}
+    detail_fetches = 0
 
     try:
         per_page = int(WHOP_API_CONFIG.get("report_page_size") or WHOP_API_CONFIG.get("page_size") or 100)
@@ -4895,6 +4946,13 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
         per_page = 100
     if per_page <= 0:
         per_page = 100
+    try:
+        detail_limit = int(WHOP_API_CONFIG.get("report_detail_fetch_limit") or per_page)
+    except Exception:
+        detail_limit = per_page
+    if detail_limit < 0:
+        detail_limit = 0
+    detail_missing_only = bool(WHOP_API_CONFIG.get("report_detail_fetch_missing_only", True))
     page = 1
     seen_memberships: set[str] = set()
 
@@ -4929,6 +4987,36 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
                     end_utc=end_utc,
                     api_client=whop_api_client,
                 )
+
+                # If list response is missing key date fields, try a detail fetch by membership_id.
+                if (
+                    detail_limit > 0
+                    and membership_id
+                    and detail_fetches < detail_limit
+                    and (
+                        not detail_missing_only
+                        or not any(
+                            [
+                                info.get("created_dt"),
+                                info.get("activated_dt"),
+                                info.get("trial_end_dt"),
+                                info.get("failure_dt"),
+                                info.get("cancel_dt"),
+                            ]
+                        )
+                    )
+                ):
+                    with suppress(Exception):
+                        detail = await whop_api_client.get_membership_by_id(membership_id)
+                    if isinstance(detail, dict) and detail:
+                        detail_fetches += 1
+                        membership = _whop_report_normalize_membership(detail)
+                        buckets, brief, info = _whop_report_compute_events(
+                            membership,
+                            start_utc=start_utc,
+                            end_utc=end_utc,
+                            api_client=whop_api_client,
+                        )
 
                 if not buckets:
                     continue
@@ -5098,7 +5186,7 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
         title=f"RS Whop Scan Report ({start_local.date().isoformat()} → {end_local.date().isoformat()})",
         description=(
             "Source: Whop API (deduped per membership per day/event) • Timezone: `America/Denver`"
-            + f"\nScanned: {scanned} memberships • Included: {included} • API calls: {api_calls}"
+            + f"\nScanned: {scanned} memberships • Included: {included} • API calls: {api_calls} • Detail fetches: {detail_fetches}"
             + (" • Output: anonymized sample CSV" if sample_csv else "")
             + warn_note
             + (f"\n⚠️ Store not saved: {save_warning}" if save_warning else "")
