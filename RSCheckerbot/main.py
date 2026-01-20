@@ -4532,7 +4532,7 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
     def _membership_id_from_membership(membership: dict) -> str:
         if not isinstance(membership, dict):
             return ""
-        for key in ("id", "membership_id", "membershipId", "membership"):
+        for key in ("id", "membership_id", "membershipId", "membership", "whop_key", "key"):
             val = membership.get(key)
             if isinstance(val, str) and val.strip():
                 return val.strip()
@@ -4567,7 +4567,7 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
         for k in keys:
             v = membership.get(k)
             if isinstance(v, dict):
-                for sk in ("created_at", "updated_at", "timestamp", "time", "date"):
+                for sk in ("created_at", "updated_at", "timestamp", "time", "date", "epoch", "seconds", "unix"):
                     dt = _parse_dt_any(v.get(sk))
                     if dt:
                         return dt
@@ -4738,12 +4738,12 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
                     new_on_page += 1
 
                 status_l = str(membership.get("status") or "").strip().lower()
-                created_dt = _pick_dt(membership, ["created_at", "createdAt", "started_at", "starts_at"])
-                activated_dt = _pick_dt(membership, ["activated_at", "activatedAt", "current_period_start", "current_period_start_at", "starts_at", "started_at"])
-                updated_dt = _pick_dt(membership, ["updated_at", "updatedAt"])
-                trial_end_dt = _pick_dt(membership, ["trial_end", "trial_end_at", "trial_ends_at"])
-                failure_dt = _pick_dt(membership, ["last_payment_failure", "last_payment_failed_at", "payment_failed_at", "last_failed_payment_at"])
-                cancel_dt = _pick_dt(membership, ["cancel_at", "cancel_at_period_end_at", "cancellation_scheduled_at", "cancelled_at", "canceled_at", "updated_at"])
+                created_dt = _pick_dt(membership, ["created_at", "createdAt", "started_at", "starts_at", "timestamps", "dates"])
+                activated_dt = _pick_dt(membership, ["activated_at", "activatedAt", "current_period_start", "current_period_start_at", "starts_at", "started_at", "timestamps", "dates"])
+                updated_dt = _pick_dt(membership, ["updated_at", "updatedAt", "timestamps", "dates"])
+                trial_end_dt = _pick_dt(membership, ["trial_end", "trial_end_at", "trial_ends_at", "timestamps", "dates"])
+                failure_dt = _pick_dt(membership, ["last_payment_failure", "last_payment_failed_at", "payment_failed_at", "last_failed_payment_at", "timestamps", "dates"])
+                cancel_dt = _pick_dt(membership, ["cancel_at", "cancel_at_period_end_at", "cancellation_scheduled_at", "cancelled_at", "canceled_at", "updated_at", "timestamps", "dates"])
 
                 trial_days_raw = (
                     membership.get("trial_days")

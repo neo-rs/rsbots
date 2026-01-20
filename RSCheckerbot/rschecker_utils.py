@@ -13,15 +13,9 @@ log = logging.getLogger("rs-checker")
 def fmt_date_any(ts_str: str | int | float | None) -> str:
     """Human-friendly date like 'January 8, 2026' (best-effort)."""
     try:
-        if ts_str is None:
+        dt = parse_dt_any(ts_str)
+        if not dt:
             return "—"
-        if isinstance(ts_str, (int, float)):
-            dt = datetime.fromtimestamp(float(ts_str), tz=timezone.utc)
-        else:
-            s = str(ts_str).strip()
-            if not s:
-                return "—"
-            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         out = dt.astimezone(timezone.utc).strftime("%B %d, %Y")
         return out.replace(" 0", " ")
     except Exception:
@@ -34,7 +28,11 @@ def parse_dt_any(ts_str: str | int | float | None) -> datetime | None:
         return None
     try:
         if isinstance(ts_str, (int, float)):
-            return datetime.fromtimestamp(float(ts_str), tz=timezone.utc)
+            val = float(ts_str)
+            # Heuristic: treat large values as milliseconds.
+            if abs(val) > 1.0e11:
+                val = val / 1000.0
+            return datetime.fromtimestamp(val, tz=timezone.utc)
         s = str(ts_str).strip()
         if not s:
             return None
@@ -45,7 +43,10 @@ def parse_dt_any(ts_str: str | int | float | None) -> datetime | None:
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt.astimezone(timezone.utc)
         # Unix-ish path (strings like "1700000000" or "1700000000.0")
-        return datetime.fromtimestamp(float(s), tz=timezone.utc)
+        val = float(s)
+        if abs(val) > 1.0e11:
+            val = val / 1000.0
+        return datetime.fromtimestamp(val, tz=timezone.utc)
     except Exception:
         return None
 

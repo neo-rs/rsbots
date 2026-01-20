@@ -60,7 +60,10 @@ class WhopAPIClient:
             return None
         try:
             if isinstance(ts_str, (int, float)):
-                return datetime.fromtimestamp(float(ts_str), tz=timezone.utc)
+                val = float(ts_str)
+                if abs(val) > 1.0e11:
+                    val = val / 1000.0
+                return datetime.fromtimestamp(val, tz=timezone.utc)
             s = str(ts_str).strip()
             if not s:
                 return None
@@ -69,7 +72,10 @@ class WhopAPIClient:
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
                 return dt.astimezone(timezone.utc)
-            return datetime.fromtimestamp(float(s), tz=timezone.utc)
+            val = float(s)
+            if abs(val) > 1.0e11:
+                val = val / 1000.0
+            return datetime.fromtimestamp(val, tz=timezone.utc)
         except Exception:
             return None
 
@@ -371,7 +377,19 @@ class WhopAPIClient:
                 params=q,
             )
             data = response.get("data", []) if isinstance(response, dict) else response
-            return data if isinstance(data, list) else []
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                for key in ("data", "items", "memberships", "results"):
+                    items = data.get(key)
+                    if isinstance(items, list):
+                        return items
+            if isinstance(response, dict):
+                for key in ("items", "memberships", "results"):
+                    items = response.get(key)
+                    if isinstance(items, list):
+                        return items
+            return []
         except WhopAPIError as e:
             log.warning(f"Failed to list memberships (page {page}): {e}")
             return []
