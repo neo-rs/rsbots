@@ -460,4 +460,161 @@ rsbots_code_head=81c6dee2456af976491263af359503d0287fa8d5
 live_tree_head=no_git
 ```
 
-
+Export products
+Read products
+Manage product control center settings
+Create products
+Delete products
+Export product statistics
+Read product statistics
+Update products
+ad_campaign:conversion:create
+ad_campaign:create
+ad_campaign:credit:create
+ad_campaign:read
+ad_campaign:update
+ad_publisher:read
+Read affiliates
+Create affiliates
+Update affiliates
+authorized_role:create
+Read app permissions
+Manage chat webhooks
+Moderate chats
+Read chat messages
+Read chats
+Create forum posts
+Read forum posts
+Moderate forum posts
+Read team members
+Read team member emails
+Read company balance
+Read logs
+Manage checkout settings
+Manage legal settings
+Read business information
+Update business details
+company:create_child
+company:delete_child
+company:update_child_fees
+child_company:basic:export
+Update social links
+custom_emoji:update
+Export content rewards
+Read content rewards
+Create content rewards
+Delete content rewards
+Moderate content reward submissions
+Update content rewards
+Read developer settings
+Create apps
+Manage OAuth settings
+Manage webhooks
+Manage app builds
+Update apps
+Attach apps to products
+Create apps
+Delete apps
+Detach apps from products
+Read hidden apps
+Update apps
+iap:read
+Create livestreams
+Delete livestreams
+Manage livestream recordings
+Read livestream chat
+Moderate livestreams
+Export members
+Read members
+Read member emails
+Read member phone numbers
+Read member payment methods
+Manage members
+Update memberships
+Moderate members
+Export member statistics
+Read member statistics
+Export payments
+Read payments
+payment:charge
+payment:dispute
+Export disputes
+Read disputes
+payment:setup_intent:read
+Manage payments
+payment:resolution_center
+Export resolution center cases
+Read resolution center cases
+Create payout destinations
+Delete payout destinations
+Read payout destinations
+Transfer funds
+Read transfers
+payout:transfer:export
+Update payout destinations
+Withdraw funds
+Read withdrawals
+payout:withdrawal:export
+Read payout accounts
+Update payout accounts
+Export plans
+Read plans
+Create plans
+Delete plans
+Export plan statistics
+Read plan statistics
+Update plans
+Manage waitlist entries
+Export waitlist entries
+Read waitlist entries
+Export promo codes
+Read promo codes
+Create promo codes
+Delete promo codes
+Update promo codes
+stats:read
+Read support chats
+Create support chats
+Send messages in support chats
+Export tracking links
+Read tracking links
+Create tracking links
+Delete tracking links
+Export tracking link statistics
+Read tracking link statistics
+Update tracking links
+Read courses
+Update courses
+Read student-lesson interactions
+Read course analytics
+Read leads
+Export leads
+Create invoices
+Read invoices
+Export invoices
+Update invoices
+Read changes to invoices
+webhook_receive:setup_intents
+webhook_receive:withdrawals
+webhook_receive:payout_methods
+webhook_receive:verifications
+Read changes to waitlist entries
+Read changes to courses
+Read changes to memberships
+Read changes to payments
+Read changes to refunds
+Read changes to disputes
+Read changes to resolution center cases
+Read changes to app payments
+Read changes to app memberships
+Create shipments
+Read shipments
+Read checkout configurations
+Create checkout configurations
+Delete checkout configurations
+Create checkout requests
+Read checkout requests
+airdrop_link:basic:read
+airdrop_link:manage
+lead:manage
+notification:create
