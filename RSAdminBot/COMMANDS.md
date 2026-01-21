@@ -156,7 +156,7 @@ RSAdminBot is the central administrative bot for managing all RS bots on the Ora
 ### Extended Admin Commands
 
 #### `!selfupdate`
-- **Description**: Update RSAdminBot from GitHub (python-only) then restart rsadminbot
+- **Description**: Update RSAdminBot from GitHub (python-only) then restart rsadminbot; also syncs repo-level shared utilities
 - **Aliases**: None
 - **Parameters**: None
 - **Usage**: `!selfupdate`

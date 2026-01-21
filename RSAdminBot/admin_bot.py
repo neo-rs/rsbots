@@ -4126,6 +4126,12 @@ fi
 TMP_SYNC_LIST="/tmp/mw_sync_${{BOT_FOLDER}}.txt"
 grep -E \"(\\\\.py$|\\\\.md$|\\\\.json$|\\\\.txt$|(^|/)requirements\\\\.txt$)\" "$TMP_ALL_LIST" | grep -v -E \"(^|/)config\\\\.secrets\\\\.json$\" > "$TMP_SYNC_LIST" || true
 sort -u "$TMP_SYNC_LIST" -o "$TMP_SYNC_LIST" || true
+
+# Also include shared utilities if present (repo-level, not in BOT_FOLDER)
+TMP_SHARED_LIST="/tmp/mw_shared_${{BOT_FOLDER}}.txt"
+git ls-files "shared" 2>/dev/null | grep -E \"(\\\\.py$|\\\\.md$|\\\\.json$|\\\\.txt$|(^|/)requirements\\\\.txt$)\" | grep -v -E \"(^|/)config\\\\.secrets\\\\.json$\" > "$TMP_SHARED_LIST" || true
+cat "$TMP_SYNC_LIST" "$TMP_SHARED_LIST" | sort -u > "${{TMP_SYNC_LIST}}.merged"
+mv "${{TMP_SYNC_LIST}}.merged" "$TMP_SYNC_LIST"
 SYNC_COUNT="$(wc -l < "$TMP_SYNC_LIST" | tr -d \" \")"
 if [ "$SYNC_COUNT" = "" ]; then SYNC_COUNT="0"; fi
 
