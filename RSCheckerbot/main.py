@@ -249,7 +249,7 @@ async def _report_scan_log_message(text: str) -> None:
         ch = bot.get_channel(ch_id)
         if isinstance(ch, discord.TextChannel):
             with suppress(Exception):
-                await ch.send(msg[:1900], allowed_mentions=discord.AllowedMentions.none())
+                await ch.send(msg[:1900], allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
     if REPORTING_CONFIG.get("scan_log_webhook_url"):
         asyncio.create_task(_post_scan_log_webhook(msg))
 
@@ -1925,7 +1925,7 @@ async def log_first(msg: str | None = None, *, embed: discord.Embed | None = Non
                 # Prefer the runtime channel name (no hardcoded labels).
                 nm = str(getattr(ch, "name", "") or "").strip()
                 e.set_footer(text=f"RSCheckerbot • {nm}" if nm else "RSCheckerbot")
-            await ch.send(embed=e, allowed_mentions=discord.AllowedMentions.none())
+            await ch.send(embed=e, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
 
 async def log_other(msg: str | None = None, *, embed: discord.Embed | None = None):
     ch = bot.get_channel(LOG_OTHER_CHANNEL_ID)
@@ -1940,7 +1940,7 @@ async def log_other(msg: str | None = None, *, embed: discord.Embed | None = Non
                 )
                 nm = str(getattr(ch, "name", "") or "").strip()
                 e.set_footer(text=f"RSCheckerbot • {nm}" if nm else "RSCheckerbot")
-            await ch.send(embed=e, allowed_mentions=discord.AllowedMentions.none())
+            await ch.send(embed=e, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
 
 async def log_role_event(message: str | None = None, *, embed: discord.Embed | None = None):
     await log_other(message, embed=embed)
@@ -6205,8 +6205,10 @@ async def future_member_audit(ctx):
                 continue
             candidates.append(int(m.id))
             if len(sample_lines) < 20:
-                # Clickable mention for staff workflow + plain username for readability.
-                sample_lines.append(f"- {m.mention} ({_plain_user(m)}) • `{m.id}`")
+                # Clickable mention (will ping) + plain username for readability.
+                disp = str(getattr(m, "display_name", "") or "").strip() or str(getattr(m, "name", "") or "").strip() or f"user_{int(m.id)}"
+                disp = disp.replace("\n", " ").strip()
+                sample_lines.append(f"- {m.mention} {disp} ({_plain_user(m)}) • `{m.id}`")
     except Exception as e:
         await ctx.send(f"❌ Scan failed: {e}", delete_after=15)
         with suppress(Exception):
