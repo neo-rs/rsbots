@@ -98,7 +98,7 @@
     "max_chars": 1800
   },
   "whop_webhook": {
-    "enabled": false,
+    "enabled": true,
     "http_server_port": 8092,
     "path": "/whop-webhook",
     "verify": true,
