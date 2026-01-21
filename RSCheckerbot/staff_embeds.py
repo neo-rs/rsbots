@@ -128,6 +128,29 @@ def _is_blank(v: object) -> bool:
     s = str(v).strip()
     return (not s) or s == "—"
 
+def _sanitize_value(v: object) -> str:
+    """Normalize placeholders to a neutral dash for staff embeds.
+
+    We never want user-visible placeholders like "Not linked yet" / "Linking…".
+    """
+    if v is None:
+        return "—"
+    s = str(v).strip()
+    if not s or s == "—":
+        return "—"
+    low = s.lower()
+    # Treat common linking placeholders as unknown (do not show them).
+    if low.startswith("not linked yet"):
+        return "—"
+    if low.startswith("linking"):
+        return "—"
+    return s
+
+def _add_field_force(embed: discord.Embed, name: str, value: object, *, inline: bool = True) -> None:
+    """Always add a field, showing '—' for unknown."""
+    v = _sanitize_value(value)
+    embed.add_field(name=str(name)[:256], value=str(v)[:1024], inline=inline)
+
 
 def _add_field(embed: discord.Embed, name: str, value: object, *, inline: bool = True) -> None:
     if _is_blank(value):
@@ -224,44 +247,33 @@ def build_case_minimal_embed(
         label_overrides["renewal_start"] = "Billing Period Started"
         label_overrides["renewal_end"] = "Access Ends On" if cancel_at_period_end else "Next Billing Date"
     # Clarify what "Total Spent" means (lifetime vs membership-only fallback).
-    spent = b.get("total_spent")
-    if isinstance(spent, str) and "(membership)" in spent:
+    spent_raw = b.get("total_spent")
+    spent_s = _sanitize_value(spent_raw)
+    if isinstance(spent_raw, str) and "(membership)" in spent_raw:
         label_overrides["total_spent"] = "Total Spent (membership)"
-    elif not _is_blank(spent):
+    elif not _is_blank(spent_s):
         label_overrides["total_spent"] = "Total Spent (lifetime)"
     embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
     apply_member_header(embed, member)
 
     # Row 1 (inline x3)
-    # Use member mention for in-Discord click target (no external link).
-    mention = getattr(member, "mention", f"<@{member.id}>")
     name = str(getattr(member, "display_name", "") or str(member))
-    _add_field(embed, "Member", f"{name}\n{mention}", inline=True)
+    _add_field(embed, "Member", name, inline=True)
     _add_field(embed, "Discord ID", f"`{member.id}`", inline=True)
     _add_field(embed, _human_label("access_roles"), access_roles, inline=True)
 
     # Row 2 (inline x3)
-    _add_field(embed, _human_label("status", label_overrides=label_overrides), b.get("status"), inline=True)
+    _add_field_force(embed, _human_label("status", label_overrides=label_overrides), b.get("status"), inline=True)
     _add_field(embed, _human_label("product", label_overrides=label_overrides), b.get("product"), inline=True)
     # Required for case channels: always show Total Spent (even if blank).
-    spent_val = str(b.get("total_spent") or "").strip() or "—"
-    embed.add_field(
-        name=_human_label("total_spent", label_overrides=label_overrides)[:256],
-        value=spent_val[:1024],
-        inline=True,
-    )
+    _add_field_force(embed, _human_label("total_spent", label_overrides=label_overrides), spent_s, inline=True)
 
     # Row 3 (inline x3)
     _add_field(embed, _human_label("remaining_days", label_overrides=label_overrides), b.get("remaining_days"), inline=True)
     _add_field(embed, _human_label("renewal_end", label_overrides=label_overrides), b.get("renewal_end"), inline=True)
     # Required for case channels: always show Dashboard (never Manage).
-    dash_val = str(b.get("dashboard_url") or "").strip() or "—"
-    embed.add_field(
-        name=_human_label("dashboard_url", label_overrides=label_overrides)[:256],
-        value=dash_val[:1024],
-        inline=True,
-    )
-    _add_field(embed, _human_label("renewal_window", label_overrides=label_overrides), b.get("renewal_window"), inline=False)
+    _add_field_force(embed, _human_label("dashboard_url", label_overrides=label_overrides), b.get("dashboard_url"), inline=True)
+    _add_field_force(embed, _human_label("renewal_window", label_overrides=label_overrides), b.get("renewal_window"), inline=False)
 
     # Optional plan/trial details
     _add_field(embed, _human_label("trial_days", label_overrides=label_overrides), b.get("trial_days"), inline=True)
@@ -303,19 +315,18 @@ def build_member_status_detailed_embed(
         label_overrides["renewal_start"] = "Billing Period Started"
         label_overrides["renewal_end"] = "Access Ends On" if cancel_at_period_end else "Next Billing Date"
     # Clarify what "Total Spent" means (lifetime vs membership-only fallback).
-    spent = b.get("total_spent")
-    if isinstance(spent, str) and "(membership)" in spent:
+    spent_raw = b.get("total_spent")
+    spent_s = _sanitize_value(spent_raw)
+    if isinstance(spent_raw, str) and "(membership)" in spent_raw:
         label_overrides["total_spent"] = "Total Spent (membership)"
-    elif not _is_blank(spent):
+    elif not _is_blank(spent_s):
         label_overrides["total_spent"] = "Total Spent (lifetime)"
     embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
     apply_member_header(embed, member)
 
     # Header row (inline x3)
-    # Use member mention for in-Discord click target (no external link).
-    mention = getattr(member, "mention", f"<@{member.id}>")
     name = str(getattr(member, "display_name", "") or str(member))
-    _add_field(embed, "Member", f"{name}\n{mention}", inline=True)
+    _add_field(embed, "Member", name, inline=True)
     _add_field(embed, "Discord ID", f"`{member.id}`", inline=True)
     _add_field(embed, _human_label("access_roles"), access_roles, inline=True)
 
@@ -349,9 +360,10 @@ def build_member_status_detailed_embed(
         _add_field(embed, name, val, inline=True)
 
     # Payment rows (inline x3)
-    _add_field(embed, _human_label("status", label_overrides=label_overrides), b.get("status"), inline=True)
+    # Always show the core Whop fields on every staff card (no "Not linked yet" placeholders).
+    _add_field_force(embed, _human_label("status", label_overrides=label_overrides), b.get("status"), inline=True)
     _add_field(embed, _human_label("product", label_overrides=label_overrides), b.get("product"), inline=True)
-    _add_field(embed, _human_label("total_spent", label_overrides=label_overrides), b.get("total_spent"), inline=True)
+    _add_field_force(embed, _human_label("total_spent", label_overrides=label_overrides), spent_s, inline=True)
 
     _add_field(embed, _human_label("trial_days", label_overrides=label_overrides), b.get("trial_days"), inline=True)
     _add_field(embed, _human_label("plan_is_renewal", label_overrides=label_overrides), b.get("plan_is_renewal"), inline=True)
@@ -360,9 +372,9 @@ def build_member_status_detailed_embed(
 
     _add_field(embed, _human_label("remaining_days", label_overrides=label_overrides), b.get("remaining_days"), inline=True)
     _add_field(embed, _human_label("renewal_end", label_overrides=label_overrides), b.get("renewal_end"), inline=True)
-    _add_field(embed, _human_label("dashboard_url", label_overrides=label_overrides), b.get("dashboard_url"), inline=True)
+    _add_field_force(embed, _human_label("dashboard_url", label_overrides=label_overrides), b.get("dashboard_url"), inline=True)
     _add_field(embed, _human_label("manage_url", label_overrides=label_overrides), b.get("manage_url"), inline=True)
-    _add_field(embed, _human_label("renewal_window", label_overrides=label_overrides), b.get("renewal_window"), inline=False)
+    _add_field_force(embed, _human_label("renewal_window", label_overrides=label_overrides), b.get("renewal_window"), inline=False)
 
     _add_field(embed, _human_label("last_success_paid_at", label_overrides=label_overrides), b.get("last_success_paid_at"), inline=True)
     _add_field(embed, _human_label("cancel_at_period_end", label_overrides=label_overrides), b.get("cancel_at_period_end"), inline=True)

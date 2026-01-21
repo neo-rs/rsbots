@@ -254,6 +254,77 @@ async def _report_scan_log_message(text: str) -> None:
         asyncio.create_task(_post_scan_log_webhook(msg))
 
 
+async def _backfill_recent_native_whop_cards() -> None:
+    """Populate member_history from recent native Whop log cards (no staff spam).
+
+    This lets Discord-only cards (join/leave) show Total Spent / Dashboard / Status / Renewal Window
+    once we've seen any native Whop card for that Discord ID.
+    """
+    try:
+        limit = int(WHOP_NATIVE_BACKFILL_LIMIT or 0)
+    except Exception:
+        limit = 0
+    if limit <= 0:
+        return
+
+    try:
+        max_days = int(WHOP_NATIVE_BACKFILL_MAX_DAYS or 0)
+    except Exception:
+        max_days = 0
+
+    now = datetime.now(timezone.utc)
+    seen_ids: set[int] = set()
+
+    channel_ids: list[int] = []
+    if str(WHOP_WEBHOOK_CHANNEL_ID or "").strip().isdigit():
+        channel_ids.append(int(WHOP_WEBHOOK_CHANNEL_ID))
+    if str(WHOP_LOGS_CHANNEL_ID or "").strip().isdigit():
+        channel_ids.append(int(WHOP_LOGS_CHANNEL_ID))
+    if not channel_ids:
+        return
+
+    for cid in channel_ids:
+        ch = bot.get_channel(int(cid))
+        if not isinstance(ch, discord.TextChannel):
+            continue
+
+        processed = 0
+        async for m in ch.history(limit=limit):
+            if max_days and getattr(m, "created_at", None):
+                try:
+                    if (now - m.created_at).days > int(max_days):
+                        break
+                except Exception:
+                    pass
+
+            did: int | None = None
+            try:
+                if m.embeds:
+                    emb = m.embeds[0]
+                    for f in (emb.fields or []):
+                        if str(getattr(f, "name", "") or "").strip().lower() == "discord id":
+                            mm = re.search(r"(\d{17,19})", str(getattr(f, "value", "") or ""))
+                            if mm:
+                                did = int(mm.group(1))
+                            break
+            except Exception:
+                did = None
+
+            if did and did in seen_ids:
+                continue
+
+            with suppress(Exception):
+                await handle_whop_webhook_message(m, backfill_only=True)
+
+            processed += 1
+            if did:
+                seen_ids.add(int(did))
+
+            # Yield occasionally so startup remains responsive.
+            if processed and (processed % 200 == 0):
+                await asyncio.sleep(0)
+
+
 def _parse_hhmm(s: str) -> tuple[int, int]:
     try:
         txt = str(s or "").strip()
@@ -856,6 +927,18 @@ try:
 except Exception:
     PAYMENT_RESUMED_RECENT_HOURS = 6.0
 PAYMENT_RESUMED_RECENT_HOURS = max(0.5, PAYMENT_RESUMED_RECENT_HOURS)
+
+# Native Whop log backfill (Discord message history -> member_history summaries)
+try:
+    WHOP_NATIVE_BACKFILL_LIMIT = int(WHOP_ENRICHMENT_CONFIG.get("native_backfill_limit", 2000))
+except Exception:
+    WHOP_NATIVE_BACKFILL_LIMIT = 2000
+WHOP_NATIVE_BACKFILL_LIMIT = max(0, WHOP_NATIVE_BACKFILL_LIMIT)
+try:
+    WHOP_NATIVE_BACKFILL_MAX_DAYS = int(WHOP_ENRICHMENT_CONFIG.get("native_backfill_max_days", 30))
+except Exception:
+    WHOP_NATIVE_BACKFILL_MAX_DAYS = 30
+WHOP_NATIVE_BACKFILL_MAX_DAYS = max(0, WHOP_NATIVE_BACKFILL_MAX_DAYS)
 
 # Files
 QUEUE_FILE = BASE_DIR / "queue.json"
@@ -1522,14 +1605,11 @@ async def _fetch_whop_brief_by_membership_id(membership_id: str) -> dict:
 def _whop_placeholder_brief(state: str) -> dict:
     """Return a placeholder Whop brief with consistent keys for staff embeds."""
     st = str(state or "").strip().lower()
-    if st == "pending":
-        dash = "Linking…"
-        spent = "Linking…"
-        status = "—"
-    else:
-        dash = "Not linked yet"
-        spent = "Not linked yet"
-        status = "—"
+    # Never surface user-visible placeholders like "Not linked yet" / "Linking…".
+    # Unknown = "—" (staff-friendly, consistent across cards).
+    dash = "—"
+    spent = "—"
+    status = "—"
     return {
         "status": status,
         "product": "—",
@@ -1668,6 +1748,12 @@ def _whop_summary_for_member(discord_id: int) -> dict:
         wh = hist.get("whop") if isinstance(hist, dict) else None
         if isinstance(wh, dict) and isinstance(wh.get("last_summary"), dict):
             return wh.get("last_summary") or {}
+        # Fallback: if we only have a timeline/status (from whop_history backfill),
+        # expose at least status so staff cards aren't blank.
+        if isinstance(wh, dict):
+            st = str(wh.get("last_status") or "").strip().lower()
+            if st:
+                return {"status": st}
     except Exception:
         return {}
     return {}
@@ -2044,15 +2130,31 @@ async def log_member_status(msg: str, embed: discord.Embed = None, *, channel_na
 
     try:
         # Use provided embed or create default one
-        if embed is None:
+        embed_was_none = embed is None
+        if embed_was_none:
             embed = discord.Embed(
                 description=msg,
                 color=0x5865F2,  # Discord blurple color
                 timestamp=datetime.now(timezone.utc),
             )
             embed.set_footer(text="RSCheckerbot • Member Status Tracking")
+
+        # Ensure member is always clickable (and consistent) by putting the user mention in message content.
+        # Mentions inside embed fields are not reliably rendered/clickable across clients.
+        content = ""
+        if not embed_was_none:
+            content = str(msg or "").strip()
+            if not content and isinstance(embed, discord.Embed):
+                with suppress(Exception):
+                    for f in (embed.fields or []):
+                        if str(getattr(f, "name", "") or "").strip().lower() == "discord id":
+                            m = re.search(r"(\d{17,19})", str(getattr(f, "value", "") or ""))
+                            if m:
+                                content = f"<@{m.group(1)}>"
+                                break
+
         # Allow user mentions for clickable member references (no role/everyone mentions).
-        sent = await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+        sent = await ch.send(content=(content or ""), embed=embed, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
         try:
             await _maybe_capture_for_reporting(embed, sent_channel_id=int(ch.id))
         except Exception:
@@ -3376,6 +3478,9 @@ async def on_ready():
         if WHOP_LOGS_CHANNEL_ID:
             channels.append(f"logs channel {WHOP_LOGS_CHANNEL_ID}")
         log.info(f"[Whop] Webhook handler initialized for {', '.join(channels)}")
+        # Backfill recent native Whop cards into member_history so join/leave cards can display Whop fields.
+        if WHOP_NATIVE_BACKFILL_LIMIT > 0:
+            asyncio.create_task(_backfill_recent_native_whop_cards())
     else:
         log.warning("[Whop] Webhook/logs channel IDs not configured - webhook handler disabled")
     
@@ -3627,7 +3732,7 @@ async def on_member_join(member: discord.Member):
                     )
                     await log_member_status("", embed=detailed)
                 else:
-                    pending = _whop_placeholder_brief("pending")
+                    pending: dict = {}
                     pending_embed = _build_member_status_detailed_embed(
                         title="👋 Member Joined",
                         member=member,
@@ -3635,7 +3740,7 @@ async def on_member_join(member: discord.Member):
                         color=0x57F287,
                         event_kind="active",
                         member_kv=base_member_kv,
-                        discord_kv=base_discord_kv + [("whop_link", "Linking…")],
+                        discord_kv=base_discord_kv,
                         whop_brief=pending,
                     )
                     msg = await log_member_status("", embed=pending_embed)
@@ -3653,8 +3758,6 @@ async def on_member_join(member: discord.Member):
                         )
 
                     def _fallback() -> discord.Embed:
-                        unlinked = _whop_placeholder_brief("unlinked")
-                        note = f"Not linked yet (joined via {source_s})" if source_s and source_s != "—" else "Not linked yet (joined via invite)"
                         return _build_member_status_detailed_embed(
                             title="👋 Member Joined",
                             member=member,
@@ -3662,8 +3765,8 @@ async def on_member_join(member: discord.Member):
                             color=0x57F287,
                             event_kind="active",
                             member_kv=base_member_kv,
-                            discord_kv=base_discord_kv + [("whop_link", note)],
-                            whop_brief=unlinked,
+                            discord_kv=base_discord_kv,
+                            whop_brief={},
                         )
 
                     if msg:
@@ -3758,7 +3861,7 @@ async def on_member_remove(member: discord.Member):
                     mid = _membership_id_from_history(member.id)
                     whop_brief = await _fetch_whop_brief_by_membership_id(mid) if mid else {}
                 if not (isinstance(whop_brief, dict) and whop_brief):
-                    whop_brief = _whop_placeholder_brief("pending" if mid else "unlinked")
+                    whop_brief = {}
                 acc = rec.get("access") if isinstance(rec.get("access"), dict) else {}
                 detailed = _build_member_status_detailed_embed(
                     title="🚪 Member Left",
@@ -4104,7 +4207,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                     )
                     await log_member_status("", embed=minimal, channel_name=PAYMENT_FAILURE_CHANNEL_NAME)
                 else:
-                    pending = _whop_placeholder_brief("pending")
+                    pending: dict = {}
                     pending_title = "✅ Access Restored"
 
                     pending_detailed = _build_member_status_detailed_embed(
@@ -4114,7 +4217,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                         color=0x57F287,
                         event_kind="active",
                         member_kv=base_member_kv,
-                        discord_kv=base_discord_kv + [("whop_link", "Linking…"), ("event", "access.restored")],
+                        discord_kv=base_discord_kv + [("event", "access.restored")],
                         whop_brief=pending,
                     )
                     msg_detailed = await log_member_status("", embed=pending_detailed)
@@ -4144,7 +4247,6 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                         )
 
                     def _fallback_detailed() -> discord.Embed:
-                        unlinked = _whop_placeholder_brief("unlinked")
                         return _build_member_status_detailed_embed(
                             title=pending_title,
                             member=after,
@@ -4152,8 +4254,8 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                             color=0x57F287,
                             event_kind="active",
                             member_kv=base_member_kv,
-                            discord_kv=base_discord_kv + [("whop_link", "Not linked yet"), ("event", "access.restored")],
-                            whop_brief=unlinked,
+                            discord_kv=base_discord_kv + [("event", "access.restored")],
+                            whop_brief={},
                         )
 
                     def _final_min(brief: dict) -> discord.Embed:
@@ -4168,12 +4270,11 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                         )
 
                     def _fallback_min() -> discord.Embed:
-                        unlinked = _whop_placeholder_brief("unlinked")
                         return _build_case_minimal_embed(
                             title=pending_title,
                             member=after,
                             access_roles=access,
-                            whop_brief=unlinked,
+                            whop_brief={},
                             color=0x57F287,
                             event_kind="active",
                         )

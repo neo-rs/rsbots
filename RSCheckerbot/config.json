@@ -84,7 +84,10 @@
     "_comment": "Controls post-then-edit behavior for staff embeds when Whop link is not yet available.",
     "link_timeout_seconds": 90,
     "link_retry_seconds": [2, 5, 10, 20, 30, 60],
-    "payment_resumed_recent_hours": 6
+    "payment_resumed_recent_hours": 6,
+    "_comment_native_backfill": "On startup, scan recent native Whop log cards to populate member_history summaries (no staff spam).",
+    "native_backfill_limit": 2000,
+    "native_backfill_max_days": 30
   },
   
   "utm_links": {

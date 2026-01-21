@@ -1103,7 +1103,7 @@ def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_r
     log.info(f"Monitoring webhook channel {webhook_channel_id} and logs channel {whop_logs_channel_id}")
 
 
-async def handle_whop_webhook_message(message: discord.Message):
+async def handle_whop_webhook_message(message: discord.Message, *, backfill_only: bool = False):
     """
     Handle messages from Whop webhook in Discord channel.
     
@@ -1122,21 +1122,24 @@ async def handle_whop_webhook_message(message: discord.Message):
         description = embed.description or ""
         title = embed.title or ""
         
-        log.info(f"Whop message detected: {title}")
+        if not backfill_only:
+            log.info(f"Whop message detected: {title}")
         
         # Try to extract EVENT_DATA from description (workflow format)
         json_match = re.search(r'EVENT_DATA:(\{.*\})', description)
         
         if json_match:
             # Workflow webhook format
+            if backfill_only:
+                return
             await _handle_workflow_webhook(message, embed, json_match)
         else:
             # Native Whop integration format
-            await _handle_native_whop_message(message, embed)
+            await _handle_native_whop_message(message, embed, backfill_only=backfill_only)
         
     except Exception as e:
         log.error(f"Error handling webhook message: {e}", exc_info=True)
-        if _log_other:
+        if _log_other and not backfill_only:
             await _log_other(f"❌ **Whop Webhook Error:** {e}")
 
 
@@ -1347,7 +1350,7 @@ async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embe
             await _log_other(f"❌ **Whop Webhook Error:** Failed to parse JSON: {e}")
 
 
-async def _handle_native_whop_message(message: discord.Message, embed: discord.Embed):
+async def _handle_native_whop_message(message: discord.Message, embed: discord.Embed, *, backfill_only: bool = False):
     """
     Handle native Whop integration messages (embed fields format).
     """
@@ -1507,16 +1510,6 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
         discord_id = discord_id_match.group(1)
         discord_user_id = int(discord_id)
         
-        # Get guild and member
-        guild = message.guild
-        member = guild.get_member(discord_user_id)
-        
-        if not member:
-            if _log_other:
-                await _log_other(f"⚠️ **Whop Native:** Member {discord_user_id} not found in guild")
-            # Still store in DB even if member not found
-            member = None
-        
         # Cache identity mapping for enrichment (email -> discord_id)
         discord_username_value = (
             parsed_data.get("discord_username")
@@ -1524,6 +1517,32 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
             or ""
         )
         _cache_identity(email_value, str(discord_user_id), str(discord_username_value))
+
+        # Always persist the native-card summary as the staff-safe source of truth.
+        # This lets Discord-only cards (join/leave) show Total Spent / Dashboard / Renewal Window
+        # as soon as we've seen at least one native Whop card for that Discord ID.
+        try:
+            event_stub = {
+                "event_type": str(event_type or "").strip(),
+                "membership_id": str(membership_id_hint or "").strip(),
+                "whop_key": str(parsed_data.get("whop_key") or parsed_data.get("key") or "").strip(),
+            }
+            _record_whop_summary_if_possible(member_id=int(discord_user_id), summary=summary_from_native, event_data=event_stub)
+        except Exception:
+            pass
+
+        if backfill_only:
+            return
+
+        # Get guild and member
+        guild = message.guild
+        member = guild.get_member(discord_user_id) if guild else None
+        
+        if not member:
+            if _log_other:
+                await _log_other(f"⚠️ **Whop Native:** Member {discord_user_id} not found in guild")
+            # Still process summary storage even if member not found
+            member = None
 
         # Process role changes if member found
         if member:

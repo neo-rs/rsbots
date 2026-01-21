@@ -104,6 +104,7 @@ OracleServerData/**
 
 # Secrets / local-only scratchpads (do not commit)
 rs-bot-tokens.txt
+*.env
 .tmp/
 **/__pycache__/
 **/*.pyc
