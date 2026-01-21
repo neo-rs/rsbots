@@ -144,6 +144,11 @@ def _load_reporting_config(cfg: dict) -> dict:
     weekly_day = _as_str(base.get("weekly_day_local") or "mon").lower() or "mon"
     retention_weeks = _as_int(base.get("retention_weeks")) or 26
     reminder_days = base.get("reminder_days_before_cancel")
+    scan_log_channel_id = _as_int(base.get("scan_log_channel_id"))
+    scan_log_each_member = _as_bool(base.get("scan_log_each_member", False))
+    scan_log_include_raw_dates = _as_bool(base.get("scan_log_include_raw_dates", False))
+    scan_log_max_members = _as_int(base.get("scan_log_max_members")) or 0
+    scan_log_progress_every = _as_int(base.get("scan_log_progress_every")) or 50
 
     if not isinstance(reminder_days, list):
         reminder_days = [7, 3, 1]
@@ -166,6 +171,8 @@ def _load_reporting_config(cfg: dict) -> dict:
     if weekly_day not in {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}:
         print("[Config] reporting.weekly_day_local invalid; using 'mon'.")
         weekly_day = "mon"
+    if scan_log_progress_every <= 0:
+        scan_log_progress_every = 50
 
     return {
         "enabled": bool(enabled),
@@ -175,6 +182,11 @@ def _load_reporting_config(cfg: dict) -> dict:
         "weekly_day_local": weekly_day,
         "retention_weeks": int(retention_weeks),
         "reminder_days_before_cancel": cleaned_days,
+        "scan_log_channel_id": scan_log_channel_id or 0,
+        "scan_log_each_member": bool(scan_log_each_member),
+        "scan_log_include_raw_dates": bool(scan_log_include_raw_dates),
+        "scan_log_max_members": int(scan_log_max_members),
+        "scan_log_progress_every": int(scan_log_progress_every),
     }
 
 REPORTING_CONFIG = _load_reporting_config(config)
@@ -190,6 +202,21 @@ def _tz_now() -> datetime:
         return datetime.now(ZoneInfo(tz_name))
     except Exception:
         return datetime.now(timezone.utc)
+
+
+async def _report_scan_log_message(text: str) -> None:
+    """Optional scan log output to a configured channel."""
+    try:
+        ch_id = int(REPORTING_CONFIG.get("scan_log_channel_id") or 0)
+    except Exception:
+        ch_id = 0
+    if not ch_id:
+        return
+    ch = bot.get_channel(ch_id)
+    if not isinstance(ch, discord.TextChannel):
+        return
+    with suppress(Exception):
+        await ch.send(str(text or "").strip()[:1900], allowed_mentions=discord.AllowedMentions.none())
 
 
 def _parse_hhmm(s: str) -> tuple[int, int]:
@@ -4919,6 +4946,12 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
             f"```\nRange (MT): {start_local.date().isoformat()} → {end_local.date().isoformat()}\nInitializing...\n```"
         )
 
+    scan_log_each_member = bool(REPORTING_CONFIG.get("scan_log_each_member"))
+    scan_log_include_raw = bool(REPORTING_CONFIG.get("scan_log_include_raw_dates"))
+    scan_log_max_members = int(REPORTING_CONFIG.get("scan_log_max_members") or 0)
+    scan_log_progress_every = int(REPORTING_CONFIG.get("scan_log_progress_every") or 50)
+    scan_log_count = 0
+
     started_at = time.time()
     last_edit = 0.0
     scanned = 0
@@ -4985,6 +5018,10 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
     if detail_limit < 0:
         detail_limit = 0
     detail_missing_only = bool(WHOP_API_CONFIG.get("report_detail_fetch_missing_only", True))
+    await _report_scan_log_message(
+        f"🧪 **Whop scan started**\nRange: {start_local.date().isoformat()} → {end_local.date().isoformat()}\n"
+        f"Page size: {per_page} • Detail limit: {detail_limit}"
+    )
     page = 1
     seen_memberships: set[str] = set()
 
@@ -5046,6 +5083,31 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
                         )
 
                 if not buckets:
+                    if scan_log_each_member and (scan_log_max_members <= 0 or scan_log_count < scan_log_max_members):
+                        scan_log_count += 1
+                        status_l = str(info.get("status_l") or "").strip().lower()
+                        def _fmt_dt(dt: datetime | None) -> str:
+                            return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if dt else "—"
+                        log.info(
+                            "[ReportScan] mem=%s status=%s created=%s activated=%s updated=%s trial_end=%s failure=%s cancel_at=%s trial_days=%s is_trial=%s buckets=—",
+                            membership_id or "—",
+                            status_l or "—",
+                            _fmt_dt(info.get("created_dt")),
+                            _fmt_dt(info.get("activated_dt")),
+                            _fmt_dt(info.get("updated_dt")),
+                            _fmt_dt(info.get("trial_end_dt")),
+                            _fmt_dt(info.get("failure_dt")),
+                            _fmt_dt(info.get("cancel_dt")),
+                            info.get("trial_days"),
+                            "yes" if info.get("is_trial") else "no",
+                        )
+                        if scan_log_include_raw:
+                            raw_dates = _whop_report_collect_date_fields(membership)
+                            log.info("[ReportScan] mem=%s raw_dates=%s", membership_id or "—", "; ".join(raw_dates) if raw_dates else "—")
+                    if scan_log_progress_every > 0 and (scanned % scan_log_progress_every) == 0:
+                        await _report_scan_log_message(
+                            f"⏳ Scan progress: scanned {scanned}, included {included}, dupes {dupes}, api_calls {api_calls}, detail_fetches {detail_fetches}"
+                        )
                     continue
 
                 status_l = str(info.get("status_l") or "").strip().lower()
@@ -5119,6 +5181,34 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
                         }
                     )
 
+                if scan_log_each_member and (scan_log_max_members <= 0 or scan_log_count < scan_log_max_members):
+                    scan_log_count += 1
+                    def _fmt_dt(dt: datetime | None) -> str:
+                        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if dt else "—"
+                    bucket_str = ",".join([b for b, _ in buckets]) if buckets else "—"
+                    log.info(
+                        "[ReportScan] mem=%s status=%s created=%s activated=%s updated=%s trial_end=%s failure=%s cancel_at=%s trial_days=%s is_trial=%s buckets=%s",
+                        membership_id or "—",
+                        status_l or "—",
+                        _fmt_dt(info.get("created_dt")),
+                        _fmt_dt(info.get("activated_dt")),
+                        _fmt_dt(info.get("updated_dt")),
+                        _fmt_dt(info.get("trial_end_dt")),
+                        _fmt_dt(info.get("failure_dt")),
+                        _fmt_dt(info.get("cancel_dt")),
+                        info.get("trial_days"),
+                        "yes" if info.get("is_trial") else "no",
+                        bucket_str,
+                    )
+                    if scan_log_include_raw:
+                        raw_dates = _whop_report_collect_date_fields(membership)
+                        log.info("[ReportScan] mem=%s raw_dates=%s", membership_id or "—", "; ".join(raw_dates) if raw_dates else "—")
+
+                if scan_log_progress_every > 0 and (scanned % scan_log_progress_every) == 0:
+                    await _report_scan_log_message(
+                        f"⏳ Scan progress: scanned {scanned}, included {included}, dupes {dupes}, api_calls {api_calls}, detail_fetches {detail_fetches}"
+                    )
+
             if new_on_page == 0 and page > 1:
                 break
             if len(batch) < int(per_page):
@@ -5127,6 +5217,7 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
     except Exception as e:
         with suppress(Exception):
             await status_msg.edit(content=f"❌ Scan failed: `{e}`")
+        await _report_scan_log_message(f"❌ Whop scan failed: {e}")
         return
 
     # Prune store (best-effort: saving can fail on misconfigured server permissions)
@@ -5250,6 +5341,10 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
     with suppress(Exception):
         if status_msg:
             await status_msg.edit(content="✅ Scan complete. Report sent via DM (with CSV).")
+    await _report_scan_log_message(
+        f"✅ **Whop scan complete**\nScanned: {scanned} • Included: {included} • "
+        f"API calls: {api_calls} • Detail fetches: {detail_fetches}"
+    )
     return
 
 
