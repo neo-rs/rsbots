@@ -803,6 +803,16 @@ LOG_FIRST_CHANNEL_ID = DM_CONFIG.get("log_first_channel_id")
 LOG_OTHER_CHANNEL_ID = DM_CONFIG.get("log_other_channel_id")
 MEMBER_STATUS_LOGS_CHANNEL_ID = DM_CONFIG.get("member_status_logs_channel_id")
 
+# Future Member audit config (Discord-only role audit helper)
+FUTURE_MEMBER_AUDIT_CONFIG = config.get("future_member_audit", {}) if isinstance(config, dict) else {}
+FUTURE_MEMBER_AUDIT_EXCLUDE_ROLE_IDS: set[int] = set()
+try:
+    for _rid in (FUTURE_MEMBER_AUDIT_CONFIG.get("exclude_role_ids") or []):
+        if str(_rid).strip().isdigit():
+            FUTURE_MEMBER_AUDIT_EXCLUDE_ROLE_IDS.add(int(str(_rid).strip()))
+except Exception:
+    FUTURE_MEMBER_AUDIT_EXCLUDE_ROLE_IDS = set()
+
 # Logging controls (spam reduction + correlation)
 LOG_CONTROLS = config.get("log_controls", {}) if isinstance(config, dict) else {}
 try:
@@ -5847,6 +5857,7 @@ class _FutureMemberAuditView(discord.ui.View):
         guild_id: int,
         member_role_id: int,
         future_role_id: int,
+        exclude_role_ids: list[int],
         candidate_ids: list[int],
         totals: dict,
     ):
@@ -5855,6 +5866,7 @@ class _FutureMemberAuditView(discord.ui.View):
         self.guild_id = int(guild_id)
         self.member_role_id = int(member_role_id)
         self.future_role_id = int(future_role_id)
+        self.exclude_role_ids = [int(x) for x in (exclude_role_ids or []) if int(x) > 0]
         self.candidate_ids = [int(x) for x in (candidate_ids or []) if int(x) > 0]
         self.totals = totals if isinstance(totals, dict) else {}
         self.message: discord.Message | None = None
@@ -5939,14 +5951,24 @@ class _FutureMemberAuditView(discord.ui.View):
         def _is_staff(m: discord.Member) -> bool:
             try:
                 p = m.guild_permissions
-                return bool(p.administrator or p.manage_guild or p.manage_roles)
+                if bool(p.administrator or p.manage_guild or p.manage_roles):
+                    return True
             except Exception:
-                return False
+                pass
+            try:
+                if self.exclude_role_ids:
+                    rids = {int(r.id) for r in (m.roles or [])}
+                    if any(int(x) in rids for x in self.exclude_role_ids):
+                        return True
+            except Exception:
+                pass
+            return False
 
         added = 0
         skipped_now_has_member = 0
         skipped_already_future = 0
         skipped_staff = 0
+        skipped_staff_role = 0
         skipped_missing_member = 0
         failed = 0
 
@@ -5974,6 +5996,7 @@ class _FutureMemberAuditView(discord.ui.View):
             e.add_field(name="Skipped (now has Member)", value=str(skipped_now_has_member), inline=True)
             e.add_field(name="Skipped (already Future)", value=str(skipped_already_future), inline=True)
             e.add_field(name="Skipped (staff/admin)", value=str(skipped_staff), inline=True)
+            e.add_field(name="Skipped (staff role)", value=str(skipped_staff_role), inline=True)
             e.add_field(name="Skipped (member not found)", value=str(skipped_missing_member), inline=True)
             e.set_footer(text=f"RSCheckerbot • futurememberaudit • {int(now - started)}s elapsed")
             with suppress(Exception):
@@ -5994,10 +6017,19 @@ class _FutureMemberAuditView(discord.ui.View):
                 continue
             if m.bot:
                 skipped_staff += 1
+                skipped_staff_role += 1
                 await _edit_progress("apply", processed)
                 continue
             if _is_staff(m):
                 skipped_staff += 1
+                # Track staff-role skips separately when applicable
+                try:
+                    if self.exclude_role_ids:
+                        rids = {int(r.id) for r in (m.roles or [])}
+                        if any(int(x) in rids for x in self.exclude_role_ids):
+                            skipped_staff_role += 1
+                except Exception:
+                    pass
                 await _edit_progress("apply", processed)
                 continue
             role_ids = {r.id for r in (m.roles or [])}
@@ -6030,6 +6062,7 @@ class _FutureMemberAuditView(discord.ui.View):
         done.add_field(name="Skipped (now has Member)", value=str(skipped_now_has_member), inline=True)
         done.add_field(name="Skipped (already Future)", value=str(skipped_already_future), inline=True)
         done.add_field(name="Skipped (staff/admin)", value=str(skipped_staff), inline=True)
+        done.add_field(name="Skipped (staff role)", value=str(skipped_staff_role), inline=True)
         done.add_field(name="Skipped (member not found)", value=str(skipped_missing_member), inline=True)
         done.set_footer(text="RSCheckerbot • futurememberaudit")
         with suppress(Exception):
@@ -6084,12 +6117,39 @@ async def future_member_audit(ctx):
             await ctx.message.delete()
         return
 
+    exclude_role_ids = sorted(list(FUTURE_MEMBER_AUDIT_EXCLUDE_ROLE_IDS))
+
     def _is_staff(m: discord.Member) -> bool:
         try:
             p = m.guild_permissions
-            return bool(p.administrator or p.manage_guild or p.manage_roles)
+            if bool(p.administrator or p.manage_guild or p.manage_roles):
+                return True
         except Exception:
-            return False
+            pass
+        try:
+            if exclude_role_ids:
+                rids = {int(r.id) for r in (m.roles or [])}
+                if any(int(x) in rids for x in exclude_role_ids):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _plain_user(m: discord.Member) -> str:
+        # No mentions (no <@id>). Use plain @username text.
+        try:
+            uname = str(getattr(m, "name", "") or "").strip()
+        except Exception:
+            uname = ""
+        if not uname:
+            try:
+                uname = str(getattr(m, "display_name", "") or "").strip()
+            except Exception:
+                uname = ""
+        uname = uname.replace("\n", " ").strip()
+        if not uname:
+            uname = f"user_{int(m.id)}"
+        return f"@{uname}"
 
     # Prefer posting preview + confirmation in member-status-logs.
     status_ch = bot.get_channel(MEMBER_STATUS_LOGS_CHANNEL_ID) if MEMBER_STATUS_LOGS_CHANNEL_ID else None
@@ -6109,6 +6169,8 @@ async def future_member_audit(ctx):
     scanned = 0
     bots_skipped = 0
     staff_skipped = 0
+    staff_role_skipped = 0
+    has_member = 0
     missing_member = 0
     already_future = 0
     candidates: list[int] = []
@@ -6125,9 +6187,17 @@ async def future_member_audit(ctx):
                 continue
             if _is_staff(m):
                 staff_skipped += 1
+                try:
+                    if exclude_role_ids:
+                        rids = {int(r.id) for r in (m.roles or [])}
+                        if any(int(x) in rids for x in exclude_role_ids):
+                            staff_role_skipped += 1
+                except Exception:
+                    pass
                 continue
             role_ids = {r.id for r in (m.roles or [])}
             if member_role_id in role_ids:
+                has_member += 1
                 continue
             missing_member += 1
             if future_role_id in role_ids:
@@ -6135,7 +6205,7 @@ async def future_member_audit(ctx):
                 continue
             candidates.append(int(m.id))
             if len(sample_lines) < 20:
-                sample_lines.append(f"- {m.mention} • `{m.id}`")
+                sample_lines.append(f"- {_plain_user(m)} • `{m.id}`")
     except Exception as e:
         await ctx.send(f"❌ Scan failed: {e}", delete_after=15)
         with suppress(Exception):
@@ -6163,8 +6233,10 @@ async def future_member_audit(ctx):
     e.add_field(name="Member role", value=_fmt_role(member_role_id, guild), inline=False)
     e.add_field(name="Future Member role", value=_fmt_role(future_role_id, guild), inline=False)
     e.add_field(name="Scanned", value=str(scanned), inline=True)
+    e.add_field(name="Has Member role", value=str(has_member), inline=True)
     e.add_field(name="Skipped (bots)", value=str(bots_skipped), inline=True)
     e.add_field(name="Skipped (staff/admin)", value=str(staff_skipped), inline=True)
+    e.add_field(name="Skipped (staff role)", value=str(staff_role_skipped), inline=True)
     e.add_field(name="Missing Member role", value=str(missing_member), inline=True)
     e.add_field(name="Already has Future role", value=str(already_future), inline=True)
     e.add_field(name="Will add Future role to", value=str(len(candidates)), inline=True)
@@ -6179,6 +6251,7 @@ async def future_member_audit(ctx):
         guild_id=int(guild.id),
         member_role_id=int(member_role_id),
         future_role_id=int(future_role_id),
+        exclude_role_ids=exclude_role_ids,
         candidate_ids=candidates,
         totals=totals,
     )

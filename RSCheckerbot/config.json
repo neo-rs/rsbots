@@ -106,6 +106,10 @@
       "completed": []
     }
   },
+  "future_member_audit": {
+    "_comment": "Discord-only role audit helper. Excludes members with these role IDs from candidate selection.",
+    "exclude_role_ids": [1406731518969385220]
+  },
   "paths": {
     "whop_history": "../RSAdminBot/whop_data/whop_history.json"
   },
