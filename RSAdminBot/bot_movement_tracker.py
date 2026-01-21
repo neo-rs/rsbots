@@ -367,9 +367,8 @@ class BotMovementTracker:
                     inline=False
                 )
             
-            # Send to bot's activity channel
-            channel_key = f"{bot_name}_activity"
-            await self.test_server_organizer.send_to_channel(channel_key, embed=embed)
+            # Send to per-bot journal/monitor channel in TestCenter
+            await self.test_server_organizer.send_to_channel(str(bot_name), embed=embed)
             
         except Exception as e:
             # Don't spam errors - just log once

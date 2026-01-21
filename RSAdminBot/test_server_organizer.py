@@ -153,7 +153,14 @@ class TestServerOrganizer:
     
     def get_channel_id(self, channel_key: str) -> Optional[int]:
         """Get channel ID by key."""
-        return self.channels_data.get("channels", {}).get(channel_key)
+        key = str(channel_key or "").strip()
+        if not key:
+            return None
+        for bucket in ("channels", "monitor_channels", "journal_channels"):
+            data = self.channels_data.get(bucket, {})
+            if isinstance(data, dict) and key in data:
+                return data.get(key)
+        return None
     
     async def send_to_channel(self, channel_key: str, content: str = None, embed: discord.Embed = None):
         """Send message to a monitoring channel."""
