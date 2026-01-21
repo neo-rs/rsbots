@@ -90,7 +90,7 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 - **Notes**:
   - Role IDs come from `config.json` (`dm_sequence.role_cancel_a` = Member role, `dm_sequence.role_to_assign` = Future Member role)
   - Staff/admins are skipped (administrator/manage-guild/manage-roles permissions) and members with any role listed in `config.json -> future_member_audit.exclude_role_ids`
-  - Sample list uses plain `@username` text (no `<@id>` mention formatting)
+  - Sample list includes clickable member mentions (and also shows plain `@username` text)
   - No roles are ever mentioned (no `<@&...>`); output is plain text names + IDs
 
 ### Direct Message Controls

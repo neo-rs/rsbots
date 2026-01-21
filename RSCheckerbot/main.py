@@ -6136,7 +6136,7 @@ async def future_member_audit(ctx):
         return False
 
     def _plain_user(m: discord.Member) -> str:
-        # No mentions (no <@id>). Use plain @username text.
+        # Plain-text username (used alongside a clickable mention in samples).
         try:
             uname = str(getattr(m, "name", "") or "").strip()
         except Exception:
@@ -6205,7 +6205,8 @@ async def future_member_audit(ctx):
                 continue
             candidates.append(int(m.id))
             if len(sample_lines) < 20:
-                sample_lines.append(f"- {_plain_user(m)} • `{m.id}`")
+                # Clickable mention for staff workflow + plain username for readability.
+                sample_lines.append(f"- {m.mention} ({_plain_user(m)}) • `{m.id}`")
     except Exception as e:
         await ctx.send(f"❌ Scan failed: {e}", delete_after=15)
         with suppress(Exception):

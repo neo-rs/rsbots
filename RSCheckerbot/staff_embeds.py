@@ -40,13 +40,16 @@ _LABEL_OVERRIDES: dict[str, str] = {
     "member_since": "Member Since",
     "renewal_start": "Billing Period Started",
     "renewal_end": "Next Billing Date",
+    "renewal_window": "Renewal Window",
     "trial_end": "Trial Ends",
     "trial_days": "Trial Days",
     "remaining_days": "Remaining Days",
     "dashboard_url": "Whop Dashboard",
     "manage_url": "Whop Billing Manage",
+    "checkout_url": "Checkout",
     "total_spent": "Total Spent",
     "plan_is_renewal": "Plan Is Renewal",
+    "promo": "Promo",
     "pricing": "Pricing",
     "last_success_paid_at": "Last Successful Payment",
     "last_payment_failure": "Payment Issue",
@@ -160,13 +163,15 @@ def brief_payment_kv(brief: dict | None) -> list[tuple[str, object]]:
         ("trial_end", b.get("trial_end")),
         ("trial_days", b.get("trial_days")),
         ("plan_is_renewal", b.get("plan_is_renewal")),
+        ("promo", b.get("promo")),
         ("pricing", b.get("pricing")),
         ("renewal_start", b.get("renewal_start")),
         ("renewal_end", b.get("renewal_end")),
+        ("renewal_window", b.get("renewal_window")),
         ("remaining_days", b.get("remaining_days")),
         ("dashboard_url", dash),
-        # Prefer the staff dashboard; show billing-manage only as fallback.
-        ("manage_url", manage if not dash else ""),
+        ("manage_url", manage),
+        ("checkout_url", b.get("checkout_url")),
         ("total_spent", b.get("total_spent")),
         ("last_success_paid_at", b.get("last_success_paid_at")),
         ("cancel_at_period_end", b.get("cancel_at_period_end")),
@@ -238,17 +243,32 @@ def build_case_minimal_embed(
     # Row 2 (inline x3)
     _add_field(embed, _human_label("status", label_overrides=label_overrides), b.get("status"), inline=True)
     _add_field(embed, _human_label("product", label_overrides=label_overrides), b.get("product"), inline=True)
-    _add_field(embed, _human_label("total_spent", label_overrides=label_overrides), b.get("total_spent"), inline=True)
+    # Required for case channels: always show Total Spent (even if blank).
+    spent_val = str(b.get("total_spent") or "").strip() or "—"
+    embed.add_field(
+        name=_human_label("total_spent", label_overrides=label_overrides)[:256],
+        value=spent_val[:1024],
+        inline=True,
+    )
 
     # Row 3 (inline x3)
     _add_field(embed, _human_label("remaining_days", label_overrides=label_overrides), b.get("remaining_days"), inline=True)
     _add_field(embed, _human_label("renewal_end", label_overrides=label_overrides), b.get("renewal_end"), inline=True)
-    _add_field(embed, _human_label("dashboard_url", label_overrides=label_overrides), b.get("dashboard_url"), inline=True)
+    # Required for case channels: always show Dashboard (never Manage).
+    dash_val = str(b.get("dashboard_url") or "").strip() or "—"
+    embed.add_field(
+        name=_human_label("dashboard_url", label_overrides=label_overrides)[:256],
+        value=dash_val[:1024],
+        inline=True,
+    )
+    _add_field(embed, _human_label("renewal_window", label_overrides=label_overrides), b.get("renewal_window"), inline=False)
 
     # Optional plan/trial details
     _add_field(embed, _human_label("trial_days", label_overrides=label_overrides), b.get("trial_days"), inline=True)
     _add_field(embed, _human_label("plan_is_renewal", label_overrides=label_overrides), b.get("plan_is_renewal"), inline=True)
+    _add_field(embed, _human_label("promo", label_overrides=label_overrides), b.get("promo"), inline=True)
     _add_field(embed, _human_label("pricing", label_overrides=label_overrides), b.get("pricing"), inline=True)
+    _add_field(embed, _human_label("checkout_url", label_overrides=label_overrides), b.get("checkout_url"), inline=False)
 
     # Long text: Payment issue
     _add_field(embed, _human_label("last_payment_failure", label_overrides=label_overrides), b.get("last_payment_failure"), inline=False)
@@ -335,11 +355,14 @@ def build_member_status_detailed_embed(
 
     _add_field(embed, _human_label("trial_days", label_overrides=label_overrides), b.get("trial_days"), inline=True)
     _add_field(embed, _human_label("plan_is_renewal", label_overrides=label_overrides), b.get("plan_is_renewal"), inline=True)
+    _add_field(embed, _human_label("promo", label_overrides=label_overrides), b.get("promo"), inline=True)
     _add_field(embed, _human_label("pricing", label_overrides=label_overrides), b.get("pricing"), inline=True)
 
     _add_field(embed, _human_label("remaining_days", label_overrides=label_overrides), b.get("remaining_days"), inline=True)
     _add_field(embed, _human_label("renewal_end", label_overrides=label_overrides), b.get("renewal_end"), inline=True)
     _add_field(embed, _human_label("dashboard_url", label_overrides=label_overrides), b.get("dashboard_url"), inline=True)
+    _add_field(embed, _human_label("manage_url", label_overrides=label_overrides), b.get("manage_url"), inline=True)
+    _add_field(embed, _human_label("renewal_window", label_overrides=label_overrides), b.get("renewal_window"), inline=False)
 
     _add_field(embed, _human_label("last_success_paid_at", label_overrides=label_overrides), b.get("last_success_paid_at"), inline=True)
     _add_field(embed, _human_label("cancel_at_period_end", label_overrides=label_overrides), b.get("cancel_at_period_end"), inline=True)
@@ -350,6 +373,7 @@ def build_member_status_detailed_embed(
 
     # Long text: Payment issue
     _add_field(embed, _human_label("last_payment_failure", label_overrides=label_overrides), b.get("last_payment_failure"), inline=False)
+    _add_field(embed, _human_label("checkout_url", label_overrides=label_overrides), b.get("checkout_url"), inline=False)
 
     embed.set_footer(text="RSCheckerbot • Member Status Tracking")
     return embed

@@ -233,6 +233,123 @@ def _parse_renewal_window(raw: str) -> tuple[str, str]:
     return (str(a).strip(), str(b).strip())
 
 
+def _promo_from_pricing(pricing: str) -> str:
+    """Return 'yes' if pricing indicates a promo (<60 USD baseline), else 'no'/' '."""
+    s = str(pricing or "").strip()
+    if not s:
+        return ""
+    # Prefer arrow format: "25 → 60 usd" or "0 -> 60 usd"
+    arrow = "→" if "→" in s else ("->" if "->" in s else "")
+    if arrow:
+        left, right = s.split(arrow, 1)
+        nums_l = re.findall(r"(-?\\d+(?:\\.\\d+)?)", left)
+        nums_r = re.findall(r"(-?\\d+(?:\\.\\d+)?)", right)
+        try:
+            before = float(nums_l[0]) if nums_l else None
+        except Exception:
+            before = None
+        try:
+            after = float(nums_r[0]) if nums_r else None
+        except Exception:
+            after = None
+        # Promo rule: if final price is around 60 and initial price is <60, it's a promo.
+        if (after is not None) and (before is not None):
+            if after >= 59.5 and before < 59.5:
+                return "yes"
+            return "no"
+    # Fallback: if we only have one numeric price, treat <60 as promo.
+    nums = re.findall(r"(-?\\d+(?:\\.\\d+)?)", s)
+    if nums:
+        try:
+            v = float(nums[0])
+            return "yes" if v < 59.5 else "no"
+        except Exception:
+            return ""
+    return ""
+
+
+def _build_whop_summary_from_native_kv(extra_kv: dict) -> dict:
+    """Build a Whop summary using native card text as source-of-truth (no formatting/verification)."""
+    extra = extra_kv if isinstance(extra_kv, dict) else {}
+
+    def _get(*keys: str) -> str:
+        for k in keys:
+            ks = str(k or "").strip().lower()
+            if not ks:
+                continue
+            v = str(extra.get(ks) or "").strip()
+            if v:
+                return v
+            v2 = str(extra.get(ks.replace("_", " ")) or "").strip()
+            if v2:
+                return v2
+        return ""
+
+    status = _get("status", "membership_status", "membership status")
+    product = _get("product", "plan", "product title")
+    total_spent = _get("total_spent", "total spent")
+    renewal_window = _get("renewal_window", "renewal window", "renewal")
+    pricing = _get("pricing", "price")
+    promo = _promo_from_pricing(pricing)
+    plan_is_renewal = _get("plan_is_renewal", "plan is renewal")
+    trial_days = _get("trial_days", "trial days")
+    dashboard_url = _get("dashboard_url", "dashboard")
+    manage_url = _get("manage_url", "manage")
+    checkout_url = _get("checkout_url", "checkout", "purchase link")
+    is_first_membership = _get("is_first_membership", "first membership")
+    last_payment_failure = _get("last_payment_failure", "failure reason", "failure message")
+
+    # Keep these as raw strings exactly as Whop posted them (no parsing/formatting).
+    renewal_start = ""
+    renewal_end = ""
+    renewal_window_human = ""
+    remaining_days = ""
+    if renewal_window and ("→" in renewal_window or "->" in renewal_window):
+        ws, we = _parse_renewal_window(renewal_window)
+        renewal_start = ws
+        renewal_end = we
+        # Humanize timestamps and compute window length (days) when possible.
+        try:
+            ds = _parse_dt_any(ws)
+            de = _parse_dt_any(we)
+        except Exception:
+            ds = None
+            de = None
+        if ds and de:
+            with suppress(Exception):
+                renewal_start = _fmt_date_any(ds.isoformat().replace("+00:00", "Z"))
+            with suppress(Exception):
+                renewal_end = _fmt_date_any(de.isoformat().replace("+00:00", "Z"))
+            # Requested: remaining_days = renewal_end - renewal_start (window length)
+            try:
+                days = int(max(0.0, (de - ds).total_seconds()) / 86400.0 + 0.00001)
+                remaining_days = str(days)
+            except Exception:
+                remaining_days = ""
+        # Keep a human-readable window string too (for staff view).
+        if renewal_start and renewal_end:
+            renewal_window_human = f"{renewal_start} → {renewal_end}"
+
+    return {
+        "status": status,
+        "product": product,
+        "total_spent": total_spent,
+        "renewal_window": renewal_window_human or renewal_window,
+        "renewal_start": renewal_start,
+        "renewal_end": renewal_end,
+        "remaining_days": remaining_days,
+        "promo": promo,
+        "pricing": pricing,
+        "plan_is_renewal": plan_is_renewal,
+        "trial_days": trial_days,
+        "dashboard_url": dashboard_url,
+        "manage_url": manage_url,
+        "checkout_url": checkout_url,
+        "is_first_membership": is_first_membership,
+        "last_payment_failure": last_payment_failure,
+    }
+
+
 def _build_whop_summary(event_data: dict, *, extra_kv: dict | None = None) -> dict:
     """Build a staff-safe Whop summary from webhook data (no cache lookups)."""
     extra = extra_kv if isinstance(extra_kv, dict) else {}
@@ -283,6 +400,7 @@ def _build_whop_summary(event_data: dict, *, extra_kv: dict | None = None) -> di
 
     trial_days = _val("trial_days", "trial_period_days", "trial_days_remaining")
     pricing = _val("pricing", "price", "plan_price")
+    promo = _promo_from_pricing(pricing)
     plan_is_renewal = _val("plan_is_renewal", "plan is renewal", "plan_is_renewal?")
     first_membership = _val("first_membership", "first membership", "is_first_membership")
     manage_url = _val("manage_url", "manage", "billing_manage")
@@ -297,15 +415,18 @@ def _build_whop_summary(event_data: dict, *, extra_kv: dict | None = None) -> di
         "member_since": _val("created_at", "member_since"),
         "trial_end": _val("trial_end", "trial_ends_at", "trial_end_at"),
         "trial_days": trial_days,
+        "renewal_window": window_raw,
         "renewal_start": _fmt_date_any(renewal_start_raw) if renewal_start_raw else "",
         "renewal_end": renewal_end_fmt or (_fmt_date_any(renewal_end_raw) if renewal_end_raw else ""),
         "renewal_end_iso": renewal_end_iso,
         "remaining_days": remaining_days,
         "manage_url": manage_url,
         "dashboard_url": dashboard_url,
+        "checkout_url": _val("checkout_url", "checkout", "purchase link"),
         "cancel_at_period_end": cancel_at_period_end,
         "is_first_membership": is_first_membership or first_membership,
         "plan_is_renewal": plan_is_renewal,
+        "promo": promo,
         "pricing": pricing,
         "last_payment_method": "",
         "last_payment_type": "",
@@ -323,9 +444,14 @@ def _summary_to_event_fields(summary: dict) -> dict[str, str]:
         "product": str(summary.get("product") or "").strip(),
         "status": str(summary.get("status") or "").strip(),
         "trial_days": str(summary.get("trial_days") or "").strip(),
+        "promo": str(summary.get("promo") or "").strip(),
         "pricing": str(summary.get("pricing") or "").strip(),
         "total_spent": str(summary.get("total_spent") or "").strip(),
         "cancel_at_period_end": str(summary.get("cancel_at_period_end") or "").strip(),
+        "renewal_window": str(summary.get("renewal_window") or "").strip(),
+        "dashboard_url": str(summary.get("dashboard_url") or "").strip(),
+        "manage_url": str(summary.get("manage_url") or "").strip(),
+        "checkout_url": str(summary.get("checkout_url") or "").strip(),
         "renewal_period_start": str(summary.get("renewal_start") or "").strip(),
         "renewal_period_end": str(summary.get("renewal_end") or "").strip(),
         "renewal_end_iso": str(summary.get("renewal_end_iso") or "").strip(),
@@ -1241,11 +1367,8 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
         # Merge: embed fields take precedence, content as fallback
         parsed_data = {**content_data, **fields_data}
         flat_kv = _flatten_field_kv(fields_data)
-        summary_from_native = {}
-        try:
-            summary_from_native = _build_whop_summary(parsed_data, extra_kv=flat_kv)
-        except Exception:
-            summary_from_native = {}
+        # For native Whop cards, treat the posted card text as the source of truth.
+        summary_from_native = _build_whop_summary_from_native_kv(flat_kv)
 
         # Extract membership status and event type (usable even when Discord ID is missing)
         membership_status = parsed_data.get("membership_status", "") or fields_data.get("membership status", "")
@@ -1404,8 +1527,39 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
 
         # Process role changes if member found
         if member:
+            title_l = title.lower()
+            desc_l = description.lower()
+
+            # Membership Activated (Pending) / Activation PENDING
+            if ("activation pending" in title_l) or ("activation pending" in desc_l) or ("activated (pending)" in title_l) or ("activated (pending)" in desc_l):
+                event_data = {
+                    "event_type": "membership.activated.pending",
+                    "discord_user_id": str(discord_user_id),
+                    "email": email_value,
+                }
+                if membership_id_hint:
+                    event_data["membership_id"] = membership_id_hint
+                if isinstance(summary_from_native, dict) and summary_from_native:
+                    event_data["_whop_summary"] = summary_from_native
+                await handle_membership_activated_pending(member, event_data)
+                return
+
+            # Billing Issue (Access Risk)
+            if ("billing issue" in title_l) or ("billing issue" in desc_l) or ("access risk" in title_l) or ("access risk" in desc_l):
+                event_data = {
+                    "event_type": "membership.deactivated.billing_issue",
+                    "discord_user_id": str(discord_user_id),
+                    "email": email_value,
+                }
+                if membership_id_hint:
+                    event_data["membership_id"] = membership_id_hint
+                if isinstance(summary_from_native, dict) and summary_from_native:
+                    event_data["_whop_summary"] = summary_from_native
+                await handle_membership_billing_issue_access_risk(member, event_data)
+                return
+
             # Check for payment failed
-            if "payment failed" in title.lower() or "payment failed" in description.lower():
+            if "payment failed" in title_l or "payment failed" in desc_l:
                 event_data = {
                     "event_type": "payment.failed",
                     "discord_user_id": str(discord_user_id),
@@ -1418,8 +1572,8 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                 await handle_payment_failed(member, event_data)
 
             # Check for payment received / succeeded (native cards)
-            elif "payment received" in title.lower() or "payment received" in description.lower() or "payment succeeded" in title.lower() or "payment succeeded" in description.lower():
-                is_renewal = ("renewal" in title.lower()) or ("renewal" in description.lower()) or ("renewal" in (message.content or "").lower())
+            elif "payment received" in title_l or "payment received" in desc_l or "payment succeeded" in title_l or "payment succeeded" in desc_l:
+                is_renewal = ("renewal" in title_l) or ("renewal" in desc_l) or ("renewal" in (message.content or "").lower())
                 evt = "payment.succeeded.renewal" if is_renewal else "payment.succeeded.activation"
                 event_data = {
                     "event_type": evt,
@@ -1436,7 +1590,7 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                     await handle_payment_activation(member, event_data)
 
             # Check for cancel action
-            elif "performing cancel" in description.lower() or "removeallroles" in description.lower():
+            elif "performing cancel" in desc_l or "removeallroles" in desc_l:
                 event_data = {
                     "event_type": "membership.deactivated",
                     "discord_user_id": str(discord_user_id),
@@ -1448,7 +1602,7 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                 await handle_membership_deactivated(member, event_data)
 
             # Check for membership status changes
-            elif "membership update" in title.lower():
+            elif "membership update" in title_l:
                 if "past due" in membership_status.lower():
                     if _log_member_status:
                         await _log_member_status(f"⚠️ **Whop Native:** {_fmt_user(member)} - Membership Past Due")
@@ -1627,6 +1781,17 @@ async def handle_membership_activated_pending(member: discord.Member, event_data
     
     # Verify with API after processing
     await _verify_webhook_with_api(member, event_data, "membership.activated.pending")
+
+
+async def handle_membership_billing_issue_access_risk(member: discord.Member, event_data: dict):
+    """Handle billing issue risk card (staff alert; no role removals)."""
+    await handle_membership_deactivated(
+        member,
+        event_data,
+        case_channel_name=PAYMENT_FAILURE_CHANNEL_NAME,
+        title_override="⚠️ Billing Issue (Access Risk)",
+        color_override=0xFEE75C,
+    )
 
 
 async def handle_membership_deactivated(
