@@ -6,9 +6,6 @@ import re
 import csv
 import io
 import time
-import base64
-import hashlib
-import hmac
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import logging
@@ -76,6 +73,7 @@ from whop_webhook_handler import (
 
 # Import Whop API client
 from whop_api_client import WhopAPIClient, WhopAPIError
+from shared.whop_webhook_utils import verify_standard_webhook
 
 # Reporting store (runtime JSON; persisted only for member-status-logs output)
 try:
@@ -388,67 +386,6 @@ async def _record_whop_event(event: dict) -> bool:
         log.warning(f"[WhopEvents] Failed to append event {event_id}: {e}")
         return False
     return True
-
-
-def _decode_webhook_secret(secret: str) -> bytes:
-    s = str(secret or "").strip()
-    if not s:
-        return b""
-    if s.startswith("whsec_"):
-        s = s[len("whsec_"):]
-    try:
-        return base64.b64decode(s)
-    except Exception:
-        return s.encode("utf-8")
-
-
-def _parse_webhook_signatures(sig_header: str) -> list[str]:
-    out: list[str] = []
-    for part in str(sig_header or "").split():
-        token = part.strip()
-        if not token:
-            continue
-        if "," in token:
-            _ver, sig = token.split(",", 1)
-            out.append(sig.strip())
-            continue
-        if "=" in token:
-            _ver, sig = token.split("=", 1)
-            out.append(sig.strip())
-            continue
-        out.append(token)
-    return [s for s in out if s]
-
-
-def _verify_standard_webhook(headers: dict, body_bytes: bytes) -> tuple[bool, str]:
-    if not WHOP_WEBHOOK_VERIFY:
-        return (True, "disabled")
-    secret = WHOP_WEBHOOK_SECRET or os.getenv("WHOP_WEBHOOK_SECRET", "")
-    if not secret:
-        return (False, "missing_webhook_secret")
-    wh_id = str(headers.get("webhook-id") or "").strip()
-    wh_ts = str(headers.get("webhook-timestamp") or "").strip()
-    wh_sig = str(headers.get("webhook-signature") or "").strip()
-    if not wh_id or not wh_ts or not wh_sig:
-        return (False, "missing_headers")
-    try:
-        ts_i = int(float(wh_ts))
-    except Exception:
-        return (False, "bad_timestamp")
-    if WHOP_WEBHOOK_TOLERANCE_SECONDS > 0:
-        now = int(time.time())
-        if abs(now - ts_i) > int(WHOP_WEBHOOK_TOLERANCE_SECONDS):
-            return (False, "timestamp_out_of_range")
-    signed_content = f"{wh_id}.{wh_ts}.{body_bytes.decode('utf-8', errors='ignore')}"
-    secret_bytes = _decode_webhook_secret(secret)
-    if not secret_bytes:
-        return (False, "bad_secret")
-    digest = hmac.new(secret_bytes, signed_content.encode("utf-8"), hashlib.sha256).digest()
-    expected = base64.b64encode(digest).decode("utf-8")
-    for sig in _parse_webhook_signatures(wh_sig):
-        if hmac.compare_digest(expected, sig):
-            return (True, "ok")
-    return (False, "signature_mismatch")
 
 
 def _whop_event_from_webhook_payload(payload: dict, *, event_id: str, occurred_at: datetime) -> dict:
@@ -2434,7 +2371,13 @@ async def handle_whop_webhook_receiver(request):
         raw_body = await request.read()
         headers = {k.lower(): v for k, v in dict(request.headers).items()}
 
-        ok, reason = _verify_standard_webhook(headers, raw_body)
+        ok, reason = verify_standard_webhook(
+            headers,
+            raw_body,
+            secret=WHOP_WEBHOOK_SECRET,
+            tolerance_seconds=WHOP_WEBHOOK_TOLERANCE_SECONDS,
+            verify=WHOP_WEBHOOK_VERIFY,
+        )
         if not ok:
             log.warning(f"[WhopWebhook] Signature verification failed: {reason}")
             return web.Response(text=f"Invalid webhook signature ({reason})", status=401)
@@ -3241,6 +3184,11 @@ async def on_ready():
     # Backfill Whop timeline from whop_history.json (before initializing whop handler)
     _backfill_whop_timeline_from_whop_history()
     _load_whop_event_dedupe_cache()
+    if WHOP_EVENTS_ENABLED:
+        try:
+            WHOP_EVENTS_FILE.touch(exist_ok=True)
+        except Exception as e:
+            log.warning(f"[WhopEvents] Failed to create ledger file: {e}")
     guild = bot.get_guild(GUILD_ID)
     if guild:
         log.info(f"[Bot] Connected to: {guild.name}")
@@ -5173,8 +5121,11 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
         return
 
     if not WHOP_EVENTS_FILE.exists():
-        await ctx.send("❌ Whop event ledger file not found. Wait for events or re-run after logs arrive.", delete_after=20)
-        return
+        try:
+            WHOP_EVENTS_FILE.touch(exist_ok=True)
+        except Exception as e:
+            await ctx.send(f"❌ Whop event ledger file not found ({e}).", delete_after=20)
+            return
 
     # Mountain Time (boss): use America/Denver for day boundaries during dedupe.
     scan_tz = None

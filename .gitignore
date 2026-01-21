@@ -14,6 +14,12 @@
 # Allow canonical docs at repo root
 !/CANONICAL_RULES.md
 
+# Allow shared utilities
+!shared/
+!shared/**/
+!shared/*.py
+!shared/**/*.py
+
 # Allow non-secret Oracle server list (keys remain untracked)
 !oraclekeys/
 !oraclekeys/servers.json

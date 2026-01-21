@@ -97,6 +97,18 @@
     "flush_seconds": 1,
     "max_chars": 1800
   },
+  "whop_webhook": {
+    "enabled": false,
+    "http_server_port": 8092,
+    "path": "/whop-webhook",
+    "verify": true,
+    "tolerance_seconds": 300,
+    "test_server_channel_id": "",
+    "test_server_category_id": "",
+    "channel_name": "whop-raw-logs",
+    "post_raw_payloads": true,
+    "max_log_chars": 1800
+  },
   "commands_catalog": {
     "enabled": true,
     "post_on_startup": true,

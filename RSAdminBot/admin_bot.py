@@ -29,8 +29,10 @@ from collections import deque
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable
 from datetime import datetime, timezone
+from contextlib import suppress
 
 import aiohttp
+from aiohttp import web
 
 # Ensure repo root is importable when executed as a script (matches Ubuntu run_bot.sh PYTHONPATH).
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +43,7 @@ from mirror_world_config import load_config_with_secrets
 from mirror_world_config import is_placeholder_secret, mask_secret
 from mirror_world_config import _deep_merge_dict
 from mirror_world_config import load_oracle_servers, pick_oracle_server, resolve_oracle_ssh_key_path
+from shared.whop_webhook_utils import verify_standard_webhook
 
 from rsbots_manifest import compare_manifests as rs_compare_manifests
 from rsbots_manifest import generate_manifest as rs_generate_manifest
@@ -2022,6 +2025,10 @@ class RSAdminBot:
         
         self.load_config()
 
+        self._whop_webhook_runner: Optional[web.AppRunner] = None
+        self._whop_webhook_site: Optional[web.TCPSite] = None
+        self._whop_webhook_lock: asyncio.Lock = asyncio.Lock()
+
         # Load SSH server config (must exist before logger init; logger may reference current_server)
         self.servers: List[Dict[str, Any]] = []
         self.current_server: Optional[Dict[str, Any]] = None
@@ -2625,6 +2632,198 @@ echo "TARGET=$TARGET"
             "journal_by_bot": journal_by_bot,
             "systemd_events_url": str(cfg.get("systemd_events_url") or ""),
         }
+
+    def _get_whop_webhook_config(self) -> Dict[str, Any]:
+        """Return Whop webhook receiver config (merged from config.secrets.json)."""
+        cfg = self.config.get("whop_webhook") if isinstance(self.config, dict) else {}
+        cfg = cfg if isinstance(cfg, dict) else {}
+
+        def _as_bool(v: object) -> bool:
+            if isinstance(v, bool):
+                return v
+            return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+        def _as_int(v: object) -> int:
+            try:
+                s = str(v).strip()
+                return int(s) if s else 0
+            except Exception:
+                return 0
+
+        def _as_str(v: object) -> str:
+            return str(v or "").strip()
+
+        return {
+            "enabled": _as_bool(cfg.get("enabled", False)),
+            "http_server_port": _as_int(cfg.get("http_server_port") or 0),
+            "path": _as_str(cfg.get("path") or "/whop-webhook") or "/whop-webhook",
+            "verify": _as_bool(cfg.get("verify", True)),
+            "tolerance_seconds": _as_int(cfg.get("tolerance_seconds") or 300),
+            "secret": _as_str(cfg.get("secret") or ""),
+            "test_server_channel_id": _as_int(cfg.get("test_server_channel_id") or 0),
+            "test_server_category_id": _as_int(cfg.get("test_server_category_id") or 0),
+            "channel_name": _as_str(cfg.get("channel_name") or "whop-raw-logs") or "whop-raw-logs",
+            "post_raw_payloads": _as_bool(cfg.get("post_raw_payloads", True)),
+            "max_log_chars": _as_int(cfg.get("max_log_chars") or 1800),
+        }
+
+    async def _ensure_test_server_channel(
+        self,
+        *,
+        channel_id: int,
+        channel_name: str,
+        category_id: int,
+    ) -> Optional[discord.TextChannel]:
+        """Return a test server channel, creating it by name if needed."""
+        if channel_id:
+            ch = self.bot.get_channel(int(channel_id))
+            return ch if isinstance(ch, discord.TextChannel) else None
+
+        try:
+            gid = int(self.config.get("test_server_guild_id") or 0)
+        except Exception:
+            gid = 0
+        if not gid:
+            return None
+        guild = self.bot.get_guild(gid)
+        if not guild:
+            return None
+
+        # Resolve optional category
+        category = None
+        if category_id:
+            cat = guild.get_channel(int(category_id))
+            if isinstance(cat, discord.CategoryChannel):
+                category = cat
+
+        name = str(channel_name or "").strip().lower()
+        if not name:
+            return None
+
+        found = discord.utils.get(guild.text_channels, name=name)
+        if found and isinstance(found, discord.TextChannel):
+            if category and found.category_id != category.id:
+                with suppress(Exception):
+                    await found.edit(category=category, reason="RSAdminBot whop webhook raw logs")
+            return found
+
+        try:
+            created = await guild.create_text_channel(
+                name,
+                category=category,
+                reason="RSAdminBot whop webhook raw logs",
+            )
+            return created
+        except Exception:
+            return None
+
+    async def _append_whop_webhook_raw(self, record: Dict[str, Any]) -> None:
+        """Append a raw webhook record to JSONL (best-effort)."""
+        try:
+            async with self._whop_webhook_lock:
+                data_dir = self.base_path / "whop_data"
+                data_dir.mkdir(parents=True, exist_ok=True)
+                path = data_dir / "whop_webhook_raw_payloads.jsonl"
+                line = json.dumps(record, ensure_ascii=True)
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+        except Exception:
+            pass
+
+    async def _post_whop_webhook_log(self, payload: dict, headers: dict, *, status: str) -> None:
+        cfg = self._get_whop_webhook_config()
+        if not cfg.get("post_raw_payloads"):
+            return
+        ch = await self._ensure_test_server_channel(
+            channel_id=int(cfg.get("test_server_channel_id") or 0),
+            channel_name=str(cfg.get("channel_name") or ""),
+            category_id=int(cfg.get("test_server_category_id") or 0),
+        )
+        if not isinstance(ch, discord.TextChannel):
+            return
+
+        event_type = str(payload.get("type") or payload.get("event_type") or payload.get("event") or "").strip()
+        event_id = str(payload.get("id") or headers.get("webhook-id") or "").strip()
+        ts = str(headers.get("webhook-timestamp") or "")
+
+        embed = MessageHelper.create_status_embed(
+            title="Whop Webhook (Raw)",
+            description="",
+            color=discord.Color.blue() if status == "ok" else discord.Color.red(),
+            fields=[
+                {"name": "Status", "value": status, "inline": True},
+                {"name": "Type", "value": event_type or "—", "inline": True},
+                {"name": "Event ID", "value": event_id or "—", "inline": True},
+                {"name": "Timestamp", "value": ts or "—", "inline": True},
+            ],
+            footer="RSAdminBot",
+        )
+
+        max_chars = int(cfg.get("max_log_chars") or 1800)
+        raw = json.dumps(payload, ensure_ascii=True)
+        if max_chars > 0:
+            raw = raw[:max_chars]
+        content = f"```json\n{raw}\n```" if raw else ""
+        with suppress(Exception):
+            await ch.send(content=content or None, embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+    async def _handle_whop_webhook_receiver(self, request: web.Request) -> web.Response:
+        cfg = self._get_whop_webhook_config()
+        try:
+            raw_body = await request.read()
+            headers = {k.lower(): v for k, v in dict(request.headers).items()}
+
+            ok, reason = verify_standard_webhook(
+                headers,
+                raw_body,
+                secret=str(cfg.get("secret") or ""),
+                tolerance_seconds=int(cfg.get("tolerance_seconds") or 0),
+                verify=bool(cfg.get("verify", True)),
+            )
+            if not ok:
+                log_msg = f"[WhopWebhook] Signature verification failed: {reason}"
+                print(log_msg)
+                return web.Response(text=f"Invalid webhook signature ({reason})", status=401)
+
+            try:
+                payload = json.loads(raw_body.decode("utf-8"))
+            except Exception:
+                print("[WhopWebhook] Invalid JSON payload")
+                return web.Response(text="Invalid JSON payload", status=400)
+
+            record = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "headers": headers,
+                "payload": payload,
+            }
+            await self._append_whop_webhook_raw(record)
+            asyncio.create_task(self._post_whop_webhook_log(payload, headers, status="ok"))
+
+            return web.Response(text="OK", status=200)
+        except Exception as e:
+            print(f"[WhopWebhook] Error handling webhook receiver: {e}")
+            return web.Response(text=f"Error: {str(e)}", status=500)
+
+    async def _initialize_whop_webhook_receiver(self) -> None:
+        cfg = self._get_whop_webhook_config()
+        if not cfg.get("enabled"):
+            return
+        if self._whop_webhook_runner:
+            return
+        port = int(cfg.get("http_server_port") or 0)
+        if port <= 0:
+            print("[WhopWebhook] Missing whop_webhook.http_server_port; receiver disabled")
+            return
+        path = str(cfg.get("path") or "/whop-webhook") or "/whop-webhook"
+        app = web.Application()
+        app.router.add_post(path, self._handle_whop_webhook_receiver)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        self._whop_webhook_runner = runner
+        self._whop_webhook_site = site
+        print(f"[WhopWebhook] Receiver listening on http://0.0.0.0:{port}{path}")
 
     def _load_secrets_dict(self) -> Dict[str, Any]:
         """Load RSAdminBot/config.secrets.json (server-only)."""
@@ -5391,6 +5590,12 @@ echo "CHANGED_END"
                     await self._initialize_journal_live()
                 except Exception as e:
                     print(f"{Colors.YELLOW}[Startup] Journal live initialization failed (non-critical): {e}{Colors.RESET}")
+
+                # Initialize Whop webhook receiver (test server raw logs)
+                try:
+                    await self._initialize_whop_webhook_receiver()
+                except Exception as e:
+                    print(f"{Colors.YELLOW}[Startup] Whop webhook receiver failed (non-critical): {e}{Colors.RESET}")
 
                 # Publish a command catalog to the configured channel (optional).
                 try:
