@@ -37,7 +37,7 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 - **Note**: Command message is auto-deleted
 
 #### `.checker report`
-- **Description**: Generate a reporting summary for a date range (from `reporting_store.json`) and DM it, or run a one-time scan to rebuild the store + DM a downloadable CSV, or run a Whop debug report for a specific membership/Discord ID
+- **Description**: Generate a reporting summary for a date range (from `reporting_store.json`) and DM it, or run a one-time scan from the Whop Event Ledger to rebuild the store + DM a downloadable CSV, or run a Whop debug report for a specific membership/Discord ID
 - **Aliases**: `reports`
 - **Parameters**:
   - `start` (optional): Start date `YYYY-MM-DD`
@@ -52,7 +52,7 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
   - `.checker report` (interactive picker; default last 7 days)
   - `.checker report 2026-01-01` (from date → now)
   - `.checker report 2026-01-01 2026-01-07` (inclusive range)
-  - `.checker report scan whop 2026-01-01 2026-01-31 confirm` (one-time scan Whop API + CSV)
+  - `.checker report scan whop 2026-01-01 2026-01-31 confirm` (one-time scan Whop Event Ledger + CSV)
   - `.checker report scan whop 2026-01-01 2026-01-31 confirm sample` (same scan, but CSV is anonymized sample output)
   - `.checker report scan memberstatus 2026-01-01 2026-01-31 confirm` (one-time scan `member-status-logs` history)
   - `.checker report debug mem_abc123 2026-01-01 2026-01-31` (Whop debug for a specific membership)
@@ -65,6 +65,7 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 - **Notes**:
   - Normal mode reads the bounded runtime `reporting_store.json`
   - Scan mode overwrites/rebuilds the reporting store for that scanned window
+  - `scan whop` reads the Whop Event Ledger (`whop_events.jsonl`) built from member-logs + webhooks
   - `scan whop` uses Mountain Time (`America/Denver`) day boundaries for dedupe per membership per day/event
   - Interactive picker exposes Manual / Scan / Debug options in a dropdown
   - If you see `Permission denied` for `reporting_store.json.tmp`, the bot service user cannot write to the `RSCheckerbot/` folder on the server (common cause: stale root-owned `.tmp` file). Fix ownership/permissions and retry.
@@ -196,6 +197,6 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 - DM sequence is controlled by `dm_sequence_enabled` setting
 - Sequence days: day_1, day_2, day_3, day_4, day_5, day_6, day_7a, day_7b
 - Whop API integration requires valid API key and company ID in config
-- Membership lookups use cached membership IDs when available
+- Membership lookups use `member_history.json` (`whop.last_membership_id`) when available
 - Legacy case channels are identified by topic containing `rschecker_payment_case` or name starting with `pay-`
 - Cleanup removes old data from registry and invites based on configured retention periods

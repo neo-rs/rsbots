@@ -83,20 +83,7 @@ async def _fetch_whop_brief(cfg: dict, membership_id: str) -> dict:
 
 
 def _resolve_membership_id(discord_id: int) -> str:
-    # Primary: whop_discord_link.json
-    p = REPO_ROOT / "RSCheckerbot" / "whop_discord_link.json"
-    if p.exists():
-        try:
-            db = json.loads(p.read_text(encoding="utf-8") or "{}")
-            rec = (db.get("by_discord_id") or {}).get(str(discord_id))
-            if isinstance(rec, dict):
-                mid = str(rec.get("membership_id") or "").strip()
-                if mid:
-                    return mid
-        except Exception:
-            pass
-
-    # Fallback: member_history.json (whop.last_membership_id)
+    # Primary: member_history.json (whop.last_membership_id / last_whop_key)
     p2 = REPO_ROOT / "RSCheckerbot" / "member_history.json"
     if p2.exists():
         try:
@@ -104,8 +91,8 @@ def _resolve_membership_id(discord_id: int) -> str:
             rec = db.get(str(discord_id))
             wh = rec.get("whop") if isinstance(rec, dict) else None
             if isinstance(wh, dict):
-                mid = str(wh.get("last_membership_id") or "").strip()
-                if mid:
+                mid = str(wh.get("last_membership_id") or wh.get("last_whop_key") or "").strip()
+                if mid.startswith(("mem_", "R-")):
                     return mid
         except Exception:
             pass

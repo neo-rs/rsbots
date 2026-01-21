@@ -71,7 +71,13 @@
     "report_time_local": "09:00",
     "weekly_day_local": "mon",
     "retention_weeks": 26,
-    "reminder_days_before_cancel": [7, 3, 1]
+    "reminder_days_before_cancel": [7, 3, 1],
+    "scan_log_channel_id": 0,
+    "scan_log_webhook_url": "",
+    "scan_log_each_member": false,
+    "scan_log_include_raw_dates": false,
+    "scan_log_max_members": 0,
+    "scan_log_progress_every": 50
   },
 
   "whop_enrichment": {

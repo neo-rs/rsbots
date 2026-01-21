@@ -9370,8 +9370,25 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
             whop_brief = {}
             membership_id_used = membership_override
             whop_fetch = {"status": "skipped", "error": "", "membership_id": "", "used_override": bool(membership_override)}
+
+            def _membership_id_from_history(discord_id: int) -> str:
+                try:
+                    hist_path = _REPO_ROOT / "RSCheckerbot" / "member_history.json"
+                    if not hist_path.exists():
+                        return ""
+                    data = json.loads(hist_path.read_text(encoding="utf-8") or "{}")
+                    if not isinstance(data, dict):
+                        return ""
+                    rec = data.get(str(discord_id), {})
+                    wh = rec.get("whop") if isinstance(rec, dict) else None
+                    if isinstance(wh, dict):
+                        mid = str(wh.get("last_membership_id") or wh.get("last_whop_key") or "").strip()
+                        if mid.startswith(("mem_", "R-")):
+                            return mid
+                except Exception:
+                    return ""
+                return ""
             try:
-                from RSCheckerbot.whop_webhook_handler import get_cached_whop_membership_id  # type: ignore
                 from RSCheckerbot.whop_api_client import WhopAPIClient  # type: ignore
                 from RSCheckerbot.whop_brief import fetch_whop_brief  # type: ignore
 
@@ -9383,7 +9400,7 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                     if api_key and company_id:
                         client = WhopAPIClient(api_key=api_key, base_url=base_url, company_id=company_id)
                         if not membership_id_used:
-                            membership_id_used = get_cached_whop_membership_id(target_member.id)
+                            membership_id_used = _membership_id_from_history(target_member.id)
                         mid = membership_id_used
                         whop_fetch["membership_id"] = mid or ""
                         if mid:

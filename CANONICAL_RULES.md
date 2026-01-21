@@ -280,16 +280,20 @@ Notes:
 ## Whop Data Sources and Reporting Fields (RSCheckerbot)
 
 ### Sources of truth (canonical)
+- **Whop Event Ledger (`whop_events.jsonl`)**:
+  - Append-only ledger for reporting, built from Whop member-logs + verified webhooks.
+  - `.checker report scan whop` reads from this ledger; `reporting_store.json` is derived.
 - **Whop member-logs channel** (native Whop integration posts):
   - Used for **event visibility** and staff-facing summaries.
   - Parsed into **staff-safe summaries** stored under `member_history.json -> whop.last_summary`.
-  - Not a durable ledger; do not depend on it for authoritative state.
+  - Ingestion source only; not authoritative by itself.
 - **Whop API**:
   - Used for **authoritative status** and details when membership_id is present.
   - Required for disputes/resolution details and payment failure reasons.
 
 ### Deprecated / removed
 - `whop_discord_link.json` is deprecated and should not be created or used.
+- `reporting_store.json` is a derived cache (rebuild via `.checker report scan ...`).
 
 ### Allowed reporting fields (staff-safe)
 - Membership: `status`, `product`, `membership_id`, `first_membership`, `cancel_at_period_end`

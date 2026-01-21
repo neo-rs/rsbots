@@ -57,6 +57,7 @@ _log_other = None
 _log_member_status = None
 _fmt_user = None
 _record_member_whop_summary = None
+_record_whop_event = None
 
 # Identity tracking and trial abuse detection
 MEMBER_STATUS_LOGS_CHANNEL_ID = None
@@ -313,6 +314,41 @@ def _build_whop_summary(event_data: dict, *, extra_kv: dict | None = None) -> di
         "last_success_paid_at": "—",
         "total_spent": total_spent_val,
     }
+
+
+def _summary_to_event_fields(summary: dict) -> dict[str, str]:
+    if not isinstance(summary, dict):
+        return {}
+    return {
+        "product": str(summary.get("product") or "").strip(),
+        "status": str(summary.get("status") or "").strip(),
+        "trial_days": str(summary.get("trial_days") or "").strip(),
+        "pricing": str(summary.get("pricing") or "").strip(),
+        "total_spent": str(summary.get("total_spent") or "").strip(),
+        "cancel_at_period_end": str(summary.get("cancel_at_period_end") or "").strip(),
+        "renewal_period_start": str(summary.get("renewal_start") or "").strip(),
+        "renewal_period_end": str(summary.get("renewal_end") or "").strip(),
+        "renewal_end_iso": str(summary.get("renewal_end_iso") or "").strip(),
+    }
+
+
+def _event_reason_from_data(event_data: dict, extra_kv: dict | None = None) -> str:
+    extra = extra_kv if isinstance(extra_kv, dict) else {}
+    return _pick_first(
+        _safe_get(event_data, "failure_reason", "cancellation_reason", "reason", default="").strip(),
+        str(extra.get("failure reason") or "").strip(),
+        str(extra.get("cancellation reason") or "").strip(),
+        str(extra.get("reason") or "").strip(),
+    )
+
+
+async def _record_whop_event_if_possible(event: dict) -> None:
+    if not _record_whop_event:
+        return
+    try:
+        await _record_whop_event(event)
+    except Exception:
+        return
 
 
 def _record_whop_summary_if_possible(*, member_id: int, summary: dict, event_data: dict) -> None:
@@ -842,7 +878,7 @@ def _safe_get(event_data: dict, *keys: str, default: str = "—") -> str:
 
 def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_role_id, role_cancel_a, role_cancel_b,
                log_other_func, log_member_status_func, fmt_user_func, member_status_logs_channel_id=None,
-               record_member_whop_summary_func=None,
+               record_member_whop_summary_func=None, record_whop_event_func=None,
                whop_api_key=None, whop_api_config=None,
                dispute_channel_id=None, resolution_channel_id=None,
                support_ping_role_id=None, support_ping_role_name=None,
@@ -862,6 +898,7 @@ def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_r
         fmt_user_func: Function to format user display (canonical owner)
         member_status_logs_channel_id: Channel ID for member status logs (lookup requests, trial alerts)
         record_member_whop_summary_func: Function to persist a Whop summary into member_history
+        record_whop_event_func: Function to persist normalized Whop event records
         whop_api_key: Whop API key (optional, from config.secrets.json)
         whop_api_config: Whop API configuration dict (optional, from config.json)
     """
@@ -869,7 +906,7 @@ def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_r
     global WHOP_SUPPORT_PING_ROLE_ID, WHOP_SUPPORT_PING_ROLE_NAME
     global ROLE_TRIGGER, WELCOME_ROLE_ID, ROLE_CANCEL_A, ROLE_CANCEL_B
     global LIFETIME_ROLE_IDS
-    global _log_other, _log_member_status, _fmt_user, _record_member_whop_summary
+    global _log_other, _log_member_status, _fmt_user, _record_member_whop_summary, _record_whop_event
     global MEMBER_STATUS_LOGS_CHANNEL_ID, EXPECTED_ROLES, _whop_api_client, _whop_api_config
     
     WHOP_WEBHOOK_CHANNEL_ID = webhook_channel_id
@@ -894,6 +931,7 @@ def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_r
     _log_member_status = log_member_status_func
     _fmt_user = fmt_user_func
     _record_member_whop_summary = record_member_whop_summary_func
+    _record_whop_event = record_whop_event_func
     MEMBER_STATUS_LOGS_CHANNEL_ID = member_status_logs_channel_id
     
     # Load expected roles config
@@ -1019,6 +1057,33 @@ async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embe
             summary = _build_whop_summary(event_data)
             if summary:
                 event_data["_whop_summary"] = summary
+        except Exception:
+            pass
+
+        # Record event ledger entry (even if Discord ID is missing).
+        try:
+            summary = event_data.get("_whop_summary") if isinstance(event_data, dict) else {}
+            fields = _summary_to_event_fields(summary if isinstance(summary, dict) else {})
+            reason = _event_reason_from_data(event_data)
+            event = {
+                "event_id": f"discord:{message.id}",
+                "source": "whop_discord_webhook",
+                "event_type": str(event_type or "").strip(),
+                "occurred_at": message.created_at.isoformat() if message.created_at else datetime.now(timezone.utc).isoformat(),
+                "membership_id": str(membership_id_val or _membership_id_from_event(None, event_data)).strip(),
+                "user_id": str(_safe_get(event_data, "user_id", "user.id", default="") or "").strip(),
+                "member_id": str(_safe_get(event_data, "member_id", "member.id", default="") or "").strip(),
+                "discord_id": str(discord_user_id or "").strip(),
+                "email": str(email or "").strip(),
+                "reason": reason,
+                "source_discord": {
+                    "channel_id": getattr(message.channel, "id", ""),
+                    "message_id": message.id,
+                    "jump_url": getattr(message, "jump_url", ""),
+                },
+            }
+            event.update(fields)
+            await _record_whop_event_if_possible(event)
         except Exception:
             pass
 
@@ -1212,6 +1277,32 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                     membership_id_hint = whop_key
         except Exception:
             membership_id_hint = ""
+
+        # Record event ledger entry (even if Discord ID is missing).
+        try:
+            fields = _summary_to_event_fields(summary_from_native)
+            reason = _event_reason_from_data(parsed_data, flat_kv)
+            event = {
+                "event_id": f"discord:{message.id}",
+                "source": "whop_discord_logs",
+                "event_type": str(event_type or "").strip(),
+                "occurred_at": message.created_at.isoformat() if message.created_at else datetime.now(timezone.utc).isoformat(),
+                "membership_id": str(membership_id_hint or parsed_data.get("membership_id") or parsed_data.get("membership id") or "").strip(),
+                "user_id": str(parsed_data.get("user_id") or parsed_data.get("user id") or "").strip(),
+                "member_id": str(parsed_data.get("member_id") or parsed_data.get("member id") or "").strip(),
+                "discord_id": str(discord_id_str or "").strip(),
+                "email": str(email_value or "").strip(),
+                "reason": reason,
+                "source_discord": {
+                    "channel_id": getattr(message.channel, "id", ""),
+                    "message_id": message.id,
+                    "jump_url": getattr(message, "jump_url", ""),
+                },
+            }
+            event.update(fields)
+            await _record_whop_event_if_possible(event)
+        except Exception:
+            pass
         
         # Extract Discord ID
         discord_id_str = None

@@ -6,11 +6,15 @@ import re
 import csv
 import io
 import time
+import base64
+import hashlib
+import hmac
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import logging
 from typing import Dict, Optional
 from contextlib import suppress
+from collections import deque
 try:
     from zoneinfo import ZoneInfo  # py3.9+
 except Exception:  # pragma: no cover
@@ -35,6 +39,8 @@ import aiohttp
 from rschecker_utils import (
     load_json,
     save_json,
+    append_jsonl,
+    iter_jsonl,
     roles_plain,
     access_roles_plain,
     coerce_role_ids,
@@ -145,6 +151,7 @@ def _load_reporting_config(cfg: dict) -> dict:
     retention_weeks = _as_int(base.get("retention_weeks")) or 26
     reminder_days = base.get("reminder_days_before_cancel")
     scan_log_channel_id = _as_int(base.get("scan_log_channel_id"))
+    scan_log_webhook_url = _as_str(base.get("scan_log_webhook_url"))
     scan_log_each_member = _as_bool(base.get("scan_log_each_member", False))
     scan_log_include_raw_dates = _as_bool(base.get("scan_log_include_raw_dates", False))
     scan_log_max_members = _as_int(base.get("scan_log_max_members")) or 0
@@ -183,6 +190,7 @@ def _load_reporting_config(cfg: dict) -> dict:
         "retention_weeks": int(retention_weeks),
         "reminder_days_before_cancel": cleaned_days,
         "scan_log_channel_id": scan_log_channel_id or 0,
+        "scan_log_webhook_url": scan_log_webhook_url,
         "scan_log_each_member": bool(scan_log_each_member),
         "scan_log_include_raw_dates": bool(scan_log_include_raw_dates),
         "scan_log_max_members": int(scan_log_max_members),
@@ -192,6 +200,7 @@ def _load_reporting_config(cfg: dict) -> dict:
 REPORTING_CONFIG = _load_reporting_config(config)
 _REPORTING_STORE: dict | None = None
 _REPORTING_STORE_LOCK: asyncio.Lock = asyncio.Lock()
+_SCAN_LOG_WEBHOOK_SESSION: aiohttp.ClientSession | None = None
 
 
 def _tz_now() -> datetime:
@@ -204,19 +213,47 @@ def _tz_now() -> datetime:
         return datetime.now(timezone.utc)
 
 
+async def _get_scan_log_webhook_session() -> aiohttp.ClientSession:
+    global _SCAN_LOG_WEBHOOK_SESSION
+    if _SCAN_LOG_WEBHOOK_SESSION and not _SCAN_LOG_WEBHOOK_SESSION.closed:
+        return _SCAN_LOG_WEBHOOK_SESSION
+    timeout = aiohttp.ClientTimeout(total=10)
+    _SCAN_LOG_WEBHOOK_SESSION = aiohttp.ClientSession(timeout=timeout)
+    return _SCAN_LOG_WEBHOOK_SESSION
+
+
+async def _post_scan_log_webhook(text: str) -> None:
+    url = str(REPORTING_CONFIG.get("scan_log_webhook_url") or "").strip()
+    msg = str(text or "").strip()
+    if not url or not msg:
+        return
+    payload = {"content": msg[:1900], "allowed_mentions": {"parse": []}}
+    try:
+        session = await _get_scan_log_webhook_session()
+        async with session.post(url, json=payload) as resp:
+            if not (200 <= resp.status < 300):
+                log.warning("[ReportScan] scan log webhook post failed (status=%s)", resp.status)
+    except Exception as e:
+        log.warning("[ReportScan] scan log webhook post failed: %s", e)
+
+
 async def _report_scan_log_message(text: str) -> None:
-    """Optional scan log output to a configured channel."""
+    """Optional scan log output to a configured channel or webhook."""
+    msg = str(text or "").strip()
+    if not msg:
+        return
+    log.info("[ReportScan] %s", msg)
     try:
         ch_id = int(REPORTING_CONFIG.get("scan_log_channel_id") or 0)
     except Exception:
         ch_id = 0
-    if not ch_id:
-        return
-    ch = bot.get_channel(ch_id)
-    if not isinstance(ch, discord.TextChannel):
-        return
-    with suppress(Exception):
-        await ch.send(str(text or "").strip()[:1900], allowed_mentions=discord.AllowedMentions.none())
+    if ch_id:
+        ch = bot.get_channel(ch_id)
+        if isinstance(ch, discord.TextChannel):
+            with suppress(Exception):
+                await ch.send(msg[:1900], allowed_mentions=discord.AllowedMentions.none())
+    if REPORTING_CONFIG.get("scan_log_webhook_url"):
+        asyncio.create_task(_post_scan_log_webhook(msg))
 
 
 def _parse_hhmm(s: str) -> tuple[int, int]:
@@ -271,6 +308,213 @@ async def _save_reporting_store(store: dict) -> None:
     _REPORTING_STORE = store
     if _report_save_store:
         _report_save_store(BASE_DIR, store)
+
+
+def _normalize_whop_event(event: dict) -> dict:
+    if not isinstance(event, dict):
+        return {}
+    ev = dict(event)
+    ev.setdefault("event_id", "")
+    ev.setdefault("source", "")
+    ev.setdefault("event_type", "unknown")
+    ev.setdefault("occurred_at", "")
+    for key in (
+        "membership_id",
+        "user_id",
+        "member_id",
+        "discord_id",
+        "email",
+        "product",
+        "status",
+        "trial_days",
+        "pricing",
+        "total_spent",
+        "cancel_at_period_end",
+        "renewal_period_start",
+        "renewal_period_end",
+        "renewal_end_iso",
+        "reason",
+    ):
+        if ev.get(key) is None:
+            ev[key] = ""
+    if not isinstance(ev.get("source_discord"), dict):
+        ev["source_discord"] = {}
+    return ev
+
+
+def _whop_event_seen(event_id: str) -> bool:
+    eid = str(event_id or "").strip()
+    if not eid:
+        return False
+    if eid in _WHOP_EVENT_DEDUPE_IDS:
+        return True
+    _WHOP_EVENT_DEDUPE_IDS.add(eid)
+    _WHOP_EVENT_DEDUPE_QUEUE.append(eid)
+    if WHOP_EVENTS_DEDUPE_MAX > 0 and len(_WHOP_EVENT_DEDUPE_QUEUE) > WHOP_EVENTS_DEDUPE_MAX:
+        old = _WHOP_EVENT_DEDUPE_QUEUE.popleft()
+        _WHOP_EVENT_DEDUPE_IDS.discard(old)
+    return False
+
+
+def _load_whop_event_dedupe_cache() -> None:
+    if WHOP_EVENTS_DEDUPE_MAX <= 0:
+        return
+    rows = iter_jsonl(WHOP_EVENTS_FILE)
+    tail = rows[-WHOP_EVENTS_DEDUPE_MAX:] if len(rows) > WHOP_EVENTS_DEDUPE_MAX else rows
+    for rec in tail:
+        eid = str(rec.get("event_id") or "").strip()
+        if not eid:
+            continue
+        _WHOP_EVENT_DEDUPE_IDS.add(eid)
+        _WHOP_EVENT_DEDUPE_QUEUE.append(eid)
+
+
+async def _record_whop_event(event: dict) -> bool:
+    if not WHOP_EVENTS_ENABLED:
+        return False
+    ev = _normalize_whop_event(event)
+    if not ev:
+        return False
+    event_id = str(ev.get("event_id") or "").strip()
+    if not event_id:
+        source = str(ev.get("source") or "event").strip()
+        event_id = f"{source}:{int(time.time() * 1000)}"
+        ev["event_id"] = event_id
+    if _whop_event_seen(event_id):
+        return False
+    try:
+        await append_jsonl(WHOP_EVENTS_FILE, ev)
+    except Exception as e:
+        log.warning(f"[WhopEvents] Failed to append event {event_id}: {e}")
+        return False
+    return True
+
+
+def _decode_webhook_secret(secret: str) -> bytes:
+    s = str(secret or "").strip()
+    if not s:
+        return b""
+    if s.startswith("whsec_"):
+        s = s[len("whsec_"):]
+    try:
+        return base64.b64decode(s)
+    except Exception:
+        return s.encode("utf-8")
+
+
+def _parse_webhook_signatures(sig_header: str) -> list[str]:
+    out: list[str] = []
+    for part in str(sig_header or "").split():
+        token = part.strip()
+        if not token:
+            continue
+        if "," in token:
+            _ver, sig = token.split(",", 1)
+            out.append(sig.strip())
+            continue
+        if "=" in token:
+            _ver, sig = token.split("=", 1)
+            out.append(sig.strip())
+            continue
+        out.append(token)
+    return [s for s in out if s]
+
+
+def _verify_standard_webhook(headers: dict, body_bytes: bytes) -> tuple[bool, str]:
+    if not WHOP_WEBHOOK_VERIFY:
+        return (True, "disabled")
+    secret = WHOP_WEBHOOK_SECRET or os.getenv("WHOP_WEBHOOK_SECRET", "")
+    if not secret:
+        return (False, "missing_webhook_secret")
+    wh_id = str(headers.get("webhook-id") or "").strip()
+    wh_ts = str(headers.get("webhook-timestamp") or "").strip()
+    wh_sig = str(headers.get("webhook-signature") or "").strip()
+    if not wh_id or not wh_ts or not wh_sig:
+        return (False, "missing_headers")
+    try:
+        ts_i = int(float(wh_ts))
+    except Exception:
+        return (False, "bad_timestamp")
+    if WHOP_WEBHOOK_TOLERANCE_SECONDS > 0:
+        now = int(time.time())
+        if abs(now - ts_i) > int(WHOP_WEBHOOK_TOLERANCE_SECONDS):
+            return (False, "timestamp_out_of_range")
+    signed_content = f"{wh_id}.{wh_ts}.{body_bytes.decode('utf-8', errors='ignore')}"
+    secret_bytes = _decode_webhook_secret(secret)
+    if not secret_bytes:
+        return (False, "bad_secret")
+    digest = hmac.new(secret_bytes, signed_content.encode("utf-8"), hashlib.sha256).digest()
+    expected = base64.b64encode(digest).decode("utf-8")
+    for sig in _parse_webhook_signatures(wh_sig):
+        if hmac.compare_digest(expected, sig):
+            return (True, "ok")
+    return (False, "signature_mismatch")
+
+
+def _whop_event_from_webhook_payload(payload: dict, *, event_id: str, occurred_at: datetime) -> dict:
+    data = payload.get("data") if isinstance(payload, dict) else {}
+    data = data if isinstance(data, dict) else {}
+    event_type = str(payload.get("type") or payload.get("event_type") or payload.get("event") or "").strip()
+    membership = data.get("membership") if isinstance(data.get("membership"), dict) else None
+    if not membership:
+        membership = data
+    membership = _whop_report_normalize_membership(membership) if isinstance(membership, dict) else {}
+    membership_id = str(
+        data.get("membership_id")
+        or membership.get("id")
+        or membership.get("membership_id")
+        or ""
+    ).strip()
+    user_id = str(data.get("user_id") or "").strip()
+    if not user_id and isinstance(membership.get("user"), dict):
+        user_id = str(membership["user"].get("id") or "").strip()
+    member_id = str(data.get("member_id") or "").strip()
+    if not member_id and isinstance(membership.get("member"), dict):
+        member_id = str(membership["member"].get("id") or "").strip()
+    email = ""
+    if isinstance(membership.get("member"), dict):
+        email = str(membership["member"].get("email") or "").strip()
+    product = ""
+    if isinstance(membership.get("product"), dict):
+        product = str(membership["product"].get("title") or "").strip()
+    status = str(membership.get("status") or data.get("status") or "").strip()
+    total_spent = str(
+        membership.get("total_spent")
+        or membership.get("total_spent_usd")
+        or data.get("total_spent")
+        or ""
+    ).strip()
+    cancel_at_period_end = str(membership.get("cancel_at_period_end") or data.get("cancel_at_period_end") or "").strip()
+    renewal_start = str(membership.get("renewal_period_start") or data.get("renewal_period_start") or "").strip()
+    renewal_end = str(membership.get("renewal_period_end") or data.get("renewal_period_end") or "").strip()
+    reason = str(
+        data.get("failure_reason")
+        or data.get("cancellation_reason")
+        or data.get("reason")
+        or ""
+    ).strip()
+    return {
+        "event_id": event_id,
+        "source": "whop_official_webhook",
+        "event_type": event_type or "unknown",
+        "occurred_at": occurred_at.isoformat(),
+        "membership_id": membership_id,
+        "user_id": user_id,
+        "member_id": member_id,
+        "discord_id": "",
+        "email": email,
+        "product": product,
+        "status": status,
+        "trial_days": str(membership.get("trial_days") or ""),
+        "pricing": str(membership.get("pricing") or ""),
+        "total_spent": total_spent,
+        "cancel_at_period_end": cancel_at_period_end,
+        "renewal_period_start": renewal_start,
+        "renewal_period_end": renewal_end,
+        "renewal_end_iso": str(membership.get("renewal_end_iso") or ""),
+        "reason": reason,
+        "source_discord": {},
+    }
 
 def _to_int(v: object) -> int | None:
     try:
@@ -550,6 +794,21 @@ WHOP_DISPUTE_CHANNEL_NAME = WHOP_API_CONFIG.get("dispute_channel_name", "dispute
 WHOP_RESOLUTION_CHANNEL_NAME = WHOP_API_CONFIG.get("resolution_channel_name", "resolution-center")
 WHOP_SUPPORT_PING_ROLE_ID = WHOP_API_CONFIG.get("support_ping_role_id", "")
 WHOP_SUPPORT_PING_ROLE_NAME = WHOP_API_CONFIG.get("support_ping_role_name", "")
+WHOP_WEBHOOK_SECRET = str(WHOP_API_CONFIG.get("webhook_secret") or WHOP_API_CONFIG.get("webhook_key") or "").strip()
+WHOP_WEBHOOK_VERIFY = bool(WHOP_API_CONFIG.get("webhook_verify", True))
+try:
+    WHOP_WEBHOOK_TOLERANCE_SECONDS = int(WHOP_API_CONFIG.get("webhook_tolerance_seconds") or 300)
+except Exception:
+    WHOP_WEBHOOK_TOLERANCE_SECONDS = 300
+WHOP_EVENTS_FILE = BASE_DIR / "whop_events.jsonl"
+WHOP_EVENTS_ENABLED = bool(WHOP_API_CONFIG.get("event_ledger_enabled", True))
+try:
+    WHOP_EVENTS_DEDUPE_MAX = int(WHOP_API_CONFIG.get("event_dedupe_max") or 2000)
+except Exception:
+    WHOP_EVENTS_DEDUPE_MAX = 2000
+WHOP_EVENTS_DEDUPE_MAX = max(0, WHOP_EVENTS_DEDUPE_MAX)
+_WHOP_EVENT_DEDUPE_IDS: set[str] = set()
+_WHOP_EVENT_DEDUPE_QUEUE: deque[str] = deque()
 
 # Invite Tracking Config
 INVITE_CONFIG = config.get("invite_tracking", {})
@@ -2172,26 +2431,44 @@ async def handle_create_invite(request):
 async def handle_whop_webhook_receiver(request):
     """Receive Whop webhook payloads, log them, and forward to Discord"""
     try:
-        # Get raw payload
-        if request.content_type == 'application/json':
-            payload = await request.json()
-        else:
-            # Try form data
-            form_data = await request.post()
-            payload = dict(form_data)
-        
-        # Get headers (for debugging)
-        headers = dict(request.headers)
-        
+        raw_body = await request.read()
+        headers = {k.lower(): v for k, v in dict(request.headers).items()}
+
+        ok, reason = _verify_standard_webhook(headers, raw_body)
+        if not ok:
+            log.warning(f"[WhopWebhook] Signature verification failed: {reason}")
+            return web.Response(text=f"Invalid webhook signature ({reason})", status=401)
+
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except Exception:
+            log.warning("[WhopWebhook] Invalid JSON payload")
+            return web.Response(text="Invalid JSON payload", status=400)
+
         # Log the raw payload
         _save_raw_webhook_payload(payload, headers)
         log.info(f"Received Whop webhook payload (saved to {WHOP_WEBHOOK_RAW_LOG_FILE.name})")
-        
+
+        # Record event ledger entry
+        try:
+            wh_id = str(headers.get("webhook-id") or payload.get("id") or "").strip()
+            wh_ts = str(headers.get("webhook-timestamp") or "").strip()
+            try:
+                ts_i = int(float(wh_ts)) if wh_ts else int(time.time())
+            except Exception:
+                ts_i = int(time.time())
+            occurred_at = datetime.fromtimestamp(ts_i, tz=timezone.utc)
+            if wh_id:
+                event = _whop_event_from_webhook_payload(payload, event_id=wh_id, occurred_at=occurred_at)
+                await _record_whop_event(event)
+        except Exception as e:
+            log.warning(f"[WhopWebhook] Failed to record event: {e}")
+
         # Forward to Discord webhook if URL is configured
         if not DISCORD_WEBHOOK_URL:
             log.warning("Discord webhook URL not configured - payload logged but not forwarded")
             return web.Response(text="OK (logged, not forwarded - no webhook URL)", status=200)
-        
+
         # Forward to Discord webhook
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -2202,10 +2479,9 @@ async def handle_whop_webhook_receiver(request):
                 if resp.status == 200 or resp.status == 204:
                     log.info(f"Forwarded webhook to Discord successfully (status: {resp.status})")
                     return web.Response(text="OK", status=200)
-                else:
-                    error_text = await resp.text()
-                    log.error(f"Failed to forward webhook to Discord (status: {resp.status}): {error_text}")
-                    return web.Response(text=f"Forward failed: {error_text}", status=500)
+                error_text = await resp.text()
+                log.error(f"Failed to forward webhook to Discord (status: {resp.status}): {error_text}")
+                return web.Response(text=f"Forward failed: {error_text}", status=500)
     
     except Exception as e:
         log.error(f"Error handling webhook receiver: {e}", exc_info=True)
@@ -2964,17 +3240,7 @@ async def on_ready():
     
     # Backfill Whop timeline from whop_history.json (before initializing whop handler)
     _backfill_whop_timeline_from_whop_history()
-    # Remove deprecated link cache file (no longer used).
-    try:
-        link_path = BASE_DIR / "whop_discord_link.json"
-        if link_path.exists():
-            link_path.unlink()
-            if post_startup_report:
-                startup_kv.append(("removed_whop_discord_link_json", "yes"))
-    except Exception as e:
-        if post_startup_report:
-            startup_kv.append(("whop_discord_link_remove_error", str(e)[:120]))
-    
+    _load_whop_event_dedupe_cache()
     guild = bot.get_guild(GUILD_ID)
     if guild:
         log.info(f"[Bot] Connected to: {guild.name}")
@@ -3138,6 +3404,7 @@ async def on_ready():
             fmt_user_func=_fmt_user,
             member_status_logs_channel_id=MEMBER_STATUS_LOGS_CHANNEL_ID,
             record_member_whop_summary_func=record_member_whop_summary,
+            record_whop_event_func=_record_whop_event,
             whop_api_key=WHOP_API_KEY,
             whop_api_config=WHOP_API_CONFIG,
             dispute_channel_id=WHOP_DISPUTE_CHANNEL_ID,
@@ -4891,7 +5158,7 @@ async def checker_report(ctx, arg1: str = "", arg2: str = "", arg3: str = "", ar
 
 
 async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = False) -> None:
-    """One-time scan of Whop API memberships to rebuild reporting_store.json and output report + CSV."""
+    """One-time scan of Whop event ledger to rebuild reporting_store.json and output report + CSV."""
 
     if not REPORTING_CONFIG.get("enabled"):
         await ctx.send("❌ Reporting is disabled in config.", delete_after=15)
@@ -4901,8 +5168,12 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
         await ctx.send("❌ Reporting store module is not available.", delete_after=20)
         return
 
-    if not whop_api_client or not getattr(whop_api_client, "list_memberships", None):
-        await ctx.send("❌ Whop API is not configured for reporting.", delete_after=20)
+    if not WHOP_EVENTS_ENABLED:
+        await ctx.send("❌ Whop event ledger is disabled in config.", delete_after=20)
+        return
+
+    if not WHOP_EVENTS_FILE.exists():
+        await ctx.send("❌ Whop event ledger file not found. Wait for events or re-run after logs arrive.", delete_after=20)
         return
 
     # Mountain Time (boss): use America/Denver for day boundaries during dedupe.
@@ -4913,7 +5184,6 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
     if scan_tz is None:
         scan_tz = timezone.utc
 
-    # Parse YYYY-MM-DD in MT
     def _parse_day_local(s: str) -> datetime | None:
         try:
             d = datetime.strptime(str(s or "").strip(), "%Y-%m-%d").date()
@@ -4933,7 +5203,7 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
 
     quiet_here = bool(MEMBER_STATUS_LOGS_CHANNEL_ID and getattr(ctx, "channel", None) and int(getattr(ctx.channel, "id", 0)) == int(MEMBER_STATUS_LOGS_CHANNEL_ID))
     status_msg = None
-    scan_label = "Whop API"
+    scan_label = "Whop Events"
     if quiet_here:
         with suppress(Exception):
             status_msg = await ctx.author.send(
@@ -4952,15 +5222,27 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
     scan_log_progress_every = int(REPORTING_CONFIG.get("scan_log_progress_every") or 50)
     scan_log_count = 0
 
+    log.info(
+        "[ReportScan] start range_mt=%s→%s events_file=%s each_member=%s max_members=%s progress_every=%s",
+        start_local.date().isoformat(),
+        end_local.date().isoformat(),
+        WHOP_EVENTS_FILE.name,
+        scan_log_each_member,
+        scan_log_max_members,
+        scan_log_progress_every,
+    )
+    await _report_scan_log_message(
+        f"🔍 Whop scan started (MT {start_local.date().isoformat()} → {end_local.date().isoformat()})"
+    )
+
     started_at = time.time()
     last_edit = 0.0
     scanned = 0
     included = 0
     dupes = 0
-    api_calls = 0
 
-    # Dedup: (bucket, identity, day_key)
     seen: set[tuple[str, str, str]] = set()
+    seen_event_ids: set[str] = set()
 
     def _rate() -> float:
         dt = max(1e-6, time.time() - started_at)
@@ -4977,248 +5259,187 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
         rate = _rate()
         await status_msg.edit(
             content=(
-                f"🔍 **Scanning Whop API for report...**\n"
+                f"🔍 **Scanning Whop Events for report...**\n"
                 f"```\n"
                 f"Stage: {stage}\n"
-                f"Memberships scanned: {scanned}\n"
+                f"Events scanned: {scanned}\n"
                 f"Included (deduped): {included}\n"
                 f"Dupes skipped: {dupes}\n"
-                f"Whop API calls: {api_calls}\n"
-                f"Rate: {rate:.1f} memberships/s\n"
+                f"Rate: {rate:.1f} events/s\n"
                 f"```"
             )[:1900]
         )
 
-    # Fresh store (overwrite)
     retention = int(REPORTING_CONFIG.get("retention_weeks", 26))
     store = _report_load_store(BASE_DIR, retention_weeks=retention)
     if isinstance(store.get("meta"), dict):
         store["meta"]["version"] = int(store["meta"].get("version") or 1)
-        store["meta"]["scan_source"] = "report.scan.whop.api"
+        store["meta"]["scan_source"] = "report.scan.whop.events"
         store["meta"]["scan_range_mt"] = f"{start_local.date().isoformat()}→{end_local.date().isoformat()}"
     store["weeks"] = {}
     store["members"] = {}
     store["unlinked"] = {}
 
-    # Detailed CSV rows (only included/deduped events)
     csv_rows: list[dict] = []
     totals = {"new_members": 0, "new_trials": 0, "payment_failed": 0, "cancellation_scheduled": 0}
-    detail_fetches = 0
+
+    def _bucket_for_event(ev: dict) -> str:
+        t = str(ev.get("event_type") or "").lower()
+        status_l = str(ev.get("status") or "").lower()
+        trial_days = str(ev.get("trial_days") or "").strip()
+        cancel_flag = str(ev.get("cancel_at_period_end") or "").strip().lower()
+
+        if "payment.failed" in t or "payment_failed" in t or "deactivated.payment_failure" in t:
+            return "payment_failed"
+        if "membership.activated.pending" in t or "trial" in t:
+            return "new_trial"
+        if "membership.activated" in t or "payment.succeeded.activation" in t:
+            return "new_member"
+        if "payment.succeeded" in t and status_l in {"active", "trialing"} and trial_days == "":
+            return "new_member"
+        if cancel_flag in {"true", "yes", "1"} and status_l in {"active", "trialing"}:
+            return "cancellation_scheduled"
+        return ""
 
     try:
-        per_page = int(WHOP_API_CONFIG.get("report_page_size") or WHOP_API_CONFIG.get("page_size") or 100)
-    except Exception:
-        per_page = 100
-    if per_page <= 0:
-        per_page = 100
-    try:
-        detail_limit = int(WHOP_API_CONFIG.get("report_detail_fetch_limit") or per_page)
-    except Exception:
-        detail_limit = per_page
-    if detail_limit < 0:
-        detail_limit = 0
-    detail_missing_only = bool(WHOP_API_CONFIG.get("report_detail_fetch_missing_only", True))
-    await _report_scan_log_message(
-        f"🧪 **Whop scan started**\nRange: {start_local.date().isoformat()} → {end_local.date().isoformat()}\n"
-        f"Page size: {per_page} • Detail limit: {detail_limit}"
-    )
-    page = 1
-    seen_memberships: set[str] = set()
-
-    try:
-        await _progress("page 1", force=True)
-        while True:
-            api_calls += 1
-            batch = await whop_api_client.list_memberships(page=page, per_page=per_page)
-            if not batch:
-                break
-            new_on_page = 0
-            for membership in batch:
-                scanned += 1
-                if (scanned % 50) == 0:
-                    with suppress(Exception):
-                        await _progress(f"page {page}")
-
-                if not isinstance(membership, dict):
+        await _progress("read ledger", force=True)
+        events = iter_jsonl(WHOP_EVENTS_FILE)
+        for idx, ev in enumerate(events):
+            scanned = idx + 1
+            if not isinstance(ev, dict):
+                continue
+            event_id = str(ev.get("event_id") or "").strip()
+            if event_id:
+                if event_id in seen_event_ids:
+                    dupes += 1
                     continue
-                membership = _whop_report_normalize_membership(membership)
+                seen_event_ids.add(event_id)
 
-                membership_id = _whop_report_membership_id(membership)
-                if membership_id:
-                    if membership_id in seen_memberships:
-                        continue
-                    seen_memberships.add(membership_id)
-                    new_on_page += 1
+            ev_dt = _parse_dt_any(ev.get("occurred_at"))
+            if not ev_dt or not (start_utc <= ev_dt <= end_utc):
+                continue
 
-                buckets, brief, info = _whop_report_compute_events(
-                    membership,
-                    start_utc=start_utc,
-                    end_utc=end_utc,
-                    api_client=whop_api_client,
+            bucket = _bucket_for_event(ev)
+            if not bucket:
+                continue
+
+            membership_id = str(ev.get("membership_id") or "").strip()
+            email = str(ev.get("email") or "").strip()
+            discord_id_raw = str(ev.get("discord_id") or "").strip()
+            discord_id = int(discord_id_raw) if discord_id_raw.isdigit() else None
+
+            ident = membership_id or discord_id_raw or email
+            if not ident:
+                continue
+
+            day_key = _whop_report_day_key(ev_dt, scan_tz)
+            key = (bucket, ident, day_key)
+            if key in seen:
+                dupes += 1
+                continue
+            seen.add(key)
+
+            event_kind = "unknown"
+            if bucket == "payment_failed":
+                event_kind = "payment_failed"
+            elif bucket == "new_trial":
+                event_kind = "trialing"
+            elif bucket == "new_member":
+                event_kind = "member_role_added"
+            elif bucket == "cancellation_scheduled":
+                event_kind = "cancellation_scheduled"
+
+            whop_brief = {
+                "product": str(ev.get("product") or ""),
+                "status": str(ev.get("status") or ""),
+                "total_spent": str(ev.get("total_spent") or ""),
+                "cancel_at_period_end": str(ev.get("cancel_at_period_end") or ""),
+                "renewal_end_iso": str(ev.get("renewal_end_iso") or ev.get("renewal_period_end") or ""),
+                "dashboard_url": "",
+            }
+
+            store = _report_record_member_status_post(
+                store,
+                ts=int(ev_dt.astimezone(timezone.utc).timestamp()),
+                event_kind=event_kind,
+                discord_id=discord_id,
+                email=email or "",
+                whop_brief=whop_brief,
+            )
+            included += 1
+
+            if bucket == "payment_failed":
+                totals["payment_failed"] += 1
+            elif bucket == "new_trial":
+                totals["new_trials"] += 1
+            elif bucket == "new_member":
+                totals["new_members"] += 1
+            elif bucket == "cancellation_scheduled":
+                totals["cancellation_scheduled"] += 1
+
+            source = ev.get("source_discord") if isinstance(ev.get("source_discord"), dict) else {}
+            csv_rows.append(
+                {
+                    "day_mt": day_key,
+                    "event_bucket": bucket,
+                    "membership_id": membership_id,
+                    "discord_id": str(discord_id or ""),
+                    "email": email,
+                    "product": str(ev.get("product") or ""),
+                    "status": str(ev.get("status") or ""),
+                    "total_spent": str(ev.get("total_spent") or ""),
+                    "cancel_at_period_end": str(ev.get("cancel_at_period_end") or ""),
+                    "renewal_end_iso": str(ev.get("renewal_end_iso") or ev.get("renewal_period_end") or ""),
+                    "dashboard_url": "",
+                    "source_channel_id": str(source.get("channel_id") or ""),
+                    "source_message_id": str(source.get("message_id") or ""),
+                    "source_jump_url": str(source.get("jump_url") or ""),
+                    "event_type": str(ev.get("event_type") or ""),
+                }
+            )
+
+            if scan_log_each_member and (scan_log_max_members <= 0 or scan_log_count < scan_log_max_members):
+                scan_log_count += 1
+                occurred_txt = ev_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                detail = (
+                    "event_id={event_id} type={event_type} occurred={occurred} bucket={bucket} "
+                    "membership_id={membership_id} discord_id={discord_id} email={email} status={status} product={product}"
+                ).format(
+                    event_id=event_id or "—",
+                    event_type=str(ev.get("event_type") or "—"),
+                    occurred=occurred_txt,
+                    bucket=bucket or "—",
+                    membership_id=membership_id or "—",
+                    discord_id=discord_id_raw or "—",
+                    email=email or "—",
+                    status=str(ev.get("status") or "—"),
+                    product=str(ev.get("product") or "—"),
                 )
+                log.info("[ReportScan] %s", detail)
+                if REPORTING_CONFIG.get("scan_log_webhook_url"):
+                    asyncio.create_task(_post_scan_log_webhook(f"[ReportScan] {detail}"))
+                if scan_log_include_raw:
+                    raw_text = json.dumps(ev, ensure_ascii=False)[:1000]
+                    log.info("[ReportScan] raw_event=%s", raw_text)
+                    if REPORTING_CONFIG.get("scan_log_webhook_url"):
+                        asyncio.create_task(_post_scan_log_webhook(f"[ReportScan] raw_event={raw_text}"))
 
-                # If list response is missing key date fields, try a detail fetch by membership_id.
-                if (
-                    detail_limit > 0
-                    and membership_id
-                    and detail_fetches < detail_limit
-                    and (
-                        (not detail_missing_only)
-                        or any(
-                            info.get(k) is None
-                            for k in ("created_dt", "activated_dt", "updated_dt", "trial_end_dt", "failure_dt", "cancel_dt")
-                        )
-                    )
-                ):
-                    with suppress(Exception):
-                        detail = await whop_api_client.get_membership_by_id(membership_id)
-                    if isinstance(detail, dict) and detail:
-                        detail_fetches += 1
-                        membership = _whop_report_normalize_membership(detail)
-                        buckets, brief, info = _whop_report_compute_events(
-                            membership,
-                            start_utc=start_utc,
-                            end_utc=end_utc,
-                            api_client=whop_api_client,
-                        )
-
-                if not buckets:
-                    if scan_log_each_member and (scan_log_max_members <= 0 or scan_log_count < scan_log_max_members):
-                        scan_log_count += 1
-                        status_l = str(info.get("status_l") or "").strip().lower()
-                        def _fmt_dt(dt: datetime | None) -> str:
-                            return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if dt else "—"
-                        log.info(
-                            "[ReportScan] mem=%s status=%s created=%s activated=%s updated=%s trial_end=%s failure=%s cancel_at=%s trial_days=%s is_trial=%s buckets=—",
-                            membership_id or "—",
-                            status_l or "—",
-                            _fmt_dt(info.get("created_dt")),
-                            _fmt_dt(info.get("activated_dt")),
-                            _fmt_dt(info.get("updated_dt")),
-                            _fmt_dt(info.get("trial_end_dt")),
-                            _fmt_dt(info.get("failure_dt")),
-                            _fmt_dt(info.get("cancel_dt")),
-                            info.get("trial_days"),
-                            "yes" if info.get("is_trial") else "no",
-                        )
-                        if scan_log_include_raw:
-                            raw_dates = _whop_report_collect_date_fields(membership)
-                            log.info("[ReportScan] mem=%s raw_dates=%s", membership_id or "—", "; ".join(raw_dates) if raw_dates else "—")
-                    if scan_log_progress_every > 0 and (scanned % scan_log_progress_every) == 0:
-                        await _report_scan_log_message(
-                            f"⏳ Scan progress: scanned {scanned}, included {included}, dupes {dupes}, api_calls {api_calls}, detail_fetches {detail_fetches}"
-                        )
-                    continue
-
-                status_l = str(info.get("status_l") or "").strip().lower()
-                discord_id = _whop_report_extract_discord_id(membership)
-                email = _whop_report_extract_email(membership)
-                if not email and not discord_id:
-                    email = membership_id
-
-                ident = (membership_id or "").strip() or (str(discord_id or "").strip()) or (email or "")
-                if not ident:
-                    continue
-
-                event_type = f"api.membership.{status_l}" if status_l else "api.membership"
-
-                for bucket, ev_dt in buckets:
-                    if not ev_dt:
-                        continue
-                    day_key = _whop_report_day_key(ev_dt, scan_tz)
-                    key = (bucket, ident, day_key)
-                    if key in seen:
-                        dupes += 1
-                        continue
-                    seen.add(key)
-
-                    event_kind = "unknown"
-                    if bucket == "payment_failed":
-                        event_kind = "payment_failed"
-                    elif bucket == "new_trial":
-                        event_kind = "trialing" if status_l == "trialing" else "membership_activated_pending"
-                    elif bucket == "new_member":
-                        event_kind = "member_role_added"
-                    elif bucket == "cancellation_scheduled":
-                        event_kind = "cancellation_scheduled"
-
-                    store = _report_record_member_status_post(
-                        store,
-                        ts=int(ev_dt.astimezone(timezone.utc).timestamp()),
-                        event_kind=event_kind,
-                        discord_id=discord_id,
-                        email=email or "",
-                        whop_brief=brief if isinstance(brief, dict) and brief else None,
-                    )
-                    included += 1
-
-                    if bucket == "payment_failed":
-                        totals["payment_failed"] += 1
-                    elif bucket == "new_trial":
-                        totals["new_trials"] += 1
-                    elif bucket == "new_member":
-                        totals["new_members"] += 1
-                    elif bucket == "cancellation_scheduled":
-                        totals["cancellation_scheduled"] += 1
-
-                    csv_rows.append(
-                        {
-                            "day_mt": day_key,
-                            "event_bucket": bucket,
-                            "membership_id": membership_id,
-                            "discord_id": str(discord_id or ""),
-                            "email": email or "",
-                            "product": str((brief or {}).get("product") or ""),
-                            "status": str((brief or {}).get("status") or ""),
-                            "total_spent": str((brief or {}).get("total_spent") or ""),
-                            "cancel_at_period_end": str((brief or {}).get("cancel_at_period_end") or ""),
-                            "renewal_end_iso": str((brief or {}).get("renewal_end_iso") or ""),
-                            "dashboard_url": str((brief or {}).get("dashboard_url") or ""),
-                            "source_channel_id": "",
-                            "source_message_id": "",
-                            "source_jump_url": "",
-                            "event_type": event_type,
-                        }
-                    )
-
-                if scan_log_each_member and (scan_log_max_members <= 0 or scan_log_count < scan_log_max_members):
-                    scan_log_count += 1
-                    def _fmt_dt(dt: datetime | None) -> str:
-                        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if dt else "—"
-                    bucket_str = ",".join([b for b, _ in buckets]) if buckets else "—"
-                    log.info(
-                        "[ReportScan] mem=%s status=%s created=%s activated=%s updated=%s trial_end=%s failure=%s cancel_at=%s trial_days=%s is_trial=%s buckets=%s",
-                        membership_id or "—",
-                        status_l or "—",
-                        _fmt_dt(info.get("created_dt")),
-                        _fmt_dt(info.get("activated_dt")),
-                        _fmt_dt(info.get("updated_dt")),
-                        _fmt_dt(info.get("trial_end_dt")),
-                        _fmt_dt(info.get("failure_dt")),
-                        _fmt_dt(info.get("cancel_dt")),
-                        info.get("trial_days"),
-                        "yes" if info.get("is_trial") else "no",
-                        bucket_str,
-                    )
-                    if scan_log_include_raw:
-                        raw_dates = _whop_report_collect_date_fields(membership)
-                        log.info("[ReportScan] mem=%s raw_dates=%s", membership_id or "—", "; ".join(raw_dates) if raw_dates else "—")
-
-                if scan_log_progress_every > 0 and (scanned % scan_log_progress_every) == 0:
-                    await _report_scan_log_message(
-                        f"⏳ Scan progress: scanned {scanned}, included {included}, dupes {dupes}, api_calls {api_calls}, detail_fetches {detail_fetches}"
-                    )
-
-            if new_on_page == 0 and page > 1:
-                break
-            if len(batch) < int(per_page):
-                break
-            page += 1
+            if scan_log_progress_every > 0 and (idx + 1) % scan_log_progress_every == 0:
+                await _report_scan_log_message(
+                    f"⏳ Scan progress: scanned {idx + 1}, included {included}, dupes {dupes}"
+                )
+                with suppress(Exception):
+                    await _progress(f"event {idx + 1}")
     except Exception as e:
         with suppress(Exception):
-            await status_msg.edit(content=f"❌ Scan failed: `{e}`")
+            if status_msg:
+                await status_msg.edit(content=f"❌ Scan failed: `{e}`")
         await _report_scan_log_message(f"❌ Whop scan failed: {e}")
         return
+
+    await _report_scan_log_message(
+        f"✅ Whop scan finished: scanned {scanned}, included {included}, dupes {dupes}, rate {_rate():.1f} events/s"
+    )
 
     # Prune store (best-effort: saving can fail on misconfigured server permissions)
     store = _report_prune_store(store, retention_weeks=retention)
@@ -5296,15 +5517,15 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
     # Report embed (from scan totals)
     warn_note = ""
     if scanned == 0:
-        warn_note = "\n⚠️ No memberships returned by the API. Check `whop_api.company_id` and API scopes."
+        warn_note = "\n⚠️ No events found in the ledger. Confirm whop-member-logs/webhooks are being recorded."
     elif included == 0:
-        warn_note = "\n⚠️ Memberships returned, but no events matched the date range. Verify date fields."
+        warn_note = "\n⚠️ Events found, but none matched the date range. Verify occurred_at timestamps."
 
     e = discord.Embed(
         title=f"RS Whop Scan Report ({start_local.date().isoformat()} → {end_local.date().isoformat()})",
         description=(
-            "Source: Whop API (deduped per membership per day/event) • Timezone: `America/Denver`"
-            + f"\nScanned: {scanned} memberships • Included: {included} • API calls: {api_calls} • Detail fetches: {detail_fetches}"
+            "Source: Whop Event Ledger (deduped per member per day/event) • Timezone: `America/Denver`"
+            + f"\nScanned: {scanned} events • Included: {included} • Dupes: {dupes}"
             + (" • Output: anonymized sample CSV" if sample_csv else "")
             + warn_note
             + (f"\n⚠️ Store not saved: {save_warning}" if save_warning else "")

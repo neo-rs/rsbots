@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -135,6 +136,52 @@ def save_json(path: Path, data: dict) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(tmp, path)
+
+
+_JSONL_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _jsonl_lock(path: Path) -> asyncio.Lock:
+    key = str(Path(path).resolve())
+    lock = _JSONL_LOCKS.get(key)
+    if not lock:
+        lock = asyncio.Lock()
+        _JSONL_LOCKS[key] = lock
+    return lock
+
+
+async def append_jsonl(path: Path, record: dict) -> None:
+    """Append a JSON record to a JSONL file with per-file locking."""
+    lock = _jsonl_lock(path)
+    async with lock:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+
+def iter_jsonl(path: Path) -> list[dict]:
+    """Read a JSONL file and return records (best-effort)."""
+    out: list[dict] = []
+    p = Path(path)
+    if not p.exists():
+        return out
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    out.append(obj)
+    except Exception:
+        return out
+    return out
 
 
 def roles_plain(member: discord.Member) -> str:
