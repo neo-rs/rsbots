@@ -5501,18 +5501,39 @@ async def _report_scan_whop(ctx, start: str, end: str, *, sample_csv: bool = Fal
         targets.append(int(ctx.author.id))
     targets = list(dict.fromkeys([int(x) for x in targets if int(x) > 0]))
 
+    invoker_id = int(getattr(ctx.author, "id", 0) or 0) if ctx.author else 0
+    invoker_dm_failed = False
     for uid in targets:
-        with suppress(Exception):
+        try:
             user = bot.get_user(uid) or await bot.fetch_user(uid)
             if not user:
                 continue
             # New file object per send
             f = discord.File(fp=io.BytesIO(csv_bytes), filename=fname)
             await user.send(embed=e, file=f)
+        except Exception:
+            # Most common: user has DMs closed. Tell the invoker explicitly so it doesn't look like "no CSV".
+            if invoker_id and int(uid) == int(invoker_id):
+                invoker_dm_failed = True
 
     with suppress(Exception):
         if status_msg:
-            await status_msg.edit(content="✅ Scan complete. Report sent via DM (with CSV).")
+            if invoker_dm_failed:
+                await status_msg.edit(
+                    content=(
+                        "✅ Scan complete. Report attempted via DM (with CSV).\n"
+                        "⚠️ Could not DM the invoker (DMs likely closed)."
+                    )[:1900]
+                )
+            else:
+                await status_msg.edit(content="✅ Scan complete. Report sent via DM (with CSV).")
+    if invoker_dm_failed:
+        with suppress(Exception):
+            await ctx.send(
+                "⚠️ I couldn’t DM you the report/CSV (DMs likely closed). "
+                "Enable DMs for this server (User Settings → Privacy & Safety → Server DMs), then rerun the scan.",
+                delete_after=35,
+            )
     await _report_scan_log_message(
         f"✅ **Whop scan complete**\nScanned: {scanned} • Included: {included} • "
         f"API calls: {api_calls} • Detail fetches: {detail_fetches}"
@@ -5816,6 +5837,360 @@ async def purge_case_channels(ctx, confirm: str = ""):
     await ctx.send(f"✅ purgecases complete — deleted: {deleted}, skipped: {skipped}, failed: {failed}", delete_after=20)
     with suppress(Exception):
         await ctx.message.delete()
+
+
+class _FutureMemberAuditView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        invoker_user_id: int,
+        guild_id: int,
+        member_role_id: int,
+        future_role_id: int,
+        candidate_ids: list[int],
+        totals: dict,
+    ):
+        super().__init__(timeout=15 * 60)
+        self.invoker_user_id = int(invoker_user_id)
+        self.guild_id = int(guild_id)
+        self.member_role_id = int(member_role_id)
+        self.future_role_id = int(future_role_id)
+        self.candidate_ids = [int(x) for x in (candidate_ids or []) if int(x) > 0]
+        self.totals = totals if isinstance(totals, dict) else {}
+        self.message: discord.Message | None = None
+        self._applied = False
+
+    def _is_allowed_clicker(self, interaction: discord.Interaction) -> bool:
+        try:
+            if int(interaction.user.id) == int(self.invoker_user_id):
+                return True
+            perms = getattr(interaction.user, "guild_permissions", None)
+            return bool(perms and perms.administrator)
+        except Exception:
+            return False
+
+    async def _deny(self, interaction: discord.Interaction) -> None:
+        with suppress(Exception):
+            await interaction.response.send_message("❌ Not allowed (invoker/admins only).", ephemeral=True)
+
+    async def _disable(self, *, cancelled: bool = False) -> None:
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            with suppress(Exception):
+                if cancelled:
+                    e = self.message.embeds[0] if self.message.embeds else discord.Embed(color=0x5865F2)
+                    e = e.copy()
+                    e.title = (str(e.title or "").strip() + " (cancelled)").strip()
+                    await self.message.edit(embed=e, view=self)
+                else:
+                    await self.message.edit(view=self)
+
+    async def on_timeout(self) -> None:
+        await self._disable(cancelled=True)
+
+    @discord.ui.button(label="Confirm apply", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        if not self._is_allowed_clicker(interaction):
+            await self._deny(interaction)
+            return
+        if self._applied:
+            with suppress(Exception):
+                await interaction.response.send_message("Already applied.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        await self._disable()
+        self._applied = True
+
+        guild = bot.get_guild(int(self.guild_id))
+        if not guild:
+            with suppress(Exception):
+                await interaction.followup.send("❌ Guild not found / bot not ready.", ephemeral=True)
+            return
+        future_role = guild.get_role(int(self.future_role_id))
+        member_role = guild.get_role(int(self.member_role_id))
+        if not future_role or not member_role:
+            with suppress(Exception):
+                await interaction.followup.send("❌ Required role(s) not found. Check config.", ephemeral=True)
+            return
+
+        # Permission + hierarchy checks (fail-fast).
+        me = getattr(guild, "me", None) or getattr(guild, "self_member", None) or guild.get_member(getattr(bot.user, "id", 0))
+        if not isinstance(me, discord.Member):
+            with suppress(Exception):
+                await interaction.followup.send("❌ Cannot resolve bot member in guild.", ephemeral=True)
+            return
+        if not getattr(me.guild_permissions, "manage_roles", False):
+            with suppress(Exception):
+                await interaction.followup.send("❌ Missing permission: Manage Roles.", ephemeral=True)
+            return
+        try:
+            if future_role >= me.top_role:
+                with suppress(Exception):
+                    await interaction.followup.send(
+                        "❌ Bot cannot assign Future Member role (role hierarchy). Move the bot role above it.",
+                        ephemeral=True,
+                    )
+                return
+        except Exception:
+            pass
+
+        def _is_staff(m: discord.Member) -> bool:
+            try:
+                p = m.guild_permissions
+                return bool(p.administrator or p.manage_guild or p.manage_roles)
+            except Exception:
+                return False
+
+        added = 0
+        skipped_now_has_member = 0
+        skipped_already_future = 0
+        skipped_staff = 0
+        skipped_missing_member = 0
+        failed = 0
+
+        started = time.time()
+        last_edit = 0.0
+
+        async def _edit_progress(stage: str, processed: int, *, force: bool = False) -> None:
+            nonlocal last_edit
+            if not self.message:
+                return
+            now = time.time()
+            if not force and (now - last_edit) < 2.0:
+                return
+            last_edit = now
+            e = discord.Embed(
+                title="Future Member Audit — applying",
+                description="Bulk role update in progress.",
+                color=0xED4245,
+                timestamp=datetime.now(timezone.utc),
+            )
+            e.add_field(name="Stage", value=str(stage)[:256], inline=False)
+            e.add_field(name="Processed", value=str(processed), inline=True)
+            e.add_field(name="Added", value=str(added), inline=True)
+            e.add_field(name="Failed", value=str(failed), inline=True)
+            e.add_field(name="Skipped (now has Member)", value=str(skipped_now_has_member), inline=True)
+            e.add_field(name="Skipped (already Future)", value=str(skipped_already_future), inline=True)
+            e.add_field(name="Skipped (staff/admin)", value=str(skipped_staff), inline=True)
+            e.add_field(name="Skipped (member not found)", value=str(skipped_missing_member), inline=True)
+            e.set_footer(text=f"RSCheckerbot • futurememberaudit • {int(now - started)}s elapsed")
+            with suppress(Exception):
+                await self.message.edit(embed=e, view=self)
+
+        await _edit_progress("starting", 0, force=True)
+
+        processed = 0
+        for uid in list(self.candidate_ids):
+            processed += 1
+            m = guild.get_member(int(uid))
+            if not isinstance(m, discord.Member):
+                with suppress(Exception):
+                    m = await guild.fetch_member(int(uid))
+            if not isinstance(m, discord.Member):
+                skipped_missing_member += 1
+                await _edit_progress("apply", processed)
+                continue
+            if m.bot:
+                skipped_staff += 1
+                await _edit_progress("apply", processed)
+                continue
+            if _is_staff(m):
+                skipped_staff += 1
+                await _edit_progress("apply", processed)
+                continue
+            role_ids = {r.id for r in (m.roles or [])}
+            if int(self.member_role_id) in role_ids:
+                skipped_now_has_member += 1
+                await _edit_progress("apply", processed)
+                continue
+            if int(self.future_role_id) in role_ids:
+                skipped_already_future += 1
+                await _edit_progress("apply", processed)
+                continue
+            try:
+                await m.add_roles(future_role, reason="RSCheckerbot: futurememberaudit (missing Member role)")
+                added += 1
+            except Exception:
+                failed += 1
+            await _edit_progress("apply", processed)
+            await asyncio.sleep(max(0.2, ROLE_UPDATE_BATCH_SECONDS))
+
+        await _edit_progress("complete", processed, force=True)
+        done = discord.Embed(
+            title="Future Member Audit — complete",
+            description="Bulk role update finished.",
+            color=0x57F287 if failed == 0 else 0xFEE75C,
+            timestamp=datetime.now(timezone.utc),
+        )
+        done.add_field(name="Candidates (initial)", value=str(len(self.candidate_ids)), inline=True)
+        done.add_field(name="Added", value=str(added), inline=True)
+        done.add_field(name="Failed", value=str(failed), inline=True)
+        done.add_field(name="Skipped (now has Member)", value=str(skipped_now_has_member), inline=True)
+        done.add_field(name="Skipped (already Future)", value=str(skipped_already_future), inline=True)
+        done.add_field(name="Skipped (staff/admin)", value=str(skipped_staff), inline=True)
+        done.add_field(name="Skipped (member not found)", value=str(skipped_missing_member), inline=True)
+        done.set_footer(text="RSCheckerbot • futurememberaudit")
+        with suppress(Exception):
+            if self.message:
+                await self.message.edit(embed=done, view=self)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        if not self._is_allowed_clicker(interaction):
+            await self._deny(interaction)
+            return
+        await interaction.response.defer()
+        await self._disable(cancelled=True)
+
+
+@bot.command(name="futurememberaudit", aliases=["futureaudit", "auditfuture"])
+@commands.has_permissions(administrator=True)
+async def future_member_audit(ctx):
+    """Scan Discord members missing the Member role and (after confirmation) add Future Member role."""
+    # Restrict to the configured primary guild.
+    if ctx.guild and GUILD_ID and int(ctx.guild.id) != int(GUILD_ID):
+        await ctx.send("❌ This command is only allowed in the main server.", delete_after=12)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    guild = bot.get_guild(GUILD_ID) if GUILD_ID else None
+    if not guild:
+        await ctx.send("❌ Guild not found / bot not ready.", delete_after=10)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    # Resolve role IDs from config (no hardcoding).
+    try:
+        member_role_id = int(str(ROLE_CANCEL_A or "").strip())
+        future_role_id = int(str(ROLE_TO_ASSIGN or "").strip())
+    except Exception:
+        member_role_id = 0
+        future_role_id = 0
+    if not member_role_id or not future_role_id:
+        await ctx.send("❌ Missing role IDs in config (dm_sequence.role_cancel_a / role_to_assign).", delete_after=15)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    member_role = guild.get_role(member_role_id)
+    future_role = guild.get_role(future_role_id)
+    if not member_role or not future_role:
+        await ctx.send("❌ Required role(s) not found in guild. Check role IDs in config.", delete_after=15)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    def _is_staff(m: discord.Member) -> bool:
+        try:
+            p = m.guild_permissions
+            return bool(p.administrator or p.manage_guild or p.manage_roles)
+        except Exception:
+            return False
+
+    # Prefer posting preview + confirmation in member-status-logs.
+    status_ch = bot.get_channel(MEMBER_STATUS_LOGS_CHANNEL_ID) if MEMBER_STATUS_LOGS_CHANNEL_ID else None
+    if not isinstance(status_ch, discord.TextChannel):
+        await ctx.send("❌ member-status-logs channel not found / not configured.", delete_after=15)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    # Let the invoker know we’re running, but avoid channel spam.
+    with suppress(Exception):
+        await ctx.send(
+            "🔍 Scanning members… I will post the preview + confirmation in member-status-logs.",
+            delete_after=15,
+        )
+
+    scanned = 0
+    bots_skipped = 0
+    staff_skipped = 0
+    missing_member = 0
+    already_future = 0
+    candidates: list[int] = []
+    sample_lines: list[str] = []
+
+    # Fetch members for correctness (cache can be partial on large guilds).
+    try:
+        async for m in guild.fetch_members(limit=None):
+            scanned += 1
+            if not isinstance(m, discord.Member):
+                continue
+            if m.bot:
+                bots_skipped += 1
+                continue
+            if _is_staff(m):
+                staff_skipped += 1
+                continue
+            role_ids = {r.id for r in (m.roles or [])}
+            if member_role_id in role_ids:
+                continue
+            missing_member += 1
+            if future_role_id in role_ids:
+                already_future += 1
+                continue
+            candidates.append(int(m.id))
+            if len(sample_lines) < 20:
+                sample_lines.append(f"- {m.mention} • `{m.id}`")
+    except Exception as e:
+        await ctx.send(f"❌ Scan failed: {e}", delete_after=15)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    totals = {
+        "scanned": scanned,
+        "bots_skipped": bots_skipped,
+        "staff_skipped": staff_skipped,
+        "missing_member": missing_member,
+        "already_future": already_future,
+        "candidates": len(candidates),
+    }
+
+    e = discord.Embed(
+        title="Future Member Audit — preview",
+        description=(
+            "This will add the Future Member role to members who are missing the Member role.\n"
+            "No changes happen until Confirm."
+        ),
+        color=0xFEE75C if candidates else 0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    e.add_field(name="Member role", value=_fmt_role(member_role_id, guild), inline=False)
+    e.add_field(name="Future Member role", value=_fmt_role(future_role_id, guild), inline=False)
+    e.add_field(name="Scanned", value=str(scanned), inline=True)
+    e.add_field(name="Skipped (bots)", value=str(bots_skipped), inline=True)
+    e.add_field(name="Skipped (staff/admin)", value=str(staff_skipped), inline=True)
+    e.add_field(name="Missing Member role", value=str(missing_member), inline=True)
+    e.add_field(name="Already has Future role", value=str(already_future), inline=True)
+    e.add_field(name="Will add Future role to", value=str(len(candidates)), inline=True)
+    sample_txt = "\n".join(sample_lines) if sample_lines else "—"
+    if len(candidates) > len(sample_lines):
+        sample_txt += f"\n… and {len(candidates) - len(sample_lines)} more"
+    e.add_field(name="Sample", value=sample_txt[:1024], inline=False)
+    e.set_footer(text="RSCheckerbot • futurememberaudit")
+
+    view = _FutureMemberAuditView(
+        invoker_user_id=int(getattr(ctx.author, "id", 0) or 0),
+        guild_id=int(guild.id),
+        member_role_id=int(member_role_id),
+        future_role_id=int(future_role_id),
+        candidate_ids=candidates,
+        totals=totals,
+    )
+    try:
+        msg = await status_ch.send(embed=e, view=view, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+        view.message = msg
+    except Exception as ex:
+        await ctx.send(f"❌ Failed to post preview in member-status-logs: {ex}", delete_after=15)
+
+    with suppress(Exception):
+        await ctx.message.delete()
+
 
 @bot.command(name="dmenable")
 @commands.has_permissions(administrator=True)

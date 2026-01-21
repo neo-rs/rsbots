@@ -80,6 +80,18 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 - **Returns**: Deletion summary (deleted count, skipped count, failed count)
 - **Note**: Command message is auto-deleted
 
+#### `.checker futurememberaudit`
+- **Description**: Scan Discord members missing the Member role and (after an explicit confirmation in `member-status-logs`) add the Future Member role
+- **Aliases**: `futureaudit`, `auditfuture`
+- **Parameters**: None
+- **Usage**: `.checker futurememberaudit`
+- **Admin Only**: Yes (requires administrator permissions)
+- **Returns**: Posts a preview + Confirm/Cancel buttons in `member-status-logs`, then (on Confirm) posts progress + a final summary
+- **Notes**:
+  - Role IDs come from `config.json` (`dm_sequence.role_cancel_a` = Member role, `dm_sequence.role_to_assign` = Future Member role)
+  - Staff/admins are skipped (administrator/manage-guild/manage-roles permissions)
+  - No roles are ever mentioned (no `<@&...>`); output is plain text names + IDs
+
 ### Direct Message Controls
 
 #### `.checker dmenable`
@@ -178,10 +190,10 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 
 ## Command Summary
 
-- **Total Commands**: 14
-- **Admin Commands**: 14 (all commands require administrator permissions)
+- **Total Commands**: 15
+- **Admin Commands**: 15 (all commands require administrator permissions)
 - **Public Commands**: 0
-- **Commands with Aliases**: 6
+- **Commands with Aliases**: 7
 - **Command Prefix**: `.checker` (dot prefix)
 
 ## Notes
@@ -190,6 +202,7 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 - All commands require administrator permissions
 - Command messages are automatically deleted
 - Replies auto-delete after 5-30 seconds depending on command
+- Whop startup/6h sync is **audit-first** by default: it only removes the Member role if `config.json -> whop_api.enforce_role_removals=true` (default is false, which logs “would remove” only)
 - Data is stored in JSON files:
   - `queue.json` - Active DM sequence queue
   - `registry.json` - Member registry
