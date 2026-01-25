@@ -450,9 +450,11 @@ async def expand_url(session: aiohttp.ClientSession, url: str, *, timeout_s: flo
 
 
 def _mavely_cookie_file_path() -> Path:
+    repo_root = Path(__file__).resolve().parents[1]
     explicit = (os.getenv("MAVELY_COOKIES_FILE", "") or "").strip()
     if explicit:
-        return Path(explicit)
+        p = Path(explicit)
+        return p if p.is_absolute() else (repo_root / p)
     return Path(__file__).parent / "mavely_cookies.txt"
 
 

@@ -53,9 +53,18 @@ def main() -> int:
 
     devtools_mode = int(args.devtools_port or 0) > 0
 
+    repo_root = Path(__file__).resolve().parents[1]
     base_url = _env("MAVELY_BASE_URL", "https://creators.joinmavely.com").rstrip("/")
-    profile_dir = Path(_env("MAVELY_PROFILE_DIR", str(Path(__file__).parent / ".mavely_profile")))
-    cookies_file = Path(_env("MAVELY_COOKIES_FILE", str(Path(__file__).parent / "mavely_cookies.txt")))
+    profile_raw = _env("MAVELY_PROFILE_DIR", str(Path(__file__).parent / ".mavely_profile"))
+    cookies_raw = _env("MAVELY_COOKIES_FILE", str(Path(__file__).parent / "mavely_cookies.txt"))
+
+    profile_dir = Path(profile_raw)
+    if not profile_dir.is_absolute():
+        profile_dir = repo_root / profile_dir
+
+    cookies_file = Path(cookies_raw)
+    if not cookies_file.is_absolute():
+        cookies_file = repo_root / cookies_file
     session_url = f"{base_url}/api/auth/session"
 
     profile_dir.mkdir(parents=True, exist_ok=True)
