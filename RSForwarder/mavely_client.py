@@ -298,6 +298,27 @@ class MavelyClient:
                 return aud.strip()
         return ""
 
+    def _auth_token_expiring_soon(self) -> bool:
+        """
+        Best-effort preemptive refresh:
+        If auth_token is a JWT with exp, refresh when exp is within MAVELY_REFRESH_SKEW_S seconds.
+        """
+        try:
+            skew = int((_env_str("MAVELY_REFRESH_SKEW_S") or "").strip() or "300")
+        except Exception:
+            skew = 300
+        skew = max(30, min(skew, 24 * 3600))
+
+        p = _jwt_payload(self.auth_token or "")
+        exp = (p or {}).get("exp") if isinstance(p, dict) else None
+        if not isinstance(exp, int):
+            try:
+                exp = int(exp)
+            except Exception:
+                return False
+        now = int(time.time())
+        return now >= (int(exp) - int(skew))
+
     def _refresh_access_token(self, sess: requests.Session) -> Optional[str]:
         """
         Try to mint a new access token using refresh_token grant (Auth0-style).
@@ -650,6 +671,12 @@ class MavelyClient:
             return None
 
         self._ensure_auth_token_from_session(sess)
+        # Preemptive refresh: if we have a bearer token that is near expiry, refresh before making the GraphQL call.
+        enable_oauth_refresh = (_env_str("MAVELY_ENABLE_OAUTH_REFRESH") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+        if enable_oauth_refresh and self.auth_token and self._auth_token_expiring_soon():
+            refreshed = self._refresh_access_token(sess)
+            if refreshed:
+                self.auth_token = refreshed
 
         gql_url = _graphql_url(self.base_url, self.graphql_endpoint)
         self.log.debug("GraphQL POST %s (has_auth=%s has_cookie=%s)", gql_url, bool(self.auth_token), bool(self.cookie_header))
@@ -863,8 +890,19 @@ mutation CreateAffiliateLink($url: String!) {
             return MavelyResult(ok=False, status_code=200, error=f"Unexpected GraphQL response: {e}", raw_snippet=snippet)
 
     def create_link(self, url: str) -> MavelyResult:
+        # Allow "refresh-token-only" mode: if no cookies/bearer are present but OAuth refresh is enabled,
+        # try minting a bearer token up-front.
+        enable_oauth_refresh = (_env_str("MAVELY_ENABLE_OAUTH_REFRESH") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+        if enable_oauth_refresh and (not self.auth_token) and self.refresh_token:
+            try:
+                minted = self._refresh_access_token(requests.Session())
+                if minted:
+                    self.auth_token = minted
+            except Exception:
+                pass
+
         if not self.cookie_header and not self.auth_token:
-            return MavelyResult(ok=False, status_code=0, error="Missing MAVELY cookie/session token (or MAVELY_AUTH_TOKEN)")
+            return MavelyResult(ok=False, status_code=0, error="Missing MAVELY cookie/session token (or MAVELY_AUTH_TOKEN / OAuth refresh token)")
 
         if not url:
             return MavelyResult(ok=False, status_code=0, error="Missing URL")

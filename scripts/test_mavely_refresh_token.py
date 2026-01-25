@@ -91,6 +91,15 @@ def main() -> int:
 
     # Instantiate client; session_token is only needed for cookie flows, but required by constructor.
     cookie_or_empty = (os.environ.get("MAVELY_COOKIES", "") or "").strip()
+    if not cookie_or_empty:
+        cookie_file = (os.environ.get("MAVELY_COOKIES_FILE", "") or "").strip()
+        if cookie_file:
+            try:
+                cookie_or_empty = (Path(cookie_file).read_text(encoding="utf-8", errors="replace") or "").strip()
+                os.environ["MAVELY_COOKIES"] = cookie_or_empty
+                print(f"- Loaded MAVELY_COOKIES from file: {cookie_file} (len={len(cookie_or_empty)})")
+            except Exception:
+                print(f"- Failed to read MAVELY_COOKIES_FILE: {cookie_file}")
     c = MavelyClient(session_token=cookie_or_empty, timeout_s=int(args.timeout))
     print(f"- Using token endpoint: {c.token_endpoint}")
 

@@ -1477,6 +1477,60 @@ class RSForwarderBot:
             return f"<@&{role_id}>"
         
         return f"<@&{role_id}> {text}"
+
+    def _members_role_ids(self) -> List[int]:
+        """
+        Return role IDs that correspond to a role named "Members" (case-insensitive).
+        Used to prevent forwarding/pinging @Members.
+        """
+        try:
+            if not self.rs_guild:
+                guild_id = int(self.config.get("guild_id", 0) or 0)
+                if guild_id:
+                    self.rs_guild = self.bot.get_guild(guild_id)
+            g = self.rs_guild
+            if not g:
+                return []
+            out: List[int] = []
+            for r in getattr(g, "roles", []) or []:
+                name = (getattr(r, "name", "") or "").strip().lower()
+                if name == "members":
+                    out.append(int(getattr(r, "id", 0) or 0))
+            return [rid for rid in out if rid > 0]
+        except Exception:
+            return []
+
+    def _strip_members_mentions(self, text: str) -> str:
+        """
+        Remove @Members role mentions from forwarded content.
+        Keeps other role mentions intact.
+        """
+        t = text or ""
+        if not t:
+            return t
+        try:
+            for rid in self._members_role_ids():
+                t = t.replace(f"<@&{rid}>", "")
+            # Also handle plain-text "@Members" if present
+            t = t.replace("@Members", "")
+            # Normalize whitespace / empty lines after removal
+            lines = [ln.rstrip() for ln in t.splitlines()]
+            # Drop lines that became empty due only to mention removal
+            compact: List[str] = []
+            for ln in lines:
+                if ln.strip() == "":
+                    if compact and compact[-1] != "":
+                        compact.append("")
+                    continue
+                compact.append(ln)
+            # Trim leading/trailing blank lines
+            while compact and compact[0] == "":
+                compact.pop(0)
+            while compact and compact[-1] == "":
+                compact.pop()
+            return "\n".join(compact).strip()
+        except Exception:
+            return (text or "").strip()
     
     async def _send_forwarding_log(self, message: discord.Message, channel_config: Dict[str, Any], success: bool, error: str = None):
         """Send forwarding log to configured logging channel"""
@@ -1580,6 +1634,10 @@ class RSForwarderBot:
                     for k, v in _notes.items():
                         if k and v:
                             affiliate_notes[str(k)] = str(v)
+
+            # Never forward/ping @Members
+            if content:
+                content = self._strip_members_mentions(content)
             
             # Get channel name for custom titles
             channel_name = channel_config.get("source_channel_name", "Unknown Channel")
@@ -1623,6 +1681,12 @@ class RSForwarderBot:
             
             # Check if we need to add role mention (works for both normal messages and embeds)
             role_mention_text = self._get_role_mention_text(channel_config)
+            # Never add @Members even if configured
+            if role_mention_text:
+                for rid in self._members_role_ids():
+                    if f"<@&{rid}>" in role_mention_text:
+                        role_mention_text = None
+                        break
             # Debug: Log role mention status
             if self.stats['messages_forwarded'] == 0:
                 if role_mention_text:

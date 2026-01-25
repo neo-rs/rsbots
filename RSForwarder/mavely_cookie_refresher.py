@@ -40,6 +40,7 @@ def main() -> int:
     base_url = _env("MAVELY_BASE_URL", "https://creators.joinmavely.com").rstrip("/")
     profile_dir = Path(_env("MAVELY_PROFILE_DIR", str(Path(__file__).parent / ".mavely_profile")))
     cookies_file = Path(_env("MAVELY_COOKIES_FILE", str(Path(__file__).parent / "mavely_cookies.txt")))
+    session_url = f"{base_url}/api/auth/session"
 
     profile_dir.mkdir(parents=True, exist_ok=True)
     cookies_file.parent.mkdir(parents=True, exist_ok=True)
@@ -69,6 +70,26 @@ def main() -> int:
             ctx.close()
             print("ERROR: Not logged in (missing next-auth cookies). Run with --interactive and log in.")
             return 2
+
+        # Validate login by calling the session endpoint (NextAuth returns {} when logged out).
+        try:
+            import requests
+
+            r = requests.get(session_url, headers={"Cookie": header, "User-Agent": "Mozilla/5.0"}, timeout=20)
+            ct = (r.headers.get("content-type") or "").lower()
+            if r.status_code != 200 or "application/json" not in ct:
+                ctx.close()
+                print(f"ERROR: Session validation failed (status={r.status_code} ct={ct.split(';')[0]})")
+                return 3
+            data = r.json()
+            if not isinstance(data, dict) or len(data) == 0:
+                ctx.close()
+                print("ERROR: Not logged in (session endpoint returned empty JSON). Run with --interactive and log in.")
+                return 2
+        except Exception as e:
+            ctx.close()
+            print(f"ERROR: Could not validate session: {e}")
+            return 3
 
         tmp = cookies_file.with_suffix(cookies_file.suffix + ".tmp")
         tmp.write_text(header, encoding="utf-8")

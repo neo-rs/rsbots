@@ -113,6 +113,10 @@ rs-bot-tokens.txt
 RSForwarder/mavely_cookies*.txt
 RSForwarder/mavely_refresh_token*.txt
 RSForwarder/.mavely_profile/**
+Instorebotforwarder/mavely_cookies*.txt
+Instorebotforwarder/mavely_refresh_token*.txt
+Instorebotforwarder/mavely_auth_token*.txt
+Instorebotforwarder/mavely_id_token*.txt
 
 # Virtualenvs
 .venv/

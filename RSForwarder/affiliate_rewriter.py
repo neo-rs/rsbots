@@ -537,6 +537,7 @@ def _apply_env_from_cfg(cfg: dict) -> None:
             "mavely_cookies_file": "MAVELY_COOKIES_FILE",
             "mavely_auto_refresh_on_fail": "MAVELY_AUTO_REFRESH_ON_FAIL",
             "mavely_auto_refresh_cooldown_s": "MAVELY_AUTO_REFRESH_COOLDOWN_S",
+            "mavely_profile_dir": "MAVELY_PROFILE_DIR",
 
             "mavely_id_token": "MAVELY_ID_TOKEN",
             "mavely_base_url": "MAVELY_BASE_URL",
