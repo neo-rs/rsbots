@@ -1,6 +1,7 @@
 {
   "guild_id": 876528050081251379,
   "brand_name": "Reselling Secrets",
+  "affiliate_rewrite_enabled": true,
   "forwarding_logs_channel_id": "1446374766180307015",
   "channels": [
     {

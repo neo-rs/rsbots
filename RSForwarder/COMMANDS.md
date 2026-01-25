@@ -69,6 +69,16 @@ RSForwarder is a standalone bot for forwarding messages from RS Server channels 
 - **Admin Only**: No (but requires channel access)
 - **Returns**: Forwarding results
 
+#### `!rstestall`
+- **Description**: Test forwarding for ALL configured channels by forwarding the most recent message(s) from each into a test channel via an auto-created webhook
+- **Aliases**: `testall`
+- **Parameters**:
+  - `test_channel_id`: Test channel ID (optional; defaults to `1446372213757313034`)
+  - `limit`: Number of messages per channel (optional; default: 1; max: 5)
+- **Usage**: `!rstestall` or `!rstestall 1446372213757313034 1`
+- **Admin Only**: Yes (can spam test channel)
+- **Returns**: Summary counts (ok/fail)
+
 ### Status Commands
 
 #### `!rsstatus`
@@ -117,10 +127,10 @@ RSForwarder is a standalone bot for forwarding messages from RS Server channels 
 
 ## Command Summary
 
-- **Total Commands**: 12
+- **Total Commands**: 13
 - **Admin Commands**: 2 (`!rsstartadminbot`, `!rsrestartadminbot`)
 - **Public Commands**: 10
-- **Commands with Aliases**: 9
+- **Commands with Aliases**: 10
 - **Command Prefix**: `!rs` (unique prefix to avoid conflicts)
 
 ## Notes

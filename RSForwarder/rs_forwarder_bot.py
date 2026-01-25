@@ -19,6 +19,8 @@ import platform
 import subprocess
 import shlex
 
+from RSForwarder import affiliate_rewriter
+
 # Ensure repo root is importable when executed as a script (matches Ubuntu run_bot.sh PYTHONPATH).
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -808,6 +810,102 @@ class RSForwarderBot:
                 await ctx.send(f"❌ Bot doesn't have permission to read messages in channel `{source_channel_id}`")
             except Exception as e:
                 await ctx.send(f"❌ Error: {str(e)}")
+
+        async def _get_or_create_test_webhook(channel: discord.TextChannel) -> Optional[str]:
+            """
+            Create/reuse a webhook in the given channel (requires Manage Webhooks permission).
+            Returns webhook URL or None.
+            """
+            try:
+                hooks = await channel.webhooks()
+            except Exception:
+                hooks = []
+            me_id = int(self.bot.user.id) if self.bot.user else 0
+            for h in hooks:
+                try:
+                    if h.user and me_id and int(h.user.id) == me_id:
+                        return str(h.url)
+                except Exception:
+                    continue
+            try:
+                wh = await channel.create_webhook(name="RSForwarder Test")
+                return str(wh.url)
+            except Exception:
+                return None
+
+        @self.bot.command(name='rstestall', aliases=['testall'])
+        async def test_forward_all(ctx, test_channel_id: str = "1446372213757313034", limit: int = 1):
+            """
+            Test forwarding for ALL configured channels by sending the most recent message(s)
+            from each source channel into the given test channel via an auto-created webhook.
+
+            Usage: !rstestall [test_channel_id] [limit]
+            Example: !rstestall 1446372213757313034 1
+            """
+            # Admin-only (this can spam the test channel)
+            if not ctx.author.guild_permissions.administrator:
+                await ctx.send("❌ Admins only.")
+                return
+
+            try:
+                test_ch = self.bot.get_channel(int(str(test_channel_id).strip()))
+            except Exception:
+                test_ch = None
+            if not isinstance(test_ch, discord.TextChannel):
+                await ctx.send(f"❌ Test channel not found or not accessible: `{test_channel_id}`")
+                return
+
+            webhook_url = await _get_or_create_test_webhook(test_ch)
+            if not webhook_url:
+                await ctx.send("❌ Could not create/reuse a webhook in the test channel. Check **Manage Webhooks** permission.")
+                return
+
+            channels = self.config.get("channels", []) or []
+            if not channels:
+                await ctx.send("❌ No channels configured in RSForwarder/config.json")
+                return
+
+            try:
+                limit_i = int(limit)
+            except Exception:
+                limit_i = 1
+            limit_i = max(1, min(limit_i, 5))
+
+            await ctx.send(f"🧪 Testing `{len(channels)}` channel(s) → <#{test_channel_id}> (limit={limit_i}) ...")
+
+            ok = 0
+            fail = 0
+            for chcfg in channels:
+                src_id = str((chcfg or {}).get("source_channel_id", "")).strip()
+                if not src_id:
+                    continue
+                src = self.bot.get_channel(int(src_id)) if src_id.isdigit() else None
+                if not isinstance(src, discord.TextChannel):
+                    fail += 1
+                    continue
+
+                # Clone config but override destination webhook to the test channel webhook
+                tmp_cfg = dict(chcfg)
+                tmp_cfg["destination_webhook_url"] = webhook_url
+                tmp_cfg["source_channel_name"] = str((chcfg or {}).get("source_channel_name") or src.name)
+
+                sent_any = False
+                try:
+                    async for message in src.history(limit=limit_i):
+                        if self.bot.user and message.author.id == self.bot.user.id:
+                            continue
+                        await self.forward_message(message, src_id, tmp_cfg)
+                        sent_any = True
+                        break
+                except Exception:
+                    sent_any = False
+
+                if sent_any:
+                    ok += 1
+                else:
+                    fail += 1
+
+            await ctx.send(f"✅ rstestall complete: ok={ok} fail={fail}")
         
         @self.bot.command(name='rsstatus', aliases=['status'])
         async def bot_status(ctx):
@@ -1440,12 +1538,24 @@ class RSForwarderBot:
             
             # Prepare message content
             content = message.content or ""
+
+            # Affiliate rewrite (standalone, same behavior as Instorebotforwarder)
+            rewrite_enabled = bool(self.config.get("affiliate_rewrite_enabled", True))
+            if rewrite_enabled and content:
+                content, _changed, _notes = await affiliate_rewriter.rewrite_text(self.config, content)
             
             # Get channel name for custom titles
             channel_name = channel_config.get("source_channel_name", "Unknown Channel")
             
             # Prepare embeds - convert normal messages to embeds if needed
             embeds_raw = [e.to_dict() for e in message.embeds] if message.embeds else []
+
+            if rewrite_enabled and embeds_raw:
+                rewritten_embeds = []
+                for e in embeds_raw:
+                    ee, _ch, _notes = await affiliate_rewriter.rewrite_embed_dict(self.config, e)
+                    rewritten_embeds.append(ee)
+                embeds_raw = rewritten_embeds
             
             # If no embeds and we have content, create an embed from the message
             if not embeds_raw and content:
@@ -1548,12 +1658,12 @@ class RSForwarderBot:
             if role_mention_text:
                 final_content_parts.append(role_mention_text)
             
-            # For normal messages converted to embeds, we don't need content (it's in the embed)
-            # Only add content if we have role mention or if there are no embeds
-            if role_mention_text or not embeds:
-                # If we have role mention but no embeds (shouldn't happen, but safety check)
-                if not embeds and content:
-                    final_content_parts.append(content)
+            # If the original message had content and embeds, preserve the content too (forward full message).
+            if content and embeds:
+                final_content_parts.append(content)
+
+            # Only add content if we have anything to post in content (role mention and/or original content)
+            if final_content_parts:
                 
                 # Combine content
                 final_content = "\n".join(final_content_parts) if final_content_parts else None
