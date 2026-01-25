@@ -109,6 +109,11 @@ rs-bot-tokens.txt
 **/__pycache__/
 **/*.pyc
 
+# Mavely local auth artifacts (never commit)
+RSForwarder/mavely_cookies*.txt
+RSForwarder/mavely_refresh_token*.txt
+RSForwarder/.mavely_profile/**
+
 # Virtualenvs
 .venv/
 venv/

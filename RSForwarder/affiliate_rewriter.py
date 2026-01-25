@@ -525,6 +525,19 @@ def _apply_env_from_cfg(cfg: dict) -> None:
     """
     try:
         mapping = {
+            # OAuth refresh (optional)
+            "mavely_refresh_token": "MAVELY_REFRESH_TOKEN",
+            "mavely_refresh_token_file": "MAVELY_REFRESH_TOKEN_FILE",
+            "mavely_enable_oauth_refresh": "MAVELY_ENABLE_OAUTH_REFRESH",
+            "mavely_token_endpoint": "MAVELY_TOKEN_ENDPOINT",
+            "mavely_client_id": "MAVELY_CLIENT_ID",
+            "mavely_auth_audience": "MAVELY_AUTH_AUDIENCE",
+            "mavely_auth_scope": "MAVELY_AUTH_SCOPE",
+            # Cookie refresh helper (optional)
+            "mavely_cookies_file": "MAVELY_COOKIES_FILE",
+            "mavely_auto_refresh_on_fail": "MAVELY_AUTO_REFRESH_ON_FAIL",
+            "mavely_auto_refresh_cooldown_s": "MAVELY_AUTO_REFRESH_COOLDOWN_S",
+
             "mavely_id_token": "MAVELY_ID_TOKEN",
             "mavely_base_url": "MAVELY_BASE_URL",
             "mavely_user_agent": "MAVELY_USER_AGENT",
@@ -580,6 +593,17 @@ async def mavely_create_link(cfg: dict, url: str) -> Tuple[Optional[str], Option
             max_retries=max_retries,
             min_seconds_between_requests=min_seconds,
         )
+        # If persistence is enabled via MAVELY_REFRESH_TOKEN_FILE and we don't have a refresh token yet,
+        # sync from /api/auth/session once so token rotation is handled automatically.
+        try:
+            rt_file = (os.getenv("MAVELY_REFRESH_TOKEN_FILE", "") or "").strip()
+            if rt_file and (not getattr(client, "refresh_token", "")) and getattr(client, "cookie_header", ""):
+                import requests
+
+                sess = requests.Session()
+                client._ensure_auth_token_from_session(sess, force=True)  # updates refreshToken/idToken too
+        except Exception:
+            pass
         res = client.create_link((url or "").strip())
         link = res.mavely_link if getattr(res, "ok", False) else None
         err = "" if link else (getattr(res, "error", None) or "Failed to generate Mavely link.")

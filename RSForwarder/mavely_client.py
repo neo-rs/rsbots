@@ -10,6 +10,7 @@ import time
 import json
 import logging
 import base64
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Dict
 
@@ -28,6 +29,28 @@ DEFAULT_TOKEN_ENDPOINT = f"{DEFAULT_AUTH_BASE}/oauth/token"
 
 def _env_str(name: str, default: str = "") -> str:
     return (os.environ.get(name, default) or "").strip()
+
+
+def _read_text_file(path: str) -> str:
+    try:
+        p = Path(path)
+        if not p.exists():
+            return ""
+        return (p.read_text(encoding="utf-8", errors="replace") or "").strip()
+    except Exception:
+        return ""
+
+
+def _write_text_file(path: str, content: str) -> bool:
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(p)
+        return True
+    except Exception:
+        return False
 
 
 def _maybe_add(headers: Dict[str, str], name: str, value: str) -> None:
@@ -202,6 +225,10 @@ class MavelyClient:
         # Some Mavely endpoints require the NextAuth "idToken" rather than the access token.
         self.id_token = _clean_token(os.environ.get("MAVELY_ID_TOKEN", ""))
         self.refresh_token = _clean_token(os.environ.get("MAVELY_REFRESH_TOKEN", ""))
+        if not self.refresh_token:
+            rt_file = _env_str("MAVELY_REFRESH_TOKEN_FILE")
+            if rt_file:
+                self.refresh_token = _clean_token(_read_text_file(rt_file))
         self.token_endpoint = _env_str("MAVELY_TOKEN_ENDPOINT") or DEFAULT_TOKEN_ENDPOINT
         self.auth_audience = _env_str("MAVELY_AUTH_AUDIENCE")  # optional
         self.auth_scope = _env_str("MAVELY_AUTH_SCOPE")        # optional
@@ -242,6 +269,20 @@ class MavelyClient:
             self._cookie_has_session,
             self._refresh_len,
         )
+        # If MAVELY_REFRESH_TOKEN_FILE is configured, seed it with the current token.
+        # (Useful on first run, before any rotation occurs.)
+        try:
+            self._maybe_persist_refresh_token()
+        except Exception:
+            pass
+
+    def _maybe_persist_refresh_token(self) -> None:
+        rt_file = _env_str("MAVELY_REFRESH_TOKEN_FILE")
+        if not rt_file:
+            return
+        if not self.refresh_token:
+            return
+        _write_text_file(rt_file, self.refresh_token)
 
     def _resolve_client_id(self) -> str:
         if self.client_id:
@@ -290,13 +331,16 @@ class MavelyClient:
             bool(self.auth_audience),
             bool(self.auth_scope),
         )
-        try:
-            resp = sess.post(
+        def _do_post() -> requests.Response:
+            return sess.post(
                 self.token_endpoint,
                 data=payload,
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 timeout=self.timeout_s,
             )
+
+        try:
+            resp = _do_post()
         except requests.RequestException as e:
             self._last_refresh_error = str(e)
             return None
@@ -311,6 +355,39 @@ class MavelyClient:
                 err_desc = str((j or {}).get("error_description") or "")
             except Exception:
                 pass
+            # If the refresh token rotated (common) and cookies are still valid,
+            # pull a fresh refreshToken from /api/auth/session and retry once.
+            if (err_code or "").strip().lower() == "invalid_grant" and self.cookie_header:
+                prev = self.refresh_token
+                try:
+                    self._ensure_auth_token_from_session(sess, force=True)
+                except Exception:
+                    pass
+                if self.refresh_token and self.refresh_token != prev:
+                    payload["refresh_token"] = self.refresh_token
+                    try:
+                        resp = _do_post()
+                        if resp.status_code == 200:
+                            try:
+                                data = resp.json()
+                            except Exception:
+                                self._last_refresh_error = "failed to parse token endpoint JSON"
+                                return None
+                            rt2 = (data or {}).get("refresh_token")
+                            if isinstance(rt2, str) and rt2.strip():
+                                new_rt2 = _clean_token(rt2)
+                                if new_rt2 and new_rt2 != self.refresh_token:
+                                    self.refresh_token = new_rt2
+                                    self._refresh_len = len(self.refresh_token or "")
+                                    self.log.debug("Refresh response included new refresh_token (len=%s)", self._refresh_len)
+                                    self._maybe_persist_refresh_token()
+                            access_token = (data or {}).get("access_token")
+                            if isinstance(access_token, str) and access_token.strip():
+                                return _clean_token(access_token)
+                            self._last_refresh_error = "token endpoint JSON missing access_token"
+                            return None
+                    except Exception:
+                        pass
             extra = ""
             if err_code or err_desc:
                 extra = f" ({err_code}{': ' if (err_code and err_desc) else ''}{err_desc})"
@@ -321,6 +398,15 @@ class MavelyClient:
         except Exception:
             self._last_refresh_error = "failed to parse token endpoint JSON"
             return None
+
+        rt = (data or {}).get("refresh_token")
+        if isinstance(rt, str) and rt.strip():
+            new_rt = _clean_token(rt)
+            if new_rt and new_rt != self.refresh_token:
+                self.refresh_token = new_rt
+                self._refresh_len = len(self.refresh_token or "")
+                self.log.debug("Refresh response included new refresh_token (len=%s)", self._refresh_len)
+                self._maybe_persist_refresh_token()
 
         access_token = (data or {}).get("access_token")
         if isinstance(access_token, str) and access_token.strip():
@@ -445,6 +531,32 @@ class MavelyClient:
             if force:
                 self.log.info("Mavely: session endpoint returned empty JSON. Your MAVELY_COOKIES are not logged in anymore.")
             return False
+
+        # Keep idToken + refreshToken in sync with current session cookies.
+        # This makes token rotation mostly hands-off as long as cookies remain valid.
+        try:
+            id_token = (
+                (data or {}).get("idToken")
+                or ((data.get("user") or {}).get("idToken") if isinstance(data.get("user"), dict) else None)
+            )
+            refresh_token = (
+                (data or {}).get("refreshToken")
+                or ((data.get("user") or {}).get("refreshToken") if isinstance(data.get("user"), dict) else None)
+            )
+            if isinstance(id_token, str) and id_token.strip():
+                new_id = _clean_token(id_token)
+                if new_id and new_id != self.id_token:
+                    self.id_token = new_id
+                    self.log.debug("Updated idToken from session JSON (len=%s)", len(self.id_token))
+            if isinstance(refresh_token, str) and refresh_token.strip():
+                new_refresh = _clean_token(refresh_token)
+                if new_refresh and new_refresh != self.refresh_token:
+                    self.refresh_token = new_refresh
+                    self._refresh_len = len(self.refresh_token or "")
+                    self.log.debug("Updated refreshToken from session JSON (len=%s)", self._refresh_len)
+                    self._maybe_persist_refresh_token()
+        except Exception:
+            pass
 
         token = (
             (data or {}).get("token")

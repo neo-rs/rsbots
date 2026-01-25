@@ -143,3 +143,19 @@ RSForwarder is a standalone bot for forwarding messages from RS Server channels 
 - Bot messages from RSForwarder itself are skipped to avoid loops
 - RSAdminBot control commands require administrator permissions
 - Local-exec mode is preferred when RSForwarder runs on Ubuntu host (no SSH key needed)
+
+## Optional: Mavely auto-auth (affiliate rewriting)
+
+RSForwarder can generate Mavely affiliate links and auto-recover when tokens expire.
+
+- **Cookies (recommended)**: use `RSForwarder/mavely_cookie_refresher.py` to keep a logged-in browser profile and write cookies to a file.
+  - `MAVELY_COOKIES_FILE`: path to cookie header text file (default in RSForwarder folder)
+  - `MAVELY_BASE_URL`: usually `https://creators.joinmavely.com`
+
+- **OAuth refresh (optional, for hands-off token renewal)**:
+  - `MAVELY_ENABLE_OAUTH_REFRESH=1`: allow refreshing access tokens when Mavely returns auth failures
+  - `MAVELY_REFRESH_TOKEN_FILE`: file path where the bot can store the latest refresh token (handles rotation)
+  - `MAVELY_TOKEN_ENDPOINT`: default is `https://auth.mave.ly/oauth/token`
+  - `MAVELY_CLIENT_ID`: optional (can often be inferred from session/idToken)
+
+If Mavely forces a real re-login (logout / Cloudflare / MFA), you may still need to refresh cookies manually.
