@@ -159,11 +159,26 @@ def _extract_markdown_link_target(markdown: str) -> Optional[str]:
 
 def _is_markdown_link_target_context(text: str, start: int, end: int) -> bool:
     try:
-        if start < 2 or end >= len(text):
+        if start < 2 or end > len(text):
             return False
-        if text[start - 2:start] != "](":
+        # Allow whitespace and optional "<" wrapper:
+        #   [label](https://...)
+        #   [label](<https://...>)
+        #   [label]( <https://...> )
+        left = text[max(0, start - 12):start]
+        j = left.rfind("](")
+        if j < 0:
             return False
-        return text[end:end + 1] == ")"
+        between = left[j + 2:]
+        if between.strip() not in {"", "<"}:
+            return False
+        right = text[end:min(len(text), end + 8)]
+        r = right.lstrip()
+        if r.startswith(")"):
+            return True
+        if r.startswith(">"):
+            return r[1:].lstrip().startswith(")")
+        return False
     except Exception:
         return False
 
@@ -174,6 +189,14 @@ def is_mavely_link(url: str) -> bool:
     except Exception:
         host = ""
     return "mavely.app.link" in host
+
+
+def _rewrap_mavely_links_enabled(cfg: dict) -> bool:
+    # Default ON (so existing mavely links get re-wrapped into YOUR link).
+    raw = (os.getenv("AFFILIATE_REWRAP_MAVELY_LINKS", "") or "").strip()
+    if raw:
+        return _bool_or_default(raw, True)
+    return _bool_or_default((cfg or {}).get("affiliate_rewrap_mavely_links"), True)
 
 
 def is_amazon_like_url(url: str) -> bool:
@@ -307,7 +330,10 @@ def should_expand_url(url: str) -> bool:
         "trackcm.com",
         "walmrt.us",
         "amzn.to",
+        "mavely.app.link",
         "deals.pennyexplorer.com",
+        "pricedoffers.com",
+        "saveyourdeals.com",
         "joylink.io",
         "fkd.deals",
         "ringinthedeals.com",
@@ -343,6 +369,7 @@ def _extract_first_outbound_url_from_html(html: str) -> Optional[str]:
     if not t:
         return None
     patterns = [
+        # Prefer direct Amazon URLs found in deal pages.
         r"https?://(?:www\.)?amazon\.[^\s\"'<>]+",
         r"https?://amzn\.to/[A-Za-z0-9]+",
         r"https?://(?:www\.)?walmart\.com/[^\s\"'<>]+",
@@ -601,7 +628,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                         host = (urlparse(final_u).netloc or "").lower()
                     except Exception:
                         host = ""
-                    if host in {"deals.pennyexplorer.com", "ringinthedeals.com", "dmflip.com", "trackcm.com", "joylink.io", "fkd.deals"}:
+                    if host in {"deals.pennyexplorer.com", "ringinthedeals.com", "dmflip.com", "trackcm.com", "joylink.io", "fkd.deals", "pricedoffers.com", "saveyourdeals.com"}:
                         try:
                             async with session.get(final_u, timeout=aiohttp.ClientTimeout(total=float(timeout_s))) as resp:
                                 txt = await resp.text(errors="ignore")
@@ -614,6 +641,29 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
     for u in unique:
         raw = (normalized.get(u) or u).strip()
         target = (resolved.get(u) or raw).strip()
+
+        # Re-wrap existing Mavely links into YOUR Mavely link (so forwarded posts always credit you).
+        if is_mavely_link(raw):
+            if not _rewrap_mavely_links_enabled(cfg):
+                notes[u] = "already mavely link"
+                continue
+            # Expand mavely.app.link to destination, then generate our own link for that destination.
+            if target and (not is_mavely_link(target)) and (target != raw):
+                link, err = await mavely_create_link(cfg, target)
+                if link and not err and link != raw:
+                    mapped[u] = link
+                    notes[u] = "rewrapped mavely link"
+                else:
+                    notes[u] = err or "rewrap failed"
+            else:
+                notes[u] = "rewrap skipped (no expanded destination)"
+            continue
+
+        # If it expands to a Mavely link, keep that final mavely link (rare but happens).
+        if is_mavely_link(target) and (target != raw):
+            mapped[u] = target
+            notes[u] = "resolves to mavely link"
+            continue
 
         if is_amazon_like_url(target):
             affiliate_url = build_amazon_affiliate_url(cfg, target)

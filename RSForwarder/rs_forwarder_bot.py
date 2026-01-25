@@ -373,6 +373,35 @@ class RSForwarderBot:
                 print(f"{Colors.RED}[Bot] ❌ CRITICAL: RS Server icon NOT available!{Colors.RESET}")
                 print(f"{Colors.RED}[Bot] Branding will not work properly without the icon.{Colors.RESET}")
                 print(f"{Colors.RED}[Bot] Use !rsfetchicon to manually fetch the icon.{Colors.RESET}")
+
+            # Affiliate rewrite startup self-test (1 Amazon + 1 Mavely)
+            try:
+                if bool(self.config.get("affiliate_rewrite_enabled")):
+                    print(f"\n{Colors.CYAN}[Affiliate] Startup self-test:{Colors.RESET}")
+
+                    amazon_test_url = (os.getenv("RS_STARTUP_TEST_AMAZON_URL", "") or "").strip() or "https://www.amazon.com/dp/B000000000"
+                    try:
+                        mapped, notes = await affiliate_rewriter.compute_affiliate_rewrites(self.config, [amazon_test_url])
+                        out = (mapped.get(amazon_test_url) or "").strip()
+                        if out and out != amazon_test_url:
+                            print(f"{Colors.GREEN}[Affiliate] ✅ Amazon PASS{Colors.RESET} -> {out}")
+                        else:
+                            why = (notes.get(amazon_test_url) or "no change").strip()
+                            print(f"{Colors.YELLOW}[Affiliate] ⚠️  Amazon NO-CHANGE{Colors.RESET} ({why})")
+                    except Exception as e:
+                        print(f"{Colors.RED}[Affiliate] ❌ Amazon FAIL{Colors.RESET} ({e})")
+
+                    mavely_test_url = (os.getenv("RS_STARTUP_TEST_MAVELY_URL", "") or "").strip() or "https://www.target.com/p/zephyr/-/A-94827558"
+                    try:
+                        link, err = await affiliate_rewriter.mavely_create_link(self.config, mavely_test_url)
+                        if link and not err:
+                            print(f"{Colors.GREEN}[Affiliate] ✅ Mavely PASS{Colors.RESET} -> {link}")
+                        else:
+                            print(f"{Colors.RED}[Affiliate] ❌ Mavely FAIL{Colors.RESET} ({err or 'unknown error'})")
+                    except Exception as e:
+                        print(f"{Colors.RED}[Affiliate] ❌ Mavely FAIL{Colors.RESET} ({e})")
+            except Exception:
+                pass
             
             print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
             print(f"{Colors.BOLD}  🔄 RS Forwarder Bot{Colors.RESET}")
