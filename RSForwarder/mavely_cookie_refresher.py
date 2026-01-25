@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import time
 from pathlib import Path
 from typing import List
@@ -61,7 +62,9 @@ def main() -> int:
     cookies_file.parent.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as p:
-        launch_args: List[str] = []
+        # Extra stability flags: the "restore pages" bubble steals focus in VNC/noVNC
+        # and makes login fields unusable. Disable it.
+        launch_args: List[str] = ["--disable-session-crashed-bubble"]
         if devtools_mode:
             launch_args.extend(
                 [
@@ -73,7 +76,7 @@ def main() -> int:
         ctx = p.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir),
             headless=(not args.interactive),
-            args=launch_args or None,
+            args=launch_args,
         )
         page = ctx.new_page()
         try:
@@ -90,13 +93,21 @@ def main() -> int:
             print("Pick the Mavely page target, then enable DevTools Screencast to interact and log in.")
             print("This script will keep polling /api/auth/session and will exit once login is detected.")
 
-        if args.interactive:
+        # In interactive mode, a visible browser window is created.
+        # If devtools mode is also enabled, we do NOT block on stdin; we just poll /api/auth/session below.
+        if args.interactive and (not devtools_mode):
             print("Browser opened. Log into Mavely if needed, then come back here and press ENTER...")
             try:
                 input()
             except KeyboardInterrupt:
                 ctx.close()
                 return 1
+            except EOFError:
+                # Detached/daemonized run: no stdin available.
+                pass
+        elif args.interactive and devtools_mode:
+            if sys.stdin.isatty():
+                print("Browser opened. Log into Mavely in the browser window. (No ENTER needed; waiting for login.)")
 
         cookies = ctx.cookies()
         header = _cookie_header_from_cookies(cookies)
