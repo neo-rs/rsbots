@@ -628,13 +628,21 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                         host = (urlparse(final_u).netloc or "").lower()
                     except Exception:
                         host = ""
-                    if host in {"deals.pennyexplorer.com", "ringinthedeals.com", "dmflip.com", "trackcm.com", "joylink.io", "fkd.deals", "pricedoffers.com", "saveyourdeals.com"}:
+                    if host in {"deals.pennyexplorer.com", "ringinthedeals.com", "dmflip.com", "trackcm.com", "joylink.io", "fkd.deals", "pricedoffers.com", "saveyourdeals.com", "mavely.app.link"}:
                         try:
                             async with session.get(final_u, timeout=aiohttp.ClientTimeout(total=float(timeout_s))) as resp:
                                 txt = await resp.text(errors="ignore")
                             out = _extract_first_outbound_url_from_html(txt)
                             if out:
-                                resolved[u] = out
+                                out2 = unwrap_known_query_redirects(out) or out
+                                # If the extracted outbound is itself a redirect hub, expand once more.
+                                try:
+                                    if should_expand_url(out2) and (not is_amazon_like_url(out2)):
+                                        out2 = await expand_url(session, out2, timeout_s=timeout_s, max_redirects=max_redirects)
+                                        out2 = unwrap_known_query_redirects(out2) or out2
+                                except Exception:
+                                    pass
+                                resolved[u] = out2
                         except Exception:
                             pass
 
