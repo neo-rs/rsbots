@@ -24,7 +24,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
-from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl, urljoin
+from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl, urljoin, unquote
 
 import aiohttp
 
@@ -333,6 +333,8 @@ def should_expand_url(url: str) -> bool:
         "amzn.to",
         "mavely.app.link",
         "deals.pennyexplorer.com",
+        "dealsabove.com",
+        "www.dealsabove.com",
         "pricedoffers.com",
         "saveyourdeals.com",
         "joylink.io",
@@ -357,6 +359,14 @@ def unwrap_known_query_redirects(url: str) -> Optional[str]:
         cand = (q.get("product") or "").strip()
         if cand.startswith("http://") or cand.startswith("https://"):
             return cand
+    if host in {"dealsabove.com", "www.dealsabove.com"}:
+        # Example:
+        #   https://www.dealsabove.com/product-redirect?l=https%3A%2F%2Fwww.amazon.com%2Fdp%2FB0BGW6DSLW#code=...
+        cand = (q.get("l") or q.get("url") or q.get("u") or "").strip()
+        if cand:
+            cand = unquote(cand)
+            if cand.startswith("http://") or cand.startswith("https://"):
+                return cand
     if host == "joylink.io":
         for k in ("url", "u", "target", "dest"):
             cand = (q.get(k) or "").strip()
@@ -369,15 +379,17 @@ def _extract_first_outbound_url_from_html(html: str) -> Optional[str]:
     t = (html or "")[:200_000]
     if not t:
         return None
-    # Prefer explicit "Go to Deal" buttons when present.
-    m_btn = re.search(r'href="([^"]+)"[^>]*>\s*Go to Deal', t, re.IGNORECASE)
-    if m_btn:
-        return _html.unescape((m_btn.group(1) or "").strip()) or None
+    # Prefer explicit button links when present.
+    for label in ("Go to Deal", "Continue to Amazon", "Claim Amazon Deal", "Claim Deal"):
+        m_btn = re.search(rf'href="([^"]+)"[^>]*>\s*{re.escape(label)}', t, re.IGNORECASE)
+        if m_btn:
+            return _html.unescape((m_btn.group(1) or "").strip()) or None
     patterns = [
         # Prefer direct Amazon URLs found in deal pages.
         r"https?://(?:www\.)?amazon\.[^\s\"'<>]+",
         r"https?://amzn\.to/[A-Za-z0-9]+",
         r"https?://saveyourdeals\.com/[A-Za-z0-9]+",
+        r"https?://(?:www\.)?dealsabove\.com/[^\s\"'<>]+",
         r"https?://(?:www\.)?walmart\.com/[^\s\"'<>]+",
         r"https?://walmrt\.us/[A-Za-z0-9]+",
         r"https?://(?:www\.)?target\.com/[^\s\"'<>]+",
