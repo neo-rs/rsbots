@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html as _html
 import json
 import os
 import re
@@ -23,7 +24,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
-from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
+from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl, urljoin
 
 import aiohttp
 
@@ -368,10 +369,15 @@ def _extract_first_outbound_url_from_html(html: str) -> Optional[str]:
     t = (html or "")[:200_000]
     if not t:
         return None
+    # Prefer explicit "Go to Deal" buttons when present.
+    m_btn = re.search(r'href="([^"]+)"[^>]*>\s*Go to Deal', t, re.IGNORECASE)
+    if m_btn:
+        return _html.unescape((m_btn.group(1) or "").strip()) or None
     patterns = [
         # Prefer direct Amazon URLs found in deal pages.
         r"https?://(?:www\.)?amazon\.[^\s\"'<>]+",
         r"https?://amzn\.to/[A-Za-z0-9]+",
+        r"https?://saveyourdeals\.com/[A-Za-z0-9]+",
         r"https?://(?:www\.)?walmart\.com/[^\s\"'<>]+",
         r"https?://walmrt\.us/[A-Za-z0-9]+",
         r"https?://(?:www\.)?target\.com/[^\s\"'<>]+",
@@ -380,7 +386,7 @@ def _extract_first_outbound_url_from_html(html: str) -> Optional[str]:
     for pat in patterns:
         m = re.search(pat, t, re.IGNORECASE)
         if m:
-            return (m.group(0) or "").strip()
+            return _html.unescape((m.group(0) or "").strip()) or None
     return None
 
 
@@ -624,27 +630,45 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                         resolved[u] = cand2
                         final_u = cand2
 
-                    try:
-                        host = (urlparse(final_u).netloc or "").lower()
-                    except Exception:
-                        host = ""
-                    if host in {"deals.pennyexplorer.com", "ringinthedeals.com", "dmflip.com", "trackcm.com", "joylink.io", "fkd.deals", "pricedoffers.com", "saveyourdeals.com", "mavely.app.link"}:
+                    special_html_hosts = {
+                        "deals.pennyexplorer.com",
+                        "ringinthedeals.com",
+                        "dmflip.com",
+                        "trackcm.com",
+                        "joylink.io",
+                        "fkd.deals",
+                        "pricedoffers.com",
+                        "saveyourdeals.com",
+                        "mavely.app.link",
+                    }
+
+                    # Some hubs require 2 steps:
+                    # pricedoffers.com -> saveyourdeals.com -> amazon.com (Go to Deal)
+                    candidate = final_u
+                    for _ in range(3):
                         try:
-                            async with session.get(final_u, timeout=aiohttp.ClientTimeout(total=float(timeout_s))) as resp:
+                            parsed = urlparse(candidate)
+                            host = (parsed.netloc or "").lower()
+                        except Exception:
+                            host = ""
+                        if host not in special_html_hosts:
+                            break
+                        try:
+                            async with session.get(candidate, timeout=aiohttp.ClientTimeout(total=float(timeout_s))) as resp:
                                 txt = await resp.text(errors="ignore")
                             out = _extract_first_outbound_url_from_html(txt)
-                            if out:
-                                out2 = unwrap_known_query_redirects(out) or out
-                                # If the extracted outbound is itself a redirect hub, expand once more.
-                                try:
-                                    if should_expand_url(out2) and (not is_amazon_like_url(out2)):
-                                        out2 = await expand_url(session, out2, timeout_s=timeout_s, max_redirects=max_redirects)
-                                        out2 = unwrap_known_query_redirects(out2) or out2
-                                except Exception:
-                                    pass
-                                resolved[u] = out2
+                            if not out:
+                                break
+                            # Resolve relative links found in HTML against the current page.
+                            out_abs = out
+                            if out_abs.startswith("/"):
+                                out_abs = urljoin(candidate, out_abs)
+                            out_abs = unwrap_known_query_redirects(out_abs) or out_abs
+                            candidate = out_abs
                         except Exception:
-                            pass
+                            break
+
+                    resolved[u] = candidate
 
     for u in unique:
         raw = (normalized.get(u) or u).strip()

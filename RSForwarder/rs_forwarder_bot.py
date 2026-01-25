@@ -1570,8 +1570,16 @@ class RSForwarderBot:
 
             # Affiliate rewrite (standalone, same behavior as Instorebotforwarder)
             rewrite_enabled = bool(self.config.get("affiliate_rewrite_enabled", True))
+            affiliate_changed = False
+            affiliate_notes: Dict[str, str] = {}
             if rewrite_enabled and content:
                 content, _changed, _notes = await affiliate_rewriter.rewrite_text(self.config, content)
+                if _changed:
+                    affiliate_changed = True
+                if isinstance(_notes, dict):
+                    for k, v in _notes.items():
+                        if k and v:
+                            affiliate_notes[str(k)] = str(v)
             
             # Get channel name for custom titles
             channel_name = channel_config.get("source_channel_name", "Unknown Channel")
@@ -1583,8 +1591,27 @@ class RSForwarderBot:
                 rewritten_embeds = []
                 for e in embeds_raw:
                     ee, _ch, _notes = await affiliate_rewriter.rewrite_embed_dict(self.config, e)
+                    if _ch:
+                        affiliate_changed = True
+                    if isinstance(_notes, dict):
+                        for k, v in _notes.items():
+                            if k and v:
+                                affiliate_notes[str(k)] = str(v)
                     rewritten_embeds.append(ee)
                 embeds_raw = rewritten_embeds
+
+            # Human-friendly affiliate signal (helps debug why links didn't change)
+            if rewrite_enabled and affiliate_changed:
+                try:
+                    print(f"{Colors.GREEN}[Affiliate] ✅ Rewrote affiliate links ({len(affiliate_notes)} url(s)) {Colors.RESET}")
+                    shown = 0
+                    for u, note in list(affiliate_notes.items()):
+                        if shown >= 4:
+                            break
+                        print(f"{Colors.CYAN}[Affiliate] - {u} ({note}){Colors.RESET}")
+                        shown += 1
+                except Exception:
+                    pass
             
             # If no embeds and we have content, create an embed from the message
             if not embeds_raw and content:
