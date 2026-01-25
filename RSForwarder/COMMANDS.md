@@ -17,7 +17,7 @@ RSForwarder is a standalone bot for forwarding messages from RS Server channels 
   - `text`: Text to include with role mention (optional)
 - **Usage**: `!rsadd #personal-deals <WEBHOOK_URL> 886824827745337374 "leads found!"`
 - **Admin Only**: No (but requires channel access)
-- **Returns**: Confirmation embed with channel and webhook details
+- **Returns**: Confirmation embed. The webhook is saved server-side in `config.secrets.json -> destination_webhooks` (not in `config.json`).
 
 #### `!rslist`
 - **Description**: List all configured channels
@@ -37,7 +37,7 @@ RSForwarder is a standalone bot for forwarding messages from RS Server channels 
   - `text`: Text for role mention (optional)
 - **Usage**: `!rsupdate #personal-deals <WEBHOOK_URL> 886824827745337374 "new text"`
 - **Admin Only**: No (but requires channel access)
-- **Returns**: Updated configuration confirmation
+- **Returns**: Updated configuration confirmation. If a webhook URL is provided, it is saved server-side in `config.secrets.json -> destination_webhooks`.
 
 #### `!rsview`
 - **Description**: View details of a specific forwarding job
@@ -46,7 +46,7 @@ RSForwarder is a standalone bot for forwarding messages from RS Server channels 
   - `source_channel`: Discord channel mention or channel ID (required)
 - **Usage**: `!rsview #personal-deals`
 - **Admin Only**: No (but requires channel access)
-- **Returns**: Detailed embed with channel, webhook, and role mention info
+- **Returns**: Detailed embed with channel, masked webhook, and role mention info
 
 #### `!rsremove`
 - **Description**: Remove a channel configuration

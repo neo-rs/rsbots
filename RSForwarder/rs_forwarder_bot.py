@@ -148,10 +148,69 @@ class RSForwarderBot:
             config_to_save = dict(self.config or {})
             config_to_save.pop("bot_token", None)
             config_to_save.pop("destination_webhooks", None)
+            # Also strip webhook URLs from channel configs (these live in config.secrets.json)
+            try:
+                channels = config_to_save.get("channels")
+                if isinstance(channels, list):
+                    for ch in channels:
+                        if isinstance(ch, dict):
+                            ch.pop("destination_webhook_url", None)
+            except Exception:
+                pass
             with open(self.config_path, 'w', encoding='utf-8') as f:
                 json.dump(config_to_save, f, indent=2, ensure_ascii=False)
         except Exception as e:
             print(f"{Colors.RED}[Config] Failed to save config: {e}{Colors.RESET}")
+
+    def _secrets_path(self) -> Path:
+        """Return the server-only secrets file path for this bot."""
+        return Path(__file__).parent / "config.secrets.json"
+
+    def _load_secrets_dict(self) -> Dict[str, Any]:
+        p = self._secrets_path()
+        if not p.exists():
+            return {}
+        try:
+            return json.loads(p.read_text(encoding="utf-8", errors="replace") or "{}")
+        except Exception:
+            return {}
+
+    def _save_secrets_dict(self, d: Dict[str, Any]) -> bool:
+        p = self._secrets_path()
+        try:
+            p.write_text(json.dumps(d, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            return True
+        except Exception as e:
+            print(f"{Colors.RED}[Config] Failed to save secrets: {e}{Colors.RESET}")
+            return False
+
+    def _set_destination_webhook_secret(self, source_channel_id: str, webhook_url: str) -> bool:
+        """Persist destination webhook mapping into config.secrets.json (server-only)."""
+        src = str(source_channel_id or "").strip()
+        url = str(webhook_url or "").strip()
+        if not src or not url:
+            return False
+        secrets = self._load_secrets_dict()
+        wh = secrets.get("destination_webhooks")
+        if not isinstance(wh, dict):
+            wh = {}
+        wh[src] = url
+        secrets["destination_webhooks"] = wh
+        return self._save_secrets_dict(secrets)
+
+    def _delete_destination_webhook_secret(self, source_channel_id: str) -> bool:
+        src = str(source_channel_id or "").strip()
+        if not src:
+            return False
+        secrets = self._load_secrets_dict()
+        wh = secrets.get("destination_webhooks")
+        if not isinstance(wh, dict):
+            return True
+        if src in wh:
+            wh.pop(src, None)
+            secrets["destination_webhooks"] = wh
+            return self._save_secrets_dict(secrets)
+        return True
     
     def get_channel_config(self, channel_id: str) -> Optional[Dict[str, Any]]:
         """Get configuration for a source channel"""
@@ -504,11 +563,16 @@ class RSForwarderBot:
                     await ctx.send("❌ Invalid role ID format. Role ID must be a number.")
                     return
             
-            # Create new channel config
+            # Persist webhook into config.secrets.json (server-only) so RSForwarder startup validation passes.
+            ok = self._set_destination_webhook_secret(source_channel_id, destination_webhook_url.strip())
+            if not ok:
+                await ctx.send("❌ Failed to write webhook into `config.secrets.json`. Check file permissions on the server.")
+                return
+
+            # Create new channel config (no secret URL stored in config.json)
             new_channel = {
                 "source_channel_id": source_channel_id,
                 "source_channel_name": channel_name,
-                "destination_webhook_url": destination_webhook_url.strip(),
                 "role_mention": {
                     "role_id": role_id.strip() if role_id else "",
                     "text": text.strip() if text else ""
@@ -542,7 +606,7 @@ class RSForwarderBot:
             )
             embed.add_field(
                 name="📤 Destination",
-                value=f"Webhook configured\n`{destination_webhook_url[:50]}...`",
+                value="Webhook configured (saved to secrets)",
                 inline=True
             )
             if role_info:
@@ -628,6 +692,11 @@ class RSForwarderBot:
                 if not destination_webhook_url.startswith('https://discord.com/api/webhooks/'):
                     await ctx.send("❌ Invalid webhook URL format. Must be a Discord webhook URL.")
                     return
+                ok = self._set_destination_webhook_secret(source_channel_id, destination_webhook_url.strip())
+                if not ok:
+                    await ctx.send("❌ Failed to write webhook into `config.secrets.json`. Check file permissions on the server.")
+                    return
+                # Keep in-memory value for display; it won't be written to config.json
                 existing["destination_webhook_url"] = destination_webhook_url.strip()
                 updated = True
             
@@ -673,7 +742,7 @@ class RSForwarderBot:
             )
             embed.add_field(
                 name="📤 Destination",
-                value=f"Webhook configured\n`{webhook[:50]}...`" if webhook else "Not set",
+                value="Webhook configured (saved to secrets)" if webhook else "Not set",
                 inline=True
             )
             
@@ -731,7 +800,7 @@ class RSForwarderBot:
             
             embed.add_field(
                 name="📤 Destination Webhook",
-                value=f"`{webhook}`" if webhook else "❌ Not configured",
+                value=f"`{mask_secret(webhook)}`" if webhook else "❌ Not configured",
                 inline=False
             )
             
@@ -780,6 +849,8 @@ class RSForwarderBot:
             ]
             
             if len(self.config["channels"]) < original_count:
+                # Remove secret webhook mapping too (server-only)
+                self._delete_destination_webhook_secret(source_channel_id)
                 self.save_config()
                 self.load_config()
                 await ctx.send(
