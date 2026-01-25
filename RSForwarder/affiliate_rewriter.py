@@ -616,14 +616,20 @@ async def mavely_create_link(cfg: dict, url: str) -> Tuple[Optional[str], Option
         return link, None
 
     err_l = (err or "").lower()
-    if ("token expired" in err_l) or ("not logged in" in err_l) or ("unauthorized" in err_l):
+    auth_fail = ("token expired" in err_l) or ("not logged in" in err_l) or ("unauthorized" in err_l) or (status == 401)
+    if auth_fail:
         if await _maybe_refresh_mavely_cookies(reason=err or "auth"):
             link2, err2, _status2 = await asyncio.to_thread(_do)
             if link2:
                 return link2, None
             err = err2 or err
 
-    return None, f"{err} (status={status})"
+    # If we still got a 401, call out the one-time server login requirement explicitly.
+    if status == 401:
+        hint = " (need server login: run RSForwarder/mavely_cookie_refresher.py --interactive on Oracle once)"
+    else:
+        hint = ""
+    return None, f"{err} (status={status}){hint}"
 
 
 async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[str, str], Dict[str, str]]:
