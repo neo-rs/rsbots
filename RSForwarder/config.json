@@ -7,7 +7,6 @@
     {
       "source_channel_id": "1446174806981480578",
       "source_channel_name": "personal-deals",
-      "destination_webhook_url": "",
       "role_mention": {
         "role_id": "886824827745337374",
         "text": ""
@@ -16,7 +15,6 @@
     {
       "source_channel_id": "1446174861931188387",
       "source_channel_name": "online-important",
-      "destination_webhook_url": "",
       "role_mention": {
         "role_id": "1139627400901169212",
         "text": ""
@@ -25,12 +23,39 @@
     {
       "source_channel_id": "1446186240272633936",
       "source_channel_name": "minor-deals",
-      "destination_webhook_url": "",
       "role_mention": {
         "role_id": "886824827745337374",
         "text": ""
       }
+    },
+    {
+      "source_channel_id": "1364289476762796183",
+      "source_channel_name": "food-deals",
+      "role_mention": {
+        "role_id": "1364296112965681233",
+        "text": ""
+      }
     }
   ],
-  "rs_server_icon_url": "https://cdn.discordapp.com/icons/876528050081251379/a_a9a346601bbd93532d931e5280616797.gif?size=256"
+  "rs_server_icon_url": "https://cdn.discordapp.com/icons/876528050081251379/a_a9a346601bbd93532d931e5280616797.gif?size=256",
+  "amazon_associate_tag": "amzlnk05-20",
+  "mavely_auth_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImNEZVlxc0h0VEF6VkpJRTkwSDFVWCJ9.eyJpZCI6ImNtNDJ3c21vZjAwMmkzc24wMzU4Z3JsenciLCJtdmx5X3N1YiI6ImF1dGgwfGNtNDJ3c21vZjAwMmkzc24wMzU4Z3JsenciLCJlbWFpbCI6ImFwYWFwa3Jpc3RpYW5AZ21haWwuY29tIiwibmFtZSI6IktyaXN0aWFuIEFwYS1hcCIsImlzQWRtaW4iOmZhbHNlLCJjalBJRCI6bnVsbCwidHlwZSI6IlBBUlRORVIiLCJyb2xlIjoiVVNFUiIsImluZmx1ZW5jZXJUeXBlcyI6W10sImhhc0xpbmtlZFNvY2lhbEFjY291bnRzIjoidHJ1ZSIsImlzcyI6Imh0dHBzOi8vYXV0aC5tYXZlLmx5LyIsInN1YiI6ImF1dGgwfGNtNDJ3c21vZjAwMmkzc24wMzU4Z3JsenciLCJhdWQiOlsiaHR0cHM6Ly9hdXRoLm1hdmUubHkvIiwiaHR0cHM6Ly9tYXZlbHkudXMuYXV0aDAuY29tL3VzZXJpbmZvIl0sImlhdCI6MTc2OTM2Mzg1MiwiZXhwIjoxNzY5MzcyODUyLCJzY29wZSI6Im9wZW5pZCBwcm9maWxlIGVtYWlsIG9mZmxpbmVfYWNjZXNzIiwiZ3R5IjoicGFzc3dvcmQiLCJhenAiOiJQSXRTckVvMzVNWW1MamhZNndKcDhzQ1FBUVJSV1l4ciJ9.jFzHfHWKGpvX-oSQmmiSuEKoA9Gog2I07JGmLTNO5B8WHeIj-VwUy-dixkQKadn4NABjZ7EgrRZJgvpPjOdN2mIc4BucN2ZNkz-9cQsywHMtyjMVQsGOwi2pXo9P9ZBCAZkJwCaO5ypEH0oDMJc4EXWEeuLiWyuJ6OSI9fR46r_D-B4dSD3QKoxMTOz27eL1k9gRCEiEsZyBCuXmoPxTbP9Jq9kqvxHzmXePEVs6ArKBnUqIXfrUfPhHpNBcyTGQgnRVDqLUK-Ss6ze1JWvo2hpaUdyiQ9IGhn8CyEbduBcMAdqmIbSNyex5y4WStiiZJ0A4UyMwtnDsFVjZ_I1CEw",
+  "mavely_id_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImNEZVlxc0h0VEF6VkpJRTkwSDFVWCJ9.eyJpZCI6ImNtNDJ3c21vZjAwMmkzc24wMzU4Z3JsenciLCJtdmx5X3N1YiI6ImF1dGgwfGNtNDJ3c21vZjAwMmkzc24wMzU4Z3JsenciLCJpc0FkbWluIjpmYWxzZSwiY2pQSUQiOm51bGwsInR5cGUiOiJQQVJUTkVSIiwicm9sZSI6IlVTRVIiLCJpbmZsdWVuY2VyVHlwZXMiOltdLCJoYXNMaW5rZWRTb2NpYWxBY2NvdW50cyI6InRydWUiLCJuaWNrbmFtZSI6ImFwYWFwa3Jpc3RpYW4iLCJuYW1lIjoiS3Jpc3RpYW4gQXBhLWFwIiwicGljdHVyZSI6Imh0dHBzOi8vcy5ncmF2YXRhci5jb20vYXZhdGFyL2UzNzA1MDFmODgzN2E0ZDg3NWRjNWE4Yzg2MDNlYWViP3M9NDgwJnI9cGcmZD1odHRwcyUzQSUyRiUyRmNkbi5hdXRoMC5jb20lMkZhdmF0YXJzJTJGa2EucG5nIiwidXBkYXRlZF9hdCI6IjIwMjYtMDEtMjVUMTc6NTc6MzEuOTE2WiIsImVtYWlsIjoiYXBhYXBrcmlzdGlhbkBnbWFpbC5jb20iLCJpc3MiOiJodHRwczovL2F1dGgubWF2ZS5seS8iLCJhdWQiOiJQSXRTckVvMzVNWW1MamhZNndKcDhzQ1FBUVJSV1l4ciIsInN1YiI6ImF1dGgwfGNtNDJ3c21vZjAwMmkzc24wMzU4Z3JsenciLCJpYXQiOjE3NjkzNjM4NTIsImV4cCI6MTc2OTM5OTg1Mn0.nRZbgb_CzryK_hlMYvwuDQw18-qiipbhEe-J9prQ2Q-6L5PtkH4UHZMKssAAKMBn9MrUO2Zixmm-jyvmlfaZqELD8ye_qlFJ_oSLB1epIHf_aEwKV1jG4dO6jxM0syGlYS-6a0vRR0ojYhNED5AtbsGb-fboXJ7A6RtQSBzehUss8R0uOUv4vQQpWl7q99su9n4xNnXTV6U3T6qqRReqaUIOJn1kso17YAfyNvwkoFmnpwsAqLQqV2O5JAwWHSjrHs2AQLbAKMel5pXVUiN8zLL8Rwlxn1zKKkeCMjbOCP2h_bnQoE2MTptqB2yaeotrFFGAhDDju7etJn5y3C2lwA",
+  "mavely_base_url": "https://creators.joinmavely.com",
+  "mavely_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+  "mavely_sec_ch_ua": "\"\\\"Not(A:Brand\\\";v=\\\"8\\\", \\\"Chromium\\\";v=\\\"144\\\", \\\"Google Chrome\\\";v=\\\"144\\\"\"",
+  "mavely_sec_ch_ua_mobile": "?0",
+  "mavely_sec_ch_ua_platform": "\"Windows\"",
+  "mavely_sec_fetch_site": "same-origin",
+  "mavely_sec_fetch_mode": "cors",
+  "mavely_sec_fetch_dest": "empty",
+  "mavely_priority": "u=1, i",
+  "mavely_cookies_file": "RSForwarder/mavely_cookies.txt",
+  "mavely_enable_oauth_refresh": true,
+  "mavely_refresh_token_file": "RSForwarder/mavely_refresh_token.txt",
+  "mavely_auto_refresh_on_fail": true,
+  "mavely_auto_refresh_cooldown_s": 600,
+  "mavely_token_endpoint": "https://auth.mave.ly/oauth/token",
+  "mavely_client_id": "PItSrEo35MYmLjhY6wJp8sCQAQRRWYxr",
+  "mavely_profile_dir": "RSForwarder/.mavely_profile"
 }

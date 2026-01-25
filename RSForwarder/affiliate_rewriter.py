@@ -273,6 +273,21 @@ def _b64url_decode_text(data: str) -> Optional[str]:
         return None
 
 
+def _b64_decode_text(data: str) -> Optional[str]:
+    """
+    Standard base64 decode (not urlsafe). Used for some bot-challenge pages that embed the
+    destination URL as base64 under a `b=` parameter.
+    """
+    s = (data or "").strip()
+    if not s:
+        return None
+    try:
+        pad = "=" * ((4 - (len(s) % 4)) % 4)
+        return base64.b64decode(s + pad).decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+
+
 def _normalize_expanded_url(url: str) -> str:
     u = (url or "").strip()
     if not u:
@@ -332,6 +347,8 @@ def should_expand_url(url: str) -> bool:
         "walmrt.us",
         "amzn.to",
         "mavely.app.link",
+        "howl.link",
+        "howl.me",
         "deals.pennyexplorer.com",
         "dealsabove.com",
         "www.dealsabove.com",
@@ -372,6 +389,15 @@ def unwrap_known_query_redirects(url: str) -> Optional[str]:
             cand = (q.get(k) or "").strip()
             if cand.startswith("http://") or cand.startswith("https://"):
                 return cand
+    if host.endswith("linksynergy.com"):
+        # Rakuten/LinkSynergy deep links commonly carry the real destination under murl=
+        # Example:
+        #   https://click.linksynergy.com/deeplink?...&murl=https://www.urbanoutfitters.com/shop/...
+        cand = (q.get("murl") or "").strip()
+        if cand:
+            cand = unquote(cand)
+            if cand.startswith("http://") or cand.startswith("https://"):
+                return cand
     return None
 
 
@@ -379,6 +405,19 @@ def _extract_first_outbound_url_from_html(html: str) -> Optional[str]:
     t = (html or "")[:200_000]
     if not t:
         return None
+
+    # PerimeterX/other bot challenges often embed the real destination URL as base64 (b=...).
+    # Example seen via howl.link: b=aHR0cHM6Ly93d3cudXJiYW5vdXRmaXR0ZXJzLmNvbS9zaG9w...
+    try:
+        m_b = re.search(r"[?&]b=([A-Za-z0-9+/=_-]{40,})", t)
+    except Exception:
+        m_b = None
+    if m_b:
+        decoded = _b64_decode_text((m_b.group(1) or "").strip()) or _b64url_decode_text((m_b.group(1) or "").strip())
+        if decoded:
+            decoded = decoded.strip()
+            if decoded.startswith("http://") or decoded.startswith("https://"):
+                return decoded
     # Prefer explicit button links when present.
     for label in ("Go to Deal", "Continue to Amazon", "Claim Amazon Deal", "Claim Deal"):
         m_btn = re.search(rf'href="([^"]+)"[^>]*>\s*{re.escape(label)}', t, re.IGNORECASE)
@@ -393,12 +432,48 @@ def _extract_first_outbound_url_from_html(html: str) -> Optional[str]:
         r"https?://(?:www\.)?walmart\.com/[^\s\"'<>]+",
         r"https?://walmrt\.us/[A-Za-z0-9]+",
         r"https?://(?:www\.)?target\.com/[^\s\"'<>]+",
+        r"https?://(?:www\.)?urbanoutfitters\.[^\s\"'<>]+",
         r"https?://bit\.ly/[A-Za-z0-9]+",
     ]
     for pat in patterns:
         m = re.search(pat, t, re.IGNORECASE)
         if m:
             return _html.unescape((m.group(0) or "").strip()) or None
+
+    # Fallback: first outbound-looking https link from an anchor tag.
+    # This helps for hubs like howl.link that may render a "continue" page instead of a redirect.
+    try:
+        hrefs = re.findall(r'href="(https?://[^"]+)"', t, re.IGNORECASE)
+    except Exception:
+        hrefs = []
+    if hrefs:
+        deny_hosts = {
+            "howl.link",
+            "howl.me",
+            "www.googletagmanager.com",
+            "googletagmanager.com",
+            "google-analytics.com",
+            "www.google-analytics.com",
+            "doubleclick.net",
+            "facebook.com",
+            "www.facebook.com",
+            "tiktok.com",
+            "www.tiktok.com",
+        }
+        deny_exts = (".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".woff", ".woff2", ".ttf")
+        for h in hrefs[:60]:
+            cand = _html.unescape((h or "").strip())
+            if not (cand.startswith("http://") or cand.startswith("https://")):
+                continue
+            try:
+                host = (urlparse(cand).netloc or "").lower()
+            except Exception:
+                host = ""
+            if host in deny_hosts:
+                continue
+            if cand.lower().split("?", 1)[0].endswith(deny_exts):
+                continue
+            return cand
     return None
 
 
@@ -685,6 +760,8 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                         "pricedoffers.com",
                         "saveyourdeals.com",
                         "mavely.app.link",
+                        "howl.link",
+                        "howl.me",
                     }
 
                     # Some hubs require 2 steps:
@@ -817,6 +894,16 @@ async def rewrite_text(cfg: dict, text: str) -> Tuple[str, bool, Dict[str, str]]
 
         out = out[:start] + rep_out + out[end:]
         changed = True
+
+        # Add a human-friendly mapping hint in notes so callers can log: original -> rewritten
+        try:
+            note = (notes or {}).get(u) or "changed"
+            rep_short = (rep_out or "").replace("\r", " ").replace("\n", " ").strip()
+            if len(rep_short) > 220:
+                rep_short = rep_short[:220] + "..."
+            notes[u] = f"{note} -> {rep_short}"
+        except Exception:
+            pass
 
     return out, changed, notes or {}
 

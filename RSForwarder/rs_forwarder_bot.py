@@ -1730,13 +1730,19 @@ class RSForwarderBot:
                 embeds_raw = rewritten_embeds
 
             # Human-friendly affiliate signal (helps debug why links didn't change)
-            if rewrite_enabled and affiliate_changed:
+            if rewrite_enabled and affiliate_notes:
                 try:
-                    print(f"{Colors.GREEN}[Affiliate] ✅ Rewrote affiliate links ({len(affiliate_notes)} url(s)) {Colors.RESET}")
+                    if affiliate_changed:
+                        print(f"{Colors.GREEN}[Affiliate] ✅ Rewrote affiliate links ({len(affiliate_notes)} url(s)) {Colors.RESET}")
+                    else:
+                        print(f"{Colors.YELLOW}[Affiliate] ↩ No affiliate rewrite ({len(affiliate_notes)} url(s)) {Colors.RESET}")
+
                     shown = 0
+                    limit = 4 if affiliate_changed else 2
                     for u, note in list(affiliate_notes.items()):
-                        if shown >= 4:
+                        if shown >= limit:
                             break
+                        # `note` may include "reason -> replacement" from affiliate_rewriter.rewrite_text
                         print(f"{Colors.CYAN}[Affiliate] - {u} ({note}){Colors.RESET}")
                         shown += 1
                 except Exception:
