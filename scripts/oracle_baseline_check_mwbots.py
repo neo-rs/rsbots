@@ -30,6 +30,23 @@ DEFAULT_DIFF_OUT = DEFAULT_OUT_DIR / "mwbots_manifest_diff.json"
 MW_BOTS = ["MWDataManagerBot", "MWPingBot", "MWDiscumBot"]
 
 
+def _default_local_repo_root() -> Path:
+    """
+    Pick the most likely local source-of-truth for MW bots.
+
+    In this workspace, MW bots live in a separate git repo at ./MWBots/,
+    while the mirror-world root is RS-only and typically ignores MW bot folders.
+    """
+    candidate = ROOT / "MWBots"
+    try:
+        if candidate.is_dir() and (candidate / ".git").exists():
+            if all((candidate / b).is_dir() for b in MW_BOTS):
+                return candidate.resolve()
+    except Exception:
+        pass
+    return ROOT
+
+
 def _parse_snapshot_ts(name: str) -> Optional[datetime]:
     m = re.match(r"^server_full_snapshot_(\d{8}_\d{6})$", name)
     if not m:
@@ -79,6 +96,11 @@ def main() -> int:
     ap.add_argument("--snapshot-dir", default="", help="Explicit snapshot folder (default: auto-pick latest in out-dir)")
     ap.add_argument("--download", action="store_true", help="Download a fresh snapshot first (runs scripts/download_oracle_snapshot_mwbots.py)")
     ap.add_argument("--server-name", default=None, help="Optional server name for download_oracle_snapshot_mwbots.py")
+    ap.add_argument(
+        "--local-root",
+        default="",
+        help="Local repo root to compare (default: auto-detect ./MWBots if present; otherwise workspace root).",
+    )
     ap.add_argument("--local-manifest", default=str(DEFAULT_LOCAL_MANIFEST))
     ap.add_argument("--server-manifest", default=str(DEFAULT_SERVER_MANIFEST))
     ap.add_argument("--diff-out", default=str(DEFAULT_DIFF_OUT))
@@ -86,6 +108,10 @@ def main() -> int:
 
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    local_root = Path(args.local_root).resolve() if args.local_root else _default_local_repo_root()
+    if not local_root.exists():
+        raise FileNotFoundError(f"Local root not found: {local_root}")
 
     if args.download:
         cmd = [sys.executable, str(ROOT / "scripts" / "download_oracle_snapshot_mwbots.py")]
@@ -103,7 +129,19 @@ def main() -> int:
     diff_out = Path(args.diff_out).resolve()
 
     bots_arg = ",".join(MW_BOTS)
-    _run([sys.executable, str(ROOT / "scripts" / "rsbots_manifest.py"), "--normalize-text-eol", "--bots", bots_arg, "--out", str(local_manifest)])
+    _run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "rsbots_manifest.py"),
+            "--normalize-text-eol",
+            "--repo-root",
+            str(local_root),
+            "--bots",
+            bots_arg,
+            "--out",
+            str(local_manifest),
+        ]
+    )
     _run(
         [
             sys.executable,
@@ -147,6 +185,7 @@ def main() -> int:
         only_remote_total += len(info.get("only_remote") or [])
 
     print("Oracle baseline check (MWBots)")
+    print(f"local:   {local_root}")
     print(f"snapshot: {snapshot_dir}")
     print(f"bots:     {', '.join(MW_BOTS)}")
     print()
