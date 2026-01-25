@@ -138,6 +138,7 @@ RSCheckerbot/staff_alerts.json
 RSCheckerbot/payment_cache.json
 RSCheckerbot/whop_discord_link.json
 RSCheckerbot/whop_identity_cache.json
+RSCheckerbot/whop_native_membership_cache.json
 RSCheckerbot/whop_webhook_raw_payloads.json
 RSCheckerbot/trial_history.json
 RSCheckerbot/reporting_store.json

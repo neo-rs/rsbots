@@ -52,6 +52,7 @@ from staff_embeds import (
     build_member_status_detailed_embed as _build_member_status_detailed_embed,
 )
 from whop_brief import fetch_whop_brief
+from whop_native_membership_cache import get_summary as _get_native_summary_by_mid
 from staff_channels import (
     PAYMENT_FAILURE_CHANNEL_NAME,
     MEMBER_CANCELLATION_CHANNEL_NAME,
@@ -1748,6 +1749,13 @@ def _whop_summary_for_member(discord_id: int) -> dict:
         wh = hist.get("whop") if isinstance(hist, dict) else None
         if isinstance(wh, dict) and isinstance(wh.get("last_summary"), dict):
             return wh.get("last_summary") or {}
+        # If we don't have a last_summary but we do have a membership_id,
+        # fetch the most recent parsed native Whop summary by membership_id.
+        mid = _membership_id_from_history(int(discord_id))
+        if mid:
+            cached = _get_native_summary_by_mid(mid)
+            if isinstance(cached, dict) and cached:
+                return cached
         # Fallback: if we only have a timeline/status (from whop_history backfill),
         # expose at least status so staff cards aren't blank.
         if isinstance(wh, dict):

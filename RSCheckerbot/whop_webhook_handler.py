@@ -27,6 +27,7 @@ from rschecker_utils import fmt_date_any as _fmt_date_any
 from rschecker_utils import parse_dt_any as _parse_dt_any
 from staff_embeds import build_case_minimal_embed, build_member_status_detailed_embed
 from whop_brief import fetch_whop_brief
+from whop_native_membership_cache import record_summary as _record_native_summary_by_mid
 from staff_channels import PAYMENT_FAILURE_CHANNEL_NAME, MEMBER_CANCELLATION_CHANNEL_NAME
 from staff_alerts_store import (
     load_staff_alerts,
@@ -1404,6 +1405,9 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
         except Exception:
             membership_id_hint = ""
 
+        # Extract Discord ID (best-effort; may be missing on native cards)
+        discord_id_str = None
+
         # Record event ledger entry (even if Discord ID is missing).
         try:
             fields = _summary_to_event_fields(summary_from_native)
@@ -1429,9 +1433,6 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
             await _record_whop_event_if_possible(event)
         except Exception:
             pass
-        
-        # Extract Discord ID
-        discord_id_str = None
         
         # Try embed fields first
         if "discord id" in fields_data:
@@ -1499,6 +1500,14 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
             if resolved_id and str(resolved_id).isdigit():
                 discord_id_str = str(resolved_id).strip()
             else:
+                # We cannot link to a Discord ID, but we CAN cache the native summary by membership_id
+                # so member-status-logs can reuse it later when a Discord user is linked.
+                if membership_id_hint and isinstance(summary_from_native, dict) and summary_from_native:
+                    _record_native_summary_by_mid(
+                        str(membership_id_hint).strip(),
+                        summary_from_native,
+                        source_message_id=int(message.id),
+                    )
                 return
         
         # Extract numeric Discord ID
@@ -1528,6 +1537,12 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                 "whop_key": str(parsed_data.get("whop_key") or parsed_data.get("key") or "").strip(),
             }
             _record_whop_summary_if_possible(member_id=int(discord_user_id), summary=summary_from_native, event_data=event_stub)
+            if membership_id_hint and isinstance(summary_from_native, dict) and summary_from_native:
+                _record_native_summary_by_mid(
+                    str(membership_id_hint).strip(),
+                    summary_from_native,
+                    source_message_id=int(message.id),
+                )
         except Exception:
             pass
 
