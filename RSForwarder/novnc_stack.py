@@ -117,11 +117,68 @@ def _cfg_or_env_int(cfg: dict, cfg_key: str, env_key: str, default: int) -> int:
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    # On Linux, a child can become a zombie (defunct). os.kill(pid, 0) still
+    # succeeds, but the process is not actually running anymore.
+    if os.name != "nt":
+        try:
+            stat = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8", errors="replace")
+            # Format: pid (comm) state ...
+            # comm can contain spaces, so split after ") ".
+            after = stat.split(") ", 1)[1]
+            state = (after.split(" ", 1)[0] or "").strip()
+            if state.upper() == "Z":
+                return False
+        except Exception:
+            pass
     try:
         os.kill(pid, 0)
         return True
     except Exception:
         return False
+
+
+def _proc_cmdline(pid: int) -> list:
+    if pid <= 0:
+        return []
+    try:
+        raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
+        parts = [p.decode("utf-8", errors="replace") for p in raw.split(b"\0") if p]
+        return [p for p in parts if p]
+    except Exception:
+        return []
+
+
+def _detect_running_display(state_dir: Path, fallback_display: str) -> str:
+    """
+    Best-effort: when the noVNC stack is already running, detect the *actual*
+    X display it uses from PID files /proc instead of trusting config.
+
+    This avoids a common mismatch where the stack is running on :1 but config
+    defaults to :99, causing Playwright to fail with "Missing X server or $DISPLAY".
+    """
+    try:
+        # Prefer x11vnc, since it directly tells us what display is being exported.
+        pid_vnc = _read_pid(state_dir / "x11vnc.pid")
+        if pid_vnc and _pid_alive(pid_vnc):
+            cmd = _proc_cmdline(pid_vnc)
+            if cmd:
+                for i, tok in enumerate(cmd):
+                    if tok == "-display" and i + 1 < len(cmd):
+                        disp = (cmd[i + 1] or "").strip()
+                        if disp:
+                            return disp
+
+        pid_xvfb = _read_pid(state_dir / "xvfb.pid")
+        if pid_xvfb and _pid_alive(pid_xvfb):
+            cmd = _proc_cmdline(pid_xvfb)
+            # Our Xvfb command is: Xvfb <display> -screen ...
+            if len(cmd) >= 2:
+                disp = (cmd[1] or "").strip()
+                if disp:
+                    return disp
+    except Exception:
+        pass
+    return (fallback_display or "").strip() or ":99"
 
 
 def _read_pid(p: Path) -> int:
@@ -231,8 +288,9 @@ def ensure_novnc(cfg: dict) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     state_dir = Path(_cfg_or_env_str(cfg, "mavely_novnc_state_dir", "MAVELY_NOVNC_STATE_DIR", "/tmp/rsforwarder_mavely_novnc"))
 
     if _port_listening("127.0.0.1", int(web_port)) and _port_listening("127.0.0.1", int(vnc_port)):
+        running_display = _detect_running_display(state_dir, display)
         return {
-            "display": display,
+            "display": running_display,
             "vnc_port": int(vnc_port),
             "web_port": int(web_port),
             "url_path": "/vnc.html",

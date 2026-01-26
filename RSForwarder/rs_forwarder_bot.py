@@ -58,7 +58,14 @@ class RSForwarderBot:
         # Mavely monitoring / alerting state (in-memory)
         self._mavely_monitor_task: Optional[asyncio.Task] = None
         self._mavely_last_preflight_ok: Optional[bool] = None
+        self._mavely_last_preflight_status: Optional[int] = None
+        self._mavely_last_preflight_err: Optional[str] = None
         self._mavely_last_alert_ts: float = 0.0
+        self._mavely_last_autologin_ts: float = 0.0
+        self._mavely_last_autologin_ok: Optional[bool] = None
+        self._mavely_last_autologin_msg: Optional[str] = None
+        self._mavely_last_refresher_pid: Optional[int] = None
+        self._mavely_last_refresher_log_path: Optional[str] = None
         self.load_config()
         
         # Validate required config
@@ -89,6 +96,93 @@ class RSForwarderBot:
         except Exception:
             v = 1800
         return max(300, min(v, 24 * 3600))
+
+    def _mavely_autologin_enabled(self) -> bool:
+        try:
+            v = (self.config or {}).get("mavely_autologin_on_fail")
+            if v is None:
+                v = os.getenv("MAVELY_AUTOLOGIN_ON_FAIL", "")
+            if isinstance(v, str):
+                return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+            return bool(v) if v is not None else True
+        except Exception:
+            return True
+
+    def _mavely_autologin_cooldown_s(self) -> int:
+        try:
+            v = int((self.config or {}).get("mavely_autologin_cooldown_s") or 300)
+        except Exception:
+            v = 300
+        return max(30, min(v, 6 * 3600))
+
+    def _mavely_state_dir(self) -> Path:
+        """
+        Local durable state/log directory for Mavely automation.
+        - On Oracle/Linux: defaults to the same dir used by noVNC stack.
+        - Else: keep it local under RSForwarder/.tmp (git-ignored).
+        """
+        try:
+            if self._is_local_exec():
+                raw = (
+                    str((self.config or {}).get("mavely_novnc_state_dir") or "").strip()
+                    or (os.getenv("MAVELY_NOVNC_STATE_DIR", "") or "").strip()
+                    or "/tmp/rsforwarder_mavely_novnc"
+                )
+                p = Path(raw)
+            else:
+                p = Path(__file__).parent / ".tmp" / "mavely_monitor"
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except Exception:
+            return Path(__file__).parent
+
+    def _mavely_status_path(self) -> Path:
+        return self._mavely_state_dir() / "mavely_status.json"
+
+    def _mavely_monitor_log_path(self) -> Path:
+        return self._mavely_state_dir() / "mavely_monitor.log"
+
+    def _mavely_append_log(self, msg: str) -> None:
+        try:
+            ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            line = f"[{ts}] {msg}".rstrip()
+            print(f"{Colors.CYAN}[Mavely]{Colors.RESET} {line}")
+            try:
+                p = self._mavely_monitor_log_path()
+                with open(p, "a", encoding="utf-8", errors="replace") as f:
+                    f.write(line + "\n")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _mavely_write_status(self, extra: Optional[Dict[str, Any]] = None) -> None:
+        try:
+            def _short(s: Optional[str], n: int) -> str:
+                t = (s or "").replace("\n", " ").strip()
+                return t if len(t) <= n else (t[:n] + "...")
+
+            data: Dict[str, Any] = {
+                "ts_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "preflight_ok": bool(self._mavely_last_preflight_ok),
+                "preflight_status": self._mavely_last_preflight_status,
+                "preflight_err": _short(self._mavely_last_preflight_err, 500),
+                "last_alert_ts": float(self._mavely_last_alert_ts or 0.0),
+                "last_autologin_ts": float(self._mavely_last_autologin_ts or 0.0),
+                "last_autologin_ok": self._mavely_last_autologin_ok,
+                "last_autologin_msg": _short(self._mavely_last_autologin_msg, 1200),
+                "last_refresher_pid": self._mavely_last_refresher_pid,
+                "last_refresher_log_path": self._mavely_last_refresher_log_path,
+            }
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    if k not in data:
+                        data[k] = v
+            tmp = self._mavely_status_path().with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8", errors="replace")
+            os.replace(str(tmp), str(self._mavely_status_path()))
+        except Exception:
+            pass
 
     def _mavely_alert_user_ids(self) -> List[int]:
         """
@@ -238,19 +332,29 @@ class RSForwarderBot:
     async def _mavely_monitor_loop(self):
         await self.bot.wait_until_ready()
         while not self.bot.is_closed():
+            interval = self._mavely_monitor_interval_s()
             try:
-                # If no one is configured to receive alerts, keep quiet.
                 targets = self._mavely_alert_user_ids()
-                interval = self._mavely_monitor_interval_s()
-                if not targets:
+                prev_ok = self._mavely_last_preflight_ok
+                ok, status, err = await affiliate_rewriter.mavely_preflight(self.config)
+                self._mavely_last_preflight_ok = bool(ok)
+                self._mavely_last_preflight_status = int(status or 0)
+                self._mavely_last_preflight_err = (err or "").strip() if not ok else ""
+                self._mavely_write_status()
+                if ok:
+                    if prev_ok is not True:
+                        self._mavely_append_log(f"preflight OK (status={status})")
                     await asyncio.sleep(interval)
                     continue
 
-                ok, status, err = await affiliate_rewriter.mavely_preflight(self.config)
-                if ok:
-                    self._mavely_last_preflight_ok = True
-                    await asyncio.sleep(interval)
-                    continue
+                # Log the failure (never log tokens/cookies; err is already "safe"/short).
+                try:
+                    msg0 = (err or "unknown error").replace("\n", " ").strip()
+                    if len(msg0) > 240:
+                        msg0 = msg0[:240] + "..."
+                    self._mavely_append_log(f"preflight FAIL (status={status}) {msg0}")
+                except Exception:
+                    pass
 
                 # If credentials are configured, try a headless auto-login first.
                 # If it succeeds, we recover without requiring user action.
@@ -260,20 +364,37 @@ class RSForwarderBot:
                 except Exception:
                     email, password = "", ""
 
-                if self._is_local_exec() and email and password:
-                    ok_run, _out = await asyncio.to_thread(novnc_stack.run_cookie_refresher_headless, self.config, wait_login_s=180)
-                    if ok_run:
-                        ok2, _status2, _err2 = await affiliate_rewriter.mavely_preflight(self.config)
-                        if ok2:
-                            self._mavely_last_preflight_ok = True
-                            await asyncio.sleep(interval)
-                            continue
+                now = time.time()
+                autologin_attempted = False
+                if self._is_local_exec() and self._mavely_autologin_enabled() and email and password:
+                    cooldown2 = self._mavely_autologin_cooldown_s()
+                    if (now - float(self._mavely_last_autologin_ts or 0.0)) >= float(cooldown2):
+                        autologin_attempted = True
+                        self._mavely_last_autologin_ts = now
+                        self._mavely_append_log("preflight FAIL -> attempting headless auto-login (cookie refresher)")
+                        ok_run, out = await asyncio.to_thread(novnc_stack.run_cookie_refresher_headless, self.config, wait_login_s=180)
+                        out_s = (out or "").strip()
+                        if len(out_s) > 4000:
+                            out_s = out_s[:4000] + "\n... (truncated)"
+                        self._mavely_last_autologin_ok = bool(ok_run)
+                        self._mavely_last_autologin_msg = out_s or ("ok" if ok_run else "failed")
+                        self._mavely_write_status()
+                        if ok_run:
+                            ok2, status2, err2 = await affiliate_rewriter.mavely_preflight(self.config)
+                            self._mavely_last_preflight_status = int(status2 or 0)
+                            self._mavely_last_preflight_err = (err2 or "").strip() if not ok2 else ""
+                            self._mavely_write_status()
+                            if ok2:
+                                self._mavely_append_log(f"auto-login recovered session (preflight OK status={status2})")
+                                self._mavely_last_preflight_ok = True
+                                await asyncio.sleep(interval)
+                                continue
 
                 # Failure path: alert (rate-limited) and optionally start noVNC + refresher automatically.
-                now = time.time()
                 cooldown = self._mavely_alert_cooldown_s()
                 should_alert = (self._mavely_last_preflight_ok is True) or ((now - float(self._mavely_last_alert_ts)) >= float(cooldown))
                 self._mavely_last_preflight_ok = False
+                self._mavely_write_status()
                 if not should_alert:
                     await asyncio.sleep(interval)
                     continue
@@ -282,7 +403,8 @@ class RSForwarderBot:
                 pid = None
                 log_path = None
                 start_err = None
-                if self._is_local_exec():
+                # Only start noVNC if someone can be alerted (otherwise there's no human to complete login).
+                if self._is_local_exec() and targets:
                     info, start_err = await asyncio.to_thread(novnc_stack.ensure_novnc, self.config)
                     if info and not start_err:
                         pid, log_path, _err2 = await asyncio.to_thread(
@@ -291,11 +413,26 @@ class RSForwarderBot:
                             display=str((info or {}).get("display") or ":99"),
                             wait_login_s=900,
                         )
+                        self._mavely_last_refresher_pid = int(pid) if pid else None
+                        self._mavely_last_refresher_log_path = str(log_path) if log_path else None
+                        self._mavely_write_status(
+                            {
+                                "novnc_display": str((info or {}).get("display") or ""),
+                                "novnc_web_port": int((info or {}).get("web_port") or 0),
+                                "novnc_url_path": str((info or {}).get("url_path") or ""),
+                            }
+                        )
 
                 msg = (err or "unknown error").replace("\n", " ").strip()
                 if len(msg) > 240:
                     msg = msg[:240] + "..."
                 header = f"⚠️ Mavely session check FAILED (status={status}).\n{msg}\n\n"
+                if autologin_attempted:
+                    if self._mavely_last_autologin_ok:
+                        header = "⚠️ Mavely session check FAILED, but auto-login ran.\n(Preflight still failing; manual login may be required.)\n\n" + header
+                    else:
+                        header = "⚠️ Mavely session check FAILED and headless auto-login did NOT recover.\nManual login required.\n\n" + header
+
                 if start_err:
                     body = f"noVNC auto-start failed: {str(start_err)[:300]}\n\nRun `!rsmavelylogin` in Discord to start login."
                 else:
@@ -307,14 +444,19 @@ class RSForwarderBot:
                     if log_path:
                         body += f"\nRefresher log (server path): `{log_path}`"
 
-                for uid in targets:
-                    await self._dm_user(uid, header + body)
-
-                self._mavely_last_alert_ts = now
+                # DM only if targets exist; automation still runs regardless.
+                if targets:
+                    for uid in targets:
+                        await self._dm_user(uid, header + body)
+                    self._mavely_last_alert_ts = now
+                    self._mavely_write_status()
+                else:
+                    # No DM recipients configured; keep a clear log trail.
+                    self._mavely_append_log("preflight still failing and no alert recipients are configured (run !rsmavelyalertme)")
             except Exception:
                 pass
 
-            await asyncio.sleep(self._mavely_monitor_interval_s())
+            await asyncio.sleep(interval)
     
     def load_config(self):
         """Load configuration from config.json + config.secrets.json (server-only)."""
@@ -1746,6 +1888,51 @@ class RSForwarderBot:
                     await ctx.send(f"❌ Mavely preflight FAIL (status={status}) {msg}")
             except Exception as e:
                 await ctx.send(f"❌ Mavely preflight FAIL ({str(e)[:300]})")
+
+        @self.bot.command(name="rsmavelystatus", aliases=["mavelystatus"])
+        async def mavely_status(ctx):
+            """Show last Mavely automation status (admin only; safe, no tokens)."""
+            if not self._is_mavely_admin_ctx(ctx):
+                await ctx.send("❌ You don't have permission to use this command.")
+                return
+            try:
+                p = self._mavely_status_path()
+                data = {}
+                if p.exists():
+                    try:
+                        data = json.loads(p.read_text(encoding="utf-8", errors="replace") or "{}")
+                    except Exception:
+                        data = {}
+                if not isinstance(data, dict):
+                    data = {}
+
+                pre_ok = bool(data.get("preflight_ok"))
+                pre_status = data.get("preflight_status")
+                pre_err = str(data.get("preflight_err") or "").strip()
+                al_ts = float(data.get("last_autologin_ts") or 0.0)
+                al_ok = data.get("last_autologin_ok")
+                al_msg = str(data.get("last_autologin_msg") or "").strip()
+                pid = data.get("last_refresher_pid")
+                lp = str(data.get("last_refresher_log_path") or "").strip()
+
+                lines = []
+                lines.append(f"**Mavely status** (from `{p}`)")
+                lines.append(f"- preflight: {'✅ OK' if pre_ok else '❌ FAIL'} (status={pre_status})")
+                if (not pre_ok) and pre_err:
+                    lines.append(f"- error: `{pre_err[:240]}`")
+                if al_ts > 0:
+                    ts_str = datetime.utcfromtimestamp(al_ts).isoformat(timespec="seconds") + "Z"
+                    lines.append(f"- last auto-login: {ts_str} (ok={al_ok})")
+                if al_msg:
+                    lines.append(f"- auto-login msg: `{al_msg[:240]}`")
+                if pid:
+                    lines.append(f"- last noVNC refresher PID: `{pid}`")
+                if lp:
+                    lines.append(f"- refresher log: `{lp}`")
+                lines.append(f"- monitor log: `{self._mavely_monitor_log_path()}`")
+                await ctx.send("\n".join(lines)[:1900])
+            except Exception as e:
+                await ctx.send(f"❌ Failed to read Mavely status: {str(e)[:300]}")
         
         @self.bot.command(name='rscommands', aliases=['commands'])
         async def bot_help(ctx):
@@ -1768,6 +1955,7 @@ class RSForwarderBot:
                 ("`!rsrestartadminbot` or `!restart`", "Restart RSAdminBot remotely on server (admin only)"),
                 ("`!rsmavelylogin` or `!refreshtoken`", "Open noVNC + Mavely login browser (admin only; manual login)"),
                 ("`!rsmavelycheck`", "Check if Mavely session is valid (safe)"),
+                ("`!rsmavelystatus`", "Show last Mavely auto-login/noVNC status (admin only)"),
                 ("`!rsmavelyalertme`", "DM me if Mavely session expires (admin only)"),
                 ("`!rsmavelyalertoff`", "Disable Mavely expiry DMs (admin only)"),
                 ("`!rscommands`", "Show this help message"),
