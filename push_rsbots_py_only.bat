@@ -45,6 +45,16 @@ echo --- diffstat
 git --no-pager diff --cached --stat
 echo.
 
+echo.
+echo === CONFIRM ===
+echo Review the staged changes above.
+choice /C YN /N /M "Proceed to COMMIT + PUSH these staged changes? [Y/N] "
+if errorlevel 2 (
+  echo.
+  echo Aborted. Nothing committed or pushed.
+  exit /b 0
+)
+
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set TS=%%i
 
 echo.

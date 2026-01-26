@@ -159,3 +159,21 @@ RSForwarder can generate Mavely affiliate links and auto-recover when tokens exp
   - `MAVELY_CLIENT_ID`: optional (can often be inferred from session/idToken)
 
 If Mavely forces a real re-login (logout / Cloudflare / MFA), you may still need to refresh cookies manually.
+
+### Manual re-login via noVNC (server desktop)
+
+If RSForwarder runs on the Oracle Linux host, you can trigger an interactive Mavely login flow without SSHing into the shell:
+
+#### `!rsmavelylogin` / `!refreshtoken` (admin only)
+- **Description**: Starts (or reuses) a localhost-only noVNC desktop on the server and launches the Mavely browser login flow.
+- **Usage**:
+  - `!rsmavelylogin`
+  - `!rsmavelylogin 900` (wait up to 900s for login)
+- **What you do**:
+  - Open the SSH tunnel command the bot prints
+  - Open the noVNC URL the bot prints
+  - Log into Mavely in the Chromium window
+- **Security**: noVNC binds to `127.0.0.1` only (requires SSH tunnel; not exposed publicly).
+
+#### `!rsmavelycheck`
+- **Description**: Runs a non-mutating session preflight check (safe). Useful to confirm login succeeded.

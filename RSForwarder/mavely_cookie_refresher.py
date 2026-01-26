@@ -102,41 +102,70 @@ def main() -> int:
             print("Pick the Mavely page target, then enable DevTools Screencast to interact and log in.")
             print("This script will keep polling /api/auth/session and will exit once login is detected.")
 
-        # In interactive mode, a visible browser window is created.
-        # If devtools mode is also enabled, we do NOT block on stdin; we just poll /api/auth/session below.
-        if args.interactive and (not devtools_mode):
-            print("Browser opened. Log into Mavely if needed, then come back here and press ENTER...")
-            try:
-                input()
-            except KeyboardInterrupt:
-                ctx.close()
-                return 1
-            except EOFError:
-                # Detached/daemonized run: no stdin available.
-                pass
-        elif args.interactive and devtools_mode:
-            if sys.stdin.isatty():
-                print("Browser opened. Log into Mavely in the browser window. (No ENTER needed; waiting for login.)")
-
-        cookies = ctx.cookies()
-        header = _cookie_header_from_cookies(cookies)
-        if (not devtools_mode) and (not header or ("next-auth" not in header and "__Secure-next-auth" not in header)):
-            ctx.close()
-            print("ERROR: Not logged in (missing next-auth cookies). Run with --interactive and log in.")
-            return 2
-
-        # Validate login by calling the session endpoint (NextAuth returns {} when logged out).
         try:
             import requests
 
+            def _has_next_auth(cookie_header: str) -> bool:
+                h = (cookie_header or "").lower()
+                return ("next-auth" in h) or ("__secure-next-auth" in h)
+
             def _session_ok(cookie_header: str) -> bool:
+                # NextAuth returns {} when logged out.
                 r = requests.get(session_url, headers={"Cookie": cookie_header, "User-Agent": "Mozilla/5.0"}, timeout=20)
                 ct = (r.headers.get("content-type") or "").lower()
                 if r.status_code != 200 or "application/json" not in ct:
                     return False
                 data = r.json()
                 return isinstance(data, dict) and len(data) > 0
+        except Exception as e:
+            ctx.close()
+            print(f"ERROR: Could not validate session: {e}")
+            return 3
 
+        # In interactive mode, a visible browser window is created.
+        # If devtools mode is enabled, we do NOT block on stdin; we just poll /api/auth/session below.
+        if args.interactive and (not devtools_mode):
+            if sys.stdin.isatty():
+                print("Browser opened. Log into Mavely if needed, then come back here and press ENTER...")
+                try:
+                    input()
+                except KeyboardInterrupt:
+                    ctx.close()
+                    return 1
+                except EOFError:
+                    # Detached/daemonized run: no stdin available.
+                    pass
+            else:
+                wait_s = int(args.wait_login)
+                print(f"No stdin detected. Waiting up to {wait_s}s for Mavely login to complete...")
+                deadline = None if wait_s <= 0 else (time.time() + max(15, wait_s))  # minimum 15s
+                ok = False
+                header = ""
+                while (not ok) and (deadline is None or time.time() < deadline):
+                    time.sleep(2)
+                    header = _cookie_header_from_cookies(ctx.cookies())
+                    if not _has_next_auth(header):
+                        continue
+                    ok = _session_ok(header)
+                if not ok:
+                    ctx.close()
+                    if not _has_next_auth(header):
+                        print("ERROR: Not logged in (missing next-auth cookies). Login did not complete in time.")
+                    else:
+                        print("ERROR: Not logged in (session endpoint returned empty JSON). Login did not complete in time.")
+                    return 2
+        elif args.interactive and devtools_mode:
+            if sys.stdin.isatty():
+                print("Browser opened. Log into Mavely in the browser window. (No ENTER needed; waiting for login.)")
+
+        header = _cookie_header_from_cookies(ctx.cookies())
+        if (not devtools_mode) and (not _has_next_auth(header)):
+            ctx.close()
+            print("ERROR: Not logged in (missing next-auth cookies). Run with --interactive and log in.")
+            return 2
+
+        # Validate login by calling the session endpoint (NextAuth returns {} when logged out).
+        try:
             if devtools_mode:
                 wait_s = int(args.wait_login)
                 deadline = None if wait_s <= 0 else (time.time() + max(15, wait_s))  # minimum 15s
@@ -144,12 +173,12 @@ def main() -> int:
                 while (not ok) and (deadline is None or time.time() < deadline):
                     time.sleep(2)
                     header = _cookie_header_from_cookies(ctx.cookies())
-                    if not header or ("next-auth" not in header and "__Secure-next-auth" not in header):
+                    if not _has_next_auth(header):
                         continue
                     ok = _session_ok(header)
                 if not ok:
                     ctx.close()
-                    if not header or ("next-auth" not in header and "__Secure-next-auth" not in header):
+                    if not _has_next_auth(header):
                         print("ERROR: Not logged in (missing next-auth cookies). Login did not complete in time.")
                     else:
                         print("ERROR: Not logged in (session endpoint returned empty JSON). Login did not complete in time.")

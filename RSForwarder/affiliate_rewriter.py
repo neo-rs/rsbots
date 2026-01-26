@@ -109,6 +109,67 @@ def _add_query_param(url: str, key: str, value: str) -> str:
         return u
 
 
+def _strip_tracking_params(url: str) -> str:
+    """
+    Remove common tracking / affiliate query params so we don't accidentally
+    credit someone else's tracking when we can't generate our own affiliate link.
+    """
+    u = (url or "").strip()
+    if not u:
+        return u
+    try:
+        parsed = urlparse(u)
+        q_pairs = list(parse_qsl(parsed.query, keep_blank_values=True))
+    except Exception:
+        return u
+
+    deny_exact = {
+        "irgwc",
+        "clickid",
+        "click_id",
+        "irclickid",
+        "irclick",
+        "afsrc",
+        "affid",
+        "affiliate",
+        "aff",
+        "cid",  # many merchants use cid=affiliate-_-...
+        "source",
+        "ref",
+        "refid",
+        "ref_id",
+        "fbclid",
+        "gclid",
+        "yclid",
+        "mc_eid",
+        "mc_cid",
+        "spm",
+        "sc_channel",
+        "sc_campaign",
+        "sc_medium",
+        "sc_content",
+        "sc_outcome",
+    }
+
+    kept = []
+    for k, v in q_pairs:
+        kl = (k or "").strip().lower()
+        if not kl:
+            continue
+        if kl.startswith("utm_"):
+            continue
+        if kl in deny_exact:
+            continue
+        kept.append((k, v))
+
+    new_q = urlencode(kept, doseq=True)
+    # Drop fragment too; it's often tracking (e.g. "#code=...").
+    try:
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_q, ""))
+    except Exception:
+        return u
+
+
 _URL_RE = re.compile(
     r"((?:https?://)?(?:www\.)?[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?:/[^\s<>()]*)?)",
     re.IGNORECASE,
@@ -193,11 +254,27 @@ def is_mavely_link(url: str) -> bool:
 
 
 def _rewrap_mavely_links_enabled(cfg: dict) -> bool:
-    # Default ON (so existing mavely links get re-wrapped into YOUR link).
+    """
+    Default ON (so existing mavely links get re-wrapped into YOUR link).
+
+    Source of truth:
+    - If `affiliate_rewrap_mavely_links` is present in cfg, honor it.
+    - Otherwise, allow env override via `AFFILIATE_REWRAP_MAVELY_LINKS`.
+
+    Rationale: config is synced and visible; env can be opaque and lead to surprising
+    "already mavely link" skips if it was set long ago.
+    """
+    try:
+        cfg_val = (cfg or {}).get("affiliate_rewrap_mavely_links", None)
+        if cfg_val is not None:
+            return _bool_or_default(cfg_val, True)
+    except Exception:
+        pass
+
     raw = (os.getenv("AFFILIATE_REWRAP_MAVELY_LINKS", "") or "").strip()
     if raw:
         return _bool_or_default(raw, True)
-    return _bool_or_default((cfg or {}).get("affiliate_rewrap_mavely_links"), True)
+    return True
 
 
 def is_amazon_like_url(url: str) -> bool:
@@ -709,6 +786,55 @@ async def mavely_create_link(cfg: dict, url: str) -> Tuple[Optional[str], Option
     return None, f"{err} (status={status}){hint}"
 
 
+async def mavely_preflight(cfg: dict) -> Tuple[bool, int, Optional[str]]:
+    """
+    Non-mutating health check for Mavely auth.
+
+    IMPORTANT:
+    - Does NOT create affiliate links (avoids "startup spam" in your Mavely dashboard).
+    - Uses MavelyClient.preflight(), which validates cookies via /api/auth/session and may
+      refresh bearer token if OAuth refresh is enabled.
+
+    Returns: (ok, status_code, error_message)
+    """
+    MavelyClient = _import_mavely_client()
+    if MavelyClient is None:
+        return False, 0, "Mavely client not available."
+
+    _apply_env_from_cfg(cfg)
+
+    session_token = (os.getenv("MAVELY_COOKIES", "") or "").strip()
+    if not session_token:
+        _reload_mavely_cookies_from_file(force=True)
+        session_token = (os.getenv("MAVELY_COOKIES", "") or "").strip()
+
+    auth_token = _cfg_or_env_str(cfg, "mavely_auth_token", "MAVELY_AUTH_TOKEN")
+    graphql_endpoint = _cfg_or_env_str(cfg, "mavely_graphql_endpoint", "MAVELY_GRAPHQL_ENDPOINT")
+    timeout_s = int(_cfg_or_env_int(cfg, "mavely_request_timeout", "REQUEST_TIMEOUT") or 20)
+    max_retries = int(_cfg_or_env_int(cfg, "mavely_max_retries", "MAX_RETRIES") or 1)
+    try:
+        min_seconds = float((cfg or {}).get("mavely_min_seconds_between_requests") or (os.getenv("MIN_SECONDS_BETWEEN_REQUESTS", "") or "").strip() or "0.0")
+    except Exception:
+        min_seconds = 0.0
+
+    def _do() -> Tuple[bool, int, Optional[str]]:
+        client = MavelyClient(
+            session_token=session_token,
+            auth_token=auth_token or None,
+            graphql_endpoint=graphql_endpoint or None,
+            timeout_s=timeout_s,
+            max_retries=max_retries,
+            min_seconds_between_requests=min_seconds,
+        )
+        res = client.preflight()
+        ok = bool(getattr(res, "ok", False))
+        status = int(getattr(res, "status_code", 0) or 0)
+        err = getattr(res, "error", None)
+        return ok, status, (str(err) if err else None)
+
+    ok, status, err = await asyncio.to_thread(_do)
+    return ok, status, err
+
 async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[str, str], Dict[str, str]]:
     """
     Returns (mapped, notes):
@@ -808,9 +934,44 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                     mapped[u] = link
                     notes[u] = "rewrapped mavely link"
                 else:
-                    notes[u] = err or "rewrap failed"
+                    # If Mavely auth is down, at least strip "someone else's Mavely link"
+                    # by falling back to the expanded destination. If that destination is
+                    # Amazon, we can still apply our Amazon affiliate tag without Mavely.
+                    if is_amazon_like_url(target):
+                        affiliate_url = build_amazon_affiliate_url(cfg, target)
+                        if affiliate_url:
+                            raw_mask = _env_first_token("AMAZON_DISCORD_MASK_LINK", "1").lower()
+                            mask_enabled = raw_mask in {"1", "true", "yes", "y", "on"}
+                            mask_prefix = _env_first_token("AMAZON_DISCORD_MASK_PREFIX", "amzn.to") or "amzn.to"
+                            try:
+                                mask_len = int(_env_first_token("AMAZON_DISCORD_MASK_LEN", "7") or "7")
+                            except Exception:
+                                mask_len = 7
+                            if mask_enabled:
+                                rep = amazon_mask_cache.get(affiliate_url)
+                                if not rep:
+                                    rep = discord_masked_link(mask_prefix, affiliate_url, slug_len=mask_len)
+                                    amazon_mask_cache[affiliate_url] = rep
+                                mapped[u] = rep
+                            else:
+                                mapped[u] = affiliate_url
+                            notes[u] = "mavely rewrap failed; fell back to amazon affiliate"
+                        else:
+                            mapped[u] = _strip_tracking_params(target)
+                            notes[u] = "mavely rewrap failed; fell back to expanded destination (stripped tracking)"
+                    else:
+                        mapped[u] = _strip_tracking_params(target)
+                        notes[u] = "mavely rewrap failed; fell back to expanded destination (stripped tracking)"
             else:
-                notes[u] = "rewrap skipped (no expanded destination)"
+                # Some mavely.app.link pages don't redirect cleanly (HTML/JS). As a fallback, try
+                # generating a link from the Mavely URL itself; if Mavely accepts it, this still
+                # converts "someone else's Mavely link" into your own tracking.
+                link, err = await mavely_create_link(cfg, raw)
+                if link and not err and link != raw:
+                    mapped[u] = link
+                    notes[u] = "rewrapped mavely link (direct)"
+                else:
+                    notes[u] = "rewrap skipped (no expanded destination)"
             continue
 
         # If it expands to a Mavely link, keep that final mavely link (rare but happens).

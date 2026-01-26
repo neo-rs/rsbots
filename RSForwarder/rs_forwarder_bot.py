@@ -20,6 +20,7 @@ import subprocess
 import shlex
 
 from RSForwarder import affiliate_rewriter
+from RSForwarder import novnc_stack
 
 # Ensure repo root is importable when executed as a script (matches Ubuntu run_bot.sh PYTHONPATH).
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -148,6 +149,17 @@ class RSForwarderBot:
             config_to_save = dict(self.config or {})
             config_to_save.pop("bot_token", None)
             config_to_save.pop("destination_webhooks", None)
+            # Strip any other secrets that were merged in from config.secrets.json.
+            # This prevents accidental leakage of tokens/cookies into the synced config.json.
+            try:
+                secrets_path = self._secrets_path()
+                if secrets_path.exists():
+                    secrets_obj = json.loads(secrets_path.read_text(encoding="utf-8", errors="replace") or "{}")
+                    if isinstance(secrets_obj, dict):
+                        for k in list(secrets_obj.keys()):
+                            config_to_save.pop(k, None)
+            except Exception:
+                pass
             # Also strip webhook URLs from channel configs (these live in config.secrets.json)
             try:
                 channels = config_to_save.get("channels")
@@ -433,7 +445,7 @@ class RSForwarderBot:
                 print(f"{Colors.RED}[Bot] Branding will not work properly without the icon.{Colors.RESET}")
                 print(f"{Colors.RED}[Bot] Use !rsfetchicon to manually fetch the icon.{Colors.RESET}")
 
-            # Affiliate rewrite startup self-test (1 Amazon + 1 Mavely)
+            # Affiliate rewrite startup self-test
             try:
                 if bool(self.config.get("affiliate_rewrite_enabled")):
                     print(f"\n{Colors.CYAN}[Affiliate] Startup self-test:{Colors.RESET}")
@@ -450,23 +462,20 @@ class RSForwarderBot:
                     except Exception as e:
                         print(f"{Colors.RED}[Affiliate] ❌ Amazon FAIL{Colors.RESET} ({e})")
 
-                    # Mavely API self-test can be noisy if cookies are expired (and some servers can't use refresh_token).
-                    # If you're not re-wrapping existing Mavely links, skip the API test unless explicitly requested.
-                    rewrap_enabled = bool(self.config.get("affiliate_rewrap_mavely_links", True))
-                    mavely_test_url = (os.getenv("RS_STARTUP_TEST_MAVELY_URL", "") or "").strip()
-                    if (not rewrap_enabled) and (not mavely_test_url):
-                        print(f"{Colors.YELLOW}[Affiliate] ⚠️  Mavely startup test skipped{Colors.RESET} (rewrap disabled; set RS_STARTUP_TEST_MAVELY_URL to force)")
-                    else:
-                        if not mavely_test_url:
-                            mavely_test_url = "https://www.target.com/p/zephyr/-/A-94827558"
-                        try:
-                            link, err = await affiliate_rewriter.mavely_create_link(self.config, mavely_test_url)
-                            if link and not err:
-                                print(f"{Colors.GREEN}[Affiliate] ✅ Mavely PASS{Colors.RESET} -> {link}")
-                            else:
-                                print(f"{Colors.RED}[Affiliate] ❌ Mavely FAIL{Colors.RESET} ({err or 'unknown error'})")
-                        except Exception as e:
-                            print(f"{Colors.RED}[Affiliate] ❌ Mavely FAIL{Colors.RESET} ({e})")
+                    # Mavely startup check (NON-mutating):
+                    # Use a preflight/session check instead of creating an affiliate link (prevents dashboard spam).
+                    try:
+                        ok, status, err = await affiliate_rewriter.mavely_preflight(self.config)
+                        if ok:
+                            print(f"{Colors.GREEN}[Affiliate] ✅ Mavely preflight OK{Colors.RESET} (status={status})")
+                        else:
+                            # Keep error short (never print cookies/tokens)
+                            msg = (err or "unknown error").replace("\n", " ").strip()
+                            if len(msg) > 180:
+                                msg = msg[:180] + "..."
+                            print(f"{Colors.RED}[Affiliate] ❌ Mavely preflight FAIL{Colors.RESET} (status={status}) {msg}")
+                    except Exception as e:
+                        print(f"{Colors.RED}[Affiliate] ❌ Mavely preflight FAIL{Colors.RESET} ({e})")
             except Exception:
                 pass
             
@@ -1339,6 +1348,93 @@ class RSForwarderBot:
             except Exception as e:
                 await ctx.send(f"❌ Error: {str(e)[:500]}")
                 print(f"{Colors.RED}[RSForwarder] Error restarting RSAdminBot: {e}{Colors.RESET}")
+
+        @self.bot.command(name="rsmavelylogin", aliases=["mavelylogin", "refreshtoken"])
+        async def mavely_login(ctx, wait_seconds: str = None):
+            """Start/ensure noVNC desktop and launch interactive Mavely cookie refresher (admin only).
+
+            Usage:
+              !rsmavelylogin
+              !rsmavelylogin 900
+
+            Notes:
+            - This does NOT log in automatically; it opens a browser on the server desktop.
+            - You connect via SSH tunnel to noVNC and log in manually.
+            """
+            if not ctx.author.guild_permissions.administrator:
+                await ctx.send("❌ You don't have permission to use this command.")
+                return
+
+            if not self._is_local_exec():
+                await ctx.send("❌ This command only works when RSForwarder is running on the Linux host (Oracle).")
+                return
+
+            try:
+                wait_s = int((wait_seconds or "").strip() or "900")
+            except Exception:
+                wait_s = 900
+            wait_s = max(60, min(wait_s, 3600))
+
+            await ctx.send("🔄 Starting noVNC desktop + launching Mavely login browser (server-local)...")
+
+            info, err = await asyncio.to_thread(novnc_stack.ensure_novnc, self.config)
+            if err or not info:
+                await ctx.send(f"❌ noVNC start failed: {str(err)[:500]}")
+                return
+
+            pid, log_path, err2 = await asyncio.to_thread(
+                novnc_stack.start_cookie_refresher,
+                self.config,
+                display=str(info.get("display") or ":99"),
+                wait_login_s=int(wait_s),
+            )
+            if err2:
+                await ctx.send(f"❌ Failed to launch cookie refresher: {str(err2)[:500]}")
+                return
+
+            web_port = int(info.get("web_port") or 6080)
+            url_path = str(info.get("url_path") or "/vnc.html")
+
+            # Best-effort: include host/user hint if servers.json exists (keys are NOT needed server-side).
+            host_hint = "<oracle-host>"
+            user_hint = "rsadmin"
+            try:
+                oraclekeys_path = _REPO_ROOT / "oraclekeys"
+                servers_json = oraclekeys_path / "servers.json"
+                if servers_json.exists():
+                    servers = json.loads(servers_json.read_text(encoding="utf-8", errors="replace") or "[]")
+                    if isinstance(servers, list) and servers:
+                        host_hint = str((servers[0] or {}).get("host") or host_hint)
+                        user_hint = str((servers[0] or {}).get("user") or user_hint)
+            except Exception:
+                pass
+
+            tunnel_cmd = f"ssh -i <YOUR_KEY> -L {web_port}:127.0.0.1:{web_port} {user_hint}@{host_hint}"
+
+            await ctx.send(
+                "✅ noVNC is running (localhost-only on the server).\n\n"
+                f"1) On your PC, open an SSH tunnel:\n```{tunnel_cmd}```\n"
+                f"2) In your PC browser, open:\n`http://localhost:{web_port}{url_path}`\n"
+                "3) Log into Mavely in the Chromium window on that desktop.\n\n"
+                f"Cookie refresher PID: `{pid}`\n"
+                f"Refresher log (server path): `{log_path}`\n\n"
+                "When you're done, run `!rsmavelycheck` to confirm the session is valid."
+            )
+
+        @self.bot.command(name="rsmavelycheck", aliases=["mavelycheck"])
+        async def mavely_check(ctx):
+            """Run a non-mutating Mavely auth preflight check (safe)."""
+            try:
+                ok, status, err = await affiliate_rewriter.mavely_preflight(self.config)
+                if ok:
+                    await ctx.send(f"✅ Mavely preflight OK (status={status})")
+                else:
+                    msg = (err or "unknown error").replace("\n", " ").strip()
+                    if len(msg) > 180:
+                        msg = msg[:180] + "..."
+                    await ctx.send(f"❌ Mavely preflight FAIL (status={status}) {msg}")
+            except Exception as e:
+                await ctx.send(f"❌ Mavely preflight FAIL ({str(e)[:300]})")
         
         @self.bot.command(name='rscommands', aliases=['commands'])
         async def bot_help(ctx):
@@ -1359,6 +1455,8 @@ class RSForwarderBot:
                 ("`!rsfetchicon`", "Manually fetch RS Server icon"),
                 ("`!rsstartadminbot`", "Start RSAdminBot remotely on server (admin only)"),
                 ("`!rsrestartadminbot` or `!restart`", "Restart RSAdminBot remotely on server (admin only)"),
+                ("`!rsmavelylogin` or `!refreshtoken`", "Open noVNC + Mavely login browser (admin only; manual login)"),
+                ("`!rsmavelycheck`", "Check if Mavely session is valid (safe)"),
                 ("`!rscommands`", "Show this help message"),
             ]
             

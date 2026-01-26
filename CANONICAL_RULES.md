@@ -67,6 +67,61 @@ This section documents the canonical operational workflow for managing RS bots o
 - **Ubuntu repo root**: `/home/<user>/bots/mirror-world` (usually `/home/rsadmin/bots/mirror-world`)
   - **Note (Ubuntu local-exec mode)**: when you are already on Oracle Ubuntu and `local_exec=yes`, no SSH key is needed.
 
+### Windows SSH usage (canonical – avoids path/quoting traps)
+
+If you are on Windows, treat SSH invocation as **canonical infrastructure**, not “whatever terminal you happened to be in”.
+
+#### Absolute path rule (prevents System32 issues)
+
+- If you run SSH from `C:\Windows\System32`, relative paths like `oraclekeys/ssh-key-*.key` **will not resolve**.
+- Canonical rule: either
+  - `cd` to the repo root first, OR
+  - use an **absolute** key path.
+
+#### Canonical SSH executable (PowerShell-safe)
+
+PowerShell can sometimes mis-parse remote command strings (especially with `&&`, `||`, `<`, `>`). Prefer calling OpenSSH explicitly:
+
+- **PowerShell**:
+  - `& "$env:WINDIR\System32\OpenSSH\ssh.exe" -i "<ABS_KEY_PATH>" rsadmin@<host> "<remote_command>"`
+- **cmd.exe**:
+  - `"C:\Windows\System32\OpenSSH\ssh.exe" -i "<ABS_KEY_PATH>" rsadmin@<host> "<remote_command>"`
+
+#### Key permissions (fixes "UNPROTECTED PRIVATE KEY FILE" / "bad permissions")
+
+If OpenSSH refuses the key due to Windows ACLs, run (Windows, repo root):
+
+- `icacls "oraclekeys\ssh-key-2025-12-15.key" /reset`
+- `icacls "oraclekeys\ssh-key-2025-12-15.key" /inheritance:r`
+- `icacls "oraclekeys\ssh-key-2025-12-15.key" /grant:r "%USERDOMAIN%\%USERNAME%:R"`
+
+Then retry SSH.
+
+#### Canonical SSH options (stable tunnels / no prompts)
+
+- Add these options when stability matters:
+  - `-o StrictHostKeyChecking=no -o ServerAliveInterval=60 -o ConnectTimeout=60`
+
+#### Canonical tunnels (examples)
+
+- **noVNC (Oracle-side noVNC running on localhost:6080)**:
+  - Tunnel:
+    - `ssh -i "<ABS_KEY_PATH>" -L 6080:127.0.0.1:6080 rsadmin@<host>`
+  - Then open:
+    - `http://127.0.0.1:6080/vnc.html`
+
+- **DevTools/Chrome remote debugging (Oracle-side listening on localhost:<port>)**:
+  - Tunnel:
+    - `ssh -i "<ABS_KEY_PATH>" -L 9222:127.0.0.1:9222 rsadmin@<host>`
+  - Then open:
+    - `http://127.0.0.1:9222`
+
+#### Canonical remote command wrapper (quoting-safe)
+
+When you need to run compound commands remotely, prefer a single `bash -lc`:
+
+- `ssh -i "<ABS_KEY_PATH>" rsadmin@<host> "bash -lc 'cd /home/rsadmin/bots/mirror-world; <command>; <command>'"`
+
 ### Preferred update paths (in order)
 
 1. **Server-side deploy (full update)**:
