@@ -129,6 +129,7 @@ def _strip_tracking_params(url: str) -> str:
         "click_id",
         "irclickid",
         "irclick",
+        "ecid",  # common affiliate/campaign id param (e.g. Ecid=af_Mavely)
         "afsrc",
         "affid",
         "affiliate",
