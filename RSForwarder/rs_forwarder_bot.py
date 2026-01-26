@@ -18,6 +18,7 @@ from datetime import datetime
 import platform
 import subprocess
 import shlex
+import time
 
 from RSForwarder import affiliate_rewriter
 from RSForwarder import novnc_stack
@@ -54,6 +55,10 @@ class RSForwarderBot:
             'errors': 0,
             'started_at': None
         }
+        # Mavely monitoring / alerting state (in-memory)
+        self._mavely_monitor_task: Optional[asyncio.Task] = None
+        self._mavely_last_preflight_ok: Optional[bool] = None
+        self._mavely_last_alert_ts: float = 0.0
         self.load_config()
         
         # Validate required config
@@ -70,6 +75,246 @@ class RSForwarderBot:
         self.bot = commands.Bot(command_prefix='!rs', intents=intents)
         self._setup_events()
         self._setup_commands()
+
+    def _mavely_monitor_interval_s(self) -> int:
+        try:
+            v = int((self.config or {}).get("mavely_monitor_interval_s") or 300)
+        except Exception:
+            v = 300
+        return max(60, min(v, 3600))
+
+    def _mavely_alert_cooldown_s(self) -> int:
+        try:
+            v = int((self.config or {}).get("mavely_alert_cooldown_s") or 1800)
+        except Exception:
+            v = 1800
+        return max(300, min(v, 24 * 3600))
+
+    def _mavely_alert_user_ids(self) -> List[int]:
+        """
+        Read alert targets from config.secrets.json (server-only).
+        """
+        try:
+            d = self._load_secrets_dict()
+            raw = d.get("mavely_alert_user_ids") or []
+            if isinstance(raw, int):
+                raw = [raw]
+            if not isinstance(raw, list):
+                return []
+            out: List[int] = []
+            for x in raw:
+                try:
+                    out.append(int(str(x).strip()))
+                except Exception:
+                    continue
+            # unique, stable order
+            seen = set()
+            uniq: List[int] = []
+            for i in out:
+                if i in seen:
+                    continue
+                seen.add(i)
+                uniq.append(i)
+            return uniq
+        except Exception:
+            return []
+
+    def _mavely_admin_user_ids(self) -> List[int]:
+        """
+        Allowed to run Mavely login commands in DMs (server-only).
+        """
+        try:
+            d = self._load_secrets_dict()
+            raw = d.get("mavely_admin_user_ids") or []
+            if isinstance(raw, int):
+                raw = [raw]
+            if not isinstance(raw, list):
+                return []
+            out: List[int] = []
+            for x in raw:
+                try:
+                    out.append(int(str(x).strip()))
+                except Exception:
+                    continue
+            seen = set()
+            uniq: List[int] = []
+            for i in out:
+                if i in seen:
+                    continue
+                seen.add(i)
+                uniq.append(i)
+            return uniq
+        except Exception:
+            return []
+
+    def _save_mavely_user_lists(self, *, alert_ids: List[int], admin_ids: List[int]) -> bool:
+        try:
+            d = self._load_secrets_dict()
+            d["mavely_alert_user_ids"] = [int(x) for x in (alert_ids or [])]
+            d["mavely_admin_user_ids"] = [int(x) for x in (admin_ids or [])]
+            return self._save_secrets_dict(d)
+        except Exception:
+            return False
+
+    def _ensure_mavely_user(self, user_id: int) -> bool:
+        """
+        Ensure user is both an alert target and DM-admin for Mavely login commands.
+        """
+        try:
+            uid = int(user_id)
+        except Exception:
+            return False
+        alert_ids = self._mavely_alert_user_ids()
+        admin_ids = self._mavely_admin_user_ids()
+        if uid not in alert_ids:
+            alert_ids.append(uid)
+        if uid not in admin_ids:
+            admin_ids.append(uid)
+        return self._save_mavely_user_lists(alert_ids=alert_ids, admin_ids=admin_ids)
+
+    def _remove_mavely_user(self, user_id: int) -> bool:
+        try:
+            uid = int(user_id)
+        except Exception:
+            return False
+        alert_ids = [i for i in self._mavely_alert_user_ids() if i != uid]
+        admin_ids = [i for i in self._mavely_admin_user_ids() if i != uid]
+        return self._save_mavely_user_lists(alert_ids=alert_ids, admin_ids=admin_ids)
+
+    def _is_mavely_admin_ctx(self, ctx) -> bool:
+        """
+        Guild: require administrator permission.
+        DM: require user id to be in mavely_admin_user_ids or mavely_alert_user_ids.
+        """
+        try:
+            if getattr(ctx, "guild", None) is not None:
+                return bool(getattr(ctx.author, "guild_permissions", None) and ctx.author.guild_permissions.administrator)
+            uid = int(getattr(ctx.author, "id", 0) or 0)
+            if not uid:
+                return False
+            return (uid in self._mavely_admin_user_ids()) or (uid in self._mavely_alert_user_ids())
+        except Exception:
+            return False
+
+    async def _dm_user(self, user_id: int, content: str) -> bool:
+        try:
+            uid = int(user_id)
+            if uid <= 0:
+                return False
+            user = self.bot.get_user(uid)
+            if user is None:
+                user = await self.bot.fetch_user(uid)
+            if user is None:
+                return False
+            await user.send(content)
+            return True
+        except Exception:
+            return False
+
+    def _build_tunnel_instructions(self, web_port: int, url_path: str) -> str:
+        host_hint = "<oracle-host>"
+        user_hint = "rsadmin"
+        try:
+            oraclekeys_path = _REPO_ROOT / "oraclekeys"
+            servers_json = oraclekeys_path / "servers.json"
+            if servers_json.exists():
+                servers = json.loads(servers_json.read_text(encoding="utf-8", errors="replace") or "[]")
+                if isinstance(servers, list) and servers:
+                    host_hint = str((servers[0] or {}).get("host") or host_hint)
+                    user_hint = str((servers[0] or {}).get("user") or user_hint)
+        except Exception:
+            pass
+        tunnel_cmd = f"ssh -i <YOUR_KEY> -L {int(web_port)}:127.0.0.1:{int(web_port)} {user_hint}@{host_hint}"
+        return (
+            "✅ noVNC is running (localhost-only on the server).\n\n"
+            f"- If you already keep a tunnel running, just open:\n`http://localhost:{int(web_port)}{url_path}`\n\n"
+            "Otherwise:\n"
+            f"1) On your PC, open an SSH tunnel:\n```{tunnel_cmd}```\n"
+            f"2) In your PC browser, open:\n`http://localhost:{int(web_port)}{url_path}`\n"
+            "3) Log into Mavely in the Chromium window on that desktop.\n\n"
+            "When you're done, run `!rsmavelycheck` to confirm the session is valid."
+        )
+
+    async def _mavely_monitor_loop(self):
+        await self.bot.wait_until_ready()
+        while not self.bot.is_closed():
+            try:
+                # If no one is configured to receive alerts, keep quiet.
+                targets = self._mavely_alert_user_ids()
+                interval = self._mavely_monitor_interval_s()
+                if not targets:
+                    await asyncio.sleep(interval)
+                    continue
+
+                ok, status, err = await affiliate_rewriter.mavely_preflight(self.config)
+                if ok:
+                    self._mavely_last_preflight_ok = True
+                    await asyncio.sleep(interval)
+                    continue
+
+                # If credentials are configured, try a headless auto-login first.
+                # If it succeeds, we recover without requiring user action.
+                try:
+                    email = str((self.config or {}).get("mavely_login_email") or "").strip()
+                    password = str((self.config or {}).get("mavely_login_password") or "").strip()
+                except Exception:
+                    email, password = "", ""
+
+                if self._is_local_exec() and email and password:
+                    ok_run, _out = await asyncio.to_thread(novnc_stack.run_cookie_refresher_headless, self.config, wait_login_s=180)
+                    if ok_run:
+                        ok2, _status2, _err2 = await affiliate_rewriter.mavely_preflight(self.config)
+                        if ok2:
+                            self._mavely_last_preflight_ok = True
+                            await asyncio.sleep(interval)
+                            continue
+
+                # Failure path: alert (rate-limited) and optionally start noVNC + refresher automatically.
+                now = time.time()
+                cooldown = self._mavely_alert_cooldown_s()
+                should_alert = (self._mavely_last_preflight_ok is True) or ((now - float(self._mavely_last_alert_ts)) >= float(cooldown))
+                self._mavely_last_preflight_ok = False
+                if not should_alert:
+                    await asyncio.sleep(interval)
+                    continue
+
+                info = None
+                pid = None
+                log_path = None
+                start_err = None
+                if self._is_local_exec():
+                    info, start_err = await asyncio.to_thread(novnc_stack.ensure_novnc, self.config)
+                    if info and not start_err:
+                        pid, log_path, _err2 = await asyncio.to_thread(
+                            novnc_stack.start_cookie_refresher,
+                            self.config,
+                            display=str((info or {}).get("display") or ":99"),
+                            wait_login_s=900,
+                        )
+
+                msg = (err or "unknown error").replace("\n", " ").strip()
+                if len(msg) > 240:
+                    msg = msg[:240] + "..."
+                header = f"⚠️ Mavely session check FAILED (status={status}).\n{msg}\n\n"
+                if start_err:
+                    body = f"noVNC auto-start failed: {str(start_err)[:300]}\n\nRun `!rsmavelylogin` in Discord to start login."
+                else:
+                    web_port = int((info or {}).get("web_port") or 6080)
+                    url_path = str((info or {}).get("url_path") or "/vnc.html")
+                    body = self._build_tunnel_instructions(web_port, url_path)
+                    if pid:
+                        body += f"\n\nCookie refresher PID: `{pid}`"
+                    if log_path:
+                        body += f"\nRefresher log (server path): `{log_path}`"
+
+                for uid in targets:
+                    await self._dm_user(uid, header + body)
+
+                self._mavely_last_alert_ts = now
+            except Exception:
+                pass
+
+            await asyncio.sleep(self._mavely_monitor_interval_s())
     
     def load_config(self):
         """Load configuration from config.json + config.secrets.json (server-only)."""
@@ -476,6 +721,13 @@ class RSForwarderBot:
                             print(f"{Colors.RED}[Affiliate] ❌ Mavely preflight FAIL{Colors.RESET} (status={status}) {msg}")
                     except Exception as e:
                         print(f"{Colors.RED}[Affiliate] ❌ Mavely preflight FAIL{Colors.RESET} ({e})")
+            except Exception:
+                pass
+
+            # Start background Mavely monitor (DM alerts + auto-start login desktop)
+            try:
+                if self._mavely_monitor_task is None or self._mavely_monitor_task.done():
+                    self._mavely_monitor_task = asyncio.create_task(self._mavely_monitor_loop())
             except Exception:
                 pass
             
@@ -1361,7 +1613,7 @@ class RSForwarderBot:
             - This does NOT log in automatically; it opens a browser on the server desktop.
             - You connect via SSH tunnel to noVNC and log in manually.
             """
-            if not ctx.author.guild_permissions.administrator:
+            if not self._is_mavely_admin_ctx(ctx):
                 await ctx.send("❌ You don't have permission to use this command.")
                 return
 
@@ -1375,7 +1627,26 @@ class RSForwarderBot:
                 wait_s = 900
             wait_s = max(60, min(wait_s, 3600))
 
-            await ctx.send("🔄 Starting noVNC desktop + launching Mavely login browser (server-local)...")
+            # Auto-enroll invoker for alerts + DM admin (guild-only).
+            try:
+                if getattr(ctx, "guild", None) is not None:
+                    self._ensure_mavely_user(int(ctx.author.id))
+            except Exception:
+                pass
+
+            # Best effort: delete the command message (keeps channels clean)
+            try:
+                if getattr(ctx, "guild", None) is not None:
+                    await ctx.message.delete()
+            except Exception:
+                pass
+
+            channel_ack = None
+            try:
+                if getattr(ctx, "guild", None) is not None:
+                    channel_ack = await ctx.send("🔄 Starting noVNC desktop + launching Mavely login browser... I’ll DM you the tunnel + URL.")
+            except Exception:
+                channel_ack = None
 
             info, err = await asyncio.to_thread(novnc_stack.ensure_novnc, self.config)
             if err or not info:
@@ -1395,31 +1666,71 @@ class RSForwarderBot:
             web_port = int(info.get("web_port") or 6080)
             url_path = str(info.get("url_path") or "/vnc.html")
 
-            # Best-effort: include host/user hint if servers.json exists (keys are NOT needed server-side).
-            host_hint = "<oracle-host>"
-            user_hint = "rsadmin"
+            msg = self._build_tunnel_instructions(web_port, url_path)
+            if pid:
+                msg += f"\n\nCookie refresher PID: `{pid}`"
+            if log_path:
+                msg += f"\nRefresher log (server path): `{log_path}`"
+
+            # Prefer DM. If DM fails, fall back to channel.
+            sent_dm = False
             try:
-                oraclekeys_path = _REPO_ROOT / "oraclekeys"
-                servers_json = oraclekeys_path / "servers.json"
-                if servers_json.exists():
-                    servers = json.loads(servers_json.read_text(encoding="utf-8", errors="replace") or "[]")
-                    if isinstance(servers, list) and servers:
-                        host_hint = str((servers[0] or {}).get("host") or host_hint)
-                        user_hint = str((servers[0] or {}).get("user") or user_hint)
+                await ctx.author.send(msg)
+                sent_dm = True
             except Exception:
-                pass
+                sent_dm = False
 
-            tunnel_cmd = f"ssh -i <YOUR_KEY> -L {web_port}:127.0.0.1:{web_port} {user_hint}@{host_hint}"
+            if getattr(ctx, "guild", None) is not None:
+                try:
+                    if sent_dm:
+                        done = await ctx.send("✅ Sent you a DM with the noVNC tunnel + URL. Run `!rsmavelycheck` after you log in.")
+                    else:
+                        done = await ctx.send(msg)
+                    try:
+                        await done.delete(delay=20)  # type: ignore[arg-type]
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                try:
+                    if channel_ack:
+                        await channel_ack.delete(delay=5)  # type: ignore[arg-type]
+                except Exception:
+                    pass
+            else:
+                # DM channel: we already sent details (or failed). Keep a short confirmation.
+                if sent_dm:
+                    await ctx.send("✅ Sent. After logging in, run `!rsmavelycheck`.")
 
-            await ctx.send(
-                "✅ noVNC is running (localhost-only on the server).\n\n"
-                f"1) On your PC, open an SSH tunnel:\n```{tunnel_cmd}```\n"
-                f"2) In your PC browser, open:\n`http://localhost:{web_port}{url_path}`\n"
-                "3) Log into Mavely in the Chromium window on that desktop.\n\n"
-                f"Cookie refresher PID: `{pid}`\n"
-                f"Refresher log (server path): `{log_path}`\n\n"
-                "When you're done, run `!rsmavelycheck` to confirm the session is valid."
-            )
+        @self.bot.command(name="rsmavelyalertme", aliases=["mavelyalertme"])
+        async def mavely_alert_me(ctx):
+            """Enable DM alerts for Mavely session failures (admin only; must be run in a guild)."""
+            if getattr(ctx, "guild", None) is None:
+                await ctx.send("❌ Run this in a server channel (not DMs) so we can verify admin permission.")
+                return
+            if not ctx.author.guild_permissions.administrator:
+                await ctx.send("❌ You don't have permission to use this command.")
+                return
+            ok = self._ensure_mavely_user(int(ctx.author.id))
+            if ok:
+                await ctx.send("✅ Mavely alerts enabled for you. If the session expires, I’ll DM you with the noVNC login steps.")
+            else:
+                await ctx.send("❌ Failed to save alert settings (could not write config.secrets.json).")
+
+        @self.bot.command(name="rsmavelyalertoff", aliases=["mavelyalertoff"])
+        async def mavely_alert_off(ctx):
+            """Disable DM alerts for Mavely session failures (admin only; must be run in a guild)."""
+            if getattr(ctx, "guild", None) is None:
+                await ctx.send("❌ Run this in a server channel (not DMs) so we can verify admin permission.")
+                return
+            if not ctx.author.guild_permissions.administrator:
+                await ctx.send("❌ You don't have permission to use this command.")
+                return
+            ok = self._remove_mavely_user(int(ctx.author.id))
+            if ok:
+                await ctx.send("✅ Mavely alerts disabled for you.")
+            else:
+                await ctx.send("❌ Failed to save alert settings (could not write config.secrets.json).")
 
         @self.bot.command(name="rsmavelycheck", aliases=["mavelycheck"])
         async def mavely_check(ctx):
@@ -1457,6 +1768,8 @@ class RSForwarderBot:
                 ("`!rsrestartadminbot` or `!restart`", "Restart RSAdminBot remotely on server (admin only)"),
                 ("`!rsmavelylogin` or `!refreshtoken`", "Open noVNC + Mavely login browser (admin only; manual login)"),
                 ("`!rsmavelycheck`", "Check if Mavely session is valid (safe)"),
+                ("`!rsmavelyalertme`", "DM me if Mavely session expires (admin only)"),
+                ("`!rsmavelyalertoff`", "Disable Mavely expiry DMs (admin only)"),
                 ("`!rscommands`", "Show this help message"),
             ]
             

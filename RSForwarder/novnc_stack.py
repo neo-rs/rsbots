@@ -22,6 +22,82 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 
+def _best_python(repo_root: Path) -> str:
+    """
+    Prefer the repo's venv python when present.
+
+    On servers, the bot may run under system python, but Playwright and other deps
+    are typically installed in the repo venv. Using sys.executable can therefore
+    break noVNC login flows.
+    """
+    try:
+        venv_py = repo_root / ".venv" / "bin" / "python"
+        if venv_py.exists() and venv_py.is_file():
+            return str(venv_py)
+    except Exception:
+        pass
+    return str(sys.executable)
+
+
+def _append_log(p: Path, text: str) -> None:
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8", errors="replace") as f:
+            f.write((text or "").rstrip() + "\n")
+    except Exception:
+        pass
+
+
+def _tail_log(p: Path, max_lines: int = 60) -> str:
+    try:
+        lines = (p.read_text(encoding="utf-8", errors="replace") or "").splitlines()
+        tail = lines[-max_lines:] if max_lines and len(lines) > max_lines else lines
+        return "\n".join(tail).strip()
+    except Exception:
+        return ""
+
+
+def _ensure_playwright_chromium(python_exe: str, *, cwd: Path, state_dir: Path) -> None:
+    """
+    Best-effort: ensure Playwright Chromium is installed.
+
+    This prevents the common "no browser shows up in noVNC" case where Playwright is installed
+    but the Chromium runtime wasn't downloaded on the server.
+    """
+    marker = state_dir / "playwright_chromium.ok"
+    log = state_dir / "playwright_install.log"
+    if marker.exists():
+        return
+
+    try:
+        _append_log(log, f"[playwright] ensuring chromium via: {python_exe} -m playwright install chromium")
+        r = subprocess.run(
+            [python_exe, "-m", "playwright", "install", "chromium"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=600,
+            encoding="utf-8",
+            errors="replace",
+        )
+        out = (r.stdout or "") + ("\n" + r.stderr if r.stderr else "")
+        if out.strip():
+            _append_log(log, out.strip())
+        if int(r.returncode or 0) == 0:
+            try:
+                marker.write_text(f"ok {int(time.time())}\n", encoding="utf-8")
+            except Exception:
+                pass
+        else:
+            _append_log(
+                log,
+                "[playwright] install chromium failed. If errors mention missing system libs, run:\n"
+                f"  sudo {python_exe} -m playwright install-deps chromium",
+            )
+    except Exception as e:
+        _append_log(log, f"[playwright] install chromium failed: {e}")
+
+
 def _cfg_or_env_str(cfg: dict, cfg_key: str, env_key: str, default: str) -> str:
     v = str((cfg or {}).get(cfg_key) or "").strip()
     if v:
@@ -284,16 +360,32 @@ def start_cookie_refresher(cfg: dict, *, display: str, wait_login_s: int = 900) 
     if existing and _pid_alive(existing):
         return int(existing), str(log_file), None
 
+    python_exe = _best_python(repo_root)
+    _ensure_playwright_chromium(python_exe, cwd=(repo_root / "RSForwarder"), state_dir=state_dir)
+
     env = dict(os.environ)
     env["DISPLAY"] = str(display)
 
+    # Optional auto-login credentials (server-only secrets)
+    try:
+        email = str((cfg or {}).get("mavely_login_email") or "").strip()
+        password = str((cfg or {}).get("mavely_login_password") or "").strip()
+        if email:
+            env["MAVELY_LOGIN_EMAIL"] = email
+        if password:
+            env["MAVELY_LOGIN_PASSWORD"] = password
+    except Exception:
+        pass
+
     cmd = [
-        sys.executable,
+        python_exe,
         str(script),
         "--interactive",
         "--wait-login",
         str(max(30, int(wait_login_s))),
     ]
+    if env.get("MAVELY_LOGIN_EMAIL") and env.get("MAVELY_LOGIN_PASSWORD"):
+        cmd.append("--auto-login")
 
     try:
         with open(log_file, "a", encoding="utf-8", errors="replace") as lf:
@@ -307,7 +399,100 @@ def start_cookie_refresher(cfg: dict, *, display: str, wait_login_s: int = 900) 
                 close_fds=True,
             )
         _write_pid(pid_file, int(p.pid))
+        # If the refresher exits immediately, surface the error to the command caller.
+        time.sleep(0.8)
+        if not _pid_alive(int(p.pid)):
+            tail = _tail_log(log_file, max_lines=60)
+            extra = _tail_log(state_dir / "playwright_install.log", max_lines=60)
+            msg = "Cookie refresher exited immediately (Chromium likely failed to launch)."
+            if tail:
+                msg += "\n\nLast refresher log lines:\n" + tail[-1800:]
+            if extra:
+                msg += "\n\nLast playwright install lines:\n" + extra[-1800:]
+            return None, str(log_file), msg
         return int(p.pid), str(log_file), None
     except Exception as e:
         return None, str(log_file), f"Failed to start cookie refresher: {e}"
+
+
+def run_cookie_refresher_headless(cfg: dict, *, wait_login_s: int = 180) -> Tuple[bool, str]:
+    """
+    Run mavely_cookie_refresher headless with optional --auto-login.
+
+    Returns: (ok, output_or_error)
+    """
+    if os.name == "nt":
+        return False, "Cookie refresher is intended to run on the Linux host."
+
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "RSForwarder" / "mavely_cookie_refresher.py"
+    if not script.exists():
+        return False, f"Missing script: {script}"
+
+    env = dict(os.environ)
+    try:
+        email = str((cfg or {}).get("mavely_login_email") or "").strip()
+        password = str((cfg or {}).get("mavely_login_password") or "").strip()
+        if email:
+            env["MAVELY_LOGIN_EMAIL"] = email
+        if password:
+            env["MAVELY_LOGIN_PASSWORD"] = password
+    except Exception:
+        email = ""
+        password = ""
+
+    # Headless auto-login works best with a dedicated clean profile directory,
+    # so a stale interactive profile cannot redirect us away from the login form.
+    headless_profile = _cfg_or_env_str(
+        cfg,
+        "mavely_headless_profile_dir",
+        "MAVELY_HEADLESS_PROFILE_DIR",
+        "/tmp/rsforwarder_mavely_profile_headless",
+    )
+    env["MAVELY_PROFILE_DIR"] = headless_profile
+
+    python_exe = _best_python(repo_root)
+    state_dir = Path(_cfg_or_env_str(cfg, "mavely_novnc_state_dir", "MAVELY_NOVNC_STATE_DIR", "/tmp/rsforwarder_mavely_novnc"))
+    _ensure_playwright_chromium(python_exe, cwd=(repo_root / "RSForwarder"), state_dir=state_dir)
+
+    cmd = [python_exe, str(script), "--wait-login", str(max(30, int(wait_login_s)))]
+    auto_login = bool(env.get("MAVELY_LOGIN_EMAIL") and env.get("MAVELY_LOGIN_PASSWORD"))
+    if auto_login:
+        cmd.append("--auto-login")
+
+    try:
+        def _run() -> Tuple[int, str]:
+            r = subprocess.run(
+                cmd,
+                cwd=str(repo_root / "RSForwarder"),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=max(60, int(wait_login_s) + 30),
+                encoding="utf-8",
+                errors="replace",
+            )
+            out = (r.stdout or r.stderr or "").strip()
+            return int(r.returncode or 0), out
+
+        code, out = _run()
+        if code == 0:
+            return True, out
+
+        # One retry with a fresh profile when auto-login is enabled.
+        if auto_login:
+            try:
+                shutil.rmtree(headless_profile, ignore_errors=True)
+            except Exception:
+                pass
+            code2, out2 = _run()
+            if code2 == 0:
+                return True, out2
+            out = (out2 or out or "").strip()
+
+        return False, out or f"cookie refresher exit={code}"
+    except subprocess.TimeoutExpired:
+        return False, "cookie refresher timed out"
+    except Exception as e:
+        return False, f"cookie refresher failed: {e}"
 
