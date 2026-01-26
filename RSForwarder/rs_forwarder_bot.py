@@ -450,15 +450,23 @@ class RSForwarderBot:
                     except Exception as e:
                         print(f"{Colors.RED}[Affiliate] ❌ Amazon FAIL{Colors.RESET} ({e})")
 
-                    mavely_test_url = (os.getenv("RS_STARTUP_TEST_MAVELY_URL", "") or "").strip() or "https://www.target.com/p/zephyr/-/A-94827558"
-                    try:
-                        link, err = await affiliate_rewriter.mavely_create_link(self.config, mavely_test_url)
-                        if link and not err:
-                            print(f"{Colors.GREEN}[Affiliate] ✅ Mavely PASS{Colors.RESET} -> {link}")
-                        else:
-                            print(f"{Colors.RED}[Affiliate] ❌ Mavely FAIL{Colors.RESET} ({err or 'unknown error'})")
-                    except Exception as e:
-                        print(f"{Colors.RED}[Affiliate] ❌ Mavely FAIL{Colors.RESET} ({e})")
+                    # Mavely API self-test can be noisy if cookies are expired (and some servers can't use refresh_token).
+                    # If you're not re-wrapping existing Mavely links, skip the API test unless explicitly requested.
+                    rewrap_enabled = bool(self.config.get("affiliate_rewrap_mavely_links", True))
+                    mavely_test_url = (os.getenv("RS_STARTUP_TEST_MAVELY_URL", "") or "").strip()
+                    if (not rewrap_enabled) and (not mavely_test_url):
+                        print(f"{Colors.YELLOW}[Affiliate] ⚠️  Mavely startup test skipped{Colors.RESET} (rewrap disabled; set RS_STARTUP_TEST_MAVELY_URL to force)")
+                    else:
+                        if not mavely_test_url:
+                            mavely_test_url = "https://www.target.com/p/zephyr/-/A-94827558"
+                        try:
+                            link, err = await affiliate_rewriter.mavely_create_link(self.config, mavely_test_url)
+                            if link and not err:
+                                print(f"{Colors.GREEN}[Affiliate] ✅ Mavely PASS{Colors.RESET} -> {link}")
+                            else:
+                                print(f"{Colors.RED}[Affiliate] ❌ Mavely FAIL{Colors.RESET} ({err or 'unknown error'})")
+                        except Exception as e:
+                            print(f"{Colors.RED}[Affiliate] ❌ Mavely FAIL{Colors.RESET} ({e})")
             except Exception:
                 pass
             
