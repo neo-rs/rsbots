@@ -234,6 +234,10 @@ class MavelyClient:
         self.auth_scope = _env_str("MAVELY_AUTH_SCOPE")        # optional
         self.client_id = _env_str("MAVELY_CLIENT_ID")
         self._last_refresh_error: Optional[str] = None
+        # If the refresh token is rejected with invalid_grant, stop retrying it for the
+        # lifetime of this process (prevents log spam + wasted requests).
+        self._oauth_refresh_disabled = False
+        self._oauth_refresh_disabled_reason: Optional[str] = None
         self.base_url = _normalize_base_url(base_url or os.environ.get("MAVELY_BASE_URL", DEFAULT_BASE_URL))
         self.graphql_endpoint = (graphql_endpoint or os.environ.get("MAVELY_GRAPHQL_ENDPOINT", "") or "").strip() or None
         self.timeout_s = int(timeout_s)
@@ -324,6 +328,10 @@ class MavelyClient:
         Try to mint a new access token using refresh_token grant (Auth0-style).
         Requires MAVELY_REFRESH_TOKEN.
         """
+        if self._oauth_refresh_disabled:
+            self._last_refresh_error = self._oauth_refresh_disabled_reason or "OAuth refresh disabled"
+            return None
+
         if not self.refresh_token:
             self.log.debug("Refresh skipped: no MAVELY_REFRESH_TOKEN configured")
             self._last_refresh_error = "no MAVELY_REFRESH_TOKEN configured"
@@ -413,6 +421,10 @@ class MavelyClient:
             if err_code or err_desc:
                 extra = f" ({err_code}{': ' if (err_code and err_desc) else ''}{err_desc})"
             self._last_refresh_error = f"token endpoint returned {resp.status_code}{extra}"
+            # If refresh_token is definitively invalid, stop trying it repeatedly.
+            if (err_code or "").strip().lower() == "invalid_grant":
+                self._oauth_refresh_disabled = True
+                self._oauth_refresh_disabled_reason = f"OAuth refresh disabled: {self._last_refresh_error}"
             return None
         try:
             data = resp.json()
