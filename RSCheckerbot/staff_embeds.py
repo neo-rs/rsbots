@@ -37,6 +37,7 @@ def apply_member_header(embed: discord.Embed, user: discord.abc.User) -> None:
 _LABEL_OVERRIDES: dict[str, str] = {
     # Whop / membership
     "product": "Membership",
+    "membership_id": "Membership ID",
     "member_since": "Member Since",
     "renewal_start": "Billing Period Started",
     "renewal_end": "Next Billing Date",
@@ -351,6 +352,7 @@ def build_member_status_detailed_embed(
         "source",
         "access_roles_at_leave",
         "whop_link",
+        "membership_id",
         "event",
     ):
         v = mk.get(key) if key in mk else dk.get(key)
@@ -359,22 +361,42 @@ def build_member_status_detailed_embed(
         name, val = _human_value_for_field(key, v)
         _add_field(embed, name, val, inline=True)
 
+    def _has_any_whop_value(brief: dict) -> bool:
+        if not isinstance(brief, dict):
+            return False
+        # "Core" values we want to avoid showing as forced blanks on join/leave cards.
+        for k in ("status", "product", "total_spent", "dashboard_url", "renewal_window", "renewal_end", "remaining_days"):
+            if not _is_blank(_sanitize_value(brief.get(k))):
+                return True
+        return False
+
+    is_lifecycle = any(x in str(title or "").lower() for x in ("member joined", "member left"))
+    has_whop = _has_any_whop_value(b)
+
     # Payment rows (inline x3)
-    # Always show the core Whop fields on every staff card (no "Not linked yet" placeholders).
-    _add_field_force(embed, _human_label("status", label_overrides=label_overrides), b.get("status"), inline=True)
-    _add_field(embed, _human_label("product", label_overrides=label_overrides), b.get("product"), inline=True)
-    _add_field_force(embed, _human_label("total_spent", label_overrides=label_overrides), spent_s, inline=True)
+    if is_lifecycle and not has_whop:
+        # For join/leave cards, avoid spamming forced "—" fields when the member isn't linked yet.
+        _add_field(embed, "Whop", "not linked (no membership_id recorded yet)", inline=False)
+    else:
+        # Always show the core Whop fields on non-lifecycle cards; for join/leave cards, hide blanks.
+        add_core = _add_field if is_lifecycle else _add_field_force
+        add_window = _add_field if is_lifecycle else _add_field_force
+        add_spent = _add_field if is_lifecycle else _add_field_force
 
-    _add_field(embed, _human_label("trial_days", label_overrides=label_overrides), b.get("trial_days"), inline=True)
-    _add_field(embed, _human_label("plan_is_renewal", label_overrides=label_overrides), b.get("plan_is_renewal"), inline=True)
-    _add_field(embed, _human_label("promo", label_overrides=label_overrides), b.get("promo"), inline=True)
-    _add_field(embed, _human_label("pricing", label_overrides=label_overrides), b.get("pricing"), inline=True)
+        add_core(embed, _human_label("status", label_overrides=label_overrides), b.get("status"), inline=True)
+        _add_field(embed, _human_label("product", label_overrides=label_overrides), b.get("product"), inline=True)
+        add_spent(embed, _human_label("total_spent", label_overrides=label_overrides), spent_s, inline=True)
 
-    _add_field(embed, _human_label("remaining_days", label_overrides=label_overrides), b.get("remaining_days"), inline=True)
-    _add_field(embed, _human_label("renewal_end", label_overrides=label_overrides), b.get("renewal_end"), inline=True)
-    _add_field_force(embed, _human_label("dashboard_url", label_overrides=label_overrides), b.get("dashboard_url"), inline=True)
-    _add_field(embed, _human_label("manage_url", label_overrides=label_overrides), b.get("manage_url"), inline=True)
-    _add_field_force(embed, _human_label("renewal_window", label_overrides=label_overrides), b.get("renewal_window"), inline=False)
+        _add_field(embed, _human_label("trial_days", label_overrides=label_overrides), b.get("trial_days"), inline=True)
+        _add_field(embed, _human_label("plan_is_renewal", label_overrides=label_overrides), b.get("plan_is_renewal"), inline=True)
+        _add_field(embed, _human_label("promo", label_overrides=label_overrides), b.get("promo"), inline=True)
+        _add_field(embed, _human_label("pricing", label_overrides=label_overrides), b.get("pricing"), inline=True)
+
+        _add_field(embed, _human_label("remaining_days", label_overrides=label_overrides), b.get("remaining_days"), inline=True)
+        _add_field(embed, _human_label("renewal_end", label_overrides=label_overrides), b.get("renewal_end"), inline=True)
+        add_core(embed, _human_label("dashboard_url", label_overrides=label_overrides), b.get("dashboard_url"), inline=True)
+        _add_field(embed, _human_label("manage_url", label_overrides=label_overrides), b.get("manage_url"), inline=True)
+        add_window(embed, _human_label("renewal_window", label_overrides=label_overrides), b.get("renewal_window"), inline=False)
 
     _add_field(embed, _human_label("last_success_paid_at", label_overrides=label_overrides), b.get("last_success_paid_at"), inline=True)
     _add_field(embed, _human_label("cancel_at_period_end", label_overrides=label_overrides), b.get("cancel_at_period_end"), inline=True)

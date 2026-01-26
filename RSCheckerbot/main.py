@@ -3724,6 +3724,10 @@ async def on_member_join(member: discord.Member):
                     ("tracked_invite", tracked_s),
                     ("source", source_s),
                 ]
+                # Helpful for staff triage; only shows when present (blanks are hidden).
+                mid_hint = _membership_id_from_history(member.id)
+                if mid_hint:
+                    base_discord_kv.append(("membership_id", mid_hint))
 
                 # Attempt immediate Whop enrichment; otherwise post placeholder then edit.
                 _mid_now, brief_now = await _resolve_whop_brief_for_discord_id(member.id)
@@ -3863,13 +3867,9 @@ async def on_member_remove(member: discord.Member):
             if ch:
                 access = _access_roles_plain(member)
 
-                mid = ""
-                whop_brief = _whop_summary_for_member(member.id)
-                if not (isinstance(whop_brief, dict) and whop_brief):
-                    mid = _membership_id_from_history(member.id)
-                    whop_brief = await _fetch_whop_brief_by_membership_id(mid) if mid else {}
-                if not (isinstance(whop_brief, dict) and whop_brief):
-                    whop_brief = {}
+                # No Whop API calls for join/leave logs; rely on member_history + native-card cache only.
+                mid = _membership_id_from_history(member.id)
+                whop_brief = _whop_summary_for_member(member.id) or {}
                 acc = rec.get("access") if isinstance(rec.get("access"), dict) else {}
                 detailed = _build_member_status_detailed_embed(
                     title="🚪 Member Left",
@@ -3887,6 +3887,7 @@ async def on_member_remove(member: discord.Member):
                     ],
                     discord_kv=[
                         ("access_roles_at_leave", access),
+                        ("membership_id", mid) if mid else ("membership_id", "—"),
                     ],
                     whop_brief=whop_brief,
                 )

@@ -731,27 +731,6 @@ class RSOnboardingBot:
         except Exception:
             return None
 
-    def _get_rschecker_whop_link(self, discord_id: int) -> dict:
-        """Best-effort Whop link info from RSCheckerbot cache (no API calls).
-
-        Reads `RSCheckerbot/whop_discord_link.json` and returns the record under
-        `by_discord_id[discord_id]` when present.
-        """
-        try:
-            p = _REPO_ROOT / "RSCheckerbot" / "whop_discord_link.json"
-            if not p.exists() or p.stat().st_size == 0:
-                return {}
-            db = json.loads(p.read_text(encoding="utf-8"))
-            if not isinstance(db, dict):
-                return {}
-            by = db.get("by_discord_id")
-            if not isinstance(by, dict):
-                return {}
-            rec = by.get(str(int(discord_id)))
-            return rec if isinstance(rec, dict) else {}
-        except Exception:
-            return {}
-
     def _get_rschecker_member_history(self, discord_id: int) -> dict:
         """Best-effort member history record from RSCheckerbot runtime JSON (no syncing, no writes).
 
@@ -992,32 +971,37 @@ class RSOnboardingBot:
                             except Exception:
                                 pass
 
-                            # Optional: include cached Whop membership link (from RSCheckerbot) when available
+                            # Optional: include cached Whop summary (from RSCheckerbot member_history) when available
                             try:
-                                whop_link = self._get_rschecker_whop_link(member.id)
-                                dash = str(whop_link.get("dashboard_url") or "").strip()
-                                if dash or (isinstance(whop_link.get("whop_brief"), dict) and whop_link.get("whop_brief")):
-                                    lines = []
-                                    brief = whop_link.get("whop_brief") if isinstance(whop_link, dict) else None
-                                    if isinstance(brief, dict):
-                                        product = str(brief.get("product") or "").strip()
-                                        status = str(brief.get("status") or "").strip()
-                                        renewal_end = str(brief.get("renewal_end") or "").strip()
-                                        total_spent = str(brief.get("total_spent") or "").strip()
-                                        cancel_end = str(brief.get("cancel_at_period_end") or "").strip()
-                                        if product:
-                                            lines.append(f"product: {product}")
-                                        if status:
-                                            lines.append(f"status: {status}")
-                                        if renewal_end:
-                                            lines.append(f"renewal_end: {renewal_end}")
-                                        if cancel_end:
-                                            lines.append(f"cancel_at_period_end: {cancel_end}")
-                                        if total_spent:
-                                            lines.append(f"total_spent: {total_spent}")
+                                hist = self._get_rschecker_member_history(member.id)
+                                wh = hist.get("whop") if isinstance(hist, dict) else None
+                                wh = wh if isinstance(wh, dict) else {}
+                                brief = wh.get("last_summary") if isinstance(wh.get("last_summary"), dict) else {}
+                                mid = str(wh.get("last_membership_id") or wh.get("last_whop_key") or "").strip()
+                                lines = []
+                                if mid:
+                                    lines.append(f"membership_id: {mid}")
+                                if isinstance(brief, dict) and brief:
+                                    product = str(brief.get("product") or "").strip()
+                                    status = str(brief.get("status") or "").strip()
+                                    renewal_end = str(brief.get("renewal_end") or "").strip()
+                                    total_spent = str(brief.get("total_spent") or "").strip()
+                                    cancel_end = str(brief.get("cancel_at_period_end") or "").strip()
+                                    dash = str(brief.get("dashboard_url") or "").strip()
+                                    if product:
+                                        lines.append(f"product: {product}")
+                                    if status:
+                                        lines.append(f"status: {status}")
+                                    if renewal_end:
+                                        lines.append(f"renewal_end: {renewal_end}")
+                                    if cancel_end:
+                                        lines.append(f"cancel_at_period_end: {cancel_end}")
+                                    if total_spent:
+                                        lines.append(f"total_spent: {total_spent}")
                                     if dash:
                                         # dashboard_url may already be markdown; keep as-is.
                                         lines.append(f"dashboard: {dash}")
+                                if lines:
                                     embed.add_field(name="Whop", value=("\n".join(lines)[:1024] or "—"), inline=False)
                             except Exception:
                                 pass

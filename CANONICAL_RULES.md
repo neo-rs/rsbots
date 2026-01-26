@@ -287,6 +287,9 @@ Notes:
   - Used for **event visibility** and staff-facing summaries.
   - Parsed into **staff-safe summaries** stored under `member_history.json -> whop.last_summary`.
   - Ingestion source only; not authoritative by itself.
+- **Native membership-id cache (`whop_native_membership_cache.json`)**:
+  - Runtime JSON cache keyed by `membership_id` built from native Whop cards.
+  - Allows `member-status-logs` to reuse native card text **without** Whop API when a Discord user has a recorded `whop.last_membership_id`.
 - **Whop API**:
   - Used for **authoritative status** and details when membership_id is present.
   - Required for disputes/resolution details and payment failure reasons.
@@ -294,6 +297,10 @@ Notes:
 ### Deprecated / removed
 - `whop_discord_link.json` is deprecated and should not be created or used.
 - `reporting_store.json` is a derived cache (rebuild via `.checker report scan ...`).
+
+### Staff output rule (member-status-logs)
+- Join/leave cards may not have Whop linkage yet; do not force blank Whop fields.
+  - If unlinked, show a single "Whop not linked" note instead of multiple `—` fields.
 
 ### Allowed reporting fields (staff-safe)
 - Membership: `status`, `product`, `membership_id`, `first_membership`, `cancel_at_period_end`
