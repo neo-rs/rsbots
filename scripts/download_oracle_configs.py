@@ -12,22 +12,26 @@ Output:
 Notes:
 - This tool downloads config.secrets.json too (contains secrets). The repo ignores:
   - Oraclserver-files/** and **/config.secrets.json
+- If you pass --apply-to-local, it will also copy downloaded files into your local bot folders
+  (either <repo>/RSBots/<BotName>/... if that structure exists, or <repo>/<BotName>/...).
 """
 
 from __future__ import annotations
 
 import argparse
 import shlex
+import shutil
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from mirror_world_config import load_oracle_servers, pick_oracle_server, resolve_oracle_ssh_key_path
-
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from mirror_world_config import load_oracle_servers, pick_oracle_server, resolve_oracle_ssh_key_path
 
 DEFAULT_BOTS = [
     "RSAdminBot",
@@ -57,6 +61,29 @@ def _scp_base(key_path: Path, ssh_options: str) -> List[str]:
 
 def _run(cmd: List[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def _detect_local_root(repo_root: Path) -> Path:
+    """
+    Auto-detect a "local RSBots root" if bot folders are grouped under `RSBots/`.
+    Otherwise fall back to the repo root itself (which already contains RS bot folders
+    in this workspace).
+    """
+    candidate = repo_root / "RSBots"
+    if candidate.exists() and candidate.is_dir():
+        return candidate
+    return repo_root
+
+
+def _apply_to_local(*, snapshot_path: Path, local_path: Path) -> tuple[bool, str]:
+    if not snapshot_path.exists():
+        return False, f"SKIP-LOCAL: missing snapshot file {snapshot_path}"
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(snapshot_path, local_path)
+        return True, f"APPLY: {snapshot_path} -> {local_path}"
+    except OSError as e:
+        return False, f"SKIP-LOCAL: {local_path} ({e.__class__.__name__}: {e})"
 
 
 def _download_one(
@@ -94,6 +121,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--out-dir",
         default=str(REPO_ROOT / "Oraclserver-files"),
         help="Local output dir (default: Oraclserver-files)",
+    )
+    ap.add_argument(
+        "--apply-to-local",
+        action="store_true",
+        help="After download, also copy configs into local bot folders (overwrites local files).",
+    )
+    ap.add_argument(
+        "--local-root",
+        default=None,
+        help="Local root containing bot folders (default: auto-detect RSBots/ else repo root).",
     )
     ap.add_argument(
         "--remote-root",
@@ -137,18 +174,26 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     bots = _split_csv(args.bots) or list(DEFAULT_BOTS)
     include_secrets = not bool(args.no_secrets)
+    apply_to_local = bool(args.apply_to_local)
+    local_root = Path(args.local_root).expanduser().resolve() if args.local_root else _detect_local_root(REPO_ROOT)
 
     scp_base = _scp_base(key, ssh_options)
 
     print(f"Server:   {user}@{host}")
     print(f"Remote:   {remote_root}")
     print(f"Local:    {dest}")
+    if apply_to_local:
+        print(f"Apply:    yes ({local_root})")
+    else:
+        print("Apply:    no")
     print(f"Bots:     {', '.join(bots)}")
     print(f"Secrets:  {'yes' if include_secrets else 'no'}")
     print()
 
     ok = 0
     skipped = 0
+    applied = 0
+    applied_skipped = 0
     for bot, filename in _iter_targets(bots, include_secrets):
         remote_path = f"{remote_root.rstrip('/')}/{bot}/{filename}"
         local_path = dest / bot / filename
@@ -162,12 +207,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(msg)
         if success:
             ok += 1
+            if apply_to_local:
+                local_dest = local_root / bot / filename
+                a_ok, a_msg = _apply_to_local(snapshot_path=local_path, local_path=local_dest)
+                print(a_msg)
+                if a_ok:
+                    applied += 1
+                else:
+                    applied_skipped += 1
         else:
             skipped += 1
 
     print()
     print(f"DONE: {dest}")
-    print(f"Summary: ok={ok} skipped={skipped}")
+    if apply_to_local:
+        print(f"Applied to local: ok={applied} skipped={applied_skipped}")
+    print(f"Download summary: ok={ok} skipped={skipped}")
     return 0
 
 
