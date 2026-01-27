@@ -2110,7 +2110,8 @@ class RSAdminBot:
         intents.guilds = True
         intents.members = True  # For admin commands
         
-        # Use prefix commands only (no slash commands for privacy)
+        # Primary interface: prefix commands ("!").
+        # Optional: RSNotes loads a private slash command (/rsnote) for per-user notes.
         self.bot = commands.Bot(command_prefix='!', intents=intents)
         
         self._setup_events()
@@ -3106,6 +3107,58 @@ echo "TARGET=$TARGET"
             details=ctx,
         )
         await self._send_webhook(url, embed=embed)
+
+    async def _initialize_rsnotes(self) -> None:
+        """Load RSNotes module (private `/rsnote`) and sync app commands to configured guild(s)."""
+        if getattr(self, "_rsnotes_initialized", False):
+            return
+        self._rsnotes_initialized = True
+
+        cfg = self.config.get("rsnotes")
+        if isinstance(cfg, dict) and cfg.get("enabled") is False:
+            return
+
+        # Load extension from RSAdminBot/RSNotes (import root includes this folder).
+        try:
+            await self.bot.load_extension("RSNotes.rsnote")
+        except commands.ExtensionAlreadyLoaded:
+            pass
+        except Exception as e:
+            print(f"{Colors.YELLOW}[RSNotes] Failed to load extension: {str(e)[:200]}{Colors.RESET}")
+            return
+
+        # Sync app commands to guild(s) for fast availability.
+        guild_ids: List[int] = []
+        raw = self.config.get("guild_ids") or []
+        if isinstance(raw, list):
+            for x in raw:
+                try:
+                    gid = int(x)
+                except Exception:
+                    continue
+                if gid and gid not in guild_ids:
+                    guild_ids.append(gid)
+        if not guild_ids:
+            try:
+                gid = int(self.config.get("guild_id") or 0)
+            except Exception:
+                gid = 0
+            if gid:
+                guild_ids.append(gid)
+
+        synced_any = False
+        for gid in guild_ids:
+            try:
+                await self.bot.tree.sync(guild=discord.Object(id=gid))
+                synced_any = True
+            except Exception as e:
+                print(f"{Colors.YELLOW}[RSNotes] Sync failed for guild {gid}: {str(e)[:160]}{Colors.RESET}")
+
+        if synced_any:
+            try:
+                print(f"{Colors.GREEN}[RSNotes] Loaded + synced `/rsnote` to {len(guild_ids)} guild(s){Colors.RESET}")
+            except Exception:
+                pass
     
     async def _initialize_monitor_channels(self) -> None:
         """Initialize monitor category and per-bot channels in test server."""
@@ -5558,6 +5611,12 @@ echo "CHANGED_END"
                     await self._ensure_botctl_symlink()
                 except Exception as e:
                     print(f"{Colors.YELLOW}[Startup] botctl symlink setup failed (non-critical): {e}{Colors.RESET}")
+
+                # RSNotes (private slash command: /rsnote)
+                try:
+                    await self._initialize_rsnotes()
+                except Exception as e:
+                    print(f"{Colors.YELLOW}[Startup] RSNotes initialization failed (non-critical): {str(e)[:200]}{Colors.RESET}")
 
                 # Import and run startup sequences
                 try:

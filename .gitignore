@@ -36,6 +36,7 @@
 !RSAdminBot/config.secrets.example.json
 !RSAdminBot/messages.json
 !RSAdminBot/vouch_config.json
+!RSAdminBot/RSNotes/configs.json
 
 !RSCheckerbot/
 !RSCheckerbot/**/

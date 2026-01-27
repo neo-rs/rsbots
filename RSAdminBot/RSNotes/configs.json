@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "notes": {
+    "data_dir": "data",
+    "db_filename": "rsnotes.json",
+    "page_size": 8,
+    "max_notes_per_user": 200,
+    "max_render_content_len": 1800,
+    "sku_search_channel_id": 1048529102581276733
+  }
+}
+

@@ -3,6 +3,15 @@
 ## Overview
 RSAdminBot is the central administrative bot for managing all RS bots on the Oracle Ubuntu server. It provides comprehensive bot management, system monitoring, deployment, and diagnostic capabilities.
 
+## Slash Commands (Private)
+
+#### `/rsnote`
+- **Description**: Private saved notes panel (SKU / RS post links / anything)
+- **Usage**: `/rsnote`
+- **Visibility**: Ephemeral (only you can see it)
+- **Storage**: `RSAdminBot/RSNotes/data/rsnotes.json` (auto-created at runtime; not committed)
+- **Config**: `RSAdminBot/RSNotes/configs.json` (tracked)
+
 ## Command Categories
 
 ### Core Commands
