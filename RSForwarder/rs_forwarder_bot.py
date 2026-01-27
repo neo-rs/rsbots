@@ -108,6 +108,42 @@ class RSForwarderBot:
         except Exception:
             return True
 
+    def _mavely_login_creds(self) -> Tuple[str, str]:
+        """
+        Resolve Mavely login credentials for auto-login.
+
+        Priority:
+        1) merged config (config.json + config.secrets.json)
+        2) env vars
+        3) secrets file directly (server-only)
+        """
+        email = ""
+        password = ""
+        try:
+            email = str((self.config or {}).get("mavely_login_email") or "").strip()
+            password = str((self.config or {}).get("mavely_login_password") or "").strip()
+        except Exception:
+            email, password = "", ""
+
+        if not (email and password):
+            try:
+                e2 = (os.getenv("MAVELY_LOGIN_EMAIL", "") or "").strip()
+                p2 = (os.getenv("MAVELY_LOGIN_PASSWORD", "") or "").strip()
+                if e2 and p2:
+                    email, password = e2, p2
+            except Exception:
+                pass
+
+        if not (email and password):
+            try:
+                s = self._load_secrets_dict()
+                email = email or str((s or {}).get("mavely_login_email") or "").strip()
+                password = password or str((s or {}).get("mavely_login_password") or "").strip()
+            except Exception:
+                pass
+
+        return email, password
+
     def _mavely_autologin_cooldown_s(self) -> int:
         try:
             v = int((self.config or {}).get("mavely_autologin_cooldown_s") or 300)
@@ -358,31 +394,7 @@ class RSForwarderBot:
 
                 # If credentials are configured, try a headless auto-login first.
                 # If it succeeds, we recover without requiring user action.
-                # Pull creds from (1) merged config, (2) env, (3) secrets file directly.
-                # This avoids a common deployment mismatch where config.json exists but
-                # config.secrets.json is missing keys on the server.
-                email = ""
-                password = ""
-                try:
-                    email = str((self.config or {}).get("mavely_login_email") or "").strip()
-                    password = str((self.config or {}).get("mavely_login_password") or "").strip()
-                except Exception:
-                    email, password = "", ""
-                if not (email and password):
-                    try:
-                        e2 = (os.getenv("MAVELY_LOGIN_EMAIL", "") or "").strip()
-                        p2 = (os.getenv("MAVELY_LOGIN_PASSWORD", "") or "").strip()
-                        if e2 and p2:
-                            email, password = e2, p2
-                    except Exception:
-                        pass
-                if not (email and password):
-                    try:
-                        s = self._load_secrets_dict()
-                        email = email or str((s or {}).get("mavely_login_email") or "").strip()
-                        password = password or str((s or {}).get("mavely_login_password") or "").strip()
-                    except Exception:
-                        pass
+                email, password = self._mavely_login_creds()
 
                 now = time.time()
                 autologin_attempted = False
@@ -393,7 +405,9 @@ class RSForwarderBot:
                         if not self._is_local_exec():
                             reasons.append("not running on the Linux host")
                         if not self._mavely_autologin_enabled():
-                            reasons.append("auto-login disabled (mavely_autologin_on_fail / MAVELY_AUTOLOGIN_ON_FAIL)")
+                            reasons.append(
+                                "auto-login disabled (set mavely_autologin_on_fail=true in RSForwarder/config.json OR MAVELY_AUTOLOGIN_ON_FAIL=1)"
+                            )
                         if not (email and password):
                             reasons.append("missing mavely_login_email/password in config.secrets.json")
                         if reasons:
@@ -472,11 +486,19 @@ class RSForwarderBot:
                         header = "⚠️ Mavely session check FAILED and headless auto-login did NOT recover.\nManual login required.\n\n" + header
 
                 if start_err:
-                    body = f"noVNC auto-start failed: {str(start_err)[:300]}\n\nRun `!rsmavelylogin` in Discord to start login."
+                    body = (
+                        f"noVNC auto-start failed: {str(start_err)[:300]}\n\n"
+                        "To try headless Playwright auto-login now, run `!rsmavelyautologin`.\n"
+                        "To start manual login via noVNC, run `!rsmavelylogin`."
+                    )
                 else:
                     web_port = int((info or {}).get("web_port") or 6080)
                     url_path = str((info or {}).get("url_path") or "/vnc.html")
-                    body = self._build_tunnel_instructions(web_port, url_path)
+                    body = (
+                        "Optional (fast): try headless Playwright auto-login now with `!rsmavelyautologin`.\n"
+                        "Auto-login can be enabled for future failures by setting `mavely_autologin_on_fail=true` in RSForwarder/config.json.\n\n"
+                        + self._build_tunnel_instructions(web_port, url_path)
+                    )
                     if pid:
                         body += f"\n\nCookie refresher PID: `{pid}`"
                     if log_path:
@@ -1882,6 +1904,83 @@ class RSForwarderBot:
                 if sent_dm:
                     await ctx.send("✅ Sent. After logging in, run `!rsmavelycheck`.")
 
+        @self.bot.command(name="rsmavelyautologin", aliases=["mavelyautologin", "mavelyheadless", "headlesslogin"])
+        async def mavely_autologin(ctx, wait_seconds: str = None):
+            """Run headless Playwright auto-login now (admin only).
+
+            Notes:
+            - Requires mavely_login_email/password to be configured (ideally in config.secrets.json).
+            - This is a one-shot attempt; it does NOT start noVNC.
+            """
+            if not self._is_mavely_admin_ctx(ctx):
+                await ctx.send("❌ You don't have permission to use this command.")
+                return
+
+            if not self._is_local_exec():
+                await ctx.send("❌ This command only works when RSForwarder is running on the Linux host (Oracle).")
+                return
+
+            try:
+                wait_s = int((wait_seconds or "").strip() or "180")
+            except Exception:
+                wait_s = 180
+            wait_s = max(30, min(wait_s, 1800))
+
+            # Best effort: delete the command message (keeps channels clean)
+            try:
+                if getattr(ctx, "guild", None) is not None:
+                    await ctx.message.delete()
+            except Exception:
+                pass
+
+            email, password = self._mavely_login_creds()
+            if not (email and password):
+                await ctx.send("❌ Missing Mavely creds. Add `mavely_login_email/password` to RSForwarder/config.secrets.json on the server.")
+                return
+
+            await ctx.send("🔄 Running headless Playwright auto-login now (this can take ~1–3 minutes)...")
+            now = time.time()
+            self._mavely_last_autologin_ts = now
+            self._mavely_last_autologin_ok = None
+            self._mavely_last_autologin_msg = ""
+            self._mavely_write_status()
+
+            cfg_run = dict(self.config or {})
+            cfg_run["mavely_login_email"] = email
+            cfg_run["mavely_login_password"] = password
+            ok_run, out = await asyncio.to_thread(novnc_stack.run_cookie_refresher_headless, cfg_run, wait_login_s=int(wait_s))
+            out_s = (out or "").strip()
+            if len(out_s) > 2500:
+                out_s = out_s[:2500] + "\n... (truncated)"
+            self._mavely_last_autologin_ok = bool(ok_run)
+            self._mavely_last_autologin_msg = out_s or ("ok" if ok_run else "failed")
+            self._mavely_write_status()
+
+            # Verify result with preflight
+            try:
+                ok2, status2, err2 = await affiliate_rewriter.mavely_preflight(self.config)
+                self._mavely_last_preflight_ok = bool(ok2)
+                self._mavely_last_preflight_status = int(status2 or 0)
+                self._mavely_last_preflight_err = (err2 or "").strip() if not ok2 else ""
+                self._mavely_write_status()
+            except Exception:
+                ok2, status2, err2 = False, None, "preflight threw an exception"
+
+            if ok_run and ok2:
+                await ctx.send(f"✅ Headless auto-login finished, and preflight is OK (status={status2}).")
+                return
+
+            msg = (str(err2 or "")).replace("\n", " ").strip()
+            if len(msg) > 220:
+                msg = msg[:220] + "..."
+            tail = f"\n\nAuto-login output (truncated):\n```{out_s[-1200:]}```" if out_s else ""
+            await ctx.send(
+                "⚠️ Headless auto-login ran but session still looks invalid.\n"
+                f"Preflight: {'✅ OK' if ok2 else '❌ FAIL'} (status={status2}) {msg}\n\n"
+                "Next: run `!rsmavelylogin` to do a manual login via noVNC, then run `!rsmavelycheck`."
+                + tail
+            )
+
         @self.bot.command(name="rsmavelyalertme", aliases=["mavelyalertme"])
         async def mavely_alert_me(ctx):
             """Enable DM alerts for Mavely session failures (admin only; must be run in a guild)."""
@@ -1992,6 +2091,7 @@ class RSForwarderBot:
                 ("`!rsstartadminbot`", "Start RSAdminBot remotely on server (admin only)"),
                 ("`!rsrestartadminbot` or `!restart`", "Restart RSAdminBot remotely on server (admin only)"),
                 ("`!rsmavelylogin` or `!refreshtoken`", "Open noVNC + Mavely login browser (admin only; manual login)"),
+                ("`!rsmavelyautologin`", "Run headless Playwright auto-login now (admin only; best-effort)"),
                 ("`!rsmavelycheck`", "Check if Mavely session is valid (safe)"),
                 ("`!rsmavelystatus`", "Show last Mavely auto-login/noVNC status (admin only)"),
                 ("`!rsmavelyalertme`", "DM me if Mavely session expires (admin only)"),

@@ -54,6 +54,8 @@
   "mavely_enable_oauth_refresh": true,
   "mavely_refresh_token_file": "RSForwarder/mavely_refresh_token.txt",
   "mavely_auto_refresh_on_fail": true,
+  "mavely_autologin_on_fail": true,
+  "mavely_autologin_cooldown_s": 300,
   "mavely_auto_refresh_cooldown_s": 600,
   "mavely_token_endpoint": "https://auth.mave.ly/oauth/token",
   "mavely_client_id": "PItSrEo35MYmLjhY6wJp8sCQAQRRWYxr",

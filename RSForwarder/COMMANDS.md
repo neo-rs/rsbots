@@ -127,7 +127,7 @@ RSForwarder is a standalone bot for forwarding messages from RS Server channels 
 
 ## Command Summary
 
-- **Total Commands**: 13
+- **Total Commands**: 14
 - **Admin Commands**: 2 (`!rsstartadminbot`, `!rsrestartadminbot`)
 - **Public Commands**: 10
 - **Commands with Aliases**: 10
@@ -177,3 +177,20 @@ If RSForwarder runs on the Oracle Linux host, you can trigger an interactive Mav
 
 #### `!rsmavelycheck`
 - **Description**: Runs a non-mutating session preflight check (safe). Useful to confirm login succeeded.
+
+### Headless Playwright auto-login (best-effort)
+
+If you have Mavely email/password credentials available on the server, RSForwarder can attempt a headless auto-login using Playwright.
+
+- **Enable on failure (automatic)**:
+  - Set `mavely_autologin_on_fail=true` in `RSForwarder/config.json` (or set `MAVELY_AUTOLOGIN_ON_FAIL=1` in the environment).
+  - Provide credentials server-side via `RSForwarder/config.secrets.json`:
+    - `mavely_login_email`
+    - `mavely_login_password`
+
+#### `!rsmavelyautologin` (admin only)
+- **Description**: Triggers headless Playwright auto-login immediately (no noVNC). Useful when you get a DM about session expiry and want the bot to try recovering without manual login.
+- **Usage**:
+  - `!rsmavelyautologin`
+  - `!rsmavelyautologin 180` (wait up to 180s)
+- **Afterwards**: run `!rsmavelycheck` to confirm the session is valid.
