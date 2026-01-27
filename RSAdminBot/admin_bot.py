@@ -3125,18 +3125,16 @@ echo "TARGET=$TARGET"
 
     async def _initialize_rsnotes(self) -> None:
         """Load RSNotes module (private `/rsnote`) and sync app commands to configured guild(s)."""
+        # If we already initialized (e.g. via setup_hook), do NOT overwrite the prior status line.
+        # (We want to preserve sync results like status=sync_done.)
+        if getattr(self, "_rsnotes_initialized", False):
+            return
+
         # Always keep a short status line for end-of-startup visibility (journal-live truncates earlier logs).
         try:
             self._rsnotes_status_line = "[RSNotes] status=init_start"
         except Exception:
             pass
-
-        if getattr(self, "_rsnotes_initialized", False):
-            try:
-                self._rsnotes_status_line = "[RSNotes] status=already_initialized"
-            except Exception:
-                pass
-            return
         self._rsnotes_initialized = True
 
         cfg = self.config.get("rsnotes")
@@ -5717,7 +5715,8 @@ echo "CHANGED_END"
 
                 # RSNotes (private slash command: /rsnote)
                 try:
-                    await self._initialize_rsnotes()
+                    if not getattr(self, "_rsnotes_initialized", False):
+                        await self._initialize_rsnotes()
                 except Exception as e:
                     print(f"{Colors.YELLOW}[Startup] RSNotes initialization failed (non-critical): {str(e)[:200]}{Colors.RESET}")
 
@@ -7513,6 +7512,65 @@ echo "CHANGED_END"
                 embed = MessageHelper.create_error_embed(
                     title="whereami Failed",
                     message="whereami failed.",
+                    error_details=err_txt,
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
+
+        @self.bot.command(name="appcmds", aliases=["slashcmds"])
+        @commands.check(lambda ctx: self.is_admin(ctx.author))
+        async def appcmds(ctx):
+            """List known application (slash) commands in the local command tree (admin only)."""
+            try:
+                # Show what the bot thinks exists locally (not a remote fetch).
+                global_cmds = self.bot.tree.get_commands() or []
+                global_names = sorted({str(getattr(c, "name", "") or "") for c in global_cmds if getattr(c, "name", None)})
+
+                gid = 0
+                try:
+                    if getattr(ctx, "guild", None) and getattr(ctx.guild, "id", None):
+                        gid = int(ctx.guild.id)
+                except Exception:
+                    gid = 0
+                if not gid:
+                    try:
+                        gid = int(self.config.get("rs_server_guild_id") or 0)
+                    except Exception:
+                        gid = 0
+
+                guild_names: List[str] = []
+                if gid:
+                    try:
+                        guild_cmds = self.bot.tree.get_commands(guild=discord.Object(id=gid)) or []
+                        guild_names = sorted({str(getattr(c, "name", "") or "") for c in guild_cmds if getattr(c, "name", None)})
+                    except Exception:
+                        guild_names = []
+
+                lines = []
+                lines.append("APP COMMANDS (local tree)")
+                lines.append(f"global.count={len(global_names)} has_rsnote={'rsnote' in set(global_names)}")
+                if global_names:
+                    lines.append("global.names=" + ", ".join(global_names))
+                if gid:
+                    lines.append(f"guild_id={gid} guild.count={len(guild_names)} has_rsnote={'rsnote' in set(guild_names)}")
+                    if guild_names:
+                        lines.append("guild.names=" + ", ".join(guild_names))
+
+                status_line = str(getattr(self, "_rsnotes_status_line", "") or "").strip()
+                if status_line:
+                    lines.append(status_line)
+
+                embed = MessageHelper.create_info_embed(
+                    title="Slash Commands (Local Tree)",
+                    message=self._codeblock("\n".join(lines), limit=1800),
+                    footer=f"Triggered by {ctx.author}",
+                )
+                await ctx.send(embed=embed)
+            except Exception as e:
+                err_txt = str(e)[:300]
+                embed = MessageHelper.create_error_embed(
+                    title="appcmds Failed",
+                    message="Failed to list app commands.",
                     error_details=err_txt,
                     footer=f"Triggered by {ctx.author}",
                 )
