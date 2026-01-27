@@ -3216,6 +3216,12 @@ echo "TARGET=$TARGET"
         synced_ok: Dict[int, bool] = {}
         for gid in guild_ids:
             try:
+                # `/rsnote` is defined as a global app command.
+                # To make it appear quickly (guild-scope), copy global commands into this guild before syncing.
+                try:
+                    self.bot.tree.copy_global_to(guild=discord.Object(id=gid))
+                except Exception:
+                    pass
                 synced = await self.bot.tree.sync(guild=discord.Object(id=gid))
                 synced_any = True
                 try:
