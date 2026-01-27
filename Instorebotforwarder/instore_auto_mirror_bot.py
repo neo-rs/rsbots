@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -215,6 +216,8 @@ class InstorebotForwarder:
         self.secrets_path = secrets_path
         self._cfg_lock = asyncio.Lock()
         self._openai_cache: Dict[str, str] = {}
+        self._amazon_scrape_cache: Dict[str, Dict[str, str]] = {}
+        self._amazon_scrape_cache_ts: Dict[str, float] = {}
 
         token = str((self.config.get("bot_token") or "")).strip()
         if is_placeholder_secret(token):
@@ -923,6 +926,331 @@ class InstorebotForwarder:
             return ua
         return "Mozilla/5.0"
 
+    def _playwright_enabled(self) -> bool:
+        """
+        Optional stronger scraping using a real browser engine.
+        Default: auto (enabled only if Playwright is importable).
+        """
+        v = (self.config or {}).get("amazon_playwright_scrape_enabled", None)
+        if isinstance(v, bool):
+            return v
+        s = str(v or "").strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "auto"}:
+            # auto: only if Playwright is available
+            try:
+                import playwright  # type: ignore  # noqa: F401
+
+                return True
+            except Exception:
+                return False
+        if s in {"0", "false", "no", "n", "off"}:
+            return False
+        # Default: auto
+        try:
+            import playwright  # type: ignore  # noqa: F401
+
+            return True
+        except Exception:
+            return False
+
+    def _playwright_timeout_s(self) -> float:
+        try:
+            v = float((self.config or {}).get("amazon_playwright_timeout_s") or 18.0)
+        except Exception:
+            v = 18.0
+        return max(8.0, min(v, 60.0))
+
+    def _scrape_cache_ttl_s(self) -> float:
+        try:
+            v = float((self.config or {}).get("amazon_scrape_cache_ttl_s") or 3600.0)
+        except Exception:
+            v = 3600.0
+        return max(60.0, min(v, 7 * 24 * 3600.0))
+
+    def _scrape_cache_get(self, asin: str) -> Optional[Dict[str, str]]:
+        a = (asin or "").strip().upper()
+        if not a:
+            return None
+        try:
+            ts = float(self._amazon_scrape_cache_ts.get(a, 0.0) or 0.0)
+        except Exception:
+            ts = 0.0
+        if not ts:
+            return None
+        if (time.time() - ts) > self._scrape_cache_ttl_s():
+            self._amazon_scrape_cache_ts.pop(a, None)
+            self._amazon_scrape_cache.pop(a, None)
+            return None
+        return self._amazon_scrape_cache.get(a)
+
+    def _scrape_cache_put(self, asin: str, data: Dict[str, str]) -> None:
+        a = (asin or "").strip().upper()
+        if not a:
+            return
+        if not isinstance(data, dict):
+            return
+        # Only cache if we got a usable image or title
+        if not ((data.get("image_url") or "").strip() or (data.get("title") or "").strip()):
+            return
+        self._amazon_scrape_cache[a] = {"title": str(data.get("title") or ""), "image_url": str(data.get("image_url") or ""), "price": str(data.get("price") or "")}
+        self._amazon_scrape_cache_ts[a] = time.time()
+
+    def _playwright_headless(self) -> bool:
+        v = (self.config or {}).get("amazon_playwright_headless", None)
+        if isinstance(v, bool):
+            return v
+        s = str(v or "").strip().lower()
+        if s in {"0", "false", "no", "n", "off"}:
+            return False
+        return True
+
+    def _playwright_profile_dir(self) -> str:
+        """
+        Optional persistent browser profile dir.
+        If set, passing a captcha once can keep scraping working.
+        """
+        raw = str((self.config or {}).get("amazon_playwright_profile_dir") or "").strip()
+        if raw:
+            return raw
+        return ""
+
+    def _extract_amazon_image_from_html(self, html_txt: str) -> str:
+        """
+        Best-effort product image extraction from Amazon DOM.
+        Prefers the "2nd image" (as requested) when multiple candidates exist.
+        """
+        t = html_txt or ""
+        if not t:
+            return ""
+
+        # Prefer the image set when present (lets us pick index=1 = 2nd image).
+        m_dyn = re.search(r'data-a-dynamic-image=["\']([^"\']+)["\']', t, re.IGNORECASE)
+        if m_dyn:
+            raw_dyn = _html.unescape((m_dyn.group(1) or "").strip())
+            try:
+                data = json.loads(raw_dyn) if raw_dyn.startswith("{") else json.loads(raw_dyn.replace("&quot;", '"'))
+            except Exception:
+                data = {}
+            if isinstance(data, dict) and data:
+                scored: List[Tuple[int, str]] = []
+                for k, v in data.items():
+                    if not isinstance(k, str):
+                        continue
+                    area = 0
+                    try:
+                        if isinstance(v, list) and len(v) >= 2:
+                            area = int(v[0]) * int(v[1])
+                    except Exception:
+                        area = 0
+                    scored.append((area, k))
+                scored.sort(key=lambda t: t[0], reverse=True)
+                urls = [u for (_a, u) in scored if u and isinstance(u, str)]
+                if urls:
+                    try:
+                        idx = int((self.config or {}).get("amazon_image_index") or 1)
+                    except Exception:
+                        idx = 1
+                    idx = max(0, min(idx, len(urls) - 1))
+                    return urls[idx]
+
+        # Fallback: landingImage old-hires (often the primary image)
+        m_hi = re.search(r'data-old-hires=["\']([^"\']+)["\']', t, re.IGNORECASE)
+        if m_hi:
+            return _html.unescape((m_hi.group(1) or "").strip())
+        return ""
+
+    def _extract_amazon_title_from_html(self, html_txt: str) -> str:
+        t = html_txt or ""
+        if not t:
+            return ""
+        m_pt = re.search(r'<span[^>]+id=["\']productTitle["\'][^>]*>(.*?)</span>', t, re.IGNORECASE | re.DOTALL)
+        if m_pt:
+            cand = _html.unescape(re.sub(r"<[^>]+>", " ", (m_pt.group(1) or "")))
+            return " ".join(cand.split()).strip()
+        m_t = re.search(r"<title>(.*?)</title>", t, re.IGNORECASE | re.DOTALL)
+        if m_t:
+            cand = _html.unescape(re.sub(r"<[^>]+>", " ", (m_t.group(1) or "")))
+            return " ".join(cand.split()).strip()
+        return ""
+
+    async def _scrape_amazon_page_playwright(self, url: str, *, headless_override: Optional[bool] = None) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+        """
+        Best-effort Playwright scrape for title/image when requests-based scrape is blocked.
+        """
+        u = (url or "").strip()
+        if not u:
+            return None, "missing url"
+        if not self._playwright_enabled():
+            return None, "playwright disabled"
+
+        timeout_s = self._playwright_timeout_s()
+        headless = self._playwright_headless() if headless_override is None else bool(headless_override)
+        ua = self._scrape_user_agent()
+        profile_dir = self._playwright_profile_dir()
+
+        def _run() -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+            try:
+                from playwright.sync_api import sync_playwright  # type: ignore
+            except Exception:
+                return None, "playwright not installed (pip install playwright)"
+
+            try:
+                with sync_playwright() as p:
+                    launch_args = [
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-dev-shm-usage",
+                        "--no-sandbox",
+                    ]
+                    if profile_dir:
+                        ctx = p.chromium.launch_persistent_context(
+                            user_data_dir=profile_dir,
+                            headless=headless,
+                            args=launch_args,
+                            user_agent=ua,
+                            locale="en-US",
+                            timezone_id="America/New_York",
+                            viewport={"width": 1280, "height": 720},
+                        )
+                        page = ctx.new_page()
+                    else:
+                        browser = p.chromium.launch(headless=headless, args=launch_args)
+                        ctx = browser.new_context(
+                            user_agent=ua,
+                            locale="en-US",
+                            timezone_id="America/New_York",
+                            viewport={"width": 1280, "height": 720},
+                        )
+                        page = ctx.new_page()
+                    # Reduce basic automation fingerprints.
+                    try:
+                        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+                    except Exception:
+                        pass
+                    page.goto(u, wait_until="domcontentloaded", timeout=int(timeout_s * 1000))
+                    # Give the page a moment to populate image attrs.
+                    page.wait_for_timeout(700)
+                    html_txt = page.content() or ""
+                    ctx.close()
+                    if not profile_dir:
+                        browser.close()
+            except Exception as e:
+                msg = str(e)[:220]
+                # Common "browser not installed" guidance
+                if "playwright install" in msg.lower() or "executable doesn't exist" in msg.lower():
+                    return None, "playwright browser missing (run: python -m playwright install chromium)"
+                return None, f"playwright failed: {msg}"
+
+            low = html_txt.lower()
+            if ("robot check" in low) or ("enter the characters you see below" in low) or ("captcha" in low and "amazon" in low):
+                return None, "blocked (robot check)"
+
+            title = self._extract_amazon_title_from_html(html_txt)
+            image_url = self._extract_amazon_image_from_html(html_txt)
+
+            out = {"title": title.strip(), "image_url": image_url.strip(), "price": ""}
+            if not (out.get("title") or out.get("image_url")):
+                return None, "no useful fields found"
+            return out, None
+
+        return await asyncio.to_thread(_run)
+
+    async def _scrape_deal_hub_for_amazon_assets(self, url: str) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+        """
+        When Amazon blocks direct scraping, try to extract Amazon-hosted image/title from
+        common deal hub pages (pricedoffers/fkd/saveyourdeals/etc).
+        """
+        u = (url or "").strip()
+        if not u:
+            return None, "missing url"
+        if not (u.startswith("http://") or u.startswith("https://")):
+            return None, "invalid url"
+
+        timeout_s = self._scrape_timeout_s()
+        max_bytes = self._scrape_max_bytes()
+        headers = {
+            "User-Agent": self._scrape_user_agent(),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        try:
+            import aiohttp
+
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
+                async with session.get(u, headers=headers, allow_redirects=True) as resp:
+                    status = int(resp.status)
+                    if status >= 400:
+                        return None, f"HTTP {status}"
+                    buf = bytearray()
+                    async for chunk in resp.content.iter_chunked(16_384):
+                        if not chunk:
+                            break
+                        buf.extend(chunk)
+                        if len(buf) >= max_bytes:
+                            break
+                    html_txt = buf.decode("utf-8", errors="replace")
+        except Exception as e:
+            return None, f"fetch failed: {e}"
+
+        title = self._extract_html_meta(html_txt, prop="og:title") or ""
+        if not title:
+            m_t = re.search(r"<title>(.*?)</title>", html_txt, re.IGNORECASE | re.DOTALL)
+            if m_t:
+                cand = _html.unescape(re.sub(r"<[^>]+>", " ", (m_t.group(1) or "")))
+                title = " ".join(cand.split()).strip()
+
+        # Find first Amazon-hosted product image.
+        # Prefer m.media-amazon.com/images/I/
+        image_url = ""
+        for pat in (
+            r"https?://m\.media-amazon\.com/images/I/[^\s\"'<>]+",
+            r"https?://images-na\.ssl-images-amazon\.com/images/I/[^\s\"'<>]+",
+        ):
+            m = re.search(pat, html_txt, re.IGNORECASE)
+            if m:
+                image_url = _html.unescape((m.group(0) or "").strip())
+                break
+
+        # Fallback: og:image if it points to Amazon image CDN
+        if not image_url:
+            ogi = self._extract_html_meta(html_txt, prop="og:image") or ""
+            if ogi and self._is_amazon_image_url(ogi):
+                image_url = ogi.strip()
+
+        out = {"title": title.strip(), "image_url": image_url.strip(), "price": ""}
+        if not (out.get("title") or out.get("image_url")):
+            return None, "no useful fields found"
+        return out, None
+
+    async def _adsystem_image_by_asin(self, asin: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Last-resort: try Amazon adsystem AsinImage endpoint.
+        This is not guaranteed to work, but it's cheap to probe.
+        """
+        a = (asin or "").strip().upper()
+        if not a:
+            return None, "missing asin"
+        # US marketplace
+        widget = f"https://ws-na.amazon-adsystem.com/widgets/q?_encoding=UTF8&MarketPlace=US&ASIN={a}&ServiceVersion=20070822&ID=AsinImage&WS=1&Format=_AC_SL500_"
+        try:
+            import aiohttp
+
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8.0)) as session:
+                async with session.get(widget, allow_redirects=True) as resp:
+                    ct = (resp.headers.get("content-type") or "").lower()
+                    final = str(resp.url) if getattr(resp, "url", None) else widget
+                    if "image/" in ct or final.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+                        return final, None
+                    # Some endpoints return HTML with an <img src="...">
+                    txt = await resp.text(errors="ignore")
+                    m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', txt, re.IGNORECASE)
+                    if m:
+                        cand = _html.unescape((m.group(1) or "").strip())
+                        if cand:
+                            return cand, None
+        except Exception as e:
+            return None, f"adsystem fetch failed: {e}"
+        return None, "adsystem no image"
+
     def _extract_html_meta(self, html: str, *, prop: str) -> str:
         """
         Extract <meta property="..."> or <meta name="..."> content.
@@ -989,6 +1317,11 @@ class InstorebotForwarder:
         if not (u.startswith("http://") or u.startswith("https://")):
             return None, "invalid url"
 
+        asin_guess = affiliate_rewriter.extract_asin(u) or ""
+        cached = self._scrape_cache_get(asin_guess) if asin_guess else None
+        if cached:
+            return cached, None
+
         timeout_s = self._scrape_timeout_s()
         max_bytes = self._scrape_max_bytes()
         headers = {
@@ -1025,7 +1358,31 @@ class InstorebotForwarder:
             or ("to discuss automated access" in low)
             or ("captcha" in low and "amazon" in low)
         ):
-            return None, "blocked (robot check)"
+            # Try a real-browser scrape (Playwright) before giving up.
+            pw, pw_err = await self._scrape_amazon_page_playwright(u)
+            if (not pw) and (pw_err or "").startswith("blocked"):
+                # Optional: retry in headful mode (much higher success rate).
+                # Requires a display (Windows desktop, or Linux + Xvfb/noVNC).
+                v = (self.config or {}).get("amazon_playwright_try_headful_on_block", True)
+                allow = bool(v) if isinstance(v, bool) else (str(v or "").strip().lower() not in {"0", "false", "no", "off"})
+                if allow:
+                    if os.name == "nt" or (os.getenv("DISPLAY", "") or "").strip():
+                        pw2, pw2_err = await self._scrape_amazon_page_playwright(u, headless_override=False)
+                        if pw2 and not pw2_err:
+                            pw, pw_err = pw2, None
+            if pw and not pw_err:
+                if asin_guess:
+                    self._scrape_cache_put(asin_guess, pw)
+                return pw, None
+            # Last-resort: try adsystem image endpoint by ASIN.
+            if asin_guess:
+                img, img_err = await self._adsystem_image_by_asin(asin_guess)
+                if img and not img_err:
+                    data = {"title": "", "image_url": img, "price": ""}
+                    self._scrape_cache_put(asin_guess, data)
+                    return data, None
+            # Even when Playwright fails, preserve the clearer reason if we have one.
+            return None, pw_err or "blocked (robot check)"
 
         # Prefer Product JSON-LD when present (more stable than og:* on Amazon).
         title = ""
@@ -1129,6 +1486,8 @@ class InstorebotForwarder:
         # Ensure at least one field is useful
         if not (out.get("title") or out.get("image_url") or out.get("price")):
             return None, "no useful fields found"
+        if asin_guess:
+            self._scrape_cache_put(asin_guess, out)
         return out, None
 
     def _extract_price_guess(self, text: str) -> str:
@@ -1529,6 +1888,20 @@ class InstorebotForwarder:
                 _log_flow("SCRAPE_OK", asin=(asin or ""), has_title=bool(scraped.get("title")), has_price=bool(scraped.get("price")), has_image=bool(scraped.get("image_url")))
             else:
                 _log_flow("SCRAPE_FAIL", asin=(asin or ""), err=(scrape_err or "unknown"))
+                # If Amazon blocks scraping, try to extract an Amazon-hosted image from the deal hub URL.
+                try:
+                    if det and det.url_used and (not affiliate_rewriter.is_amazon_like_url(det.url_used)):
+                        hub, hub_err = await self._scrape_deal_hub_for_amazon_assets(det.url_used)
+                    else:
+                        hub, hub_err = None, None
+                except Exception as e:
+                    hub, hub_err = None, str(e)[:200]
+                if hub and not hub_err:
+                    # Merge hub-derived title/image only when Amazon scrape failed.
+                    scraped = {**(scraped or {}), **{k: v for k, v in (hub or {}).items() if v}}
+                    _log_flow("HUB_OK", host=str(urlparse(det.url_used).netloc or ""), has_title=bool(hub.get("title")), has_image=bool(hub.get("image_url")))
+                elif hub_err:
+                    _log_flow("HUB_FAIL", err=str(hub_err)[:180])
         else:
             _log_flow("SCRAPE_SKIP", asin=(asin or ""), reason=("disabled" if not self._scrape_enabled() else "no_url"))
 

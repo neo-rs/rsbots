@@ -127,6 +127,10 @@ Instorebotforwarder/mavely_refresh_token*.txt
 Instorebotforwarder/mavely_auth_token*.txt
 Instorebotforwarder/mavely_id_token*.txt
 
+# Playwright persistent browser profile (never commit)
+Instorebotforwarder/playwright_profile/**
+Instorebotforwarder/.playwright/**
+
 # Virtualenvs
 .venv/
 venv/
