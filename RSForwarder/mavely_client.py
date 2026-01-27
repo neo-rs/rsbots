@@ -131,6 +131,26 @@ def _is_token_expired_error(errors: object) -> bool:
         return False
 
 
+def _is_brand_not_found_error(errors: object) -> bool:
+    """
+    Mavely GraphQL sometimes returns BAD_USER_INPUT like:
+      "Brand not found for url: https://go.sylikes.com/..."
+    This is effectively "merchant not supported" for that URL.
+    """
+    try:
+        if not isinstance(errors, list):
+            return False
+        for e in errors:
+            if not isinstance(e, dict):
+                continue
+            msg = e.get("message")
+            if isinstance(msg, str) and "brand not found for url" in msg.lower():
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def _parse_json_best_effort(text: str) -> Optional[object]:
     """
     Parse JSON from a response body defensively.
@@ -792,6 +812,16 @@ mutation CreateAffiliateLink($url: String!) {
         payload2 = data.get("response") if isinstance(data, dict) and isinstance(data.get("response"), dict) else data
         errors = (payload2 or {}).get("errors") if isinstance(payload2, dict) else None
         if isinstance(payload2, dict) and errors:
+            if _is_brand_not_found_error(errors):
+                # Provide a clear, non-robotic message.
+                try:
+                    from urllib.parse import urlparse
+
+                    host = (urlparse(url).netloc or "").lower()
+                except Exception:
+                    host = ""
+                extra = f" ({host})" if host else ""
+                return MavelyResult(ok=False, status_code=200, error=f"Merchant not supported by Mavely for this URL{extra}.", raw_snippet=snippet)
             if _is_token_expired_error(errors):
                 try:
                     resp_cookie = _do_post(self._graphql_headers_cookie_only())

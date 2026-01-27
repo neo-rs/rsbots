@@ -13,8 +13,28 @@ Instorebotforwarder scans configured source channels for Amazon links (including
 - **Admin Only**: No (but requires permission to view the target channel/message)
 - **Returns**: Ephemeral diagnostic output + embed preview
 
+#### `/embedbuild list`
+- **Description**: List which template routes currently have templates set and which config key they map to.
+- **Admin Only**: Yes (administrator in a server)
+- **Returns**: Ephemeral list output
+
+#### `/embedbuild edit`
+- **Description**: Edit a template via a Discord modal by pasting JSON. Saves to `Instorebotforwarder/config.json` only.
+- **Parameters**:
+  - `route`: `personal`, `grocery`, `deals`, `default`, `enrich_failed`
+- **Admin Only**: Yes (administrator in a server)
+- **Returns**: Ephemeral success/failure message
+
+#### `/embedbuild preview`
+- **Description**: Render a template preview (ephemeral) using placeholder/enriched context.
+- **Parameters**:
+  - `route`: `personal`, `grocery`, `deals`, `default`, `enrich_failed`
+  - `asin`: Optional ASIN (defaults to `startup_test_asin`)
+- **Admin Only**: Yes (administrator in a server)
+- **Returns**: Ephemeral embed preview + debug header
+
 ## Command Summary
-- **Total Commands**: 1
-- **Admin Commands**: 0
+- **Total Commands**: 4
+- **Admin Commands**: 3 (`/embedbuild list`, `/embedbuild edit`, `/embedbuild preview`)
 - **Public Commands**: 1
 

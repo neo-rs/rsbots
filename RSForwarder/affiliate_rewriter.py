@@ -275,30 +275,6 @@ def is_mavely_link(url: str) -> bool:
     return "mavely.app.link" in host
 
 
-def _rewrap_mavely_links_enabled(cfg: dict) -> bool:
-    """
-    Default ON (so existing mavely links get re-wrapped into YOUR link).
-
-    Source of truth:
-    - If `affiliate_rewrap_mavely_links` is present in cfg, honor it.
-    - Otherwise, allow env override via `AFFILIATE_REWRAP_MAVELY_LINKS`.
-
-    Rationale: config is synced and visible; env can be opaque and lead to surprising
-    "already mavely link" skips if it was set long ago.
-    """
-    try:
-        cfg_val = (cfg or {}).get("affiliate_rewrap_mavely_links", None)
-        if cfg_val is not None:
-            return _bool_or_default(cfg_val, True)
-    except Exception:
-        pass
-
-    raw = (os.getenv("AFFILIATE_REWRAP_MAVELY_LINKS", "") or "").strip()
-    if raw:
-        return _bool_or_default(raw, True)
-    return True
-
-
 def is_amazon_like_url(url: str) -> bool:
     try:
         host = (urlparse(url).netloc or "").lower()
@@ -446,6 +422,10 @@ def should_expand_url(url: str) -> bool:
         "walmrt.us",
         "amzn.to",
         "mavely.app.link",
+        # Redirect chains seen from go.sylikes.com -> rd.bizrate.com -> go.skimresources.com -> merchant
+        "go.sylikes.com",
+        "rd.bizrate.com",
+        "go.skimresources.com",
         "howl.link",
         "howl.me",
         "deals.pennyexplorer.com",
@@ -475,6 +455,30 @@ def unwrap_known_query_redirects(url: str) -> Optional[str]:
         cand = (q.get("product") or "").strip()
         if cand.startswith("http://") or cand.startswith("https://"):
             return cand
+    if host == "rd.bizrate.com":
+        # Example:
+        #   https://rd.bizrate.com/rd2?t=https%3A%2F%2Fgo.skimresources.com%3F...%26url%3Dhttps%253A%252F%252Fwww.lowes.com%252F...
+        cand = (q.get("t") or q.get("url") or q.get("u") or "").strip()
+        if cand:
+            # Typically nested URL-encoded once (or more). Decode a few times.
+            for _ in range(3):
+                nxt = unquote(cand)
+                if nxt == cand:
+                    break
+                cand = nxt
+            if cand.startswith("http://") or cand.startswith("https://"):
+                return cand
+    if host == "go.skimresources.com":
+        # Skimlinks commonly uses url= as the real destination (often double-encoded).
+        cand = (q.get("url") or q.get("u") or q.get("dest") or "").strip()
+        if cand:
+            for _ in range(3):
+                nxt = unquote(cand)
+                if nxt == cand:
+                    break
+                cand = nxt
+            if cand.startswith("http://") or cand.startswith("https://"):
+                return cand
     if host in {"dealsabove.com", "www.dealsabove.com"}:
         # Example:
         #   https://www.dealsabove.com/product-redirect?l=https%3A%2F%2Fwww.amazon.com%2Fdp%2FB0BGW6DSLW#code=...
@@ -921,6 +925,9 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                         "pricedoffers.com",
                         "saveyourdeals.com",
                         "mavely.app.link",
+                        "go.sylikes.com",
+                        "rd.bizrate.com",
+                        "go.skimresources.com",
                         "howl.link",
                         "howl.me",
                     }
@@ -957,11 +964,16 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
         raw = (normalized.get(u) or u).strip()
         target = (resolved.get(u) or raw).strip()
 
+        def _short_err(s: Optional[str], n: int = 160) -> str:
+            t = (s or "").replace("\r", " ").replace("\n", " ").strip()
+            return t if len(t) <= n else (t[:n] + "...")
+
+        def _is_mavely_unsupported(err_msg: Optional[str]) -> bool:
+            m = (err_msg or "").strip().lower()
+            return ("merchant not supported" in m) or ("brand not found" in m)
+
         # Re-wrap existing Mavely links into YOUR Mavely link (so forwarded posts always credit you).
         if is_mavely_link(raw):
-            if not _rewrap_mavely_links_enabled(cfg):
-                notes[u] = "already mavely link"
-                continue
             # Expand mavely.app.link to destination, then generate our own link for that destination.
             if target and (not is_mavely_link(target)) and (target != raw):
                 link, err = await mavely_create_link(cfg, target)
@@ -990,13 +1002,22 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                 mapped[u] = rep
                             else:
                                 mapped[u] = affiliate_url
-                            notes[u] = "mavely rewrap failed; fell back to amazon affiliate"
+                            reason = _short_err(err)
+                            notes[u] = f"mavely rewrap failed ({reason}); fell back to amazon affiliate" if reason else "mavely rewrap failed; fell back to amazon affiliate"
                         else:
                             mapped[u] = _strip_tracking_params(target)
-                            notes[u] = "mavely rewrap failed; fell back to expanded destination (stripped tracking)"
+                            reason = _short_err(err)
+                            if _is_mavely_unsupported(err):
+                                notes[u] = "merchant not supported by Mavely; used expanded destination"
+                            else:
+                                notes[u] = f"mavely rewrap failed ({reason}); fell back to expanded destination (stripped tracking)" if reason else "mavely rewrap failed; fell back to expanded destination (stripped tracking)"
                     else:
                         mapped[u] = _strip_tracking_params(target)
-                        notes[u] = "mavely rewrap failed; fell back to expanded destination (stripped tracking)"
+                        reason = _short_err(err)
+                        if _is_mavely_unsupported(err):
+                            notes[u] = "merchant not supported by Mavely; used expanded destination"
+                        else:
+                            notes[u] = f"mavely rewrap failed ({reason}); fell back to expanded destination (stripped tracking)" if reason else "mavely rewrap failed; fell back to expanded destination (stripped tracking)"
             else:
                 # Some mavely.app.link pages don't redirect cleanly (HTML/JS). As a fallback, try
                 # generating a link from the Mavely URL itself; if Mavely accepts it, this still
@@ -1006,7 +1027,8 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                     mapped[u] = link
                     notes[u] = "rewrapped mavely link (direct)"
                 else:
-                    notes[u] = "rewrap skipped (no expanded destination)"
+                    reason = _short_err(err)
+                    notes[u] = f"rewrap failed ({reason})" if reason else "rewrap failed (no expanded destination)"
             continue
 
         # If it expands to a Mavely link, keep that final mavely link (rare but happens).
@@ -1048,9 +1070,16 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
             notes[u] = "mavely affiliate"
         elif target and (target != raw):
             mapped[u] = target
-            notes[u] = "expanded only"
+            if _is_mavely_unsupported(err):
+                notes[u] = "expanded only (merchant not supported by Mavely)"
+            else:
+                reason = _short_err(err)
+                notes[u] = f"expanded only (mavely failed: {reason})" if reason else "expanded only"
         else:
-            notes[u] = err or "no change"
+            if _is_mavely_unsupported(err):
+                notes[u] = "merchant not supported by Mavely"
+            else:
+                notes[u] = _short_err(err, 220) or "no change"
 
     return mapped, notes
 

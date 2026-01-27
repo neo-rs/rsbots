@@ -1,5 +1,5 @@
 {
-  "guild_id": 0,
+  "guild_id": 1451275225512546497,
   "source_channel_ids": [],
   "output_channels": {
     "personal": "1464853876988706969",
@@ -20,6 +20,14 @@
   ],
   "amazon_expand_timeout_s": 8,
   "amazon_expand_max_redirects": 8,
+  "amazon_scrape_enabled": true,
+  "amazon_scrape_timeout_s": 10,
+  "amazon_scrape_max_bytes": 600000,
+  "amazon_scrape_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "openai_rephrase_enabled": false,
+  "openai_model": "gpt-4o-mini",
+  "openai_timeout_s": 12,
+  "openai_max_chars": 1800,
   "amazon_grocery_keywords": [
     "grocery",
     "gourmet",
@@ -28,95 +36,79 @@
     "pantry"
   ],
   "startup_test_asin": "B0FLMLDTPB",
+  "startup_paapi_preflight_keywords": "grocery",
   "amazon_embed_templates": {
     "by_channel_id": {
       "1464853876988706969": {
-        "title": "RS Personal Lead — {title}",
+        "title": "{deal_type}",
         "url": "{final_url}",
-        "description": "**ASIN:** `{asin}`\n**Link:** {link}\n\n**Source:** {source_line}\n[Jump]({source_jump})",
         "color": 16753920,
-        "thumbnail": {
-          "url": "{image_url}"
-        },
+        "image": { "url": "{image_url}" },
         "fields": [
-          {
-            "name": "Category",
-            "value": "{category}",
-            "inline": false
-          },
-          {
-            "name": "Move",
-            "value": "Check OOS/restocks • Fast checkout • Screenshot cart",
-            "inline": false
-          }
+          { "name": "Title", "value": "{title}", "inline": false },
+          { "name": "Price", "value": "{price}", "inline": true },
+          { "name": "Promo / Steps", "value": "{promo_steps}", "inline": false },
+          { "name": "Info", "value": "{info_rephrased}", "inline": false },
+          { "name": "Key", "value": "{key_link}", "inline": false }
         ],
-        "footer": {
-          "text": "Reselling Secrets • Personal"
-        }
+        "footer": { "text": "{source_credit}" }
       },
       "1457129579557949551": {
-        "title": "RS Grocery Lead — {title}",
+        "title": "{deal_type}",
         "url": "{final_url}",
-        "description": "**ASIN:** `{asin}`\n**Link:** {link}\n\n**Source:** {source_line}\n[Jump]({source_jump})",
         "color": 3066993,
-        "thumbnail": {
-          "url": "{image_url}"
-        },
+        "image": { "url": "{image_url}" },
         "fields": [
-          {
-            "name": "Note",
-            "value": "Grocery listings often fail enrichment. Link + ASIN are the truth.",
-            "inline": false
-          },
-          {
-            "name": "Move",
-            "value": "Limit qty • Expect cancels • Watch substitutions",
-            "inline": false
-          }
+          { "name": "Title", "value": "{title}", "inline": false },
+          { "name": "Price", "value": "{price}", "inline": true },
+          { "name": "Promo / Steps", "value": "{promo_steps}", "inline": false },
+          { "name": "Info", "value": "{info_rephrased}", "inline": false },
+          { "name": "Key", "value": "{key_link}", "inline": false }
         ],
-        "footer": {
-          "text": "Reselling Secrets • Grocery"
-        }
+        "footer": { "text": "{source_credit}" }
       },
       "1457129557067960482": {
-        "title": "RS Amazon Deal — {title}",
+        "title": "{deal_type}",
         "url": "{final_url}",
-        "description": "**ASIN:** `{asin}`\n**Link:** {link}\n\n**Source:** {source_line}\n[Jump]({source_jump})",
         "color": 16753920,
-        "thumbnail": {
-          "url": "{image_url}"
-        },
+        "image": { "url": "{image_url}" },
         "fields": [
-          {
-            "name": "Price",
-            "value": "{price}",
-            "inline": true
-          },
-          {
-            "name": "Category",
-            "value": "{category}",
-            "inline": false
-          },
-          {
-            "name": "Move",
-            "value": "Watch cancels • Limit qty • Fast checkout",
-            "inline": false
-          }
+          { "name": "Title", "value": "{title}", "inline": false },
+          { "name": "Price", "value": "{price}", "inline": true },
+          { "name": "Promo / Steps", "value": "{promo_steps}", "inline": false },
+          { "name": "Info", "value": "{info_rephrased}", "inline": false },
+          { "name": "Key", "value": "{key_link}", "inline": false }
         ],
-        "footer": {
-          "text": "Reselling Secrets • Amazon Deals"
-        }
+        "footer": { "text": "{source_credit}" }
       }
     },
-    "default": {},
-    "enrich_failed": {
-      "title": "RS Lead (No Enrich) — ASIN {asin}",
+    "default": {
+      "title": "{deal_type}",
       "url": "{final_url}",
-      "description": "**Link:** {link}\n**Source:** {source_line}\n\nEnrichment unavailable on this listing (common for grocery/suppressed ASINs).",
+      "color": 16753920,
+      "image": { "url": "{image_url}" },
+      "fields": [
+        { "name": "Title", "value": "{title}", "inline": false },
+        { "name": "Price", "value": "{price}", "inline": true },
+        { "name": "Promo / Steps", "value": "{promo_steps}", "inline": false },
+        { "name": "Info", "value": "{info_rephrased}", "inline": false },
+        { "name": "Key", "value": "{key_link}", "inline": false }
+      ],
+      "footer": { "text": "{source_credit}" }
+    },
+    "enrich_failed": {
+      "title": "{deal_type}",
+      "url": "{final_url}",
       "color": 15158332,
-      "footer": {
-        "text": "Reselling Secrets • Enrich Failed"
-      }
+      "image": { "url": "{image_url}" },
+      "fields": [
+        { "name": "Title", "value": "{title}", "inline": false },
+        { "name": "Price", "value": "{price}", "inline": true },
+        { "name": "Promo / Steps", "value": "{promo_steps}", "inline": false },
+        { "name": "Info", "value": "{info_rephrased}", "inline": false },
+        { "name": "Key", "value": "{key_link}", "inline": false }
+      ],
+      "footer": { "text": "{source_credit}" }
     }
   }
 }
