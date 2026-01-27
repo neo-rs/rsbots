@@ -358,21 +358,59 @@ class RSForwarderBot:
 
                 # If credentials are configured, try a headless auto-login first.
                 # If it succeeds, we recover without requiring user action.
+                # Pull creds from (1) merged config, (2) env, (3) secrets file directly.
+                # This avoids a common deployment mismatch where config.json exists but
+                # config.secrets.json is missing keys on the server.
+                email = ""
+                password = ""
                 try:
                     email = str((self.config or {}).get("mavely_login_email") or "").strip()
                     password = str((self.config or {}).get("mavely_login_password") or "").strip()
                 except Exception:
                     email, password = "", ""
+                if not (email and password):
+                    try:
+                        e2 = (os.getenv("MAVELY_LOGIN_EMAIL", "") or "").strip()
+                        p2 = (os.getenv("MAVELY_LOGIN_PASSWORD", "") or "").strip()
+                        if e2 and p2:
+                            email, password = e2, p2
+                    except Exception:
+                        pass
+                if not (email and password):
+                    try:
+                        s = self._load_secrets_dict()
+                        email = email or str((s or {}).get("mavely_login_email") or "").strip()
+                        password = password or str((s or {}).get("mavely_login_password") or "").strip()
+                    except Exception:
+                        pass
 
                 now = time.time()
                 autologin_attempted = False
+                # Log (once per fail-streak) why auto-login didn't run; otherwise it looks "stuck".
+                try:
+                    if prev_ok is not False:
+                        reasons = []
+                        if not self._is_local_exec():
+                            reasons.append("not running on the Linux host")
+                        if not self._mavely_autologin_enabled():
+                            reasons.append("auto-login disabled (mavely_autologin_on_fail / MAVELY_AUTOLOGIN_ON_FAIL)")
+                        if not (email and password):
+                            reasons.append("missing mavely_login_email/password in config.secrets.json")
+                        if reasons:
+                            self._mavely_append_log("auto-login skipped: " + "; ".join(reasons))
+                except Exception:
+                    pass
+
                 if self._is_local_exec() and self._mavely_autologin_enabled() and email and password:
                     cooldown2 = self._mavely_autologin_cooldown_s()
                     if (now - float(self._mavely_last_autologin_ts or 0.0)) >= float(cooldown2):
                         autologin_attempted = True
                         self._mavely_last_autologin_ts = now
                         self._mavely_append_log("preflight FAIL -> attempting headless auto-login (cookie refresher)")
-                        ok_run, out = await asyncio.to_thread(novnc_stack.run_cookie_refresher_headless, self.config, wait_login_s=180)
+                        cfg_run = dict(self.config or {})
+                        cfg_run["mavely_login_email"] = email
+                        cfg_run["mavely_login_password"] = password
+                        ok_run, out = await asyncio.to_thread(novnc_stack.run_cookie_refresher_headless, cfg_run, wait_login_s=180)
                         out_s = (out or "").strip()
                         if len(out_s) > 4000:
                             out_s = out_s[:4000] + "\n... (truncated)"

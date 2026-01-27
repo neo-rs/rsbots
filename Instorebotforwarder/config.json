@@ -7,27 +7,24 @@
     "deals": "1457129557067960482",
     "enrich_failed": ""
   },
-  "amazon_associate_tag": "",
+  "amazon_associate_tag": "amzlnk05-20",
   "amazon_api_marketplace": "https://www.amazon.com",
-  "amazon_paapi_host": "webservices.amazon.com",
-  "amazon_paapi_region": "us-east-1",
-  "amazon_paapi_marketplace": "www.amazon.com",
-  "amazon_paapi_resources": [
-    "ItemInfo.Title",
-    "Images.Primary.Large",
-    "Offers.Listings.Price",
-    "BrowseNodeInfo.BrowseNodes"
-  ],
   "amazon_expand_timeout_s": 8,
   "amazon_expand_max_redirects": 8,
   "amazon_scrape_enabled": true,
   "amazon_scrape_timeout_s": 10,
   "amazon_scrape_max_bytes": 600000,
   "amazon_scrape_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "openai_rephrase_enabled": false,
+  "openai_rephrase_enabled": "auto",
   "openai_model": "gpt-4o-mini",
   "openai_timeout_s": 12,
   "openai_max_chars": 1800,
+  "startup_smoketest_enabled": true,
+  "startup_smoketest_count": 3,
+  "startup_smoketest_scan_limit_per_channel": 50,
+  "startup_smoketest_send_delay_s": 1.0,
+  "startup_smoketest_output_channel_id": "",
+  "startup_smoketest_use_amazon_log_fallback": true,
   "amazon_grocery_keywords": [
     "grocery",
     "gourmet",
@@ -36,79 +33,48 @@
     "pantry"
   ],
   "startup_test_asin": "B0FLMLDTPB",
-  "startup_paapi_preflight_keywords": "grocery",
   "amazon_embed_templates": {
     "by_channel_id": {
       "1464853876988706969": {
-        "title": "{deal_type}",
-        "url": "{final_url}",
+        "title": "{title}",
+        "url": "",
         "color": 16753920,
         "image": { "url": "{image_url}" },
-        "fields": [
-          { "name": "Title", "value": "{title}", "inline": false },
-          { "name": "Price", "value": "{price}", "inline": true },
-          { "name": "Promo / Steps", "value": "{promo_steps}", "inline": false },
-          { "name": "Info", "value": "{info_rephrased}", "inline": false },
-          { "name": "Key", "value": "{key_link}", "inline": false }
-        ],
-        "footer": { "text": "{source_credit}" }
+        "description": "{card_body}",
+        "timestamp": false
       },
       "1457129579557949551": {
-        "title": "{deal_type}",
-        "url": "{final_url}",
+        "title": "{title}",
+        "url": "",
         "color": 3066993,
         "image": { "url": "{image_url}" },
-        "fields": [
-          { "name": "Title", "value": "{title}", "inline": false },
-          { "name": "Price", "value": "{price}", "inline": true },
-          { "name": "Promo / Steps", "value": "{promo_steps}", "inline": false },
-          { "name": "Info", "value": "{info_rephrased}", "inline": false },
-          { "name": "Key", "value": "{key_link}", "inline": false }
-        ],
-        "footer": { "text": "{source_credit}" }
+        "description": "{card_body}",
+        "timestamp": false
       },
       "1457129557067960482": {
-        "title": "{deal_type}",
-        "url": "{final_url}",
+        "title": "{title}",
+        "url": "",
         "color": 16753920,
         "image": { "url": "{image_url}" },
-        "fields": [
-          { "name": "Title", "value": "{title}", "inline": false },
-          { "name": "Price", "value": "{price}", "inline": true },
-          { "name": "Promo / Steps", "value": "{promo_steps}", "inline": false },
-          { "name": "Info", "value": "{info_rephrased}", "inline": false },
-          { "name": "Key", "value": "{key_link}", "inline": false }
-        ],
-        "footer": { "text": "{source_credit}" }
+        "description": "{card_body}",
+        "timestamp": false
       }
     },
     "default": {
-      "title": "{deal_type}",
-      "url": "{final_url}",
+      "title": "{title}",
+      "url": "",
       "color": 16753920,
       "image": { "url": "{image_url}" },
-      "fields": [
-        { "name": "Title", "value": "{title}", "inline": false },
-        { "name": "Price", "value": "{price}", "inline": true },
-        { "name": "Promo / Steps", "value": "{promo_steps}", "inline": false },
-        { "name": "Info", "value": "{info_rephrased}", "inline": false },
-        { "name": "Key", "value": "{key_link}", "inline": false }
-      ],
-      "footer": { "text": "{source_credit}" }
+      "description": "{card_body}",
+      "timestamp": false
     },
     "enrich_failed": {
-      "title": "{deal_type}",
-      "url": "{final_url}",
+      "title": "{title}",
+      "url": "",
       "color": 15158332,
       "image": { "url": "{image_url}" },
-      "fields": [
-        { "name": "Title", "value": "{title}", "inline": false },
-        { "name": "Price", "value": "{price}", "inline": true },
-        { "name": "Promo / Steps", "value": "{promo_steps}", "inline": false },
-        { "name": "Info", "value": "{info_rephrased}", "inline": false },
-        { "name": "Key", "value": "{key_link}", "inline": false }
-      ],
-      "footer": { "text": "{source_credit}" }
+      "description": "{card_body}",
+      "timestamp": false
     }
   }
 }

@@ -300,8 +300,20 @@ def build_amazon_affiliate_url(cfg: dict, raw_url: str) -> Optional[str]:
     u = (raw_url or "").strip()
     if not u:
         return None
+    associate_tag = _cfg_or_env_str(cfg, "amazon_associate_tag", "AMAZON_ASSOCIATE_TAG")
+
     asin = extract_asin(u)
     if not asin:
+        # If we don't have an ASIN, we can still tag real Amazon URLs (search, promo pages, etc).
+        # Don't try to tag amzn.to short links directly; expand those first.
+        if not associate_tag:
+            return None
+        try:
+            host = (urlparse(u).netloc or "").lower()
+        except Exception:
+            host = ""
+        if ("amazon." in host) or host.endswith("amazon.com") or host.endswith("amazon.co.uk"):
+            return _add_query_param(u, "tag", associate_tag)
         return None
 
     marketplace = _cfg_or_env_str(cfg, "amazon_api_marketplace", "AMAZON_API_MARKETPLACE").rstrip("/")
@@ -316,7 +328,6 @@ def build_amazon_affiliate_url(cfg: dict, raw_url: str) -> Optional[str]:
         except Exception:
             canon_url = f"https://www.amazon.com/dp/{asin}"
 
-    associate_tag = _cfg_or_env_str(cfg, "amazon_associate_tag", "AMAZON_ASSOCIATE_TAG")
     if associate_tag:
         return _add_query_param(canon_url, "tag", associate_tag)
     return canon_url

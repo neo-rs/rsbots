@@ -1,7 +1,7 @@
 # Instorebotforwarder Commands Reference
 
 ## Overview
-Instorebotforwarder scans configured source channels for Amazon links (including links inside embeds and link buttons), expands/normalizes them, optionally enriches via Amazon PA-API, routes into output buckets, and renders RS-style embeds using JSON templates from `config.json`.
+Instorebotforwarder scans configured source channels for Amazon links (including links inside embeds and link buttons), expands/normalizes them, rebuilds a fresh RS-style deal embed from the message content (plus optional Amazon page scrape), routes into output buckets, and renders using JSON templates from `config.json`.
 
 ## Slash Commands
 

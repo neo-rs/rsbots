@@ -138,12 +138,17 @@ def _embed_from_template(tpl: Dict[str, Any], ctx: Dict[str, str]) -> Optional[d
     except Exception:
         color = discord.Color.blurple()
 
+    # Only show a timestamp if explicitly enabled in the template.
+    ts_enabled = tpl.get("timestamp", False)
+    timestamp = datetime.now(timezone.utc) if bool(ts_enabled) else None
+
+    # NOTE: discord.py does not expose Embed.Empty in all versions; use None/conditional setters.
     embed = discord.Embed(
-        title=title or discord.Embed.Empty,
-        description=description or discord.Embed.Empty,
+        title=(title or None),
+        description=(description or None),
         url=(url or None),
         color=color,
-        timestamp=datetime.now(timezone.utc),
+        timestamp=timestamp,
     )
 
     thumb = tpl.get("thumbnail", None)
@@ -163,15 +168,15 @@ def _embed_from_template(tpl: Dict[str, Any], ctx: Dict[str, str]) -> Optional[d
         an = _tpl(author.get("name", ""), ctx).strip()
         au = _tpl(author.get("url", ""), ctx).strip()
         ai = _tpl(author.get("icon_url", ""), ctx).strip()
-        if an or au or ai:
-            embed.set_author(name=(an or discord.Embed.Empty), url=(au or None), icon_url=(ai or None))
+        if an:
+            embed.set_author(name=an, url=(au or None), icon_url=(ai or None))
 
     footer = tpl.get("footer", None)
     if isinstance(footer, dict):
         ft = _tpl(footer.get("text", ""), ctx).strip()
         fi = _tpl(footer.get("icon_url", ""), ctx).strip()
-        if ft or fi:
-            embed.set_footer(text=(ft or discord.Embed.Empty), icon_url=(fi or None))
+        if ft:
+            embed.set_footer(text=ft, icon_url=(fi or None))
 
     fields = tpl.get("fields", None)
     if isinstance(fields, list):
@@ -529,7 +534,8 @@ class InstorebotForwarder:
         u = (final_url or "").strip()
         if not u:
             return ""
-        seed = f"{asin}|{message_id}|{u}"
+        # Stable across reposts: do NOT include message_id in the slug seed.
+        seed = (asin or "").strip() or u
         slug = self._stable_key_slug(seed, length=7)
         return f"[amzn.to/{slug}](<{u}>)"
 
@@ -554,6 +560,61 @@ class InstorebotForwarder:
         """
         Extract likely "steps" lines from a messy deal message.
         """
+        noise_tokens = {"atc", "keepa", "sas", "ebay"}
+        action_tokens = {
+            "clip",
+            "coupon",
+            "select",
+            "apply",
+            "checkout",
+            "subscribe",
+            "sub",
+            "save",
+            "buy",
+            "click",
+            "use code",
+            "apply code",
+            "buy via",
+            "go here",
+        }
+
+        def _has_urlish(s: str) -> bool:
+            low = (s or "").lower()
+            return ("http://" in low) or ("https://" in low) or ("amzn.to/" in low) or ("amazon." in low) or ("/dp/" in low)
+
+        def _looks_actionable(line: str) -> bool:
+            low = (line or "").lower()
+            if _has_urlish(low):
+                return True
+            return any(tok in low for tok in action_tokens)
+
+        def _is_noise_step(line: str) -> bool:
+            s = " ".join((line or "").split()).strip()
+            if not s:
+                return True
+            low = s.lower()
+            # Strip a leading step number like "1)" or "2 -"
+            low2 = re.sub(r"^\s*\d+\s*[-:)]\s*", "", low).strip()
+            if not low2:
+                return True
+            # Normalize markdown links: "[ATC](https://...)" -> "ATC"
+            try:
+                low2_plain = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", low2)
+            except Exception:
+                low2_plain = low2
+            low2_plain = low2_plain.replace("`", "").strip()
+            # Common "tools list" line: "ATC | KEEPA | SAS | EBAY"
+            if "|" in low2_plain:
+                parts = [p.strip() for p in low2_plain.split("|") if p.strip()]
+                if parts and all(p in noise_tokens for p in parts):
+                    return True
+            # Also drop if the entire line is just these tokens separated by spaces/commas
+            tmp = re.sub(r"[|,/]+", " ", low2_plain)
+            toks = [t for t in tmp.split() if t]
+            if toks and all(t in noise_tokens for t in toks):
+                return True
+            return False
+
         lines = [ln.strip() for ln in (text or "").splitlines()]
         out: List[str] = []
         for ln in lines:
@@ -565,15 +626,25 @@ class InstorebotForwarder:
             if "http://" in low or "https://" in low:
                 # Keep explicit steps or action lines with links
                 if low.startswith("step") or re.match(r"^\d+\s*[-:)]", low):
-                    out.append(ln)
+                    if not _is_noise_step(ln):
+                        out.append(ln)
                     continue
                 if any(k in low for k in ("clip", "select", "apply", "checkout", "subscribe", "buy via", "click here", "use code")):
-                    out.append(ln)
+                    if not _is_noise_step(ln):
+                        out.append(ln)
                     continue
             else:
                 # Non-link steps sometimes: "Step 3: Use code X"
-                if low.startswith("step") or any(k in low for k in ("use code", "apply code", "clip coupon", "sub & save", "subscribe & save")):
-                    out.append(ln)
+                if low.startswith("step"):
+                    if (not _is_noise_step(ln)) and _looks_actionable(ln):
+                        out.append(ln)
+                elif re.match(r"^\d+\s*[-:)]", low):
+                    # Numbered lines are only steps if they look actionable (prevents tool-tag rows).
+                    if (not _is_noise_step(ln)) and _looks_actionable(ln):
+                        out.append(ln)
+                elif any(k in low for k in ("use code", "apply code", "clip coupon", "sub & save", "subscribe & save", "buy via", "click here", "checkout")):
+                    if (not _is_noise_step(ln)) and _looks_actionable(ln):
+                        out.append(ln)
         # Deduplicate
         seen = set()
         dedup = []
@@ -609,7 +680,7 @@ class InstorebotForwarder:
         if "glitch" in t:
             return "Glitch!!"
         if "promo" in t and "glitch" in t:
-            return "Promo Glitch"
+            return "Promo Glitch!"
         if "deal" in t:
             return "Amazon Deal"
         return "Amazon Lead"
@@ -654,6 +725,45 @@ class InstorebotForwarder:
         # Default: send to your "deals" output channel
         return self._route_to_dest_id("deals")
 
+    def _startup_smoketest_sources(self) -> List[int]:
+        """
+        Prefer config `source_channel_ids`.
+        If empty, optionally fall back to `logs/Datalogs/Amazon.json` as a local "channel map"
+        so startup smoke tests can run without manual config.
+        """
+        sources = self._source_channel_ids()
+        if sources:
+            return sources
+
+        v = (self.config or {}).get("startup_smoketest_use_amazon_log_fallback", True)
+        if isinstance(v, bool):
+            enabled = v
+        else:
+            enabled = str(v or "").strip().lower() not in {"0", "false", "no", "off"}
+        if not enabled:
+            return []
+
+        try:
+            p = _REPO_ROOT / "logs" / "Datalogs" / "Amazon.json"
+            if not p.exists():
+                return []
+            raw = p.read_text(encoding="utf-8", errors="replace")
+            data = json.loads(raw) if raw else []
+            if not isinstance(data, list):
+                return []
+            ids: List[int] = []
+            for item in data[:500]:
+                if not isinstance(item, dict):
+                    continue
+                cid = _safe_int(item.get("source_channel_id"))
+                if cid and cid not in ids:
+                    ids.append(cid)
+                if len(ids) >= 25:
+                    break
+            return ids
+        except Exception:
+            return []
+
     async def _startup_smoketest(self) -> None:
         """
         On startup, scan recent messages in configured source channels and post the bot's rebuilt
@@ -671,9 +781,9 @@ class InstorebotForwarder:
         log.info("-------- Startup Smoke Test --------")
         log.info("[BOOT][SMOKE] target_count=%s scan_limit_per_channel=%s output_channel_id=%s", count, scan_limit, out_id or "")
 
-        sources = self._source_channel_ids()
+        sources = self._startup_smoketest_sources()
         if not sources:
-            log.warning("[BOOT][SMOKE] No source channels configured. Set Instorebotforwarder/config.json -> source_channel_ids.")
+            log.warning("[BOOT][SMOKE] No source channels configured. Set Instorebotforwarder/config.json -> source_channel_ids (or enable Amazon.json fallback).")
             return
         if not out_id:
             log.warning("[BOOT][SMOKE] No output channel configured. Set output_channels.deals or startup_smoketest_output_channel_id.")
@@ -715,6 +825,28 @@ class InstorebotForwarder:
                     except Exception:
                         pass
 
+                    # Fast pre-filter: skip messages that clearly can't contain Amazon links.
+                    # This keeps startup smoke tests quick even in noisy channels.
+                    try:
+                        surfaces = self._gather_message_text_surfaces(msg)
+                        joined_l = " ".join(surfaces).lower()
+                    except Exception:
+                        joined_l = ""
+                    if joined_l and not any(
+                        k in joined_l
+                        for k in (
+                            "amazon.",
+                            "amazon.com",
+                            "amzn.to",
+                            "a.co/",
+                            "/dp/",
+                            "pricedoffers.com",
+                            "saveyourdeals.com",
+                            "fkd.deals",
+                        )
+                    ):
+                        continue
+
                     try:
                         embed, meta = await self._analyze_message(msg)
                     except Exception as e:
@@ -727,7 +859,13 @@ class InstorebotForwarder:
                     header = f"Startup smoke-test {sent}/{count} • source <#{src_id}> • [jump]({msg.jump_url})"
                     try:
                         await out_ch.send(content=header, embed=embed, allowed_mentions=discord.AllowedMentions.none())
-                        log.info("[BOOT][SMOKE] SEND_OK %s/%s msg=%s", sent, count, getattr(msg, "id", ""))
+                        try:
+                            scrape_ok = ((meta or {}).get("ctx") or {}).get("scrape_ok", "")
+                            scrape_err = ((meta or {}).get("ctx") or {}).get("scrape_err", "")
+                        except Exception:
+                            scrape_ok = ""
+                            scrape_err = ""
+                        log.info("[BOOT][SMOKE] SEND_OK %s/%s msg=%s scrape_ok=%s scrape_err=%s", sent, count, getattr(msg, "id", ""), scrape_ok, (scrape_err or "")[:120])
                     except Exception as e:
                         log.info("[BOOT][SMOKE] SEND_FAIL msg=%s err=%s", getattr(msg, "id", ""), str(e)[:200])
                         sent -= 1
@@ -880,25 +1018,36 @@ class InstorebotForwarder:
 
         low = html_txt.lower()
         # Common anti-bot page signals
-        if ("robot check" in low) or ("enter the characters you see below" in low) or ("sorry, we just need to make sure" in low):
+        if (
+            ("robot check" in low)
+            or ("enter the characters you see below" in low)
+            or ("sorry, we just need to make sure" in low)
+            or ("to discuss automated access" in low)
+            or ("captcha" in low and "amazon" in low)
+        ):
             return None, "blocked (robot check)"
 
-        title = self._extract_html_meta(html_txt, prop="og:title") or ""
-        image_url = self._extract_html_meta(html_txt, prop="og:image") or ""
+        # Prefer Product JSON-LD when present (more stable than og:* on Amazon).
+        title = ""
+        image_url = ""
 
         price = ""
         # JSON-LD offers.price is the cleanest when present
         prod = self._extract_jsonld_product(html_txt)
         if prod:
             try:
-                if not title:
-                    title = str(prod.get("name") or "").strip()
-                if not image_url:
-                    img = prod.get("image")
-                    if isinstance(img, list) and img:
-                        image_url = str(img[0] or "").strip()
-                    elif isinstance(img, str):
-                        image_url = img.strip()
+                title = str(prod.get("name") or "").strip() or title
+
+                # Prefer the "2nd image" when available; otherwise use the 1st.
+                img = prod.get("image")
+                if isinstance(img, list):
+                    if len(img) >= 2:
+                        image_url = str(img[1] or "").strip() or image_url
+                    elif img:
+                        image_url = str(img[0] or "").strip() or image_url
+                elif isinstance(img, str):
+                    image_url = img.strip() or image_url
+
                 offers = prod.get("offers")
                 offer0 = offers[0] if isinstance(offers, list) and offers and isinstance(offers[0], dict) else (offers if isinstance(offers, dict) else None)
                 if isinstance(offer0, dict):
@@ -910,6 +1059,57 @@ class InstorebotForwarder:
                             price = f"{price} {str(cur).strip()}".strip()
             except Exception:
                 pass
+
+        # Fallback: og meta
+        if not title:
+            title = self._extract_html_meta(html_txt, prop="og:title") or ""
+        if not image_url:
+            image_url = self._extract_html_meta(html_txt, prop="og:image") or ""
+
+        # Fallback: common Amazon DOM patterns (works even when og/meta are missing)
+        if not title:
+            m_pt = re.search(r'<span[^>]+id=["\']productTitle["\'][^>]*>(.*?)</span>', html_txt, re.IGNORECASE | re.DOTALL)
+            if m_pt:
+                cand = _html.unescape(re.sub(r"<[^>]+>", " ", (m_pt.group(1) or "")))
+                title = " ".join(cand.split()).strip()
+        if not title:
+            m_t = re.search(r"<title>(.*?)</title>", html_txt, re.IGNORECASE | re.DOTALL)
+            if m_t:
+                cand = _html.unescape(re.sub(r"<[^>]+>", " ", (m_t.group(1) or "")))
+                title = " ".join(cand.split()).strip()
+
+        if not image_url:
+            m_hi = re.search(r'data-old-hires=["\']([^"\']+)["\']', html_txt, re.IGNORECASE)
+            if m_hi:
+                image_url = _html.unescape((m_hi.group(1) or "").strip())
+
+        if not image_url:
+            # Try to parse data-a-dynamic-image JSON and prefer the 2nd best image.
+            m_dyn = re.search(r'data-a-dynamic-image=["\']([^"\']+)["\']', html_txt, re.IGNORECASE)
+            if m_dyn:
+                raw_dyn = _html.unescape((m_dyn.group(1) or "").strip())
+                try:
+                    data = json.loads(raw_dyn) if raw_dyn.startswith("{") else json.loads(raw_dyn.replace("&quot;", '"'))
+                except Exception:
+                    data = {}
+                if isinstance(data, dict) and data:
+                    scored: List[Tuple[int, str]] = []
+                    for k, v in data.items():
+                        if not isinstance(k, str):
+                            continue
+                        area = 0
+                        try:
+                            if isinstance(v, list) and len(v) >= 2:
+                                area = int(v[0]) * int(v[1])
+                        except Exception:
+                            area = 0
+                        scored.append((area, k))
+                    scored.sort(key=lambda t: t[0], reverse=True)
+                    urls = [u for (_a, u) in scored if u]
+                    if len(urls) >= 2:
+                        image_url = urls[1]
+                    elif urls:
+                        image_url = urls[0]
 
         # Fallback price patterns (very best-effort)
         if not price:
@@ -932,17 +1132,129 @@ class InstorebotForwarder:
         return out, None
 
     def _extract_price_guess(self, text: str) -> str:
+        """
+        "Current price" guess from a messy deal post.
+
+        We intentionally prefer the LOWEST currency amount mentioned, because posts commonly include:
+        - retail/list/orig price (higher)
+        - deal price (lower)
+        """
         s = (text or "")
         if not s:
             return ""
-        # Basic price patterns seen in deal posts.
-        m = re.search(r"(?<!\w)(\$|£|€)\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?", s)
-        if m:
-            return (m.group(0) or "").strip()
-        m2 = re.search(r"(?<!\w)\d{1,4}(?:\.\d{2})?\s?(USD|CAD|AUD|GBP|EUR)\b", s, re.IGNORECASE)
-        if m2:
-            return (m2.group(0) or "").strip()
-        return ""
+
+        # Capture all symbol-prefixed prices and pick the minimum numeric value.
+        matches = list(re.finditer(r"(?<!\w)([$£€])\s?(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)(?!\w)", s))
+        best_sym = ""
+        best_val: Optional[float] = None
+        best_raw = ""
+        for m in matches:
+            sym = (m.group(1) or "").strip()
+            num_raw = (m.group(2) or "").replace(",", "").strip()
+            try:
+                val = float(num_raw)
+            except Exception:
+                continue
+            if best_val is None or val < best_val:
+                best_val = val
+                best_sym = sym
+                best_raw = f"{sym}{val:.2f}".rstrip("0").rstrip(".")
+
+        if best_raw:
+            return best_raw
+
+        # Fallback: currency codes (pick the minimum numeric amount there too)
+        matches2 = list(re.finditer(r"(?<!\w)(\d{1,4}(?:\.\d{2})?)\s?(USD|CAD|AUD|GBP|EUR)\b", s, re.IGNORECASE))
+        best_val2: Optional[float] = None
+        best_raw2 = ""
+        for m in matches2:
+            num_raw = (m.group(1) or "").strip()
+            code = (m.group(2) or "").upper().strip()
+            try:
+                val = float(num_raw)
+            except Exception:
+                continue
+            if best_val2 is None or val < best_val2:
+                best_val2 = val
+                best_raw2 = f"{val:g} {code}".strip()
+        return best_raw2
+
+    def _extract_before_price_guess(self, text: str, *, current_price: str) -> str:
+        """
+        Best-effort "Before" price from common patterns like:
+        - retail $39.99
+        - (Orig. $30)
+        - list price $99
+        """
+        s = (text or "")
+        if not s:
+            return ""
+        cur = (current_price or "").strip()
+
+        # Prefer explicit orig/retail/list patterns.
+        patterns = [
+            r"\b(?:orig(?:inal)?|retail(?:s)?|list\s*price|was)\b[^$£€]{0,40}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)",
+            r"\(\s*(?:orig(?:inal)?|retail)\.?\s*([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)\s*\)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, s, re.IGNORECASE)
+            if m:
+                cand = " ".join((m.group(1) or "").split()).strip()
+                if cand and cand != cur:
+                    return cand
+
+        # Otherwise, take the maximum currency amount if it differs from current.
+        vals: List[Tuple[float, str]] = []
+        for m in re.finditer(r"(?<!\w)([$£€])\s?(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)(?!\w)", s):
+            sym = (m.group(1) or "").strip()
+            num_raw = (m.group(2) or "").replace(",", "").strip()
+            try:
+                val = float(num_raw)
+            except Exception:
+                continue
+            raw = f"{sym}{val:.2f}".rstrip("0").rstrip(".")
+            vals.append((val, raw))
+        if not vals:
+            return ""
+        vals.sort(key=lambda t: t[0], reverse=True)
+        top = vals[0][1].strip()
+        return top if top and top != cur else ""
+
+    def _clean_product_title(self, title: str) -> str:
+        t = " ".join((title or "").split()).strip()
+        if not t:
+            return ""
+        # Common og:title prefix
+        if t.lower().startswith("amazon.com:"):
+            t = t.split(":", 1)[-1].strip()
+        # Remove trailing " - Amazon.com" style suffixes
+        t = re.sub(r"\s*-\s*amazon\.[a-z.]+\s*$", "", t, flags=re.IGNORECASE).strip()
+
+        # Remove common deal-post suffixes so we keep just the product name.
+        # Example: "X for $6.99, retail $19.99!" -> "X"
+        t = re.sub(r"\s+for\s+([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)\b.*$", "", t, flags=re.IGNORECASE).strip()
+        t = re.sub(r"\s*(?:,|\(|-)?\s*(?:retail|retails|orig|original|list\s*price|was)\b.*$", "", t, flags=re.IGNORECASE).strip()
+
+        # User-requested: prefer the part BEFORE the first comma (keeps product name shorter).
+        if "," in t:
+            left = t.split(",", 1)[0].strip()
+            if left:
+                t = left
+        return t[:240]
+
+    def _is_amazon_image_url(self, url: str) -> bool:
+        """
+        Only treat Amazon-hosted images as valid "Amazon website" images.
+        This avoids using Discord attachment screenshots when you want a clean card image.
+        """
+        u = (url or "").strip()
+        if not u:
+            return False
+        try:
+            host = (urlparse(u).netloc or "").lower()
+        except Exception:
+            host = ""
+        return host.endswith("m.media-amazon.com") or host.endswith("images-na.ssl-images-amazon.com") or host.endswith("images.amazon.com")
 
     def _gather_message_text_surfaces(self, message: discord.Message) -> List[str]:
         parts: List[str] = []
@@ -971,7 +1283,7 @@ class InstorebotForwarder:
         texts = self._gather_message_text_surfaces(message)
         joined = "\n".join(texts)
 
-        # Title: prefer embed title, else first non-empty line of content without URLs.
+        # Title: prefer embed title, else first non-empty line of content/description without URLs.
         title = ""
         if message.embeds:
             try:
@@ -986,11 +1298,26 @@ class InstorebotForwarder:
             base = " ".join(base.split()).strip()
             if base:
                 title = (base[:120] + "…") if len(base) > 120 else base
+        if (not title) and message.embeds:
+            # Many bots post the "real" text in embed.description with empty message.content.
+            try:
+                d0 = getattr(message.embeds[0], "description", None)
+                if d0:
+                    base2 = self._strip_urls_from_text(str(d0))
+                    base2 = self._neutralize_mentions(base2)
+                    base2 = base2.strip()
+                    if base2:
+                        first_line = base2.splitlines()[0].strip()
+                        if first_line:
+                            title = (first_line[:120] + "…") if len(first_line) > 120 else first_line
+            except Exception:
+                pass
 
         if not title:
             title = f"Amazon lead {asin}".strip() if asin else "Amazon lead"
 
         price = self._extract_price_guess(joined)
+        before_price = self._extract_before_price_guess(joined, current_price=price)
         promo_codes = self._extract_promo_codes(joined)
         steps_lines = self._extract_step_lines(joined)
         source_credit = self._extract_source_credit(joined)
@@ -1026,6 +1353,9 @@ class InstorebotForwarder:
                         break
             except Exception:
                 image_url = ""
+        # Only accept Amazon-hosted images when using message-derived image fallback.
+        if image_url and not self._is_amazon_image_url(image_url):
+            image_url = ""
 
         excerpt = self._strip_urls_from_text(message.content or "")
         excerpt = self._neutralize_mentions(excerpt)
@@ -1043,6 +1373,7 @@ class InstorebotForwarder:
         return {
             "title": title,
             "price": price,
+            "before_price": before_price,
             "category": category,
             "image_url": image_url,
             "source_excerpt": excerpt,
@@ -1172,6 +1503,14 @@ class InstorebotForwarder:
             elif not final_url:
                 final_url = f"https://www.amazon.com/dp/{asin}"
 
+        # Apply Amazon affiliate tag early so all downstream uses (key_link, url, etc) are tagged.
+        try:
+            affiliate_final = affiliate_rewriter.build_amazon_affiliate_url(self.config or {}, final_url)
+        except Exception:
+            affiliate_final = None
+        if affiliate_final:
+            final_url = affiliate_final
+
         # Reconstruct listing details from the source message (no PA-API required).
         guessed = self._guess_listing_from_message(message, asin=asin, final_url=final_url)
 
@@ -1193,39 +1532,81 @@ class InstorebotForwarder:
         else:
             _log_flow("SCRAPE_SKIP", asin=(asin or ""), reason=("disabled" if not self._scrape_enabled() else "no_url"))
 
-        # Final fields: prefer scrape values when present, else use reconstructed values.
-        title = str((scraped or {}).get("title") or "").strip() or guessed.get("title", "").strip() or "Amazon lead"
-        price = str((scraped or {}).get("price") or "").strip() or guessed.get("price", "").strip()
+        # Final fields:
+        # - Title: prefer Amazon product name when available, else message reconstruction.
+        # - Price: prefer message-derived deal price only (user request).
+        # - Image: prefer Amazon page image only (user request).
+        raw_title = str((scraped or {}).get("title") or "").strip() or guessed.get("title", "").strip() or "Amazon lead"
+        title = self._clean_product_title(raw_title) or raw_title or "Amazon lead"
+        price = guessed.get("price", "").strip()
+        before_price = guessed.get("before_price", "").strip()
         category = guessed.get("category", "").strip()
-        image_url = str((scraped or {}).get("image_url") or "").strip() or guessed.get("image_url", "").strip()
+        image_url = str((scraped or {}).get("image_url") or "").strip()
+        if not image_url:
+            # If Amazon blocks scraping, fall back to an Amazon-hosted image already present in the source embed.
+            # (Still "Amazon website" image, but avoids blank cards.)
+            image_url = guessed.get("image_url", "").strip()
+        try:
+            img_src = "scrape" if str((scraped or {}).get("image_url") or "").strip() else ("embed" if guessed.get("image_url", "").strip() else "none")
+        except Exception:
+            img_src = "none"
+        _log_flow("IMAGE", source=img_src, has=("1" if bool(image_url) else "0"))
 
         # Build RS-style blocks from message-derived info.
         promo_codes = (guessed.get("promo_codes") or "").strip()
         steps_raw = (guessed.get("steps_raw") or "").strip()
         info_raw = (guessed.get("source_excerpt") or "").strip()
 
-        promo_block = f"Code: `{promo_codes}`" if promo_codes else ""
+        # Normalize into numbered steps, but aggressively drop noisy / redundant lines:
+        # - "Buy via Amazon --> <link>" (we show ONE key link at the bottom)
+        # - bare URL-only lines
         steps_block = ""
         if steps_raw:
-            # Normalize into numbered steps if not already.
             lines = [ln.strip() for ln in steps_raw.splitlines() if ln.strip()]
-            numbered = []
-            for i, ln in enumerate(lines, start=1):
+            kept: List[str] = []
+            for ln in lines:
+                low = ln.lower().strip()
+                # Drop the common redundant "buy via amazon" line.
+                if "buy via amazon" in low:
+                    continue
+                # Drop url-only lines.
+                if re.fullmatch(r"(https?://\S+|amzn\.to/\S+|www\.\S+)", low):
+                    continue
+                kept.append(ln)
+
+            numbered: List[str] = []
+            for i, ln in enumerate(kept, start=1):
                 if re.match(r"^\d+\s*[-:)]", ln):
                     numbered.append(ln)
                 elif ln.lower().startswith("step"):
                     numbered.append(ln)
                 else:
                     numbered.append(f"{i}) {ln}")
-            steps_block = "\n".join(numbered)
+
+            # Only show "How it works" when we have at least 2 meaningful steps.
+            if len(numbered) >= 2:
+                steps_block = "\n".join(numbered)
+
+        # Rewrite URLs inside steps so Amazon links get affiliate-tagged and short/deal hubs expand.
+        steps_block_rewritten = steps_block
+        if steps_block:
+            try:
+                steps_block_rewritten, changed, notes = await affiliate_rewriter.rewrite_text(self.config or {}, steps_block)
+                if changed:
+                    _log_flow("STEPS_URLS", changed="1", notes=str(len(notes or {})))
+                else:
+                    _log_flow("STEPS_URLS", changed="0")
+            except Exception as e:
+                _log_flow("STEPS_URLS_FAIL", err=str(e)[:180])
 
         # Optional OpenAI rephrase (only if key present/enabled and source text exists)
-        steps_rephrased = await self._openai_rephrase("steps", steps_block) if steps_block else ""
+        steps_rephrased = await self._openai_rephrase("steps", steps_block_rewritten) if steps_block_rewritten else ""
         info_rephrased = await self._openai_rephrase("info", info_raw) if info_raw else ""
 
-        promo_steps_parts = []
-        if promo_block:
-            promo_steps_parts.append(promo_block)
+        # Optional combined block (kept for compatibility with older templates).
+        promo_steps_parts: List[str] = []
+        if promo_codes:
+            promo_steps_parts.append(f"CODE: {promo_codes}")
         if steps_rephrased:
             promo_steps_parts.append(steps_rephrased)
         promo_steps = "\n".join([p for p in promo_steps_parts if p]).strip()
@@ -1233,6 +1614,23 @@ class InstorebotForwarder:
         key_link = self._key_link(final_url, message_id=str(getattr(message, "id", "") or ""), asin=asin)
         deal_type = (guessed.get("deal_type") or "").strip() or "Amazon Lead"
         source_credit = (guessed.get("source_credit") or "").strip()
+
+        # Build the "card body" to match your desired format (no footer/timestamp, one key link).
+        card_lines: List[str] = []
+        if price:
+            card_lines.append(f"Current Price: **{price}**")
+        if before_price:
+            card_lines.append(f"Before: **{before_price}**")
+        if promo_codes:
+            card_lines.append(f"CODE: {promo_codes}")
+        if steps_rephrased:
+            card_lines.append("")
+            card_lines.append("How it works:")
+            card_lines.append(steps_rephrased)
+        if key_link:
+            card_lines.append("")
+            card_lines.append(key_link)
+        card_body = "\n".join(card_lines).strip()
 
         # Routing is based on message-derived category only.
         dest_id, route_reason = self._pick_dest_channel_id(category=category, enrich_failed=False)
@@ -1258,6 +1656,7 @@ class InstorebotForwarder:
             "deal_type": deal_type,
             "title": title,
             "price": price,
+            "before_price": before_price,
             "category": category,
             "image_url": image_url,
             "source_line": source_line,
@@ -1275,6 +1674,7 @@ class InstorebotForwarder:
             "info_raw": info_raw,
             "info_rephrased": info_rephrased,
             "promo_steps": promo_steps,
+            "card_body": card_body,
         }
 
         embed = _embed_from_template(tpl or {}, ctx) if tpl else None
@@ -1534,38 +1934,28 @@ class InstorebotForwarder:
             if not asin2:
                 asin2 = (_cfg_str(self.config, "startup_test_asin", "STARTUP_TEST_ASIN") or "B0FLMLDTPB").strip().upper()
 
-            product = None
-            err = None
-            enrich_attempted = False
-            enrich_failed = False
-            enrich_ok = False
-            if asin2 and (self._paapi_ok is True):
-                enrich_attempted = True
-                product, err = await _amazon_enrich_by_asin(self.config, asin2)
-                enrich_failed = bool(err or (not product))
-                enrich_ok = bool(product) and (not err)
-
             mp = _cfg_str(self.config, "amazon_api_marketplace", "AMAZON_API_MARKETPLACE").rstrip("/")
             final_url = f"{mp}/dp/{asin2}" if mp else f"https://www.amazon.com/dp/{asin2}"
 
             # Reconstructed defaults (no PA-API required)
             title_guess = f"Amazon lead {asin2}".strip() if asin2 else "Amazon lead"
+            product: Dict[str, Any] = {}
             ctx = {
                 "asin": asin2,
                 "final_url": final_url,
                 "link": f"<{final_url}>",
-                "title": str((product or {}).get("title") or title_guess).strip(),
-                "price": str((product or {}).get("price") or "").strip(),
-                "category": str((product or {}).get("category") or "").strip(),
-                "image_url": str((product or {}).get("image_url") or "").strip(),
+                "title": title_guess,
+                "price": "",
+                "category": "",
+                "image_url": "",
                 "source_line": "EMBED_PREVIEW",
                 "source_jump": "",
                 "source_message_id": "",
-                "paapi_ok": "yes" if (self._paapi_ok is True) else ("no" if (self._paapi_ok is False) else ""),
-                "enrich_attempted": "yes" if enrich_attempted else "no",
-                "enrich_ok": "yes" if enrich_ok else "no",
-                "enrich_failed": "yes" if enrich_failed else "no",
-                "enrich_err": (str(err) if err else ""),
+                "promo_steps": "",
+                "info_rephrased": "",
+                "key_link": f"[amzn.to/{self._stable_key_slug(final_url)}](<{final_url}>)" if final_url else "",
+                "deal_type": "Preview",
+                "source_credit": "",
             }
 
             if r == "enrich_failed":
@@ -1577,16 +1967,7 @@ class InstorebotForwarder:
                 tpl, tpl_key = self._pick_template(dest_id, enrich_failed=False)
 
             embed = _embed_from_template(tpl or {}, ctx) if tpl else None
-            header = (
-                f"- route: `{r}`\n"
-                f"- template_key: `{tpl_key}`\n"
-                f"- asin: `{asin2}`\n"
-                f"- paapi_ok: `{ctx.get('paapi_ok')}`\n"
-                f"- enrich_attempted: `{ctx.get('enrich_attempted')}`\n"
-                f"- enrich_failed: `{ctx.get('enrich_failed')}`"
-            )
-            if ctx.get("enrich_err"):
-                header += f"\n- enrich_err: `{str(ctx.get('enrich_err'))[:160]}`"
+            header = f"- route: `{r}`\n- template_key: `{tpl_key}`\n- asin: `{asin2}`"
 
             if embed:
                 await interaction.followup.send(content=header, embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
