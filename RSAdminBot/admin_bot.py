@@ -2113,6 +2113,21 @@ class RSAdminBot:
         # Primary interface: prefix commands ("!").
         # Optional: RSNotes loads a private slash command (/rsnote) for per-user notes.
         self.bot = commands.Bot(command_prefix='!', intents=intents)
+
+        # Ensure RSNotes slash command registration runs once per process start.
+        # setup_hook runs after login and before the gateway is connected (discord.py best-practice spot).
+        async def _mw_setup_hook():
+            try:
+                await self._initialize_rsnotes()
+            except Exception as e:
+                try:
+                    print(f"{Colors.YELLOW}[RSNotes] setup_hook init failed: {type(e).__name__}: {str(e)[:200]}{Colors.RESET}")
+                except Exception:
+                    pass
+
+        # Only set if not already customized elsewhere.
+        if not hasattr(self.bot, "setup_hook") or getattr(self.bot.setup_hook, "__name__", "") == "setup_hook":
+            self.bot.setup_hook = _mw_setup_hook  # type: ignore
         
         self._setup_events()
         self._setup_commands()
@@ -3116,7 +3131,18 @@ echo "TARGET=$TARGET"
 
         cfg = self.config.get("rsnotes")
         if isinstance(cfg, dict) and cfg.get("enabled") is False:
+            try:
+                print(f"{Colors.DIM}[RSNotes] Disabled in config (rsnotes.enabled=false){Colors.RESET}")
+            except Exception:
+                pass
             return
+
+        try:
+            import sys
+            sp0 = str(sys.path[0]) if sys.path else ""
+            print(f"{Colors.CYAN}[RSNotes] Init: starting (sys.path[0]={sp0}){Colors.RESET}")
+        except Exception:
+            pass
 
         # Load extension from RSAdminBot/RSNotes (import root includes this folder).
         try:
@@ -3124,11 +3150,23 @@ echo "TARGET=$TARGET"
         except commands.ExtensionAlreadyLoaded:
             pass
         except Exception as e:
-            print(f"{Colors.YELLOW}[RSNotes] Failed to load extension: {str(e)[:200]}{Colors.RESET}")
+            try:
+                print(f"{Colors.YELLOW}[RSNotes] Failed to load extension: {type(e).__name__}: {str(e)[:200]}{Colors.RESET}")
+            except Exception:
+                pass
             return
 
         # Sync app commands to guild(s) for fast availability.
         guild_ids: List[int] = []
+        # Prefer the real RS server guild id if present.
+        for key in ("rs_server_guild_id",):
+            try:
+                gid = int(self.config.get(key) or 0)
+            except Exception:
+                gid = 0
+            if gid and gid not in guild_ids:
+                guild_ids.append(gid)
+
         raw = self.config.get("guild_ids") or []
         if isinstance(raw, list):
             for x in raw:
@@ -3146,13 +3184,34 @@ echo "TARGET=$TARGET"
             if gid:
                 guild_ids.append(gid)
 
+        # Debug: do we actually have the command in the tree?
+        try:
+            tree_names = []
+            try:
+                tree_names = [c.name for c in (self.bot.tree.get_commands() or [])]
+            except Exception:
+                tree_names = []
+            has_rsnote = "rsnote" in set(tree_names)
+            print(f"{Colors.CYAN}[RSNotes] Extension loaded. tree.has_rsnote={has_rsnote} tree.count={len(tree_names)} guild_ids={guild_ids}{Colors.RESET}")
+        except Exception:
+            pass
+
         synced_any = False
         for gid in guild_ids:
             try:
-                await self.bot.tree.sync(guild=discord.Object(id=gid))
+                synced = await self.bot.tree.sync(guild=discord.Object(id=gid))
                 synced_any = True
+                try:
+                    names = [getattr(x, "name", "") for x in (synced or [])]
+                    ok = "rsnote" in set(names)
+                    print(f"{Colors.GREEN}[RSNotes] Sync OK: guild={gid} commands={len(names)} has_rsnote={ok}{Colors.RESET}")
+                except Exception:
+                    pass
             except Exception as e:
-                print(f"{Colors.YELLOW}[RSNotes] Sync failed for guild {gid}: {str(e)[:160]}{Colors.RESET}")
+                try:
+                    print(f"{Colors.YELLOW}[RSNotes] Sync failed: guild={gid} err={type(e).__name__}: {str(e)[:160]}{Colors.RESET}")
+                except Exception:
+                    pass
 
         if synced_any:
             try:
