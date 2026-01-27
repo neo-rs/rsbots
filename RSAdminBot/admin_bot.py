@@ -3125,7 +3125,17 @@ echo "TARGET=$TARGET"
 
     async def _initialize_rsnotes(self) -> None:
         """Load RSNotes module (private `/rsnote`) and sync app commands to configured guild(s)."""
+        # Always keep a short status line for end-of-startup visibility (journal-live truncates earlier logs).
+        try:
+            self._rsnotes_status_line = "[RSNotes] status=init_start"
+        except Exception:
+            pass
+
         if getattr(self, "_rsnotes_initialized", False):
+            try:
+                self._rsnotes_status_line = "[RSNotes] status=already_initialized"
+            except Exception:
+                pass
             return
         self._rsnotes_initialized = True
 
@@ -3133,6 +3143,10 @@ echo "TARGET=$TARGET"
         if isinstance(cfg, dict) and cfg.get("enabled") is False:
             try:
                 print(f"{Colors.DIM}[RSNotes] Disabled in config (rsnotes.enabled=false){Colors.RESET}")
+            except Exception:
+                pass
+            try:
+                self._rsnotes_status_line = "[RSNotes] status=disabled"
             except Exception:
                 pass
             return
@@ -3152,6 +3166,10 @@ echo "TARGET=$TARGET"
         except Exception as e:
             try:
                 print(f"{Colors.YELLOW}[RSNotes] Failed to load extension: {type(e).__name__}: {str(e)[:200]}{Colors.RESET}")
+            except Exception:
+                pass
+            try:
+                self._rsnotes_status_line = f"[RSNotes] status=load_failed err={type(e).__name__}: {str(e)[:120]}"
             except Exception:
                 pass
             return
@@ -3197,6 +3215,7 @@ echo "TARGET=$TARGET"
             pass
 
         synced_any = False
+        synced_ok: Dict[int, bool] = {}
         for gid in guild_ids:
             try:
                 synced = await self.bot.tree.sync(guild=discord.Object(id=gid))
@@ -3204,6 +3223,7 @@ echo "TARGET=$TARGET"
                 try:
                     names = [getattr(x, "name", "") for x in (synced or [])]
                     ok = "rsnote" in set(names)
+                    synced_ok[int(gid)] = bool(ok)
                     print(f"{Colors.GREEN}[RSNotes] Sync OK: guild={gid} commands={len(names)} has_rsnote={ok}{Colors.RESET}")
                 except Exception:
                     pass
@@ -3212,10 +3232,28 @@ echo "TARGET=$TARGET"
                     print(f"{Colors.YELLOW}[RSNotes] Sync failed: guild={gid} err={type(e).__name__}: {str(e)[:160]}{Colors.RESET}")
                 except Exception:
                     pass
+                try:
+                    synced_ok[int(gid)] = False
+                except Exception:
+                    pass
 
         if synced_any:
             try:
                 print(f"{Colors.GREEN}[RSNotes] Loaded + synced `/rsnote` to {len(guild_ids)} guild(s){Colors.RESET}")
+            except Exception:
+                pass
+            try:
+                ext_loaded = "RSNotes.rsnote" in set(getattr(self.bot, "extensions", {}).keys())
+                self._rsnotes_status_line = (
+                    f"[RSNotes] status=sync_done ext_loaded={ext_loaded} "
+                    f"tree_has_rsnote={has_rsnote} guild_results={synced_ok}"
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                ext_loaded = "RSNotes.rsnote" in set(getattr(self.bot, "extensions", {}).keys())
+                self._rsnotes_status_line = f"[RSNotes] status=no_guilds ext_loaded={ext_loaded} guild_ids={guild_ids}"
             except Exception:
                 pass
     
@@ -5658,6 +5696,12 @@ echo "CHANGED_END"
                 print(f"{Colors.GREEN}[Reconnect] ✓ Bot connected as: {self.bot.user}{Colors.RESET}")
                 print(f"{Colors.GREEN}[Reconnect] ✓ Bot ID: {self.bot.user.id}{Colors.RESET}")
                 print(f"{Colors.GREEN}[Reconnect] ✓ Bot latency: {round(self.bot.latency * 1000)}ms{Colors.RESET}\n")
+                try:
+                    line = str(getattr(self, "_rsnotes_status_line", "") or "")
+                    if line:
+                        print(line[:400])
+                except Exception:
+                    pass
                 return
             
             # Mark startup as in progress - commands are already registered, so mark complete even if sequences fail
@@ -5773,6 +5817,14 @@ echo "CHANGED_END"
                 import traceback
                 print(f"{Colors.RED}[Startup] Full traceback: {traceback.format_exc()}{Colors.RESET}")
             
+            # Always emit RSNotes status near the end (journal-live truncates earlier lines)
+            try:
+                line = str(getattr(self, "_rsnotes_status_line", "") or "")
+                if line:
+                    print(line[:400])
+            except Exception:
+                pass
+
             # Always log completion
             print(f"{Colors.GREEN}[Startup] ✓ on_ready completed successfully{Colors.RESET}")
             print(f"{Colors.GREEN}[Startup] ✓ Bot is ready and accepting commands{Colors.RESET}\n")
