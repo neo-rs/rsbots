@@ -1,0 +1,123 @@
+{
+  "guild_id": 0,
+  "source_channel_ids": [],
+  "output_channels": {
+    "personal": "1464853876988706969",
+    "grocery": "1457129579557949551",
+    "deals": "1457129557067960482",
+    "enrich_failed": ""
+  },
+  "amazon_associate_tag": "",
+  "amazon_api_marketplace": "https://www.amazon.com",
+  "amazon_paapi_host": "webservices.amazon.com",
+  "amazon_paapi_region": "us-east-1",
+  "amazon_paapi_marketplace": "www.amazon.com",
+  "amazon_paapi_resources": [
+    "ItemInfo.Title",
+    "Images.Primary.Large",
+    "Offers.Listings.Price",
+    "BrowseNodeInfo.BrowseNodes"
+  ],
+  "amazon_expand_timeout_s": 8,
+  "amazon_expand_max_redirects": 8,
+  "amazon_grocery_keywords": [
+    "grocery",
+    "gourmet",
+    "grocery & gourmet food",
+    "fresh",
+    "pantry"
+  ],
+  "startup_test_asin": "B0FLMLDTPB",
+  "amazon_embed_templates": {
+    "by_channel_id": {
+      "1464853876988706969": {
+        "title": "RS Personal Lead — {title}",
+        "url": "{final_url}",
+        "description": "**ASIN:** `{asin}`\n**Link:** {link}\n\n**Source:** {source_line}\n[Jump]({source_jump})",
+        "color": 16753920,
+        "thumbnail": {
+          "url": "{image_url}"
+        },
+        "fields": [
+          {
+            "name": "Category",
+            "value": "{category}",
+            "inline": false
+          },
+          {
+            "name": "Move",
+            "value": "Check OOS/restocks • Fast checkout • Screenshot cart",
+            "inline": false
+          }
+        ],
+        "footer": {
+          "text": "Reselling Secrets • Personal"
+        }
+      },
+      "1457129579557949551": {
+        "title": "RS Grocery Lead — {title}",
+        "url": "{final_url}",
+        "description": "**ASIN:** `{asin}`\n**Link:** {link}\n\n**Source:** {source_line}\n[Jump]({source_jump})",
+        "color": 3066993,
+        "thumbnail": {
+          "url": "{image_url}"
+        },
+        "fields": [
+          {
+            "name": "Note",
+            "value": "Grocery listings often fail enrichment. Link + ASIN are the truth.",
+            "inline": false
+          },
+          {
+            "name": "Move",
+            "value": "Limit qty • Expect cancels • Watch substitutions",
+            "inline": false
+          }
+        ],
+        "footer": {
+          "text": "Reselling Secrets • Grocery"
+        }
+      },
+      "1457129557067960482": {
+        "title": "RS Amazon Deal — {title}",
+        "url": "{final_url}",
+        "description": "**ASIN:** `{asin}`\n**Link:** {link}\n\n**Source:** {source_line}\n[Jump]({source_jump})",
+        "color": 16753920,
+        "thumbnail": {
+          "url": "{image_url}"
+        },
+        "fields": [
+          {
+            "name": "Price",
+            "value": "{price}",
+            "inline": true
+          },
+          {
+            "name": "Category",
+            "value": "{category}",
+            "inline": false
+          },
+          {
+            "name": "Move",
+            "value": "Watch cancels • Limit qty • Fast checkout",
+            "inline": false
+          }
+        ],
+        "footer": {
+          "text": "Reselling Secrets • Amazon Deals"
+        }
+      }
+    },
+    "default": {},
+    "enrich_failed": {
+      "title": "RS Lead (No Enrich) — ASIN {asin}",
+      "url": "{final_url}",
+      "description": "**Link:** {link}\n**Source:** {source_line}\n\nEnrichment unavailable on this listing (common for grocery/suppressed ASINs).",
+      "color": 15158332,
+      "footer": {
+        "text": "Reselling Secrets • Enrich Failed"
+      }
+    }
+  }
+}
+

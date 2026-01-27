@@ -178,12 +178,33 @@ _URL_RE = re.compile(
 
 
 def normalize_input_url(raw: str) -> str:
-    u = (raw or "").strip()
-    if not u:
-        return u
-    if u.startswith("http://") or u.startswith("https://"):
-        return u
-    return f"https://{u}"
+    """
+    Normalize a user-provided URL-ish string into a URL.
+
+    IMPORTANT: This must NOT manufacture fake URLs from Discord mentions (e.g. "https://@everyone").
+    If the input is clearly not a URL, return "".
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+
+    low = s.lower()
+
+    # Guard: mentions are NOT urls (prevents "https://@everyone" pollution).
+    if low.startswith("@") or low in {"@everyone", "@here"}:
+        return ""
+    if low.startswith("<@") or low.startswith("<#") or low.startswith("<@&"):
+        return ""
+
+    # Trim common Discord URL wrappers: <https://...>
+    if s.startswith("<") and s.endswith(">") and len(s) > 2:
+        inner = s[1:-1].strip()
+        if inner:
+            s = inner
+
+    if s.startswith("http://") or s.startswith("https://"):
+        return s
+    return f"https://{s}"
 
 
 def extract_urls_with_spans(text: str) -> List[Tuple[str, int, int]]:
@@ -286,7 +307,7 @@ def is_amazon_like_url(url: str) -> bool:
     return ("amazon." in host) or host.endswith("amazon.com") or host.endswith("amazon.co.uk") or ("amzn.to" in host)
 
 
-def _extract_asin_fallback(text_or_url: str) -> Optional[str]:
+def extract_asin(text_or_url: str) -> Optional[str]:
     if not text_or_url:
         return None
     m = re.search(r"/dp/([A-Z0-9]{10})", text_or_url, re.IGNORECASE)
@@ -303,7 +324,7 @@ def build_amazon_affiliate_url(cfg: dict, raw_url: str) -> Optional[str]:
     u = (raw_url or "").strip()
     if not u:
         return None
-    asin = _extract_asin_fallback(u)
+    asin = extract_asin(u)
     if not asin:
         return None
 
@@ -846,9 +867,22 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
     if not unique:
         return {}, {}
 
-    normalized = {u: normalize_input_url(u) for u in unique}
     mapped: Dict[str, str] = {}
     notes: Dict[str, str] = {}
+
+    # Mention-safe normalization (skip anything that isn't really a URL).
+    normalized: Dict[str, str] = {}
+    candidates: List[str] = []
+    for u in unique:
+        nu = normalize_input_url(u)
+        if nu:
+            normalized[u] = nu
+            candidates.append(u)
+        else:
+            notes[u] = "not a url"
+
+    if not candidates:
+        return {}, notes
 
     # Stable amazon masks per destination within a message
     amazon_mask_cache: Dict[str, str] = {}
@@ -857,16 +891,16 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
     max_redirects = int(_cfg_or_env_int(cfg, "affiliate_max_redirects", "AUTO_AFFILIATE_MAX_REDIRECTS") or 8)
     timeout_s = float(_cfg_or_env_int(cfg, "affiliate_expand_timeout_s", "AUTO_AFFILIATE_EXPAND_TIMEOUT_S") or 8)
 
-    resolved: Dict[str, str] = {u: normalized.get(u) or u for u in unique}
+    resolved: Dict[str, str] = {u: normalized.get(u) or u for u in candidates}
 
-    for u in unique:
+    for u in candidates:
         cand = unwrap_known_query_redirects(resolved.get(u) or u)
         if cand:
             resolved[u] = cand
 
     if expand_enabled:
         async with aiohttp.ClientSession() as session:
-            for u in unique:
+            for u in candidates:
                 start_u = (resolved.get(u) or u).strip()
                 if should_expand_url(start_u):
                     final_u = await expand_url(session, start_u, timeout_s=timeout_s, max_redirects=max_redirects)
@@ -919,7 +953,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
 
                     resolved[u] = candidate
 
-    for u in unique:
+    for u in candidates:
         raw = (normalized.get(u) or u).strip()
         target = (resolved.get(u) or raw).strip()
 

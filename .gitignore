@@ -55,6 +55,14 @@
 !RSForwarder/messages.json
 !RSForwarder/vouch_config.json
 
+!Instorebotforwarder/
+!Instorebotforwarder/**/
+!Instorebotforwarder/*.py
+!Instorebotforwarder/**/*.py
+!Instorebotforwarder/COMMANDS.md
+!Instorebotforwarder/config.json
+!Instorebotforwarder/config.secrets.example.json
+
 !RSMentionPinger/
 !RSMentionPinger/**/
 !RSMentionPinger/*.py
