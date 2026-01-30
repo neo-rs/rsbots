@@ -48,10 +48,6 @@ from whop_api_client import WhopAPIClient, WhopAPIError
 # Configuration (initialized from main)
 WHOP_WEBHOOK_CHANNEL_ID = None
 WHOP_LOGS_CHANNEL_ID = None
-WHOP_DISPUTE_CHANNEL_ID = None
-WHOP_RESOLUTION_CHANNEL_ID = None
-WHOP_SUPPORT_PING_ROLE_ID = None
-WHOP_SUPPORT_PING_ROLE_NAME = None
 ROLE_TRIGGER = None
 WELCOME_ROLE_ID = None
 ROLE_CANCEL_A = None
@@ -80,7 +76,6 @@ BASE_DIR = Path(__file__).resolve().parent
 IDENTITY_CACHE_FILE = BASE_DIR / "whop_identity_cache.json"
 TRIAL_CACHE_FILE = BASE_DIR / "trial_history.json"
 IDENTITY_CONFLICTS_FILE = BASE_DIR / "identity_conflicts.jsonl"
-RESOLUTION_ALERT_STATE_FILE = BASE_DIR / "whop_resolution_alert_state.json"
 STAFF_ALERTS_FILE = BASE_DIR / "staff_alerts.json"
 PAYMENT_CACHE_FILE = BASE_DIR / "payment_cache.json"
 
@@ -93,73 +88,10 @@ def _norm_email(s: str) -> str:
 
 
 
-def _load_resolution_state() -> dict:
-    try:
-        db = _load_json(RESOLUTION_ALERT_STATE_FILE)
-        return db if isinstance(db, dict) else {}
-    except Exception:
-        return {}
-
-
-def _save_resolution_state(db: dict) -> None:
-    try:
-        if not isinstance(db, dict):
-            return
-        # Keep file small
-        max_events = 2000
-        events = db.get("events")
-        if isinstance(events, list) and len(events) > max_events:
-            db["events"] = events[-max_events:]
-        _save_json(RESOLUTION_ALERT_STATE_FILE, db)
-    except Exception:
-        pass
-
-
-def _already_alerted(alert_key: str) -> bool:
-    db = _load_resolution_state()
-    seen = db.get("seen") or {}
-    return bool(isinstance(seen, dict) and seen.get(alert_key))
-
-
-def _mark_alerted(alert_key: str, payload: dict) -> None:
-    db = _load_resolution_state()
-    seen = db.get("seen")
-    if not isinstance(seen, dict):
-        seen = {}
-    seen[alert_key] = datetime.now(timezone.utc).isoformat()
-    db["seen"] = seen
-
-    events = db.get("events")
-    if not isinstance(events, list):
-        events = []
-    payload = payload if isinstance(payload, dict) else {}
-    payload["alert_key"] = alert_key
-    payload["ts"] = datetime.now(timezone.utc).isoformat()
-    events.append(payload)
-    db["events"] = events
-    _save_resolution_state(db)
-
-
-def _support_mention(guild: discord.Guild) -> str:
-    if not guild:
-        return ""
-    if WHOP_SUPPORT_PING_ROLE_ID:
-        try:
-            rid = int(WHOP_SUPPORT_PING_ROLE_ID)
-        except Exception:
-            rid = 0
-        role = guild.get_role(rid) if rid else None
-        if role:
-            # No role mentions (forbidden); return plain text only.
-            return f"{role.name} (`{role.id}`)"
-        return f"support_role_id `{WHOP_SUPPORT_PING_ROLE_ID}`"
-    if WHOP_SUPPORT_PING_ROLE_NAME:
-        role = discord.utils.get(guild.roles, name=WHOP_SUPPORT_PING_ROLE_NAME)
-        if role:
-            # No role mentions (forbidden); return plain text only.
-            return f"{role.name} (`{role.id}`)"
-        return f"support_role `{WHOP_SUPPORT_PING_ROLE_NAME}`"
-    return ""
+#
+# Dispute/Resolution reporting was removed from the runtime bot.
+# If you need to inspect disputes/chargebacks, use `whop_api_probe.py alerts` or `raw`.
+#
 
 
 def _access_roles_compact(member: discord.Member) -> str:
@@ -601,8 +533,37 @@ async def _whop_brief_from_event(member: discord.Member, event_data: dict) -> di
             summary = _build_whop_summary(event_data)
         except Exception:
             summary = {}
-    # IMPORTANT: webhook-driven staff cards should not depend on Whop API (scans/sync own API usage).
-    # If a summary is missing, leave it blank and rely on Discord native cards + workflow payloads.
+
+    def _blank(v: object) -> bool:
+        s = str(v or "").strip()
+        return (not s) or s == "—" or s.lower() == "n/a"
+
+    def _merge_missing(base: dict, extra: dict) -> dict:
+        out = dict(base or {})
+        for k, v in (extra or {}).items():
+            if k not in out or _blank(out.get(k)):
+                out[k] = v
+        return out
+
+    # Optional: enrich via Whop API for webhook-driven cards (controlled by config).
+    # This is how we match the richer set-to-cancel fields across all staff cards.
+    if _cards_use_api() and _whop_api_client:
+        mid = ""
+        try:
+            mid = _safe_get(event_data or {}, "membership_id", "membership.id", default="").strip()
+        except Exception:
+            mid = ""
+        if not mid:
+            try:
+                mid = _safe_get(event_data or {}, "whop_key", "key", default="").strip()
+            except Exception:
+                mid = ""
+        if mid:
+            with suppress(Exception):
+                api_brief = await fetch_whop_brief(_whop_api_client, mid, enable_enrichment=True)
+                if isinstance(api_brief, dict) and api_brief:
+                    summary = _merge_missing(summary, api_brief)
+
     if summary:
         _record_whop_summary_if_possible(member_id=int(member.id), summary=summary, event_data=event_data)
     return summary
@@ -757,197 +718,12 @@ async def resolve_discord_id_from_whop_logs(
     )
 
 
-def _looks_like_dispute(payment: dict) -> bool:
-    if not isinstance(payment, dict):
-        return False
-    if payment.get("dispute_alerted_at"):
-        return True
-    status = str(payment.get("status") or "").lower()
-    substatus = str(payment.get("substatus") or "").lower()
-    billing_reason = str(payment.get("billing_reason") or "").lower()
-    txt = " ".join([status, substatus, billing_reason])
-    return any(w in txt for w in ("dispute", "chargeback"))
-
-
-def _looks_like_resolution_needed(membership: dict, payment: dict) -> bool:
-    # "Resolution needed" = billing/payment state suggests staff action, even if not dispute
-    if isinstance(membership, dict):
-        m_status = str(membership.get("status") or "").lower()
-        if m_status in ("past_due", "unpaid"):
-            return True
-        if membership.get("payment_collection_paused") is True:
-            return True
-    if not isinstance(payment, dict):
-        return False
-    status = str(payment.get("status") or "").lower()
-    substatus = str(payment.get("substatus") or "").lower()
-    failure_msg = str(payment.get("failure_message") or "").strip()
-    retryable = payment.get("retryable")
-    if failure_msg:
-        return True
-    if isinstance(retryable, bool) and retryable:
-        return True
-    # Avoid spamming on generic "open" invoices; require a stronger signal.
-    if payment.get("dispute_alerted_at"):
-        return True
-    if payment.get("refunded_at") or (float(payment.get("refunded_amount") or 0) > 0 if str(payment.get("refunded_amount") or "").strip() else False):
-        return True
-    return status in ("failed",) or substatus in ("past_due", "unpaid")
-
-
 def _cards_use_api() -> bool:
     """Whether webhook-driven staff cards are allowed to call Whop API."""
     try:
         return bool((_whop_api_config or {}).get("cards_use_api", False))
     except Exception:
         return False
-
-
-async def _post_resolution_or_dispute_alert(
-    member: discord.Member,
-    membership: dict,
-    latest_payment: dict,
-    source_event: str,
-) -> None:
-    """Post a detailed alert to dispute/resolution channel (no member mention; ping support only)."""
-    if not member or not member.guild:
-        return
-    # Webhook-driven cards should not depend on Whop API (scans/sync own API usage).
-    if not _cards_use_api():
-        return
-    if not _whop_api_config.get("enable_resolution_reporting", True):
-        return
-    if not WHOP_DISPUTE_CHANNEL_ID and not WHOP_RESOLUTION_CHANNEL_ID:
-        return
-
-    is_dispute = _looks_like_dispute(latest_payment)
-    needs_resolution = _looks_like_resolution_needed(membership, latest_payment)
-    if not is_dispute and not needs_resolution:
-        return
-
-    mem_id = str((membership or {}).get("id") or "").strip()
-    pay_id = str((latest_payment or {}).get("id") or "").strip()
-    alert_type = "dispute" if is_dispute else "resolution"
-    alert_key = f"{alert_type}|{member.id}|{mem_id}|{pay_id}"
-    if _already_alerted(alert_key):
-        return
-
-    target_channel_id = WHOP_DISPUTE_CHANNEL_ID if is_dispute else WHOP_RESOLUTION_CHANNEL_ID
-    ch = member.guild.get_channel(int(target_channel_id)) if target_channel_id else None
-    if not isinstance(ch, discord.TextChannel):
-        return
-
-    sup = _support_mention(member.guild)
-    title = "Whop Dispute Detected" if is_dispute else "Whop Resolution Needed"
-    color = 0xED4245 if is_dispute else 0xFEE75C
-    embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
-
-    # Try to enrich with Whop admin details (email/name) via /members/{mber_...}
-    whop_email = ""
-    whop_name = ""
-    try:
-        whop_member_id = ""
-        if isinstance((membership or {}).get("member"), dict):
-            whop_member_id = str(membership["member"].get("id") or "").strip()
-        if whop_member_id and _whop_api_client:
-            rec = await _whop_api_client.get_member_by_id(whop_member_id)
-            if isinstance(rec, dict):
-                u = rec.get("user")
-                if isinstance(u, dict):
-                    whop_email = str(u.get("email") or "").strip()
-                    whop_name = str(u.get("name") or "").strip()
-    except Exception:
-        pass
-
-    # Mention member for quick reference in staff alerts
-    embed.add_field(name="Support", value=sup or "(configure support role to ping)", inline=False)
-    mention = getattr(member, "mention", f"<@{member.id}>")
-    name = str(getattr(member, "display_name", "") or str(member))
-    embed.add_field(name="Discord", value=f"{name}\n{mention}", inline=False)
-    embed.add_field(name="Discord User ID", value=f"`{member.id}`", inline=True)
-    if whop_email:
-        embed.add_field(name="Email (API)", value=f"`{whop_email}`", inline=True)
-    if whop_name and len(embed.fields) < 25:
-        embed.add_field(name="Name (API)", value=whop_name[:256], inline=True)
-    if source_event:
-        embed.add_field(name="Source", value=source_event[:128], inline=True)
-
-    # Membership summary
-    m_status = str((membership or {}).get("status") or "").strip()
-    if m_status:
-        embed.add_field(name="Membership Status (API)", value=m_status, inline=True)
-    if mem_id:
-        embed.add_field(name="Membership ID (API)", value=f"`{mem_id}`", inline=True)
-    product_title = ""
-    if isinstance((membership or {}).get("product"), dict):
-        product_title = str(membership["product"].get("title") or "").strip()
-    if product_title:
-        embed.add_field(name="Product (API)", value=product_title[:1024], inline=False)
-    license_key = str((membership or {}).get("license_key") or "").strip()
-    if license_key:
-        embed.add_field(name="License Key (API)", value=f"`{license_key}`"[:1024], inline=True)
-    cancel_at_period_end = (membership or {}).get("cancel_at_period_end")
-    if isinstance(cancel_at_period_end, bool):
-        embed.add_field(name="Cancel At Period End (API)", value="Yes" if cancel_at_period_end else "No", inline=True)
-    canceled_at = (membership or {}).get("canceled_at")
-    if canceled_at:
-        embed.add_field(name="Canceled At (API)", value=_fmt_discord_ts(str(canceled_at), "D"), inline=True)
-    cancellation_reason = str((membership or {}).get("cancellation_reason") or "").strip()
-    if cancellation_reason:
-        embed.add_field(name="Cancellation Reason (API)", value=cancellation_reason[:1024], inline=False)
-    renew_end = (membership or {}).get("renewal_period_end")
-    if renew_end:
-        embed.add_field(name="Renewal Period End (API)", value=_fmt_discord_ts(str(renew_end), "D"), inline=True)
-    manage_url = str((membership or {}).get("manage_url") or "").strip()
-    if manage_url:
-        embed.add_field(name="Manage (API)", value=f"[Open]({manage_url})", inline=True)
-
-    # Payment summary
-    if isinstance(latest_payment, dict) and latest_payment:
-        pay_currency = str(latest_payment.get("currency") or (membership or {}).get("currency") or "").strip()
-        pay_total = (
-            latest_payment.get("usd_total")
-            or latest_payment.get("total")
-            or latest_payment.get("subtotal")
-            or latest_payment.get("amount_after_fees")
-        )
-        amt = fmt_money(pay_total, pay_currency)
-        p_status = str(latest_payment.get("status") or "").strip()
-        p_sub = str(latest_payment.get("substatus") or "").strip()
-        created = latest_payment.get("created_at") or ""
-        paid = latest_payment.get("paid_at") or ""
-        failure_msg = str(latest_payment.get("failure_message") or "").strip()
-        retryable = latest_payment.get("retryable")
-        dispute_alerted_at = latest_payment.get("dispute_alerted_at")
-        refunded_at = latest_payment.get("refunded_at")
-        refunded_amount = latest_payment.get("refunded_amount")
-
-        pay_lines = []
-        if pay_id:
-            pay_lines.append(f"id: `{pay_id}`")
-        if amt:
-            pay_lines.append(f"amount: {amt}")
-        if p_status:
-            pay_lines.append(f"status: {p_status}{f' ({p_sub})' if p_sub else ''}")
-        if paid:
-            pay_lines.append(f"paid: {_fmt_discord_ts(str(paid), 'R')}")
-        elif created:
-            pay_lines.append(f"created: {_fmt_discord_ts(str(created), 'R')}")
-        if failure_msg:
-            pay_lines.append(f"failure: {failure_msg}")
-        if isinstance(retryable, bool):
-            pay_lines.append(f"retryable: {'yes' if retryable else 'no'}")
-        if dispute_alerted_at:
-            pay_lines.append(f"dispute_alerted: {_fmt_discord_ts(str(dispute_alerted_at), 'D')}")
-        if refunded_at:
-            ra = fmt_money(refunded_amount, pay_currency)
-            pay_lines.append(f"refunded: {_fmt_discord_ts(str(refunded_at), 'D')}{f' ({ra})' if ra else ''}")
-        if pay_lines:
-            embed.add_field(name="Latest Payment (API)", value="\n".join(pay_lines)[:1024], inline=False)
-
-    content = (sup + " ") if sup else ""
-    await ch.send(content=content, embed=embed)
-    _mark_alerted(alert_key, {"type": alert_type, "member_id": str(member.id), "membership_id": mem_id, "payment_id": pay_id, "source": source_event})
 
 def _cache_identity(email: str, discord_id: str, discord_username: str = "") -> None:
     """Cache email -> discord_id mapping for future enrichment"""
@@ -1243,13 +1019,23 @@ def _safe_get(event_data: dict, *keys: str, default: str = "—") -> str:
     return default
 
 
-def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_role_id, role_cancel_a, role_cancel_b,
-               log_other_func, log_member_status_func, fmt_user_func, member_status_logs_channel_id=None,
-               record_member_whop_summary_func=None, record_whop_event_func=None,
-               whop_api_key=None, whop_api_config=None,
-               dispute_channel_id=None, resolution_channel_id=None,
-               support_ping_role_id=None, support_ping_role_name=None,
-               lifetime_role_ids=None):
+def initialize(
+    webhook_channel_id,
+    whop_logs_channel_id,
+    role_trigger,
+    welcome_role_id,
+    role_cancel_a,
+    role_cancel_b,
+    log_other_func,
+    log_member_status_func,
+    fmt_user_func,
+    member_status_logs_channel_id=None,
+    record_member_whop_summary_func=None,
+    record_whop_event_func=None,
+    whop_api_key=None,
+    whop_api_config=None,
+    lifetime_role_ids=None,
+):
     """
     Initialize handler with configuration and logging functions.
     
@@ -1269,8 +1055,7 @@ def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_r
         whop_api_key: Whop API key (optional, from config.secrets.json)
         whop_api_config: Whop API configuration dict (optional, from config.json)
     """
-    global WHOP_WEBHOOK_CHANNEL_ID, WHOP_LOGS_CHANNEL_ID, WHOP_DISPUTE_CHANNEL_ID, WHOP_RESOLUTION_CHANNEL_ID
-    global WHOP_SUPPORT_PING_ROLE_ID, WHOP_SUPPORT_PING_ROLE_NAME
+    global WHOP_WEBHOOK_CHANNEL_ID, WHOP_LOGS_CHANNEL_ID
     global ROLE_TRIGGER, WELCOME_ROLE_ID, ROLE_CANCEL_A, ROLE_CANCEL_B
     global LIFETIME_ROLE_IDS
     global _log_other, _log_member_status, _fmt_user, _record_member_whop_summary, _record_whop_event
@@ -1278,10 +1063,6 @@ def initialize(webhook_channel_id, whop_logs_channel_id, role_trigger, welcome_r
     
     WHOP_WEBHOOK_CHANNEL_ID = webhook_channel_id
     WHOP_LOGS_CHANNEL_ID = whop_logs_channel_id
-    WHOP_DISPUTE_CHANNEL_ID = int(dispute_channel_id) if str(dispute_channel_id or "").strip().isdigit() else None
-    WHOP_RESOLUTION_CHANNEL_ID = int(resolution_channel_id) if str(resolution_channel_id or "").strip().isdigit() else None
-    WHOP_SUPPORT_PING_ROLE_ID = int(support_ping_role_id) if str(support_ping_role_id or "").strip().isdigit() else None
-    WHOP_SUPPORT_PING_ROLE_NAME = str(support_ping_role_name or "").strip() or None
     ROLE_TRIGGER = role_trigger
     WELCOME_ROLE_ID = welcome_role_id
     ROLE_CANCEL_A = role_cancel_a

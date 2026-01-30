@@ -36,39 +36,33 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 - **Returns**: Confirmation message (auto-deletes after 5 seconds)
 - **Note**: Command message is auto-deleted
 
-#### `.checker report`
-- **Description**: Generate a reporting summary for a date range (from `reporting_store.json`) and DM it, or run a one-time scan from the Whop Event Ledger to rebuild the store + DM a downloadable CSV, or run a Whop debug report for a specific membership/Discord ID
-- **Aliases**: `reports`
+#### `.checker syncsummary`
+- **Description**: DM a boss-friendly report to the invoker. With **no dates**, it re-sends the latest **Whop Sync Summary + CSV** (from `#whop-sync-summary` mirror). With **dates**, it generates a **Whop memberships joined report** filtered by **Whop “Joined at”** (membership `created_at`, with `date_joined` fallback) and DMs an embed + CSV.
+- **Aliases**: `whopsync`, `whopsyncsummary`, `sync-report`
 - **Parameters**:
-  - `start` (optional): Start date `YYYY-MM-DD`
-  - `end` (optional): End date `YYYY-MM-DD` (inclusive)
-  - `scan` (optional): Literal word `scan` to run a one-time rebuild
-  - `source` (scan mode): `whop` or `memberstatus`
-  - `confirm` (scan mode): Must be exactly `confirm`
-  - `sample` (optional, scan whop only): Anonymize CSV output (no real Discord IDs / membership IDs / emails / URLs)
-  - `debug` (optional): Literal word `debug` to run Whop debug
-  - `target` (debug mode): Whop membership ID (`mem_...`) or Discord ID
+  - `start` (optional): Start date (accepts `YYYY-MM-DD`, `MM-DD-YY`, `MM/DD`, `MM-DD`)
+  - `end` (optional): End date (same formats). If omitted, uses `start`
 - **Usage**:
-  - `.checker report` (interactive picker; default last 7 days)
-  - `.checker report 2026-01-01` (from date → now)
-  - `.checker report 2026-01-01 2026-01-07` (inclusive range)
-  - `.checker report scan whop 2026-01-01 2026-01-31 confirm` (one-time scan Whop Event Ledger + CSV)
-  - `.checker report scan whop 2026-01-01 2026-01-31 confirm sample` (same scan, but CSV is anonymized sample output)
-  - `.checker report scan memberstatus 2026-01-01 2026-01-31 confirm` (one-time scan `member-status-logs` history)
-  - `.checker report debug mem_abc123 2026-01-01 2026-01-31` (Whop debug for a specific membership)
-  - `.checker report debug 1281616986660405304` (Whop debug for a specific Discord ID)
+  - `.checker syncsummary` (labels as today)
+  - `.checker syncsummary 01-30-26`
+  - `.checker syncsummary 01/30`
+  - `.checker syncsummary 01-01-26 01-30-26`
 - **Admin Only**: Yes (requires administrator permissions)
 - **Returns**:
-  - Normal mode: Report embed via DM (to Neo from config + to the invoker), plus a short confirmation (auto-deletes)
-  - Scan mode: Live progress message, then DM report embed + downloadable CSV (to Neo from config + to the invoker)
-  - Debug mode: DM debug embed with parsed date fields and computed buckets
+  - No dates: DM to the invoker containing the embed + `whop-sync-report_<label>.csv` (if available)
+  - With dates: DM to the invoker containing the embed + `whop-joined-report_<label>.csv`
+- **Note**: Date filtering uses day boundaries in `reporting.timezone`
+
+#### `.checker canceling`
+- **Description**: Manually run the Whop **canceling snapshot** (same as startup) and post the results into Neo Test Server `#set-to-cancel`.
+- **Aliases**: `cancelling`, `set-to-cancel`, `settocancel`
+- **Parameters**: None
+- **Usage**: `.checker canceling`
+- **Admin Only**: Yes (requires administrator permissions)
+- **Returns**: Posts snapshot embeds into Neo `#set-to-cancel` and sends a short confirmation message (auto-deletes)
 - **Notes**:
-  - Normal mode reads the bounded runtime `reporting_store.json`
-  - Scan mode overwrites/rebuilds the reporting store for that scanned window
-  - `scan whop` reads the Whop Event Ledger (`whop_events.jsonl`) built from member-logs + webhooks
-  - `scan whop` uses Mountain Time (`America/Denver`) day boundaries for dedupe per membership per day/event
-  - Interactive picker exposes Manual / Scan / Debug options in a dropdown
-  - If you see `Permission denied` for `reporting_store.json.tmp`, the bot service user cannot write to the `RSCheckerbot/` folder on the server (common cause: stale root-owned `.tmp` file). Fix ownership/permissions and retry.
+  - Snapshot output channel is controlled by `config.json -> reporting.cancel_reminders_output_guild_id` + `reporting.cancel_reminders_output_channel_name`
+  - Optional clear-before-post behavior is controlled by `reporting.startup_canceling_snapshot_clear_channel`
 
 #### `.checker purgecases`
 - **Description**: Delete legacy per-user payment case channels under the configured category
@@ -166,33 +160,10 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 - **Returns**: Confirmation that sequence is cancelled
 - **Note**: Only works if user is in active queue
 
-#### `.checker test`
-- **Description**: Test checker sequence for a member (sends all day messages immediately)
-- **Aliases**: None
-- **Parameters**: 
-  - `member`: Discord member mention (required)
-- **Usage**: `.checker test @user`
-- **Admin Only**: Yes (requires administrator permissions)
-- **Returns**: Test completion confirmation
-- **Note**: Sends all day messages (day_1 through day_7b) with TEST_INTERVAL_SECONDS delay between each
-
-#### `.checker relocate`
-- **Description**: Relocate sequence to different day
-- **Aliases**: None
-- **Parameters**: 
-  - `member`: Discord member mention (required)
-  - `day`: Day identifier - can be:
-    - Number (1-6): `1`, `2`, `3`, `4`, `5`, `6`
-    - Special days: `7a`, `7b`
-    - Full format: `day_1`, `day_2`, etc.
-- **Usage**: `.checker relocate @user 3` or `.checker relocate @user day_7a`
-- **Admin Only**: Yes (requires administrator permissions)
-- **Returns**: Confirmation that member is relocated and will receive message in ~5 seconds
-
 ## Command Summary
 
-- **Total Commands**: 15
-- **Admin Commands**: 15 (all commands require administrator permissions)
+- **Total Commands**: 13
+- **Admin Commands**: 13 (all commands require administrator permissions)
 - **Public Commands**: 0
 - **Commands with Aliases**: 7
 - **Command Prefix**: `.checker` (dot prefix)

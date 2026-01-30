@@ -46,9 +46,12 @@ _LABEL_OVERRIDES: dict[str, str] = {
     "trial_days": "Trial Days",
     "remaining_days": "Remaining Days",
     "dashboard_url": "Whop Dashboard",
-    "manage_url": "Whop Billing Manage",
     "checkout_url": "Checkout",
     "total_spent": "Total Spent",
+    "mrr": "MRR",
+    "customer_since": "Customer since",
+    "connected_discord": "Connected Discord",
+    "cancellation_reason": "Cancellation reason",
     "plan_is_renewal": "Plan Is Renewal",
     "promo": "Promo",
     "pricing": "Pricing",
@@ -127,7 +130,10 @@ def _is_blank(v: object) -> bool:
     if v is None:
         return True
     s = str(v).strip()
-    return (not s) or s == "—"
+    if (not s) or s == "—":
+        return True
+    low = s.lower()
+    return low in {"n/a", "na", "none", "null"}
 
 def _sanitize_value(v: object) -> str:
     """Normalize placeholders to a neutral dash for staff embeds.
@@ -140,6 +146,8 @@ def _sanitize_value(v: object) -> str:
     if not s or s == "—":
         return "—"
     low = s.lower()
+    if low in {"n/a", "na", "none", "null"}:
+        return "—"
     # Treat common linking placeholders as unknown (do not show them).
     if low.startswith("not linked yet"):
         return "—"
@@ -179,8 +187,8 @@ def _human_value_for_field(key: str, value: object) -> tuple[str, object]:
 def brief_payment_kv(brief: dict | None) -> list[tuple[str, object]]:
     b = brief if isinstance(brief, dict) else {}
     dash = b.get("dashboard_url")
-    manage = b.get("manage_url")
     return [
+        ("membership_id", b.get("membership_id")),
         ("status", b.get("status")),
         ("product", b.get("product")),
         ("member_since", b.get("member_since")),
@@ -194,9 +202,12 @@ def brief_payment_kv(brief: dict | None) -> list[tuple[str, object]]:
         ("renewal_window", b.get("renewal_window")),
         ("remaining_days", b.get("remaining_days")),
         ("dashboard_url", dash),
-        ("manage_url", manage),
         ("checkout_url", b.get("checkout_url")),
         ("total_spent", b.get("total_spent")),
+        ("mrr", b.get("mrr")),
+        ("customer_since", b.get("customer_since")),
+        ("connected_discord", b.get("connected_discord")),
+        ("cancellation_reason", b.get("cancellation_reason")),
         ("last_success_paid_at", b.get("last_success_paid_at")),
         ("cancel_at_period_end", b.get("cancel_at_period_end")),
         ("is_first_membership", b.get("is_first_membership")),
@@ -276,14 +287,7 @@ def build_case_minimal_embed(
     _add_field_force(embed, _human_label("dashboard_url", label_overrides=label_overrides), b.get("dashboard_url"), inline=True)
     _add_field_force(embed, _human_label("renewal_window", label_overrides=label_overrides), b.get("renewal_window"), inline=False)
 
-    # Optional plan/trial details
-    _add_field(embed, _human_label("trial_days", label_overrides=label_overrides), b.get("trial_days"), inline=True)
-    _add_field(embed, _human_label("plan_is_renewal", label_overrides=label_overrides), b.get("plan_is_renewal"), inline=True)
-    _add_field(embed, _human_label("promo", label_overrides=label_overrides), b.get("promo"), inline=True)
-    _add_field(embed, _human_label("pricing", label_overrides=label_overrides), b.get("pricing"), inline=True)
-    _add_field(embed, _human_label("checkout_url", label_overrides=label_overrides), b.get("checkout_url"), inline=False)
-
-    # Long text: Payment issue
+    # Optional long text: payment issue (only when present)
     _add_field(embed, _human_label("last_payment_failure", label_overrides=label_overrides), b.get("last_payment_failure"), inline=False)
 
     embed.set_footer(text="RSCheckerbot")
@@ -300,6 +304,7 @@ def build_member_status_detailed_embed(
     member_kv: list[tuple[str, object]] | None = None,
     whop_brief: dict | None = None,
     event_kind: str | None = None,
+    force_whop_core_fields: bool = True,
 ) -> discord.Embed:
     """Detailed staff embed for member-status-logs.
 
@@ -352,8 +357,6 @@ def build_member_status_detailed_embed(
         "source",
         "access_roles_at_leave",
         "whop_link",
-        "membership_id",
-        "event",
     ):
         v = mk.get(key) if key in mk else dk.get(key)
         if _is_blank(v):
@@ -379,10 +382,22 @@ def build_member_status_detailed_embed(
         _add_field(embed, "Whop", "not linked (no membership_id recorded yet)", inline=False)
     else:
         # Always show the core Whop fields on non-lifecycle cards; for join/leave cards, hide blanks.
-        add_core = _add_field if is_lifecycle else _add_field_force
-        add_window = _add_field if is_lifecycle else _add_field_force
-        add_spent = _add_field if is_lifecycle else _add_field_force
+        if (not force_whop_core_fields) or is_lifecycle:
+            add_core = _add_field
+            add_window = _add_field
+            add_spent = _add_field
+        else:
+            add_core = _add_field_force
+            add_window = _add_field_force
+            add_spent = _add_field_force
 
+        # Membership ID (keep in Whop section, not in Discord section).
+        mid_any = b.get("membership_id")
+        if _is_blank(mid_any):
+            mid_any = mk.get("membership_id") if isinstance(mk, dict) else ""
+        if _is_blank(mid_any):
+            mid_any = dk.get("membership_id") if isinstance(dk, dict) else ""
+        _add_field(embed, _human_label("membership_id", label_overrides=label_overrides), mid_any, inline=True)
         add_core(embed, _human_label("status", label_overrides=label_overrides), b.get("status"), inline=True)
         _add_field(embed, _human_label("product", label_overrides=label_overrides), b.get("product"), inline=True)
         add_spent(embed, _human_label("total_spent", label_overrides=label_overrides), spent_s, inline=True)
@@ -395,19 +410,21 @@ def build_member_status_detailed_embed(
         _add_field(embed, _human_label("remaining_days", label_overrides=label_overrides), b.get("remaining_days"), inline=True)
         _add_field(embed, _human_label("renewal_end", label_overrides=label_overrides), b.get("renewal_end"), inline=True)
         add_core(embed, _human_label("dashboard_url", label_overrides=label_overrides), b.get("dashboard_url"), inline=True)
-        _add_field(embed, _human_label("manage_url", label_overrides=label_overrides), b.get("manage_url"), inline=True)
         add_window(embed, _human_label("renewal_window", label_overrides=label_overrides), b.get("renewal_window"), inline=False)
+
+    # Extra Whop UI-style fields (shown when available; never forced in the probe path).
+    _add_field(embed, _human_label("mrr", label_overrides=label_overrides), b.get("mrr"), inline=True)
+    _add_field(embed, _human_label("customer_since", label_overrides=label_overrides), b.get("customer_since"), inline=True)
+    _add_field(embed, _human_label("connected_discord", label_overrides=label_overrides), b.get("connected_discord"), inline=False)
+    _add_field(embed, _human_label("cancellation_reason", label_overrides=label_overrides), b.get("cancellation_reason"), inline=False)
 
     _add_field(embed, _human_label("last_success_paid_at", label_overrides=label_overrides), b.get("last_success_paid_at"), inline=True)
     _add_field(embed, _human_label("cancel_at_period_end", label_overrides=label_overrides), b.get("cancel_at_period_end"), inline=True)
     _add_field(embed, _human_label("is_first_membership", label_overrides=label_overrides), b.get("is_first_membership"), inline=True)
 
-    _add_field(embed, _human_label("last_payment_method", label_overrides=label_overrides), b.get("last_payment_method"), inline=True)
-    _add_field(embed, _human_label("last_payment_type", label_overrides=label_overrides), b.get("last_payment_type"), inline=True)
-
-    # Long text: Payment issue
+    # We intentionally omit noisy plan/payment-method fields. If there's a real failure message,
+    # we still show it (and it won't render for N/A).
     _add_field(embed, _human_label("last_payment_failure", label_overrides=label_overrides), b.get("last_payment_failure"), inline=False)
-    _add_field(embed, _human_label("checkout_url", label_overrides=label_overrides), b.get("checkout_url"), inline=False)
 
     embed.set_footer(text="RSCheckerbot • Member Status Tracking")
     return embed
