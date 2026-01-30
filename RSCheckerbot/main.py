@@ -13,6 +13,14 @@ from typing import Dict, Optional
 from contextlib import suppress
 from collections import deque
 try:
+    import fcntl  # type: ignore
+except Exception:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
+try:
+    import msvcrt  # type: ignore
+except Exception:  # pragma: no cover
+    msvcrt = None  # type: ignore[assignment]
+try:
     from zoneinfo import ZoneInfo  # py3.9+
 except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore[assignment]
@@ -24,6 +32,107 @@ if str(_REPO_ROOT) not in sys.path:
 
 # Always resolve bot-local files relative to this directory (do not depend on cwd).
 BASE_DIR = Path(__file__).resolve().parent
+
+# Startup sequencing: ensure heavy scans finish before sync begins.
+_STARTUP_SCANS_DONE: asyncio.Event = asyncio.Event()
+
+# -----------------------------
+# Progress formatting (Discord + terminal)
+# -----------------------------
+def _progress_bar(done: int, total: int, *, width: int) -> str:
+    try:
+        total_i = int(total)
+    except Exception:
+        total_i = 0
+    try:
+        done_i = int(done)
+    except Exception:
+        done_i = 0
+    try:
+        w = int(width)
+    except Exception:
+        w = 26
+    w = max(10, min(w, 60))
+    if total_i <= 0:
+        filled = 0
+        pct = 0
+    else:
+        pct = int(round((done_i / max(1, total_i)) * 100))
+        filled = int(round((done_i / max(1, total_i)) * w))
+    filled = max(0, min(filled, w))
+    return "[" + ("—" * filled) + (" " * (w - filled)) + f"] {pct}% ({done_i}/{total_i})"
+
+
+def _progress_text(*, label: str, step: tuple[int, int], done: int, total: int, stats: dict[str, object], stage: str) -> str:
+    try:
+        width = int(LOG_CONTROLS.get("progress_bar_width", 26))
+    except Exception:
+        width = 26
+    s1 = f"Fetchall: {str(label or '').strip()} ({int(step[0])}/{int(step[1])})"
+    s2 = _progress_bar(int(done), int(total), width=width)
+    parts: list[str] = []
+    for k, v in (stats or {}).items():
+        if v is None:
+            continue
+        parts.append(f"{k}={v}")
+    parts.append(f"stage={stage}")
+    s3 = " ".join(parts)[:1900]
+    return f"{s1}\n{s2}\n{s3}"
+
+# -----------------------------
+# Single-instance guard (prevents duplicate events when multiple processes start)
+# -----------------------------
+_INSTANCE_LOCK_FH: io.TextIOWrapper | None = None
+
+
+def _acquire_single_instance_lock() -> bool:
+    """Best-effort cross-platform single-instance lock using a lock file."""
+    global _INSTANCE_LOCK_FH
+    lock_path = BASE_DIR / ".rscheckerbot.lock"
+    fh: io.TextIOWrapper | None = None
+    existing = ""
+    try:
+        fh = open(lock_path, "a+", encoding="utf-8")
+        with suppress(Exception):
+            fh.seek(0)
+            existing = (fh.read() or "").strip()
+            fh.seek(0)
+    except Exception:
+        fh = None
+
+    if not fh:
+        return True  # cannot lock -> do not block startup
+
+    try:
+        if msvcrt is not None:
+            # Lock 1 byte at start of file (Windows).
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        elif fcntl is not None:
+            # Unix advisory lock.
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[arg-type]
+        else:
+            # Unknown platform; skip lock.
+            _INSTANCE_LOCK_FH = fh
+            return True
+    except Exception:
+        with suppress(Exception):
+            fh.close()
+        msg = (existing[:200] + ("…" if len(existing) > 200 else "")) if existing else "—"
+        try:
+            log.error(f"[Boot] Another RSCheckerbot instance is already running (lock busy). lock_file={lock_path} existing={msg}")
+        except Exception:
+            pass
+        return False
+
+    # Write pid metadata (best-effort) and keep handle open for duration of process.
+    with suppress(Exception):
+        fh.seek(0)
+        fh.truncate(0)
+        fh.write(json.dumps({"pid": os.getpid(), "started_at": datetime.now(timezone.utc).isoformat()}))
+        fh.flush()
+    _INSTANCE_LOCK_FH = fh
+    return True
 
 from mirror_world_config import load_config_with_secrets
 from mirror_world_config import is_placeholder_secret, mask_secret
@@ -70,6 +179,8 @@ from staff_alerts_store import (
 from whop_webhook_handler import (
     initialize as init_whop_handler,
     handle_whop_webhook_message,
+    extract_native_whop_card_debug,
+    resolve_discord_id_from_whop_logs as _resolve_discord_id_from_whop_logs,
 )
 
 # Import Whop API client
@@ -156,6 +267,26 @@ def _load_reporting_config(cfg: dict) -> dict:
     scan_log_max_members = _as_int(base.get("scan_log_max_members")) or 0
     scan_log_progress_every = _as_int(base.get("scan_log_progress_every")) or 50
 
+    # Optional mirrors / startup snapshots (must never crash).
+    cancel_out_gid = _as_int(base.get("cancel_reminders_output_guild_id")) or 0
+    cancel_out_name = _as_str(base.get("cancel_reminders_output_channel_name"))
+    startup_canceling_enabled = _as_bool(base.get("startup_canceling_snapshot_enabled", False))
+    startup_canceling_max_pages = _as_int(base.get("startup_canceling_snapshot_max_pages")) or 0
+    startup_canceling_per_page = _as_int(base.get("startup_canceling_snapshot_per_page")) or 0
+    startup_canceling_max_rows = _as_int(base.get("startup_canceling_snapshot_max_rows")) or 0
+    try:
+        startup_canceling_min_spent = float(base.get("startup_canceling_snapshot_min_total_spent_usd") or 0.0)
+    except Exception:
+        startup_canceling_min_spent = 0.0
+
+    # Startup canceling snapshot diagnostics/output controls (optional).
+    startup_canceling_log_each = _as_bool(base.get("startup_canceling_snapshot_log_each_member", False))
+    startup_canceling_one_per_member = _as_bool(base.get("startup_canceling_snapshot_one_message_per_member", False))
+    startup_canceling_fill_total = _as_bool(base.get("startup_canceling_snapshot_fill_total_spend_via_payments", False))
+    startup_canceling_attach_csv = _as_bool(base.get("startup_canceling_snapshot_attach_csv", False))
+    startup_canceling_pay_sleep_ms = _as_int(base.get("startup_canceling_snapshot_payments_sleep_ms")) or 0
+    startup_canceling_pay_sleep_ms = max(0, min(int(startup_canceling_pay_sleep_ms or 0), 2000))
+
     if not isinstance(reminder_days, list):
         reminder_days = [7, 3, 1]
     cleaned_days: list[int] = []
@@ -188,6 +319,18 @@ def _load_reporting_config(cfg: dict) -> dict:
         "weekly_day_local": weekly_day,
         "retention_weeks": int(retention_weeks),
         "reminder_days_before_cancel": cleaned_days,
+        "cancel_reminders_output_guild_id": int(cancel_out_gid or 0),
+        "cancel_reminders_output_channel_name": cancel_out_name,
+        "startup_canceling_snapshot_enabled": bool(startup_canceling_enabled),
+        "startup_canceling_snapshot_max_pages": max(0, int(startup_canceling_max_pages or 0)),
+        "startup_canceling_snapshot_per_page": max(0, min(200, int(startup_canceling_per_page or 0))),
+        "startup_canceling_snapshot_max_rows": max(0, min(200, int(startup_canceling_max_rows or 0))),
+        "startup_canceling_snapshot_min_total_spent_usd": float(max(0.0, startup_canceling_min_spent)),
+        "startup_canceling_snapshot_log_each_member": bool(startup_canceling_log_each),
+        "startup_canceling_snapshot_one_message_per_member": bool(startup_canceling_one_per_member),
+        "startup_canceling_snapshot_fill_total_spend_via_payments": bool(startup_canceling_fill_total),
+        "startup_canceling_snapshot_payments_sleep_ms": int(startup_canceling_pay_sleep_ms),
+        "startup_canceling_snapshot_attach_csv": bool(startup_canceling_attach_csv),
         "scan_log_channel_id": scan_log_channel_id or 0,
         "scan_log_webhook_url": scan_log_webhook_url,
         "scan_log_each_member": bool(scan_log_each_member),
@@ -324,6 +467,1182 @@ async def _backfill_recent_native_whop_cards() -> None:
             # Yield occasionally so startup remains responsive.
             if processed and (processed % 200 == 0):
                 await asyncio.sleep(0)
+
+
+async def _startup_native_whop_smoketest() -> None:
+    """On startup, replay the last N native Whop log cards into the Neo test server.
+
+    This uses the same staff embed builder used in `member-status-logs` so you can verify
+    Total Spent / Whop Dashboard parsing without changing the live channel history.
+    """
+    if not WHOP_STARTUP_NATIVE_SMOKETEST_ENABLED:
+        return
+
+    # Default to the configured webhook channel; also use the configured logs channel as a secondary
+    # source (it often includes Discord ID/username when the webhook channel does not).
+    primary_id = int(WHOP_STARTUP_NATIVE_SMOKETEST_SOURCE_CHANNEL_ID or (WHOP_WEBHOOK_CHANNEL_ID or 0) or 0)
+    secondary_id = int(WHOP_LOGS_CHANNEL_ID or 0)
+    if not primary_id:
+        log.info("[BOOT][WhopSmoke] disabled (missing primary source channel id)")
+        return
+    log.info(
+        "[BOOT][WhopSmoke] enabled count=%s source_channel_id=%s output_guild_id=%s output_channel_id=%s output_channel_name=%s",
+        int(WHOP_STARTUP_NATIVE_SMOKETEST_COUNT or 3),
+        primary_id,
+        int(WHOP_STARTUP_NATIVE_SMOKETEST_OUTPUT_GUILD_ID or 0),
+        int(WHOP_STARTUP_NATIVE_SMOKETEST_OUTPUT_CHANNEL_ID or 0),
+        str(WHOP_STARTUP_NATIVE_SMOKETEST_OUTPUT_CHANNEL_NAME or "").strip(),
+    )
+
+    async def _get_text_channel(cid: int) -> discord.TextChannel | None:
+        ch = bot.get_channel(int(cid))
+        if isinstance(ch, discord.TextChannel):
+            return ch
+        with suppress(Exception):
+            fetched = await bot.fetch_channel(int(cid))
+            return fetched if isinstance(fetched, discord.TextChannel) else None
+        return None
+
+    async def _pick_writable_text_channel(guild: discord.Guild) -> discord.TextChannel | None:
+        """Best-effort writable channel selection (no pings)."""
+        if not guild:
+            return None
+        me = guild.me or guild.get_member(int(getattr(bot.user, "id", 0) or 0))
+        # Prefer system channel if writable.
+        sys_ch = getattr(guild, "system_channel", None)
+        if isinstance(sys_ch, discord.TextChannel) and me and sys_ch.permissions_for(me).send_messages:
+            return sys_ch
+        # Else pick first writable text channel.
+        for ch in (guild.text_channels or []):
+            if not isinstance(ch, discord.TextChannel):
+                continue
+            if me and ch.permissions_for(me).send_messages:
+                return ch
+        return None
+
+    async def _resolve_output_channel() -> discord.TextChannel | None:
+        # 1) Explicit channel id (works across guilds).
+        if int(WHOP_STARTUP_NATIVE_SMOKETEST_OUTPUT_CHANNEL_ID or 0):
+            return await _get_text_channel(int(WHOP_STARTUP_NATIVE_SMOKETEST_OUTPUT_CHANNEL_ID))
+
+        # 2) Target guild + channel name (Neo test).
+        gid = int(WHOP_STARTUP_NATIVE_SMOKETEST_OUTPUT_GUILD_ID or 0)
+        g = bot.get_guild(gid) if gid else None
+        if gid and not g:
+            log.warning("[BOOT][WhopSmoke] output guild not found in cache (bot may not be in this server): %s", gid)
+        if g:
+            name = str(WHOP_STARTUP_NATIVE_SMOKETEST_OUTPUT_CHANNEL_NAME or "").strip().lower()
+            if name:
+                for ch in (g.text_channels or []):
+                    if isinstance(ch, discord.TextChannel) and str(ch.name).lower() == name:
+                        return ch
+                # Create channel if allowed.
+                me = g.me or g.get_member(int(getattr(bot.user, "id", 0) or 0))
+                if me and getattr(me.guild_permissions, "manage_channels", False):
+                    with suppress(Exception):
+                        created = await g.create_text_channel(name=name, reason="RSCheckerbot: startup Whop smoke test output")
+                        if isinstance(created, discord.TextChannel):
+                            return created
+            # Fallback: any writable channel in the target guild.
+            ch_any = await _pick_writable_text_channel(g)
+            if ch_any:
+                return ch_any
+
+        # 3) Final fallback: current guild's member status logs.
+        if int(MEMBER_STATUS_LOGS_CHANNEL_ID or 0):
+            return await _get_text_channel(int(MEMBER_STATUS_LOGS_CHANNEL_ID))
+        return None
+
+    src = await _get_text_channel(primary_id)
+    out = await _resolve_output_channel()
+    if not src or not out:
+        log.warning("[BOOT][WhopSmoke] disabled (channel not found) src=%s out=%s", primary_id, int(getattr(out, "id", 0) or 0))
+        return
+
+    # Secondary source (best-effort)
+    src2: discord.TextChannel | None = None
+    if secondary_id and int(secondary_id) != int(primary_id):
+        src2 = await _get_text_channel(int(secondary_id))
+        if not src2:
+            log.warning("[BOOT][WhopSmoke] secondary channel not found: %s", secondary_id)
+
+    count = int(WHOP_STARTUP_NATIVE_SMOKETEST_COUNT or 3)
+    main_guild = bot.get_guild(GUILD_ID) if GUILD_ID else None
+    out_guild = getattr(out, "guild", None)
+    if isinstance(out_guild, discord.Guild):
+        # Ensure case channels exist in the Neo test server (best-effort).
+        with suppress(Exception):
+            await _ensure_alert_channels(out_guild)
+    out_payment_ch = _find_text_channel_by_name(out_guild, PAYMENT_FAILURE_CHANNEL_NAME) if isinstance(out_guild, discord.Guild) else None
+    out_cancel_ch = _find_text_channel_by_name(out_guild, MEMBER_CANCELLATION_CHANNEL_NAME) if isinstance(out_guild, discord.Guild) else None
+
+    async def _resolve_member(guild: discord.Guild | None, user_id: int) -> discord.Member | None:
+        if not guild or not user_id:
+            return None
+        m = guild.get_member(int(user_id))
+        if m:
+            return m
+        with suppress(Exception):
+            return await guild.fetch_member(int(user_id))
+        return None
+
+    def _blank(v: object) -> bool:
+        s = str(v or "").strip()
+        return (not s) or s == "—"
+
+    def _merge_briefs(a: dict | None, b: dict | None) -> dict:
+        aa = a if isinstance(a, dict) else {}
+        bb = b if isinstance(b, dict) else {}
+        out: dict = {}
+        for k in set(list(aa.keys()) + list(bb.keys())):
+            va = aa.get(k)
+            vb = bb.get(k)
+            out[k] = va if not _blank(va) else vb
+        return out
+
+    def _title_key(t: str) -> str:
+        return re.sub(r"\\s+", " ", str(t or "").strip().lower())
+
+    def _norm_email(s: str) -> str:
+        return str(s or "").strip().lower()
+
+    def _event_guess(title: str) -> str:
+        t = str(title or "").strip().lower()
+        if "payment failed" in t:
+            return "payment.failed"
+        if "payment succeeded" in t or "payment received" in t:
+            return "payment.succeeded"
+        if "activated" in t and "pending" in t:
+            return "membership.activated.pending"
+        if "activated" in t:
+            return "membership.activated"
+        return "whop.native"
+
+    # Preload a small window from the secondary channel so we can pair events.
+    secondary_pool: list[dict] = []
+    if src2:
+        limit = max(10, min(80, count * 20))
+        async for m2 in src2.history(limit=limit):
+            info2 = extract_native_whop_card_debug(m2) or {}
+            secondary_pool.append(
+                {
+                    "msg": m2,
+                    "info": info2,
+                    "title": _title_key(str(info2.get("title") or "")),
+                    "email": _norm_email(str(info2.get("email") or "")),
+                    "membership_id": str(info2.get("membership_id") or "").strip(),
+                    "discord_id": str(info2.get("discord_id") or "").strip(),
+                    "created_at": getattr(m2, "created_at", None),
+                }
+            )
+
+    def _best_pair(msg: discord.Message, info: dict) -> dict | None:
+        if not secondary_pool:
+            return None
+        t1 = _title_key(str(info.get("title") or ""))
+        email1 = _norm_email(str(info.get("email") or ""))
+        mid1 = str(info.get("membership_id") or "").strip()
+        ts1 = getattr(msg, "created_at", None)
+        best = None
+        best_score = None
+        for cand in secondary_pool:
+            # Prefer hard keys: membership_id match, then email match.
+            mid2 = str(cand.get("membership_id") or "").strip()
+            email2 = str(cand.get("email") or "").strip()
+            hard = 0
+            if mid1 and mid2 and mid1 == mid2:
+                hard = 2
+            elif email1 and email2 and email1 == email2:
+                hard = 1
+            else:
+                # Fallback: weak title similarity.
+                t2 = str(cand.get("title") or "")
+                if t1 and t2 and not (t1 == t2 or t1 in t2 or t2 in t1):
+                    continue
+            dt = None
+            try:
+                if ts1 and cand.get("created_at"):
+                    dt = abs((ts1 - cand["created_at"]).total_seconds())
+            except Exception:
+                dt = None
+            # Allow a wider window here because the two sources can lag slightly.
+            if dt is None or dt > 900:
+                continue
+            # Score: prefer hard match, then closer timestamp.
+            score = (0 if hard == 2 else (10 if hard == 1 else 30)) + float(dt or 0.0) / 60.0
+            if best_score is None or score < best_score:
+                best = cand
+                best_score = score
+        return best
+
+    # Build embeds using the same builder as member-status-logs.
+    embeds: list[discord.Embed] = []
+    found = 0
+    async for m in src.history(limit=count):
+        found += 1
+        info = extract_native_whop_card_debug(m) or {}
+        summary1 = info.get("summary") if isinstance(info.get("summary"), dict) else {}
+        pair = _best_pair(m, info)
+        info2 = (pair or {}).get("info") if isinstance((pair or {}).get("info"), dict) else {}
+        summary2 = info2.get("summary") if isinstance(info2.get("summary"), dict) else {}
+        summary = _merge_briefs(summary1, summary2)
+        # If we have a membership_id, fill missing staff fields via Whop API to match production cards better.
+        mid = str(info.get("membership_id") or "").strip() or str(info2.get("membership_id") or "").strip()
+        if mid and whop_api_client and bool(WHOP_API_CONFIG.get("enable_enrichment", True)):
+            api_brief = await _fetch_whop_brief_by_membership_id(mid)
+            if isinstance(api_brief, dict) and api_brief:
+                summary = _merge_briefs(summary, api_brief)
+        title = str(info.get("title") or "").strip() or "Whop card"
+        jump = str(getattr(m, "jump_url", "") or "").strip()
+
+        did_s = str(info.get("discord_id") or "").strip() or str(info2.get("discord_id") or "").strip()
+        try:
+            did = int(did_s) if did_s.isdigit() else 0
+        except Exception:
+            did = 0
+
+        member = await _resolve_member(main_guild, did) if did else None
+        event_name = _event_guess(title)
+        if member:
+            relevant = coerce_role_ids(ROLE_TRIGGER, WELCOME_ROLE_ID, ROLE_CANCEL_A, ROLE_CANCEL_B)
+            access = access_roles_plain(member, relevant)
+            e = _build_member_status_detailed_embed(
+                title=f"[SMOKE] {title}",
+                member=member,
+                access_roles=access,
+                color=0x5865F2,
+                discord_kv=[
+                    ("event", event_name),
+                    ("source_primary_channel_id", str(src.id)),
+                    ("source_primary_message_id", str(m.id)),
+                    ("source_primary_jump_url", jump),
+                    ("source_secondary_channel_id", str(getattr(src2, "id", "") or "") if src2 else ""),
+                    ("source_secondary_message_id", str(getattr((pair or {}).get("msg"), "id", "") or "") if pair else ""),
+                ],
+                whop_brief=summary,
+            )
+        else:
+            # Fallback: no member resolvable in the main guild (or no Discord ID on the card).
+            e = discord.Embed(
+                title=f"[SMOKE] {title}",
+                color=0xFEE75C,
+                timestamp=datetime.now(timezone.utc),
+            )
+            e.add_field(name="Source", value=f"{src.name} (`{src.id}`)", inline=False)
+            e.add_field(name="Message", value=f"`{m.id}`" + (f"\n{jump}" if jump else ""), inline=False)
+            e.add_field(name="Discord ID", value=(f"`{did_s}`" if did_s else "—"), inline=True)
+            e.add_field(name="Total Spent", value=str((summary or {}).get("total_spent") or "—"), inline=True)
+            e.add_field(name="Whop Dashboard", value=str((summary or {}).get("dashboard_url") or "—"), inline=True)
+            e.set_footer(text="RSCheckerbot • Startup Whop Smoke Test")
+
+        embeds.append(e)
+
+        # Also post minimal "case" embeds into the Neo test server's case channels (best-effort).
+        if member and isinstance(out_guild, discord.Guild):
+            try:
+                if event_name == "payment.failed" and isinstance(out_payment_ch, discord.TextChannel):
+                    mini = _build_case_minimal_embed(
+                        title=f"[SMOKE] {title}",
+                        member=member,
+                        access_roles=access_roles_plain(member, coerce_role_ids(ROLE_TRIGGER, WELCOME_ROLE_ID, ROLE_CANCEL_A, ROLE_CANCEL_B)),
+                        whop_brief=summary,
+                        color=0xED4245,
+                        event_kind="payment_failed",
+                    )
+                    with suppress(Exception):
+                        await out_payment_ch.send(embed=mini, allowed_mentions=discord.AllowedMentions.none())
+                elif event_name == "cancellation_scheduled" and isinstance(out_cancel_ch, discord.TextChannel):
+                    mini = _build_case_minimal_embed(
+                        title=f"[SMOKE] {title}",
+                        member=member,
+                        access_roles=access_roles_plain(member, coerce_role_ids(ROLE_TRIGGER, WELCOME_ROLE_ID, ROLE_CANCEL_A, ROLE_CANCEL_B)),
+                        whop_brief=summary,
+                        color=0xFEE75C,
+                        event_kind="cancellation_scheduled",
+                    )
+                    with suppress(Exception):
+                        await out_cancel_ch.send(embed=mini, allowed_mentions=discord.AllowedMentions.none())
+            except Exception:
+                pass
+
+    header = (
+        f"RSCheckerbot startup Whop smoke test: last {count} message(s)\n"
+        f"primary: {src.name} (`{src.id}`)\n"
+        f"secondary: {getattr(src2, 'name', '—')} (`{getattr(src2, 'id', '—')}`)\n"
+        f"dest: {getattr(out.guild, 'name', 'unknown')} / #{out.name} (`{out.id}`)\n"
+        f"case_channels: #{PAYMENT_FAILURE_CHANNEL_NAME}, #{MEMBER_CANCELLATION_CHANNEL_NAME}"
+    )
+    if found == 0:
+        header += "\n(no messages found in source history)"
+
+    # One message with up to 10 embeds (we cap count to <=10 in config parsing).
+    try:
+        sent = await out.send(content=header[:1900], embeds=embeds[:10], allowed_mentions=discord.AllowedMentions.none())
+        log.info(
+            "[BOOT][WhopSmoke] posted %s embed(s) to %s/#%s (%s) msg_id=%s",
+            len(embeds),
+            getattr(out.guild, "id", ""),
+            getattr(out, "name", ""),
+            getattr(out, "id", ""),
+            getattr(sent, "id", ""),
+        )
+    except Exception as e:
+        log.warning(
+            "[BOOT][WhopSmoke] FAILED to post to %s/#%s (%s): %s",
+            getattr(out.guild, "id", ""),
+            getattr(out, "name", ""),
+            getattr(out, "id", ""),
+            str(e)[:240],
+        )
+
+
+async def _startup_canceling_members_snapshot() -> None:
+    """On startup, query Whop API for memberships that are canceling/cancel_at_period_end and post a snapshot to Neo."""
+    try:
+        if not REPORTING_CONFIG.get("startup_canceling_snapshot_enabled"):
+            return
+        if not whop_api_client:
+            return
+
+        # Output channel (Neo): reuse the same config used for cancellation reminders mirror.
+        try:
+            out_gid = int(REPORTING_CONFIG.get("cancel_reminders_output_guild_id") or 0)
+        except Exception:
+            out_gid = 0
+        out_name = str(REPORTING_CONFIG.get("cancel_reminders_output_channel_name") or "").strip()
+        if not out_gid or not out_name:
+            return
+
+        g = bot.get_guild(int(out_gid))
+        if not g:
+            log.warning("[BOOT][Canceling] output guild not found: %s", out_gid)
+            return
+
+        ch = await _get_or_create_text_channel(g, name=out_name, category_id=STAFF_ALERTS_CATEGORY_ID)
+        if not isinstance(ch, discord.TextChannel):
+            log.warning("[BOOT][Canceling] output channel not found/creatable: %s", out_name)
+            return
+
+        max_pages = int(REPORTING_CONFIG.get("startup_canceling_snapshot_max_pages") or 0) or 3
+        per_page = int(REPORTING_CONFIG.get("startup_canceling_snapshot_per_page") or 0) or 100
+        max_rows = int(REPORTING_CONFIG.get("startup_canceling_snapshot_max_rows") or 0) or 50
+        min_spent = float(REPORTING_CONFIG.get("startup_canceling_snapshot_min_total_spent_usd") or 0.0)
+        log_each = bool(REPORTING_CONFIG.get("startup_canceling_snapshot_log_each_member", False))
+        per_member_msgs = bool(REPORTING_CONFIG.get("startup_canceling_snapshot_one_message_per_member", False))
+        fill_total_via_payments = bool(REPORTING_CONFIG.get("startup_canceling_snapshot_fill_total_spend_via_payments", False))
+        attach_csv = bool(REPORTING_CONFIG.get("startup_canceling_snapshot_attach_csv", False))
+        try:
+            pay_sleep_ms = int(REPORTING_CONFIG.get("startup_canceling_snapshot_payments_sleep_ms", 120))
+        except Exception:
+            pay_sleep_ms = 120
+        pay_sleep_ms = max(0, min(pay_sleep_ms, 2000))
+
+        # Prefer Whop's official "canceling" status filter (matches dashboard UI).
+        log.info("[BOOT][Canceling] scanning Whop memberships (statuses=canceling pages=%s per_page=%s)", max_pages, per_page)
+        rows: list[dict] = []
+
+        # Best-effort enrichment caches (avoid repeat API hits per membership/member).
+        membership_cache: dict[str, dict] = {}
+        member_cache: dict[str, dict] = {}
+        src_guild = bot.get_guild(int(GUILD_ID)) if str(GUILD_ID or "").strip().isdigit() else None
+
+        def _extract_member_id(m: dict) -> str:
+            """Extract mber_... from membership/member objects (best-effort)."""
+            if not isinstance(m, dict):
+                return ""
+            mm = m.get("member")
+            if isinstance(mm, str) and mm.strip().startswith("mber_"):
+                return mm.strip()
+            if isinstance(mm, dict):
+                mid = str(mm.get("id") or mm.get("member_id") or "").strip()
+                if mid.startswith("mber_"):
+                    return mid
+            mid2 = str(m.get("member_id") or "").strip()
+            if mid2.startswith("mber_"):
+                return mid2
+            return ""
+
+        def _extract_total_spend_raw(obj: object) -> object:
+            if not isinstance(obj, dict):
+                return ""
+            return (
+                obj.get("total_spent")
+                or obj.get("total_spent_usd")
+                or obj.get("total_spend")
+                or obj.get("total_spend_usd")
+                or ((obj.get("user") or {}).get("total_spent") if isinstance(obj.get("user"), dict) else "")
+                or ((obj.get("user") or {}).get("total_spend") if isinstance(obj.get("user"), dict) else "")
+            )
+
+        def _usd_float_maybe_cents(v: object) -> float:
+            """Parse USD amount; treat large integers as cents (best-effort)."""
+            try:
+                if v is None or v == "" or isinstance(v, bool):
+                    return 0.0
+                # Objects like {"amount": 5260} may be cents.
+                if isinstance(v, dict):
+                    for k in ("amount", "total", "paid_amount", "value", "usd", "usd_amount"):
+                        if k in v:
+                            return _usd_float_maybe_cents(v.get(k))
+                    return 0.0
+                if isinstance(v, (int, float)):
+                    num = float(v)
+                    # Heuristic: treat values >= 1000 with no decimals as cents.
+                    if abs(num) >= 1000 and float(int(num)) == float(num):
+                        return num / 100.0
+                    return num
+                raw_s = str(v).strip()
+                if not raw_s:
+                    return 0.0
+                s = raw_s.replace("$", "").replace(",", "")
+                cleaned = "".join(ch for ch in s if ch.isdigit() or ch in ".-")
+                if not cleaned:
+                    return 0.0
+                # If it's a big integer-like string (no decimal), assume cents.
+                if "." not in cleaned and cleaned.lstrip("-").isdigit():
+                    n = float(cleaned)
+                    return (n / 100.0) if abs(n) >= 1000 else n
+                # If it's a large integer-ish float (e.g. "5260.0"), also treat as cents.
+                n2 = float(cleaned)
+                if abs(n2) >= 1000 and float(int(n2)) == float(n2):
+                    return n2 / 100.0
+                return n2
+            except Exception:
+                return 0.0
+
+        def _fmt_usd(v: object) -> str:
+            amt = float(_usd_float_maybe_cents(v))
+            return f"${amt:.2f}"
+
+        async def _total_spend_from_payments(mid: str) -> str:
+            """Compute total spend from successful payments (best-effort)."""
+            mem_id = str(mid or "").strip()
+            if not mem_id:
+                return ""
+            try:
+                pays = await whop_api_client.get_payments_for_membership(mem_id)
+            except Exception:
+                pays = []
+            total = 0.0
+            for p in (pays or []):
+                if not isinstance(p, dict):
+                    continue
+                st = str(p.get("status") or "").strip().lower()
+                if st not in {"succeeded", "paid", "successful", "success"}:
+                    continue
+                amt_raw = (
+                    p.get("amount")
+                    or p.get("amount_usd")
+                    or p.get("paid_amount")
+                    or p.get("paid_amount_usd")
+                    or p.get("total")
+                    or p.get("total_usd")
+                )
+                try:
+                    total += float(_usd_float_maybe_cents(amt_raw))
+                except Exception:
+                    continue
+            return f"${total:.2f}"
+
+        after: str | None = None
+        scanned_pages = 0
+
+        # Local identity cache: email -> discord_id (fast + no Discord history scan).
+        identity_cache: dict = {}
+        with suppress(Exception):
+            identity_cache = load_json(BASE_DIR / "whop_identity_cache.json")
+        if not isinstance(identity_cache, dict):
+            identity_cache = {}
+
+        # Build a quick email->discord_id index from whop-logs (one history scan, rate-limit friendly).
+        email_to_did: dict[str, int] = {}
+        try:
+            lim = int(WHOP_API_CONFIG.get("logs_lookup_limit", 50))
+        except Exception:
+            lim = 50
+        lim = max(10, min(lim, 250))
+        try:
+            import re as _re
+
+            cid = int(WHOP_LOGS_CHANNEL_ID)
+            ch_logs = bot.get_channel(cid)
+            if ch_logs is None:
+                ch_logs = await bot.fetch_channel(cid)
+            if isinstance(ch_logs, discord.TextChannel):
+                async for m in ch_logs.history(limit=lim):
+                    if not m.embeds:
+                        continue
+                    e0 = m.embeds[0]
+                    fields = getattr(e0, "fields", None) or []
+                    blob = " ".join(
+                        [
+                            str(getattr(e0, "title", "") or ""),
+                            str(getattr(e0, "description", "") or ""),
+                        ]
+                        + [f"{getattr(f,'name','')}: {getattr(f,'value','')}" for f in fields]
+                    )
+                    mm = _re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", blob)
+                    did_m = _re.search(r"(\d{17,19})", blob)
+                    if mm and did_m:
+                        em = mm.group(1).strip().lower()
+                        did_i = int(did_m.group(1))
+                        if em and did_i:
+                            email_to_did[em] = did_i
+            else:
+                log.warning("[BOOT][Canceling] cannot read whop-logs history (channel not text): %s", str(type(ch_logs)))
+        except Exception as ex:
+            log.warning("[BOOT][Canceling] cannot read whop-logs history: %s", str(ex)[:240])
+
+        # Build a quick membership_id/email -> total_spent index from whop-membership-logs (last N cards).
+        mid_to_spend: dict[str, str] = {}
+        email_to_spend: dict[str, str] = {}
+        try:
+            import re as _re
+
+            cid = int(WHOP_WEBHOOK_CHANNEL_ID)
+            ch_memlogs = bot.get_channel(cid)
+            if ch_memlogs is None:
+                ch_memlogs = await bot.fetch_channel(cid)
+            if isinstance(ch_memlogs, discord.TextChannel):
+                async for m in ch_memlogs.history(limit=lim):
+                    if not m.embeds:
+                        continue
+                    e0 = m.embeds[0]
+                    fields = getattr(e0, "fields", None) or []
+                    blob = " ".join(
+                        [
+                            str(getattr(e0, "title", "") or ""),
+                            str(getattr(e0, "description", "") or ""),
+                        ]
+                        + [f"{getattr(f,'name','')}: {getattr(f,'value','')}" for f in fields]
+                    )
+                    mm = _re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", blob)
+                    mid_m = _re.search(r"(mem_[A-Za-z0-9]+)", blob)
+                    spent_m = _re.search(r"total\s+spen[dt]\s*:\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)", blob, _re.IGNORECASE)
+
+                    em = mm.group(1).strip().lower() if mm else ""
+                    mid_s = mid_m.group(1).strip() if mid_m else ""
+                    spent_s = ""
+                    if spent_m:
+                        try:
+                            spent_s = f"${float(spent_m.group(1).replace(',', '')):.2f}"
+                        except Exception:
+                            spent_s = ""
+                    if spent_s:
+                        if mid_s:
+                            mid_to_spend[mid_s] = spent_s
+                        if em:
+                            email_to_spend[em] = spent_s
+            else:
+                log.warning("[BOOT][Canceling] cannot read whop-membership-logs history (channel not text): %s", str(type(ch_memlogs)))
+        except Exception as ex:
+            log.warning("[BOOT][Canceling] cannot read whop-membership-logs history: %s", str(ex)[:240])
+
+        log.info(
+            "[BOOT][Canceling] index whop_logs emails=%s memlogs mids=%s memlogs emails=%s",
+            len(email_to_did),
+            len(mid_to_spend),
+            len(email_to_spend),
+        )
+
+        # Live progress message in Neo (edited as we scan/post).
+        progress_msg: discord.Message | None = None
+        try:
+            txt = _progress_text(
+                label="Canceling Snapshot",
+                step=(1, 1),
+                done=0,
+                total=max_rows,
+                stats={"pages": f"{scanned_pages}/{max_pages}", "rows": 0, "errors": 0},
+                stage="start",
+            )
+            progress_msg = await ch.send(content=txt, allowed_mentions=discord.AllowedMentions.none())
+        except Exception:
+            progress_msg = None
+
+        while scanned_pages < max_pages and len(rows) < max_rows:
+            batch, page_info = await whop_api_client.list_memberships(
+                first=per_page,
+                after=after,
+                params={"statuses[]": "canceling", "order": "canceled_at", "direction": "asc"},
+            )
+            if not batch:
+                break
+            log.info("[BOOT][Canceling] page=%s got=%s has_next=%s", scanned_pages + 1, len(batch), bool(page_info.get("has_next_page") if isinstance(page_info, dict) else False))
+
+            for rec in batch:
+                if not isinstance(rec, dict):
+                    continue
+                mship = _whop_report_normalize_membership(rec)
+                if not isinstance(mship, dict):
+                    continue
+
+                status_l = str(mship.get("status") or "").strip().lower()
+                cape = (mship.get("cancel_at_period_end") is True) or _whop_report_norm_bool(mship.get("cancel_at_period_end"))
+
+                mid = _whop_report_membership_id(mship)
+                mship_full: dict | None = None
+                if mid:
+                    if mid not in membership_cache:
+                        membership_cache[mid] = (await whop_api_client.get_membership_by_id(mid)) or {}
+                    mship_full = membership_cache.get(mid) if isinstance(membership_cache.get(mid), dict) and membership_cache.get(mid) else None
+
+                # Use fuller membership object when available to fill missing totals/IDs.
+                m_use = mship_full if isinstance(mship_full, dict) and mship_full else mship
+
+                # Best-effort resolve Discord ID and email:
+                did = _whop_report_extract_discord_id(m_use) or 0
+                email = _whop_report_extract_email(m_use)
+                did_src = "membership" if did else ""
+
+                # Preferred fallback: identity cache by email.
+                if (not did) and email:
+                    rec0 = identity_cache.get(str(email).strip().lower() or "")
+                    if isinstance(rec0, dict):
+                        did_s = str(rec0.get("discord_id") or "").strip()
+                        if did_s.isdigit():
+                            did = int(did_s)
+                            did_src = "identity_cache"
+
+                # If missing Discord ID, try member record via mber_... (often has connections).
+                mber_id = _extract_member_id(m_use)
+                if (not did) and mber_id:
+                    if mber_id not in member_cache:
+                        member_cache[mber_id] = (await whop_api_client.get_member_by_id(mber_id)) or {}
+                    mrec = member_cache.get(mber_id) if isinstance(member_cache.get(mber_id), dict) else None
+                    if isinstance(mrec, dict) and mrec:
+                        raw = extract_discord_id_from_whop_member_record(mrec)
+                        if str(raw or "").strip().isdigit():
+                            did = int(str(raw).strip())
+                            did_src = "member_api"
+                        if not email:
+                            # member record usually has user.email
+                            u = mrec.get("user")
+                            if isinstance(u, dict):
+                                email = str(u.get("email") or "").strip()
+
+                # Final fallback (no API): use whop-logs email->discord_id index.
+                if (not did) and email:
+                    did2 = email_to_did.get(str(email).strip().lower() or "")
+                    if isinstance(did2, int) and did2:
+                        did = int(did2)
+                        did_src = "whop_logs"
+
+                # Total spend: prefer API-provided totals if present; fall back to member record.
+                total_raw = _extract_total_spend_raw(m_use)
+                if (not str(total_raw or "").strip()) and mber_id:
+                    mrec = member_cache.get(mber_id) if isinstance(member_cache.get(mber_id), dict) else None
+                    if isinstance(mrec, dict) and mrec:
+                        total_raw = _extract_total_spend_raw(mrec) or _extract_total_spend_raw(mrec.get("user") if isinstance(mrec.get("user"), dict) else {})
+                total_spent_s = ""
+                spend_src = ""
+                if str(total_raw or "").strip():
+                    total_spent_s = _fmt_usd(total_raw)
+                    spend_src = "membership"
+
+                # Preferred fallback: native membership cache keyed by membership_id.
+                if (not total_spent_s) and mid:
+                    with suppress(Exception):
+                        nsum = _get_native_summary_by_mid(mid)
+                        if isinstance(nsum, dict) and nsum:
+                            n_spent = str(nsum.get("total_spent") or "").strip()
+                            if n_spent:
+                                total_spent_s = _fmt_usd(n_spent)
+                                spend_src = "native_cache"
+                # Use memlogs mapping if available (fast, no extra API).
+                if (not total_spent_s) and mid and mid in mid_to_spend:
+                    total_spent_s = str(mid_to_spend.get(mid) or "").strip()
+                    if total_spent_s:
+                        spend_src = "whop_membership_logs"
+                if (not total_spent_s) and email:
+                    ekey = str(email).strip().lower()
+                    if ekey in email_to_spend:
+                        total_spent_s = str(email_to_spend.get(ekey) or "").strip()
+                        if total_spent_s:
+                            spend_src = "whop_membership_logs"
+                if (not total_spent_s) and fill_total_via_payments and mid:
+                    # Slow but accurate fallback (startup scan only).
+                    try:
+                        total_spent_s = await _total_spend_from_payments(mid)
+                    except Exception:
+                        total_spent_s = ""
+                    if pay_sleep_ms:
+                        await asyncio.sleep(float(pay_sleep_ms) / 1000.0)
+                    if total_spent_s:
+                        spend_src = "payments"
+
+                # Whop UI always shows a number; default to $0.00 if unknown.
+                if not total_spent_s:
+                    total_spent_s = "$0.00"
+                    spend_src = "default_0"
+
+                # Build brief from membership (for dashboard/manage links). Override total_spent with enriched value if we found it.
+                brief = _whop_report_brief_from_membership(m_use, api_client=whop_api_client)
+                if total_spent_s:
+                    brief["total_spent"] = total_spent_s
+
+                spent = usd_amount(brief.get("total_spent"))
+                if float(spent) < float(min_spent):
+                    continue
+
+                end_dt = _access_end_dt_from_membership(m_use)
+                # Best-effort user + product columns (match Whop UI list).
+                user_name = ""
+                try:
+                    u = m_use.get("user")
+                    if isinstance(u, dict):
+                        user_name = str(u.get("name") or u.get("username") or "").strip()
+                    elif isinstance(u, str):
+                        user_name = u.strip()
+                except Exception:
+                    user_name = ""
+                if not user_name:
+                    user_name = str(email.split("@", 1)[0] if str(email or "").strip() else "").strip()
+                product_title = ""
+                try:
+                    prod = m_use.get("product")
+                    if isinstance(prod, dict):
+                        product_title = str(prod.get("title") or "").strip()
+                except Exception:
+                    product_title = ""
+                if not product_title:
+                    try:
+                        ap = m_use.get("access_pass")
+                        if isinstance(ap, dict):
+                            product_title = str(ap.get("title") or "").strip()
+                    except Exception:
+                        product_title = ""
+
+                # Joined timestamps (best-effort)
+                first_joined_dt = _whop_report_pick_dt(m_use, ["member", "created_at", "createdAt", "created_on", "date_joined"])
+                joined_dt = _whop_report_pick_dt(m_use, ["date_joined", "date_joined_at", "created_at", "createdAt", "created_on"])
+                trial_end_dt = _whop_report_pick_dt(m_use, ["trial_end", "trial_end_at", "trial_ends_at", "trial_end_on"])
+
+                rows.append(
+                    {
+                        "discord_id": int(did) if did else 0,
+                        "email": str(email or "").strip(),
+                        "membership_id": str(mid or "").strip(),
+                        "status": status_l or "—",
+                        "cancel_at_period_end": bool(cape),
+                        "ends_at": end_dt,
+                        "total_spent": str((brief.get("total_spent") or total_spent_s) or "").strip(),
+                        "user_name": user_name,
+                        "product_title": product_title,
+                        "first_joined_at": first_joined_dt,
+                        "joined_at": joined_dt,
+                        "trial_end_at": trial_end_dt,
+                        "dashboard_url": str(brief.get("dashboard_url") or "").strip(),
+                        "manage_url": str(brief.get("manage_url") or "").strip(),
+                    }
+                )
+                if len(rows) >= max_rows:
+                    break
+
+                if log_each:
+                    log.info(
+                        "[BOOT][Canceling][row] email=%s did=%s did_src=%s mid=%s mber=%s status=%s cape=%s end=%s spend=%s spend_src=%s source=%s",
+                        str(email or ""),
+                        str(did or ""),
+                        str(did_src or ""),
+                        str(mid or ""),
+                        str(mber_id or ""),
+                        str(status_l or ""),
+                        "true" if bool(cape) else "false",
+                        str(end_dt.isoformat() if isinstance(end_dt, datetime) else ""),
+                        str((brief.get("total_spent") or total_spent_s or "").strip()),
+                        str(spend_src or ""),
+                        "api" if mship_full else "list",
+                    )
+
+            scanned_pages += 1
+            after = str(page_info.get("end_cursor") or "") if isinstance(page_info, dict) else ""
+            has_next = bool(page_info.get("has_next_page")) if isinstance(page_info, dict) else False
+            if not has_next or not after:
+                break
+
+            if progress_msg:
+                with suppress(Exception):
+                    txt = _progress_text(
+                        label="Canceling Snapshot",
+                        step=(1, 1),
+                        done=min(len(rows), max_rows),
+                        total=max_rows,
+                        stats={"pages": f"{scanned_pages}/{max_pages}", "rows": len(rows), "errors": 0},
+                        stage="scan",
+                    )
+                    await progress_msg.edit(content=txt)
+
+        # Sort by soonest end date.
+        def _sort_key(r: dict) -> float:
+            dt = r.get("ends_at")
+            if isinstance(dt, datetime):
+                return float(dt.timestamp())
+            return 9e18
+
+        rows.sort(key=_sort_key)
+
+        # Render (embed layout aligned to Whop table columns).
+        now = datetime.now(timezone.utc)
+
+        def _fmt_delta(dt: datetime | None, *, prefix: str) -> str:
+            if not isinstance(dt, datetime):
+                return "—"
+            delta = (dt - now).total_seconds()
+            if delta <= 0:
+                return "—"
+            days = int(delta // 86400)
+            hours = int((delta % 86400) // 3600)
+            if days > 0:
+                return f"{prefix} in {days}d {hours}h"
+            return f"{prefix} in {hours}h"
+
+        def _ts_rel(dt: datetime | None) -> str:
+            if not isinstance(dt, datetime):
+                return "—"
+            return f"<t:{int(dt.timestamp())}:R>"
+
+        # Header embed
+        header = discord.Embed(
+            title="Canceling (Whop) — Snapshot",
+            description=f"Count: **{len(rows[:max_rows])}** • Source: Whop API `/memberships` filter `statuses[]=canceling`",
+            color=0xFEE75C,
+            timestamp=datetime.now(timezone.utc),
+        )
+        header.set_footer(text="RSCheckerbot • Whop API")
+        embeds: list[discord.Embed] = []
+
+        # Optional CSV attachment
+        file_obj: discord.File | None = None
+        if attach_csv and rows:
+            try:
+                buf = io.StringIO()
+                w = csv.DictWriter(
+                    buf,
+                    fieldnames=[
+                        "user",
+                        "email",
+                        "discord_id",
+                        "membership_id",
+                        "status",
+                        "cancel_at_period_end",
+                        "ends_at",
+                        "total_spend",
+                        "dashboard_url",
+                        "manage_url",
+                    ],
+                )
+                w.writeheader()
+                for r in rows[:max_rows]:
+                    ends = r.get("ends_at")
+                    ends_s = ends.isoformat() if isinstance(ends, datetime) else ""
+                    w.writerow(
+                        {
+                            "user": str(r.get("user_name") or ""),
+                            "email": str(r.get("email") or ""),
+                            "discord_id": str(r.get("discord_id") or ""),
+                            "membership_id": str(r.get("membership_id") or ""),
+                            "status": str(r.get("status") or ""),
+                            "cancel_at_period_end": "true" if bool(r.get("cancel_at_period_end")) else "false",
+                            "ends_at": ends_s,
+                            "total_spend": str(r.get("total_spent") or ""),
+                            "dashboard_url": str(r.get("dashboard_url") or ""),
+                            "manage_url": str(r.get("manage_url") or ""),
+                        }
+                    )
+                data = buf.getvalue().encode("utf-8")
+                file_obj = discord.File(fp=io.BytesIO(data), filename="canceling-snapshot.csv")
+            except Exception:
+                file_obj = None
+
+        # Send header (with optional file) first.
+        with suppress(Exception):
+            if file_obj:
+                await ch.send(embed=header, file=file_obj, allowed_mentions=discord.AllowedMentions.none())
+            else:
+                await ch.send(embed=header, allowed_mentions=discord.AllowedMentions.none())
+
+        # If configured, post one embed per member and stop (avoid bundled mega-embeds).
+        if per_member_msgs:
+            sent_msgs = 0
+            last_err: Exception | None = None
+            for r in rows[:max_rows]:
+                user_name = str(r.get("user_name") or "").strip() or "Member"
+                email_s = str(r.get("email") or "").strip() or "—"
+                product_s = str(r.get("product_title") or "").strip() or "—"
+                spent_s = str(r.get("total_spent") or "").strip() or "—"
+                did = int(r.get("discord_id") or 0)
+                mid = str(r.get("membership_id") or "").strip() or "—"
+                status_l = str(r.get("status") or "").strip().lower() or "—"
+                cape = bool(r.get("cancel_at_period_end"))
+                trial_end = r.get("trial_end_at") if isinstance(r.get("trial_end_at"), datetime) else None
+                end_dt = r.get("ends_at") if isinstance(r.get("ends_at"), datetime) else None
+
+                # Display status: cancels for canceling/cape, else trial ends for trialing.
+                if cape or status_l == "canceling":
+                    status_disp = _fmt_delta(end_dt, prefix="Cancels") if end_dt else "Cancels —"
+                elif status_l in {"trialing", "trial", "pending"} or trial_end:
+                    status_disp = _fmt_delta(trial_end or end_dt, prefix="Trial ends")
+                else:
+                    status_disp = status_l or "—"
+
+                dash_url = str(r.get("dashboard_url") or "").strip()
+                manage_url = str(r.get("manage_url") or "").strip()
+
+                e = discord.Embed(
+                    title=f"Canceling — {user_name}"[:256],
+                    color=0xFEE75C,
+                    timestamp=datetime.now(timezone.utc),
+                )
+                e.add_field(name="Email", value=email_s[:1024], inline=False)
+                e.add_field(name="Product", value=product_s[:1024], inline=True)
+                e.add_field(name="Status", value=str(status_disp)[:1024], inline=True)
+                e.add_field(name="Total spend", value=spent_s[:1024], inline=True)
+                e.add_field(name="Discord ID", value=(f"`{did}`" if did else "—"), inline=True)
+                e.add_field(name="Membership ID", value=(f"`{mid}`" if mid and mid != "—" else "—"), inline=True)
+                if dash_url:
+                    e.add_field(name="Whop Dashboard", value=dash_url[:1024], inline=False)
+                if manage_url and len(e.fields) < 25:
+                    e.add_field(name="Whop Manage", value=manage_url[:1024], inline=False)
+                e.set_footer(text="RSCheckerbot • Whop API")
+
+                try:
+                    await ch.send(embed=e, allowed_mentions=discord.AllowedMentions.none())
+                    sent_msgs += 1
+                except Exception as ex:
+                    last_err = ex
+                    break
+
+            # Mark progress complete (best-effort).
+            if progress_msg:
+                with suppress(Exception):
+                    txt = _progress_text(
+                        label="Canceling Snapshot",
+                        step=(1, 1),
+                        done=min(len(rows), max_rows),
+                        total=max_rows,
+                        stats={"pages": f"{scanned_pages}/{max_pages}", "rows": len(rows), "msgs": sent_msgs, "errors": 0 if not last_err else 1},
+                        stage="complete" if sent_msgs else "failed",
+                    )
+                    await progress_msg.edit(content=txt)
+
+            if sent_msgs:
+                log.info(
+                    "[BOOT][Canceling] posted snapshot rows=%s msgs=%s to %s/#%s (%s)",
+                    len(rows),
+                    sent_msgs,
+                    getattr(g, "id", ""),
+                    getattr(ch, "name", ""),
+                    getattr(ch, "id", ""),
+                )
+            else:
+                log.warning(
+                    "[BOOT][Canceling] FAILED to post snapshot (rows=%s) to %s/#%s (%s): %s",
+                    len(rows),
+                    getattr(g, "id", ""),
+                    getattr(ch, "name", ""),
+                    getattr(ch, "id", ""),
+                    str(last_err)[:240] if last_err else "unknown error",
+                )
+            return
+
+        def _embed_size(e: discord.Embed) -> int:
+            try:
+                n = len(str(e.title or "")) + len(str(e.description or ""))
+                for f in (e.fields or []):
+                    n += len(str(getattr(f, "name", "") or "")) + len(str(getattr(f, "value", "") or ""))
+                return int(n)
+            except Exception:
+                return 0
+
+        # Discord hard limit is 6000 chars per embed; keep a large safety margin.
+        MAX_EMBED_SIZE = 4800
+
+        def _new_page() -> discord.Embed:
+            p = discord.Embed(
+                title="Canceling Members (details)",
+                color=0xFEE75C,
+                timestamp=datetime.now(timezone.utc),
+            )
+            p.set_footer(text="RSCheckerbot • Whop API")
+            return p
+
+        page = _new_page()
+
+        for r in rows[:max_rows]:
+            user_name = str(r.get("user_name") or "").strip() or "—"
+            email_s = str(r.get("email") or "").strip() or "—"
+            product_s = str(r.get("product_title") or "").strip() or "—"
+            spent_s = str(r.get("total_spent") or "").strip() or "—"
+            did = int(r.get("discord_id") or 0)
+            mid = str(r.get("membership_id") or "").strip() or "—"
+            status_l = str(r.get("status") or "").strip().lower() or "—"
+            cape = bool(r.get("cancel_at_period_end"))
+
+            trial_end = r.get("trial_end_at") if isinstance(r.get("trial_end_at"), datetime) else None
+            end_dt = r.get("ends_at") if isinstance(r.get("ends_at"), datetime) else None
+            # Whop-style status column:
+            # - If Whop says cancel_at_period_end / canceling: show "Cancels …" even if trial fields exist.
+            if cape or status_l == "canceling":
+                status_disp = _fmt_delta(end_dt, prefix="Cancels") if end_dt else "Cancels —"
+            elif status_l in {"trialing", "trial", "pending"} or trial_end:
+                status_disp = _fmt_delta(trial_end or end_dt, prefix="Trial ends")
+            else:
+                status_disp = (status_l or "—")
+
+            first_joined = r.get("first_joined_at") if isinstance(r.get("first_joined_at"), datetime) else None
+            joined_at = r.get("joined_at") if isinstance(r.get("joined_at"), datetime) else None
+
+            contact = []
+            if email_s and email_s != "—":
+                contact.append("email")
+            if did:
+                contact.append("discord")
+            contact_s = " / ".join(contact) if contact else "—"
+
+            val = (
+                f"Email: {email_s}\n"
+                f"Product: {product_s}\n"
+                f"Status: {status_disp}\n"
+                f"Total spend: {spent_s}\n"
+                f"Contact: {contact_s}\n"
+                f"First joined at: {_ts_rel(first_joined)}\n"
+                f"Joined at: {_ts_rel(joined_at)}\n"
+                f"Discord ID: {f'`{did}`' if did else '—'}\n"
+                f"Membership ID: {f'`{mid}`' if mid and mid != '—' else '—'}"
+            )
+            field_name = f"User: **{user_name}**"[:160]
+            field_val = val[:520]
+
+            # Add field, but ensure we don't exceed size limit.
+            page.add_field(name=field_name, value=field_val, inline=False)
+            if _embed_size(page) > MAX_EMBED_SIZE or len(page.fields) >= 25:
+                # Remove and start a new page.
+                with suppress(Exception):
+                    page.remove_field(len(page.fields) - 1)
+                embeds.append(page)
+                page = _new_page()
+                page.add_field(name=field_name, value=field_val, inline=False)
+
+        if page.fields:
+            embeds.append(page)
+
+        if progress_msg:
+            with suppress(Exception):
+                txt = _progress_text(
+                    label="Canceling Snapshot",
+                    step=(1, 1),
+                    done=min(len(rows), max_rows),
+                    total=max_rows,
+                    stats={"pages": f"{scanned_pages}/{max_pages}", "rows": len(rows), "errors": 0},
+                    stage="post",
+                )
+                await progress_msg.edit(content=txt)
+
+        # Legacy: compact paged embeds (kept for backwards compatibility).
+        sent_msgs = 0
+        last_err: Exception | None = None
+        embeds.append(header)
+        for e in embeds:
+            try:
+                await ch.send(embed=e, allowed_mentions=discord.AllowedMentions.none())
+                sent_msgs += 1
+            except Exception as ex:
+                last_err = ex
+                break
+
+        # Mark progress complete (best-effort).
+        if progress_msg:
+            with suppress(Exception):
+                txt = _progress_text(
+                    label="Canceling Snapshot",
+                    step=(1, 1),
+                    done=min(len(rows), max_rows),
+                    total=max_rows,
+                    stats={"pages": f"{scanned_pages}/{max_pages}", "rows": len(rows), "msgs": sent_msgs, "errors": 0 if not last_err else 1},
+                    stage="complete" if sent_msgs else "failed",
+                )
+                await progress_msg.edit(content=txt)
+
+        if sent_msgs:
+            log.info(
+                "[BOOT][Canceling] posted snapshot rows=%s msgs=%s to %s/#%s (%s)",
+                len(rows),
+                sent_msgs,
+                getattr(g, "id", ""),
+                getattr(ch, "name", ""),
+                getattr(ch, "id", ""),
+            )
+        else:
+            log.warning(
+                "[BOOT][Canceling] FAILED to post snapshot (rows=%s) to %s/#%s (%s): %s",
+                len(rows),
+                getattr(g, "id", ""),
+                getattr(ch, "name", ""),
+                getattr(ch, "id", ""),
+                str(last_err)[:240] if last_err else "unknown error",
+            )
+    except Exception:
+        log.exception("[BOOT][Canceling] snapshot failed")
+
+
+async def _run_startup_scans() -> None:
+    """Run startup scans in a single canonical sequence (anti-rate-limit)."""
+    # Small delay so on_ready completes and caches settle.
+    try:
+        delay_s = float(LOG_CONTROLS.get("startup_scans_delay_seconds", 2.0))
+    except Exception:
+        delay_s = 2.0
+    delay_s = max(0.0, min(delay_s, 10.0))
+    if delay_s:
+        await asyncio.sleep(delay_s)
+
+    try:
+        _STARTUP_SCANS_DONE.clear()
+        # Run in order (cheap -> expensive).
+        with suppress(Exception):
+            await _startup_canceling_members_snapshot()
+
+        with suppress(Exception):
+            if WHOP_STARTUP_NATIVE_SMOKETEST_ENABLED:
+                await _startup_native_whop_smoketest()
+
+        with suppress(Exception):
+            if WHOP_NATIVE_BACKFILL_LIMIT > 0:
+                # Backfill can be heavy; keep it last.
+                await _backfill_recent_native_whop_cards()
+    finally:
+        with suppress(Exception):
+            _STARTUP_SCANS_DONE.set()
+
+
+async def _start_whop_sync_job_after_startup() -> None:
+    """Start the Whop membership sync job after a short delay to avoid startup pileups."""
+    if not whop_api_client:
+        return
+    if not WHOP_API_CONFIG.get("enable_sync", True):
+        return
+    # If we're routing output to a different guild (Neo test mode), still allow sync,
+    # but delay it so startup scans can complete first.
+    # Wait for startup scans to complete (plus a small delay).
+    try:
+        delay_s = float(WHOP_API_CONFIG.get("startup_sync_delay_seconds", 20))
+    except Exception:
+        delay_s = 20.0
+    delay_s = max(0.0, min(delay_s, 300.0))
+    with suppress(Exception):
+        await asyncio.wait_for(_STARTUP_SCANS_DONE.wait(), timeout=300.0)
+    if delay_s:
+        await asyncio.sleep(delay_s)
+
+    try:
+        sync_interval = WHOP_API_CONFIG.get("sync_interval_hours", 6)
+        if not sync_whop_memberships.is_running():
+            sync_whop_memberships.change_interval(hours=sync_interval)
+            sync_whop_memberships.start()
+            log.info(f"[Whop Sync] Membership sync job started (every {sync_interval} hours)")
+    except Exception as e:
+        log.warning(f"[Whop Sync] Failed to start sync job: {e}")
 
 
 def _parse_hhmm(s: str) -> tuple[int, int]:
@@ -789,6 +2108,41 @@ async def _run_daily_cancel_reminders(dm_uid: int) -> None:
     e.set_footer(text="RSCheckerbot • Reporting")
     await _dm_user(dm_uid, embed=e)
 
+    # Optional: mirror reminders into a test channel (no pings).
+    try:
+        out_gid = int(REPORTING_CONFIG.get("cancel_reminders_output_guild_id") or 0)
+    except Exception:
+        out_gid = 0
+    out_name = str(REPORTING_CONFIG.get("cancel_reminders_output_channel_name") or "").strip()
+    if out_gid and out_name:
+        g = bot.get_guild(int(out_gid))
+        if g:
+            ch = _find_text_channel_by_name(g, out_name)
+            if ch is None:
+                me = g.me or g.get_member(int(getattr(bot.user, "id", 0) or 0))
+                if me and getattr(me.guild_permissions, "manage_channels", False):
+                    with suppress(Exception):
+                        ch = await g.create_text_channel(name=out_name, reason="RSCheckerbot: cancellation reminders mirror")
+            if isinstance(ch, discord.TextChannel):
+                # Rebuild description without mentions to avoid pings in test server.
+                safe_lines = []
+                for raw in rows:
+                    m = re.search(r"<@(\d{17,19})>", str(raw))
+                    if m:
+                        did = m.group(1)
+                        safe_lines.append(f"- user_id `{did}` ends {raw.split('ends', 1)[-1].strip()}")
+                    else:
+                        safe_lines.append(str(raw))
+                e2 = discord.Embed(
+                    title="Cancellation Reminders (mirror)",
+                    description="\n".join(safe_lines)[:4000],
+                    color=0xFEE75C,
+                    timestamp=datetime.now(timezone.utc),
+                )
+                e2.set_footer(text="RSCheckerbot • Reporting")
+                with suppress(Exception):
+                    await ch.send(embed=e2, allowed_mentions=discord.AllowedMentions.none())
+
 # -----------------------------
 # ENV / CONSTANTS
 # -----------------------------
@@ -901,6 +2255,15 @@ except Exception:
     CID_TTL_MINUTES = 10.0
 VERBOSE_ROLE_LISTS = bool(LOG_CONTROLS.get("verbose_role_lists", False))
 
+# Optional output routing (send staff logs to a different guild, e.g. Neo Test Server).
+try:
+    OUTPUT_GUILD_ID = int(LOG_CONTROLS.get("output_guild_id") or 0)
+except Exception:
+    OUTPUT_GUILD_ID = 0
+OUTPUT_LOG_OTHER_CHANNEL_NAME = str(LOG_CONTROLS.get("output_log_other_channel_name") or "").strip()
+OUTPUT_MEMBER_STATUS_CHANNEL_NAME = str(LOG_CONTROLS.get("output_member_status_channel_name") or "").strip()
+OUTPUT_WHOP_CHANNEL_NAME = str(LOG_CONTROLS.get("output_whop_channel_name") or "").strip()
+
 # Member history controls (bounded storage; human-auditable)
 MEMBER_HISTORY_CONFIG = config.get("member_history", {}) if isinstance(config, dict) else {}
 try:
@@ -940,6 +2303,28 @@ try:
 except Exception:
     WHOP_NATIVE_BACKFILL_MAX_DAYS = 30
 WHOP_NATIVE_BACKFILL_MAX_DAYS = max(0, WHOP_NATIVE_BACKFILL_MAX_DAYS)
+
+# Startup native Whop log smoke test (post parsed summary of last N cards).
+_smoke_enabled_raw = WHOP_ENRICHMENT_CONFIG.get("startup_native_smoketest_enabled", False)
+WHOP_STARTUP_NATIVE_SMOKETEST_ENABLED = bool(_smoke_enabled_raw) if isinstance(_smoke_enabled_raw, bool) else (str(_smoke_enabled_raw).strip().lower() in {"1", "true", "yes", "on"})
+try:
+    WHOP_STARTUP_NATIVE_SMOKETEST_COUNT = int(WHOP_ENRICHMENT_CONFIG.get("startup_native_smoketest_count", 3))
+except Exception:
+    WHOP_STARTUP_NATIVE_SMOKETEST_COUNT = 3
+WHOP_STARTUP_NATIVE_SMOKETEST_COUNT = max(1, min(10, WHOP_STARTUP_NATIVE_SMOKETEST_COUNT))
+try:
+    WHOP_STARTUP_NATIVE_SMOKETEST_SOURCE_CHANNEL_ID = int(WHOP_ENRICHMENT_CONFIG.get("startup_native_smoketest_source_channel_id") or 0)
+except Exception:
+    WHOP_STARTUP_NATIVE_SMOKETEST_SOURCE_CHANNEL_ID = 0
+try:
+    WHOP_STARTUP_NATIVE_SMOKETEST_OUTPUT_CHANNEL_ID = int(WHOP_ENRICHMENT_CONFIG.get("startup_native_smoketest_output_channel_id") or 0)
+except Exception:
+    WHOP_STARTUP_NATIVE_SMOKETEST_OUTPUT_CHANNEL_ID = 0
+try:
+    WHOP_STARTUP_NATIVE_SMOKETEST_OUTPUT_GUILD_ID = int(WHOP_ENRICHMENT_CONFIG.get("startup_native_smoketest_output_guild_id") or 0)
+except Exception:
+    WHOP_STARTUP_NATIVE_SMOKETEST_OUTPUT_GUILD_ID = 0
+WHOP_STARTUP_NATIVE_SMOKETEST_OUTPUT_CHANNEL_NAME = str(WHOP_ENRICHMENT_CONFIG.get("startup_native_smoketest_output_channel_name") or "").strip()
 
 # Files
 QUEUE_FILE = BASE_DIR / "queue.json"
@@ -2022,30 +3407,54 @@ async def log_first(msg: str | None = None, *, embed: discord.Embed | None = Non
             await ch.send(embed=e, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
 
 async def log_other(msg: str | None = None, *, embed: discord.Embed | None = None):
-    ch = bot.get_channel(LOG_OTHER_CHANNEL_ID)
-    if ch:
-        with suppress(Exception):
-            e = embed
-            if e is None:
-                e = discord.Embed(
-                    description=str(msg or "").strip() or "—",
-                    color=0x5865F2,
-                    timestamp=datetime.now(timezone.utc),
-                )
-                nm = str(getattr(ch, "name", "") or "").strip()
-                e.set_footer(text=f"RSCheckerbot • {nm}" if nm else "RSCheckerbot")
-            await ch.send(embed=e, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+    guild = _output_guild()
+    if not guild:
+        return
+
+    ch: discord.TextChannel | None = None
+    # If output guild is the main guild, prefer configured channel ID.
+    if (not OUTPUT_GUILD_ID) or int(getattr(guild, "id", 0) or 0) == int(GUILD_ID or 0):
+        base = bot.get_channel(LOG_OTHER_CHANNEL_ID) if LOG_OTHER_CHANNEL_ID else None
+        ch = base if isinstance(base, discord.TextChannel) else None
+    # Otherwise (or if missing), use channel name override.
+    if ch is None:
+        name = OUTPUT_LOG_OTHER_CHANNEL_NAME or "bot-logs"
+        ch = await _get_or_create_text_channel(guild, name=name)
+    if not ch:
+        return
+
+    with suppress(Exception):
+        e = embed
+        if e is None:
+            e = discord.Embed(
+                description=str(msg or "").strip() or "—",
+                color=0x5865F2,
+                timestamp=datetime.now(timezone.utc),
+            )
+            nm = str(getattr(ch, "name", "") or "").strip()
+            e.set_footer(text=f"RSCheckerbot • {nm}" if nm else "RSCheckerbot")
+        allow = discord.AllowedMentions.none() if int(getattr(guild, "id", 0) or 0) != int(GUILD_ID or 0) else discord.AllowedMentions(users=True, roles=False, everyone=False)
+        await ch.send(embed=e, allowed_mentions=allow)
 
 async def log_role_event(message: str | None = None, *, embed: discord.Embed | None = None):
     await log_other(message, embed=embed)
 
 async def log_whop(msg: str):
     """Log to Whop logs channel (for subscription data from Whop system)"""
-    if WHOP_LOGS_CHANNEL_ID:
-        ch = bot.get_channel(WHOP_LOGS_CHANNEL_ID)
-        if ch:
-            with suppress(Exception):
-                await ch.send(msg)
+    guild = _output_guild()
+    if not guild:
+        return
+    ch: discord.TextChannel | None = None
+    if (not OUTPUT_GUILD_ID) or int(getattr(guild, "id", 0) or 0) == int(GUILD_ID or 0):
+        base = bot.get_channel(WHOP_LOGS_CHANNEL_ID) if WHOP_LOGS_CHANNEL_ID else None
+        ch = base if isinstance(base, discord.TextChannel) else None
+    if ch is None:
+        name = OUTPUT_WHOP_CHANNEL_NAME or "whop-logs"
+        ch = await _get_or_create_text_channel(guild, name=name)
+    if not ch:
+        return
+    with suppress(Exception):
+        await ch.send(str(msg or "")[:1900], allowed_mentions=discord.AllowedMentions.none())
 
 def _find_text_channel_by_name(guild: discord.Guild, name: str) -> discord.TextChannel | None:
     nm = (name or "").strip().lower()
@@ -2054,6 +3463,37 @@ def _find_text_channel_by_name(guild: discord.Guild, name: str) -> discord.TextC
     for ch in guild.text_channels:
         if str(ch.name or "").lower() == nm:
             return ch
+    return None
+
+
+def _output_guild() -> discord.Guild | None:
+    """Guild used for bot output/logging (defaults to main guild)."""
+    gid = int(OUTPUT_GUILD_ID or 0) or int(GUILD_ID or 0)
+    return bot.get_guild(int(gid)) if gid else None
+
+
+async def _get_or_create_text_channel(
+    guild: discord.Guild,
+    *,
+    name: str,
+    category_id: int | None = None,
+) -> discord.TextChannel | None:
+    nm = str(name or "").strip()
+    if not guild or not nm:
+        return None
+    existing = _find_text_channel_by_name(guild, nm)
+    if existing:
+        return existing
+    me = guild.me or guild.get_member(int(getattr(bot.user, "id", 0) or 0))
+    if not me or not getattr(me.guild_permissions, "manage_channels", False):
+        return None
+    category = None
+    if category_id:
+        base = guild.get_channel(int(category_id))
+        category = base if isinstance(base, discord.CategoryChannel) else None
+    with suppress(Exception):
+        created = await guild.create_text_channel(name=nm, category=category, reason="RSCheckerbot: auto-create output channel")
+        return created if isinstance(created, discord.TextChannel) else None
     return None
 
 
@@ -2084,27 +3524,38 @@ async def _ensure_alert_channels(guild: discord.Guild) -> None:
 
 async def log_member_status(msg: str, embed: discord.Embed = None, *, channel_name: str | None = None):
     """Log staff embeds. Defaults to member status logs channel, but can route by channel name."""
-    guild = bot.get_guild(GUILD_ID) if GUILD_ID else None
+    guild = _output_guild()
     if not guild:
         return
 
     ch: discord.TextChannel | None = None
+    is_member_status_target = False
     if channel_name:
         ch = _find_text_channel_by_name(guild, channel_name)
         if ch is None:
             log.warning(f"[Log] Requested channel '{channel_name}' not found; falling back to member_status_logs_channel_id")
-    if ch is None and MEMBER_STATUS_LOGS_CHANNEL_ID:
-        base = bot.get_channel(MEMBER_STATUS_LOGS_CHANNEL_ID)
-        ch = base if isinstance(base, discord.TextChannel) else None
+    else:
+        is_member_status_target = True
+
+    # Member status default: resolve by channel name in the output guild, not by ID from the main guild.
+    if ch is None and is_member_status_target:
+        name = OUTPUT_MEMBER_STATUS_CHANNEL_NAME or "member-status-logs"
+        ch = await _get_or_create_text_channel(guild, name=name, category_id=STAFF_ALERTS_CATEGORY_ID)
+
+    # If a case channel is requested, best-effort ensure they exist in the output guild.
+    if ch is None and channel_name and channel_name in (PAYMENT_FAILURE_CHANNEL_NAME, MEMBER_CANCELLATION_CHANNEL_NAME):
+        with suppress(Exception):
+            await _ensure_alert_channels(guild)
+        ch = _find_text_channel_by_name(guild, channel_name)
 
     if not ch:
         return
 
-    async def _maybe_capture_for_reporting(sent_embed: discord.Embed, *, sent_channel_id: int) -> None:
+    async def _maybe_capture_for_reporting(sent_embed: discord.Embed, *, is_member_status: bool) -> None:
         """Persist only member-status-logs output into the reporting store (bounded)."""
         if not REPORTING_CONFIG.get("enabled"):
             return
-        if not MEMBER_STATUS_LOGS_CHANNEL_ID or int(sent_channel_id) != int(MEMBER_STATUS_LOGS_CHANNEL_ID):
+        if not is_member_status:
             return
         if not (_report_load_store and _report_save_store and _report_prune_store and _report_record_member_status_post):
             return
@@ -2161,10 +3612,11 @@ async def log_member_status(msg: str, embed: discord.Embed = None, *, channel_na
                                 content = f"<@{m.group(1)}>"
                                 break
 
-        # Allow user mentions for clickable member references (no role/everyone mentions).
-        sent = await ch.send(content=(content or ""), embed=embed, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+        # Avoid pings in output-guild mode; allow user mentions only in main guild.
+        allow = discord.AllowedMentions.none() if int(getattr(guild, "id", 0) or 0) != int(GUILD_ID or 0) else discord.AllowedMentions(users=True, roles=False, everyone=False)
+        sent = await ch.send(content=(content or ""), embed=embed, allowed_mentions=allow)
         try:
-            await _maybe_capture_for_reporting(embed, sent_channel_id=int(ch.id))
+            await _maybe_capture_for_reporting(embed, is_member_status=is_member_status_target)
         except Exception:
             pass
         return sent
@@ -2558,7 +4010,14 @@ async def init_http_server():
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", HTTP_SERVER_PORT)
-    await site.start()
+    try:
+        await site.start()
+    except OSError as e:
+        # Common on local dev: another bot already bound the port.
+        log.warning(f"[HTTP Server] Failed to bind port {HTTP_SERVER_PORT}: {e}")
+        with suppress(Exception):
+            await runner.cleanup()
+        return
     log.info(f"HTTP server started on port {HTTP_SERVER_PORT}")
     log.info(f"Whop webhook receiver: http://0.0.0.0:{HTTP_SERVER_PORT}/whop-webhook")
 
@@ -2849,6 +4308,12 @@ async def sync_whop_memberships():
     relinked_count = 0
     would_remove_count = 0
     auto_healed_count = 0
+    checked_with_mid = 0
+    cancel_scheduled_count = 0
+    status_counts: dict[str, int] = {}
+    actual_status_counts: dict[str, int] = {}
+    missing_membership_data = 0
+    report_rows: list[dict[str, str]] = []
     
     # Get all members with Member role
     member_role = guild.get_role(ROLE_CANCEL_A)
@@ -2858,6 +4323,36 @@ async def sync_whop_memberships():
     
     members_to_check = [m for m in guild.members if member_role in m.roles]
     log.info(f"Checking {len(members_to_check)} members with Member role...")
+
+    # Optional: live progress in Neo (single message edited periodically).
+    progress_msg: discord.Message | None = None
+    last_progress_edit = 0.0
+    mirror_ch: discord.TextChannel | None = None
+    try:
+        mirror_enabled = bool(WHOP_API_CONFIG.get("sync_summary_enabled", False))
+    except Exception:
+        mirror_enabled = False
+    try:
+        mirror_gid = int(WHOP_API_CONFIG.get("sync_summary_output_guild_id") or 0) if mirror_enabled else 0
+    except Exception:
+        mirror_gid = 0
+    mirror_name = str(WHOP_API_CONFIG.get("sync_summary_output_channel_name") or "").strip()
+    if mirror_gid and mirror_name:
+        g2 = bot.get_guild(int(mirror_gid))
+        if g2:
+            mirror_ch = await _get_or_create_text_channel(g2, name=mirror_name, category_id=STAFF_ALERTS_CATEGORY_ID)
+            if isinstance(mirror_ch, discord.TextChannel):
+                with suppress(Exception):
+                    txt = _progress_text(
+                        label="Whop Sync",
+                        step=(1, 1),
+                        done=0,
+                        total=len(members_to_check),
+                        stats={"linked": 0, "errors": 0, "would_remove": 0, "removed": 0, "relinked": 0},
+                        stage="start",
+                    )
+                    progress_msg = await mirror_ch.send(content=txt, allowed_mentions=discord.AllowedMentions.none())
+                    last_progress_edit = time.time()
 
     auto_heal_enabled = bool(WHOP_API_CONFIG.get("auto_heal_add_members_role", False))
     # Safety defaults:
@@ -2951,23 +4446,49 @@ async def sync_whop_memberships():
                     return (mid2, m2)
         return ("", {})
     
-    for member in members_to_check:
+    for idx, member in enumerate(members_to_check, start=1):
         try:
             # Check membership status via API (membership_id-based; avoids mismatched users)
             membership_id = _membership_id_from_history(member.id)
             if not membership_id:
                 continue
+            checked_with_mid += 1
             verification = await whop_api_client.verify_membership_status(membership_id, "active")
 
             # Cancellation scheduled signal (active/trialing but cancel_at_period_end=true).
             # This does NOT DM users; it's staff-only visibility (case channel + member status logs).
             membership_data = verification.get("membership_data") if isinstance(verification, dict) else None
+            row_action = "none"
+            row_status = ""
+            row_actual_status = ""
+            row_cape = ""
+            row_renew_end = ""
+            if isinstance(membership_data, dict):
+                row_status = str(membership_data.get("status") or "").strip().lower()
+                row_cape = "true" if (membership_data.get("cancel_at_period_end") is True) else "false"
+                row_renew_end = str(membership_data.get("renewal_period_end") or "").strip()
             if isinstance(membership_data, dict):
                 status_now = str(membership_data.get("status") or "").strip().lower()
+                status_counts[status_now or "unknown"] = int(status_counts.get(status_now or "unknown", 0)) + 1
                 cape_now = membership_data.get("cancel_at_period_end")
                 if cape_now is True and status_now in ("active", "trialing"):
+                    cancel_scheduled_count += 1
+                    if not row_action or row_action == "none":
+                        row_action = "set_to_cancel"
                     if not post_cancel_cards:
                         # Startup/6h sync is allowed to stay silent (report-only mode).
+                        # Still record into report.
+                        report_rows.append(
+                            {
+                                "discord_id": str(member.id),
+                                "membership_id": str(membership_id),
+                                "status": row_status or status_now,
+                                "actual_status": "",
+                                "cancel_at_period_end": row_cape,
+                                "renewal_period_end": row_renew_end,
+                                "action": row_action,
+                            }
+                        )
                         continue
                     # Only emit this alert once per membership per renewal_end per day (prevents spam).
                     renewal_end_key = str(membership_data.get("renewal_period_end") or "").strip()
@@ -3025,6 +4546,9 @@ async def sync_whop_memberships():
             
             if not verification["matches"]:
                 actual_status = verification["actual_status"]
+                st = str(actual_status or "").strip().lower() or "unknown"
+                actual_status_counts[st] = int(actual_status_counts.get(st, 0)) + 1
+                row_actual_status = st
                 
                 # If API says canceled but user has Member role, remove it
                 if actual_status in ("canceled", "completed", "past_due", "unpaid"):
@@ -3087,6 +4611,7 @@ async def sync_whop_memberships():
                                 membership_id=mid2,
                             )
                             relinked_count += 1
+                            row_action = "relinked_keep_access"
                             if not sync_silent:
                                 await log_other(
                                     f"✅ **Whop Sync kept access (newer active membership)** {_fmt_user(member)}\n"
@@ -3109,6 +4634,7 @@ async def sync_whop_memberships():
                         continue
                     if not enforce_removals:
                         would_remove_count += 1
+                        row_action = "would_remove_role"
                         if not sync_silent:
                             await log_other(
                                 f"⚠️ **Whop Sync would remove role (enforcement disabled)** {_fmt_user(member)}\n"
@@ -3128,9 +4654,60 @@ async def sync_whop_memberships():
                             f"   Removed: {_fmt_role(ROLE_CANCEL_A, guild)}"
                         )
                     synced_count += 1
+                    row_action = "removed_role"
         except Exception as e:
             error_count += 1
             log.error(f"Error syncing member {member.id}: {e}")
+            continue
+
+        if membership_data is None:
+            missing_membership_data += 1
+
+        # Record one audit row per checked membership.
+        report_rows.append(
+            {
+                "discord_id": str(member.id),
+                "membership_id": str(membership_id),
+                "status": row_status,
+                "actual_status": row_actual_status,
+                "cancel_at_period_end": row_cape,
+                "renewal_period_end": row_renew_end,
+                "action": row_action,
+            }
+        )
+
+        # Periodic progress (console + Neo progress message).
+        if idx % 50 == 0 or idx == len(members_to_check):
+            log.info(
+                "[Whop Sync] progress %s/%s (linked=%s errors=%s would_remove=%s removed=%s relinked=%s)",
+                idx,
+                len(members_to_check),
+                checked_with_mid,
+                error_count,
+                would_remove_count,
+                synced_count,
+                relinked_count,
+            )
+            if progress_msg and mirror_ch:
+                now_s = time.time()
+                if (now_s - last_progress_edit) >= 10.0:
+                    last_progress_edit = now_s
+                    with suppress(Exception):
+                        txt = _progress_text(
+                            label="Whop Sync",
+                            step=(1, 1),
+                            done=idx,
+                            total=len(members_to_check),
+                            stats={
+                                "linked": checked_with_mid,
+                                "errors": error_count,
+                                "would_remove": would_remove_count,
+                                "removed": synced_count,
+                                "relinked": relinked_count,
+                            },
+                            stage="scan",
+                        )
+                        await progress_msg.edit(content=txt)
 
     # Auto-heal: add Member role for users missing it, when Whop shows active+entitled access and paid (>$1).
     if auto_heal_enabled:
@@ -3277,6 +4854,93 @@ async def sync_whop_memberships():
             f"   Errors: {error_count}"
         )
 
+    # Optional: mirror an accurate sync summary to Neo Test Server (does not affect main guild output).
+    if mirror_ch:
+                # Status rollups are from THIS sync pass.
+                def _c(d: dict[str, int], *keys: str) -> int:
+                    return int(sum(int(d.get(k, 0) or 0) for k in keys))
+
+                users = int(checked_with_mid or 0) or int(len(members_to_check) or 0)
+                active = _c(status_counts, "active")
+                trialing = _c(status_counts, "trialing")
+                canceled = _c(status_counts, "canceled") + _c(actual_status_counts, "canceled", "completed")
+                past_due = _c(status_counts, "past_due", "unpaid") + _c(actual_status_counts, "past_due", "unpaid")
+                churn_pct = (float(canceled) / float(users) * 100.0) if users else 0.0
+
+                e = discord.Embed(
+                    title="Whop Sync Summary (mirror)",
+                    description="Latest Whop sync sweep (members with Member role; membership_id-linked where available).",
+                    color=0x5865F2,
+                    timestamp=datetime.now(timezone.utc),
+                )
+                e.add_field(name="Members with Member role", value=str(len(members_to_check)), inline=True)
+                e.add_field(name="Linked memberships", value=str(checked_with_mid), inline=True)
+                e.add_field(name="Errors", value=str(error_count), inline=True)
+                e.add_field(name="Active", value=str(active), inline=True)
+                e.add_field(name="Trialing", value=str(trialing), inline=True)
+                e.add_field(name="Set to cancel", value=str(cancel_scheduled_count), inline=True)
+                e.add_field(name="Canceled / completed", value=str(canceled), inline=True)
+                e.add_field(name="Past due / unpaid", value=str(past_due), inline=True)
+                e.add_field(name="Churn", value=f"{churn_pct:.2f}%", inline=True)
+                e.add_field(name="Role updates", value=str(synced_count), inline=True)
+                e.add_field(name="Would remove (enforcement disabled)", value=str(would_remove_count), inline=True)
+                e.add_field(name="Relinked", value=str(relinked_count), inline=True)
+                e.add_field(name="Auto-healed", value=str(auto_healed_count), inline=True)
+                e.add_field(name="Missing membership_data", value=str(missing_membership_data), inline=True)
+                e.set_footer(text="RSCheckerbot • Whop Sync")
+                # Optional downloadable report attachment
+                attach = False
+                fmt = ""
+                try:
+                    attach = bool(WHOP_API_CONFIG.get("sync_summary_attach_report", False))
+                except Exception:
+                    attach = False
+                try:
+                    fmt = str(WHOP_API_CONFIG.get("sync_summary_report_format") or "csv").strip().lower()
+                except Exception:
+                    fmt = "csv"
+
+                if attach and report_rows and fmt == "csv":
+                    try:
+                        buf = io.StringIO()
+                        w = csv.DictWriter(
+                            buf,
+                            fieldnames=[
+                                "discord_id",
+                                "membership_id",
+                                "status",
+                                "actual_status",
+                                "cancel_at_period_end",
+                                "renewal_period_end",
+                                "action",
+                            ],
+                        )
+                        w.writeheader()
+                        for r in report_rows:
+                            w.writerow({k: str(r.get(k, "") or "") for k in w.fieldnames})
+                        data = buf.getvalue().encode("utf-8")
+                        f = discord.File(fp=io.BytesIO(data), filename="whop-sync-report.csv")
+                        with suppress(Exception):
+                            if progress_msg:
+                                await progress_msg.edit(embed=discord.Embed(title="Whop Sync — complete", color=0x57F287, timestamp=datetime.now(timezone.utc)))
+                        await mirror_ch.send(embed=e, file=f, allowed_mentions=discord.AllowedMentions.none())
+                    except Exception:
+                        pass
+
+                with suppress(Exception):
+                    if progress_msg:
+                        txt = _progress_text(
+                            label="Whop Sync",
+                            step=(1, 1),
+                            done=len(members_to_check),
+                            total=len(members_to_check),
+                            stats={"linked": checked_with_mid, "errors": error_count},
+                            stage="complete",
+                        )
+                        await progress_msg.edit(content=txt)
+                with suppress(Exception):
+                    await mirror_ch.send(embed=e, allowed_mentions=discord.AllowedMentions.none())
+
 @sync_whop_memberships.error
 async def sync_whop_memberships_error(error):
     await log_other(f"❌ Sync job error: `{error}`")
@@ -3313,8 +4977,9 @@ async def on_ready():
     if guild:
         log.info(f"[Bot] Connected to: {guild.name}")
 
-        # Ensure the two staff alert channels exist (payment-failure + member-cancelation).
-        await _ensure_alert_channels(guild)
+        # Ensure staff alert channels exist (only when writing outputs to this guild).
+        if not OUTPUT_GUILD_ID or int(OUTPUT_GUILD_ID) == int(GUILD_ID):
+            await _ensure_alert_channels(guild)
         
         # Display config information
         log.info("")
@@ -3378,8 +5043,9 @@ async def on_ready():
             else:
                 log.warning(f"⚠️  Invite Channel: Not found (ID: {INVITE_CHANNEL_ID})")
         
-        # Ensure Whop dispute/resolution channels exist (optional, config-driven)
-        await _ensure_whop_resolution_channels(guild)
+        # Ensure Whop dispute/resolution channels exist (only when writing outputs to this guild).
+        if not OUTPUT_GUILD_ID or int(OUTPUT_GUILD_ID) == int(GUILD_ID):
+            await _ensure_whop_resolution_channels(guild)
         
         log.info("-"*60)
         
@@ -3486,9 +5152,8 @@ async def on_ready():
         if WHOP_LOGS_CHANNEL_ID:
             channels.append(f"logs channel {WHOP_LOGS_CHANNEL_ID}")
         log.info(f"[Whop] Webhook handler initialized for {', '.join(channels)}")
-        # Backfill recent native Whop cards into member_history so join/leave cards can display Whop fields.
-        if WHOP_NATIVE_BACKFILL_LIMIT > 0:
-            asyncio.create_task(_backfill_recent_native_whop_cards())
+        # Startup scans can be expensive; run them sequentially in one canonical routine.
+        asyncio.create_task(_run_startup_scans())
     else:
         log.warning("[Whop] Webhook/logs channel IDs not configured - webhook handler disabled")
     
@@ -3501,13 +5166,9 @@ async def on_ready():
     periodic_cleanup.start()
     log.info("[Cleanup] Periodic cleanup scheduled (every 24 hours)")
     
-    # Start Whop membership sync job if enabled
+    # Start Whop membership sync job AFTER startup scans (anti-rate-limit).
     if whop_api_client and WHOP_API_CONFIG.get("enable_sync", True):
-        sync_interval = WHOP_API_CONFIG.get("sync_interval_hours", 6)
-        if not sync_whop_memberships.is_running():
-            sync_whop_memberships.change_interval(hours=sync_interval)
-            sync_whop_memberships.start()
-            log.info(f"[Whop Sync] Membership sync job started (every {sync_interval} hours)")
+        asyncio.create_task(_start_whop_sync_job_after_startup())
 
     # Start reporting loop (weekly report + daily reminders) if enabled
     if REPORTING_CONFIG.get("enabled"):
@@ -3648,6 +5309,49 @@ async def _ensure_whop_resolution_channels(guild: discord.Guild) -> None:
 @bot.event
 async def on_member_join(member: discord.Member):
     if member.guild.id == GUILD_ID and not member.bot:
+        async def _upsert_member_join_card(embed: discord.Embed) -> discord.Message | None:
+            """Prevent duplicate join cards by editing an existing recent one if present."""
+            try:
+                base = bot.get_channel(MEMBER_STATUS_LOGS_CHANNEL_ID) if MEMBER_STATUS_LOGS_CHANNEL_ID else None
+                ch = base if isinstance(base, discord.TextChannel) else None
+                if not ch:
+                    return None
+                me = bot.user
+                if not me:
+                    return None
+                now = datetime.now(timezone.utc)
+                # Look back a small window for the same user+event (multi-process safety).
+                async for m in ch.history(limit=20):
+                    try:
+                        if int(getattr(m.author, "id", 0) or 0) != int(getattr(me, "id", 0) or 0):
+                            continue
+                        if (now - m.created_at).total_seconds() > 180:
+                            break
+                        if not m.embeds:
+                            continue
+                        e0 = m.embeds[0]
+                        t = str(getattr(e0, "title", "") or "")
+                        if "member joined" not in t.lower():
+                            continue
+                        # Match by Discord ID field if present.
+                        did = ""
+                        try:
+                            for f in (getattr(e0, "fields", None) or []):
+                                if str(getattr(f, "name", "") or "").strip().lower() == "discord id":
+                                    did = re.sub(r"[^\d]", "", str(getattr(f, "value", "") or ""))
+                                    break
+                        except Exception:
+                            did = ""
+                        if did and did.isdigit() and int(did) == int(member.id):
+                            with suppress(Exception):
+                                await m.edit(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+                            return m
+                    except Exception:
+                        continue
+            except Exception:
+                return None
+            return None
+
         # Track join event FIRST (before other logic)
         rec = _touch_join(member.id, member)
 
@@ -3742,7 +5446,10 @@ async def on_member_join(member: discord.Member):
                         discord_kv=base_discord_kv,
                         whop_brief=brief_now,
                     )
-                    await log_member_status("", embed=detailed)
+                    # Upsert to avoid duplicates (e.g. multiple instances online).
+                    existing = await _upsert_member_join_card(detailed)
+                    if not existing:
+                        await log_member_status("", embed=detailed)
                 else:
                     pending: dict = {}
                     pending_embed = _build_member_status_detailed_embed(
@@ -3755,7 +5462,10 @@ async def on_member_join(member: discord.Member):
                         discord_kv=base_discord_kv,
                         whop_brief=pending,
                     )
-                    msg = await log_member_status("", embed=pending_embed)
+                    # Upsert to avoid duplicates (e.g. multiple instances online).
+                    msg = await _upsert_member_join_card(pending_embed)
+                    if not msg:
+                        msg = await log_member_status("", embed=pending_embed)
 
                     def _final(brief: dict) -> discord.Embed:
                         return _build_member_status_detailed_embed(
@@ -4828,10 +6538,11 @@ def _whop_report_collect_date_fields(membership: dict) -> list[str]:
 async def _whop_report_find_membership_for_discord_id(discord_id: int, *, max_pages: int = 8) -> dict:
     if not whop_api_client:
         return {}
-    page = 1
-    per_page = 100
-    while page <= max_pages:
-        batch = await whop_api_client.list_memberships(page=page, per_page=per_page)
+    after: str | None = None
+    first = 100
+    scanned = 0
+    while scanned < max_pages:
+        batch, page_info = await whop_api_client.list_memberships(first=first, after=after)
         if not batch:
             break
         for rec in batch:
@@ -4841,9 +6552,11 @@ async def _whop_report_find_membership_for_discord_id(discord_id: int, *, max_pa
             did = _whop_report_extract_discord_id(membership)
             if did and int(did) == int(discord_id):
                 return membership
-        if len(batch) < per_page:
+        scanned += 1
+        after = str(page_info.get("end_cursor") or "") if isinstance(page_info, dict) else ""
+        has_next = bool(page_info.get("has_next_page")) if isinstance(page_info, dict) else False
+        if not has_next or not after:
             break
-        page += 1
     return {}
 
 def _report_mode_label(mode: str) -> str:
@@ -6677,5 +8390,9 @@ if __name__ == "__main__":
 
     if not TOKEN:
         raise RuntimeError("bot_token must be set in config.secrets.json (server-only)")
+
+    # Prevent duplicate event spam when multiple processes start.
+    if not _acquire_single_instance_lock():
+        raise SystemExit(0)
     bot.run(TOKEN)
 

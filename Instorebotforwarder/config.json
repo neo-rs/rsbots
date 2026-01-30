@@ -1,6 +1,14 @@
 {
   "guild_id": 1451275225512546497,
-  "source_channel_ids": [],
+  "source_channel_ids": [
+    1438969997178306661,
+    1435066421133443174,
+    1435985494356918333
+  ],
+  "source_channel_routes": {
+    "1438969997178306661": "deals",
+    "1435985494356918333": "deals"
+  },
   "output_channels": {
     "personal": "1464853876988706969",
     "grocery": "1457129579557949551",
@@ -15,10 +23,17 @@
   "amazon_scrape_timeout_s": 10,
   "amazon_scrape_max_bytes": 600000,
   "amazon_scrape_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "amazon_playwright_scrape_enabled": "auto",
+  "amazon_playwright_timeout_s": 18,
+  "amazon_playwright_headless": true,
+  "amazon_playwright_try_headful_on_block": false,
+  "amazon_playwright_profile_dir": "Instorebotforwarder/playwright_profile",
+  "amazon_delivery_zip": "10001",
   "openai_rephrase_enabled": "auto",
   "openai_model": "gpt-4o-mini",
   "openai_timeout_s": 12,
   "openai_max_chars": 1800,
+  "dedupe_asin_ttl_s": 21600,
   "startup_smoketest_enabled": true,
   "startup_smoketest_count": 3,
   "startup_smoketest_scan_limit_per_channel": 50,

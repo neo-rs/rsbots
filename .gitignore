@@ -131,6 +131,9 @@ Instorebotforwarder/mavely_id_token*.txt
 Instorebotforwarder/playwright_profile/**
 Instorebotforwarder/.playwright/**
 
+# Instorebotforwarder single-instance lock (runtime artifact)
+Instorebotforwarder/.instorebotforwarder.lock
+
 # Virtualenvs
 .venv/
 venv/

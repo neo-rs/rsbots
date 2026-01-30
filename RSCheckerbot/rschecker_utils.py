@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import asyncio
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -92,6 +93,21 @@ def extract_discord_id_from_whop_member_record(rec: dict) -> str:
         if depth > 6:
             return ""
         if isinstance(obj, dict):
+            # Special-case: connection objects often look like {"provider":"discord", ... "user_id":"123..."}
+            try:
+                prov = str(obj.get("provider") or obj.get("service") or "").strip().lower()
+                if prov == "discord":
+                    for k in ("user_id", "id", "uid", "account_id", "snowflake"):
+                        cand = _as_discord_id(obj.get(k))
+                        if cand:
+                            return cand
+                    # Fallback: scan all values in this dict for a discord-like id.
+                    for _k, _v in obj.items():
+                        cand = _as_discord_id(_v)
+                        if cand:
+                            return cand
+            except Exception:
+                pass
             for k, v in obj.items():
                 k_low = str(k or "").lower()
                 ctx = discord_context or ("discord" in k_low)
@@ -122,7 +138,63 @@ def load_json(path: Path) -> dict:
             return {}
         with open(path, "r", encoding="utf-8") as f:
             data = f.read().strip()
-            return {} if not data else json.loads(data)
+            if not data:
+                return {}
+            try:
+                return json.loads(data)
+            except json.JSONDecodeError:
+                # Best-effort salvage for corrupted files (e.g., concatenated JSON objects).
+                # Extract the first complete JSON object/array from the file and parse it.
+                s = data.lstrip()
+                if not s:
+                    return {}
+                start = 0
+                # Find first opening brace/bracket
+                while start < len(s) and s[start] not in "{[":
+                    start += 1
+                if start >= len(s):
+                    return {}
+                open_ch = s[start]
+                close_ch = "}" if open_ch == "{" else "]"
+                depth = 0
+                in_str = False
+                esc = False
+                end_idx = None
+                for i in range(start, len(s)):
+                    ch = s[i]
+                    if in_str:
+                        if esc:
+                            esc = False
+                            continue
+                        if ch == "\\":
+                            esc = True
+                            continue
+                        if ch == '"':
+                            in_str = False
+                        continue
+                    if ch == '"':
+                        in_str = True
+                        continue
+                    if ch == open_ch:
+                        depth += 1
+                    elif ch == close_ch:
+                        depth -= 1
+                        if depth == 0:
+                            end_idx = i + 1
+                            break
+                if end_idx is None:
+                    return {}
+                candidate = s[start:end_idx].strip()
+                if not candidate:
+                    return {}
+                obj = json.loads(candidate)
+                # If we salvaged a dict, rewrite the file cleanly (best-effort).
+                if isinstance(obj, dict):
+                    try:
+                        save_json(path, obj)
+                    except Exception:
+                        pass
+                return obj if isinstance(obj, dict) else {}
     except Exception as e:
         log.error(f"Failed to read {path}: {e}. Treating as empty.")
         return {}
@@ -132,10 +204,32 @@ def save_json(path: Path, data: dict) -> None:
     """Atomic JSON write (tmp + replace)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # Use a unique tmp name to avoid collisions between multiple processes.
+    pid = str(os.getpid())
+    tmp = path.with_suffix(path.suffix + f".tmp.{pid}")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
+    # Windows + OneDrive can transiently lock files; retry a few times.
+    last_err: Exception | None = None
+    for _attempt in range(6):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as e:
+            last_err = e
+            time.sleep(0.05)
+        except OSError as e:
+            last_err = e
+            time.sleep(0.05)
+    # Cleanup tmp on failure (best-effort) then re-raise.
+    try:
+        if tmp.exists():
+            tmp.unlink()
+    except Exception:
+        pass
+    if last_err:
+        raise last_err
+    raise OSError("save_json failed")
 
 
 _JSONL_LOCKS: dict[str, asyncio.Lock] = {}

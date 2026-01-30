@@ -207,6 +207,66 @@ class AmazonDetection:
 class InstorebotForwarder:
     _TEMPLATE_ROUTES = ("personal", "grocery", "deals", "default", "enrich_failed")
 
+    def _single_instance_lock_enabled(self) -> bool:
+        v = (self.config or {}).get("single_instance_lock_enabled", None)
+        if isinstance(v, bool):
+            return v
+        s = str(v or "").strip().lower()
+        if s in {"0", "false", "no", "off"}:
+            return False
+        return True
+
+    def _acquire_single_instance_lock(self, base_dir: Path) -> None:
+        """
+        Prevent multiple running instances (which causes duplicate forwards).
+
+        Implementation: non-blocking OS file lock held for process lifetime.
+        """
+        if not self._single_instance_lock_enabled():
+            log.info("[LOCK] single_instance_lock_enabled=false (skipping lock)")
+            self._instance_lock_fh = None
+            self._instance_lock_path = ""
+            return
+
+        try:
+            lock_path_cfg = str((self.config or {}).get("single_instance_lock_path") or "").strip()
+        except Exception:
+            lock_path_cfg = ""
+        lock_path = Path(lock_path_cfg) if lock_path_cfg else (base_dir / ".instorebotforwarder.lock")
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        fh = open(lock_path, "a+b")
+        try:
+            try:
+                fh.seek(0)
+                fh.write(b"1")
+                fh.flush()
+            except Exception:
+                pass
+
+            if os.name == "nt":
+                import msvcrt  # type: ignore
+
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl  # type: ignore
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except Exception:
+            try:
+                fh.close()
+            except Exception:
+                pass
+            raise RuntimeError("Another Instorebotforwarder instance is already running. Stop the other process and retry.")
+
+        self._instance_lock_fh = fh
+        self._instance_lock_path = str(lock_path)
+        log.info("[LOCK] acquired %s", str(lock_path))
+
     def __init__(self) -> None:
         _setup_logging()
         base = Path(__file__).parent
@@ -216,8 +276,21 @@ class InstorebotForwarder:
         self.secrets_path = secrets_path
         self._cfg_lock = asyncio.Lock()
         self._openai_cache: Dict[str, str] = {}
+        self._openai_stats: Dict[str, int] = {}
+        self._openai_last_mode: Dict[str, str] = {}
+
+        # ASIN de-dupe (avoid forwarding duplicate leads)
+        self._dedupe_inflight: set[str] = set()
+        self._dedupe_sent_ts: Dict[str, float] = {}
+        self._dedupe_skipped: int = 0
+
         self._amazon_scrape_cache: Dict[str, Dict[str, str]] = {}
         self._amazon_scrape_cache_ts: Dict[str, float] = {}
+
+        # Guard against multiple processes posting duplicates.
+        self._instance_lock_fh = None
+        self._instance_lock_path = ""
+        self._acquire_single_instance_lock(base)
 
         token = str((self.config.get("bot_token") or "")).strip()
         if is_placeholder_secret(token):
@@ -338,7 +411,7 @@ class InstorebotForwarder:
                 out.append(vi)
         return list(dict.fromkeys(out))
 
-    def _pick_dest_channel_id(self, *, category: str, enrich_failed: bool) -> Tuple[Optional[int], str]:
+    def _pick_dest_channel_id(self, *, source_channel_id: Optional[int], category: str, enrich_failed: bool) -> Tuple[Optional[int], str]:
         oc = (self.config or {}).get("output_channels") or {}
         if not isinstance(oc, dict):
             return None, "output_channels missing"
@@ -350,6 +423,20 @@ class InstorebotForwarder:
 
         if enrich_failed:
             return (ef or deals), "enrich_failed"
+
+        # Per-source routing override (when you want a specific source channel to always land in a route).
+        try:
+            scr = (self.config or {}).get("source_channel_routes") or {}
+        except Exception:
+            scr = {}
+        if isinstance(scr, dict) and source_channel_id:
+            forced = (scr.get(str(int(source_channel_id))) or scr.get(int(source_channel_id)) or "").strip().lower()
+        else:
+            forced = ""
+        if forced in {"deals", "personal", "grocery", "enrich_failed"}:
+            forced_id = self._route_to_dest_id(forced)
+            if forced_id:
+                return forced_id, f"source_route:{forced}"
 
         cat = (category or "").lower()
         kws = (self.config or {}).get("amazon_grocery_keywords") or []
@@ -405,6 +492,199 @@ class InstorebotForwarder:
         s = re.sub(r"<#\d+>", "#channel", s)
         return s
 
+    def _normalize_price_str(self, price: str) -> str:
+        """
+        Normalize various scraped/message price formats to the display format you want.
+        Examples:
+        - "439.99 USD" -> "$439.99"
+        - "$ 439.99" -> "$439.99"
+        """
+        s = " ".join((price or "").split()).strip()
+        if not s:
+            return ""
+        m = re.search(r"([$£€])\s?(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", s)
+        if m:
+            return f"{m.group(1)}{m.group(2)}"
+        m2 = re.search(r"(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)\s*(USD|CAD|AUD|GBP|EUR)\b", s, re.IGNORECASE)
+        if m2:
+            num = (m2.group(1) or "").replace(",", "").strip()
+            code = (m2.group(2) or "").upper().strip()
+            sym = {"USD": "$", "CAD": "$", "AUD": "$", "GBP": "£", "EUR": "€"}.get(code)
+            return f"{sym}{num}" if sym else f"{num} {code}".strip()
+        return s
+
+    def _extract_amazon_before_price_from_html(self, html_txt: str, *, current_price: str = "") -> str:
+        """
+        Best-effort "Before" (list/was/MSRP) price extraction from Amazon HTML.
+        This is not guaranteed; Amazon often doesn't expose list price for every product.
+        """
+        t = html_txt or ""
+        if not t:
+            return ""
+
+        # Prefer common strike-through/list-price DOM fragments.
+        for pat in (
+            r'a-text-price[^>]*>\s*<span[^>]*>\s*([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)',
+            r'\bList Price\b[^$£€]{0,80}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)',
+            r'\bWas\b[^$£€]{0,80}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)',
+            r'\bMSRP\b[^$£€]{0,80}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)',
+            r'\bTypical price\b[^$£€]{0,80}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)',
+        ):
+            m = re.search(pat, t, re.IGNORECASE | re.DOTALL)
+            if m:
+                cand = self._normalize_price_str(m.group(1) or "")
+                if cand:
+                    return cand
+
+        # Fallback: pick the highest currency amount that differs from current.
+        cur_norm = self._normalize_price_str(current_price)
+        cur_val: Optional[float] = None
+        if cur_norm:
+            mcur = re.search(r"([$£€])(\d+(?:\.\d+)?)", cur_norm)
+            if mcur:
+                try:
+                    cur_val = float(mcur.group(2))
+                except Exception:
+                    cur_val = None
+
+        vals: List[Tuple[float, str]] = []
+        for m in re.finditer(r"(?<!\w)([$£€])\s?(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)(?!\w)", t):
+            sym = (m.group(1) or "").strip()
+            num_raw = (m.group(2) or "").replace(",", "").strip()
+            try:
+                val = float(num_raw)
+            except Exception:
+                continue
+            raw = f"{sym}{val:.2f}".rstrip("0").rstrip(".")
+            vals.append((val, raw))
+        if not vals:
+            return ""
+        vals.sort(key=lambda x: x[0], reverse=True)
+        for val, raw in vals:
+            if cur_val is not None and val <= cur_val:
+                continue
+            cand = self._normalize_price_str(raw)
+            if cand and cand != cur_norm:
+                return cand
+        return ""
+
+    def _extract_amazon_discount_notes_from_html(self, html_txt: str) -> List[str]:
+        """
+        Best-effort extraction of "why is it cheaper" signals.
+        Examples we try to detect:
+        - Coupon (clip coupon / save $ / save %)
+        - Subscribe & Save % (sometimes exposed in HTML text)
+        - Limited time deal badge
+
+        NOTE: This does not guarantee the *final* effective checkout price, because many discounts
+        depend on account eligibility, selected variant, delivery location, and interaction (clip coupon).
+        """
+        t = html_txt or ""
+        if not t:
+            return []
+        low = t.lower()
+        notes: List[str] = []
+
+        # Limited time deal / deal badges
+        if "limited time deal" in low:
+            notes.append("Limited time deal")
+        if "prime exclusive deal" in low:
+            notes.append("Prime exclusive deal")
+
+        # Subscribe & Save signals
+        if "subscribe & save" in low or "subscribe and save" in low:
+            # Try to grab a nearby percent if present.
+            mss = re.search(r"(subscribe\s*(?:&|and)\s*save)[^%]{0,40}(\d{1,2})\s*%", t, re.IGNORECASE)
+            if mss:
+                notes.append(f"Subscribe & Save {mss.group(2)}%")
+            else:
+                notes.append("Subscribe & Save")
+
+        # Coupon signals (clip coupon, save $ / save %)
+        if ("clip coupon" in low) or ("coupon" in low and "clip" in low):
+            # Try to capture "Save $X" or "Save X%" near coupon wording.
+            mc1 = re.search(r"(clip\s+coupon)[^$£€%]{0,60}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", t, re.IGNORECASE)
+            mc2 = re.search(r"(clip\s+coupon)[^%]{0,60}(\d{1,2})\s*%", t, re.IGNORECASE)
+            if mc1:
+                notes.append(f"Coupon: save {self._normalize_price_str(mc1.group(2) or '')}")
+            elif mc2:
+                notes.append(f"Coupon: save {mc2.group(2)}%")
+            else:
+                notes.append("Coupon available")
+        else:
+            # Sometimes coupon is present as JSON-ish fields.
+            mcj = re.search(r"coupon[^\\n]{0,120}(save|off)[^\\n]{0,60}(\d{1,2})\s*%", t, re.IGNORECASE)
+            if mcj:
+                notes.append(f"Coupon: save {mcj.group(2)}%")
+
+        # Deduplicate while preserving order
+        out: List[str] = []
+        seen = set()
+        for n in notes:
+            nn = " ".join((n or "").split()).strip()
+            if nn and nn.lower() not in seen:
+                out.append(nn)
+                seen.add(nn.lower())
+        return out[:4]
+
+    # -----------------------
+    # De-dupe (ASIN)
+    # -----------------------
+    def _dedupe_asin_ttl_s(self) -> float:
+        """
+        Skip forwarding the same ASIN within this window.
+        Config: dedupe_asin_ttl_s
+        """
+        try:
+            v = float((self.config or {}).get("dedupe_asin_ttl_s") or 0.0)
+        except Exception:
+            v = 0.0
+        # Default 6 hours if not configured.
+        if v <= 0:
+            v = 6 * 3600.0
+        return max(60.0, min(v, 14 * 24 * 3600.0))
+
+    def _dedupe_prune(self) -> None:
+        ttl = self._dedupe_asin_ttl_s()
+        now = time.time()
+        # Prune sent cache
+        for a, ts in list(self._dedupe_sent_ts.items()):
+            try:
+                if (now - float(ts or 0.0)) > ttl:
+                    self._dedupe_sent_ts.pop(a, None)
+            except Exception:
+                self._dedupe_sent_ts.pop(a, None)
+
+    def _dedupe_reserve(self, asin: str) -> bool:
+        """
+        Reserve an ASIN for processing (prevents duplicates wasting scrape/OpenAI).
+        """
+        a = (asin or "").strip().upper()
+        if not a:
+            return True
+        self._dedupe_prune()
+        if a in self._dedupe_inflight:
+            self._dedupe_skipped += 1
+            return False
+        if a in self._dedupe_sent_ts:
+            self._dedupe_skipped += 1
+            return False
+        self._dedupe_inflight.add(a)
+        return True
+
+    def _dedupe_commit(self, asin: str) -> None:
+        a = (asin or "").strip().upper()
+        if not a:
+            return
+        self._dedupe_inflight.discard(a)
+        self._dedupe_sent_ts[a] = time.time()
+
+    def _dedupe_release(self, asin: str) -> None:
+        a = (asin or "").strip().upper()
+        if not a:
+            return
+        self._dedupe_inflight.discard(a)
+
     def _openai_enabled(self) -> bool:
         v = (self.config or {}).get("openai_rephrase_enabled", None)
         if isinstance(v, bool):
@@ -447,16 +727,24 @@ class InstorebotForwarder:
         """
         raw = (text or "").strip()
         if not raw:
+            self._openai_last_mode[kind] = "empty"
+            self._openai_stats["skip_empty"] = int(self._openai_stats.get("skip_empty", 0) or 0) + 1
             return ""
         if not self._openai_enabled():
+            self._openai_last_mode[kind] = "disabled"
+            self._openai_stats["skip_disabled"] = int(self._openai_stats.get("skip_disabled", 0) or 0) + 1
             return raw
         key = self._openai_api_key()
         if not key:
+            self._openai_last_mode[kind] = "no_key"
+            self._openai_stats["skip_no_key"] = int(self._openai_stats.get("skip_no_key", 0) or 0) + 1
             return raw
 
         # Cache by kind+hash to avoid repeat costs within a run.
         cache_key = f"{kind}:{hashlib.sha256(raw.encode('utf-8', errors='ignore')).hexdigest()[:16]}"
         if cache_key in self._openai_cache:
+            self._openai_last_mode[kind] = "cache"
+            self._openai_stats["cache_hit"] = int(self._openai_stats.get("cache_hit", 0) or 0) + 1
             return self._openai_cache[cache_key]
 
         clipped = raw
@@ -494,12 +782,16 @@ class InstorebotForwarder:
         try:
             import aiohttp
 
+            self._openai_last_mode[kind] = "api_call"
+            self._openai_stats["api_call"] = int(self._openai_stats.get("api_call", 0) or 0) + 1
             headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
             timeout_s = self._openai_timeout_s()
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
                 async with session.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers) as resp:
                     txt = await resp.text(errors="replace")
                     if int(resp.status) >= 400:
+                        self._openai_last_mode[kind] = f"api_http_{int(resp.status)}"
+                        self._openai_stats["api_fail"] = int(self._openai_stats.get("api_fail", 0) or 0) + 1
                         return raw
                     data = json.loads(txt) if txt else {}
                     out = ""
@@ -509,12 +801,18 @@ class InstorebotForwarder:
                         out = ""
                     out = str(out).strip()
                     if not out:
+                        self._openai_last_mode[kind] = "api_empty"
+                        self._openai_stats["api_fail"] = int(self._openai_stats.get("api_fail", 0) or 0) + 1
                         return raw
                     # Safety: prevent pings
                     out = self._neutralize_mentions(out)
                     self._openai_cache[cache_key] = out
+                    self._openai_last_mode[kind] = "api_ok"
+                    self._openai_stats["api_ok"] = int(self._openai_stats.get("api_ok", 0) or 0) + 1
                     return out
         except Exception:
+            self._openai_last_mode[kind] = "api_exc"
+            self._openai_stats["api_fail"] = int(self._openai_stats.get("api_fail", 0) or 0) + 1
             return raw
 
     def _stable_key_slug(self, seed: str, *, length: int = 7) -> str:
@@ -781,6 +1079,10 @@ class InstorebotForwarder:
         delay_s = self._startup_smoketest_send_delay_s()
         out_id = self._startup_smoketest_output_channel_id()
 
+        # Reset per-run OpenAI stats (so startup logs tell you exactly what was used this boot)
+        self._openai_stats = {}
+        self._openai_last_mode = {}
+
         log.info("-------- Startup Smoke Test --------")
         log.info("[BOOT][SMOKE] target_count=%s scan_limit_per_channel=%s output_channel_id=%s", count, scan_limit, out_id or "")
 
@@ -865,12 +1167,28 @@ class InstorebotForwarder:
                         try:
                             scrape_ok = ((meta or {}).get("ctx") or {}).get("scrape_ok", "")
                             scrape_err = ((meta or {}).get("ctx") or {}).get("scrape_err", "")
+                            openai_steps = ((meta or {}).get("ctx") or {}).get("openai_steps_mode", "")
                         except Exception:
                             scrape_ok = ""
                             scrape_err = ""
-                        log.info("[BOOT][SMOKE] SEND_OK %s/%s msg=%s scrape_ok=%s scrape_err=%s", sent, count, getattr(msg, "id", ""), scrape_ok, (scrape_err or "")[:120])
+                            openai_steps = ""
+                        # Commit de-dupe on successful send
+                        try:
+                            asin = str(((meta.get("amazon") or {}) if isinstance(meta.get("amazon"), dict) else {}).get("asin") or "").strip().upper()
+                        except Exception:
+                            asin = ""
+                        if bool(meta.get("dedupe_reserved")) and asin:
+                            self._dedupe_commit(asin)
+                        log.info("[BOOT][SMOKE] SEND_OK %s/%s msg=%s scrape_ok=%s openai_steps=%s scrape_err=%s", sent, count, getattr(msg, "id", ""), scrape_ok, openai_steps, (scrape_err or "")[:120])
                     except Exception as e:
                         log.info("[BOOT][SMOKE] SEND_FAIL msg=%s err=%s", getattr(msg, "id", ""), str(e)[:200])
+                        # Release de-dupe reservation if we failed to send.
+                        try:
+                            asin = str(((meta.get("amazon") or {}) if isinstance(meta.get("amazon"), dict) else {}).get("asin") or "").strip().upper()
+                        except Exception:
+                            asin = ""
+                        if bool(meta.get("dedupe_reserved")) and asin:
+                            self._dedupe_release(asin)
                         sent -= 1
                         continue
 
@@ -881,6 +1199,8 @@ class InstorebotForwarder:
 
         if sent < count:
             log.warning("[BOOT][SMOKE] Completed with only %s/%s messages found that contain usable Amazon links.", sent, count)
+        log.info("[BOOT][SMOKE] OPENAI stats=%s", json.dumps(self._openai_stats or {}, ensure_ascii=True))
+        log.info("[BOOT][SMOKE] DEDUPE skipped=%s ttl_s=%s", int(self._dedupe_skipped or 0), int(self._dedupe_asin_ttl_s()))
 
     def _strip_urls_from_text(self, text: str) -> str:
         s = text or ""
@@ -925,6 +1245,16 @@ class InstorebotForwarder:
         if ua:
             return ua
         return "Mozilla/5.0"
+
+    def _amazon_delivery_zip(self) -> str:
+        """
+        Optional US ZIP code to set "Deliver to" location in Playwright scrapes.
+        This improves consistency for price/availability and discount badges, but is best-effort.
+        """
+        z = str((self.config or {}).get("amazon_delivery_zip") or "").strip()
+        # Simple guard: keep only 5 digits.
+        m = re.search(r"\b(\d{5})\b", z)
+        return m.group(1) if m else ""
 
     def _playwright_enabled(self) -> bool:
         """
@@ -992,7 +1322,13 @@ class InstorebotForwarder:
         # Only cache if we got a usable image or title
         if not ((data.get("image_url") or "").strip() or (data.get("title") or "").strip()):
             return
-        self._amazon_scrape_cache[a] = {"title": str(data.get("title") or ""), "image_url": str(data.get("image_url") or ""), "price": str(data.get("price") or "")}
+        self._amazon_scrape_cache[a] = {
+            "title": str(data.get("title") or ""),
+            "image_url": str(data.get("image_url") or ""),
+            "price": str(data.get("price") or ""),
+            "before_price": str(data.get("before_price") or ""),
+            "discount_notes": str(data.get("discount_notes") or ""),
+        }
         self._amazon_scrape_cache_ts[a] = time.time()
 
     def _playwright_headless(self) -> bool:
@@ -1087,6 +1423,7 @@ class InstorebotForwarder:
         headless = self._playwright_headless() if headless_override is None else bool(headless_override)
         ua = self._scrape_user_agent()
         profile_dir = self._playwright_profile_dir()
+        delivery_zip = self._amazon_delivery_zip()
 
         def _run() -> Tuple[Optional[Dict[str, str]], Optional[str]]:
             try:
@@ -1127,6 +1464,41 @@ class InstorebotForwarder:
                     except Exception:
                         pass
                     page.goto(u, wait_until="domcontentloaded", timeout=int(timeout_s * 1000))
+
+                    # Best-effort: set delivery ZIP for US pricing consistency (if configured).
+                    if delivery_zip:
+                        try:
+                            # Open location popover (different layouts use different selectors).
+                            # nav-global-location-popover-link exists on most Amazon pages.
+                            try:
+                                page.click("#nav-global-location-popover-link", timeout=1500)
+                            except Exception:
+                                try:
+                                    page.click("#glow-ingress-line2", timeout=1500)
+                                except Exception:
+                                    pass
+
+                            # Zip input + apply.
+                            try:
+                                page.wait_for_selector("#GLUXZipUpdateInput", timeout=1800)
+                                page.fill("#GLUXZipUpdateInput", delivery_zip)
+                                page.click("#GLUXZipUpdate", timeout=1500)
+                                # Some flows require a confirmation button.
+                                try:
+                                    page.click("#GLUXConfirmClose", timeout=1800)
+                                except Exception:
+                                    try:
+                                        page.click("input[name='glowDoneButton']", timeout=1800)
+                                    except Exception:
+                                        pass
+                                page.wait_for_timeout(700)
+                                # Reload after location set so price/badges update.
+                                page.reload(wait_until="domcontentloaded", timeout=int(timeout_s * 1000))
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+
                     # Give the page a moment to populate image attrs.
                     page.wait_for_timeout(700)
                     html_txt = page.content() or ""
@@ -1146,8 +1518,16 @@ class InstorebotForwarder:
 
             title = self._extract_amazon_title_from_html(html_txt)
             image_url = self._extract_amazon_image_from_html(html_txt)
+            before_price = self._extract_amazon_before_price_from_html(html_txt)
+            discount_notes = self._extract_amazon_discount_notes_from_html(html_txt)
 
-            out = {"title": title.strip(), "image_url": image_url.strip(), "price": ""}
+            out = {
+                "title": title.strip(),
+                "image_url": image_url.strip(),
+                "price": "",
+                "before_price": before_price.strip(),
+                "discount_notes": "; ".join([n for n in (discount_notes or []) if n]).strip(),
+            }
             if not (out.get("title") or out.get("image_url")):
                 return None, "no useful fields found"
             return out, None
@@ -1216,7 +1596,7 @@ class InstorebotForwarder:
             if ogi and self._is_amazon_image_url(ogi):
                 image_url = ogi.strip()
 
-        out = {"title": title.strip(), "image_url": image_url.strip(), "price": ""}
+        out = {"title": title.strip(), "image_url": image_url.strip(), "price": "", "before_price": ""}
         if not (out.get("title") or out.get("image_url")):
             return None, "no useful fields found"
         return out, None
@@ -1378,7 +1758,7 @@ class InstorebotForwarder:
             if asin_guess:
                 img, img_err = await self._adsystem_image_by_asin(asin_guess)
                 if img and not img_err:
-                    data = {"title": "", "image_url": img, "price": ""}
+                    data = {"title": "", "image_url": img, "price": "", "before_price": ""}
                     self._scrape_cache_put(asin_guess, data)
                     return data, None
             # Even when Playwright fails, preserve the clearer reason if we have one.
@@ -1389,6 +1769,8 @@ class InstorebotForwarder:
         image_url = ""
 
         price = ""
+        before_price = ""
+        discount_notes: List[str] = []
         # JSON-LD offers.price is the cleanest when present
         prod = self._extract_jsonld_product(html_txt)
         if prod:
@@ -1478,10 +1860,30 @@ class InstorebotForwarder:
             if m2:
                 price = (m2.group(0) or "").strip()
 
+        # Best-effort before/list price (strike-through, list price labels, etc).
+        before_price = self._extract_amazon_before_price_from_html(html_txt, current_price=price)
+
+        # Best-effort discount signals (coupon/sub&save/deal badge).
+        try:
+            discount_notes = self._extract_amazon_discount_notes_from_html(html_txt)
+        except Exception:
+            discount_notes = []
+
+        # If we still have no image, try adsystem image by ASIN (works even when the HTML is sparse).
+        if (not image_url) and asin_guess:
+            try:
+                img2, img2_err = await self._adsystem_image_by_asin(asin_guess)
+            except Exception as e:
+                img2, img2_err = None, str(e)[:200]
+            if img2 and not img2_err:
+                image_url = str(img2).strip()
+
         out = {
             "title": " ".join((title or "").split()).strip(),
             "image_url": (image_url or "").strip(),
             "price": " ".join((price or "").split()).strip(),
+            "before_price": " ".join((before_price or "").split()).strip(),
+            "discount_notes": "; ".join([n for n in (discount_notes or []) if n]).strip(),
         }
         # Ensure at least one field is useful
         if not (out.get("title") or out.get("image_url") or out.get("price")):
@@ -1870,6 +2272,14 @@ class InstorebotForwarder:
         if affiliate_final:
             final_url = affiliate_final
 
+        # De-dupe by ASIN to avoid forwarding the same lead repeatedly.
+        dedupe_reserved = False
+        if asin:
+            if not self._dedupe_reserve(asin):
+                _log_flow("DUP_ASIN_SKIP", asin=asin)
+                return None, {"urls": urls, "amazon": {"asin": asin, "final_url": final_url, "url_used": det.url_used}, "dup_asin": asin, "dedupe_reserved": False}
+            dedupe_reserved = True
+
         # Reconstruct listing details from the source message (no PA-API required).
         guessed = self._guess_listing_from_message(message, asin=asin, final_url=final_url)
 
@@ -1885,7 +2295,15 @@ class InstorebotForwarder:
             scraped, scrape_err = await self._scrape_amazon_page(final_url)
             if scraped and not scrape_err:
                 scrape_ok = True
-                _log_flow("SCRAPE_OK", asin=(asin or ""), has_title=bool(scraped.get("title")), has_price=bool(scraped.get("price")), has_image=bool(scraped.get("image_url")))
+                _log_flow(
+                    "SCRAPE_OK",
+                    asin=(asin or ""),
+                    has_title=bool(scraped.get("title")),
+                    has_price=bool(scraped.get("price")),
+                    has_before=bool(scraped.get("before_price")),
+                    has_image=bool(scraped.get("image_url")),
+                    has_discount=bool((scraped.get("discount_notes") or "").strip()),
+                )
             else:
                 _log_flow("SCRAPE_FAIL", asin=(asin or ""), err=(scrape_err or "unknown"))
                 # If Amazon blocks scraping, try to extract an Amazon-hosted image from the deal hub URL.
@@ -1907,13 +2325,50 @@ class InstorebotForwarder:
 
         # Final fields:
         # - Title: prefer Amazon product name when available, else message reconstruction.
-        # - Price: prefer message-derived deal price only (user request).
-        # - Image: prefer Amazon page image only (user request).
+        # - Price/Before: prefer message-derived values; if missing, fill from scrape when available.
+        # - Image: prefer Amazon page image; fall back to Amazon-hosted image already in the source embed.
         raw_title = str((scraped or {}).get("title") or "").strip() or guessed.get("title", "").strip() or "Amazon lead"
         title = self._clean_product_title(raw_title) or raw_title or "Amazon lead"
         price = guessed.get("price", "").strip()
         before_price = guessed.get("before_price", "").strip()
+
+        price_src = "message" if price else "none"
+        before_src = "message" if before_price else "none"
+
+        # Fill missing prices from scrape.
+        if not price:
+            sp = str((scraped or {}).get("price") or "").strip()
+            spn = self._normalize_price_str(sp)
+            if spn:
+                price = spn
+                price_src = "scrape"
+        if not before_price:
+            sb = str((scraped or {}).get("before_price") or "").strip()
+            sbn = self._normalize_price_str(sb)
+            if sbn:
+                before_price = sbn
+                before_src = "scrape"
+
+        # Ensure the card always has both lines.
+        if not price:
+            price = "N/A"
+            price_src = "missing"
+        if not before_price:
+            before_price = "N/A"
+            before_src = "missing"
+        # Category: detect from message text, and also from scraped title when available
+        # (so grocery routing can work even if the source post is short).
         category = guessed.get("category", "").strip()
+        if not category:
+            try:
+                combined = f"{guessed.get('title','')}\n{raw_title}\n{final_url}"
+            except Exception:
+                combined = ""
+            kws = (self.config or {}).get("amazon_grocery_keywords") or []
+            kws_l = [str(k).strip().lower() for k in kws] if isinstance(kws, list) else []
+            combined_l = combined.lower()
+            if any(k and (k in combined_l) for k in kws_l):
+                category = "grocery"
         image_url = str((scraped or {}).get("image_url") or "").strip()
         if not image_url:
             # If Amazon blocks scraping, fall back to an Amazon-hosted image already present in the source embed.
@@ -1924,6 +2379,50 @@ class InstorebotForwarder:
         except Exception:
             img_src = "none"
         _log_flow("IMAGE", source=img_src, has=("1" if bool(image_url) else "0"))
+        _log_flow("PRICES", current_src=price_src, before_src=before_src, has_current=("1" if price and price != "N/A" else "0"), has_before=("1" if before_price and before_price != "N/A" else "0"))
+
+        # Deal notes (coupon/sub&save/limited time deal) from scrape, rendered in your preferred wording.
+        raw_discount = str((scraped or {}).get("discount_notes") or "").strip()
+        discount_lines: List[str] = []
+        if raw_discount:
+            parts = [p.strip() for p in raw_discount.split(";") if p.strip()]
+            for p in parts[:4]:
+                low = p.lower()
+                if ("limited time deal" in low) or ("prime exclusive deal" in low):
+                    discount_lines.append("Limited time deal ONLY!")
+                    continue
+                if low.startswith("coupon:"):
+                    amt = p.split(":", 1)[-1].strip()
+                    if amt:
+                        discount_lines.append(f"Coupon Available — clip it before checkout! (save {amt})")
+                    else:
+                        discount_lines.append("Coupon Available — clip it before checkout!")
+                    continue
+                if "coupon" in low:
+                    discount_lines.append("Coupon Available — clip it before checkout!")
+                    continue
+                if ("subscribe" in low) and ("save" in low):
+                    m = re.search(r"(\\d{1,2})\\s*%", p)
+                    pct = m.group(1) if m else ""
+                    if pct:
+                        discount_lines.append(f"Subscribe & Save — get up to {pct}% off (cancel after item arrives)")
+                    else:
+                        discount_lines.append("Subscribe & Save — discount may apply (cancel after item arrives)")
+                    continue
+                discount_lines.append(p)
+
+            # Deduplicate, preserve order, cap lines.
+            seen_dl: set[str] = set()
+            deduped: List[str] = []
+            for ln in discount_lines:
+                k = ln.strip().lower()
+                if k and k not in seen_dl:
+                    deduped.append(ln.strip())
+                    seen_dl.add(k)
+            discount_lines = deduped[:3]
+
+        if discount_lines:
+            _log_flow("DISCOUNT", notes=" | ".join(discount_lines)[:180])
 
         # Build RS-style blocks from message-derived info.
         promo_codes = (guessed.get("promo_codes") or "").strip()
@@ -1973,8 +2472,17 @@ class InstorebotForwarder:
                 _log_flow("STEPS_URLS_FAIL", err=str(e)[:180])
 
         # Optional OpenAI rephrase (only if key present/enabled and source text exists)
-        steps_rephrased = await self._openai_rephrase("steps", steps_block_rewritten) if steps_block_rewritten else ""
-        info_rephrased = await self._openai_rephrase("info", info_raw) if info_raw else ""
+        if steps_block_rewritten:
+            steps_rephrased = await self._openai_rephrase("steps", steps_block_rewritten)
+            openai_steps_mode = self._openai_last_mode.get("steps", "")
+        else:
+            steps_rephrased = ""
+            openai_steps_mode = "skip_no_steps"
+
+        # IMPORTANT: we currently do not display info text in the RS card output,
+        # so do NOT spend OpenAI usage rewriting it.
+        info_rephrased = info_raw
+        openai_info_mode = "skip_unused"
 
         # Optional combined block (kept for compatibility with older templates).
         promo_steps_parts: List[str] = []
@@ -1990,10 +2498,11 @@ class InstorebotForwarder:
 
         # Build the "card body" to match your desired format (no footer/timestamp, one key link).
         card_lines: List[str] = []
-        if price:
-            card_lines.append(f"Current Price: **{price}**")
-        if before_price:
-            card_lines.append(f"Before: **{before_price}**")
+        card_lines.append(f"Current Price: **{price}**")
+        card_lines.append(f"Before: **{before_price}**")
+        if discount_lines:
+            card_lines.append("")
+            card_lines.extend([str(x) for x in discount_lines if str(x).strip()])
         if promo_codes:
             card_lines.append(f"CODE: {promo_codes}")
         if steps_rephrased:
@@ -2005,8 +2514,12 @@ class InstorebotForwarder:
             card_lines.append(key_link)
         card_body = "\n".join(card_lines).strip()
 
-        # Routing is based on message-derived category only.
-        dest_id, route_reason = self._pick_dest_channel_id(category=category, enrich_failed=False)
+        # Routing: allow per-source overrides, otherwise personal vs grocery based on detected category.
+        try:
+            src_id = int(getattr(getattr(message, "channel", None), "id", 0) or 0)
+        except Exception:
+            src_id = 0
+        dest_id, route_reason = self._pick_dest_channel_id(source_channel_id=(src_id or None), category=category, enrich_failed=False)
         _log_flow("ROUTE", dest_id=(dest_id or ""), reason=route_reason)
 
         tpl, tpl_key = self._pick_template(dest_id, enrich_failed=False)
@@ -2032,6 +2545,7 @@ class InstorebotForwarder:
             "before_price": before_price,
             "category": category,
             "image_url": image_url,
+            "discount_notes": "\n".join([str(x) for x in (discount_lines or []) if str(x).strip()]).strip(),
             "source_line": source_line,
             "source_jump": str(getattr(message, "jump_url", "") or ""),
             "source_message_id": str(getattr(message, "id", "") or ""),
@@ -2048,6 +2562,8 @@ class InstorebotForwarder:
             "info_rephrased": info_rephrased,
             "promo_steps": promo_steps,
             "card_body": card_body,
+            "openai_steps_mode": openai_steps_mode,
+            "openai_info_mode": openai_info_mode,
         }
 
         embed = _embed_from_template(tpl or {}, ctx) if tpl else None
@@ -2055,6 +2571,8 @@ class InstorebotForwarder:
             _log_flow("RENDER", ok="1", title=(embed.title or "")[:80], fields=len(embed.fields))
         else:
             _log_flow("RENDER", ok="0")
+            if dedupe_reserved and asin:
+                self._dedupe_release(asin)
 
         meta = {
             "urls": urls,
@@ -2065,6 +2583,7 @@ class InstorebotForwarder:
             "route_reason": route_reason,
             "template_key": tpl_key,
             "ctx": ctx,
+            "dedupe_reserved": bool(dedupe_reserved),
         }
         return embed, meta
 
@@ -2085,9 +2604,17 @@ class InstorebotForwarder:
         if not embed:
             return
 
+        try:
+            asin = str(((meta.get("amazon") or {}) if isinstance(meta.get("amazon"), dict) else {}).get("asin") or "").strip().upper()
+        except Exception:
+            asin = ""
+        reserved = bool(meta.get("dedupe_reserved"))
+
         dest_id = meta.get("dest_channel_id")
         if not dest_id:
             _log_flow("SEND_FAIL", reason="dest_channel_missing")
+            if reserved and asin:
+                self._dedupe_release(asin)
             return
 
         ch = self.bot.get_channel(int(dest_id))
@@ -2098,13 +2625,19 @@ class InstorebotForwarder:
                 ch = None
         if not isinstance(ch, (discord.TextChannel, discord.Thread, discord.DMChannel)):
             _log_flow("SEND_FAIL", reason="dest_channel_not_text")
+            if reserved and asin:
+                self._dedupe_release(asin)
             return
 
         try:
             await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
             _log_flow("SEND_OK", dest_id=dest_id, message_id=str(message.id))
+            if reserved and asin:
+                self._dedupe_commit(asin)
         except Exception as e:
             _log_flow("SEND_FAIL", dest_id=dest_id, err=str(e)[:200])
+            if reserved and asin:
+                self._dedupe_release(asin)
 
     # -----------------------
     # Discord events/commands

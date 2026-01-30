@@ -342,57 +342,41 @@ class WhopAPIClient:
     async def list_memberships(
         self,
         *,
-        page: int = 1,
-        per_page: int = 100,
+        first: int = 100,
+        after: str | None = None,
         params: Optional[Dict] = None,
-    ) -> List[Dict]:
+    ) -> tuple[List[Dict], Dict]:
         """
         List memberships for the company (company-scoped).
 
-        Args:
-            page: Page number (best-effort; API may ignore if unsupported)
-            per_page: Page size (best-effort; API may ignore if unsupported)
-            params: Additional query params to pass through
+        Whop uses cursor pagination:
+        - `first` controls page size
+        - `after` is a cursor from `page_info.end_cursor`
 
-        Returns:
-            List of membership dicts (may be empty)
+        Returns: (memberships, page_info)
         """
         try:
-            q = {"company_id": self.company_id}
+            q: Dict = {"company_id": self.company_id}
             try:
-                if int(page) > 0:
-                    q["page"] = int(page)
+                if int(first) > 0:
+                    q["first"] = int(first)
             except Exception:
-                pass
-            try:
-                if int(per_page) > 0:
-                    q["per_page"] = int(per_page)
-            except Exception:
-                pass
+                q["first"] = 100
+            if after:
+                q["after"] = str(after)
             if isinstance(params, dict):
                 q.update(params)
-            response = await self._request(
-                "GET",
-                "/memberships",
-                params=q,
-            )
-            data = response.get("data", []) if isinstance(response, dict) else response
-            if isinstance(data, list):
-                return data
-            if isinstance(data, dict):
-                for key in ("data", "items", "memberships", "results"):
-                    items = data.get(key)
-                    if isinstance(items, list):
-                        return items
-            if isinstance(response, dict):
-                for key in ("items", "memberships", "results"):
-                    items = response.get(key)
-                    if isinstance(items, list):
-                        return items
-            return []
+
+            response = await self._request("GET", "/memberships", params=q)
+            data = response.get("data", []) if isinstance(response, dict) else []
+            page_info = response.get("page_info", {}) if isinstance(response, dict) else {}
+
+            memberships: List[Dict] = data if isinstance(data, list) else []
+            page_info = page_info if isinstance(page_info, dict) else {}
+            return (memberships, page_info)
         except WhopAPIError as e:
-            log.warning(f"Failed to list memberships (page {page}): {e}")
-            return []
+            log.warning(f"Failed to list memberships: {e}")
+            return ([], {})
     
     async def get_payments_for_membership(self, membership_id: str) -> List[Dict]:
         """

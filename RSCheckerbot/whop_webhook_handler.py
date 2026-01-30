@@ -11,12 +11,17 @@ Canonical Owner: This module owns Whop webhook processing logic.
 import json
 import re
 import logging
+import time
 import discord
 from pathlib import Path
 from datetime import datetime, timezone
 from contextlib import suppress
 
 log = logging.getLogger("rs-checker")
+
+# whop-logs history lookup throttles (avoid Discord 429s)
+_WHOP_LOGS_LOOKUP_CACHE: dict[str, tuple[str, float]] = {}
+_WHOP_LOGS_LOOKUP_LAST: dict[str, float] = {}
 
 # Canonical shared helpers (single source of truth)
 from rschecker_utils import load_json as _load_json
@@ -220,6 +225,38 @@ def _flatten_field_kv(fields_data: dict) -> dict[str, str]:
     return out
 
 
+def _extract_native_kv_from_embed(embed: discord.Embed) -> tuple[dict[str, str], dict[str, str]]:
+    """Return (fields_data, merged_kv) for native Whop cards.
+
+    - fields_data: normalized mapping of field-name -> field-value (lowercased)
+    - merged_kv: union of direct field pairs + bullet KV parsed from multi-line fields
+    """
+    fields_data: dict[str, str] = {}
+    try:
+        for field in (getattr(embed, "fields", None) or []):
+            try:
+                k = str(getattr(field, "name", "") or "").strip().lower()
+                v = str(getattr(field, "value", "") or "").strip()
+            except Exception:
+                continue
+            if k:
+                fields_data[k] = v
+    except Exception:
+        fields_data = {}
+
+    # Direct KV: Whop sometimes places key data as field names (e.g. "Total Spent").
+    direct_kv = {k: v for k, v in (fields_data or {}).items() if str(v or "").strip()}
+    bullet_kv = _flatten_field_kv(fields_data)
+    # Many Whop cards put the actual data in the embed description (not fields).
+    desc_kv: dict[str, str] = {}
+    try:
+        desc_kv = _parse_bullet_kv(str(getattr(embed, "description", "") or ""))
+    except Exception:
+        desc_kv = {}
+    merged_kv = {**direct_kv, **bullet_kv, **desc_kv}
+    return (fields_data, merged_kv)
+
+
 def _parse_renewal_window(raw: str) -> tuple[str, str]:
     """Parse 'start → end' or 'start -> end' into (start, end)."""
     s = str(raw or "").strip()
@@ -288,13 +325,18 @@ def _build_whop_summary_from_native_kv(extra_kv: dict) -> dict:
 
     status = _get("status", "membership_status", "membership status")
     product = _get("product", "plan", "product title")
-    total_spent = _get("total_spent", "total spent")
+    # Native cards vary between "Total Spent" and "Total Spend".
+    total_spent = _get("total_spent", "total spent", "total spend")
     renewal_window = _get("renewal_window", "renewal window", "renewal")
+    # Some cards output a bare arrow (e.g. "→") when window is unknown.
+    if renewal_window.strip() in {"→", "->"}:
+        renewal_window = ""
     pricing = _get("pricing", "price")
     promo = _promo_from_pricing(pricing)
     plan_is_renewal = _get("plan_is_renewal", "plan is renewal")
     trial_days = _get("trial_days", "trial days")
-    dashboard_url = _get("dashboard_url", "dashboard")
+    # Native cards often label this as "Whop Dashboard".
+    dashboard_url = _get("dashboard_url", "dashboard", "whop dashboard", "whop_dashboard")
     manage_url = _get("manage_url", "manage")
     checkout_url = _get("checkout_url", "checkout", "purchase link")
     is_first_membership = _get("is_first_membership", "first membership")
@@ -349,6 +391,53 @@ def _build_whop_summary_from_native_kv(extra_kv: dict) -> dict:
         "is_first_membership": is_first_membership,
         "last_payment_failure": last_payment_failure,
     }
+
+
+def extract_native_whop_card_debug(message: discord.Message) -> dict:
+    """Best-effort extractor for native Whop embed cards (debug/testing only).
+
+    Returns a small dict with the parsed Whop summary and key identifiers. This is used for
+    startup smoke tests and should never raise.
+    """
+    try:
+        if not message or not getattr(message, "embeds", None):
+            return {}
+        embed = message.embeds[0]
+
+        fields_data, merged_kv = _extract_native_kv_from_embed(embed)
+
+        # Discord ID best-effort (field, then description)
+        discord_id_str = ""
+        if "discord id" in fields_data:
+            discord_id_str = re.sub(r"<@!?(\d+)>", r"\1", str(fields_data.get("discord id") or "")).strip()
+        if not discord_id_str:
+            desc = str(getattr(embed, "description", "") or "")
+            m = re.search(r"Discord ID[:\s]+(\d{17,19})", desc, re.IGNORECASE)
+            if m:
+                discord_id_str = m.group(1)
+        did_match = re.search(r"(\d{17,19})", str(discord_id_str or ""))
+        did = did_match.group(1) if did_match else ""
+
+        # Useful pairing keys
+        email = str(merged_kv.get("email") or "").strip()
+        membership_id = str(merged_kv.get("membership id") or merged_kv.get("membership_id") or merged_kv.get("membership") or "").strip()
+        if membership_id.startswith("`") and membership_id.endswith("`"):
+            membership_id = membership_id.strip("`").strip()
+
+        summary = _build_whop_summary_from_native_kv(merged_kv)
+        return {
+            "message_id": int(getattr(message, "id", 0) or 0),
+            "channel_id": int(getattr(getattr(message, "channel", None), "id", 0) or 0),
+            "created_at": getattr(message, "created_at", None).isoformat() if getattr(message, "created_at", None) else "",
+            "title": str(getattr(embed, "title", "") or "").strip(),
+            "discord_id": did,
+            "email": email,
+            "membership_id": membership_id,
+            "summary": summary if isinstance(summary, dict) else {},
+            "kv_keys": sorted(list({str(k) for k in (merged_kv or {}).keys() if str(k or "").strip()}))[:50],
+        }
+    except Exception:
+        return {}
 
 
 def _build_whop_summary(event_data: dict, *, extra_kv: dict | None = None) -> dict:
@@ -512,20 +601,160 @@ async def _whop_brief_from_event(member: discord.Member, event_data: dict) -> di
             summary = _build_whop_summary(event_data)
         except Exception:
             summary = {}
-    if (not summary) and _whop_api_client:
-        mid = _membership_id_from_event(member, event_data)
-        if mid:
-            try:
-                summary = await fetch_whop_brief(
-                    _whop_api_client,
-                    mid,
-                    enable_enrichment=bool(_whop_api_config.get("enable_enrichment", True)),
-                )
-            except Exception:
-                summary = {}
+    # IMPORTANT: webhook-driven staff cards should not depend on Whop API (scans/sync own API usage).
+    # If a summary is missing, leave it blank and rely on Discord native cards + workflow payloads.
     if summary:
         _record_whop_summary_if_possible(member_id=int(member.id), summary=summary, event_data=event_data)
     return summary
+
+
+def _extract_discord_id_from_embed(embed: discord.Embed) -> str:
+    """Best-effort extract Discord ID from an embed."""
+    try:
+        fields_data, merged_kv = _extract_native_kv_from_embed(embed)
+    except Exception:
+        fields_data, merged_kv = ({}, {})
+    did = str(merged_kv.get("discord id") or merged_kv.get("discord_id") or "").strip()
+    if not did:
+        did = str(fields_data.get("discord id") or "").strip()
+    if did:
+        did = re.sub(r"<@!?(\d+)>", r"\1", did).strip()
+    m = re.search(r"(\d{17,19})", did or "")
+    return m.group(1) if m else ""
+
+
+def _extract_email_from_embed(embed: discord.Embed) -> str:
+    try:
+        _fields_data, merged_kv = _extract_native_kv_from_embed(embed)
+    except Exception:
+        merged_kv = {}
+    email = str(merged_kv.get("email") or "").strip()
+    return _norm_email(email) if email else ""
+
+
+def _extract_key_from_embed(embed: discord.Embed) -> str:
+    try:
+        _fields_data, merged_kv = _extract_native_kv_from_embed(embed)
+    except Exception:
+        merged_kv = {}
+    key = str(merged_kv.get("key") or merged_kv.get("whop_key") or "").strip()
+    return key
+
+
+async def _resolve_discord_id_from_whop_logs(
+    guild: discord.Guild | None,
+    *,
+    email: str,
+    membership_id_hint: str,
+    whop_key: str,
+    limit: int = 50,
+) -> str:
+    """Search whop-logs channel for a matching email/key and return Discord ID."""
+    # Rate-limit protection: do not repeatedly scan channel history for the same key.
+    global _WHOP_LOGS_LOOKUP_CACHE, _WHOP_LOGS_LOOKUP_LAST
+    if not guild:
+        return ""
+    if not WHOP_LOGS_CHANNEL_ID:
+        return ""
+    ch = guild.get_channel(int(WHOP_LOGS_CHANNEL_ID))
+    if not isinstance(ch, discord.TextChannel):
+        return ""
+    email_n = _norm_email(email) if email else ""
+    mid = str(membership_id_hint or "").strip()
+    key = str(whop_key or "").strip()
+    if not (email_n or mid or key):
+        return ""
+
+    now = time.time()
+    cache_key_email = f"email:{email_n}" if email_n else ""
+    cache_key_key = f"key:{key}" if key else ""
+
+    # Return cached results.
+    try:
+        if cache_key_email and cache_key_email in _WHOP_LOGS_LOOKUP_CACHE:
+            did, ts = _WHOP_LOGS_LOOKUP_CACHE[cache_key_email]
+            if did and (now - float(ts)) < 6 * 3600:
+                return str(did)
+        if cache_key_key and cache_key_key in _WHOP_LOGS_LOOKUP_CACHE:
+            did, ts = _WHOP_LOGS_LOOKUP_CACHE[cache_key_key]
+            if did and (now - float(ts)) < 6 * 3600:
+                return str(did)
+    except Exception:
+        pass
+
+    # Throttle repeated history scans.
+    try:
+        last = float(_WHOP_LOGS_LOOKUP_LAST.get(cache_key_email or cache_key_key or "global", 0.0))
+        if (now - last) < 60.0:
+            return ""
+        _WHOP_LOGS_LOOKUP_LAST[cache_key_email or cache_key_key or "global"] = now
+    except Exception:
+        pass
+
+    try:
+        async for m in ch.history(limit=int(max(10, min(75, int(limit))))):
+            if not m.embeds:
+                continue
+            e0 = m.embeds[0]
+            try:
+                e_email = _extract_email_from_embed(e0)
+                e_key = _extract_key_from_embed(e0)
+            except Exception:
+                e_email = ""
+                e_key = ""
+            # Prefer email match; fall back to key match when available.
+            if email_n and e_email and email_n == e_email:
+                did = _extract_discord_id_from_embed(e0)
+                if did:
+                    with suppress(Exception):
+                        if cache_key_email:
+                            _WHOP_LOGS_LOOKUP_CACHE[cache_key_email] = (did, now)
+                        if cache_key_key:
+                            _WHOP_LOGS_LOOKUP_CACHE[cache_key_key] = (did, now)
+                    return did
+            if key and e_key and key == e_key:
+                did = _extract_discord_id_from_embed(e0)
+                if did:
+                    with suppress(Exception):
+                        if cache_key_email:
+                            _WHOP_LOGS_LOOKUP_CACHE[cache_key_email] = (did, now)
+                        if cache_key_key:
+                            _WHOP_LOGS_LOOKUP_CACHE[cache_key_key] = (did, now)
+                    return did
+            # Some logs include membership ids/keys in description; try raw text match as last resort.
+            if mid:
+                raw = (str(getattr(e0, "description", "") or "") + " " + " ".join([str(getattr(f, "value", "") or "") for f in (getattr(e0, "fields", None) or [])])).lower()
+                if mid.lower() in raw:
+                    did = _extract_discord_id_from_embed(e0)
+                    if did:
+                        with suppress(Exception):
+                            if cache_key_email:
+                                _WHOP_LOGS_LOOKUP_CACHE[cache_key_email] = (did, now)
+                            if cache_key_key:
+                                _WHOP_LOGS_LOOKUP_CACHE[cache_key_key] = (did, now)
+                        return did
+    except Exception:
+        return ""
+    return ""
+
+
+# Public wrapper (used by startup scans) - keeps lookup logic single-sourced.
+async def resolve_discord_id_from_whop_logs(
+    guild: discord.Guild | None,
+    *,
+    email: str,
+    membership_id_hint: str = "",
+    whop_key: str = "",
+    limit: int = 50,
+) -> str:
+    """Resolve Discord ID by searching `whop-logs` for the matching email/key."""
+    return await _resolve_discord_id_from_whop_logs(
+        guild,
+        email=email,
+        membership_id_hint=membership_id_hint,
+        whop_key=whop_key,
+        limit=limit,
+    )
 
 
 def _looks_like_dispute(payment: dict) -> bool:
@@ -566,6 +795,14 @@ def _looks_like_resolution_needed(membership: dict, payment: dict) -> bool:
     return status in ("failed",) or substatus in ("past_due", "unpaid")
 
 
+def _cards_use_api() -> bool:
+    """Whether webhook-driven staff cards are allowed to call Whop API."""
+    try:
+        return bool((_whop_api_config or {}).get("cards_use_api", False))
+    except Exception:
+        return False
+
+
 async def _post_resolution_or_dispute_alert(
     member: discord.Member,
     membership: dict,
@@ -574,6 +811,9 @@ async def _post_resolution_or_dispute_alert(
 ) -> None:
     """Post a detailed alert to dispute/resolution channel (no member mention; ping support only)."""
     if not member or not member.guild:
+        return
+    # Webhook-driven cards should not depend on Whop API (scans/sync own API usage).
+    if not _cards_use_api():
         return
     if not _whop_api_config.get("enable_resolution_reporting", True):
         return
@@ -1361,18 +1601,17 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
         content = message.content or ""
         
         # Extract data from embed fields (primary source)
-        fields_data = {}
-        for field in embed.fields:
-            fields_data[field.name.lower()] = field.value
+        fields_data, merged_kv = _extract_native_kv_from_embed(embed)
         
         # Also parse message content as fallback (for messages without embeds)
         content_data = _parse_whop_content(content)
         
         # Merge: embed fields take precedence, content as fallback
-        parsed_data = {**content_data, **fields_data}
-        flat_kv = _flatten_field_kv(fields_data)
+        # Include merged_kv so description-parsed bullets (membership id, email, total spent, links)
+        # are available to the rest of the handler.
+        parsed_data = {**content_data, **fields_data, **merged_kv}
         # For native Whop cards, treat the posted card text as the source of truth.
-        summary_from_native = _build_whop_summary_from_native_kv(flat_kv)
+        summary_from_native = _build_whop_summary_from_native_kv(merged_kv)
 
         # Extract membership status and event type (usable even when Discord ID is missing)
         membership_status = parsed_data.get("membership_status", "") or fields_data.get("membership status", "")
@@ -1455,38 +1694,11 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                 discord_id_str = desc_match.group(1)
         
         if not discord_id_str or discord_id_str == "No Discord":
-            log.info(f"Native Whop message has no Discord ID: {title}")
+            if not backfill_only:
+                log.info(f"Native Whop message has no Discord ID: {title}")
             resolved_id = ""
 
-            # Best-effort #1 (preferred): if we have a membership id hint, resolve via Whop API
-            # to discover the connected Discord ID. This avoids "lookup needed" spam and keeps routing correct.
-            if membership_id_hint and _whop_api_client:
-                try:
-                    membership = await _whop_api_client.get_membership_by_id(str(membership_id_hint).strip())
-                except Exception:
-                    membership = None
-
-                whop_member_id = ""
-                if isinstance(membership, dict):
-                    m = membership.get("member")
-                    if isinstance(m, dict):
-                        whop_member_id = str(m.get("id") or m.get("member_id") or "").strip()
-                    elif isinstance(m, str):
-                        whop_member_id = m.strip()
-                    if not whop_member_id:
-                        whop_member_id = str(membership.get("member_id") or "").strip()
-
-                member_rec = None
-                if whop_member_id and whop_member_id.startswith("mber_") and _whop_api_client:
-                    with suppress(Exception):
-                        member_rec = await _whop_api_client.get_member_by_id(whop_member_id)
-
-                if isinstance(member_rec, dict):
-                    resolved_id = extract_discord_id_from_whop_member_record(member_rec)
-                    if resolved_id and resolved_id.isdigit():
-                        pass
-
-            # Best-effort #2: resolve Discord ID from cached identity (email -> discord_id).
+            # Best-effort #1: resolve Discord ID from cached identity (email -> discord_id).
             if not resolved_id:
                 try:
                     email_n = _norm_email(str(email_value or "").strip())
@@ -1496,6 +1708,23 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                     cached_id = ""
                 if cached_id and cached_id.isdigit():
                     resolved_id = cached_id
+
+            # Best-effort #2: resolve from whop-logs channel by matching email/key (no Whop API).
+            if not resolved_id:
+                try:
+                    whop_key = str(parsed_data.get("whop_key") or parsed_data.get("key") or "").strip()
+                except Exception:
+                    whop_key = ""
+                try:
+                    resolved_id = await _resolve_discord_id_from_whop_logs(
+                        message.guild if message.guild else None,
+                        email=str(email_value or "").strip(),
+                        membership_id_hint=str(membership_id_hint or "").strip(),
+                        whop_key=whop_key,
+                        limit=50,
+                    )
+                except Exception:
+                    resolved_id = ""
 
             if resolved_id and str(resolved_id).isdigit():
                 discord_id_str = str(resolved_id).strip()
@@ -1552,11 +1781,38 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
         # Get guild and member
         guild = message.guild
         member = guild.get_member(discord_user_id) if guild else None
+        if (not member) and guild:
+            with suppress(Exception):
+                member = await guild.fetch_member(discord_user_id)
         
         if not member:
+            # Still process summary storage even if member not found, but also post a minimal staff card
+            # so events don't silently disappear.
             if _log_other:
-                await _log_other(f"⚠️ **Whop Native:** Member {discord_user_id} not found in guild")
-            # Still process summary storage even if member not found
+                await _log_other(f"⚠️ **Whop Native:** Member `{discord_user_id}` not found in guild (posting fallback card)")
+            if _log_member_status:
+                e = discord.Embed(
+                    title=str(title or "Whop Native Event").strip()[:256],
+                    description=str(description or "").strip()[:3500] or "—",
+                    color=0xFEE75C,
+                    timestamp=datetime.now(timezone.utc),
+                )
+                with suppress(Exception):
+                    if email_value:
+                        e.add_field(name="Email", value=str(email_value)[:1024], inline=False)
+                with suppress(Exception):
+                    e.add_field(name="Discord ID", value=f"`{discord_user_id}`", inline=False)
+                with suppress(Exception):
+                    if membership_id_hint:
+                        e.add_field(name="Membership ID", value=f"`{membership_id_hint}`", inline=False)
+                with suppress(Exception):
+                    dash = str(summary_from_native.get("dashboard_url") or "").strip() if isinstance(summary_from_native, dict) else ""
+                    if dash:
+                        e.add_field(name="Whop Dashboard", value=dash[:1024], inline=False)
+                with suppress(Exception):
+                    e.set_footer(text="RSCheckerbot • Member Status Tracking")
+                with suppress(Exception):
+                    await _log_member_status("", embed=e)
             member = None
 
         # Process role changes if member found
@@ -1624,7 +1880,7 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                     await handle_payment_activation(member, event_data)
 
             # Check for cancel action
-            elif "performing cancel" in desc_l or "removeallroles" in desc_l:
+            elif ("performing cancel" in desc_l) or ("removeallroles" in desc_l) or ("performing cancel" in title_l) or ("removeallroles" in title_l):
                 event_data = {
                     "event_type": "membership.deactivated",
                     "discord_user_id": str(discord_user_id),
@@ -1724,10 +1980,11 @@ async def _verify_webhook_with_api(member: discord.Member, event_data: dict, eve
         event_data: Webhook event data
         event_type: Event type string (e.g., "membership.activated")
     """
+    # Webhook-driven cards should not depend on Whop API (scans/sync own API usage).
+    if not bool((_whop_api_config or {}).get("cards_use_api", False)):
+        return
     if not _whop_api_client:
-        return  # API client not available
-    
-    # Check if verification is enabled
+        return
     if not _whop_api_config.get("enable_verification", True):
         return
     
@@ -1868,7 +2125,7 @@ async def handle_membership_deactivated(
         membership_id = ""
         membership_id_source = ""
 
-    if membership_id and _whop_api_client:
+    if _cards_use_api() and membership_id and _whop_api_client:
         try:
             m = await _whop_api_client.get_membership_by_id(membership_id)
             entitled, _until_dt, _why = await _whop_api_client.is_entitled_until_end(
