@@ -30,7 +30,9 @@ def apply_member_header(embed: discord.Embed, user: discord.abc.User) -> None:
     if not url:
         return
     with suppress(Exception):
-        embed.set_author(name=str(user), icon_url=url)
+        # Make the author name clickable without pinging.
+        prof = f"https://discord.com/users/{int(getattr(user, 'id', 0) or 0)}"
+        embed.set_author(name=str(user), url=prof, icon_url=url)
         embed.set_thumbnail(url=url)
 
 
@@ -270,7 +272,8 @@ def build_case_minimal_embed(
 
     # Row 1 (inline x3)
     name = str(getattr(member, "display_name", "") or str(member))
-    _add_field(embed, "Member", name, inline=True)
+    prof = f"https://discord.com/users/{int(getattr(member, 'id', 0) or 0)}"
+    _add_field(embed, "Member", f"[{name}]({prof})", inline=True)
     _add_field(embed, "Discord ID", f"`{member.id}`", inline=True)
     _add_field(embed, _human_label("access_roles"), access_roles, inline=True)
 
@@ -332,7 +335,8 @@ def build_member_status_detailed_embed(
 
     # Header row (inline x3)
     name = str(getattr(member, "display_name", "") or str(member))
-    _add_field(embed, "Member", name, inline=True)
+    prof = f"https://discord.com/users/{int(getattr(member, 'id', 0) or 0)}"
+    _add_field(embed, "Member", f"[{name}]({prof})", inline=True)
     _add_field(embed, "Discord ID", f"`{member.id}`", inline=True)
     _add_field(embed, _human_label("access_roles"), access_roles, inline=True)
 

@@ -1838,6 +1838,14 @@ async def _startup_canceling_members_snapshot() -> None:
                         color=0xFEE75C,
                         timestamp=datetime.now(timezone.utc),
                     )
+                    # Make the Discord identity clickable even when the user isn't in this guild.
+                    if did:
+                        link_name = (discord_user if discord_user and discord_user != "—" else user_name) or "Member"
+                        e.add_field(
+                            name="Member",
+                            value=f"[{link_name}](https://discord.com/users/{did})",
+                            inline=True,
+                        )
                     e.add_field(name="Email", value=email_s[:1024], inline=False)
                     e.add_field(name="Discord ID", value=(f"`{did}`" if did else "—"), inline=True)
                     e.add_field(name="Membership", value=product_s[:1024], inline=True)
@@ -1850,8 +1858,8 @@ async def _startup_canceling_members_snapshot() -> None:
                 # Snapshot-only extras are now carried via whop_brief so all cards share the same layout.
 
                 try:
-                    # Make the member clickable (no ping) when we have a Discord member.
-                    content = member_obj.mention if member_obj is not None else None
+                    # Keep member identity inside the embed (no content mention -> avoids @unknown-user).
+                    content = None
                     for dst in [ch] + mirror_chs:
                         await dst.send(content=content, embed=e, allowed_mentions=discord.AllowedMentions.none())
                     sent_msgs += 1
@@ -6121,6 +6129,24 @@ async def on_ready():
 @bot.event
 async def on_member_join(member: discord.Member):
     if member.guild.id == GUILD_ID and not member.bot:
+        # Discord can emit duplicate join events; dedupe per user for a short window.
+        global _RECENT_MEMBER_JOINED
+        try:
+            _RECENT_MEMBER_JOINED
+        except Exception:
+            _RECENT_MEMBER_JOINED = {}  # type: ignore[var-annotated]
+        try:
+            now_ts = int(time.time())
+            prev_ts = int((_RECENT_MEMBER_JOINED or {}).get(str(member.id)) or 0)
+            if prev_ts and (now_ts - prev_ts) < 60:
+                return
+            _RECENT_MEMBER_JOINED[str(member.id)] = now_ts
+            if len(_RECENT_MEMBER_JOINED) > 5000:
+                items = sorted(_RECENT_MEMBER_JOINED.items(), key=lambda kv: int(kv[1] or 0), reverse=True)[:2000]
+                _RECENT_MEMBER_JOINED = dict(items)  # type: ignore[assignment]
+        except Exception:
+            pass
+
         async def _upsert_member_join_card(embed: discord.Embed) -> discord.Message | None:
             """Prevent duplicate join cards by editing an existing recent one if present."""
             try:
@@ -6133,11 +6159,12 @@ async def on_member_join(member: discord.Member):
                     return None
                 now = datetime.now(timezone.utc)
                 # Look back a small window for the same user+event (multi-process safety).
-                async for m in ch.history(limit=20):
+                matches: list[discord.Message] = []
+                async for m in ch.history(limit=50):
                     try:
                         if int(getattr(m.author, "id", 0) or 0) != int(getattr(me, "id", 0) or 0):
                             continue
-                        if (now - m.created_at).total_seconds() > 180:
+                        if (now - m.created_at).total_seconds() > 300:
                             break
                         if not m.embeds:
                             continue
@@ -6155,11 +6182,18 @@ async def on_member_join(member: discord.Member):
                         except Exception:
                             did = ""
                         if did and did.isdigit() and int(did) == int(member.id):
-                            with suppress(Exception):
-                                await m.edit(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-                            return m
+                            matches.append(m)
                     except Exception:
                         continue
+                if matches:
+                    # History yields newest-first; edit the most recent and delete any extras.
+                    keep = matches[0]
+                    with suppress(Exception):
+                        await keep.edit(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+                    for extra in matches[1:]:
+                        with suppress(Exception):
+                            await extra.delete()
+                    return keep
             except Exception:
                 return None
             return None
