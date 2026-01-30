@@ -315,6 +315,21 @@ def _load_reporting_config(cfg: dict) -> dict:
     ]
     startup_canceling_exclude_product_keywords = sorted(set(startup_canceling_exclude_product_keywords))
 
+    # Optional mirror targets for canceling snapshot (by channel id).
+    mirror_ids_raw = base.get("startup_canceling_snapshot_mirror_channel_ids")
+    if not isinstance(mirror_ids_raw, list):
+        mirror_ids_raw = []
+    mirror_ids: list[int] = []
+    for x in mirror_ids_raw:
+        xi = _as_int(x)
+        if isinstance(xi, int) and xi > 0:
+            mirror_ids.append(int(xi))
+    mirror_ids = list(dict.fromkeys(mirror_ids))  # preserve order, unique
+
+    mirror_clear = _as_bool(base.get("startup_canceling_snapshot_mirror_clear_channel", False))
+    mirror_clear_limit = _as_int(base.get("startup_canceling_snapshot_mirror_clear_limit")) or 0
+    mirror_clear_limit = max(0, min(int(mirror_clear_limit or 0), 500))
+
     if not isinstance(reminder_days, list):
         reminder_days = [7, 3, 1]
     cleaned_days: list[int] = []
@@ -365,6 +380,9 @@ def _load_reporting_config(cfg: dict) -> dict:
         "startup_canceling_snapshot_skip_payment_status_keywords": startup_canceling_skip_payment_keywords,
         "startup_canceling_snapshot_payment_check_limit": int(startup_canceling_payment_check_limit),
         "startup_canceling_snapshot_exclude_product_title_keywords": startup_canceling_exclude_product_keywords,
+        "startup_canceling_snapshot_mirror_channel_ids": mirror_ids,
+        "startup_canceling_snapshot_mirror_clear_channel": bool(mirror_clear),
+        "startup_canceling_snapshot_mirror_clear_limit": int(mirror_clear_limit),
         "scan_log_channel_id": scan_log_channel_id or 0,
         "scan_log_webhook_url": scan_log_webhook_url,
         "scan_log_each_member": bool(scan_log_each_member),
@@ -924,6 +942,28 @@ async def _startup_canceling_members_snapshot() -> None:
             log.warning("[BOOT][Canceling] output channel not found/creatable: %s", out_name)
             return
 
+        # Optional mirror channels (e.g. main guild case channel).
+        mirror_chs: list[discord.TextChannel] = []
+        try:
+            mirror_ids = REPORTING_CONFIG.get("startup_canceling_snapshot_mirror_channel_ids")
+        except Exception:
+            mirror_ids = []
+        if not isinstance(mirror_ids, list):
+            mirror_ids = []
+        for cid in mirror_ids:
+            try:
+                cid_i = int(cid)
+            except Exception:
+                continue
+            if cid_i <= 0 or cid_i == int(ch.id):
+                continue
+            mch = bot.get_channel(cid_i)
+            if mch is None:
+                with suppress(Exception):
+                    mch = await bot.fetch_channel(cid_i)
+            if isinstance(mch, discord.TextChannel):
+                mirror_chs.append(mch)
+
         max_pages = int(REPORTING_CONFIG.get("startup_canceling_snapshot_max_pages") or 0) or 3
         per_page = int(REPORTING_CONFIG.get("startup_canceling_snapshot_per_page") or 0) or 100
         max_rows = int(REPORTING_CONFIG.get("startup_canceling_snapshot_max_rows") or 0) or 50
@@ -936,6 +976,12 @@ async def _startup_canceling_members_snapshot() -> None:
         except Exception:
             clear_limit = 200
         clear_limit = max(0, min(clear_limit, 500))
+        mirror_clear_first = bool(REPORTING_CONFIG.get("startup_canceling_snapshot_mirror_clear_channel", False))
+        try:
+            mirror_clear_limit = int(REPORTING_CONFIG.get("startup_canceling_snapshot_mirror_clear_limit", clear_limit))
+        except Exception:
+            mirror_clear_limit = clear_limit
+        mirror_clear_limit = max(0, min(mirror_clear_limit, 500))
         fill_total_via_payments = bool(REPORTING_CONFIG.get("startup_canceling_snapshot_fill_total_spend_via_payments", False))
         attach_csv = bool(REPORTING_CONFIG.get("startup_canceling_snapshot_attach_csv", False))
         try:
@@ -1231,22 +1277,28 @@ async def _startup_canceling_members_snapshot() -> None:
             len(email_to_spend),
         )
 
-        # Optional: clear recent bot messages in the snapshot channel (keep channel tidy).
-        if clear_first and bot.user and clear_limit > 0:
+        async def _maybe_clear_channel(target: discord.TextChannel, *, do_clear: bool, limit_n: int) -> None:
+            if not do_clear or not bot.user or limit_n <= 0:
+                return
             try:
                 deleted = 0
-                async for m in ch.history(limit=clear_limit):
+                async for m in target.history(limit=limit_n):
                     if int(getattr(m.author, "id", 0) or 0) != int(bot.user.id):
                         continue
                     with suppress(Exception):
                         await m.delete()
                         deleted += 1
                 if deleted:
-                    log.info("[BOOT][Canceling] cleared %s bot message(s) in #%s", deleted, str(getattr(ch, "name", "")))
+                    log.info("[BOOT][Canceling] cleared %s bot message(s) in #%s", deleted, str(getattr(target, "name", "")))
             except Exception as ex:
                 log.warning("[BOOT][Canceling] clear channel failed: %s", str(ex)[:240])
 
-        # Live progress message in Neo (edited as we scan/post).
+        # Optional: clear recent bot messages in the snapshot channels (keep channels tidy).
+        await _maybe_clear_channel(ch, do_clear=clear_first, limit_n=clear_limit)
+        for mch in mirror_chs:
+            await _maybe_clear_channel(mch, do_clear=mirror_clear_first, limit_n=mirror_clear_limit)
+
+        # Live progress message in primary snapshot channel (edited as we scan/post).
         progress_msg: discord.Message | None = None
         try:
             txt = _progress_text(
@@ -1683,12 +1735,21 @@ async def _startup_canceling_members_snapshot() -> None:
             except Exception:
                 file_obj = None
 
-        # Send header (with optional file) first.
-        with suppress(Exception):
-            if file_obj:
-                await ch.send(embed=header, file=file_obj, allowed_mentions=discord.AllowedMentions.none())
-            else:
-                await ch.send(embed=header, allowed_mentions=discord.AllowedMentions.none())
+        # Send header (with optional file) first to all snapshot destinations.
+        header_bytes: bytes | None = None
+        if file_obj:
+            with suppress(Exception):
+                # Read underlying buffer so we can re-attach for mirrors.
+                fp = getattr(file_obj, "fp", None)
+                if fp and hasattr(fp, "getvalue"):
+                    header_bytes = fp.getvalue()
+        for dst in [ch] + mirror_chs:
+            with suppress(Exception):
+                if header_bytes:
+                    f2 = discord.File(fp=io.BytesIO(header_bytes), filename="canceling-snapshot.csv")
+                    await dst.send(embed=header, file=f2, allowed_mentions=discord.AllowedMentions.none())
+                else:
+                    await dst.send(embed=header, allowed_mentions=discord.AllowedMentions.none())
 
         # If configured, post one embed per member and stop (avoid bundled mega-embeds).
         if per_member_msgs:
@@ -1791,7 +1852,8 @@ async def _startup_canceling_members_snapshot() -> None:
                 try:
                     # Make the member clickable (no ping) when we have a Discord member.
                     content = member_obj.mention if member_obj is not None else None
-                    await ch.send(content=content, embed=e, allowed_mentions=discord.AllowedMentions.none())
+                    for dst in [ch] + mirror_chs:
+                        await dst.send(content=content, embed=e, allowed_mentions=discord.AllowedMentions.none())
                     sent_msgs += 1
                 except Exception as ex:
                     last_err = ex
@@ -2590,6 +2652,30 @@ try:
 except Exception:
     WHOP_EVENTS_POLL_MAX_EVENTS_PER_TICK = 10
 WHOP_EVENTS_POLL_MAX_EVENTS_PER_TICK = max(1, min(WHOP_EVENTS_POLL_MAX_EVENTS_PER_TICK, 100))
+try:
+    WHOP_EVENTS_POLL_POST_UNLINKED = bool(WHOP_API_CONFIG.get("events_poll_post_unlinked", True))
+except Exception:
+    WHOP_EVENTS_POLL_POST_UNLINKED = True
+try:
+    WHOP_EVENTS_POLL_POST_UNLINKED_TO_CASE = bool(WHOP_API_CONFIG.get("events_poll_post_unlinked_to_case_channels", False))
+except Exception:
+    WHOP_EVENTS_POLL_POST_UNLINKED_TO_CASE = False
+WHOP_EVENTS_POLL_UNLINKED_NOTE = str(
+    WHOP_API_CONFIG.get("events_poll_unlinked_note")
+    or "Discord not linked. Ask the member to connect Discord in Whop: Dashboard -> Connected accounts -> Discord."
+).strip()
+try:
+    WHOP_EVENTS_POLL_LOG_ENABLED = bool(WHOP_API_CONFIG.get("events_poll_log_enabled", True))
+except Exception:
+    WHOP_EVENTS_POLL_LOG_ENABLED = True
+try:
+    WHOP_EVENTS_POLL_LOG_OUTPUT_GUILD_ID = int(WHOP_API_CONFIG.get("events_poll_log_output_guild_id") or 0)
+except Exception:
+    WHOP_EVENTS_POLL_LOG_OUTPUT_GUILD_ID = 0
+try:
+    WHOP_EVENTS_POLL_LOG_OUTPUT_CHANNEL_ID = int(WHOP_API_CONFIG.get("events_poll_log_output_channel_id") or 0)
+except Exception:
+    WHOP_EVENTS_POLL_LOG_OUTPUT_CHANNEL_ID = 0
 _WHOP_EVENT_DEDUPE_IDS: set[str] = set()
 _WHOP_EVENT_DEDUPE_QUEUE: deque[str] = deque()
 
@@ -5419,6 +5505,7 @@ async def sync_whop_memberships():
 # Whop API-only movement watcher
 # -----------------------------
 _WHOP_API_EVENTS_LOCK: asyncio.Lock = asyncio.Lock()
+_WHOP_API_EVENTS_LOG_CH: discord.TextChannel | None = None
 
 
 def _load_whop_api_events_state() -> dict:
@@ -5439,6 +5526,59 @@ def _extract_discord_id_from_connected(s: str) -> int:
         return int(m.group(1)) if m else 0
     except Exception:
         return 0
+
+
+async def _whop_api_events_log(msg: str) -> None:
+    """Best-effort log of API watcher detections into Neo test."""
+    global _WHOP_API_EVENTS_LOG_CH
+    if not WHOP_EVENTS_POLL_LOG_ENABLED:
+        return
+    if not bot.is_ready():
+        return
+    if not msg or not str(msg).strip():
+        return
+    cid = int(WHOP_EVENTS_POLL_LOG_OUTPUT_CHANNEL_ID or 0)
+    if cid <= 0:
+        return
+    ch = _WHOP_API_EVENTS_LOG_CH
+    if not isinstance(ch, discord.TextChannel) or int(getattr(ch, "id", 0) or 0) != cid:
+        ch2 = bot.get_channel(cid)
+        if isinstance(ch2, discord.TextChannel):
+            ch = ch2
+        else:
+            with suppress(Exception):
+                fetched = await bot.fetch_channel(cid)
+                ch = fetched if isinstance(fetched, discord.TextChannel) else None
+        _WHOP_API_EVENTS_LOG_CH = ch if isinstance(ch, discord.TextChannel) else None
+    if not isinstance(ch, discord.TextChannel):
+        return
+    with suppress(Exception):
+        await ch.send(content=str(msg)[:1900], allowed_mentions=discord.AllowedMentions.none())
+
+
+def _linked_hint_embed(*, title: str, color: int, brief: dict, note: str) -> discord.Embed:
+    """Staff-only embed for Whop events with no connected Discord."""
+    e = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
+    user_name = str((brief or {}).get("user_name") or "").strip() or "—"
+    email = str((brief or {}).get("email") or "").strip() or "—"
+    product = str((brief or {}).get("product") or "").strip() or "—"
+    status = str((brief or {}).get("status") or "").strip() or "—"
+    spent = str((brief or {}).get("total_spent") or "").strip() or "—"
+    dash = str((brief or {}).get("dashboard_url") or "").strip() or "—"
+    renew = str((brief or {}).get("renewal_window") or "").strip() or "—"
+    e.add_field(name="Member (Whop)", value=user_name[:1024], inline=True)
+    e.add_field(name="Email", value=email[:1024], inline=True)
+    e.add_field(name="Discord", value="Not linked", inline=True)
+    e.add_field(name="Membership", value=product[:1024], inline=True)
+    e.add_field(name="Status", value=status[:1024], inline=True)
+    e.add_field(name="Total Spent (lifetime)", value=spent[:1024], inline=True)
+    e.add_field(name="Whop Dashboard", value=dash[:1024], inline=False)
+    if renew and renew != "—":
+        e.add_field(name="Renewal Window", value=renew[:1024], inline=False)
+    if note:
+        e.add_field(name="Action", value=str(note)[:1024], inline=False)
+    e.set_footer(text="RSCheckerbot • Whop API")
+    return e
 
 
 def _status_bucket(status: str) -> str:
@@ -5592,7 +5732,25 @@ async def whop_api_events_poll():
                         with suppress(Exception):
                             member_obj = await guild.fetch_member(int(did))
                 if member_obj is None:
-                    # No Discord mapping -> skip staff post (avoid confusing blanks).
+                    # No Discord mapping -> still post a staff hint card (so we don't miss events).
+                    if not WHOP_EVENTS_POLL_POST_UNLINKED:
+                        continue
+                    title2 = f"{title} (Discord not linked)"
+                    e_unlinked = _linked_hint_embed(title=title2, color=color, brief=brief, note=WHOP_EVENTS_POLL_UNLINKED_NOTE)
+                    await log_member_status("", embed=e_unlinked)
+                    await _whop_api_events_log(
+                        f"[Whop API][detected] kind={kind} linked=no mid={mid} status={cur.get('status')} "
+                        f"email={str(brief.get('email') or '—').strip()} product={str(brief.get('product') or '—').strip()}"
+                    )
+                    if WHOP_EVENTS_POLL_POST_UNLINKED_TO_CASE and kind == "payment_failed":
+                        await log_member_status("", embed=e_unlinked, channel_name=PAYMENT_FAILURE_CHANNEL_NAME)
+                    elif WHOP_EVENTS_POLL_POST_UNLINKED_TO_CASE and kind == "cancellation_scheduled":
+                        await log_member_status("", embed=e_unlinked, channel_name=MEMBER_CANCELLATION_CHANNEL_NAME)
+                    sent[event_key] = now.isoformat().replace("+00:00", "Z")
+                    posted += 1
+                    if posted >= int(WHOP_EVENTS_POLL_MAX_EVENTS_PER_TICK):
+                        stop = True
+                        break
                     continue
 
                 relevant = coerce_role_ids(ROLE_TRIGGER, WELCOME_ROLE_ID, ROLE_CANCEL_A, ROLE_CANCEL_B)
@@ -5608,6 +5766,10 @@ async def whop_api_events_poll():
                     whop_brief=brief,
                 )
                 await log_member_status("", embed=detailed)
+                await _whop_api_events_log(
+                    f"[Whop API][detected] kind={kind} linked=yes did={member_obj.id} mid={mid} status={cur.get('status')} "
+                    f"product={str(brief.get('product') or '—').strip()}"
+                )
 
                 # Case channels (minimal) only for high urgency.
                 if kind == "payment_failed":
@@ -6218,6 +6380,27 @@ async def on_member_join(member: discord.Member):
 @bot.event
 async def on_member_remove(member: discord.Member):
     """Track member leave events and log to member-status-logs"""
+    # Discord can emit duplicate leave events; dedupe per user for a short window.
+    global _RECENT_MEMBER_LEFT
+    try:
+        _RECENT_MEMBER_LEFT
+    except Exception:
+        _RECENT_MEMBER_LEFT = {}  # type: ignore[var-annotated]
+
+    try:
+        now_ts = int(time.time())
+        prev_ts = int((_RECENT_MEMBER_LEFT or {}).get(str(member.id)) or 0)
+        if prev_ts and (now_ts - prev_ts) < 60:
+            return
+        _RECENT_MEMBER_LEFT[str(member.id)] = now_ts
+        # Bound size (best-effort)
+        if len(_RECENT_MEMBER_LEFT) > 5000:
+            # keep most recent ~2000
+            items = sorted(_RECENT_MEMBER_LEFT.items(), key=lambda kv: int(kv[1] or 0), reverse=True)[:2000]
+            _RECENT_MEMBER_LEFT = {k: v for k, v in items}  # type: ignore[var-annotated]
+    except Exception:
+        pass
+
     if member.guild.id == GUILD_ID and not member.bot:
         rec = _touch_leave(member.id, member)
         
@@ -8946,7 +9129,7 @@ async def whop_sync_summary_dm(ctx, start: str = "", end: str = ""):
 @bot.command(name="canceling", aliases=["cancelling", "set-to-cancel", "settocancel"])
 @commands.has_permissions(administrator=True)
 async def run_canceling_snapshot(ctx) -> None:
-    """Manually run the Whop canceling snapshot (same as startup) into Neo `#set-to-cancel`."""
+    """Manually run the Whop canceling snapshot (same as startup) into configured destinations."""
     with suppress(Exception):
         await ctx.message.delete()
     try:
@@ -8955,7 +9138,7 @@ async def run_canceling_snapshot(ctx) -> None:
             return
         # Run the same snapshot logic (respects reporting.* config including clear_channel).
         await _startup_canceling_members_snapshot()
-        await ctx.send("✅ Posted canceling snapshot to Neo `#set-to-cancel`.", delete_after=10)
+        await ctx.send("✅ Posted canceling snapshot (Neo + any configured mirrors).", delete_after=10)
     except Exception:
         log.exception("[Canceling] manual snapshot failed")
         await ctx.send("❌ Canceling snapshot failed (see logs).", delete_after=20)

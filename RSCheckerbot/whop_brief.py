@@ -174,6 +174,8 @@ async def fetch_whop_brief(
         "membership_id": str(membership.get("id") or mid).strip(),
         "status": str(membership.get("status") or "").strip() or "—",
         "product": product_title,
+        "user_name": "",
+        "email": "",
         "member_since": _fmt_date_any(membership.get("created_at")),
         "trial_end": _fmt_date_any(membership.get("trial_end") or membership.get("trial_ends_at") or membership.get("trial_end_at")),
         "renewal_start": _fmt_date_any(membership.get("renewal_period_start")),
@@ -199,6 +201,15 @@ async def fetch_whop_brief(
         "whop_user_id": "",
         "whop_member_id": "",
     }
+
+    # User identity (email/name) from membership payload (staff-only).
+    try:
+        u = membership.get("user")
+        if isinstance(u, dict):
+            brief["user_name"] = str(u.get("name") or u.get("username") or "").strip()
+            brief["email"] = str(u.get("email") or "").strip()
+    except Exception:
+        pass
     # Cancellation reason (membership payload)
     try:
         reason_raw = str(membership.get("cancel_option") or membership.get("cancellation_reason") or "").strip()
