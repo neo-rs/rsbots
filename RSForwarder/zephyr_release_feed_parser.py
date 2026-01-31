@@ -48,6 +48,7 @@ def tag_to_store(tag: str) -> Optional[str]:
         "amazon": "Amazon",
         "walmart": "Walmart",
         "target": "Target",
+        "lowes": "Lowes",
         "homedepot": "Homedepot",
         "gamestop": "Gamestop",
         "costco": "Costco",
@@ -57,6 +58,8 @@ def tag_to_store(tag: str) -> Optional[str]:
         "mattel": "Mattel",
         "shopify": "Shopify",
         "us-mint": "US Mint",
+        "funkopop": "Funkopop",
+        "funko": "Funkopop",
         # Some deployments use these variants:
         "barnes": "Barnes and Nobles",
         "barnesandnobles": "Barnes and Nobles",

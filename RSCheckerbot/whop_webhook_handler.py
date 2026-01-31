@@ -17,6 +17,9 @@ from pathlib import Path
 from datetime import datetime, timezone
 from contextlib import suppress
 
+# Support CRM tickets (Neo)
+import support_tickets
+
 log = logging.getLogger("rs-checker")
 
 # whop-logs history lookup throttles (avoid Discord 429s)
@@ -1220,6 +1223,13 @@ async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embe
         # Parse event data
         json_string = json_match.group(1)
         event_data = json.loads(json_string)
+
+        # Attach source references for downstream systems (support tickets, reporting)
+        with suppress(Exception):
+            event_data["_source_jump_url"] = str(getattr(message, "jump_url", "") or "").strip()
+        with suppress(Exception):
+            if getattr(message, "created_at", None):
+                event_data["_occurred_at_iso"] = message.created_at.astimezone(timezone.utc).isoformat()
         
         event_type = event_data.get('event_type', '').strip()
         discord_user_id = event_data.get('discord_user_id', '').strip()
@@ -1687,6 +1697,11 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                     "amount": "N/A",
                     "failure_reason": "Payment failed",
                 }
+                with suppress(Exception):
+                    event_data["_source_jump_url"] = str(getattr(message, "jump_url", "") or "").strip()
+                with suppress(Exception):
+                    if getattr(message, "created_at", None):
+                        event_data["_occurred_at_iso"] = message.created_at.astimezone(timezone.utc).isoformat()
                 if isinstance(summary_from_native, dict) and summary_from_native:
                     event_data["_whop_summary"] = summary_from_native
                 await handle_payment_failed(member, event_data)
@@ -1700,6 +1715,11 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                     "discord_user_id": str(discord_user_id),
                     "email": email_value,
                 }
+                with suppress(Exception):
+                    event_data["_source_jump_url"] = str(getattr(message, "jump_url", "") or "").strip()
+                with suppress(Exception):
+                    if getattr(message, "created_at", None):
+                        event_data["_occurred_at_iso"] = message.created_at.astimezone(timezone.utc).isoformat()
                 if membership_id_hint:
                     event_data["membership_id"] = membership_id_hint
                 if isinstance(summary_from_native, dict) and summary_from_native:
@@ -1881,6 +1901,10 @@ async def handle_membership_activated(member: discord.Member, event_data: dict):
     # Verify with API after processing
     await _verify_webhook_with_api(member, event_data, "membership.activated")
 
+    # Free Pass tickets: close immediately once Whop access is confirmed.
+    with suppress(Exception):
+        await support_tickets.close_free_pass_if_whop_linked(int(member.id))
+
 
 async def handle_membership_activated_pending(member: discord.Member, event_data: dict):
     """Handle pending membership activation - log with support card embed"""
@@ -1902,6 +1926,10 @@ async def handle_membership_activated_pending(member: discord.Member, event_data
     
     # Verify with API after processing
     await _verify_webhook_with_api(member, event_data, "membership.activated.pending")
+
+    # Free Pass tickets: close once Whop linking is detected (pending activation counts as linked intent).
+    with suppress(Exception):
+        await support_tickets.close_free_pass_if_whop_linked(int(member.id))
 
 
 async def handle_membership_billing_issue_access_risk(member: discord.Member, event_data: dict):
@@ -2042,6 +2070,21 @@ async def handle_membership_deactivated(
             cooldown_hours=6.0,
         ):
             await _log_member_status("", embed=minimal, channel_name=dest)
+
+        # Support tickets (Neo): open/update a Cancellation ticket (skip payment-failure destinations).
+        if dest == MEMBER_CANCELLATION_CHANNEL_NAME:
+            with suppress(Exception):
+                occurred_at = _parse_dt_any(str(event_data.get("_occurred_at_iso") or "")) or datetime.now(timezone.utc)
+                mid = _membership_id_from_event(member, event_data) or str(membership_id or "").strip()
+                fingerprint = f"{mid or int(member.id)}|cancel|{occurred_at.date().isoformat()}"
+                reason_txt = _event_reason_from_data(event_data)
+                await support_tickets.open_cancellation_ticket(
+                    member=member,
+                    whop_brief=whop_brief,
+                    cancellation_reason=reason_txt,
+                    fingerprint=fingerprint,
+                    reference_jump_url=str(event_data.get("_source_jump_url") or "").strip(),
+                )
     
     # Verify with API after processing
     await _verify_webhook_with_api(member, event_data, "membership.deactivated")
@@ -2084,6 +2127,10 @@ async def handle_payment_renewal(member: discord.Member, event_data: dict):
     # Verify with API after processing
     await _verify_webhook_with_api(member, event_data, "payment.succeeded.renewal")
 
+    # Free Pass tickets: close if user is now linked/active.
+    with suppress(Exception):
+        await support_tickets.close_free_pass_if_whop_linked(int(member.id))
+
 
 async def handle_payment_activation(member: discord.Member, event_data: dict):
     """Handle first payment - assign Member role and log with support card embed"""
@@ -2113,6 +2160,10 @@ async def handle_payment_activation(member: discord.Member, event_data: dict):
     
     # Verify with API after processing
     await _verify_webhook_with_api(member, event_data, "payment.succeeded.activation")
+
+    # Free Pass tickets: close if user claimed/activated access.
+    with suppress(Exception):
+        await support_tickets.close_free_pass_if_whop_linked(int(member.id))
 
 
 async def handle_payment_failed(member: discord.Member, event_data: dict):
@@ -2147,6 +2198,24 @@ async def handle_payment_failed(member: discord.Member, event_data: dict):
             cooldown_hours=2.0,
         ):
             await _log_member_status("", embed=minimal, channel_name=PAYMENT_FAILURE_CHANNEL_NAME)
+
+        # Support tickets (Neo): open/update a Billing ticket (current month only).
+        with suppress(Exception):
+            occurred_at = _parse_dt_any(str(event_data.get("_occurred_at_iso") or "")) or datetime.now(timezone.utc)
+            invoice_id = _safe_get(event_data, "invoice_id", "invoice.id", default="").strip()
+            payment_id = _safe_get(event_data, "payment_id", "payment.id", default="").strip()
+            fingerprint = invoice_id or payment_id or f"payment.failed|{int(member.id)}|{occurred_at.date().isoformat()}"
+            st = str((whop_brief or {}).get("status") or event_data.get("status") or "Past Due").strip()
+            if st.lower() in {"past_due", "past due", "unpaid"}:
+                st = "Past Due"
+            await support_tickets.open_billing_ticket(
+                member=member,
+                event_type="payment.failed",
+                status=st or "Past Due",
+                fingerprint=fingerprint,
+                occurred_at=occurred_at,
+                reference_jump_url=str(event_data.get("_source_jump_url") or "").strip(),
+            )
 
 
 async def handle_payment_refunded(member: discord.Member, event_data: dict):

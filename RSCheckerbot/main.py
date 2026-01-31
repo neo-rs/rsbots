@@ -6,6 +6,7 @@ import re
 import csv
 import io
 import time
+import hashlib
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import logging
@@ -180,6 +181,13 @@ from staff_alerts_store import (
     record_alert_post,
     should_post_and_record_alert,
 )
+
+# Shared channel helpers (canonical for ticket-like channels)
+from ticket_channels import slug_channel_name as _slug_channel_name
+from ticket_channels import ensure_ticket_like_channel as _ensure_whop_case_channel
+
+# Support CRM tickets (Neo)
+import support_tickets
 
 # Import Whop webhook handler
 from whop_webhook_handler import (
@@ -2935,7 +2943,20 @@ intents.members = True
 intents.guilds = True
 intents.invites = True
 
-bot = commands.Bot(command_prefix=commands.when_mentioned_or(".checker "), intents=intents)
+_base_prefix = commands.when_mentioned_or(".checker ")
+
+def _command_prefix(bot_obj: commands.Bot, message: discord.Message):
+    # Only allow `!` commands inside support ticket channels.
+    prefixes = list(_base_prefix(bot_obj, message))
+    try:
+        ch_id = int(getattr(getattr(message, "channel", None), "id", 0) or 0)
+        if ch_id and support_tickets.is_ticket_channel(ch_id):
+            prefixes.append("!")
+    except Exception:
+        pass
+    return prefixes
+
+bot = commands.Bot(command_prefix=_command_prefix, intents=intents)
 
 # Make bot instance accessible for message editor
 class RSCheckerBot:
@@ -4091,6 +4112,66 @@ def _output_guild() -> discord.Guild | None:
     return bot.get_guild(int(gid)) if gid else None
 
 
+_STAFF_SEND_DEDUPE: dict[str, float] = {}
+
+
+def _staff_send_dedupe_key(*, channel_id: int, content: str, embed: discord.Embed) -> str:
+    """Stable-ish key to prevent duplicate staff posts (short window).
+
+    We intentionally avoid embed timestamps; we key off semantic fields.
+    """
+    try:
+        title = str(getattr(embed, "title", "") or "").strip()
+    except Exception:
+        title = ""
+    try:
+        desc = str(getattr(embed, "description", "") or "").strip()
+    except Exception:
+        desc = ""
+    try:
+        footer = str(getattr(getattr(embed, "footer", None), "text", "") or "").strip()
+    except Exception:
+        footer = ""
+
+    # Prefer identity/status fields to avoid suppressing different events.
+    important_names = {
+        "discord id",
+        "membership id",
+        "status",
+        "membership",
+        "email",
+        "member (whop)",
+        "whop key",
+        "key",
+    }
+    fields_out: list[str] = []
+    try:
+        for f in (getattr(embed, "fields", None) or []):
+            try:
+                nm = str(getattr(f, "name", "") or "").strip()
+                val = str(getattr(f, "value", "") or "").strip()
+            except Exception:
+                continue
+            if not nm or not val:
+                continue
+            if nm.strip().lower() in important_names:
+                fields_out.append(f"{nm}:{val}")
+    except Exception:
+        pass
+
+    blob = "\n".join(
+        [
+            f"ch={int(channel_id)}",
+            f"title={title}",
+            f"footer={footer}",
+            f"content={str(content or '').strip()}",
+            f"desc={desc[:300]}",
+            *fields_out[:20],
+        ]
+    )
+    return hashlib.sha1(blob.encode("utf-8", errors="ignore")).hexdigest()
+
+
 async def _get_or_create_text_channel(
     guild: discord.Guild,
     *,
@@ -4238,6 +4319,30 @@ async def log_member_status(msg: str, embed: discord.Embed = None, *, channel_na
             if not in_main_guild
             else discord.AllowedMentions(users=True, roles=False, everyone=False)
         )
+
+        # Dedupe: avoid duplicate staff cards (webhook retries / race conditions).
+        try:
+            ttl = int(LOG_CONTROLS.get("staff_embed_dedupe_seconds", 45))
+        except Exception:
+            ttl = 45
+        ttl = max(0, min(ttl, 600))
+        if ttl > 0 and isinstance(embed, discord.Embed):
+            now = time.time()
+            key = _staff_send_dedupe_key(channel_id=int(getattr(ch, "id", 0) or 0), content=(content or ""), embed=embed)
+            # Prune old entries (cheap).
+            if _STAFF_SEND_DEDUPE:
+                try:
+                    cutoff = now - float(ttl)
+                    stale = [k for k, ts in _STAFF_SEND_DEDUPE.items() if float(ts) < cutoff]
+                    for k in stale[:2000]:
+                        _STAFF_SEND_DEDUPE.pop(k, None)
+                except Exception:
+                    pass
+            prev = _STAFF_SEND_DEDUPE.get(key)
+            if prev and (now - float(prev)) < float(ttl):
+                return None
+            # Reserve key immediately to avoid races; if send fails, remove reservation.
+            _STAFF_SEND_DEDUPE[key] = now
         try:
             sent = await ch.send(content=(content or ""), embed=embed, allowed_mentions=allow, silent=bool(in_main_guild))
         except TypeError:
@@ -4249,6 +4354,12 @@ async def log_member_status(msg: str, embed: discord.Embed = None, *, channel_na
             pass
         return sent
     except Exception:
+        # If we reserved a dedupe key but failed to send, clear it so a retry can post.
+        with suppress(Exception):
+            if "key" in locals():
+                now0 = locals().get("now", None)
+                if now0 is not None and _STAFF_SEND_DEDUPE.get(locals()["key"]) == now0:
+                    _STAFF_SEND_DEDUPE.pop(locals()["key"], None)
         return None
 
 # -----------------------------
@@ -6220,90 +6331,6 @@ def _payment_id_any(p: dict) -> str:
         return ""
 
 
-def _slug_channel_name(s: str, *, max_len: int = 90) -> str:
-    """Discord channel name slug (lowercase, alnum + hyphen)."""
-    raw = str(s or "").strip().lower()
-    out = []
-    last_dash = False
-    for ch in raw:
-        ok = ("a" <= ch <= "z") or ("0" <= ch <= "9")
-        if ok:
-            out.append(ch)
-            last_dash = False
-        else:
-            if not last_dash:
-                out.append("-")
-                last_dash = True
-    slug = "".join(out).strip("-")
-    while "--" in slug:
-        slug = slug.replace("--", "-")
-    if not slug:
-        slug = "case"
-    return slug[:max_len]
-
-
-async def _ensure_whop_case_channel(
-    *,
-    guild: discord.Guild,
-    category_id: int,
-    case_key: str,
-    channel_name: str,
-    topic: str,
-) -> discord.TextChannel | None:
-    """Find or create a ticket-like text channel under a category."""
-    if not isinstance(guild, discord.Guild):
-        return None
-    try:
-        cat = guild.get_channel(int(category_id))
-    except Exception:
-        cat = None
-    if not isinstance(cat, discord.CategoryChannel):
-        return None
-
-    key = str(case_key or "").strip()
-    # First: global lookup by topic key (channel could have been moved categories).
-    if key:
-        with suppress(Exception):
-            for ch in list(getattr(guild, "text_channels", []) or []):
-                if not isinstance(ch, discord.TextChannel):
-                    continue
-                if key in str(ch.topic or ""):
-                    # If category differs, move it under the requested category.
-                    try:
-                        if int(getattr(ch, "category_id", 0) or 0) != int(cat.id):
-                            await ch.edit(category=cat, reason="RSCheckerbot: move whop case channel")
-                    except Exception:
-                        pass
-                    # Best-effort rename to match requested channel_name.
-                    try:
-                        nm = _slug_channel_name(channel_name, max_len=90)
-                        if nm and str(getattr(ch, "name", "") or "") != nm:
-                            await ch.edit(name=nm, reason="RSCheckerbot: rename whop case channel")
-                    except Exception:
-                        pass
-                    return ch
-
-    # Second: category-local scan.
-    with suppress(Exception):
-        for ch in list(cat.channels):
-            if not isinstance(ch, discord.TextChannel):
-                continue
-            if key and key in str(ch.topic or ""):
-                return ch
-
-    nm = _slug_channel_name(channel_name, max_len=90)
-    top = str(topic or "").strip()
-    if key and key not in top:
-        top = (top + "\n" + key).strip()
-    if len(top) > 950:
-        top = top[:950]
-    try:
-        created = await guild.create_text_channel(name=nm, category=cat, topic=top, reason="RSCheckerbot: whop dispute/resolution case")
-        return created if isinstance(created, discord.TextChannel) else None
-    except Exception:
-        return None
-
-
 async def _maybe_open_dispute_resolution_case(
     *,
     guild: discord.Guild,
@@ -6733,6 +6760,27 @@ async def on_ready():
     
     queue_state = load_json(QUEUE_FILE)
     registry = load_json(REGISTRY_FILE)
+
+    # Support tickets (Neo): initialize after config load so ticket commands + sweeper can run.
+    try:
+        tz_name = str((REPORTING_CONFIG or {}).get("timezone") or "UTC").strip() or "UTC"
+    except Exception:
+        tz_name = "UTC"
+
+    def _is_whop_linked(did: int) -> bool:
+        try:
+            return bool(_membership_id_from_history(int(did)))
+        except Exception:
+            return False
+
+    with suppress(Exception):
+        support_tickets.initialize(
+            bot=bot,
+            config=config,
+            log_func=log_other,
+            is_whop_linked=_is_whop_linked,
+            timezone_name=tz_name,
+        )
     
     # Backfill Whop timeline from whop_history.json (before initializing whop handler)
     _backfill_whop_timeline_from_whop_history()
@@ -6822,6 +6870,22 @@ async def on_ready():
             log.info(f"[Invites] Cached {len(invite_usage_cache)} invites")
         except Exception as e:
             log.error(f"[Invites] Error caching invites: {e}")
+
+        # Also cache invites for the support-tickets guild (Neo) so invite-delta detection works there too.
+        try:
+            st_gid = int((config.get("support_tickets") or {}).get("guild_id") or 0) if isinstance(config, dict) else 0
+        except Exception:
+            st_gid = 0
+        if st_gid and int(st_gid) != int(GUILD_ID):
+            g2 = bot.get_guild(int(st_gid))
+            if g2:
+                try:
+                    inv2 = await g2.invites()
+                    for inv in inv2:
+                        invite_usage_cache[inv.code] = inv.uses
+                    log.info(f"[Invites] Cached {len(inv2)} invites for support_tickets guild ({st_gid})")
+                except Exception as e:
+                    log.error(f"[Invites] Error caching invites for support_tickets guild ({st_gid}): {e}")
     else:
         log.warning(f"⚠️  Guild not found (ID: {GUILD_ID})")
 
@@ -7086,6 +7150,14 @@ async def on_member_join(member: discord.Member):
             invite_entry = invites_data.get(used_invite_code) or {}
             is_tracked = bool(invite_entry) and invite_entry.get("used_at") is None
             join_method_lines.append(f"• Tracked invite: {'yes' if is_tracked else 'no'}")
+            # Support tickets: invite-based Free Pass intake (Neo-only; support_tickets enforces guild match).
+            with suppress(Exception):
+                asyncio.create_task(
+                    support_tickets.handle_free_pass_join_if_needed(
+                        member=member,
+                        tracked_one_time_invite=bool(is_tracked),
+                    )
+                )
             if is_tracked:
                 join_method_lines.append("• Source: One-time invite")
                 lead_id = invite_entry.get("lead_id") or ""
@@ -7671,6 +7743,10 @@ async def on_message(message: discord.Message):
     if bot.user and message.author and message.author.id == bot.user.id:
         return
 
+    # Support tickets: track last_activity for non-bot messages (always, even when webhooks are enabled).
+    with suppress(Exception):
+        await support_tickets.record_activity_from_message(message)
+
     # Webhooks are canonical: do not rely on Discord whop-* channels.
     if bool(str(WHOP_WEBHOOK_SECRET or "").strip()):
         return
@@ -7813,6 +7889,50 @@ async def cleanup_data(ctx):
         await ctx.message.delete()
     except Exception:
         pass
+
+
+@bot.command(name="transcript")
+@support_tickets.staff_check_for_ctx()
+@commands.guild_only()
+async def ticket_transcript(ctx: commands.Context):
+    """Export transcript for a support ticket channel and close it."""
+    ch_id = int(getattr(getattr(ctx, "channel", None), "id", 0) or 0)
+    rec = await support_tickets.get_ticket_record_for_channel_id(ch_id)
+    if not isinstance(rec, dict) or str(rec.get("status") or "").strip().upper() != "OPEN":
+        await ctx.send("❌ This command only works inside an OPEN ticket channel.", delete_after=12)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+    with suppress(Exception):
+        await ctx.send("⏳ Exporting transcript and closing…", delete_after=10)
+    await support_tickets.close_ticket_by_channel_id(
+        ch_id,
+        close_reason="manual_transcript",
+        do_transcript=True,
+        delete_channel=True,
+    )
+
+
+@bot.command(name="close")
+@support_tickets.staff_check_for_ctx()
+@commands.guild_only()
+async def ticket_close(ctx: commands.Context):
+    """Close a support ticket channel (defaults to transcript + delete)."""
+    ch_id = int(getattr(getattr(ctx, "channel", None), "id", 0) or 0)
+    rec = await support_tickets.get_ticket_record_for_channel_id(ch_id)
+    if not isinstance(rec, dict) or str(rec.get("status") or "").strip().upper() != "OPEN":
+        await ctx.send("❌ This command only works inside an OPEN ticket channel.", delete_after=12)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+    with suppress(Exception):
+        await ctx.send("⏳ Closing ticket…", delete_after=10)
+    await support_tickets.close_ticket_by_channel_id(
+        ch_id,
+        close_reason="manual_close",
+        do_transcript=True,
+        delete_channel=True,
+    )
 
 
 def _parse_date_ymd(s: str) -> datetime | None:

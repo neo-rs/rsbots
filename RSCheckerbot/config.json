@@ -58,6 +58,7 @@
     "cid_ttl_minutes": 10,
     "verbose_role_lists": false,
     "progress_bar_width": 26,
+    "staff_embed_dedupe_seconds": 45,
     "_comment_output": "Optional: route ALL bot output logs to a different guild (e.g. Neo Test Server).",
     "output_guild_id": 0,
     "output_log_other_channel_name": "bot-logs",
@@ -215,6 +216,48 @@
     "webhook_verify": true,
     "webhook_tolerance_seconds": 300,
     "webhook_secret": ""
+  }
+  ,
+  "support_tickets": {
+    "_comment": "Discord-native Support CRM tickets (Neo Test Server). All IDs are config-driven; leave 0 until you create categories/channels and paste their IDs.",
+    "guild_id": 1451275225512546497,
+    "permissions": {
+      "_comment": "Staff can run !transcript/!close and view all ticket channels. Admin roles are optional; administrators are always treated as allowed.",
+      "staff_role_ids": [],
+      "admin_role_ids": []
+    },
+    "ticket_categories": {
+      "cancellation_category_id": 0,
+      "billing_category_id": 0,
+      "free_pass_category_id": 0
+    },
+    "transcripts": {
+      "cancellation_transcript_channel_id": 0,
+      "billing_transcript_channel_id": 0,
+      "free_pass_transcript_channel_id": 0
+    },
+    "free_pass": {
+      "what_you_missed_channel_id": 1310420229129764924,
+      "preview_limit": 3,
+      "auto_delete": {
+        "enabled": true,
+        "inactivity_seconds": 86400,
+        "check_interval_seconds": 600,
+        "delete_on_whop_linked": true
+      }
+    },
+    "dedupe": {
+      "enabled": true,
+      "free_pass": { "cooldown_seconds": 86400 },
+      "billing": { "cooldown_seconds": 21600 },
+      "cancellation": { "cooldown_seconds": 86400 }
+    },
+    "sources": {
+      "_comment": "Optional: jump links to the original RSCheckerbot full-log messages (keeps ticket embeds minimal).",
+      "membership_logs_channel_id": 0,
+      "billing_logs_channel_id": 0,
+      "whop_dashboard_base_url": ""
+    }
   }
 }
 

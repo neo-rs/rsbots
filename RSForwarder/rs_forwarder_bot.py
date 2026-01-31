@@ -754,11 +754,14 @@ class RSForwarderBot:
             "amazon": "amazon-monitor",
             "walmart": "walmart-monitor",
             "target": "target-monitor",
+            "lowes": "lowes-monitor",
             "gamestop": "gamestop-monitor",
             "costco": "costco-monitor",
             "bestbuy": "bestbuy-monitor",
             "homedepot": "homedepot-monitor",
             "topps": "topps-monitor",
+            "funko": "funkopop-monitor",
+            "funkopop": "funkopop-monitor",
         }
         for key, name in mapping.items():
             if key in s:
@@ -1206,12 +1209,22 @@ class RSForwarderBot:
 
             # Prefer items where we can build a URL (so small limits like 1 still show something useful).
             try:
-                # Pick items that have a store URL first.
+                # Pick items that have either:
+                # - a buildable store URL, OR
+                # - a known monitor channel mapping (so we can still fetch title+url from the monitor embed)
                 candidates = []
+                monitor_capable = 0
                 for (st, sk) in (pairs or []):
                     try:
                         if rs_fs_sheet_sync.build_store_link(st, sk):
                             candidates.append((st, sk))
+                            continue
+                    except Exception:
+                        pass
+                    try:
+                        if self._monitor_channel_name_for_store(st):
+                            candidates.append((st, sk))
+                            monitor_capable += 1
                     except Exception:
                         pass
                 chosen = (candidates if candidates else (pairs or []))[:limit]
@@ -1219,7 +1232,7 @@ class RSForwarderBot:
                 if dry_run and out_ch and hasattr(out_ch, "send"):
                     try:
                         await out_ch.send(
-                            f"RS-FS: parsed {len(pairs)} item(s); eligible_with_url={len(candidates)}; processing {len(chosen)}.",
+                            f"RS-FS: parsed {len(pairs)} item(s); eligible_candidates={len(candidates)} (monitor_only={monitor_capable}); processing {len(chosen)}.",
                             allowed_mentions=discord.AllowedMentions.none(),
                         )
                     except Exception:

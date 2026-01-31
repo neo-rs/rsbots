@@ -600,8 +600,20 @@ class InstorebotForwarder:
         if cur_val is None:
             return ""
 
+        # Reduce false positives by focusing on the main price area when possible.
+        focus = t
+        try:
+            low_all = t.lower()
+            mpos = re.search(r"(corepricedisplay_desktop_feature_div|corepricedisplay_mobile_feature_div|apexpricetopay|pricetopay|buybox)", low_all)
+            if mpos:
+                start = max(0, mpos.start() - 2000)
+                end = min(len(t), mpos.start() + 9000)
+                focus = t[start:end]
+        except Exception:
+            focus = t
+
         vals: List[Tuple[float, str]] = []
-        for m in re.finditer(r"(?<!\w)([$£€])\s?(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)(?!\w)", t):
+        for m in re.finditer(r"(?<!\w)([$£€])\s?(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)(?!\w)", focus):
             sym = (m.group(1) or "").strip()
             num_raw = (m.group(2) or "").replace(",", "").strip()
             try:
@@ -620,6 +632,85 @@ class InstorebotForwarder:
             if cand and cand != cur_norm:
                 return cand
         return ""
+
+    def _extract_amazon_current_price_from_html(self, html_txt: str) -> str:
+        """
+        Best-effort current price extraction from Amazon HTML.
+
+        Notes:
+        - Amazon's markup varies heavily (and sometimes defers price rendering to JS).
+        - We prefer "core price display" regions to avoid per-unit prices.
+        - Returns "" if we can't confidently extract a current price.
+        """
+        t = html_txt or ""
+        if not t:
+            return ""
+
+        # 1) Prefer core price/buybox areas that usually contain the "price to pay".
+        for pat in (
+            r"(?:apexPriceToPay|priceToPay)[^>]*>[\s\S]{0,8000}a-offscreen[\"']>\s*([^<]{1,32})<",
+            r"(?:corePriceDisplay_desktop_feature_div|corePriceDisplay_mobile_feature_div)[\s\S]{0,12000}a-offscreen[\"']>\s*([^<]{1,32})<",
+            r"(?:corePrice_feature_div|corePrice_desktop_feature_div|corePrice_mobile_feature_div)[\s\S]{0,12000}a-offscreen[\"']>\s*([^<]{1,32})<",
+            r"(?:buybox|apex_desktop|apex_mobile)[\s\S]{0,16000}a-offscreen[\"']>\s*([^<]{1,32})<",
+            r"(?:priceblock_ourprice|priceblock_dealprice|priceblock_saleprice)[\s\S]{0,1500}a-offscreen[\"']>\s*([^<]{1,32})<",
+        ):
+            m0 = re.search(pat, t, re.IGNORECASE | re.DOTALL)
+            if not m0:
+                continue
+            cand0 = self._normalize_price_str(m0.group(1) or "")
+            if cand0:
+                return cand0
+
+        # 2) JSON-ish blobs (often present even when HTML is sparse).
+        for pat in (
+            r'["\']displayPrice["\']\s*:\s*["\'](\$?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)["\']',
+            r'["\']formattedPrice["\']\s*:\s*["\'](\$?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)["\']',
+            r'["\']priceToPay["\'][\s\S]{0,1200}["\']displayPrice["\']\s*:\s*["\'](\$?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)["\']',
+        ):
+            m = re.search(pat, t, re.IGNORECASE | re.DOTALL)
+            if not m:
+                continue
+            cand = self._normalize_price_str(m.group(1) or "")
+            if cand:
+                return cand
+
+        # 3) Last resort: scan for a-offscreen prices ONLY in the main price area.
+        # We avoid scanning the whole document because it frequently contains unrelated prices.
+        try:
+            low_all = t.lower()
+            mpos = re.search(r"(corepricedisplay_desktop_feature_div|corepricedisplay_mobile_feature_div|apexpricetopay|pricetopay|buybox|apex_desktop|apex_mobile)", low_all)
+        except Exception:
+            mpos = None
+        if not mpos:
+            return ""
+
+        focus = t[max(0, mpos.start() - 1500) : min(len(t), mpos.start() + 12000)]
+
+        candidates: List[str] = []
+        for m in re.finditer(
+            r'a-offscreen["\']?\s*>\s*([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)\s*<',
+            focus,
+            re.IGNORECASE,
+        ):
+            raw = m.group(1) or ""
+            cand = self._normalize_price_str(raw)
+            if not cand:
+                continue
+            ctx = (focus[max(0, m.start() - 140) : min(len(focus), m.end() + 140)] or "").lower()
+            # Skip obvious per-unit prices.
+            if ("/oz" in ctx) or ("/ounce" in ctx) or ("/count" in ctx) or ("/lb" in ctx) or ("/pound" in ctx) or ("per " in ctx and ("ounce" in ctx or "oz" in ctx or "count" in ctx or "lb" in ctx or "pound" in ctx)):
+                continue
+            # Skip strike/list labels (these are "before" candidates).
+            if ("list price" in ctx) or ("typical price" in ctx) or ("msrp" in ctx) or (" was " in ctx):
+                continue
+            candidates.append(cand)
+
+        if not candidates:
+            return ""
+
+        # Prefer the FIRST candidate in the focused region (usually "priceToPay") over "min price",
+        # because variant selectors can contain multiple unrelated prices.
+        return candidates[0]
 
     def _extract_amazon_discount_notes_from_html(self, html_txt: str) -> List[str]:
         """
@@ -1571,6 +1662,29 @@ class InstorebotForwarder:
 
                     # Give the page a moment to populate image attrs.
                     page.wait_for_timeout(700)
+                    # Try to read the buybox/current price directly from the DOM (more reliable than regex on HTML).
+                    price_txt = ""
+                    try:
+                        for sel in (
+                            "span.priceToPay span.a-offscreen",
+                            "#corePriceDisplay_desktop_feature_div span.priceToPay span.a-offscreen",
+                            "#corePriceDisplay_desktop_feature_div span.a-price:not(.a-text-price) span.a-offscreen",
+                            "#corePriceDisplay_mobile_feature_div span.priceToPay span.a-offscreen",
+                            "#corePriceDisplay_mobile_feature_div span.a-price:not(.a-text-price) span.a-offscreen",
+                            "#apex_desktop span.priceToPay span.a-offscreen",
+                            "#apex_mobile span.priceToPay span.a-offscreen",
+                        ):
+                            try:
+                                el = page.query_selector(sel)
+                                tx = (el.text_content() if el else "") or ""
+                                tx = " ".join(tx.split()).strip()
+                                if tx:
+                                    price_txt = tx
+                                    break
+                            except Exception:
+                                continue
+                    except Exception:
+                        price_txt = ""
                     html_txt = page.content() or ""
                     ctx.close()
                     if not profile_dir:
@@ -1588,19 +1702,20 @@ class InstorebotForwarder:
 
             title = self._extract_amazon_title_from_html(html_txt)
             image_url = self._extract_amazon_image_from_html(html_txt)
-            before_price = self._extract_amazon_before_price_from_html(html_txt)
+            price = self._normalize_price_str(price_txt) or self._extract_amazon_current_price_from_html(html_txt)
+            before_price = self._extract_amazon_before_price_from_html(html_txt, current_price=price)
             discount_notes = self._extract_amazon_discount_notes_from_html(html_txt)
             dept = self._extract_amazon_department_from_html(html_txt)
 
             out = {
                 "title": title.strip(),
                 "image_url": image_url.strip(),
-                "price": "",
+                "price": (price or "").strip(),
                 "before_price": before_price.strip(),
                 "discount_notes": "; ".join([n for n in (discount_notes or []) if n]).strip(),
                 "department": (dept or "").strip(),
             }
-            if not (out.get("title") or out.get("image_url")):
+            if not (out.get("title") or out.get("image_url") or out.get("price")):
                 return None, "no useful fields found"
             return out, None
 
@@ -2023,25 +2138,12 @@ class InstorebotForwarder:
                     elif urls:
                         image_url = urls[0]
 
-        # Fallback price patterns (very best-effort)
-        # Prefer extracting from the core price display area to avoid per-unit prices.
+        # Fallback current price patterns (best-effort).
         if not price:
-            for pat in (
-                r"apexPriceToPay[^>]*>[\s\S]{0,2000}a-offscreen\">([^<]{1,24})<",
-                r"priceToPay[^>]*>[\s\S]{0,2000}a-offscreen\">([^<]{1,24})<",
-                r"corePriceDisplay_desktop_feature_div[\s\S]{0,6000}a-offscreen\">([^<]{1,24})<",
-                r"(?:priceblock_ourprice|priceblock_dealprice|priceblock_saleprice)[\s\S]{0,300}a-offscreen\">([^<]{1,24})<",
-            ):
-                m0 = re.search(pat, html_txt, re.IGNORECASE)
-                if m0:
-                    cand0 = self._normalize_price_str(m0.group(1) or "")
-                    if cand0:
-                        price = cand0
-                        break
-        if not price:
-            m = re.search(r'["\']price["\']\s*:\s*["\'](\$?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)["\']', html_txt, re.IGNORECASE)
-            if m:
-                price = (m.group(1) or "").strip()
+            try:
+                price = self._extract_amazon_current_price_from_html(html_txt) or ""
+            except Exception:
+                price = ""
 
         # Best-effort before/list price (strike-through, list price labels, etc).
         before_price = self._extract_amazon_before_price_from_html(html_txt, current_price=price)
@@ -2078,6 +2180,18 @@ class InstorebotForwarder:
         # Ensure at least one field is useful
         if not (out.get("title") or out.get("image_url") or out.get("price")):
             return None, "no useful fields found"
+
+        # If the requests-based fetch didn't expose the current price (common on some product layouts),
+        # try a Playwright scrape and merge any missing fields.
+        if self._playwright_enabled() and (not out.get("price") or not out.get("image_url")):
+            try:
+                pw, pw_err = await self._scrape_amazon_page_playwright(u)
+            except Exception as e:
+                pw, pw_err = None, str(e)[:200]
+            if pw and not pw_err:
+                for k in ("title", "image_url", "price", "before_price", "discount_notes", "department"):
+                    if (not str(out.get(k) or "").strip()) and str(pw.get(k) or "").strip():
+                        out[k] = str(pw.get(k) or "").strip()
         if asin_guess:
             self._scrape_cache_put(asin_guess, out)
         return out, None
