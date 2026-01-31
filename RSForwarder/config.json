@@ -59,5 +59,18 @@
   "mavely_auto_refresh_cooldown_s": 600,
   "mavely_token_endpoint": "https://auth.mave.ly/oauth/token",
   "mavely_client_id": "PItSrEo35MYmLjhY6wJp8sCQAQRRWYxr",
-  "mavely_profile_dir": "RSForwarder/.mavely_profile"
+  "mavely_profile_dir": "RSForwarder/.mavely_profile",
+
+  "_notes_rs_fs_sheet": "RS - Full Send List sheet sync (Zephyr release feed -> Google Sheet). Secrets go in config.secrets.json.",
+  "rs_fs_sheet_enabled": false,
+  "rs_fs_sheet_spreadsheet_id": "",
+  "rs_fs_sheet_tab_name": "",
+  "rs_fs_sheet_tab_gid": 0,
+  "rs_fs_sheet_dedupe_cache_ttl_s": 300,
+  "rs_fs_title_fetch_concurrency": 3,
+  "rs_fs_sheet_dry_run": true,
+  "rs_fs_sheet_test_output_enabled": true,
+  "rs_fs_sheet_test_output_channel_id": "",
+  "rs_fs_sheet_test_limit": 120,
+  "zephyr_release_feed_channel_id": "1438893232686895194"
 }

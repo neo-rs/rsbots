@@ -13,7 +13,7 @@ import asyncio
 import discord
 from discord.ext import commands
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, Set
 from datetime import datetime
 import platform
 import subprocess
@@ -22,6 +22,8 @@ import time
 
 from RSForwarder import affiliate_rewriter
 from RSForwarder import novnc_stack
+from RSForwarder import rs_fs_sheet_sync
+from RSForwarder import zephyr_release_feed_parser
 
 # Ensure repo root is importable when executed as a script (matches Ubuntu run_bot.sh PYTHONPATH).
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +69,10 @@ class RSForwarderBot:
         self._mavely_last_refresher_pid: Optional[int] = None
         self._mavely_last_refresher_log_path: Optional[str] = None
         self.load_config()
+
+        # RS - Full Send List sheet sync (Zephyr release feed -> Google Sheet)
+        self._rs_fs_sheet = rs_fs_sheet_sync.RsFsSheetSync(self.config)
+        self._rs_fs_seen_message_ids: Set[int] = set()
         
         # Validate required config
         if not self.config.get("bot_token"):
@@ -551,6 +557,13 @@ class RSForwarderBot:
                     print(f"{Colors.RED}[Config] ERROR: Missing destination webhook(s) for source_channel_id(s): {', '.join(missing_hooks[:5])}{Colors.RESET}")
                     print(f"{Colors.RED}[Config] Add them to config.secrets.json under destination_webhooks{{...}}{Colors.RESET}")
                     sys.exit(1)
+
+                # Refresh optional subsystems that depend on config
+                try:
+                    if hasattr(self, "_rs_fs_sheet") and self._rs_fs_sheet:
+                        self._rs_fs_sheet.refresh_config(self.config)
+                except Exception:
+                    pass
             except Exception as e:
                 print(f"{Colors.RED}[Config] Failed to load config: {e}{Colors.RESET}")
                 self.config = {}
@@ -677,6 +690,206 @@ class RSForwarderBot:
             if str(channel.get("source_channel_id")) == str(channel_id):
                 return channel
         return None
+
+    def _zephyr_release_feed_channel_id(self) -> Optional[int]:
+        try:
+            raw = str((self.config or {}).get("zephyr_release_feed_channel_id") or "").strip()
+            if not raw:
+                raw = str(os.getenv("ZEPHYR_RELEASE_FEED_CHANNEL_ID", "") or "").strip()
+            if not raw:
+                return None
+            return int(raw)
+        except Exception:
+            return None
+
+    def _collect_embed_text(self, message: discord.Message) -> str:
+        parts: List[str] = []
+        try:
+            for e in (message.embeds or []):
+                try:
+                    t = getattr(e, "title", None)
+                    if isinstance(t, str) and t.strip():
+                        parts.append(t.strip())
+                except Exception:
+                    pass
+                try:
+                    d = getattr(e, "description", None)
+                    if isinstance(d, str) and d.strip():
+                        parts.append(d.strip())
+                except Exception:
+                    pass
+                try:
+                    fields = getattr(e, "fields", None) or []
+                    for f in fields:
+                        try:
+                            n = getattr(f, "name", None)
+                            v = getattr(f, "value", None)
+                        except Exception:
+                            n, v = None, None
+                        if isinstance(n, str) and n.strip():
+                            parts.append(n.strip())
+                        if isinstance(v, str) and v.strip():
+                            parts.append(v.strip())
+                except Exception:
+                    pass
+        except Exception:
+            return ""
+        return "\n".join(parts).strip()
+
+    async def _maybe_sync_rs_fs_sheet_from_message(self, message: discord.Message) -> None:
+        """
+        If enabled, parse Zephyr "Release Feed(s)" embed messages and append rows to the RS - FS List sheet.
+        """
+        try:
+            if not getattr(self, "_rs_fs_sheet", None):
+                return
+            # Allow "dry-run" / preview mode without Google Sheets credentials.
+            try:
+                test_enabled = bool((self.config or {}).get("rs_fs_sheet_test_output_enabled"))
+            except Exception:
+                test_enabled = False
+            sheet_enabled = bool(self._rs_fs_sheet.enabled())
+            if not (sheet_enabled or test_enabled):
+                return
+
+            target_ch = self._zephyr_release_feed_channel_id()
+            if not target_ch:
+                return
+            if int(getattr(message.channel, "id", 0) or 0) != int(target_ch):
+                return
+
+            mid = int(getattr(message, "id", 0) or 0)
+            if mid and mid in (self._rs_fs_seen_message_ids or set()):
+                return
+
+            if not (message.embeds or []):
+                return
+
+            text = self._collect_embed_text(message)
+            if not zephyr_release_feed_parser.looks_like_release_feed_embed_text(text):
+                return
+
+            pairs = zephyr_release_feed_parser.parse_release_feed_pairs(text)
+            if not pairs:
+                return
+
+            # Dry-run/preview: send output into the same channel (or configured override).
+            try:
+                dry_run = bool((self.config or {}).get("rs_fs_sheet_dry_run"))
+            except Exception:
+                dry_run = False
+            dry_run = bool(dry_run or test_enabled)
+
+            try:
+                limit = int((self.config or {}).get("rs_fs_sheet_test_limit") or 25)
+            except Exception:
+                limit = 25
+            limit = max(1, min(limit, 200))
+
+            try:
+                out_ch_raw = str((self.config or {}).get("rs_fs_sheet_test_output_channel_id") or "").strip()
+                out_ch_id = int(out_ch_raw) if out_ch_raw else int(target_ch)
+            except Exception:
+                out_ch_id = int(target_ch)
+
+            if dry_run:
+                try:
+                    out_ch = self.bot.get_channel(int(out_ch_id))
+                except Exception:
+                    out_ch = None
+                if out_ch and hasattr(out_ch, "send"):
+                    # Chunk into embeds (25 fields max)
+                    title = "RS-FS Preview (dry-run)" if sheet_enabled else "RS-FS Preview (no-sheet)"
+                    header = discord.Embed(title=title, color=discord.Color.blurple())
+                    header.description = (
+                        f"Parsed `{len(pairs)}` item(s). Fetching titles for up to `{min(len(pairs), limit)}`…\n"
+                        "(No Google Sheet writes.)"
+                    )
+                    await out_ch.send(embed=header, allowed_mentions=discord.AllowedMentions.none())
+
+            raw_entries = await rs_fs_sheet_sync.build_preview_entries(pairs[:limit], self.config)
+            entries = [e for e in raw_entries if (e.url or "").strip()]
+            skipped_no_url = len(raw_entries) - len(entries)
+
+            if dry_run:
+                try:
+                    out_ch = self.bot.get_channel(int(out_ch_id))
+                except Exception:
+                    out_ch = None
+                if out_ch and hasattr(out_ch, "send"):
+                    done = discord.Embed(
+                        title="RS-FS Preview (results)",
+                        description=(
+                            f"Showing `{len(entries)}` item(s)."
+                            + (f" (skipped `{skipped_no_url}` with no URL)" if skipped_no_url else "")
+                        ),
+                        color=discord.Color.dark_teal(),
+                    )
+                    await out_ch.send(embed=done, allowed_mentions=discord.AllowedMentions.none())
+
+                    chunk: List[rs_fs_sheet_sync.RsFsPreviewEntry] = []
+                    for e in entries:
+                        chunk.append(e)
+                        if len(chunk) >= 20:
+                            await self._send_rs_fs_preview_embed(out_ch, chunk)
+                            chunk = []
+                    if chunk:
+                        await self._send_rs_fs_preview_embed(out_ch, chunk)
+
+            ok, msg, added = True, "dry-run", 0
+            if (not dry_run) and sheet_enabled:
+                rows = [[e.store, e.sku, e.title] for e in entries]
+                ok, msg, added = await self._rs_fs_sheet.append_rows(rows)
+
+            # Mark message processed to avoid reprocessing the same embed.
+            if mid:
+                try:
+                    self._rs_fs_seen_message_ids.add(mid)
+                    # Keep bounded
+                    if len(self._rs_fs_seen_message_ids) > 2000:
+                        self._rs_fs_seen_message_ids = set(list(self._rs_fs_seen_message_ids)[-1200:])
+                except Exception:
+                    pass
+
+            if ok and added > 0:
+                print(f"{Colors.GREEN}[RS-FS Sheet]{Colors.RESET} Added {added} row(s) (msg_id={mid})")
+            elif not ok:
+                short = (msg or "").replace("\n", " ").strip()
+                if len(short) > 240:
+                    short = short[:240] + "..."
+                print(f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Sync skipped/failed: {short}")
+        except Exception:
+            # Never let sheet sync break forwarding.
+            return
+
+    async def _send_rs_fs_preview_embed(self, channel: discord.abc.Messageable, entries: List[rs_fs_sheet_sync.RsFsPreviewEntry]) -> None:
+        try:
+            emb = discord.Embed(color=discord.Color.dark_teal())
+            for e in entries:
+                name = f"{e.store} | {e.sku}".strip()
+                if len(name) > 256:
+                    name = name[:253] + "..."
+                title = (e.title or "").strip()
+                url = (e.url or "").strip()
+                err = (e.error or "").strip()
+                if len(title) > 800:
+                    title = title[:800] + "..."
+                if len(url) > 300:
+                    url = url[:300] + "..."
+                value_parts: List[str] = []
+                if title:
+                    value_parts.append(title)
+                if url:
+                    value_parts.append(url)
+                if err and err.lower() not in {"", "title not found"}:
+                    value_parts.append(f"(err: {err})")
+                value = "\n".join(value_parts).strip() or "(no data)"
+                if len(value) > 1024:
+                    value = value[:1021] + "..."
+                emb.add_field(name=name, value=value, inline=False)
+            await channel.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
+        except Exception:
+            return
     
     def _get_guild_icon_url(self, guild: discord.Guild) -> Optional[str]:
         """Get guild icon URL"""
@@ -969,6 +1182,12 @@ class RSForwarderBot:
             # Only skip our own bot's messages to avoid loops
             if message.author.id == self.bot.user.id:
                 return
+
+            # Optional: Zephyr release feed -> RS-FS Google Sheet sync
+            try:
+                await self._maybe_sync_rs_fs_sheet_from_message(message)
+            except Exception:
+                pass
             
             # Check if this is a monitored channel
             channel_id = str(message.channel.id)

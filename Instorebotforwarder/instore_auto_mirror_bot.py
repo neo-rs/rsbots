@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse, urljoin
 
 import discord
 from discord import app_commands
@@ -492,6 +493,37 @@ class InstorebotForwarder:
         s = re.sub(r"<#\d+>", "#channel", s)
         return s
 
+    def _amazon_affiliate_enabled(self) -> bool:
+        v = (self.config or {}).get("amazon_affiliate_enabled", None)
+        if isinstance(v, bool):
+            return v
+        s = str(v or "").strip().lower()
+        if s in {"0", "false", "no", "n", "off"}:
+            return False
+        # default enabled (unless explicitly disabled)
+        return True
+
+    def _amazon_key_link_mode(self) -> str:
+        """
+        Controls what we append as the "final link" line in the card:
+        - "raw": show the raw canonical Amazon URL (no markdown, no amzn.to)
+        - "short": show stable amzn.to-style masked link (legacy)
+        """
+        s = str((self.config or {}).get("amazon_key_link_mode") or "").strip().lower()
+        return s or "raw"
+
+    def _amazon_rewrite_step_links_enabled(self) -> bool:
+        v = (self.config or {}).get("amazon_rewrite_step_links_enabled", None)
+        if isinstance(v, bool):
+            return v
+        s = str(v or "").strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off"}:
+            return False
+        # default: keep off (safer/no surprises) unless explicitly enabled
+        return False
+
     def _normalize_price_str(self, price: str) -> str:
         """
         Normalize various scraped/message price formats to the display format you want.
@@ -512,6 +544,25 @@ class InstorebotForwarder:
             sym = {"USD": "$", "CAD": "$", "AUD": "$", "GBP": "£", "EUR": "€"}.get(code)
             return f"{sym}{num}" if sym else f"{num} {code}".strip()
         return s
+
+    def _price_to_float(self, price: str) -> Tuple[Optional[float], str]:
+        """
+        Parse a normalized price string like "$19.99" into (19.99, "$").
+        Returns (None, "") when not parseable.
+        """
+        s = (price or "").strip()
+        if not s or s.upper() == "N/A":
+            return None, ""
+        m = re.search(r"([$£€])\s?(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", s)
+        if not m:
+            return None, ""
+        sym = (m.group(1) or "").strip()
+        num_raw = (m.group(2) or "").replace(",", "").strip()
+        try:
+            val = float(num_raw)
+        except Exception:
+            return None, ""
+        return val, sym
 
     def _extract_amazon_before_price_from_html(self, html_txt: str, *, current_price: str = "") -> str:
         """
@@ -844,12 +895,15 @@ class InstorebotForwarder:
 
     def _key_link(self, final_url: str, *, message_id: str, asin: str) -> str:
         """
-        Render a stable masked display link like:
-        [amzn.to/8fdaf3b](<https://www.amazon.com/dp/ASIN?...>)
+        Render the final link line according to config:
+        - raw: https://www.amazon.com/dp/ASIN
+        - short: [amzn.to/xxxxxxx](<https://www.amazon.com/dp/ASIN>)
         """
         u = (final_url or "").strip()
         if not u:
             return ""
+        if self._amazon_key_link_mode() == "raw":
+            return u
         # Stable across reposts: do NOT include message_id in the slug seed.
         seed = (asin or "").strip() or u
         slug = self._stable_key_slug(seed, length=7)
@@ -1614,7 +1668,36 @@ class InstorebotForwarder:
             if ogi and self._is_amazon_image_url(ogi):
                 image_url = ogi.strip()
 
-        out = {"title": title.strip(), "image_url": image_url.strip(), "price": "", "before_price": "", "discount_notes": "", "department": ""}
+        # Find a canonical Amazon /dp/ASIN link on the hub page (dmflip, pricedoffers, etc).
+        amazon_url = ""
+        asin = ""
+        try:
+            # First, look for explicit /dp/ASIN links.
+            m_dp = re.search(r"https?://(?:www\.)?amazon\.[a-z.]+/dp/([A-Z0-9]{10})", html_txt, re.IGNORECASE)
+            if m_dp:
+                asin = (m_dp.group(1) or "").strip().upper()
+            if not asin:
+                # Also allow gp/product
+                m_gp = re.search(r"https?://(?:www\.)?amazon\.[a-z.]+/gp/product/([A-Z0-9]{10})", html_txt, re.IGNORECASE)
+                if m_gp:
+                    asin = (m_gp.group(1) or "").strip().upper()
+            if asin:
+                mp = _cfg_str(self.config, "amazon_api_marketplace", "AMAZON_API_MARKETPLACE").rstrip("/")
+                amazon_url = f"{mp}/dp/{asin}" if mp else f"https://www.amazon.com/dp/{asin}"
+        except Exception:
+            amazon_url = ""
+            asin = ""
+
+        out = {
+            "title": title.strip(),
+            "image_url": image_url.strip(),
+            "price": "",
+            "before_price": "",
+            "discount_notes": "",
+            "department": "",
+            "amazon_url": amazon_url.strip(),
+            "asin": asin.strip(),
+        }
         if not (out.get("title") or out.get("image_url")):
             return None, "no useful fields found"
         return out, None
@@ -2334,8 +2417,59 @@ class InstorebotForwarder:
                     except Exception:
                         final_url = cand
 
+                    # Special-case: mavely.app.link often uses HTML/JS interstitials and doesn't always 3xx redirect.
+                    # If we still have a Mavely link after expansion, fetch HTML and extract the first outbound URL.
+                    try:
+                        if affiliate_rewriter.is_mavely_link(final_url):
+                            try:
+                                async with session.get(final_url, timeout=aiohttp.ClientTimeout(total=timeout_s)) as resp:
+                                    html_txt = await resp.text(errors="ignore")
+                            except Exception:
+                                html_txt = ""
+                            out = ""
+                            try:
+                                out = affiliate_rewriter._extract_first_outbound_url_from_html(html_txt) or ""  # type: ignore[attr-defined]
+                            except Exception:
+                                out = ""
+                            if out:
+                                out_abs = out
+                                if out_abs.startswith("/"):
+                                    out_abs = urljoin(final_url, out_abs)
+                                out_abs = affiliate_rewriter.unwrap_known_query_redirects(out_abs) or out_abs
+                                final_url = out_abs
+                                # One more redirect-follow if needed
+                                if affiliate_rewriter.should_expand_url(final_url):
+                                    try:
+                                        final_url = await affiliate_rewriter.expand_url(
+                                            session,
+                                            final_url,
+                                            timeout_s=timeout_s,
+                                            max_redirects=max_redirects,
+                                        )
+                                        final_url = affiliate_rewriter.unwrap_known_query_redirects(final_url) or final_url
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+
                     if not affiliate_rewriter.is_amazon_like_url(final_url):
-                        continue
+                        # Try deal-hub pages (dmflip/pricedoffers/etc) to locate the embedded Amazon /dp/ASIN link.
+                        try:
+                            hub, hub_err = await self._scrape_deal_hub_for_amazon_assets(final_url)
+                        except Exception:
+                            hub, hub_err = None, None
+                        if hub and not hub_err:
+                            hub_amz = str(hub.get("amazon_url") or "").strip()
+                            if hub_amz and affiliate_rewriter.is_amazon_like_url(hub_amz):
+                                final_url = hub_amz
+                            else:
+                                # If we at least got an ASIN, build canonical URL.
+                                hub_asin = str(hub.get("asin") or "").strip().upper()
+                                if hub_asin:
+                                    mp = _cfg_str(self.config, "amazon_api_marketplace", "AMAZON_API_MARKETPLACE").rstrip("/")
+                                    final_url = f"{mp}/dp/{hub_asin}" if mp else f"https://www.amazon.com/dp/{hub_asin}"
+                        if not affiliate_rewriter.is_amazon_like_url(final_url):
+                            continue
 
                     asin = affiliate_rewriter.extract_asin(final_url) or affiliate_rewriter.extract_asin(url_used) or ""
                     return AmazonDetection(asin=asin, url_used=url_used, final_url=final_url)
@@ -2371,13 +2505,14 @@ class InstorebotForwarder:
             elif not final_url:
                 final_url = f"https://www.amazon.com/dp/{asin}"
 
-        # Apply Amazon affiliate tag early so all downstream uses (key_link, url, etc) are tagged.
-        try:
-            affiliate_final = affiliate_rewriter.build_amazon_affiliate_url(self.config or {}, final_url)
-        except Exception:
-            affiliate_final = None
-        if affiliate_final:
-            final_url = affiliate_final
+        # Optional affiliate tagging (disabled when you want raw canonical URLs only).
+        if self._amazon_affiliate_enabled():
+            try:
+                affiliate_final = affiliate_rewriter.build_amazon_affiliate_url(self.config or {}, final_url)
+            except Exception:
+                affiliate_final = None
+            if affiliate_final:
+                final_url = affiliate_final
 
         # De-dupe by ASIN to avoid forwarding the same lead repeatedly.
         dedupe_reserved = False
@@ -2488,6 +2623,22 @@ class InstorebotForwarder:
         _log_flow("IMAGE", source=img_src, has=("1" if bool(image_url) else "0"))
         _log_flow("PRICES", current_src=price_src, before_src=before_src, has_current=("1" if price and price != "N/A" else "0"), has_before=("1" if before_price and before_price != "N/A" else "0"))
 
+        # Percent off (only when both prices are known and Before > Current).
+        discount_pct_str = ""
+        try:
+            cur_val, cur_sym = self._price_to_float(price)
+            bef_val, bef_sym = self._price_to_float(before_price)
+        except Exception:
+            cur_val, cur_sym = None, ""
+            bef_val, bef_sym = None, ""
+        if (cur_val is not None) and (bef_val is not None) and bef_val > 0 and cur_val < bef_val:
+            # Only show when symbols match (or one is missing).
+            if (not cur_sym) or (not bef_sym) or (cur_sym == bef_sym):
+                pct = int(round(((bef_val - cur_val) / bef_val) * 100.0))
+                if pct > 0:
+                    discount_pct_str = f"{pct}% OFF"
+                    _log_flow("PCT_OFF", pct=str(pct), current=str(price), before=str(before_price))
+
         # Deal notes (coupon/sub&save/limited time deal) from scrape, rendered in your preferred wording.
         raw_discount = str((scraped or {}).get("discount_notes") or "").strip()
         discount_lines: List[str] = []
@@ -2566,9 +2717,9 @@ class InstorebotForwarder:
             if len(numbered) >= 2:
                 steps_block = "\n".join(numbered)
 
-        # Rewrite URLs inside steps so Amazon links get affiliate-tagged and short/deal hubs expand.
+        # Optional URL rewrite inside steps (OFF by default; when off, we keep raw links).
         steps_block_rewritten = steps_block
-        if steps_block:
+        if steps_block and self._amazon_rewrite_step_links_enabled():
             try:
                 steps_block_rewritten, changed, notes = await affiliate_rewriter.rewrite_text(self.config or {}, steps_block)
                 if changed:
@@ -2577,6 +2728,8 @@ class InstorebotForwarder:
                     _log_flow("STEPS_URLS", changed="0")
             except Exception as e:
                 _log_flow("STEPS_URLS_FAIL", err=str(e)[:180])
+        elif steps_block:
+            _log_flow("STEPS_URLS_SKIP", reason="disabled")
 
         # Optional OpenAI rephrase (only if key present/enabled and source text exists)
         if steps_block_rewritten:
@@ -2607,6 +2760,8 @@ class InstorebotForwarder:
         card_lines: List[str] = []
         card_lines.append(f"Current Price: **{price}**")
         card_lines.append(f"Before: **{before_price}**")
+        if discount_pct_str:
+            card_lines.append(f"Discount: **{discount_pct_str}**")
         if discount_lines:
             card_lines.append("")
             card_lines.extend([str(x) for x in discount_lines if str(x).strip()])
@@ -2650,6 +2805,7 @@ class InstorebotForwarder:
             "title": title,
             "price": price,
             "before_price": before_price,
+            "discount_pct": discount_pct_str,
             "category": category,
             "image_url": image_url,
             "discount_notes": "\n".join([str(x) for x in (discount_lines or []) if str(x).strip()]).strip(),
@@ -2768,6 +2924,15 @@ class InstorebotForwarder:
                 await self._startup_smoketest()
             except Exception:
                 log.exception("Startup smoke test crashed (continuing)")
+
+            # Optional run-once mode (used for scripted checks / CI / assistant-run tests).
+            exit_after = (os.getenv("INSTORE_EXIT_AFTER_STARTUP", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+            if exit_after:
+                log.info("[BOOT] exit-after-startup enabled; closing bot.")
+                try:
+                    await self.bot.close()
+                except Exception:
+                    pass
 
         @self.bot.event
         async def on_message(message: discord.Message) -> None:
@@ -2995,6 +3160,10 @@ class InstorebotForwarder:
 
 
 def main() -> int:
+    # CLI flags (minimal; avoids adding deps)
+    argv = [a.strip() for a in (sys.argv[1:] or []) if (a or "").strip()]
+    if ("--exit-after-startup" in argv) or ("--run-once" in argv):
+        os.environ["INSTORE_EXIT_AFTER_STARTUP"] = "1"
     try:
         bot = InstorebotForwarder()
     except Exception as e:

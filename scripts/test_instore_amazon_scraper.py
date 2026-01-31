@@ -54,6 +54,14 @@ async def _scrape_one(scraper, url: str) -> Tuple[Optional[Dict[str, str]], Opti
     return await scraper._scrape_amazon_page(url)  # noqa: SLF001
 
 
+async def _detect_one(scraper, url: str):
+    try:
+        det = await scraper._detect_amazon([url])  # noqa: SLF001
+    except Exception as e:
+        return None, f"detect exception: {e}"
+    return det, None
+
+
 def _print_result(url: str, data: Optional[Dict[str, str]], err: Optional[str]) -> None:
     print("=" * 88)
     print(f"URL: {url}")
@@ -87,8 +95,23 @@ async def main(argv: list[str]) -> int:
 
     started = time.time()
     for u in urls:
+        det, det_err = await _detect_one(scraper, u)
+        if det_err:
+            print("=" * 88)
+            print(f"DETECT_URL: {u}")
+            print(f"DETECT_ERR: {det_err}")
+        elif det:
+            print("=" * 88)
+            print(f"DETECT_URL: {u}")
+            try:
+                print(f"url_used: {getattr(det, 'url_used', '')}")
+                print(f"final_url: {getattr(det, 'final_url', '')}")
+                print(f"asin: {getattr(det, 'asin', '')}")
+            except Exception:
+                print("detect: <unprintable>")
         try:
-            data, err = await _scrape_one(scraper, u)
+            target = str(getattr(det, "final_url", "") or "").strip() if det else u
+            data, err = await _scrape_one(scraper, target)
         except Exception as e:
             data, err = None, f"exception: {e}"
         _print_result(u, data, err)
