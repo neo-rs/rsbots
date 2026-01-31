@@ -214,6 +214,14 @@
     "enable_enrichment": true,
     "payment_case_category_id": 1458533733681598654,
     "payment_case_access_role_ids": []
+    ,
+    "_comment_dispute_resolution_cases": "Optional: auto-create per-case ticket channels for dispute/resolution payments.",
+    "dispute_case_category_id": 1466815842401386698,
+    "resolution_case_category_id": 1466816113525522695,
+    "payment_issue_cases_startup_scan_enabled": true,
+    "payment_issue_cases_startup_scan_max_pages": 3,
+    "payment_issue_cases_startup_scan_per_page": 50,
+    "payment_issue_cases_startup_scan_max_cases": 25
   }
 }
 

@@ -915,6 +915,42 @@ async def _startup_native_whop_smoketest() -> None:
                         await out.send(content=content[:1900], embed=emb, allowed_mentions=discord.AllowedMentions.none())
 
 
+async def _best_payment_for_membership(mid: str, *, limit: int = 0) -> dict:
+    """Return the most recent payment we can associate to membership_id (best-effort)."""
+    mem_id = str(mid or "").strip()
+    if not mem_id or not whop_api_client:
+        return {}
+    try:
+        pays = await whop_api_client.get_payments_for_membership(mem_id)
+    except Exception:
+        pays = []
+    pool = [p for p in (pays or []) if isinstance(p, dict)]
+    if not pool:
+        return {}
+
+    def _payment_mid(p: dict) -> str:
+        v = p.get("membership_id") or p.get("membership") or ""
+        if isinstance(v, dict):
+            return str(v.get("id") or v.get("membership_id") or "").strip()
+        return str(v or "").strip()
+
+    # Prefer payments that explicitly reference this membership id.
+    filtered = [p for p in pool if _payment_mid(p) == mem_id]
+    if not filtered:
+        return {}
+    pool2 = filtered
+
+    # Sort by paid_at/created_at desc.
+    def _ts(p: dict) -> str:
+        return str(p.get("paid_at") or p.get("created_at") or "").strip()
+
+    with suppress(Exception):
+        pool2.sort(key=_ts, reverse=True)
+    if int(limit or 0) > 0 and len(pool2) > int(limit):
+        pool2 = pool2[: int(limit)]
+    return pool2[0] if pool2 and isinstance(pool2[0], dict) else {}
+
+
 async def _startup_canceling_members_snapshot() -> None:
     """On startup, query Whop API for memberships that are canceling/cancel_at_period_end and post a snapshot to Neo."""
     try:
@@ -1010,42 +1046,6 @@ async def _startup_canceling_members_snapshot() -> None:
         if not isinstance(exclude_prod, list):
             exclude_prod = []
         exclude_prod_norm = sorted({str(x or "").strip().lower() for x in exclude_prod if str(x or "").strip()})
-
-        async def _best_payment_for_membership(mid: str) -> dict:
-            """Return the most recent payment we can associate to membership_id (best-effort)."""
-            mem_id = str(mid or "").strip()
-            if not mem_id or not whop_api_client:
-                return {}
-            try:
-                pays = await whop_api_client.get_payments_for_membership(mem_id)
-            except Exception:
-                pays = []
-            pool = [p for p in (pays or []) if isinstance(p, dict)]
-            if not pool:
-                return {}
-
-            def _payment_mid(p: dict) -> str:
-                v = p.get("membership_id") or p.get("membership") or ""
-                if isinstance(v, dict):
-                    return str(v.get("id") or v.get("membership_id") or "").strip()
-                return str(v or "").strip()
-
-            # Prefer payments that explicitly reference this membership id.
-            filtered = [p for p in pool if _payment_mid(p) == mem_id]
-            if not filtered:
-                # If we can't associate a payment to this membership, don't guess.
-                return {}
-            pool2 = filtered
-
-            # Sort by paid_at/created_at desc.
-            def _ts(p: dict) -> str:
-                return str(p.get("paid_at") or p.get("created_at") or "").strip()
-
-            with suppress(Exception):
-                pool2.sort(key=_ts, reverse=True)
-            if pay_check_limit and len(pool2) > pay_check_limit:
-                pool2 = pool2[:pay_check_limit]
-            return pool2[0] if pool2 and isinstance(pool2[0], dict) else {}
 
         # Prefer Whop's official "canceling" status filter (matches dashboard UI).
         log.info("[BOOT][Canceling] scanning Whop memberships (statuses=canceling pages=%s per_page=%s)", max_pages, per_page)
@@ -1535,7 +1535,7 @@ async def _startup_canceling_members_snapshot() -> None:
 
                 # Skip if recent payment looks like dispute/resolution (best-effort).
                 if skip_keywords_norm and pay_check_limit > 0 and mid:
-                    pay = await _best_payment_for_membership(mid)
+                    pay = await _best_payment_for_membership(mid, limit=pay_check_limit)
                     if isinstance(pay, dict) and pay:
                         txt = " ".join(
                             [
@@ -2110,6 +2110,11 @@ async def _start_whop_sync_job_after_startup() -> None:
                 log.info("[Whop API] Movement watcher started (poll every %ss)", WHOP_EVENTS_POLL_INTERVAL_SECONDS)
                 with suppress(Exception):
                     await _whop_api_events_log(f"[Whop API] movement watcher started (poll every {WHOP_EVENTS_POLL_INTERVAL_SECONDS}s)")
+                # One-time sweep for dispute/resolution case channels (best-effort).
+                global _PAYMENT_ISSUE_CASES_STARTUP_SCAN_STARTED
+                if PAYMENT_ISSUE_CASES_STARTUP_SCAN_ENABLED and not _PAYMENT_ISSUE_CASES_STARTUP_SCAN_STARTED:
+                    _PAYMENT_ISSUE_CASES_STARTUP_SCAN_STARTED = True
+                    asyncio.create_task(_startup_payment_issue_cases_scan())
         except Exception as e:
             log.warning("[Whop API] Failed to start movement watcher: %s", str(e)[:240])
 
@@ -2697,6 +2702,35 @@ try:
     WHOP_EVENTS_POLL_LOG_ALL_MOVEMENTS = bool(WHOP_API_CONFIG.get("events_poll_log_all_movements", False))
 except Exception:
     WHOP_EVENTS_POLL_LOG_ALL_MOVEMENTS = False
+
+# Dispute / resolution per-case channels (main guild only).
+try:
+    DISPUTE_CASE_CATEGORY_ID = int(WHOP_API_CONFIG.get("dispute_case_category_id") or 0)
+except Exception:
+    DISPUTE_CASE_CATEGORY_ID = 0
+try:
+    RESOLUTION_CASE_CATEGORY_ID = int(WHOP_API_CONFIG.get("resolution_case_category_id") or 0)
+except Exception:
+    RESOLUTION_CASE_CATEGORY_ID = 0
+try:
+    PAYMENT_ISSUE_CASES_STARTUP_SCAN_ENABLED = bool(WHOP_API_CONFIG.get("payment_issue_cases_startup_scan_enabled", False))
+except Exception:
+    PAYMENT_ISSUE_CASES_STARTUP_SCAN_ENABLED = False
+try:
+    PAYMENT_ISSUE_CASES_STARTUP_SCAN_MAX_PAGES = int(WHOP_API_CONFIG.get("payment_issue_cases_startup_scan_max_pages") or 3)
+except Exception:
+    PAYMENT_ISSUE_CASES_STARTUP_SCAN_MAX_PAGES = 3
+PAYMENT_ISSUE_CASES_STARTUP_SCAN_MAX_PAGES = max(0, min(PAYMENT_ISSUE_CASES_STARTUP_SCAN_MAX_PAGES, 50))
+try:
+    PAYMENT_ISSUE_CASES_STARTUP_SCAN_PER_PAGE = int(WHOP_API_CONFIG.get("payment_issue_cases_startup_scan_per_page") or 50)
+except Exception:
+    PAYMENT_ISSUE_CASES_STARTUP_SCAN_PER_PAGE = 50
+PAYMENT_ISSUE_CASES_STARTUP_SCAN_PER_PAGE = max(10, min(PAYMENT_ISSUE_CASES_STARTUP_SCAN_PER_PAGE, 200))
+try:
+    PAYMENT_ISSUE_CASES_STARTUP_SCAN_MAX_CASES = int(WHOP_API_CONFIG.get("payment_issue_cases_startup_scan_max_cases") or 25)
+except Exception:
+    PAYMENT_ISSUE_CASES_STARTUP_SCAN_MAX_CASES = 25
+PAYMENT_ISSUE_CASES_STARTUP_SCAN_MAX_CASES = max(0, min(PAYMENT_ISSUE_CASES_STARTUP_SCAN_MAX_CASES, 500))
 _WHOP_EVENT_DEDUPE_IDS: set[str] = set()
 _WHOP_EVENT_DEDUPE_QUEUE: deque[str] = deque()
 
@@ -5536,6 +5570,7 @@ async def sync_whop_memberships():
 # -----------------------------
 _WHOP_API_EVENTS_LOCK: asyncio.Lock = asyncio.Lock()
 _WHOP_API_EVENTS_LOG_CH: discord.TextChannel | None = None
+_PAYMENT_ISSUE_CASES_STARTUP_SCAN_STARTED: bool = False
 
 
 def _load_whop_api_events_state() -> dict:
@@ -5556,6 +5591,201 @@ def _extract_discord_id_from_connected(s: str) -> int:
         return int(m.group(1)) if m else 0
     except Exception:
         return 0
+
+
+def _payment_issue_bucket_from_payment(p: dict) -> str:
+    """Return 'dispute' | 'resolution' | '' for a payment record (best-effort)."""
+    if not isinstance(p, dict) or not p:
+        return ""
+    txt = " ".join(
+        [
+            str(p.get("status") or ""),
+            str(p.get("substatus") or ""),
+            str(p.get("billing_reason") or ""),
+            str(p.get("failure_message") or ""),
+            str(p.get("reason") or ""),
+            str(p.get("note") or ""),
+        ]
+    ).strip()
+    low = txt.lower()
+    # Dispute-ish
+    if any(k in low for k in ("dispute", "disputed", "chargeback", "under review", "under_review")):
+        return "dispute"
+    # Resolution-ish
+    if any(k in low for k in ("resolution", "resolved", "won", "lost")):
+        return "resolution"
+    return ""
+
+
+def _payment_id_any(p: dict) -> str:
+    try:
+        pid = str(p.get("id") or p.get("payment_id") or p.get("payment") or "").strip()
+        if isinstance(p.get("payment"), dict):
+            pid = str(p["payment"].get("id") or p["payment"].get("payment_id") or "").strip() or pid
+        return pid
+    except Exception:
+        return ""
+
+
+def _slug_channel_name(s: str, *, max_len: int = 90) -> str:
+    """Discord channel name slug (lowercase, alnum + hyphen)."""
+    raw = str(s or "").strip().lower()
+    out = []
+    last_dash = False
+    for ch in raw:
+        ok = ("a" <= ch <= "z") or ("0" <= ch <= "9")
+        if ok:
+            out.append(ch)
+            last_dash = False
+        else:
+            if not last_dash:
+                out.append("-")
+                last_dash = True
+    slug = "".join(out).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    if not slug:
+        slug = "case"
+    return slug[:max_len]
+
+
+async def _ensure_whop_case_channel(
+    *,
+    guild: discord.Guild,
+    category_id: int,
+    case_key: str,
+    channel_name: str,
+    topic: str,
+) -> discord.TextChannel | None:
+    """Find or create a ticket-like text channel under a category."""
+    if not isinstance(guild, discord.Guild):
+        return None
+    try:
+        cat = guild.get_channel(int(category_id))
+    except Exception:
+        cat = None
+    if not isinstance(cat, discord.CategoryChannel):
+        return None
+
+    key = str(case_key or "").strip()
+    with suppress(Exception):
+        for ch in list(cat.channels):
+            if not isinstance(ch, discord.TextChannel):
+                continue
+            if key and key in str(ch.topic or ""):
+                return ch
+
+    nm = _slug_channel_name(channel_name, max_len=90)
+    top = str(topic or "").strip()
+    if key and key not in top:
+        top = (top + "\n" + key).strip()
+    if len(top) > 950:
+        top = top[:950]
+    try:
+        created = await guild.create_text_channel(name=nm, category=cat, topic=top, reason="RSCheckerbot: whop dispute/resolution case")
+        return created if isinstance(created, discord.TextChannel) else None
+    except Exception:
+        return None
+
+
+async def _maybe_open_dispute_resolution_case(
+    *,
+    guild: discord.Guild,
+    mid: str,
+    updated_at: str,
+    brief: dict,
+    cases: dict,
+    did: int = 0,
+    member_obj: discord.Member | None = None,
+) -> None:
+    """Open a per-case channel for dispute/resolution payments (best-effort)."""
+    if not isinstance(cases, dict):
+        return
+    if int(DISPUTE_CASE_CATEGORY_ID or 0) <= 0 and int(RESOLUTION_CASE_CATEGORY_ID or 0) <= 0:
+        return
+    mid_s = str(mid or "").strip()
+    if not mid_s:
+        return
+
+    pay = await _best_payment_for_membership(mid_s, limit=25)
+    issue = _payment_issue_bucket_from_payment(pay) if isinstance(pay, dict) else ""
+    if issue not in {"dispute", "resolution"}:
+        return
+
+    cat_id = int(DISPUTE_CASE_CATEGORY_ID) if issue == "dispute" else int(RESOLUTION_CASE_CATEGORY_ID)
+    if cat_id <= 0:
+        return
+    pid = _payment_id_any(pay) if isinstance(pay, dict) else ""
+    key = f"rschecker_whop_case:{issue}:mid={mid_s}:pid={pid or updated_at or 'unknown'}"
+    if key in cases:
+        return
+
+    # Resolve Discord ID if missing
+    did_i = int(did or 0)
+    if did_i <= 0:
+        did_i = _extract_discord_id_from_connected(str((brief or {}).get("connected_discord") or ""))
+
+    suffix = (pid[-6:] if pid else mid_s[-6:]).lower()
+    ch_name = f"{issue}-{suffix}"
+    topic = (
+        f"rschecker_whop_case issue={issue}\n"
+        f"mid={mid_s}\n"
+        f"pid={pid or '—'}\n"
+        f"did={did_i or '—'}\n"
+        f"email={str((brief or {}).get('email') or '—').strip()}\n"
+        f"product={str((brief or {}).get('product') or '—').strip()}\n"
+    )
+    case_ch = await _ensure_whop_case_channel(
+        guild=guild,
+        category_id=cat_id,
+        case_key=key,
+        channel_name=ch_name,
+        topic=topic,
+    )
+    if not isinstance(case_ch, discord.TextChannel):
+        return
+
+    cases[key] = int(case_ch.id)
+
+    # Starter card (silent)
+    with suppress(Exception):
+        ecase = discord.Embed(
+            title=("⚠️ Dispute Case" if issue == "dispute" else "🟡 Resolution Case"),
+            color=(0xED4245 if issue == "dispute" else 0xFEE75C),
+            timestamp=datetime.now(timezone.utc),
+        )
+        mname = str(getattr(member_obj, "display_name", "") or "").strip() if member_obj else ""
+        if not mname:
+            mname = str((brief or {}).get("user_name") or "").strip() or "—"
+        ecase.add_field(name="Member", value=mname[:1024], inline=True)
+        ecase.add_field(name="Discord ID", value=(f"`{int(member_obj.id)}`" if member_obj else (f"`{did_i}`" if did_i else "—")), inline=True)
+        ecase.add_field(name="Membership ID", value=str(mid_s)[:1024], inline=False)
+        ecase.add_field(name="Membership", value=str((brief or {}).get("product") or "—")[:1024], inline=True)
+        ecase.add_field(name="Status", value=str((brief or {}).get("status") or "—")[:1024], inline=True)
+        pay_txt = " ".join(
+            [
+                str(pay.get("status") or ""),
+                str(pay.get("substatus") or ""),
+                str(pay.get("billing_reason") or ""),
+                str(pay.get("failure_message") or ""),
+            ]
+        ).strip()
+        if pay_txt:
+            ecase.add_field(name="Payment", value=pay_txt[:1024], inline=False)
+        dash = str((brief or {}).get("dashboard_url") or "").strip()
+        if dash and dash != "—":
+            ecase.add_field(name="Whop Dashboard", value=dash[:1024], inline=False)
+        ecase.set_footer(text="RSCheckerbot • Whop API")
+        # Only mention when the member is in-guild (avoids @unknown-user).
+        mention = f"<@{int(member_obj.id)}>" if member_obj else ""
+        await case_ch.send(
+            content=mention,
+            embed=ecase,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            silent=True,
+        )
+    with suppress(Exception):
+        await _whop_api_events_log(f"[Whop Case] opened issue={issue} mid={mid_s} ch=#{case_ch.name} ({case_ch.id})")
 
 
 async def _whop_api_events_log(msg: str) -> None:
@@ -5713,10 +5943,13 @@ async def whop_api_events_poll():
         state = _load_whop_api_events_state()
         memberships = state.get("memberships") if isinstance(state.get("memberships"), dict) else {}
         sent = state.get("sent") if isinstance(state.get("sent"), dict) else {}
+        cases = state.get("cases") if isinstance(state.get("cases"), dict) else {}
         if not isinstance(memberships, dict):
             memberships = {}
         if not isinstance(sent, dict):
             sent = {}
+        if not isinstance(cases, dict):
+            cases = {}
 
         now = datetime.now(timezone.utc)
         last_iso = str(state.get("last_seen_updated_at") or "").strip()
@@ -5835,6 +6068,25 @@ async def whop_api_events_poll():
                         await log_member_status("", embed=e_unlinked, channel_name=PAYMENT_FAILURE_CHANNEL_NAME)
                     elif WHOP_EVENTS_POLL_POST_UNLINKED_TO_CASE and kind == "cancellation_scheduled":
                         await log_member_status("", embed=e_unlinked, channel_name=MEMBER_CANCELLATION_CHANNEL_NAME)
+                    # Dispute/resolution per-case channels (Whop payments) — best-effort, main guild only.
+                    try:
+                        check_pay = False
+                        if kind in {"payment_failed", "payment_succeeded", "access_restored"}:
+                            check_pay = True
+                        if str(cur.get("status") or "").strip().lower() in {"past_due", "unpaid"}:
+                            check_pay = True
+                        if check_pay:
+                            await _maybe_open_dispute_resolution_case(
+                                guild=guild,
+                                mid=mid,
+                                updated_at=str(cur.get("updated_at") or ""),
+                                brief=brief,
+                                cases=cases,
+                                did=did,
+                                member_obj=None,
+                            )
+                    except Exception:
+                        pass
                     sent[event_key] = now.isoformat().replace("+00:00", "Z")
                     posted += 1
                     if posted >= int(WHOP_EVENTS_POLL_MAX_EVENTS_PER_TICK):
@@ -5860,6 +6112,25 @@ async def whop_api_events_poll():
                     f"[Whop API][detected] kind={kind} linked=yes did={member_obj.id} mid={mid} status={cur.get('status')} "
                     f"product={str(brief.get('product') or '—').strip()}"
                 )
+                # Dispute/resolution per-case channels (Whop payments) — best-effort, main guild only.
+                try:
+                    check_pay = False
+                    if kind in {"payment_failed", "payment_succeeded", "access_restored"}:
+                        check_pay = True
+                    if str(cur.get("status") or "").strip().lower() in {"past_due", "unpaid"}:
+                        check_pay = True
+                    if check_pay:
+                        await _maybe_open_dispute_resolution_case(
+                            guild=guild,
+                            mid=mid,
+                            updated_at=str(cur.get("updated_at") or ""),
+                            brief=brief,
+                            cases=cases,
+                            did=did,
+                            member_obj=member_obj,
+                        )
+                except Exception:
+                    pass
 
                 # Case channels (minimal) only for high urgency.
                 if kind == "payment_failed":
@@ -5913,6 +6184,7 @@ async def whop_api_events_poll():
 
         state["memberships"] = memberships
         state["sent"] = sent
+        state["cases"] = cases
         # Watermark:
         # - If we fully scanned down to the cutoff, advance to newest_dt (fast).
         # - If we stopped early (post/page cap), only advance to the oldest item we actually saw
@@ -5922,6 +6194,93 @@ async def whop_api_events_poll():
         else:
             state["last_seen_updated_at"] = newest_dt.isoformat().replace("+00:00", "Z") if isinstance(newest_dt, datetime) else cutoff_dt.isoformat().replace("+00:00", "Z")
         _save_whop_api_events_state(state)
+
+
+async def _startup_payment_issue_cases_scan() -> None:
+    """One-time sweep to open dispute/resolution case channels from Whop API (best-effort)."""
+    if not PAYMENT_ISSUE_CASES_STARTUP_SCAN_ENABLED:
+        return
+    if not whop_api_client or not bot.is_ready():
+        return
+    if int(DISPUTE_CASE_CATEGORY_ID or 0) <= 0 and int(RESOLUTION_CASE_CATEGORY_ID or 0) <= 0:
+        return
+    guild = bot.get_guild(GUILD_ID) if GUILD_ID else None
+    if not isinstance(guild, discord.Guild):
+        return
+
+    max_pages = int(PAYMENT_ISSUE_CASES_STARTUP_SCAN_MAX_PAGES or 0)
+    per_page = int(PAYMENT_ISSUE_CASES_STARTUP_SCAN_PER_PAGE or 0)
+    max_cases = int(PAYMENT_ISSUE_CASES_STARTUP_SCAN_MAX_CASES or 0)
+    if max_pages <= 0 or per_page <= 0 or max_cases <= 0:
+        return
+
+    opened = 0
+    scanned = 0
+    after: str | None = None
+    pages = 0
+
+    with suppress(Exception):
+        await _whop_api_events_log(
+            f"[Whop Case][startup] scanning for disputes/resolutions (pages={max_pages} per_page={per_page} max_cases={max_cases})"
+        )
+
+    async with _WHOP_API_EVENTS_LOCK:
+        state = _load_whop_api_events_state()
+        cases = state.get("cases") if isinstance(state.get("cases"), dict) else {}
+        if not isinstance(cases, dict):
+            cases = {}
+
+        while pages < max_pages and opened < max_cases:
+            batch, page_info = await whop_api_client.list_memberships(
+                first=int(per_page),
+                after=after,
+                params={"order": "updated_at", "direction": "desc"},
+            )
+            if not batch:
+                break
+            pages += 1
+
+            for rec in batch:
+                if opened >= max_cases:
+                    break
+                if not isinstance(rec, dict):
+                    continue
+                raw_id = str(rec.get("id") or rec.get("membership_id") or "").strip()
+                if not raw_id:
+                    continue
+                scanned += 1
+
+                # Build brief so we have email/product/dashboard for the case channel.
+                brief = await fetch_whop_brief(whop_api_client, raw_id, enable_enrichment=True)
+                if not isinstance(brief, dict) or not brief:
+                    continue
+                mid = str(brief.get("membership_id") or raw_id).strip()
+                did = _extract_discord_id_from_connected(str(brief.get("connected_discord") or ""))
+                member_obj = guild.get_member(int(did)) if did else None
+                if member_obj is None and did:
+                    with suppress(Exception):
+                        member_obj = await guild.fetch_member(int(did))
+
+                before_n = len(cases)
+                await _maybe_open_dispute_resolution_case(
+                    guild=guild,
+                    mid=mid,
+                    updated_at=str(rec.get("updated_at") or ""),
+                    brief=brief,
+                    cases=cases,
+                    did=did,
+                    member_obj=member_obj,
+                )
+                after_n = len(cases)
+                if after_n > before_n:
+                    opened += (after_n - before_n)
+
+        state["cases"] = cases
+        _save_whop_api_events_state(state)
+
+    with suppress(Exception):
+        await _whop_api_events_log(f"[Whop Case][startup] complete opened={opened} scanned={scanned} pages={pages}")
+
 
 @sync_whop_memberships.error
 async def sync_whop_memberships_error(error):
