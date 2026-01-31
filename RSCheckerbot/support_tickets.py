@@ -411,7 +411,6 @@ async def _open_or_update_ticket(
     fingerprint: str,
     category_id: int,
     preview_embed: discord.Embed,
-    controls_text: str,
     reference_jump_url: str = "",
     whop_dashboard_url: str = "",
     extra_sends: list[tuple[str, discord.Embed | None]] | None = None,
@@ -480,10 +479,10 @@ async def _open_or_update_ticket(
                     content=f"<@{int(owner.id)}>",
                     allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
                 )
-        # Preview + controls (single message, buttons attached)
+        # Preview + controls (single message, buttons attached; no command text)
         with suppress(Exception):
             view = _CONTROLS_VIEW or SupportTicketControlsView()
-            await ch.send(content=str(controls_text or ""), embed=preview_embed, view=view, silent=True)
+            await ch.send(content="", embed=preview_embed, view=view, silent=True)
         for content, emb in (extra_sends or []):
             with suppress(Exception):
                 if emb is None:
@@ -513,15 +512,6 @@ async def _open_or_update_ticket(
         db["tickets"][ticket_id] = rec  # type: ignore[index]
         _index_save(db)
         return ch
-
-
-def _controls_text() -> str:
-    return (
-        "**Ticket Controls**\n"
-        "- `!transcript` export & close\n"
-        "- `!close` close (defaults to transcript)\n\n"
-        "**Status:** OPEN"
-    )
 
 
 def _embed_link(label: str, url: str) -> str:
@@ -682,7 +672,6 @@ async def open_cancellation_ticket(
         fingerprint=fingerprint,
         category_id=int(cfg.cancellation_category_id),
         preview_embed=embed,
-        controls_text=_controls_text(),
         reference_jump_url=reference_jump_url,
         whop_dashboard_url=str((whop_brief or {}).get("dashboard_url") or "") if isinstance(whop_brief, dict) else "",
     )
@@ -730,7 +719,6 @@ async def open_billing_ticket(
         fingerprint=fingerprint,
         category_id=int(cfg.billing_category_id),
         preview_embed=embed,
-        controls_text=_controls_text(),
         reference_jump_url=reference_jump_url,
     )
 
@@ -856,7 +844,6 @@ async def open_free_pass_ticket(
         fingerprint=fingerprint,
         category_id=int(cfg.free_pass_category_id),
         preview_embed=header,
-        controls_text=_controls_text(),
         extra_sends=extra,
         extra_record_fields={"what_you_missed_jump_url": str(source_jump or "")},
     )
