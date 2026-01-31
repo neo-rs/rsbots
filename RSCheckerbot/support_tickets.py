@@ -426,24 +426,18 @@ async def _open_or_update_ticket(
         return None
 
     # Dedupe / cooldown: single open ticket per (type,user) or fingerprint.
-    cooldown_s = _cooldown_seconds_for(ticket_type) if cfg.dedupe_enabled else 0
-
     async with _INDEX_LOCK:
         db = _index_load()
         existing = _ticket_find_open(db, ticket_type=ticket_type, user_id=int(owner.id), fingerprint=fingerprint)
-        if existing and cooldown_s > 0:
-            tid, rec = existing
-            created_dt = _parse_iso(str(rec.get("created_at_iso") or "")) or _now_utc()
-            if (_now_utc() - created_dt) < timedelta(seconds=int(cooldown_s)):
-                ch_id = _as_int(rec.get("channel_id"))
-                ch = guild.get_channel(int(ch_id)) if ch_id else None
-                if isinstance(ch, discord.TextChannel):
-                    with suppress(Exception):
-                        await ch.send("ℹ️ Ticket already open (deduped). Posting an update.", silent=True)
-                    rec["last_activity_at_iso"] = _now_iso()
-                    db["tickets"][tid] = rec  # type: ignore[index]
-                    _index_save(db)
-                    return ch
+        if existing and cfg.dedupe_enabled:
+            _tid, rec = existing
+            ch_id = _as_int(rec.get("channel_id"))
+            ch = guild.get_channel(int(ch_id)) if ch_id else None
+            if isinstance(ch, discord.TextChannel):
+                with suppress(Exception):
+                    await ch.send("ℹ️ Ticket already open (deduped).", silent=True)
+                # Important: do NOT bump last_activity for bot messages.
+                return ch
 
         ticket_id = _make_ticket_id()
         case_key = _ticket_case_key(ticket_id=ticket_id)

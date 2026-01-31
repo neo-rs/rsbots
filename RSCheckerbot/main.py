@@ -7125,32 +7125,6 @@ async def on_member_join(member: discord.Member):
         st_gid = int((config.get("support_tickets") or {}).get("guild_id") or 0) if isinstance(config, dict) else 0
     except Exception:
         st_gid = 0
-    if st_gid and int(getattr(member.guild, "id", 0) or 0) == int(st_gid) and int(st_gid) != int(GUILD_ID):
-        used_invite_code = None
-        try:
-            invites = await member.guild.invites()
-            for inv in invites:
-                prev_uses = invite_usage_cache.get(inv.code, inv.uses)
-                if (inv.uses or 0) > (prev_uses or 0) and used_invite_code is None:
-                    used_invite_code = inv.code
-                invite_usage_cache[inv.code] = inv.uses
-        except Exception:
-            used_invite_code = None
-
-        is_tracked = False
-        if used_invite_code:
-            invite_entry = invites_data.get(used_invite_code) or {}
-            is_tracked = bool(invite_entry) and invite_entry.get("used_at") is None
-
-        with suppress(Exception):
-            await support_tickets.handle_free_pass_join_if_needed(member=member, tracked_one_time_invite=bool(is_tracked))
-
-        # Mark tracked one-time invite used (keeps invites.json consistent across guilds)
-        with suppress(Exception):
-            if used_invite_code and is_tracked:
-                await track_invite_usage(used_invite_code, member)
-        return
-
     if member.guild.id == GUILD_ID:
 
         async def _upsert_member_join_card(embed: discord.Embed) -> discord.Message | None:
@@ -7234,14 +7208,6 @@ async def on_member_join(member: discord.Member):
             invite_entry = invites_data.get(used_invite_code) or {}
             is_tracked = bool(invite_entry) and invite_entry.get("used_at") is None
             join_method_lines.append(f"• Tracked invite: {'yes' if is_tracked else 'no'}")
-            # Support tickets: invite-based Free Pass intake (Neo-only; support_tickets enforces guild match).
-            with suppress(Exception):
-                asyncio.create_task(
-                    support_tickets.handle_free_pass_join_if_needed(
-                        member=member,
-                        tracked_one_time_invite=bool(is_tracked),
-                    )
-                )
             if is_tracked:
                 join_method_lines.append("• Source: One-time invite")
                 lead_id = invite_entry.get("lead_id") or ""
@@ -7823,13 +7789,114 @@ async def on_message(message: discord.Message):
     # Process commands first (canonical pattern)
     await bot.process_commands(message)
     
-    # Prevent self-loops
+    async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> None:
+        # Trigger tickets from the canonical member-status-logs cards (no extra Whop API).
+        if not MEMBER_STATUS_LOGS_CHANNEL_ID:
+            return
+        try:
+            if int(getattr(getattr(msg, "channel", None), "id", 0) or 0) != int(MEMBER_STATUS_LOGS_CHANNEL_ID):
+                return
+        except Exception:
+            return
+        if not getattr(msg, "embeds", None):
+            return
+        e0 = msg.embeds[0]
+        if not isinstance(e0, discord.Embed):
+            return
+
+        ts_i, kind, did, whop_brief = _extract_reporting_from_member_status_embed(
+            e0,
+            fallback_ts=int((getattr(msg, "created_at", None) or datetime.now(timezone.utc)).timestamp()),
+        )
+        if not did:
+            return
+        did_i = int(did)
+
+        guild = bot.get_guild(GUILD_ID)
+        if not guild:
+            return
+        member = guild.get_member(int(did_i))
+        if not isinstance(member, discord.Member):
+            with suppress(Exception):
+                member = await guild.fetch_member(int(did_i))
+        if not isinstance(member, discord.Member):
+            return
+
+        title = str(getattr(e0, "title", "") or "")
+        title_low = title.lower()
+        ref_url = str(getattr(msg, "jump_url", "") or "").strip()
+        occurred_at = getattr(msg, "created_at", None) or datetime.now(timezone.utc)
+
+        # Close Free Pass as soon as we see an access-confirmation style card in member-status-logs.
+        if (
+            kind in {"membership_activated_pending", "member_role_added", "trialing"}
+            or ("membership activated" in title_low)
+            or ("payment activated" in title_low)
+            or ("payment renewed" in title_low)
+            or ("payment resumed" in title_low)
+            or ("access restored" in title_low)
+        ):
+            with suppress(Exception):
+                await support_tickets.close_free_pass_if_whop_linked(int(did_i))
+
+        # Open tickets based on canonical kinds/titles.
+        if kind == "member_joined":
+            # Free Pass: only if not linked to Whop yet (no membership_id recorded).
+            if not _membership_id_from_history(int(did_i)):
+                fp = f"{int(did_i)}|freepass|{_tz_now().date().isoformat()}"
+                with suppress(Exception):
+                    await support_tickets.open_free_pass_ticket(member=member, fingerprint=fp)
+            return
+
+        # Billing (payment failed / billing issue)
+        if (kind == "payment_failed") or ("billing issue" in title_low) or ("past due" in title_low) or ("payment failed" in title_low):
+            mid = _membership_id_from_history(int(did_i))
+            fp = f"{mid or int(did_i)}|billing|{occurred_at.date().isoformat()}"
+            st = str((whop_brief or {}).get("status") or "Past Due").strip() if isinstance(whop_brief, dict) else "Past Due"
+            with suppress(Exception):
+                await support_tickets.open_billing_ticket(
+                    member=member,
+                    event_type="payment.failed",
+                    status=st or "Past Due",
+                    fingerprint=fp,
+                    occurred_at=occurred_at,
+                    reference_jump_url=ref_url,
+                )
+            return
+
+        # Cancellation
+        if kind in {"cancellation_scheduled", "deactivated"} or ("cancellation" in title_low) or ("deactivated" in title_low):
+            mid = _membership_id_from_history(int(did_i))
+            fp = f"{mid or int(did_i)}|cancel|{occurred_at.date().isoformat()}"
+            reason = ""
+            with suppress(Exception):
+                for f in (getattr(e0, "fields", None) or []):
+                    n = str(getattr(f, "name", "") or "").strip().lower()
+                    v = str(getattr(f, "value", "") or "").strip()
+                    if "cancellation reason" in n or (n == "reason"):
+                        reason = v
+                        break
+            with suppress(Exception):
+                await support_tickets.open_cancellation_ticket(
+                    member=member,
+                    whop_brief=whop_brief if isinstance(whop_brief, dict) else {},
+                    cancellation_reason=reason,
+                    fingerprint=fp,
+                    reference_jump_url=ref_url,
+                )
+            return
+
+    # Allow bot-authored member-status-logs cards to trigger tickets.
     if bot.user and message.author and message.author.id == bot.user.id:
+        with suppress(Exception):
+            await _maybe_open_tickets_from_member_status_logs(message)
         return
 
     # Support tickets: track last_activity for non-bot messages (always, even when webhooks are enabled).
     with suppress(Exception):
         await support_tickets.record_activity_from_message(message)
+
+    # Also allow non-bot messages in member-status-logs to be ignored (tickets trigger only from bot cards).
 
     # Webhooks are canonical: do not rely on Discord whop-* channels.
     if bool(str(WHOP_WEBHOOK_SECRET or "").strip()):
