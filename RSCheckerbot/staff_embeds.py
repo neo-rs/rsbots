@@ -271,8 +271,8 @@ def build_case_minimal_embed(
 
     # Row 1 (inline x3)
     name = str(getattr(member, "display_name", "") or str(member))
-    # Use a mention so clicking opens the in-app profile (allowed_mentions is disabled at send sites).
-    _add_field(embed, "Member", member.mention, inline=True)
+    # Keep embed fields stable (no mentions); clickability is handled in message content by sender.
+    _add_field(embed, "Member", name, inline=True)
     _add_field(embed, "Discord ID", f"`{member.id}`", inline=True)
     _add_field(embed, _human_label("access_roles"), access_roles, inline=True)
 
@@ -334,8 +334,8 @@ def build_member_status_detailed_embed(
 
     # Header row (inline x3)
     name = str(getattr(member, "display_name", "") or str(member))
-    # Use a mention so clicking opens the in-app profile (allowed_mentions is disabled at send sites).
-    _add_field(embed, "Member", member.mention, inline=True)
+    # Keep embed fields stable (no mentions); clickability is handled in message content by sender.
+    _add_field(embed, "Member", name, inline=True)
     _add_field(embed, "Discord ID", f"`{member.id}`", inline=True)
     _add_field(embed, _human_label("access_roles"), access_roles, inline=True)
 

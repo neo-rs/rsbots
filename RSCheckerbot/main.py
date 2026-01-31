@@ -1856,9 +1856,15 @@ async def _startup_canceling_members_snapshot() -> None:
 
                 try:
                     # Keep member identity inside the embed (no content mention -> avoids @unknown-user).
-                    content = None
                     for dst in [ch] + mirror_chs:
-                        await dst.send(content=content, embed=e, allowed_mentions=discord.AllowedMentions.none())
+                        # Main guild: clickable mention in message content (silent, no ping).
+                        in_main = bool(int(getattr(getattr(dst, "guild", None), "id", 0) or 0) == int(GUILD_ID or 0))
+                        content = f"<@{did}>" if (in_main and did) else ""
+                        allow = discord.AllowedMentions(users=True, roles=False, everyone=False) if in_main else discord.AllowedMentions.none()
+                        try:
+                            await dst.send(content=content, embed=e, allowed_mentions=allow, silent=bool(in_main))
+                        except TypeError:
+                            await dst.send(content=content, embed=e, allowed_mentions=allow)
                     sent_msgs += 1
                 except Exception as ex:
                     last_err = ex
@@ -2102,6 +2108,8 @@ async def _start_whop_sync_job_after_startup() -> None:
                 whop_api_events_poll.change_interval(seconds=WHOP_EVENTS_POLL_INTERVAL_SECONDS)
                 whop_api_events_poll.start()
                 log.info("[Whop API] Movement watcher started (poll every %ss)", WHOP_EVENTS_POLL_INTERVAL_SECONDS)
+                with suppress(Exception):
+                    await _whop_api_events_log(f"[Whop API] movement watcher started (poll every {WHOP_EVENTS_POLL_INTERVAL_SECONDS}s)")
         except Exception as e:
             log.warning("[Whop API] Failed to start movement watcher: %s", str(e)[:240])
 
@@ -2681,6 +2689,10 @@ try:
     WHOP_EVENTS_POLL_LOG_OUTPUT_CHANNEL_ID = int(WHOP_API_CONFIG.get("events_poll_log_output_channel_id") or 0)
 except Exception:
     WHOP_EVENTS_POLL_LOG_OUTPUT_CHANNEL_ID = 0
+try:
+    WHOP_EVENTS_POLL_LOG_OUTPUT_CHANNEL_NAME = str(WHOP_API_CONFIG.get("events_poll_log_output_channel_name") or "").strip()
+except Exception:
+    WHOP_EVENTS_POLL_LOG_OUTPUT_CHANNEL_NAME = ""
 _WHOP_EVENT_DEDUPE_IDS: set[str] = set()
 _WHOP_EVENT_DEDUPE_QUEUE: deque[str] = deque()
 
@@ -4132,10 +4144,11 @@ async def log_member_status(msg: str, embed: discord.Embed = None, *, channel_na
             )
             embed.set_footer(text="RSCheckerbot • Member Status Tracking")
 
-        # Ensure member is always clickable (and consistent) by putting the user mention in message content.
-        # Mentions inside embed fields are not reliably rendered/clickable across clients.
+        # Ensure member is always clickable by putting the user mention in message content.
+        # Embed mentions are unreliable across clients. We also keep Neo output non-mention to avoid "unknown-user".
         content = ""
-        if not embed_was_none:
+        in_main_guild = int(getattr(guild, "id", 0) or 0) == int(GUILD_ID or 0)
+        if (not embed_was_none) and in_main_guild:
             content = str(msg or "").strip()
             if not content and isinstance(embed, discord.Embed):
                 with suppress(Exception):
@@ -4146,9 +4159,17 @@ async def log_member_status(msg: str, embed: discord.Embed = None, *, channel_na
                                 content = f"<@{m.group(1)}>"
                                 break
 
-        # Avoid pings in output-guild mode; allow user mentions only in main guild.
-        allow = discord.AllowedMentions.none() if int(getattr(guild, "id", 0) or 0) != int(GUILD_ID or 0) else discord.AllowedMentions(users=True, roles=False, everyone=False)
-        sent = await ch.send(content=(content or ""), embed=embed, allowed_mentions=allow)
+        # Allow user mentions only in main guild, but send "silent" so staff cards don't ping.
+        allow = (
+            discord.AllowedMentions.none()
+            if not in_main_guild
+            else discord.AllowedMentions(users=True, roles=False, everyone=False)
+        )
+        try:
+            sent = await ch.send(content=(content or ""), embed=embed, allowed_mentions=allow, silent=bool(in_main_guild))
+        except TypeError:
+            # Backwards compatibility (older discord.py)
+            sent = await ch.send(content=(content or ""), embed=embed, allowed_mentions=allow)
         try:
             await _maybe_capture_for_reporting(embed, is_member_status=is_member_status_target)
         except Exception:
@@ -5543,18 +5564,27 @@ async def _whop_api_events_log(msg: str) -> None:
     if not msg or not str(msg).strip():
         return
     cid = int(WHOP_EVENTS_POLL_LOG_OUTPUT_CHANNEL_ID or 0)
-    if cid <= 0:
-        return
     ch = _WHOP_API_EVENTS_LOG_CH
-    if not isinstance(ch, discord.TextChannel) or int(getattr(ch, "id", 0) or 0) != cid:
-        ch2 = bot.get_channel(cid)
-        if isinstance(ch2, discord.TextChannel):
-            ch = ch2
-        else:
-            with suppress(Exception):
-                fetched = await bot.fetch_channel(cid)
-                ch = fetched if isinstance(fetched, discord.TextChannel) else None
-        _WHOP_API_EVENTS_LOG_CH = ch if isinstance(ch, discord.TextChannel) else None
+    if cid > 0:
+        if not isinstance(ch, discord.TextChannel) or int(getattr(ch, "id", 0) or 0) != cid:
+            ch2 = bot.get_channel(cid)
+            if isinstance(ch2, discord.TextChannel):
+                ch = ch2
+            else:
+                with suppress(Exception):
+                    fetched = await bot.fetch_channel(cid)
+                    ch = fetched if isinstance(fetched, discord.TextChannel) else None
+            _WHOP_API_EVENTS_LOG_CH = ch if isinstance(ch, discord.TextChannel) else None
+    else:
+        # Name-based: create/find a dedicated channel in the configured guild (Neo).
+        gid = int(WHOP_EVENTS_POLL_LOG_OUTPUT_GUILD_ID or 0)
+        name = str(WHOP_EVENTS_POLL_LOG_OUTPUT_CHANNEL_NAME or "").strip() or "whop-movement-logs"
+        g = bot.get_guild(gid) if gid else None
+        if isinstance(g, discord.Guild):
+            if not isinstance(ch, discord.TextChannel) or int(getattr(ch, "guild", None).id) != int(g.id) or str(getattr(ch, "name", "") or "") != name:
+                with suppress(Exception):
+                    ch = await _get_or_create_text_channel(g, name=name, category_id=None)
+                _WHOP_API_EVENTS_LOG_CH = ch if isinstance(ch, discord.TextChannel) else None
     if not isinstance(ch, discord.TextChannel):
         return
     with suppress(Exception):
@@ -5623,12 +5653,23 @@ def _classify_whop_change(prev: dict | None, cur: dict) -> str:
         return "access_restored"
     if cur_bucket == "payment_failed" and prev_bucket != "payment_failed":
         return "payment_failed"
+    # Repeated payment failures: Whop can emit multiple "payment failed" movements while status remains past_due/unpaid.
+    # Use updated_at watermark (stored in state) to treat each update as a movement.
+    if cur_bucket == "payment_failed" and prev_bucket == "payment_failed":
+        if str(cur.get("updated_at") or "") and str(cur.get("updated_at") or "") != str(prev.get("updated_at") or ""):
+            return "payment_failed"
     if cur_bucket == "deactivated" and prev_bucket != "deactivated":
         return "deactivated"
     if (not prev_cape) and cur_cape and cur_bucket in {"active", "trialing"}:
         return "cancellation_scheduled"
     if prev_cape and (not cur_cape) and prev_bucket in {"active", "trialing"}:
         return "cancellation_removed"
+    # Payment succeeded / renewal: status may stay active but renewal window advances.
+    if cur_bucket in {"active", "trialing"} and prev_bucket in {"active", "trialing"}:
+        cur_end = str(cur.get("renewal_period_end") or cur.get("renewal_end") or "").strip()
+        prev_end = str(prev.get("renewal_period_end") or prev.get("renewal_end") or "").strip()
+        if cur_end and cur_end != prev_end:
+            return "payment_succeeded"
     return ""
 
 
@@ -5636,6 +5677,8 @@ def _title_for_event(kind: str) -> tuple[str, int, str]:
     k = str(kind or "").strip().lower()
     if k == "payment_failed":
         return ("❌ Payment Failed — Action Needed", 0xED4245, "payment_failed")
+    if k == "payment_succeeded":
+        return ("✅ Payment Succeeded", 0x57F287, "active")
     if k == "cancellation_scheduled":
         return ("⚠️ Cancellation Scheduled", 0xFEE75C, "cancellation_scheduled")
     if k == "cancellation_removed":
@@ -5677,10 +5720,12 @@ async def whop_api_events_poll():
             cutoff_dt = now - timedelta(minutes=int(WHOP_EVENTS_POLL_LOOKBACK_MINUTES or 180))
 
         newest_dt = cutoff_dt
+        oldest_seen_dt: datetime | None = None
         posted = 0
         after: str | None = None
         pages = 0
         stop = False
+        incomplete = False
 
         while (not stop) and pages < int(WHOP_EVENTS_POLL_MAX_PAGES) and posted < int(WHOP_EVENTS_POLL_MAX_EVENTS_PER_TICK):
             batch, page_info = await whop_api_client.list_memberships(
@@ -5705,6 +5750,8 @@ async def whop_api_events_poll():
                     break
                 if upd_dt > newest_dt:
                     newest_dt = upd_dt
+                if (oldest_seen_dt is None) or (upd_dt < oldest_seen_dt):
+                    oldest_seen_dt = upd_dt
 
                 # Build a full API brief (includes dashboard fields + connected discord + totals).
                 brief = await fetch_whop_brief(whop_api_client, raw_id, enable_enrichment=True)
@@ -5755,6 +5802,7 @@ async def whop_api_events_poll():
                     posted += 1
                     if posted >= int(WHOP_EVENTS_POLL_MAX_EVENTS_PER_TICK):
                         stop = True
+                        incomplete = True
                         break
                     continue
 
@@ -5802,12 +5850,20 @@ async def whop_api_events_poll():
                 posted += 1
                 if posted >= int(WHOP_EVENTS_POLL_MAX_EVENTS_PER_TICK):
                     stop = True
+                    incomplete = True
                     break
 
             after = str(page_info.get("end_cursor") or "") if isinstance(page_info, dict) else ""
             has_next = bool(page_info.get("has_next_page")) if isinstance(page_info, dict) else False
             if not has_next or not after:
                 break
+
+        # If we hit page limits before reaching the cutoff, treat as incomplete so we don't skip older updates.
+        try:
+            if (not stop) and pages >= int(WHOP_EVENTS_POLL_MAX_PAGES):
+                incomplete = True
+        except Exception:
+            pass
 
         # Compact sent cache (avoid unbounded growth)
         try:
@@ -5820,7 +5876,14 @@ async def whop_api_events_poll():
 
         state["memberships"] = memberships
         state["sent"] = sent
-        state["last_seen_updated_at"] = newest_dt.isoformat().replace("+00:00", "Z") if isinstance(newest_dt, datetime) else cutoff_dt.isoformat().replace("+00:00", "Z")
+        # Watermark:
+        # - If we fully scanned down to the cutoff, advance to newest_dt (fast).
+        # - If we stopped early (post/page cap), only advance to the oldest item we actually saw
+        #   so we don't skip bursts of updates.
+        if incomplete and isinstance(oldest_seen_dt, datetime):
+            state["last_seen_updated_at"] = oldest_seen_dt.isoformat().replace("+00:00", "Z")
+        else:
+            state["last_seen_updated_at"] = newest_dt.isoformat().replace("+00:00", "Z") if isinstance(newest_dt, datetime) else cutoff_dt.isoformat().replace("+00:00", "Z")
         _save_whop_api_events_state(state)
 
 @sync_whop_memberships.error
