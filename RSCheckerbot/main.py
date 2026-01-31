@@ -2693,6 +2693,10 @@ try:
     WHOP_EVENTS_POLL_LOG_OUTPUT_CHANNEL_NAME = str(WHOP_API_CONFIG.get("events_poll_log_output_channel_name") or "").strip()
 except Exception:
     WHOP_EVENTS_POLL_LOG_OUTPUT_CHANNEL_NAME = ""
+try:
+    WHOP_EVENTS_POLL_LOG_ALL_MOVEMENTS = bool(WHOP_API_CONFIG.get("events_poll_log_all_movements", False))
+except Exception:
+    WHOP_EVENTS_POLL_LOG_ALL_MOVEMENTS = False
 _WHOP_EVENT_DEDUPE_IDS: set[str] = set()
 _WHOP_EVENT_DEDUPE_QUEUE: deque[str] = deque()
 
@@ -5670,6 +5674,7 @@ def _classify_whop_change(prev: dict | None, cur: dict) -> str:
         prev_end = str(prev.get("renewal_period_end") or prev.get("renewal_end") or "").strip()
         if cur_end and cur_end != prev_end:
             return "payment_succeeded"
+    # Generic membership update: log-only (when enabled) will capture this as movement.
     return ""
 
 
@@ -5763,12 +5768,44 @@ async def whop_api_events_poll():
                     "cancel_at_period_end": (str(brief.get("cancel_at_period_end") or "").strip().lower() == "yes")
                     or bool(rec.get("cancel_at_period_end") is True),
                     "renewal_period_end": str(rec.get("renewal_period_end") or "").strip(),
+                    # Extra fields for movement logging (best-effort; may be blank depending on API payloads).
+                    "product": str(brief.get("product") or "").strip(),
+                    "email": str(brief.get("email") or "").strip(),
+                    "user_name": str(brief.get("user_name") or "").strip(),
+                    "connected_discord": str(brief.get("connected_discord") or "").strip(),
                     "updated_at": upd_dt.isoformat().replace("+00:00", "Z"),
                 }
                 prev = memberships.get(mid) if isinstance(memberships.get(mid), dict) else None
                 kind = _classify_whop_change(prev, cur)
                 memberships[mid] = cur
                 if not kind:
+                    if WHOP_EVENTS_POLL_LOG_ALL_MOVEMENTS:
+                        # Log any membership update movement even if it's not a staff-card-worthy event.
+                        # Keep it compact: include changed keys (when previous state exists).
+                        changed: list[str] = []
+                        if isinstance(prev, dict) and prev:
+                            for k in ("status", "cancel_at_period_end", "renewal_period_end", "product", "email", "user_name", "connected_discord"):
+                                if str(prev.get(k) or "") != str(cur.get(k) or ""):
+                                    changed.append(k)
+                        else:
+                            changed = ["new_seen"]
+
+                        event_key = f"{mid}:movement:{cur.get('updated_at')}"
+                        if event_key in sent:
+                            continue
+                        did_hint = _extract_discord_id_from_connected(str(cur.get("connected_discord") or ""))
+                        await _whop_api_events_log(
+                            f"[Whop API][movement] mid={mid} did={did_hint or '—'} "
+                            f"changed={','.join(changed) if changed else '—'} "
+                            f"status={cur.get('status') or '—'} product={cur.get('product') or '—'} "
+                            f"email={cur.get('email') or '—'}"
+                        )
+                        sent[event_key] = now.isoformat().replace("+00:00", "Z")
+                        posted += 1
+                        if posted >= int(WHOP_EVENTS_POLL_MAX_EVENTS_PER_TICK):
+                            stop = True
+                            incomplete = True
+                            break
                     continue
 
                 event_key = f"{mid}:{kind}:{cur.get('updated_at')}"

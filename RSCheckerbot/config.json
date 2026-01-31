@@ -188,6 +188,8 @@
     "_comment_events_poll_log": "Detection logs are sent to a dedicated channel in Neo for easier tracking (separate from smoketest).",
     "events_poll_log_output_channel_id": 0,
     "events_poll_log_output_channel_name": "whop-movement-logs",
+    "_comment_events_poll_log_all": "If true, also log ANY membership update movement even if it doesn't map to a staff-card event type (can be noisy).",
+    "events_poll_log_all_movements": true,
     "_comment_sync_summary": "Optional: mirror Whop sync summary into Neo Test Server.",
     "sync_summary_enabled": true,
     "sync_summary_output_guild_id": 1451275225512546497,
