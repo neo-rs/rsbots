@@ -307,7 +307,17 @@ class WhopAPIClient:
         Get Whop Member (company member record) by member ID (mber_...).
         This endpoint includes user email/name which is useful for support tooling.
         """
-        if not member_id:
+        mid = str(member_id or "").strip()
+        if not mid:
+            return None
+        try:
+            response = await self._request("GET", f"/members/{mid}")
+            # /members/{id} may be direct object or wrapped in "data" depending on API version.
+            if isinstance(response, dict) and "data" in response:
+                return response.get("data")
+            return response if isinstance(response, dict) else None
+        except WhopAPIError as e:
+            log.warning(f"Failed to get member {mid}: {e}")
             return None
 
     async def get_payment_by_id(self, payment_id: str) -> Optional[Dict]:
@@ -368,13 +378,6 @@ class WhopAPIClient:
             return response.get("data") if isinstance(response, dict) and "data" in response else response
         except WhopAPIError as e:
             log.warning(f"Failed to get setup_intent {sid}: {e}")
-            return None
-        try:
-            response = await self._request("GET", f"/members/{member_id}")
-            # /members/{id} returns a direct object (not wrapped)
-            return response.get("data") if "data" in response else response
-        except WhopAPIError as e:
-            log.warning(f"Failed to get member {member_id}: {e}")
             return None
     
     async def get_user_memberships(self, user_id: str) -> List[Dict]:

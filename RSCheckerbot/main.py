@@ -6697,10 +6697,13 @@ async def whop_api_events_poll():
         incomplete = False
 
         while (not stop) and pages < int(WHOP_EVENTS_POLL_MAX_PAGES) and posted < int(WHOP_EVENTS_POLL_MAX_EVENTS_PER_TICK):
+            # Whop /memberships `order` does NOT support `updated_at` (docs). Valid options:
+            # id, created_at, status, canceled_at, date_joined, total_spend.
+            # We fetch newest memberships by created_at and still detect movements using each record's `updated_at`.
             batch, page_info = await whop_api_client.list_memberships(
                 first=int(WHOP_EVENTS_POLL_PER_PAGE),
                 after=after,
-                params={"order": "updated_at", "direction": "desc"},
+                params={"order": "created_at", "direction": "desc"},
             )
             if not batch:
                 break
@@ -6971,10 +6974,11 @@ async def _startup_payment_issue_cases_scan() -> None:
             cases = {}
 
         while pages < max_pages and opened < max_cases:
+            # Same constraint as above: no `updated_at` ordering on /memberships.
             batch, page_info = await whop_api_client.list_memberships(
                 first=int(per_page),
                 after=after,
-                params={"order": "updated_at", "direction": "desc"},
+                params={"order": "created_at", "direction": "desc"},
             )
             if not batch:
                 break
