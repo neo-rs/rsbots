@@ -7,7 +7,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import quote_plus
 
 import requests
@@ -462,7 +462,12 @@ async def build_rows_with_titles(pairs: Iterable[Tuple[str, str]], cfg: Dict[str
     return [[e.store, e.sku, e.title] for e in entries]
 
 
-async def build_preview_entries(pairs: Iterable[Tuple[str, str]], cfg: Dict[str, Any]) -> List[RsFsPreviewEntry]:
+async def build_preview_entries(
+    pairs: Iterable[Tuple[str, str]],
+    cfg: Dict[str, Any],
+    *,
+    on_progress: Optional[Callable[[int, int, int, RsFsPreviewEntry], Optional[Awaitable[None]]]] = None,
+) -> List[RsFsPreviewEntry]:
     """
     Build preview entries (store, sku, title, url) for (store, sku) pairs, fetching titles best-effort.
     """
@@ -504,5 +509,37 @@ async def build_preview_entries(pairs: Iterable[Tuple[str, str]], cfg: Dict[str,
             title = url or ""
         return RsFsPreviewEntry(store=st, sku=sk, url=url, title=title, error=err)
 
-    return await asyncio.gather(*[_one(st, sk) for (st, sk) in unique])
+    total = len(unique)
+    results: List[Optional[RsFsPreviewEntry]] = [None] * total
+    errors = 0
+
+    tasks: List[asyncio.Task] = []
+    task_to_idx: Dict[asyncio.Task, int] = {}
+    for i, (st, sk) in enumerate(unique):
+        t = asyncio.create_task(_one(st, sk))
+        tasks.append(t)
+        task_to_idx[t] = i
+
+    done = 0
+    for t in asyncio.as_completed(tasks):
+        entry = await t
+        idx = task_to_idx.get(t, None)
+        if isinstance(idx, int) and 0 <= idx < total:
+            results[idx] = entry
+        done += 1
+        if (entry.error or "").strip():
+            errors += 1
+        if on_progress:
+            try:
+                maybe = on_progress(done, total, errors, entry)
+                if asyncio.iscoroutine(maybe):
+                    await maybe  # type: ignore[misc]
+            except Exception:
+                pass
+
+    out: List[RsFsPreviewEntry] = []
+    for r in results:
+        if isinstance(r, RsFsPreviewEntry):
+            out.append(r)
+    return out
 

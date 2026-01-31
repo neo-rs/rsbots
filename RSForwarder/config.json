@@ -72,5 +72,7 @@
   "rs_fs_sheet_test_output_enabled": true,
   "rs_fs_sheet_test_output_channel_id": "",
   "rs_fs_sheet_test_limit": 120,
+  "rs_fs_sheet_progress_enabled": true,
+  "rs_fs_sheet_progress_update_s": 2.0,
   "zephyr_release_feed_channel_id": "1438893232686895194"
 }

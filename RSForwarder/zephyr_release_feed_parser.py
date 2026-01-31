@@ -16,10 +16,21 @@ _HEADER_RE = re.compile(r"release\s+feed\(s\)", re.IGNORECASE)
 _SKU_LINE_RE = re.compile(r"^\s*(\d+)\.\s*([+-]{1,2})\s*(.+?)(?:\s*\||$)")
 _MONITOR_RE = re.compile(r"\b([a-z0-9]+(?:[-_][a-z0-9]+)*)-monitor\b", re.IGNORECASE)
 _BRACKET_RE = re.compile(r"\[([^\]]+)\]")
+_ITEM_START_INLINE_RE = re.compile(r"(?:^|\s)(\d{1,4})\s*\.\s*([+-]{1,2})\s*([^|\[]+?)(?=\s*(?:\||\[))")
+_MD_BOLD_RE = re.compile(r"\*\*")
 
 
 def looks_like_release_feed_embed_text(text: str) -> bool:
-    return bool(_HEADER_RE.search(text or ""))
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _HEADER_RE.search(t):
+        return True
+    low = t.lower()
+    # Zephyr often splits the list across multiple embeds; continuation parts may not include the header.
+    if "zephyr companion bot" in low and "-monitor" in low and re.search(r"\b\d{1,4}\s*\.", low):
+        return True
+    return False
 
 
 def _norm_token(s: str) -> str:
@@ -105,6 +116,18 @@ def _iter_lines(text: str) -> Iterable[str]:
             yield s
 
 
+def _strip_markdown(s: str) -> str:
+    t = (s or "").replace("\n", " ").replace("\r", " ").strip()
+    if not t:
+        return ""
+    # Minimal markdown normalization (Discord Companion bolds numbers and pipes).
+    t = _MD_BOLD_RE.sub("", t)
+    # Normalize special separators into plain spaces.
+    t = t.replace("\u2503", "|")  # box drawing vertical bar
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 def parse_release_feed_items(text: str) -> List[ZephyrReleaseFeedItem]:
     """
     Parse Zephyr "Release Feed(s) in this server:" embed text into (sku, store, monitor).
@@ -118,6 +141,7 @@ def parse_release_feed_items(text: str) -> List[ZephyrReleaseFeedItem]:
     pending_sku: Optional[str] = None
     pending_sign: Optional[str] = None
 
+    # First try line-based parsing (older embed formatting).
     for line in _iter_lines(text):
         m_sku = _SKU_LINE_RE.match(line)
         if m_sku:
@@ -163,6 +187,40 @@ def parse_release_feed_items(text: str) -> List[ZephyrReleaseFeedItem]:
                     items.append(ZephyrReleaseFeedItem(sku=pending_sku, store=store, source_tag=_norm_token(tag)))
                 pending_sku = None
                 pending_sign = None
+
+    if items:
+        return items
+
+    # Inline parsing for Discord Companion / Zephyr formatting (everything in one line).
+    t = _strip_markdown(text)
+    if not t:
+        return []
+
+    starts = list(_ITEM_START_INLINE_RE.finditer(t))
+    if not starts:
+        return []
+
+    for i, m in enumerate(starts):
+        sign = (m.group(2) or "").strip()
+        token = _clean_sku_token(m.group(3) or "")
+        if not token:
+            continue
+        if sign.startswith("-"):
+            continue
+        seg_start = int(m.start())
+        seg_end = int(starts[i + 1].start()) if i + 1 < len(starts) else len(t)
+        seg = t[seg_start:seg_end]
+        tag = _extract_bracket_tag(seg)
+        if not tag:
+            m_mon = _MONITOR_RE.search(seg)
+            if m_mon:
+                tag = f"{m_mon.group(1)}-monitor"
+        if not tag:
+            continue
+        store = tag_to_store(tag)
+        if not store:
+            continue
+        items.append(ZephyrReleaseFeedItem(sku=token, store=store, source_tag=_norm_token(tag)))
 
     return items
 

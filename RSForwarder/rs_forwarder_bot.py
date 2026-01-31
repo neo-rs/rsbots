@@ -717,6 +717,19 @@ class RSForwarderBot:
         except Exception:
             return None
 
+    def _format_progress_bar(self, done: int, total: int, *, width: int = 18) -> str:
+        try:
+            t = max(1, int(total))
+            d = max(0, min(int(done), t))
+            w = max(8, min(int(width), 30))
+            filled = int(round((d / t) * w))
+            filled = max(0, min(filled, w))
+            bar = ("█" * filled) + ("░" * (w - filled))
+            pct = int(round((d / t) * 100))
+            return f"[{bar}] {d}/{t} ({pct}%)"
+        except Exception:
+            return f"{done}/{total}"
+
     def _collect_embed_text(self, message: discord.Message) -> str:
         parts: List[str] = []
         try:
@@ -832,6 +845,21 @@ class RSForwarderBot:
                     print(f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Skip: parsed 0 items from embed text")
                 except Exception:
                     pass
+                # If test mode is enabled, post a visible hint so the user isn't left waiting.
+                try:
+                    test_enabled = bool((self.config or {}).get("rs_fs_sheet_test_output_enabled"))
+                except Exception:
+                    test_enabled = False
+                if test_enabled:
+                    try:
+                        out_ch = await self._resolve_channel_by_id(int(self._zephyr_release_feed_channel_id() or 0))
+                        if out_ch and hasattr(out_ch, "send"):
+                            await out_ch.send(
+                                "RS-FS: ❌ Parsed 0 items from the Zephyr embed text. (Embed format may have changed.)",
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+                    except Exception:
+                        pass
                 return
 
             # Dry-run/preview: send output into the same channel (or configured override).
@@ -853,13 +881,24 @@ class RSForwarderBot:
             except Exception:
                 out_ch_id = int(target_ch)
 
+            out_ch = None
+            progress_msg = None
+            progress_enabled = False
+            progress_interval_s = 2.0
+            try:
+                progress_enabled = bool((self.config or {}).get("rs_fs_sheet_progress_enabled", True))
+                progress_interval_s = float((self.config or {}).get("rs_fs_sheet_progress_update_s", 2.0) or 2.0)
+            except Exception:
+                progress_enabled = True
+                progress_interval_s = 2.0
+            progress_interval_s = max(1.0, min(progress_interval_s, 10.0))
+
             if dry_run:
                 try:
                     out_ch = await self._resolve_channel_by_id(int(out_ch_id))
                 except Exception:
                     out_ch = None
                 if out_ch and hasattr(out_ch, "send"):
-                    # Chunk into embeds (25 fields max)
                     title = "RS-FS Preview (dry-run)" if sheet_enabled else "RS-FS Preview (no-sheet)"
                     header = discord.Embed(title=title, color=discord.Color.blurple())
                     header.description = (
@@ -867,10 +906,54 @@ class RSForwarderBot:
                         "(No Google Sheet writes.)"
                     )
                     await out_ch.send(embed=header, allowed_mentions=discord.AllowedMentions.none())
+                    if progress_enabled:
+                        try:
+                            progress_msg = await out_ch.send(
+                                f"RS-FS progress: {self._format_progress_bar(0, min(len(pairs), limit))} | errors: 0",
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+                        except Exception:
+                            progress_msg = None
                 else:
                     print(f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Cannot resolve output channel id={out_ch_id} (no send permission or not cached)")
 
-            raw_entries = await rs_fs_sheet_sync.build_preview_entries(pairs[:limit], self.config)
+            started = time.monotonic()
+            last_update = 0.0
+
+            async def _on_progress(done: int, total: int, errors: int, entry) -> None:
+                nonlocal last_update
+                if not progress_msg:
+                    return
+                now = time.monotonic()
+                if done != total and (now - last_update) < progress_interval_s:
+                    return
+                last_update = now
+                try:
+                    last = ""
+                    try:
+                        last = f" | last: {getattr(entry, 'store', '')} {getattr(entry, 'sku', '')}".strip()
+                    except Exception:
+                        last = ""
+                    await progress_msg.edit(
+                        content=f"RS-FS progress: {self._format_progress_bar(done, total)} | errors: {errors}{last}"
+                    )
+                except Exception:
+                    return
+
+            try:
+                raw_entries = await rs_fs_sheet_sync.build_preview_entries(
+                    pairs[:limit],
+                    self.config,
+                    on_progress=_on_progress if progress_msg else None,
+                )
+            except Exception as e:
+                if progress_msg:
+                    try:
+                        await progress_msg.edit(content=f"RS-FS progress: ❌ failed: {str(e)[:200]}")
+                    except Exception:
+                        pass
+                raise
+
             entries = [e for e in raw_entries if (e.url or "").strip()]
             skipped_no_url = len(raw_entries) - len(entries)
 
@@ -880,6 +963,16 @@ class RSForwarderBot:
                 except Exception:
                     out_ch = None
                 if out_ch and hasattr(out_ch, "send"):
+                    if progress_msg:
+                        try:
+                            total_show = min(len(pairs), limit)
+                            elapsed = time.monotonic() - started
+                            err_count = sum(1 for e in raw_entries if (e.error or "").strip())
+                            await progress_msg.edit(
+                                content=f"RS-FS progress: ✅ done {total_show}/{total_show} in {elapsed:.1f}s | errors: {err_count}"
+                            )
+                        except Exception:
+                            pass
                     done = discord.Embed(
                         title="RS-FS Preview (results)",
                         description=(
