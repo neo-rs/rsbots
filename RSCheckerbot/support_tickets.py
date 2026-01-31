@@ -50,6 +50,10 @@ class SupportTicketConfig:
     cooldown_free_pass_seconds: int
     cooldown_billing_seconds: int
     cooldown_cancellation_seconds: int
+    startup_enabled: bool
+    startup_delay_seconds: int
+    startup_recent_history_limit: int
+    startup_templates: dict[str, str]
 
 
 _BOT: commands.Bot | None = None
@@ -141,6 +145,8 @@ def initialize(
     fp = st.get("free_pass") if isinstance(st.get("free_pass"), dict) else {}
     fp_ad = fp.get("auto_delete") if isinstance(fp.get("auto_delete"), dict) else {}
     dd = st.get("dedupe") if isinstance(st.get("dedupe"), dict) else {}
+    sm = st.get("startup_messages") if isinstance(st.get("startup_messages"), dict) else {}
+    sm_templates = sm.get("templates") if isinstance(sm.get("templates"), dict) else {}
 
     def _int_list(obj: object) -> list[int]:
         out: list[int] = []
@@ -172,6 +178,10 @@ def initialize(
         cooldown_free_pass_seconds=max(0, _as_int((dd.get("free_pass") or {}).get("cooldown_seconds")) or 86400),
         cooldown_billing_seconds=max(0, _as_int((dd.get("billing") or {}).get("cooldown_seconds")) or 21600),
         cooldown_cancellation_seconds=max(0, _as_int((dd.get("cancellation") or {}).get("cooldown_seconds")) or 86400),
+        startup_enabled=_as_bool(sm.get("enabled")),
+        startup_delay_seconds=max(5, _as_int(sm.get("delay_seconds")) or 300),
+        startup_recent_history_limit=max(10, min(200, _as_int(sm.get("recent_history_limit")) or 50)),
+        startup_templates={str(k).strip().lower(): str(v) for k, v in (sm_templates or {}).items() if str(k or "").strip()},
     )
 
     # Register persistent view so buttons survive restarts.
@@ -209,6 +219,137 @@ def _ticket_iter(db: dict) -> list[tuple[str, dict]]:
             continue
         out.append((str(tid), rec))
     return out
+
+
+def _startup_template(ticket_type: str) -> str:
+    cfg = _cfg()
+    if not cfg:
+        return ""
+    key = str(ticket_type or "").strip().lower()
+    tmpl = (cfg.startup_templates or {}).get(key) if isinstance(cfg.startup_templates, dict) else ""
+    return str(tmpl or "").strip()
+
+
+async def _startup_has_human_activity_since_creation(
+    *,
+    ch: discord.TextChannel,
+    created_at: datetime,
+    limit: int,
+) -> bool:
+    """Return True if any non-bot message exists since creation."""
+    with suppress(Exception):
+        async for m in ch.history(limit=int(limit), oldest_first=False):
+            if not m:
+                continue
+            try:
+                if (m.created_at or _now_utc()) < created_at:
+                    # history is newest-first, so once we cross creation time we can stop
+                    break
+            except Exception:
+                pass
+            if getattr(getattr(m, "author", None), "bot", False):
+                continue
+            return True
+    return False
+
+
+async def sweep_startup_messages() -> None:
+    """Pattern A: stateless sweeper loop for 5-minute startup acknowledgement."""
+    if not _ensure_cfg_loaded():
+        return
+    cfg = _cfg()
+    if not cfg or not cfg.startup_enabled or not _BOT:
+        return
+    guild = _BOT.get_guild(int(cfg.guild_id))
+    if not guild:
+        return
+
+    now = _now_utc()
+
+    # Copy candidates under lock to avoid holding lock across awaits.
+    candidates: list[tuple[str, dict]] = []
+    async with _INDEX_LOCK:
+        db = _index_load()
+        for tid, rec in _ticket_iter(db):
+            if not _ticket_is_open(rec):
+                continue
+            # already sent or skipped
+            if str(rec.get("startup_sent_at_iso") or "").strip():
+                continue
+            if str(rec.get("startup_skipped_at_iso") or "").strip():
+                continue
+            candidates.append((tid, dict(rec)))
+
+    for tid, rec in candidates:
+        created_dt = _parse_iso(str(rec.get("created_at_iso") or "")) or now
+        if (now - created_dt) < timedelta(seconds=int(cfg.startup_delay_seconds)):
+            continue
+
+        ch_id = _as_int(rec.get("channel_id"))
+        uid = _as_int(rec.get("user_id"))
+        ttype = str(rec.get("ticket_type") or "").strip().lower()
+
+        ch = guild.get_channel(int(ch_id)) if ch_id else None
+        if not isinstance(ch, discord.TextChannel):
+            # Channel missing -> close record
+            async with _INDEX_LOCK:
+                db2 = _index_load()
+                found = _ticket_by_channel_id(db2, int(ch_id))
+                if found:
+                    tid2, rec2 = found
+                    if _ticket_is_open(rec2):
+                        rec2["status"] = "CLOSED"
+                        rec2["close_reason"] = "channel_missing"
+                        rec2["closed_at_iso"] = _now_iso()
+                        db2["tickets"][tid2] = rec2  # type: ignore[index]
+                        _index_save(db2)
+            continue
+
+        # Guard: skip if any human spoke since creation.
+        spoke = await _startup_has_human_activity_since_creation(
+            ch=ch,
+            created_at=created_dt,
+            limit=int(cfg.startup_recent_history_limit),
+        )
+        if spoke:
+            async with _INDEX_LOCK:
+                db2 = _index_load()
+                found = _ticket_by_channel_id(db2, int(ch_id))
+                if found:
+                    tid2, rec2 = found
+                    if _ticket_is_open(rec2) and (not str(rec2.get("startup_sent_at_iso") or "").strip()):
+                        rec2["startup_skipped_at_iso"] = _now_iso()
+                        db2["tickets"][tid2] = rec2  # type: ignore[index]
+                        _index_save(db2)
+            continue
+
+        tmpl = _startup_template(ttype)
+        if not tmpl:
+            continue
+        mention = f"<@{int(uid)}>" if uid else ""
+        content = tmpl.replace("{mention}", mention).strip()
+        if not content:
+            continue
+
+        ok = True
+        try:
+            await ch.send(
+                content=content[:1900],
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+        except Exception:
+            ok = False
+
+        if ok:
+            async with _INDEX_LOCK:
+                db2 = _index_load()
+                found = _ticket_by_channel_id(db2, int(ch_id))
+                if found:
+                    tid2, rec2 = found
+                    if _ticket_is_open(rec2) and (not str(rec2.get("startup_sent_at_iso") or "").strip()):
+                        rec2["startup_sent_at_iso"] = _now_iso()
+                        db2["tickets"][tid2] = rec2  # type: ignore[index]
+                        _index_save(db2)
 
 
 def _ticket_by_channel_id(db: dict, channel_id: int) -> tuple[str, dict] | None:
@@ -503,6 +644,8 @@ async def _open_or_update_ticket(
             "whop_dashboard_url": str(whop_dashboard_url or ""),
             "close_reason": "",
             "closed_at_iso": "",
+            "startup_sent_at_iso": "",
+            "startup_skipped_at_iso": "",
         }
         if isinstance(extra_record_fields, dict):
             for k, v in extra_record_fields.items():
@@ -1116,6 +1259,9 @@ async def sweep_free_pass_tickets() -> None:
     """Periodic sweeper: inactivity and whop-linked closure for Free Pass tickets."""
     if not _ensure_cfg_loaded():
         return
+    # Always run startup-message sweeper (config-gated; restart-safe).
+    with suppress(Exception):
+        await sweep_startup_messages()
     cfg = _cfg()
     if not cfg or not cfg.auto_delete_enabled:
         return

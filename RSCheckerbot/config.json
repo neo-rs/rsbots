@@ -250,6 +250,17 @@
         "delete_on_whop_linked": true
       }
     },
+    "startup_messages": {
+      "_comment": "5-minute startup acknowledgement (Pattern A sweeper). Disabled by default.",
+      "enabled": true,
+      "delay_seconds": 300,
+      "recent_history_limit": 50,
+      "templates": {
+        "cancellation": "Yo {mention}! Just checking in. We’ve got your cancellation ticket and are taking a look. If you don’t mind sharing what made you decide to cancel, feel free to let us know here.",
+        "billing": "Yo {mention}! Just checking in. We’ve got your billing ticket and are looking into it. If you saw an error or tried another payment method, that info can help us resolve this faster.",
+        "free_pass": "Yo {mention}! Just checking in. This ticket is here to help you get full access. You’re already seeing some of what we post in what you missed. Once your Whop account is connected, you’ll have full access. Let us know if you need help."
+      }
+    },
     "dedupe": {
       "enabled": true,
       "free_pass": { "cooldown_seconds": 86400 },
