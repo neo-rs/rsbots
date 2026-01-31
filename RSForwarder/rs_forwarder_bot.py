@@ -765,26 +765,53 @@ class RSForwarderBot:
                 return name
         return None
 
-    async def _resolve_text_channel_by_name(self, name: str) -> Optional[discord.TextChannel]:
+    async def _resolve_text_channel_by_name(self, name: str, *, guild: Optional[discord.Guild] = None) -> Optional[discord.TextChannel]:
         """
-        Resolve a text channel by name within the configured guild.
+        Resolve a text channel by name.
+
+        Priority:
+        1) provided guild (usually the Zephyr/monitor guild)
+        2) configured guild_id (legacy)
+        3) any guild the bot is in
         """
         target = (name or "").strip().lower()
         if not target:
             return None
+
+        def _find_in_g(g: Optional[discord.Guild]) -> Optional[discord.TextChannel]:
+            if not g:
+                return None
+            try:
+                for ch in getattr(g, "text_channels", []) or []:
+                    if str(getattr(ch, "name", "") or "").strip().lower() == target:
+                        return ch
+            except Exception:
+                return None
+            return None
+
+        # 1) Explicit guild (best)
+        hit = _find_in_g(guild)
+        if hit:
+            return hit
+
+        # 2) Configured guild_id
         try:
             guild_id = int((self.config or {}).get("guild_id") or 0)
         except Exception:
             guild_id = 0
-        guild = self.bot.get_guild(guild_id) if guild_id else None
-        if not guild:
-            return None
+        if guild_id:
+            hit = _find_in_g(self.bot.get_guild(guild_id))
+            if hit:
+                return hit
+
+        # 3) Any guild
         try:
-            for ch in getattr(guild, "text_channels", []) or []:
-                if str(getattr(ch, "name", "") or "").strip().lower() == target:
-                    return ch
+            for g in list(getattr(self.bot, "guilds", []) or [])[:50]:
+                hit = _find_in_g(g)
+                if hit:
+                    return hit
         except Exception:
-            return None
+            pass
         return None
 
     @staticmethod
@@ -804,7 +831,13 @@ class RSForwarderBot:
         m = re.search(r"(https?://[^\s<>()]+)", t)
         return (m.group(1) or "").strip() if m else ""
 
-    async def _monitor_lookup_for_store(self, store: str, sku: str) -> Optional[rs_fs_sheet_sync.RsFsPreviewEntry]:
+    async def _monitor_lookup_for_store(
+        self,
+        store: str,
+        sku: str,
+        *,
+        guild: Optional[discord.Guild] = None,
+    ) -> Optional[rs_fs_sheet_sync.RsFsPreviewEntry]:
         """
         Try to find a matching monitor embed for (store, sku) and extract title + url from that embed.
         Returns None if not found / not accessible.
@@ -814,7 +847,7 @@ class RSForwarderBot:
         ch_name = self._monitor_channel_name_for_store(store)
         if not ch_name:
             return None
-        ch = await self._resolve_text_channel_by_name(ch_name)
+        ch = await self._resolve_text_channel_by_name(ch_name, guild=guild)
         if not ch:
             return None
 
@@ -822,42 +855,110 @@ class RSForwarderBot:
         if not target:
             return None
 
+        target_digits = "".join([c for c in target if c.isdigit()])
+
+        def _looks_like_id_value(cleaned: str) -> bool:
+            # Heuristic: IDs are usually fairly long, or contain letters (ASIN / BestBuy sku).
+            if not cleaned:
+                return False
+            if any(c.isalpha() for c in cleaned):
+                return len(cleaned) >= 6
+            # numeric
+            return len(cleaned) >= 6
+
+        def _id_like_field_name(name: str) -> bool:
+            n = (name or "").strip().lower()
+            if not n:
+                return False
+            hints = (
+                "sku",
+                "pid",
+                "tcin",
+                "asin",
+                "upc",
+                "item",
+                "product",
+                "product id",
+                "productid",
+                "model",
+                "mpn",
+                "id",
+            )
+            return any(h in n for h in hints)
+
+        def _value_matches_target(raw_val: str) -> bool:
+            val_clean = self._clean_sku_text(raw_val or "")
+            if not val_clean:
+                return False
+            if val_clean == target:
+                return True
+            # Numeric-only match (handles formatting/commas/spaces)
+            if target_digits:
+                val_digits = "".join([c for c in val_clean if c.isdigit()])
+                if val_digits and val_digits == target_digits and len(target_digits) >= 6:
+                    return True
+            return False
+
         limit = self._rs_fs_monitor_history_limit()
         try:
             async for m in ch.history(limit=limit):
                 embeds = getattr(m, "embeds", None) or []
                 for e in embeds:
-                    # Look for SKU field
                     fields = getattr(e, "fields", None) or []
+
+                    def _extract_title_url() -> Tuple[str, str]:
+                        title = str(getattr(e, "title", "") or "").strip()
+                        url = str(getattr(e, "url", "") or "").strip()
+                        if not url:
+                            # Try pull first URL from any field values
+                            for f2 in fields:
+                                url = self._first_url_in_text(str(getattr(f2, "value", "") or ""))
+                                if url:
+                                    break
+                        if not url:
+                            url = self._first_url_in_text(str(getattr(e, "description", "") or ""))
+                        if not title:
+                            title = url or ""
+                        return title, url
+
+                    # Pass 1: ID-like fields (SKU/PID/TCIN/ASIN/UPC/etc)
                     for f in fields:
-                        name = str(getattr(f, "name", "") or "").strip().lower()
+                        name = str(getattr(f, "name", "") or "").strip()
+                        val = str(getattr(f, "value", "") or "").strip()
+                        if not (name and val):
+                            continue
+                        if not _id_like_field_name(name):
+                            continue
+                        if _value_matches_target(val):
+                            title, url = _extract_title_url()
+                            return rs_fs_sheet_sync.RsFsPreviewEntry(
+                                store=store,
+                                sku=sku,
+                                url=url,
+                                title=title,
+                                error="" if url else "no url in monitor embed",
+                                source=f"monitor:{ch_name}",
+                            )
+
+                    # Pass 2: exact match anywhere in values (avoid false positives on short numbers)
+                    for f in fields:
                         val = str(getattr(f, "value", "") or "").strip()
                         if not val:
                             continue
-                        if ("sku" in name) or ("tcin" in name) or ("asin" in name) or ("upc" in name):
-                            cand = self._clean_sku_text(val)
-                            if cand == target:
-                                title = str(getattr(e, "title", "") or "").strip()
-                                url = str(getattr(e, "url", "") or "").strip()
-                                if not url:
-                                    # Try pull first URL from any field values
-                                    for f2 in fields:
-                                        url = self._first_url_in_text(str(getattr(f2, "value", "") or ""))
-                                        if url:
-                                            break
-                                if not url:
-                                    # Try description
-                                    url = self._first_url_in_text(str(getattr(e, "description", "") or ""))
-                                if not title:
-                                    title = url or ""
-                                return rs_fs_sheet_sync.RsFsPreviewEntry(
-                                    store=store,
-                                    sku=sku,
-                                    url=url,
-                                    title=title,
-                                    error="",
-                                    source=f"monitor:{ch_name}",
-                                )
+                        val_clean = self._clean_sku_text(val)
+                        if not _looks_like_id_value(val_clean):
+                            continue
+                        if _value_matches_target(val):
+                            title, url = _extract_title_url()
+                            return rs_fs_sheet_sync.RsFsPreviewEntry(
+                                store=store,
+                                sku=sku,
+                                url=url,
+                                title=title,
+                                error="" if url else "no url in monitor embed",
+                                source=f"monitor:{ch_name}",
+                            )
+
                     # Fallback: raw text match anywhere in embed
                     blob = " ".join(
                         [
@@ -878,7 +979,7 @@ class RSForwarderBot:
                             sku=sku,
                             url=url,
                             title=title,
-                            error="",
+                            error="" if url else "no url in monitor embed",
                             source=f"monitor:{ch_name}",
                         )
         except Exception:
@@ -990,6 +1091,15 @@ class RSForwarderBot:
                 except Exception:
                     pass
                 return
+
+            # Don't try to parse user command messages (prevents noisy "parsed 0 items" when someone runs !rsfstest).
+            try:
+                if isinstance(getattr(message, "content", None), str):
+                    c0 = (message.content or "").strip()
+                    if c0.startswith("!"):
+                        return
+            except Exception:
+                pass
 
             # Always attempt parsing. Zephyr splits long lists into multiple embeds and
             # continuation chunks often omit the "Release Feed(s)" header.
@@ -1124,8 +1234,9 @@ class RSForwarderBot:
                             await out_ch.send("RS-FS: Stage 1/2 monitor lookup…", allowed_mentions=discord.AllowedMentions.none())
                         except Exception:
                             pass
+                    zephyr_guild = getattr(getattr(message, "channel", None), "guild", None)
                     for st, sk in chosen:
-                        found = await self._monitor_lookup_for_store(st, sk)
+                        found = await self._monitor_lookup_for_store(st, sk, guild=zephyr_guild)
                         if found:
                             monitor_hits.append(found)
                         else:
@@ -1942,6 +2053,81 @@ class RSForwarderBot:
                 await self._maybe_sync_rs_fs_sheet_from_message(shim)  # type: ignore[arg-type]
             except Exception as e:
                 await ctx.send(f"❌ RS-FS test failed: {str(e)[:200]}")
+
+        @self.bot.command(name="rsfstestsku", aliases=["fstestsku", "rsfssku"])
+        async def rsfs_test_sku(ctx, store: str = "", sku: str = ""):
+            """
+            Manual dry-run for ONE item (bypasses Zephyr list parsing):
+              !rsfstestsku gamestop 20023800
+            Posts output into the channel where you run the command.
+            """
+            st_in = (store or "").strip()
+            sk_in = (sku or "").strip()
+            if not (st_in and sk_in):
+                await ctx.send("❌ Usage: `!rsfstestsku <store> <sku>` (example: `!rsfstestsku gamestop 20023800`)")
+                return
+
+            # Ensure we output to the invoking channel for this test.
+            try:
+                self.config["rs_fs_sheet_test_output_enabled"] = True
+                self.config["rs_fs_sheet_dry_run"] = True
+                self.config["rs_fs_sheet_test_output_channel_id"] = str(getattr(ctx.channel, "id", "") or "")
+                self.config["rs_fs_sheet_test_limit"] = 1
+            except Exception:
+                pass
+
+            out_ch = ctx.channel
+            await ctx.send(f"✅ RS-FS dry-run for `{st_in}` / `{sk_in}`… (monitor lookup first, then website fallback)")
+
+            # Progress message
+            progress_msg = None
+            try:
+                progress_msg = await out_ch.send(
+                    f"RS-FS progress: {self._format_progress_bar(0, 1)} | errors: 0",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except Exception:
+                progress_msg = None
+
+            # Stage 1: monitor lookup
+            entry = None
+            try:
+                entry = await self._monitor_lookup_for_store(st_in, sk_in, guild=getattr(ctx, "guild", None))
+            except Exception:
+                entry = None
+
+            if entry is None:
+                # Stage 2: website fallback
+                try:
+                    if progress_msg:
+                        await progress_msg.edit(content=f"RS-FS progress: {self._format_progress_bar(0, 1)} | errors: 0 | stage: website")
+                except Exception:
+                    pass
+                try:
+                    web_entries = await rs_fs_sheet_sync.build_preview_entries([(st_in, sk_in)], self.config)
+                    entry = web_entries[0] if web_entries else None
+                except Exception as e:
+                    entry = rs_fs_sheet_sync.RsFsPreviewEntry(
+                        store=st_in,
+                        sku=sk_in,
+                        url=rs_fs_sheet_sync.build_store_link(st_in, sk_in),
+                        title="",
+                        error=str(e)[:200],
+                        source="website",
+                    )
+
+            if progress_msg:
+                try:
+                    err_count = 1 if (entry and (entry.error or "").strip()) else 0
+                    await progress_msg.edit(content=f"RS-FS progress: ✅ done 1/1 | errors: {err_count}")
+                except Exception:
+                    pass
+
+            if not entry:
+                await ctx.send("RS-FS: ❌ No result.")
+                return
+
+            await self._send_rs_fs_preview_embed(out_ch, [entry])
         
         @self.bot.command(name='rsremove', aliases=['remove'])
         async def remove_channel(ctx, source_channel: discord.TextChannel = None):

@@ -510,23 +510,22 @@ async def build_preview_entries(
             title = url or ""
         return RsFsPreviewEntry(store=st, sku=sk, url=url, title=title, error=err, source="website")
 
+    async def _one_indexed(i: int, st: str, sk: str) -> Tuple[int, RsFsPreviewEntry]:
+        return i, await _one(st, sk)
+
     total = len(unique)
     results: List[Optional[RsFsPreviewEntry]] = [None] * total
     errors = 0
 
     tasks: List[asyncio.Task] = []
-    task_to_idx: Dict[asyncio.Task, int] = {}
     for i, (st, sk) in enumerate(unique):
-        t = asyncio.create_task(_one(st, sk))
-        tasks.append(t)
-        task_to_idx[t] = i
+        tasks.append(asyncio.create_task(_one_indexed(i, st, sk)))
 
     done = 0
-    for t in asyncio.as_completed(tasks):
-        entry = await t
-        idx = task_to_idx.get(t, None)
-        if isinstance(idx, int) and 0 <= idx < total:
-            results[idx] = entry
+    for fut in asyncio.as_completed(tasks):
+        i, entry = await fut
+        if isinstance(i, int) and 0 <= i < total:
+            results[i] = entry
         done += 1
         if (entry.error or "").strip():
             errors += 1

@@ -30,6 +30,8 @@ from whop_api_client import WhopAPIClient
 from rschecker_utils import extract_discord_id_from_whop_member_record
 from rschecker_utils import access_roles_plain, coerce_role_ids, fmt_date_any, usd_amount
 from staff_embeds import build_case_minimal_embed, build_member_status_detailed_embed
+from whop_webhook_handler import _extract_email_from_embed as _extract_email_from_native_embed
+from whop_webhook_handler import _extract_discord_id_from_embed as _extract_discord_id_from_native_embed
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -1232,6 +1234,104 @@ async def _probe_raw(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _probe_resolve_discord(args: argparse.Namespace) -> int:
+    """Resolve Discord ID by scanning native whop-logs cards for an email."""
+    cfg = load_config()
+    token = str(cfg.get("bot_token") or "").strip()
+    if not token:
+        print("Missing bot_token in config.secrets.json")
+        return 2
+
+    try:
+        guild_id = int(str(getattr(args, "guild_id", "") or cfg.get("guild_id") or 0).strip())
+    except Exception:
+        guild_id = 0
+    if not guild_id:
+        print("Missing guild_id.")
+        return 2
+
+    inv = cfg.get("invite_tracking") if isinstance(cfg, dict) else {}
+    inv = inv if isinstance(inv, dict) else {}
+    try:
+        default_whop_logs = int(str(inv.get("whop_logs_channel_id") or 0).strip())
+    except Exception:
+        default_whop_logs = 0
+
+    try:
+        channel_id = int(str(getattr(args, "channel_id", "") or default_whop_logs or 0).strip())
+    except Exception:
+        channel_id = default_whop_logs
+    if not channel_id:
+        print("Missing whop-logs channel id (invite_tracking.whop_logs_channel_id).")
+        return 2
+
+    email_q = str(getattr(args, "email", "") or "").strip().lower()
+    if not email_q or "@" not in email_q:
+        print("Missing/invalid --email.")
+        return 2
+
+    hist_lim = int(getattr(args, "limit", 250) or 250)
+    hist_lim = max(10, min(hist_lim, 500))
+    show = int(getattr(args, "show", 3) or 3)
+    show = max(1, min(show, 25))
+
+    intents = discord.Intents.none()
+    intents.guilds = True
+    bot = discord.Client(intents=intents)
+
+    @bot.event
+    async def on_ready():
+        g = bot.get_guild(guild_id)
+        if g is None:
+            with suppress(Exception):
+                g = await bot.fetch_guild(guild_id)
+        ch = bot.get_channel(channel_id)
+        if ch is None:
+            with suppress(Exception):
+                ch = await bot.fetch_channel(channel_id)
+        if not isinstance(ch, discord.TextChannel):
+            print(f"channel not found or not text: {channel_id}")
+            with suppress(Exception):
+                await bot.close()
+            return
+
+        found = 0
+        scanned = 0
+        samples: list[str] = []
+        async for msg in ch.history(limit=hist_lim):
+            scanned += 1
+            e0 = msg.embeds[0] if msg.embeds else None
+            if not isinstance(e0, discord.Embed):
+                continue
+            em = str(_extract_email_from_native_embed(e0) or "").strip().lower()
+            if em and len(samples) < 10:
+                samples.append(em)
+            if not em or em != email_q:
+                continue
+            did = str(_extract_discord_id_from_native_embed(e0) or "").strip()
+            title0 = str(getattr(e0, "title", "") or "").strip()
+            print(f"match: email={em} did={did or '—'} title={title0 or '(no title)'} jump={str(getattr(msg,'jump_url','') or '')}")
+            found += 1
+            if found >= show:
+                break
+
+        if found <= 0:
+            print(f"no matches found in last {hist_lim} messages (scanned={scanned}).")
+            if samples:
+                print("sample extracted emails (up to 10):")
+                for s in samples:
+                    print(f"- {s}")
+            else:
+                print("note: no emails could be extracted from embeds in this window (parser mismatch or cards are not embeds).")
+
+        with suppress(Exception):
+            await bot.close()
+
+    async with bot:
+        await bot.start(token)
+    return 0
+
+
 def _looks_like_dispute(payment: dict) -> bool:
     if not isinstance(payment, dict):
         return False
@@ -1795,6 +1895,13 @@ def main() -> int:
     pr.add_argument("--param", action="append", default=[], help="Query param key=value (repeatable).")
     pr.add_argument("--out", default="", help="Optional output JSON file path.")
 
+    pres = sub.add_parser("resolve-discord", help="Scan whop-logs and resolve Discord ID by email.")
+    pres.add_argument("--email", required=True, help="Exact email address to match.")
+    pres.add_argument("--limit", type=int, default=250, help="How many recent whop-logs messages to scan.")
+    pres.add_argument("--show", type=int, default=3, help="How many matches to print.")
+    pres.add_argument("--guild-id", default="", help="Override guild id (defaults to config guild_id).")
+    pres.add_argument("--channel-id", default="", help="Override whop-logs channel id (defaults to invite_tracking.whop_logs_channel_id).")
+
     pa = sub.add_parser("alerts", help="Scan /payments and print dispute/resolution-like signals.")
     pa.add_argument("--max-pages", type=int, default=5)
     pa.add_argument("--first", type=int, default=100)
@@ -1846,6 +1953,8 @@ def main() -> int:
         return asyncio.run(_probe_canceling(args))
     if args.mode == "raw":
         return asyncio.run(_probe_raw(args))
+    if args.mode == "resolve-discord":
+        return asyncio.run(_probe_resolve_discord(args))
     if args.mode == "alerts":
         return asyncio.run(_probe_alerts(args))
     if args.mode == "compare-csv":

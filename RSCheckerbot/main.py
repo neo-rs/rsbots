@@ -39,6 +39,9 @@ BASE_DIR = Path(__file__).resolve().parent
 # Startup sequencing: ensure heavy scans finish before sync begins.
 _STARTUP_SCANS_DONE: asyncio.Event = asyncio.Event()
 
+# Email -> Discord ID cache (populated by parsing native whop-logs cards).
+WHOP_IDENTITY_CACHE_FILE = BASE_DIR / "whop_identity_cache.json"
+
 # -----------------------------
 # Progress formatting (Discord + terminal)
 # -----------------------------
@@ -3540,13 +3543,44 @@ async def _fetch_whop_brief_by_membership_id(membership_id: str) -> dict:
         except Exception:
             email_hint = ""
         if email_hint:
+            # 1) Fast path: local identity cache (no Discord API calls).
+            try:
+                email_n = str(email_hint).strip().lower()
+            except Exception:
+                email_n = ""
+            if email_n:
+                with suppress(Exception):
+                    db = load_json(WHOP_IDENTITY_CACHE_FILE)
+                    if isinstance(db, dict):
+                        rec = db.get(email_n) if isinstance(db.get(email_n), dict) else None
+                        did_s = str((rec or {}).get("discord_id") or "").strip() if isinstance(rec, dict) else ""
+                        if did_s.isdigit():
+                            brief["connected_discord"] = did_s
+                            return brief
+
             try:
                 lim = int(WHOP_API_CONFIG.get("logs_lookup_limit") or 50)
             except Exception:
                 lim = 50
             lim = max(10, min(lim, 250))
             with suppress(Exception):
-                g = bot.get_guild(int(GUILD_ID)) if int(GUILD_ID or 0) else None
+                # Prefer the guild that actually contains the configured whop-logs channel.
+                g: discord.Guild | None = None
+                for gid0 in (int(GUILD_ID or 0), int(OUTPUT_GUILD_ID or 0)):
+                    if not gid0:
+                        continue
+                    gg = bot.get_guild(int(gid0))
+                    if not isinstance(gg, discord.Guild):
+                        continue
+                    try:
+                        ch0 = gg.get_channel(int(WHOP_LOGS_CHANNEL_ID or 0)) if WHOP_LOGS_CHANNEL_ID else None
+                    except Exception:
+                        ch0 = None
+                    if isinstance(ch0, discord.TextChannel):
+                        g = gg
+                        break
+                if g is None:
+                    g = bot.get_guild(int(GUILD_ID)) if int(GUILD_ID or 0) else None
                 resolved = await _resolve_discord_id_from_whop_logs(
                     g,
                     email=email_hint,

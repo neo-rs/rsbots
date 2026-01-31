@@ -575,13 +575,34 @@ def _extract_discord_id_from_embed(embed: discord.Embed) -> str:
         fields_data, merged_kv = _extract_native_kv_from_embed(embed)
     except Exception:
         fields_data, merged_kv = ({}, {})
-    did = str(merged_kv.get("discord id") or merged_kv.get("discord_id") or "").strip()
+    did = str(
+        merged_kv.get("discord id")
+        or merged_kv.get("discord_id")
+        or merged_kv.get("discordid")
+        or merged_kv.get("discord user id")
+        or merged_kv.get("discord userid")
+        or ""
+    ).strip()
     if not did:
         did = str(fields_data.get("discord id") or "").strip()
     if did:
         did = re.sub(r"<@!?(\d+)>", r"\1", did).strip()
     m = re.search(r"(\d{17,19})", did or "")
-    return m.group(1) if m else ""
+    if m:
+        return m.group(1)
+
+    # Heuristic fallback: any KV whose key contains "discord" and whose value contains a snowflake.
+    try:
+        for k, v in (merged_kv or {}).items():
+            if "discord" not in str(k or "").lower():
+                continue
+            raw = re.sub(r"<@!?(\d+)>", r"\1", str(v or "")).strip()
+            m2 = re.search(r"(\d{17,19})", raw or "")
+            if m2:
+                return m2.group(1)
+    except Exception:
+        pass
+    return ""
 
 
 def _extract_email_from_embed(embed: discord.Embed) -> str:
@@ -589,8 +610,35 @@ def _extract_email_from_embed(embed: discord.Embed) -> str:
         _fields_data, merged_kv = _extract_native_kv_from_embed(embed)
     except Exception:
         merged_kv = {}
-    email = str(merged_kv.get("email") or "").strip()
-    return _norm_email(email) if email else ""
+    # Common explicit keys
+    for k in ("email", "email address", "customer email", "member email", "user email"):
+        email = str(merged_kv.get(k) or "").strip()
+        if "@" in email:
+            return _norm_email(email)
+
+    # Heuristic: any KV key containing "email"
+    try:
+        for k, v in (merged_kv or {}).items():
+            if "email" not in str(k or "").lower():
+                continue
+            email = str(v or "").strip()
+            if "@" in email:
+                return _norm_email(email)
+    except Exception:
+        pass
+
+    # Last resort: scan values for an email-like substring.
+    try:
+        for v in (merged_kv or {}).values():
+            s = str(v or "").strip()
+            if "@" not in s:
+                continue
+            m = re.search(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", s, flags=re.I)
+            if m:
+                return _norm_email(m.group(1))
+    except Exception:
+        pass
+    return ""
 
 
 def _extract_key_from_embed(embed: discord.Embed) -> str:
@@ -653,7 +701,8 @@ async def _resolve_discord_id_from_whop_logs(
         pass
 
     try:
-        async for m in ch.history(limit=int(max(10, min(75, int(limit))))):
+        # This scan is throttled + cached; allow a deeper window so older members still resolve.
+        async for m in ch.history(limit=int(max(10, min(250, int(limit))))):
             if not m.embeds:
                 continue
             e0 = m.embeds[0]
