@@ -186,8 +186,10 @@
     "events_poll_log_enabled": true,
     "events_poll_log_output_guild_id": 1451275225512546497,
     "_comment_events_poll_log": "Detection logs are sent to a dedicated channel in Neo for easier tracking (separate from smoketest).",
-    "events_poll_log_output_channel_id": 0,
+    "events_poll_log_output_channel_id": 1466959374865137696,
     "events_poll_log_output_channel_name": "whop-movement-logs",
+    "_comment_events_poll_log_webhook": "Optional: send movement logs via a Discord webhook URL (put in config.secrets.json).",
+    "events_poll_log_webhook_url": "",
     "_comment_events_poll_log_all": "If true, also log ANY membership update movement even if it doesn't map to a staff-card event type (can be noisy).",
     "events_poll_log_all_movements": true,
     "_comment_sync_summary": "Optional: mirror Whop sync summary into Neo Test Server.",
@@ -221,7 +223,11 @@
     "payment_issue_cases_startup_scan_enabled": true,
     "payment_issue_cases_startup_scan_max_pages": 3,
     "payment_issue_cases_startup_scan_per_page": 50,
-    "payment_issue_cases_startup_scan_max_cases": 25
+    "payment_issue_cases_startup_scan_max_cases": 25,
+    "_comment_webhook_receiver": "Whop Developer Webhooks (real-time). Set whop_api.webhook_secret in config.secrets.json and keep webhook_verify=true in production.",
+    "webhook_verify": true,
+    "webhook_tolerance_seconds": 300,
+    "webhook_secret": ""
   }
 }
 

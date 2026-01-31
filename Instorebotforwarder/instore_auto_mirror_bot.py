@@ -524,7 +524,6 @@ class InstorebotForwarder:
 
         # Prefer common strike-through/list-price DOM fragments.
         for pat in (
-            r'a-text-price[^>]*>\s*<span[^>]*>\s*([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)',
             r'\bList Price\b[^$£€]{0,80}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)',
             r'\bWas\b[^$£€]{0,80}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)',
             r'\bMSRP\b[^$£€]{0,80}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)',
@@ -536,7 +535,8 @@ class InstorebotForwarder:
                 if cand:
                     return cand
 
-        # Fallback: pick the highest currency amount that differs from current.
+        # Only do the "highest currency" fallback when we *also* know a current price.
+        # Otherwise we risk picking per-unit prices like "$0.21/oz" as a fake "Before".
         cur_norm = self._normalize_price_str(current_price)
         cur_val: Optional[float] = None
         if cur_norm:
@@ -546,6 +546,8 @@ class InstorebotForwarder:
                     cur_val = float(mcur.group(2))
                 except Exception:
                     cur_val = None
+        if cur_val is None:
+            return ""
 
         vals: List[Tuple[float, str]] = []
         for m in re.finditer(r"(?<!\w)([$£€])\s?(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)(?!\w)", t):
@@ -561,7 +563,7 @@ class InstorebotForwarder:
             return ""
         vals.sort(key=lambda x: x[0], reverse=True)
         for val, raw in vals:
-            if cur_val is not None and val <= cur_val:
+            if val <= cur_val:
                 continue
             cand = self._normalize_price_str(raw)
             if cand and cand != cur_norm:
@@ -582,7 +584,20 @@ class InstorebotForwarder:
         t = html_txt or ""
         if not t:
             return []
-        low = t.lower()
+
+        # Reduce false positives by focusing on the main price area when possible.
+        low_all = t.lower()
+        focus = t
+        try:
+            mpos = re.search(r"(corepricedisplay_desktop_feature_div|apexpricetopay|pricetopay)", low_all)
+            if mpos:
+                start = max(0, mpos.start() - 2000)
+                end = min(len(t), mpos.start() + 9000)
+                focus = t[start:end]
+        except Exception:
+            focus = t
+
+        low = focus.lower()
         notes: List[str] = []
 
         # Limited time deal / deal badges
@@ -594,7 +609,7 @@ class InstorebotForwarder:
         # Subscribe & Save signals
         if "subscribe & save" in low or "subscribe and save" in low:
             # Try to grab a nearby percent if present.
-            mss = re.search(r"(subscribe\s*(?:&|and)\s*save)[^%]{0,40}(\d{1,2})\s*%", t, re.IGNORECASE)
+            mss = re.search(r"(subscribe\s*(?:&|and)\s*save)[^%]{0,40}(\d{1,2})\s*%", focus, re.IGNORECASE)
             if mss:
                 notes.append(f"Subscribe & Save {mss.group(2)}%")
             else:
@@ -603,8 +618,8 @@ class InstorebotForwarder:
         # Coupon signals (clip coupon, save $ / save %)
         if ("clip coupon" in low) or ("coupon" in low and "clip" in low):
             # Try to capture "Save $X" or "Save X%" near coupon wording.
-            mc1 = re.search(r"(clip\s+coupon)[^$£€%]{0,60}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", t, re.IGNORECASE)
-            mc2 = re.search(r"(clip\s+coupon)[^%]{0,60}(\d{1,2})\s*%", t, re.IGNORECASE)
+            mc1 = re.search(r"(clip\s+coupon)[^$£€%]{0,60}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", focus, re.IGNORECASE)
+            mc2 = re.search(r"(clip\s+coupon)[^%]{0,60}(\d{1,2})\s*%", focus, re.IGNORECASE)
             if mc1:
                 notes.append(f"Coupon: save {self._normalize_price_str(mc1.group(2) or '')}")
             elif mc2:
@@ -613,7 +628,7 @@ class InstorebotForwarder:
                 notes.append("Coupon available")
         else:
             # Sometimes coupon is present as JSON-ish fields.
-            mcj = re.search(r"coupon[^\\n]{0,120}(save|off)[^\\n]{0,60}(\d{1,2})\s*%", t, re.IGNORECASE)
+            mcj = re.search(r"coupon[^\\n]{0,120}(save|off)[^\\n]{0,60}(\d{1,2})\s*%", focus, re.IGNORECASE)
             if mcj:
                 notes.append(f"Coupon: save {mcj.group(2)}%")
 
@@ -1328,6 +1343,7 @@ class InstorebotForwarder:
             "price": str(data.get("price") or ""),
             "before_price": str(data.get("before_price") or ""),
             "discount_notes": str(data.get("discount_notes") or ""),
+            "department": str(data.get("department") or ""),
         }
         self._amazon_scrape_cache_ts[a] = time.time()
 
@@ -1520,6 +1536,7 @@ class InstorebotForwarder:
             image_url = self._extract_amazon_image_from_html(html_txt)
             before_price = self._extract_amazon_before_price_from_html(html_txt)
             discount_notes = self._extract_amazon_discount_notes_from_html(html_txt)
+            dept = self._extract_amazon_department_from_html(html_txt)
 
             out = {
                 "title": title.strip(),
@@ -1527,6 +1544,7 @@ class InstorebotForwarder:
                 "price": "",
                 "before_price": before_price.strip(),
                 "discount_notes": "; ".join([n for n in (discount_notes or []) if n]).strip(),
+                "department": (dept or "").strip(),
             }
             if not (out.get("title") or out.get("image_url")):
                 return None, "no useful fields found"
@@ -1596,7 +1614,7 @@ class InstorebotForwarder:
             if ogi and self._is_amazon_image_url(ogi):
                 image_url = ogi.strip()
 
-        out = {"title": title.strip(), "image_url": image_url.strip(), "price": "", "before_price": ""}
+        out = {"title": title.strip(), "image_url": image_url.strip(), "price": "", "before_price": "", "discount_notes": "", "department": ""}
         if not (out.get("title") or out.get("image_url")):
             return None, "no useful fields found"
         return out, None
@@ -1645,6 +1663,77 @@ class InstorebotForwarder:
         m2 = re.search(rf'<meta[^>]+name=["\']{re.escape(prop)}["\'][^>]+content=["\']([^"\']+)["\']', t, re.IGNORECASE)
         if m2:
             return _html.unescape((m2.group(1) or "").strip())
+        return ""
+
+    def _extract_amazon_department_from_html(self, html_txt: str) -> str:
+        """
+        Best-effort "department" (category) hint from an Amazon product page.
+        Examples:
+        - "Grocery & Gourmet Food"
+        - "Health & Household"
+
+        Used for routing (e.g. grocery) when message text doesn't include keywords.
+        """
+        t = html_txt or ""
+        if not t:
+            return ""
+
+        # 1) Title/og:title often ends with ": <Department>"
+        candidates: List[str] = []
+        try:
+            og = self._extract_html_meta(t, prop="og:title")
+            if og:
+                candidates.append(og)
+        except Exception:
+            pass
+        try:
+            m_t = re.search(r"<title>(.*?)</title>", t, re.IGNORECASE | re.DOTALL)
+            if m_t:
+                cand = _html.unescape(re.sub(r"<[^>]+>", " ", (m_t.group(1) or "")))
+                cand = " ".join(cand.split()).strip()
+                if cand:
+                    candidates.append(cand)
+        except Exception:
+            pass
+
+        for c in candidates:
+            if not c:
+                continue
+            parts = [p.strip() for p in c.split(":") if p.strip()]
+            if not parts:
+                continue
+            last = parts[-1]
+            low_last = last.lower()
+            if "amazon" in low_last or "sign in" in low_last:
+                continue
+            if 3 <= len(last) <= 60:
+                return last
+
+        # 2) Breadcrumbs: wayfinding-breadcrumbs_container
+        try:
+            m = re.search(r'wayfinding-breadcrumbs_container(.{0,5000})</div>', t, re.IGNORECASE | re.DOTALL)
+            snippet = m.group(0) if m else ""
+            if snippet:
+                crumbs: List[str] = []
+                for mm in re.finditer(r"<a[^>]*>([^<]{1,80})</a>", snippet, re.IGNORECASE):
+                    txt = _html.unescape((mm.group(1) or "").strip())
+                    txt = " ".join(txt.split()).strip()
+                    if not txt:
+                        continue
+                    low = txt.lower()
+                    if low in {"back", "see all", "details"}:
+                        continue
+                    if "amazon" in low:
+                        continue
+                    crumbs.append(txt)
+                if crumbs:
+                    # Prefer the last crumb that looks like a department label.
+                    for cand in reversed(crumbs):
+                        if 3 <= len(cand) <= 60:
+                            return cand
+        except Exception:
+            pass
+
         return ""
 
     def _extract_jsonld_product(self, html: str) -> Dict[str, Any]:
@@ -1758,7 +1847,7 @@ class InstorebotForwarder:
             if asin_guess:
                 img, img_err = await self._adsystem_image_by_asin(asin_guess)
                 if img and not img_err:
-                    data = {"title": "", "image_url": img, "price": "", "before_price": ""}
+                    data = {"title": "", "image_url": img, "price": "", "before_price": "", "discount_notes": "", "department": ""}
                     self._scrape_cache_put(asin_guess, data)
                     return data, None
             # Even when Playwright fails, preserve the clearer reason if we have one.
@@ -1771,6 +1860,7 @@ class InstorebotForwarder:
         price = ""
         before_price = ""
         discount_notes: List[str] = []
+        department = ""
         # JSON-LD offers.price is the cleanest when present
         prod = self._extract_jsonld_product(html_txt)
         if prod:
@@ -1851,14 +1941,24 @@ class InstorebotForwarder:
                         image_url = urls[0]
 
         # Fallback price patterns (very best-effort)
+        # Prefer extracting from the core price display area to avoid per-unit prices.
+        if not price:
+            for pat in (
+                r"apexPriceToPay[^>]*>[\s\S]{0,2000}a-offscreen\">([^<]{1,24})<",
+                r"priceToPay[^>]*>[\s\S]{0,2000}a-offscreen\">([^<]{1,24})<",
+                r"corePriceDisplay_desktop_feature_div[\s\S]{0,6000}a-offscreen\">([^<]{1,24})<",
+                r"(?:priceblock_ourprice|priceblock_dealprice|priceblock_saleprice)[\s\S]{0,300}a-offscreen\">([^<]{1,24})<",
+            ):
+                m0 = re.search(pat, html_txt, re.IGNORECASE)
+                if m0:
+                    cand0 = self._normalize_price_str(m0.group(1) or "")
+                    if cand0:
+                        price = cand0
+                        break
         if not price:
             m = re.search(r'["\']price["\']\s*:\s*["\'](\$?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)["\']', html_txt, re.IGNORECASE)
             if m:
                 price = (m.group(1) or "").strip()
-        if not price:
-            m2 = re.search(r'(?<!\w)(\$)\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?', html_txt)
-            if m2:
-                price = (m2.group(0) or "").strip()
 
         # Best-effort before/list price (strike-through, list price labels, etc).
         before_price = self._extract_amazon_before_price_from_html(html_txt, current_price=price)
@@ -1868,6 +1968,12 @@ class InstorebotForwarder:
             discount_notes = self._extract_amazon_discount_notes_from_html(html_txt)
         except Exception:
             discount_notes = []
+
+        # Best-effort department/category hint (e.g. Grocery & Gourmet Food).
+        try:
+            department = self._extract_amazon_department_from_html(html_txt)
+        except Exception:
+            department = ""
 
         # If we still have no image, try adsystem image by ASIN (works even when the HTML is sparse).
         if (not image_url) and asin_guess:
@@ -1884,6 +1990,7 @@ class InstorebotForwarder:
             "price": " ".join((price or "").split()).strip(),
             "before_price": " ".join((before_price or "").split()).strip(),
             "discount_notes": "; ".join([n for n in (discount_notes or []) if n]).strip(),
+            "department": (department or "").strip(),
         }
         # Ensure at least one field is useful
         if not (out.get("title") or out.get("image_url") or out.get("price")):
@@ -2361,7 +2468,7 @@ class InstorebotForwarder:
         category = guessed.get("category", "").strip()
         if not category:
             try:
-                combined = f"{guessed.get('title','')}\n{raw_title}\n{final_url}"
+                combined = f"{guessed.get('title','')}\n{raw_title}\n{(scraped or {}).get('department','')}\n{final_url}"
             except Exception:
                 combined = ""
             kws = (self.config or {}).get("amazon_grocery_keywords") or []

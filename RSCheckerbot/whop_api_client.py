@@ -309,6 +309,66 @@ class WhopAPIClient:
         """
         if not member_id:
             return None
+
+    async def get_payment_by_id(self, payment_id: str) -> Optional[Dict]:
+        """Get a payment by ID (pay_...)."""
+        pid = str(payment_id or "").strip()
+        if not pid:
+            return None
+        try:
+            response = await self._request("GET", f"/payments/{pid}")
+            return response.get("data") if isinstance(response, dict) and "data" in response else response
+        except WhopAPIError as e:
+            log.warning(f"Failed to get payment {pid}: {e}")
+            return None
+
+    async def get_refund_by_id(self, refund_id: str) -> Optional[Dict]:
+        """Get a refund by ID (rfnd_...)."""
+        rid = str(refund_id or "").strip()
+        if not rid:
+            return None
+        try:
+            response = await self._request("GET", f"/refunds/{rid}")
+            return response.get("data") if isinstance(response, dict) and "data" in response else response
+        except WhopAPIError as e:
+            log.warning(f"Failed to get refund {rid}: {e}")
+            return None
+
+    async def get_dispute_by_id(self, dispute_id: str) -> Optional[Dict]:
+        """Get a dispute by ID (dspt_...)."""
+        did = str(dispute_id or "").strip()
+        if not did:
+            return None
+        try:
+            response = await self._request("GET", f"/disputes/{did}")
+            return response.get("data") if isinstance(response, dict) and "data" in response else response
+        except WhopAPIError as e:
+            log.warning(f"Failed to get dispute {did}: {e}")
+            return None
+
+    async def get_invoice_by_id(self, invoice_id: str) -> Optional[Dict]:
+        """Get an invoice by ID (inv_...)."""
+        iid = str(invoice_id or "").strip()
+        if not iid:
+            return None
+        try:
+            response = await self._request("GET", f"/invoices/{iid}")
+            return response.get("data") if isinstance(response, dict) and "data" in response else response
+        except WhopAPIError as e:
+            log.warning(f"Failed to get invoice {iid}: {e}")
+            return None
+
+    async def get_setup_intent_by_id(self, setup_intent_id: str) -> Optional[Dict]:
+        """Get a setup intent by ID (sint_...)."""
+        sid = str(setup_intent_id or "").strip()
+        if not sid:
+            return None
+        try:
+            response = await self._request("GET", f"/setup_intents/{sid}")
+            return response.get("data") if isinstance(response, dict) and "data" in response else response
+        except WhopAPIError as e:
+            log.warning(f"Failed to get setup_intent {sid}: {e}")
+            return None
         try:
             response = await self._request("GET", f"/members/{member_id}")
             # /members/{id} returns a direct object (not wrapped)

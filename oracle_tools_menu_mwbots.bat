@@ -123,7 +123,7 @@ goto menu
 
 :set_server_name
 echo.
-set /p SERVER_NAME=Enter SERVER_NAME (exact match in oraclekeys\servers.json, blank for default): 
+set /p SERVER_NAME=Enter SERVER_NAME (exact match in oracleserverkeys\servers.json, blank for default): 
 goto menu
 
 :do_mw_download

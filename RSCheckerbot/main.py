@@ -12,6 +12,9 @@ import logging
 from typing import Dict, Optional
 from contextlib import suppress
 from collections import deque
+
+# Logger must exist early (used by early config/webhook wiring).
+log = logging.getLogger("rs-checker")
 try:
     import fcntl  # type: ignore
 except Exception:  # pragma: no cover
@@ -2632,6 +2635,23 @@ try:
     WHOP_WEBHOOK_TOLERANCE_SECONDS = int(WHOP_API_CONFIG.get("webhook_tolerance_seconds") or 300)
 except Exception:
     WHOP_WEBHOOK_TOLERANCE_SECONDS = 300
+
+# Support env-configured secret (systemd Environment=WHOP_WEBHOOK_SECRET=...),
+# while still allowing config.secrets.json to be the primary source of truth.
+if not WHOP_WEBHOOK_SECRET:
+    WHOP_WEBHOOK_SECRET = str(os.getenv("WHOP_WEBHOOK_SECRET", "") or "").strip()
+
+# Safety: don't silently reject every webhook due to missing secret.
+# If you want verification ON (recommended), set whop_api.webhook_secret in config.secrets.json.
+if WHOP_WEBHOOK_VERIFY and not WHOP_WEBHOOK_SECRET:
+    log.warning("[WhopWebhook] webhook_verify enabled but webhook_secret is empty; DISABLING verification until configured")
+    WHOP_WEBHOOK_VERIFY = False
+log.info(
+    "[WhopWebhook] verify=%s tolerance_s=%s secret_configured=%s",
+    ("on" if WHOP_WEBHOOK_VERIFY else "off"),
+    str(WHOP_WEBHOOK_TOLERANCE_SECONDS),
+    ("yes" if bool(WHOP_WEBHOOK_SECRET) else "no"),
+)
 WHOP_EVENTS_FILE = BASE_DIR / "whop_events.jsonl"
 WHOP_EVENTS_ENABLED = bool(WHOP_API_CONFIG.get("event_ledger_enabled", True))
 try:
@@ -2702,6 +2722,10 @@ try:
     WHOP_EVENTS_POLL_LOG_ALL_MOVEMENTS = bool(WHOP_API_CONFIG.get("events_poll_log_all_movements", False))
 except Exception:
     WHOP_EVENTS_POLL_LOG_ALL_MOVEMENTS = False
+try:
+    WHOP_EVENTS_POLL_LOG_WEBHOOK_URL = str(WHOP_API_CONFIG.get("events_poll_log_webhook_url") or "").strip()
+except Exception:
+    WHOP_EVENTS_POLL_LOG_WEBHOOK_URL = ""
 
 # Dispute / resolution per-case channels (main guild only).
 try:
@@ -2969,7 +2993,6 @@ messages_data = load_messages()
 # Logging
 # -----------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("rs-checker")
 
 # -----------------------------
 # Discord client
@@ -3694,7 +3717,20 @@ def record_member_whop_summary(
         rec = _ensure_member_history_shape(rec, now=now)
         wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
         if isinstance(summary, dict) and summary:
-            wh["last_summary"] = summary
+            # Ensure we never persist PII like email/name into member_history.json.
+            safe = dict(summary)
+            for k in (
+                "email",
+                "user_name",
+                "name",
+                "username",
+                "whop_user_id",
+                "whop_member_id",
+                "manage_url",
+            ):
+                with suppress(Exception):
+                    safe.pop(k, None)
+            wh["last_summary"] = safe
             st = str(summary.get("status") or "").strip().lower()
             if st:
                 wh["last_status"] = st
@@ -4530,6 +4566,610 @@ async def handle_create_invite(request):
         log.error(f"Error handling invite request: {e}")
         return web.json_response({"error": str(e)}, status=500)
 
+
+def _deep_get(obj: object, path: str) -> object:
+    """Best-effort nested dict access using dot paths."""
+    cur = obj
+    for part in str(path or "").split("."):
+        if not part:
+            continue
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        else:
+            return None
+    return cur
+
+
+def _first_str(*vals: object) -> str:
+    for v in vals:
+        s = str(v or "").strip()
+        if s and s != "—":
+            return s
+    return ""
+
+
+def _first_prefixed(prefix: str, *vals: object) -> str:
+    p = str(prefix or "").strip()
+    if not p:
+        return ""
+    for v in vals:
+        s = str(v or "").strip()
+        if s and s.startswith(p):
+            return s
+    return ""
+
+
+def _whop_std_event_type(payload: dict) -> str:
+    # Whop webhooks commonly use `type` with a dotted name (e.g. "payment.created").
+    return _first_str(
+        payload.get("type"),
+        payload.get("event_type"),
+        payload.get("event"),
+        _deep_get(payload, "data.type"),
+        _deep_get(payload, "data.event_type"),
+    ).lower()
+
+
+def _whop_std_membership_id(payload: dict) -> str:
+    # Try common shapes for membership id under `data`.
+    cand = _first_str(
+        payload.get("membership_id"),
+        _deep_get(payload, "membership.id"),
+        _deep_get(payload, "membership_id"),
+        _deep_get(payload, "data.membership_id"),
+        _deep_get(payload, "data.membership.id"),
+        _deep_get(payload, "data.membership"),
+        _deep_get(payload, "data.object.membership_id"),
+        _deep_get(payload, "data.object.membership.id"),
+        _deep_get(payload, "data.object.membership"),
+        _deep_get(payload, "data.payment.membership_id"),
+        _deep_get(payload, "data.payment.membership.id"),
+        _deep_get(payload, "data.payment.membership"),
+        _deep_get(payload, "data.data.membership_id"),
+        _deep_get(payload, "data.data.membership.id"),
+        _deep_get(payload, "data.data.membership"),
+    )
+    if cand:
+        return str(cand).strip()
+
+    # Fallback: scan payload for a mem_... token anywhere.
+    try:
+        def _walk(obj: object) -> str:
+            if isinstance(obj, dict):
+                for _k, v in obj.items():
+                    out = _walk(v)
+                    if out:
+                        return out
+            elif isinstance(obj, list):
+                for it in obj:
+                    out = _walk(it)
+                    if out:
+                        return out
+            else:
+                s = str(obj or "").strip()
+                if s and "mem_" in s:
+                    m = re.search(r"\b(mem_[A-Za-z0-9]+)\b", s)
+                    if m:
+                        return m.group(1)
+            return ""
+
+        return _walk(payload)
+    except Exception:
+        return ""
+
+
+def _whop_std_payment_id(payload: dict) -> str:
+    # Whop: payment.* events use data.id = pay_...
+    return _first_prefixed(
+        "pay_",
+        _deep_get(payload, "data.payment.id"),
+        _deep_get(payload, "payment.id"),
+        payload.get("payment_id"),
+        _deep_get(payload, "data.id"),
+        _deep_get(payload, "data.payment.id"),
+        _deep_get(payload, "payment.id"),
+        payload.get("payment_id"),
+    )
+
+
+def _whop_std_refund_id(payload: dict) -> str:
+    return _first_prefixed(
+        "rfnd_",
+        _deep_get(payload, "data.id"),
+        _deep_get(payload, "data.refund.id"),
+        _deep_get(payload, "refund.id"),
+        payload.get("refund_id"),
+    )
+
+
+def _whop_std_dispute_id(payload: dict) -> str:
+    return _first_prefixed(
+        "dspt_",
+        _deep_get(payload, "data.id"),
+        _deep_get(payload, "data.dispute.id"),
+        _deep_get(payload, "dispute.id"),
+        payload.get("dispute_id"),
+    )
+
+
+def _whop_std_user_id(payload: dict) -> str:
+    return _first_prefixed(
+        "user_",
+        _deep_get(payload, "data.user.id"),
+        _deep_get(payload, "data.user"),
+        _deep_get(payload, "user.id"),
+        _deep_get(payload, "user"),
+        payload.get("user_id"),
+    )
+
+
+def _whop_std_member_id(payload: dict) -> str:
+    # Whop: setup_intent.* includes data.member.id = mber_...
+    return _first_prefixed(
+        "mber_",
+        _deep_get(payload, "data.member.id"),
+        _deep_get(payload, "data.member"),
+        payload.get("member_id"),
+    )
+
+
+def _pick_best_membership_id_for_user(memberships: list[dict]) -> str:
+    """Pick the most relevant membership id from a Whop user memberships list."""
+    if not isinstance(memberships, list) or not memberships:
+        return ""
+    pri = {
+        "active": 0,
+        "trialing": 1,
+        "past_due": 2,
+        "unpaid": 2,
+        "canceling": 3,
+        "canceled": 4,
+        "cancelled": 4,
+        "completed": 4,
+        "expired": 5,
+        "ended": 5,
+        "drafted": 9,
+    }
+
+    def _score(m: dict) -> tuple[int, str]:
+        st = str(m.get("status") or "").strip().lower()
+        p = pri.get(st, 8)
+        ts = str(m.get("updated_at") or m.get("created_at") or "").strip()
+        return (p, ts)
+
+    best: dict | None = None
+    for m in memberships:
+        if not isinstance(m, dict):
+            continue
+        mid = str(m.get("id") or m.get("membership_id") or "").strip()
+        if not mid.startswith("mem_"):
+            continue
+        if best is None:
+            best = m
+            continue
+        try:
+            # Prefer lower priority, then later timestamp.
+            if _score(m)[0] < _score(best)[0]:
+                best = m
+            elif _score(m)[0] == _score(best)[0] and _score(m)[1] > _score(best)[1]:
+                best = m
+        except Exception:
+            best = m
+    if not isinstance(best, dict):
+        return ""
+    return str(best.get("id") or best.get("membership_id") or "").strip()
+
+
+def _normalize_whop_std_event_type(evt: str) -> str:
+    """Normalize Whop webhook `type` to the canonical dot format used in docs.
+
+    Whop docs/examples use dot-separated types (e.g. `invoice.created`), while the UI
+    can display underscore variants (e.g. `invoice_created`). To avoid missed routing
+    when Whop delivers underscore-style types, normalize known variants here.
+    """
+    e = str(evt or "").strip().lower()
+    if not e:
+        return ""
+    if "." in e:
+        return e
+    if "_" not in e:
+        return e
+    mapping = {
+        # Payments
+        "payment_created": "payment.created",
+        "payment_succeeded": "payment.succeeded",
+        "payment_failed": "payment.failed",
+        "payment_pending": "payment.pending",
+        # Refunds / disputes
+        "refund_created": "refund.created",
+        "refund_updated": "refund.updated",
+        "dispute_created": "dispute.created",
+        "dispute_updated": "dispute.updated",
+        # Setup intents
+        "setup_intent_requires_action": "setup_intent.requires_action",
+        "setup_intent_succeeded": "setup_intent.succeeded",
+        "setup_intent_canceled": "setup_intent.canceled",
+        # Invoices
+        "invoice_created": "invoice.created",
+        "invoice_paid": "invoice.paid",
+        "invoice_past_due": "invoice.past_due",
+        "invoice_voided": "invoice.voided",
+        # Withdrawals / payout methods / verification
+        "withdrawal_created": "withdrawal.created",
+        "withdrawal_updated": "withdrawal.updated",
+        "payout_method_created": "payout_method.created",
+        "payoutmethod_created": "payout_method.created",
+        "verification_succeeded": "verification.succeeded",
+        # Memberships
+        "membership_activated": "membership.activated",
+        "membership_deactivated": "membership.deactivated",
+        "membership_cancel_at_period_end_changed": "membership.cancel_at_period_end_changed",
+        # Entries / courses
+        "entry_created": "entry.created",
+        "entry_approved": "entry.approved",
+        "entry_denied": "entry.denied",
+        "entry_deleted": "entry.deleted",
+        "course_lesson_interaction_completed": "course_lesson_interaction.completed",
+        "courselessoninteraction_completed": "course_lesson_interaction.completed",
+    }
+    return mapping.get(e, e)
+
+
+async def _resolve_membership_id_for_std_webhook(evt: str, payload: dict) -> tuple[str, dict]:
+    """Resolve membership_id for webhook types that don't include `membership` directly."""
+    mid = _whop_std_membership_id(payload)
+    ctx: dict = {
+        "payment_id": "",
+        "refund_id": "",
+        "dispute_id": "",
+        "user_id": "",
+        "member_id": "",
+    }
+    if mid:
+        return (mid, ctx)
+    evt_l = _normalize_whop_std_event_type(evt)
+    ctx["payment_id"] = str(_whop_std_payment_id(payload) or "").strip()
+    ctx["refund_id"] = str(_whop_std_refund_id(payload) or "").strip() if evt_l.startswith("refund.") else ""
+    ctx["dispute_id"] = str(_whop_std_dispute_id(payload) or "").strip() if evt_l.startswith("dispute.") else ""
+    ctx["user_id"] = str(_whop_std_user_id(payload) or "").strip()
+    ctx["member_id"] = str(_whop_std_member_id(payload) or "").strip() if evt_l.startswith("setup_intent.") else ""
+
+    # 1) payment/refund/dispute: resolve via payment.id
+    pay_obj: dict | None = None
+    pay_id = str(ctx.get("payment_id") or "").strip()
+    if evt_l.startswith("refund.") and not pay_id:
+        pay_id = _first_prefixed("pay_", _deep_get(payload, "data.payment.id"), _deep_get(payload, "data.payment"))
+        ctx["payment_id"] = str(pay_id or "").strip()
+    if evt_l.startswith("dispute.") and not pay_id:
+        pay_id = _first_prefixed("pay_", _deep_get(payload, "data.payment.id"), _deep_get(payload, "data.payment"))
+        ctx["payment_id"] = str(pay_id or "").strip()
+        if not pay_id:
+            # dispute.updated often omits payment; fetch dispute to find payment id.
+            dspt = str(ctx.get("dispute_id") or "").strip()
+            if dspt and hasattr(whop_api_client, "get_dispute_by_id"):
+                with suppress(Exception):
+                    ds = await whop_api_client.get_dispute_by_id(dspt)  # type: ignore[attr-defined]
+                    if isinstance(ds, dict):
+                        pay_id = _first_prefixed("pay_", ds.get("payment_id"), _deep_get(ds, "payment.id"), _deep_get(ds, "payment"))
+                        if pay_id:
+                            ctx["payment_id"] = str(pay_id).strip()
+
+    if pay_id and hasattr(whop_api_client, "get_payment_by_id"):
+        with suppress(Exception):
+            pay_obj = await whop_api_client.get_payment_by_id(str(pay_id))  # type: ignore[attr-defined]
+    if isinstance(pay_obj, dict) and pay_obj:
+        mid = _first_str(
+            pay_obj.get("membership_id"),
+            _deep_get(pay_obj, "membership.id"),
+            _deep_get(pay_obj, "membership"),
+        )
+        if mid and str(mid).strip().startswith("mem_"):
+            return (str(mid).strip(), ctx)
+
+    # 2) setup_intent: resolve member -> user -> memberships -> best membership
+    if evt_l.startswith("setup_intent.") and str(ctx.get("member_id") or "").strip().startswith("mber_"):
+        mber_id = str(ctx.get("member_id") or "").strip()
+        if hasattr(whop_api_client, "get_member_by_id"):
+            with suppress(Exception):
+                mber = await whop_api_client.get_member_by_id(mber_id)
+                if isinstance(mber, dict):
+                    uid = _first_prefixed("user_", mber.get("user_id"), _deep_get(mber, "user.id"), _deep_get(mber, "user"))
+                    if uid:
+                        ctx["user_id"] = str(uid).strip()
+
+    # 3) user-centric events (entries / course): resolve via user.id -> memberships
+    uid = str(ctx.get("user_id") or "").strip()
+    if uid.startswith("user_"):
+        with suppress(Exception):
+            candidates = await whop_api_client.get_user_memberships(uid)
+            best_mid = _pick_best_membership_id_for_user(candidates or [])
+            if best_mid:
+                return (best_mid, ctx)
+
+    return ("", ctx)
+
+
+async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> None:
+    """Process Whop standard webhooks (real-time) into staff cards + movement logs."""
+    if not isinstance(payload, dict) or not payload:
+        return
+    if not whop_api_client or not bot.is_ready():
+        return
+
+    evt = _normalize_whop_std_event_type(_whop_std_event_type(payload))
+    wh_id = str((headers or {}).get("webhook-id") or payload.get("id") or "").strip()
+    mid = _whop_std_membership_id(payload)
+    if not mid:
+        mid, ctx = await _resolve_membership_id_for_std_webhook(evt, payload)
+        if mid:
+            with suppress(Exception):
+                await _whop_api_events_log(
+                    f"[Whop Webhook] resolved mid={mid} type={evt or '—'} pay={str(ctx.get('payment_id') or '—')} dspt={str(ctx.get('dispute_id') or '—')}"
+                )
+
+    # Always log receipt (movement logs in Neo).
+    with suppress(Exception):
+        # Keep it intentionally simple for easy scanning.
+        await _whop_api_events_log(f"[Whop Webhook] detected type={evt or '—'} mid={mid or '—'} id={wh_id or '—'}")
+
+    # Many webhook types (withdrawals, payout methods, invoices, etc.) have no membership context.
+    # We still log them above; staff-card output only happens when we can resolve a membership.
+    if not mid:
+        return
+
+    now = datetime.now(timezone.utc)
+    guild = bot.get_guild(GUILD_ID) if GUILD_ID else None
+    if not isinstance(guild, discord.Guild):
+        return
+
+    async with _WHOP_API_EVENTS_LOCK:
+        state = _load_whop_api_events_state()
+        memberships = state.get("memberships") if isinstance(state.get("memberships"), dict) else {}
+        sent = state.get("sent") if isinstance(state.get("sent"), dict) else {}
+        cases = state.get("cases") if isinstance(state.get("cases"), dict) else {}
+        if not isinstance(memberships, dict):
+            memberships = {}
+        if not isinstance(sent, dict):
+            sent = {}
+        if not isinstance(cases, dict):
+            cases = {}
+
+        # Dedupe: webhook deliveries are unique by webhook-id.
+        if wh_id:
+            dkey = f"whop_webhook:{wh_id}"
+            if dkey in sent:
+                return
+            sent[dkey] = now.isoformat().replace("+00:00", "Z")
+
+        # Fetch authoritative state via API (builds connected Discord + totals + dashboard).
+        brief = await fetch_whop_brief(whop_api_client, mid, enable_enrichment=True)
+        if not isinstance(brief, dict) or not brief:
+            return
+
+        mid2 = str(brief.get("membership_id") or mid).strip() or mid
+        renewal_end_iso = str(brief.get("renewal_end_iso") or "").strip()
+        cur = {
+            "status": str(brief.get("status") or "").strip().lower(),
+            "cancel_at_period_end": (str(brief.get("cancel_at_period_end") or "").strip().lower() == "yes"),
+            "renewal_period_end": _first_str(
+                _deep_get(payload, "data.renewal_period_end"),
+                _deep_get(payload, "data.membership.renewal_period_end"),
+                renewal_end_iso,
+            ),
+            "updated_at": now.isoformat().replace("+00:00", "Z"),
+        }
+        prev = memberships.get(mid2) if isinstance(memberships.get(mid2), dict) else None
+        # Prefer explicit webhook type to decide "kind" (real-time triggers),
+        # then fall back to diff-based classification.
+        kind = ""
+        evt_l = _normalize_whop_std_event_type(evt)
+        if evt_l == "payment.created":
+            kind = "payment_created"
+        elif evt_l == "payment.pending":
+            kind = "payment_pending"
+        elif evt_l == "setup_intent.requires_action":
+            kind = "setup_intent_requires_action"
+        elif evt_l == "setup_intent.succeeded":
+            kind = "setup_intent_succeeded"
+        elif evt_l == "setup_intent.canceled":
+            kind = "setup_intent_canceled"
+        elif evt_l == "entry.created":
+            kind = "entry_created"
+        elif evt_l == "entry.approved":
+            kind = "entry_approved"
+        elif evt_l == "entry.denied":
+            kind = "entry_denied"
+        elif evt_l == "entry.deleted":
+            kind = "entry_deleted"
+        elif evt_l == "course_lesson_interaction.completed":
+            kind = "course_lesson_completed"
+        elif evt_l == "invoice.created":
+            kind = "invoice_created"
+        elif evt_l == "invoice.paid":
+            kind = "invoice_paid"
+        elif evt_l == "invoice.past_due":
+            kind = "invoice_past_due"
+        elif evt_l == "invoice.voided":
+            kind = "invoice_voided"
+        elif evt_l == "refund.created":
+            kind = "refund_created"
+        elif evt_l == "refund.updated":
+            kind = "refund_updated"
+        elif evt_l == "dispute.created":
+            kind = "dispute_created"
+        elif evt_l == "dispute.updated":
+            kind = "dispute_updated"
+        elif "payment" in evt_l and "failed" in evt_l:
+            kind = "payment_failed"
+        elif "payment" in evt_l and ("succeeded" in evt_l or "paid" in evt_l):
+            kind = "payment_succeeded"
+        elif "membership" in evt_l and any(x in evt_l for x in ("deactivated", "canceled", "cancelled", "expired", "ended")):
+            kind = "deactivated"
+        elif evt_l == "membership.cancel_at_period_end_changed":
+            cape = bool(_deep_get(payload, "data.cancel_at_period_end") is True)
+            kind = "cancellation_scheduled" if cape else "cancellation_removed"
+        elif "cancel" in evt_l and any(x in evt_l for x in ("removed", "unscheduled", "resumed")):
+            kind = "cancellation_removed"
+        elif "membership" in evt_l and any(x in evt_l for x in ("created", "activated", "purchased", "generated", "started")):
+            # We'll still rely on status bucket to choose joined vs activated title.
+            kind = "membership_activated"
+
+        if not kind:
+            kind = _classify_whop_change(prev, cur)
+        memberships[mid2] = cur
+
+        # Generic movement log (changed fields) if requested.
+        if not kind and WHOP_EVENTS_POLL_LOG_ALL_MOVEMENTS:
+            changed: list[str] = []
+            if isinstance(prev, dict) and prev:
+                for k in ("status", "cancel_at_period_end", "renewal_period_end"):
+                    if str(prev.get(k) or "") != str(cur.get(k) or ""):
+                        changed.append(k)
+            else:
+                changed = ["new_seen"]
+            with suppress(Exception):
+                await _whop_api_events_log(
+                    f"[Whop Webhook][movement] type={evt or '—'} mid={mid2} changed={','.join(changed) if changed else '—'} status={cur.get('status') or '—'}"
+                )
+            state["memberships"] = memberships
+            state["sent"] = sent
+            state["cases"] = cases
+            _save_whop_api_events_state(state)
+            return
+
+        if not kind:
+            state["memberships"] = memberships
+            state["sent"] = sent
+            state["cases"] = cases
+            _save_whop_api_events_state(state)
+            return
+
+        title, color, embed_kind = _title_for_event(kind)
+        did = _extract_discord_id_from_connected(str(brief.get("connected_discord") or ""))
+        member_obj: discord.Member | None = None
+        if did:
+            member_obj = guild.get_member(int(did))
+            if member_obj is None:
+                with suppress(Exception):
+                    member_obj = await guild.fetch_member(int(did))
+
+        # Persist brief for later role-driven cards.
+        if did and isinstance(brief, dict) and brief:
+            with suppress(Exception):
+                record_member_whop_summary(int(did), brief, event_type=f"whop.webhook.{evt or kind}", membership_id=str(mid2))
+
+        if member_obj is None:
+            if WHOP_EVENTS_POLL_POST_UNLINKED:
+                title2 = f"{title} (Discord not linked)"
+                e_unlinked = _linked_hint_embed(title=title2, color=color, brief=brief, note=WHOP_EVENTS_POLL_UNLINKED_NOTE)
+                await log_member_status("", embed=e_unlinked)
+                with suppress(Exception):
+                    await _whop_api_events_log(f"[Whop Webhook][detected] kind={kind} linked=no mid={mid2} type={evt or '—'}")
+                with suppress(Exception):
+                    issue_override = ""
+                    case_key_override = ""
+                    extra_topic = ""
+                    extra_fields: list[tuple[str, str]] = []
+                    always_post = False
+                    if evt_l.startswith("dispute."):
+                        dspt = str(_deep_get(payload, "data.id") or "").strip()
+                        if dspt.startswith("dspt_"):
+                            dstatus = str(_deep_get(payload, "data.status") or "").strip()
+                            dreason = str(_deep_get(payload, "data.reason") or "").strip()
+                            dby = str(_deep_get(payload, "data.needs_response_by") or "").strip()
+                            damt = str(_deep_get(payload, "data.amount") or "").strip()
+                            dcur = str(_deep_get(payload, "data.currency") or "").strip()
+                            issue_override = _bucket_for_dispute_status(dstatus)
+                            case_key_override = f"rschecker_whop_case:dspt={dspt}"
+                            extra_topic = f"dspt={dspt}\nstatus={dstatus or '—'}\nreason={dreason or '—'}"
+                            always_post = True
+                            extra_fields = [
+                                ("Dispute ID", dspt),
+                                ("Dispute status", dstatus),
+                                ("Reason", dreason),
+                                ("Needs response by", dby),
+                                ("Amount", (f"{damt} {dcur}".strip() if (damt or dcur) else "")),
+                                ("Event", evt_l),
+                            ]
+                    await _maybe_open_dispute_resolution_case(
+                        guild=guild,
+                        mid=mid2,
+                        updated_at=str(cur.get("updated_at") or ""),
+                        brief=brief,
+                        cases=cases,
+                        did=did,
+                        member_obj=None,
+                        issue_override=issue_override,
+                        case_key_override=case_key_override,
+                        extra_topic=extra_topic,
+                        always_post=always_post,
+                        extra_fields=extra_fields,
+                    )
+        else:
+            relevant = coerce_role_ids(ROLE_TRIGGER, WELCOME_ROLE_ID, ROLE_CANCEL_A, ROLE_CANCEL_B)
+            access = access_roles_plain(member_obj, relevant)
+            detailed = _build_member_status_detailed_embed(
+                title=title,
+                member=member_obj,
+                access_roles=access,
+                color=color,
+                event_kind=embed_kind,
+                discord_kv=[("event", f"whop.webhook.{evt or kind}")],
+                member_kv=[("membership_id", mid2)],
+                whop_brief=brief,
+            )
+            await log_member_status("", embed=detailed)
+            with suppress(Exception):
+                await _whop_api_events_log(
+                    f"[Whop Webhook][detected] kind={kind} linked=yes did={member_obj.id} mid={mid2} type={evt or '—'}"
+                )
+            with suppress(Exception):
+                issue_override = ""
+                case_key_override = ""
+                extra_topic = ""
+                extra_fields: list[tuple[str, str]] = []
+                always_post = False
+                if evt_l.startswith("dispute."):
+                    dspt = str(_deep_get(payload, "data.id") or "").strip()
+                    if dspt.startswith("dspt_"):
+                        dstatus = str(_deep_get(payload, "data.status") or "").strip()
+                        dreason = str(_deep_get(payload, "data.reason") or "").strip()
+                        dby = str(_deep_get(payload, "data.needs_response_by") or "").strip()
+                        damt = str(_deep_get(payload, "data.amount") or "").strip()
+                        dcur = str(_deep_get(payload, "data.currency") or "").strip()
+                        issue_override = _bucket_for_dispute_status(dstatus)
+                        case_key_override = f"rschecker_whop_case:dspt={dspt}"
+                        extra_topic = f"dspt={dspt}\nstatus={dstatus or '—'}\nreason={dreason or '—'}"
+                        always_post = True
+                        extra_fields = [
+                            ("Dispute ID", dspt),
+                            ("Dispute status", dstatus),
+                            ("Reason", dreason),
+                            ("Needs response by", dby),
+                            ("Amount", (f"{damt} {dcur}".strip() if (damt or dcur) else "")),
+                            ("Event", evt_l),
+                        ]
+                await _maybe_open_dispute_resolution_case(
+                    guild=guild,
+                    mid=mid2,
+                    updated_at=str(cur.get("updated_at") or ""),
+                    brief=brief,
+                    cases=cases,
+                    did=member_obj.id,
+                    member_obj=member_obj,
+                    issue_override=issue_override,
+                    case_key_override=case_key_override,
+                    extra_topic=extra_topic,
+                    always_post=always_post,
+                    extra_fields=extra_fields,
+                )
+
+        state["memberships"] = memberships
+        state["sent"] = sent
+        state["cases"] = cases
+        _save_whop_api_events_state(state)
+
+
 async def handle_whop_webhook_receiver(request):
     """Receive Whop webhook payloads, log them, and forward to Discord"""
     try:
@@ -4572,24 +5212,11 @@ async def handle_whop_webhook_receiver(request):
         except Exception as e:
             log.warning(f"[WhopWebhook] Failed to record event: {e}")
 
-        # Forward to Discord webhook if URL is configured
-        if not DISCORD_WEBHOOK_URL:
-            log.warning("Discord webhook URL not configured - payload logged but not forwarded")
-            return web.Response(text="OK (logged, not forwarded - no webhook URL)", status=200)
-
-        # Forward to Discord webhook
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                DISCORD_WEBHOOK_URL,
-                json=payload,
-                headers={"Content-Type": "application/json"}
-            ) as resp:
-                if resp.status == 200 or resp.status == 204:
-                    log.info(f"Forwarded webhook to Discord successfully (status: {resp.status})")
-                    return web.Response(text="OK", status=200)
-                error_text = await resp.text()
-                log.error(f"Failed to forward webhook to Discord (status: {resp.status}): {error_text}")
-                return web.Response(text=f"Forward failed: {error_text}", status=500)
+        # Process the webhook directly (real-time staff cards + movement logs).
+        # This replaces the legacy "forward raw JSON to a Discord webhook" behavior which caused blanks.
+        with suppress(Exception):
+            await _process_whop_standard_webhook(payload, headers=headers)
+        return web.Response(text="OK", status=200)
     
     except Exception as e:
         log.error(f"Error handling webhook receiver: {e}", exc_info=True)
@@ -5617,6 +6244,15 @@ def _payment_issue_bucket_from_payment(p: dict) -> str:
     return ""
 
 
+def _bucket_for_dispute_status(status: str) -> str:
+    s = str(status or "").strip().lower()
+    if not s:
+        return "dispute"
+    if any(k in s for k in ("won", "lost", "resolved", "closed", "settled", "completed")):
+        return "resolution"
+    return "dispute"
+
+
 def _payment_id_any(p: dict) -> str:
     try:
         pid = str(p.get("id") or p.get("payment_id") or p.get("payment") or "").strip()
@@ -5668,6 +6304,29 @@ async def _ensure_whop_case_channel(
         return None
 
     key = str(case_key or "").strip()
+    # First: global lookup by topic key (channel could have been moved categories).
+    if key:
+        with suppress(Exception):
+            for ch in list(getattr(guild, "text_channels", []) or []):
+                if not isinstance(ch, discord.TextChannel):
+                    continue
+                if key in str(ch.topic or ""):
+                    # If category differs, move it under the requested category.
+                    try:
+                        if int(getattr(ch, "category_id", 0) or 0) != int(cat.id):
+                            await ch.edit(category=cat, reason="RSCheckerbot: move whop case channel")
+                    except Exception:
+                        pass
+                    # Best-effort rename to match requested channel_name.
+                    try:
+                        nm = _slug_channel_name(channel_name, max_len=90)
+                        if nm and str(getattr(ch, "name", "") or "") != nm:
+                            await ch.edit(name=nm, reason="RSCheckerbot: rename whop case channel")
+                    except Exception:
+                        pass
+                    return ch
+
+    # Second: category-local scan.
     with suppress(Exception):
         for ch in list(cat.channels):
             if not isinstance(ch, discord.TextChannel):
@@ -5697,6 +6356,12 @@ async def _maybe_open_dispute_resolution_case(
     cases: dict,
     did: int = 0,
     member_obj: discord.Member | None = None,
+    issue_override: str = "",
+    case_key_override: str = "",
+    pay_override: dict | None = None,
+    extra_topic: str = "",
+    always_post: bool = False,
+    extra_fields: list[tuple[str, str]] | None = None,
 ) -> None:
     """Open a per-case channel for dispute/resolution payments (best-effort)."""
     if not isinstance(cases, dict):
@@ -5707,8 +6372,10 @@ async def _maybe_open_dispute_resolution_case(
     if not mid_s:
         return
 
-    pay = await _best_payment_for_membership(mid_s, limit=25)
-    issue = _payment_issue_bucket_from_payment(pay) if isinstance(pay, dict) else ""
+    pay = pay_override if isinstance(pay_override, dict) else None
+    if pay is None:
+        pay = await _best_payment_for_membership(mid_s, limit=25)
+    issue = str(issue_override or "").strip().lower() or (_payment_issue_bucket_from_payment(pay) if isinstance(pay, dict) else "")
     if issue not in {"dispute", "resolution"}:
         return
 
@@ -5716,9 +6383,7 @@ async def _maybe_open_dispute_resolution_case(
     if cat_id <= 0:
         return
     pid = _payment_id_any(pay) if isinstance(pay, dict) else ""
-    key = f"rschecker_whop_case:{issue}:mid={mid_s}:pid={pid or updated_at or 'unknown'}"
-    if key in cases:
-        return
+    key = str(case_key_override or "").strip() or f"rschecker_whop_case:{issue}:mid={mid_s}:pid={pid or updated_at or 'unknown'}"
 
     # Resolve Discord ID if missing
     did_i = int(did or 0)
@@ -5735,6 +6400,8 @@ async def _maybe_open_dispute_resolution_case(
         f"email={str((brief or {}).get('email') or '—').strip()}\n"
         f"product={str((brief or {}).get('product') or '—').strip()}\n"
     )
+    if extra_topic and str(extra_topic).strip():
+        topic = (topic + "\n" + str(extra_topic).strip()).strip()
     case_ch = await _ensure_whop_case_channel(
         guild=guild,
         category_id=cat_id,
@@ -5745,47 +6412,60 @@ async def _maybe_open_dispute_resolution_case(
     if not isinstance(case_ch, discord.TextChannel):
         return
 
+    first_seen = key not in cases
     cases[key] = int(case_ch.id)
 
-    # Starter card (silent)
-    with suppress(Exception):
-        ecase = discord.Embed(
-            title=("⚠️ Dispute Case" if issue == "dispute" else "🟡 Resolution Case"),
-            color=(0xED4245 if issue == "dispute" else 0xFEE75C),
-            timestamp=datetime.now(timezone.utc),
-        )
-        mname = str(getattr(member_obj, "display_name", "") or "").strip() if member_obj else ""
-        if not mname:
-            mname = str((brief or {}).get("user_name") or "").strip() or "—"
-        ecase.add_field(name="Member", value=mname[:1024], inline=True)
-        ecase.add_field(name="Discord ID", value=(f"`{int(member_obj.id)}`" if member_obj else (f"`{did_i}`" if did_i else "—")), inline=True)
-        ecase.add_field(name="Membership ID", value=str(mid_s)[:1024], inline=False)
-        ecase.add_field(name="Membership", value=str((brief or {}).get("product") or "—")[:1024], inline=True)
-        ecase.add_field(name="Status", value=str((brief or {}).get("status") or "—")[:1024], inline=True)
-        pay_txt = " ".join(
-            [
-                str(pay.get("status") or ""),
-                str(pay.get("substatus") or ""),
-                str(pay.get("billing_reason") or ""),
-                str(pay.get("failure_message") or ""),
-            ]
-        ).strip()
-        if pay_txt:
-            ecase.add_field(name="Payment", value=pay_txt[:1024], inline=False)
-        dash = str((brief or {}).get("dashboard_url") or "").strip()
-        if dash and dash != "—":
-            ecase.add_field(name="Whop Dashboard", value=dash[:1024], inline=False)
-        ecase.set_footer(text="RSCheckerbot • Whop API")
-        # Only mention when the member is in-guild (avoids @unknown-user).
-        mention = f"<@{int(member_obj.id)}>" if member_obj else ""
-        await case_ch.send(
-            content=mention,
-            embed=ecase,
-            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
-            silent=True,
-        )
-    with suppress(Exception):
-        await _whop_api_events_log(f"[Whop Case] opened issue={issue} mid={mid_s} ch=#{case_ch.name} ({case_ch.id})")
+    # Starter / update card (silent)
+    if (first_seen or always_post):
+        with suppress(Exception):
+            ecase = discord.Embed(
+                title=("⚠️ Dispute Case" if issue == "dispute" else "🟡 Resolution Case"),
+                color=(0xED4245 if issue == "dispute" else 0xFEE75C),
+                timestamp=datetime.now(timezone.utc),
+            )
+            mname = str(getattr(member_obj, "display_name", "") or "").strip() if member_obj else ""
+            if not mname:
+                mname = str((brief or {}).get("user_name") or "").strip() or "—"
+            ecase.add_field(name="Member", value=mname[:1024], inline=True)
+            ecase.add_field(
+                name="Discord ID",
+                value=(f"`{int(member_obj.id)}`" if member_obj else (f"`{did_i}`" if did_i else "—")),
+                inline=True,
+            )
+            ecase.add_field(name="Membership ID", value=str(mid_s)[:1024], inline=False)
+            ecase.add_field(name="Membership", value=str((brief or {}).get("product") or "—")[:1024], inline=True)
+            ecase.add_field(name="Status", value=str((brief or {}).get("status") or "—")[:1024], inline=True)
+            pay_txt = " ".join(
+                [
+                    str((pay or {}).get("status") or ""),
+                    str((pay or {}).get("substatus") or ""),
+                    str((pay or {}).get("billing_reason") or ""),
+                    str((pay or {}).get("failure_message") or ""),
+                ]
+            ).strip()
+            if pay_txt:
+                ecase.add_field(name="Payment", value=pay_txt[:1024], inline=False)
+            dash = str((brief or {}).get("dashboard_url") or "").strip()
+            if dash and dash != "—":
+                ecase.add_field(name="Whop Dashboard", value=dash[:1024], inline=False)
+            if isinstance(extra_fields, list):
+                for k, v in extra_fields:
+                    kk = str(k or "").strip()
+                    vv = str(v or "").strip()
+                    if kk and vv:
+                        ecase.add_field(name=kk[:256], value=vv[:1024], inline=False)
+            ecase.set_footer(text="RSCheckerbot • Whop API")
+            # Only mention when the member is in-guild (avoids @unknown-user).
+            mention = f"<@{int(member_obj.id)}>" if member_obj else ""
+            await case_ch.send(
+                content=mention,
+                embed=ecase,
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+                silent=True,
+            )
+    if first_seen:
+        with suppress(Exception):
+            await _whop_api_events_log(f"[Whop Case] opened issue={issue} mid={mid_s} ch=#{case_ch.name} ({case_ch.id})")
 
 
 async def _whop_api_events_log(msg: str) -> None:
@@ -5797,6 +6477,19 @@ async def _whop_api_events_log(msg: str) -> None:
         return
     if not msg or not str(msg).strip():
         return
+    # Optional: send via Discord webhook (best-effort; avoids channel-perms issues).
+    if WHOP_EVENTS_POLL_LOG_WEBHOOK_URL:
+        try:
+            async with aiohttp.ClientSession() as session:
+                await session.post(
+                    WHOP_EVENTS_POLL_LOG_WEBHOOK_URL,
+                    json={"content": str(msg)[:1900], "allowed_mentions": {"parse": []}},
+                    timeout=aiohttp.ClientTimeout(total=8),
+                )
+            return
+        except Exception:
+            # Fall back to channel send below.
+            pass
     cid = int(WHOP_EVENTS_POLL_LOG_OUTPUT_CHANNEL_ID or 0)
     ch = _WHOP_API_EVENTS_LOG_CH
     if cid > 0:
@@ -5910,10 +6603,46 @@ def _classify_whop_change(prev: dict | None, cur: dict) -> str:
 
 def _title_for_event(kind: str) -> tuple[str, int, str]:
     k = str(kind or "").strip().lower()
+    if k == "payment_created":
+        return ("🧾 Payment Created", 0x5865F2, "payment_created")
+    if k == "payment_pending":
+        return ("⏳ Payment Pending", 0xFEE75C, "payment_pending")
+    if k == "setup_intent_requires_action":
+        return ("⚠️ Setup Intent — Requires Action", 0xED4245, "setup_intent")
+    if k == "setup_intent_succeeded":
+        return ("✅ Setup Intent Succeeded", 0x57F287, "setup_intent")
+    if k == "setup_intent_canceled":
+        return ("🟨 Setup Intent Canceled", 0xFEE75C, "setup_intent")
+    if k == "entry_created":
+        return ("📩 Entry Created", 0x5865F2, "entry")
+    if k == "entry_approved":
+        return ("✅ Entry Approved", 0x57F287, "entry")
+    if k == "entry_denied":
+        return ("⛔ Entry Denied", 0xED4245, "entry")
+    if k == "entry_deleted":
+        return ("🗑️ Entry Deleted", 0xFEE75C, "entry")
+    if k == "course_lesson_completed":
+        return ("📚 Lesson Completed", 0x5865F2, "course")
+    if k == "invoice_created":
+        return ("🧾 Invoice Created", 0x5865F2, "invoice")
+    if k == "invoice_paid":
+        return ("✅ Invoice Paid", 0x57F287, "invoice")
+    if k == "invoice_past_due":
+        return ("⚠️ Invoice Past Due", 0xED4245, "invoice")
+    if k == "invoice_voided":
+        return ("🗑️ Invoice Voided", 0xFEE75C, "invoice")
     if k == "payment_failed":
         return ("❌ Payment Failed — Action Needed", 0xED4245, "payment_failed")
     if k == "payment_succeeded":
         return ("✅ Payment Succeeded", 0x57F287, "active")
+    if k == "refund_created":
+        return ("↩️ Refund Created", 0xFEE75C, "refund_created")
+    if k == "refund_updated":
+        return ("↩️ Refund Updated", 0xFEE75C, "refund_updated")
+    if k == "dispute_created":
+        return ("⚠️ Dispute Created", 0xED4245, "dispute")
+    if k == "dispute_updated":
+        return ("⚠️ Dispute Updated", 0xED4245, "dispute")
     if k == "cancellation_scheduled":
         return ("⚠️ Cancellation Scheduled", 0xFEE75C, "cancellation_scheduled")
     if k == "cancellation_removed":
@@ -5924,6 +6653,8 @@ def _title_for_event(kind: str) -> tuple[str, int, str]:
         return ("✅ Access Restored", 0x57F287, "active")
     if k == "membership_joined":
         return ("👋 Member Joined", 0x5865F2, "active")
+    if k == "membership_activated":
+        return ("✅ Membership Activated", 0x57F287, "active")
     return ("✅ Membership Activated", 0x57F287, "active")
 
 
@@ -6047,6 +6778,15 @@ async def whop_api_events_poll():
 
                 title, color, embed_kind = _title_for_event(kind)
                 did = _extract_discord_id_from_connected(str(brief.get("connected_discord") or ""))
+                # Persist the brief into member_history so later role-driven cards don't go blank.
+                if did and isinstance(brief, dict) and brief:
+                    with suppress(Exception):
+                        record_member_whop_summary(
+                            int(did),
+                            brief,
+                            event_type=f"whop.api.{kind}",
+                            membership_id=str(mid or "").strip(),
+                        )
                 member_obj: discord.Member | None = None
                 if did:
                     member_obj = guild.get_member(int(did))
@@ -6460,35 +7200,9 @@ async def on_ready():
         else:
             log.info("[Whop API] Client disabled (no API key)")
     
-    # Initialize Whop webhook handler
-    if WHOP_WEBHOOK_CHANNEL_ID or WHOP_LOGS_CHANNEL_ID:
-        init_whop_handler(
-            webhook_channel_id=WHOP_WEBHOOK_CHANNEL_ID,
-            whop_logs_channel_id=WHOP_LOGS_CHANNEL_ID,
-            role_trigger=ROLE_TRIGGER,
-            welcome_role_id=WELCOME_ROLE_ID,
-            role_cancel_a=ROLE_CANCEL_A,
-            role_cancel_b=ROLE_CANCEL_B,
-            lifetime_role_ids=sorted(list(LIFETIME_ROLE_IDS)),
-            log_other_func=log_other,
-            log_member_status_func=log_member_status,
-            fmt_user_func=_fmt_user,
-            member_status_logs_channel_id=MEMBER_STATUS_LOGS_CHANNEL_ID,
-            record_member_whop_summary_func=record_member_whop_summary,
-            record_whop_event_func=_record_whop_event,
-            whop_api_key=WHOP_API_KEY,
-            whop_api_config=WHOP_API_CONFIG,
-        )
-        channels = []
-        if WHOP_WEBHOOK_CHANNEL_ID:
-            channels.append(f"webhook channel {WHOP_WEBHOOK_CHANNEL_ID}")
-        if WHOP_LOGS_CHANNEL_ID:
-            channels.append(f"logs channel {WHOP_LOGS_CHANNEL_ID}")
-        log.info(f"[Whop] Webhook handler initialized for {', '.join(channels)}")
-        # Startup scans can be expensive; run them sequentially in one canonical routine.
-        asyncio.create_task(_run_startup_scans())
-    else:
-        log.warning("[Whop] Webhook/logs channel IDs not configured - webhook handler disabled")
+    # Startup scans can be expensive; run them sequentially in one canonical routine.
+    # NOTE: We do NOT rely on Discord whop-* channels when API/webhook mode is enabled.
+    asyncio.create_task(_run_startup_scans())
     
     # Schedule periodic cleanup (every 24 hours)
     @tasks.loop(hours=24)
@@ -7079,10 +7793,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         only_member_removed = len(all_removed_in_update) == 1 or (len(all_removed_in_update) == 2 and ROLE_CANCEL_B in all_removed_in_update)
         if only_member_removed:
             # Determine whether this is a payment failure (past_due/unpaid) vs cancellation.
-            whop_brief = _whop_summary_for_member(after.id)
-            if not (isinstance(whop_brief, dict) and whop_brief):
-                whop_mid = _membership_id_from_history(after.id)
-                whop_brief = await _fetch_whop_brief_by_membership_id(whop_mid) if whop_mid else {}
+            _mid_now, whop_brief = await _resolve_whop_brief_for_discord_id(after.id)
             whop_status = str((whop_brief.get("status") or "")).strip().lower()
             is_payment_failed = whop_status in ("past_due", "unpaid") or bool(whop_brief.get("last_payment_failure"))
             event_kind = "payment_failed" if is_payment_failed else "deactivated"
@@ -7101,38 +7812,83 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                 # Detailed card -> member-status-logs
                 hist = get_member_history(after.id) or {}
                 acc = hist.get("access") if isinstance(hist.get("access"), dict) else {}
-                detailed = _build_member_status_detailed_embed(
-                    title=title,
-                    member=after,
-                    access_roles=access,
-                    color=color,
-                    event_kind=event_kind,
-                    member_kv=[
-                        ("account_created", after.created_at.strftime("%b %d, %Y")),
-                        ("first_joined", _fmt_ts(hist.get("first_join_ts"), "D") if hist.get("first_join_ts") else "—"),
-                        ("join_count", hist.get("join_count") or "—"),
-                        ("ever_had_member_role", "yes" if acc.get("ever_had_member_role") is True else "no"),
-                        ("first_access", _fmt_ts(acc.get("first_access_ts"), "D") if acc.get("first_access_ts") else "—"),
-                        ("last_access", _fmt_ts(acc.get("last_access_ts"), "D") if acc.get("last_access_ts") else "—"),
-                    ],
-                    discord_kv=[
-                        ("roles_removed", removed_names),
-                        ("reason", "member_role_removed"),
-                    ],
-                    whop_brief=whop_brief,
-                )
-                await log_member_status("", embed=detailed)
+                base_member_kv = [
+                    ("account_created", after.created_at.strftime("%b %d, %Y")),
+                    ("first_joined", _fmt_ts(hist.get("first_join_ts"), "D") if hist.get("first_join_ts") else "—"),
+                    ("join_count", hist.get("join_count") or "—"),
+                    ("ever_had_member_role", "yes" if acc.get("ever_had_member_role") is True else "no"),
+                    ("first_access", _fmt_ts(acc.get("first_access_ts"), "D") if acc.get("first_access_ts") else "—"),
+                    ("last_access", _fmt_ts(acc.get("last_access_ts"), "D") if acc.get("last_access_ts") else "—"),
+                ]
+                base_discord_kv = [
+                    ("roles_removed", removed_names),
+                    ("reason", "member_role_removed"),
+                ]
 
-                # Minimal card -> case channel
-                minimal = _build_case_minimal_embed(
-                    title=title,
-                    member=after,
-                    access_roles=access,
-                    whop_brief=whop_brief,
-                    color=color,
-                    event_kind=event_kind,
-                )
-                await log_member_status("", embed=minimal, channel_name=dest)
+                def _mk_detailed(brief: dict) -> discord.Embed:
+                    return _build_member_status_detailed_embed(
+                        title=title,
+                        member=after,
+                        access_roles=access,
+                        color=color,
+                        event_kind=event_kind,
+                        member_kv=base_member_kv,
+                        discord_kv=base_discord_kv,
+                        whop_brief=brief,
+                    )
+
+                def _mk_min(brief: dict) -> discord.Embed:
+                    return _build_case_minimal_embed(
+                        title=title,
+                        member=after,
+                        access_roles=access,
+                        whop_brief=brief,
+                        color=color,
+                        event_kind=event_kind,
+                    )
+
+                if isinstance(whop_brief, dict) and whop_brief:
+                    await log_member_status("", embed=_mk_detailed(whop_brief))
+                    await log_member_status("", embed=_mk_min(whop_brief), channel_name=dest)
+                else:
+                    pending: dict = {}
+                    msg_detailed = await log_member_status("", embed=_mk_detailed(pending))
+                    msg_min = await log_member_status("", embed=_mk_min(pending), channel_name=dest)
+
+                    def _final_detailed(brief: dict) -> discord.Embed:
+                        return _mk_detailed(brief)
+
+                    def _final_min(brief: dict) -> discord.Embed:
+                        return _mk_min(brief)
+
+                    def _fallback_detailed() -> discord.Embed:
+                        return _mk_detailed({})
+
+                    def _fallback_min() -> discord.Embed:
+                        return _mk_min({})
+
+                    if msg_detailed:
+                        asyncio.create_task(
+                            _retry_whop_enrich_and_edit(
+                                discord_id=after.id,
+                                messages=[msg_detailed],
+                                make_embed=_final_detailed,
+                                make_fallback_embed=_fallback_detailed,
+                                timeout_seconds=WHOP_LINK_TIMEOUT_SECONDS,
+                                retry_seconds=WHOP_LINK_RETRY_SECONDS,
+                            )
+                        )
+                    if msg_min:
+                        asyncio.create_task(
+                            _retry_whop_enrich_and_edit(
+                                discord_id=after.id,
+                                messages=[msg_min],
+                                make_embed=_final_min,
+                                make_fallback_embed=_fallback_min,
+                                timeout_seconds=WHOP_LINK_TIMEOUT_SECONDS,
+                                retry_seconds=WHOP_LINK_RETRY_SECONDS,
+                            )
+                        )
         
         role_obj = after.guild.get_role(ROLE_CANCEL_A) if after.guild else None
         role_name = str(role_obj.name) if role_obj else "Member"
@@ -7376,8 +8132,8 @@ async def on_message(message: discord.Message):
     if bot.user and message.author and message.author.id == bot.user.id:
         return
 
-    # API-only mode: do not rely on Discord whop-* channels.
-    if WHOP_EVENTS_POLL_ENABLED:
+    # API/webhook-only mode: do not rely on Discord whop-* channels.
+    if WHOP_EVENTS_POLL_ENABLED or bool(str(WHOP_WEBHOOK_SECRET or "").strip()):
         return
 
     # Check if this is a Whop message (from either channel).

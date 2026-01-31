@@ -59,11 +59,11 @@ This section documents the canonical operational workflow for managing RS bots o
 
 ### Source of truth: server target and key
 
-- **Server list (non-secret, tracked in git)**: `oraclekeys/servers.json`
-- **SSH private key (secret, NEVER committed)**: `oraclekeys/ssh-key-*.key`
-  - The `key` field in `oraclekeys/servers.json` is typically a **filename**, e.g. `"ssh-key-2025-12-15.key"`.
-  - After a Windows reinstall/clone, you must restore the `.key` file from your private backup into `oraclekeys/`.
-  - **Example (Windows)**: `ssh -i oraclekeys/ssh-key-2025-12-15.key rsadmin@137.131.14.157`
+- **Server list (non-secret, tracked in git)**: `oracleserverkeys/servers.json`
+- **SSH private key (secret, NEVER committed)**: `oracleserverkeys/ssh-key-*.key`
+  - The `key` field in `oracleserverkeys/servers.json` is typically a **filename**, e.g. `"ssh-key-2025-12-15.key"`.
+  - After a Windows reinstall/clone, you must restore the `.key` file from your private backup into `oracleserverkeys/`.
+  - **Example (Windows)**: `ssh -i oracleserverkeys/ssh-key-2025-12-15.key rsadmin@137.131.14.157`
 - **Ubuntu repo root**: `/home/<user>/bots/mirror-world` (usually `/home/rsadmin/bots/mirror-world`)
   - **Note (Ubuntu local-exec mode)**: when you are already on Oracle Ubuntu and `local_exec=yes`, no SSH key is needed.
 
@@ -73,7 +73,7 @@ If you are on Windows, treat SSH invocation as **canonical infrastructure**, not
 
 #### Absolute path rule (prevents System32 issues)
 
-- If you run SSH from `C:\Windows\System32`, relative paths like `oraclekeys/ssh-key-*.key` **will not resolve**.
+- If you run SSH from `C:\Windows\System32`, relative paths like `oracleserverkeys/ssh-key-*.key` **will not resolve**.
 - Canonical rule: either
   - `cd` to the repo root first, OR
   - use an **absolute** key path.
@@ -91,9 +91,9 @@ PowerShell can sometimes mis-parse remote command strings (especially with `&&`,
 
 If OpenSSH refuses the key due to Windows ACLs, run (Windows, repo root):
 
-- `icacls "oraclekeys\ssh-key-2025-12-15.key" /reset`
-- `icacls "oraclekeys\ssh-key-2025-12-15.key" /inheritance:r`
-- `icacls "oraclekeys\ssh-key-2025-12-15.key" /grant:r "%USERDOMAIN%\%USERNAME%:R"`
+- `icacls "oracleserverkeys\ssh-key-2025-12-15.key" /reset`
+- `icacls "oracleserverkeys\ssh-key-2025-12-15.key" /inheritance:r`
+- `icacls "oracleserverkeys\ssh-key-2025-12-15.key" /grant:r "%USERDOMAIN%\%USERNAME%:R"`
 
 Then retry SSH.
 

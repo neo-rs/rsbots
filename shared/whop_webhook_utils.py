@@ -6,16 +6,52 @@ import time
 from typing import Tuple, List
 
 
-def _decode_webhook_secret(secret: str) -> bytes:
-    s = str(secret or "").strip()
-    if not s:
-        return b""
-    if s.startswith("whsec_"):
-        s = s[len("whsec_") :]
+def _try_b64decode(s: str) -> bytes:
     try:
         return base64.b64decode(s)
     except Exception:
-        return s.encode("utf-8")
+        return b""
+
+
+def _try_urlsafe_b64decode(s: str) -> bytes:
+    try:
+        return base64.urlsafe_b64decode(s)
+    except Exception:
+        return b""
+
+
+def _candidate_webhook_secret_bytes(secret: str) -> List[bytes]:
+    """Return candidate secret-bytes for signature verification.
+
+    Whop follows the Standard Webhooks signature spec. Depending on where you copy the
+    secret from (dashboard vs SDK examples) you may have:
+    - a raw secret string (common in dashboards / API responses)
+    - a `whsec_...` secret (prefix + base64-ish payload)
+    - a base64 (or urlsafe base64) encoded secret
+
+    To avoid silently rejecting valid webhooks due to secret formatting differences,
+    we try a small set of reasonable interpretations and accept if any matches.
+    """
+    s = str(secret or "").strip()
+    if not s:
+        return []
+
+    raw = s.encode("utf-8")
+    out: list[bytes] = [raw]
+
+    # `whsec_`-prefixed secrets commonly store base64 after the prefix.
+    if s.startswith("whsec_"):
+        s2 = s[len("whsec_") :]
+        for b in (_try_b64decode(s2), _try_urlsafe_b64decode(s2)):
+            if b and b not in out:
+                out.append(b)
+        return out
+
+    # Non-prefixed secrets: try base64 / urlsafe base64 as optional interpretations.
+    for b in (_try_b64decode(s), _try_urlsafe_b64decode(s)):
+        if b and b not in out:
+            out.append(b)
+    return out
 
 
 def _parse_webhook_signatures(sig_header: str) -> List[str]:
@@ -63,12 +99,16 @@ def verify_standard_webhook(
         if abs(now - ts_i) > int(tolerance_seconds):
             return (False, "timestamp_out_of_range")
     signed_content = f"{wh_id}.{wh_ts}.{body_bytes.decode('utf-8', errors='ignore')}"
-    secret_bytes = _decode_webhook_secret(secret)
-    if not secret_bytes:
+    secret_candidates = _candidate_webhook_secret_bytes(secret)
+    if not secret_candidates:
         return (False, "bad_secret")
-    digest = hmac.new(secret_bytes, signed_content.encode("utf-8"), hashlib.sha256).digest()
-    expected = base64.b64encode(digest).decode("utf-8")
-    for sig in _parse_webhook_signatures(wh_sig):
-        if hmac.compare_digest(expected, sig):
-            return (True, "ok")
+    sigs = _parse_webhook_signatures(wh_sig)
+    if not sigs:
+        return (False, "missing_headers")
+    for secret_bytes in secret_candidates:
+        digest = hmac.new(secret_bytes, signed_content.encode("utf-8"), hashlib.sha256).digest()
+        expected = base64.b64encode(digest).decode("utf-8")
+        for sig in sigs:
+            if hmac.compare_digest(expected, sig):
+                return (True, "ok")
     return (False, "signature_mismatch")
