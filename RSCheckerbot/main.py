@@ -5554,6 +5554,30 @@ async def delayed_assign_former_member(member: discord.Member):
         pending_former_checks.discard(member.id)
 
 # -----------------------------
+# Support ticket sweeper (Free Pass)
+# -----------------------------
+@tasks.loop(seconds=600)
+async def support_ticket_sweeper_loop():
+    try:
+        if not bot.is_ready():
+            return
+        await support_tickets.sweep_free_pass_tickets()
+    except Exception as e:
+        with suppress(Exception):
+            await log_other(f"⚠️ support_ticket_sweeper_loop error: `{str(e)[:200]}`")
+
+
+@support_ticket_sweeper_loop.error
+async def support_ticket_sweeper_loop_error(error):
+    with suppress(Exception):
+        await log_other(f"🔁 support_ticket_sweeper_loop crashed: `{error}` — restarting in 5s")
+    with suppress(Exception):
+        support_ticket_sweeper_loop.cancel()
+    await asyncio.sleep(5)
+    with suppress(Exception):
+        support_ticket_sweeper_loop.start()
+
+# -----------------------------
 # Scheduler loop
 # -----------------------------
 @tasks.loop(seconds=10)
@@ -6908,6 +6932,25 @@ async def on_ready():
         scheduler_loop.start()
         log.info("[Scheduler] Started and state restored")
 
+    # Support tickets: Free Pass auto-delete sweeper (config-driven interval)
+    try:
+        st = config.get("support_tickets") if isinstance(config, dict) else {}
+        fp = (st.get("free_pass") if isinstance(st, dict) else {}) if isinstance(st, dict) else {}
+        ad = fp.get("auto_delete") if isinstance(fp, dict) else {}
+        sweeper_enabled = bool(ad.get("enabled", False))
+        sweeper_interval = int(ad.get("check_interval_seconds") or 600)
+    except Exception:
+        sweeper_enabled = False
+        sweeper_interval = 600
+    if sweeper_enabled:
+        try:
+            support_ticket_sweeper_loop.change_interval(seconds=max(30, int(sweeper_interval)))
+        except Exception:
+            pass
+        if not support_ticket_sweeper_loop.is_running():
+            support_ticket_sweeper_loop.start()
+            log.info(f"[SupportTickets] Free Pass sweeper started (every {max(30, int(sweeper_interval))}s)")
+
     if post_startup_report:
         startup_notes.append("Scheduler started and state restored.")
     
@@ -7050,7 +7093,10 @@ async def on_ready():
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    if member.guild.id == GUILD_ID and not member.bot:
+    if member.bot:
+        return
+
+    def _dedupe_recent_join(m: discord.Member) -> bool:
         # Discord can emit duplicate join events; dedupe per user for a short window.
         global _RECENT_MEMBER_JOINED
         try:
@@ -7059,15 +7105,53 @@ async def on_member_join(member: discord.Member):
             _RECENT_MEMBER_JOINED = {}  # type: ignore[var-annotated]
         try:
             now_ts = int(time.time())
-            prev_ts = int((_RECENT_MEMBER_JOINED or {}).get(str(member.id)) or 0)
+            key = f"{int(getattr(getattr(m, 'guild', None), 'id', 0) or 0)}:{int(m.id)}"
+            prev_ts = int((_RECENT_MEMBER_JOINED or {}).get(str(key)) or 0)
             if prev_ts and (now_ts - prev_ts) < 60:
-                return
-            _RECENT_MEMBER_JOINED[str(member.id)] = now_ts
+                return False
+            _RECENT_MEMBER_JOINED[str(key)] = now_ts
             if len(_RECENT_MEMBER_JOINED) > 5000:
                 items = sorted(_RECENT_MEMBER_JOINED.items(), key=lambda kv: int(kv[1] or 0), reverse=True)[:2000]
                 _RECENT_MEMBER_JOINED = dict(items)  # type: ignore[assignment]
+            return True
         except Exception:
-            pass
+            return True
+
+    if not _dedupe_recent_join(member):
+        return
+
+    # Support tickets guild (Neo): minimal join handling for invite-based Free Pass tickets.
+    try:
+        st_gid = int((config.get("support_tickets") or {}).get("guild_id") or 0) if isinstance(config, dict) else 0
+    except Exception:
+        st_gid = 0
+    if st_gid and int(getattr(member.guild, "id", 0) or 0) == int(st_gid) and int(st_gid) != int(GUILD_ID):
+        used_invite_code = None
+        try:
+            invites = await member.guild.invites()
+            for inv in invites:
+                prev_uses = invite_usage_cache.get(inv.code, inv.uses)
+                if (inv.uses or 0) > (prev_uses or 0) and used_invite_code is None:
+                    used_invite_code = inv.code
+                invite_usage_cache[inv.code] = inv.uses
+        except Exception:
+            used_invite_code = None
+
+        is_tracked = False
+        if used_invite_code:
+            invite_entry = invites_data.get(used_invite_code) or {}
+            is_tracked = bool(invite_entry) and invite_entry.get("used_at") is None
+
+        with suppress(Exception):
+            await support_tickets.handle_free_pass_join_if_needed(member=member, tracked_one_time_invite=bool(is_tracked))
+
+        # Mark tracked one-time invite used (keeps invites.json consistent across guilds)
+        with suppress(Exception):
+            if used_invite_code and is_tracked:
+                await track_invite_usage(used_invite_code, member)
+        return
+
+    if member.guild.id == GUILD_ID:
 
         async def _upsert_member_join_card(embed: discord.Embed) -> discord.Message | None:
             """Prevent duplicate join cards by editing an existing recent one if present."""

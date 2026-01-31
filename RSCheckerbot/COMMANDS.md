@@ -160,18 +160,38 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 - **Returns**: Confirmation that sequence is cancelled
 - **Note**: Only works if user is in active queue
 
+### Support Ticket Commands (Ticket Channels Only)
+
+These commands are only available **inside an OPEN support ticket channel** and are intended for staff workflows.
+
+#### `!transcript`
+- **Description**: Export transcript to the configured transcripts channel and close the ticket (deletes the ticket channel after export)
+- **Aliases**: None
+- **Parameters**: None
+- **Usage**: `!transcript` (run inside a ticket channel)
+- **Admin Only**: No (staff-only via `config.json -> support_tickets.permissions.staff_role_ids` or Discord Administrator)
+- **Returns**: Uploads a transcript file + summary embed in the appropriate transcripts channel, then closes/deletes the ticket channel
+
+#### `!close`
+- **Description**: Close the ticket (defaults to transcript + delete)
+- **Aliases**: None
+- **Parameters**: None
+- **Usage**: `!close` (run inside a ticket channel)
+- **Admin Only**: No (staff-only via `config.json -> support_tickets.permissions.staff_role_ids` or Discord Administrator)
+- **Returns**: Same as `!transcript` by default (exports then deletes)
+
 ## Command Summary
 
-- **Total Commands**: 13
-- **Admin Commands**: 13 (all commands require administrator permissions)
+- **Total Commands**: 15
+- **Admin Commands**: 13 (the `.checker` commands require administrator permissions)
 - **Public Commands**: 0
 - **Commands with Aliases**: 7
-- **Command Prefix**: `.checker` (dot prefix)
+- **Command Prefix**: `.checker` (dot prefix) + `!` (ticket channels only)
 
 ## Notes
 
-- All commands use the `.checker` prefix
-- All commands require administrator permissions
+- Most commands use the `.checker` prefix and require administrator permissions
+- Support ticket commands use the `!` prefix and only work inside ticket channels
 - Command messages are automatically deleted
 - Replies auto-delete after 5-30 seconds depending on command
 - Whop startup/6h sync is **audit-first** by default: it only removes the Member role if `config.json -> whop_api.enforce_role_removals=true` (default is false, which logs “would remove” only)

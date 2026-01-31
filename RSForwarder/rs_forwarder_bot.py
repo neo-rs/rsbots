@@ -1142,6 +1142,13 @@ class RSForwarderBot:
                 limit = 25
             limit = max(1, min(limit, 200))
 
+            # In real sheet mode, don't process everything at once.
+            try:
+                max_per_run = int((self.config or {}).get("rs_fs_sheet_max_per_run") or 250)
+            except Exception:
+                max_per_run = 250
+            max_per_run = max(10, min(max_per_run, 1000))
+
             try:
                 out_ch_raw = str((self.config or {}).get("rs_fs_sheet_test_output_channel_id") or "").strip()
                 out_ch_id = int(out_ch_raw) if out_ch_raw else int(target_ch)
@@ -1209,6 +1216,15 @@ class RSForwarderBot:
 
             # Prefer items where we can build a URL (so small limits like 1 still show something useful).
             try:
+                # If we're actually writing to the sheet, pre-dedupe first (saves work).
+                if sheet_enabled and (not dry_run):
+                    try:
+                        pairs = await self._rs_fs_sheet.filter_new_pairs(list(pairs or []))
+                    except Exception:
+                        pass
+                    if not pairs:
+                        return
+
                 # Pick items that have either:
                 # - a buildable store URL, OR
                 # - a known monitor channel mapping (so we can still fetch title+url from the monitor embed)
@@ -1227,7 +1243,11 @@ class RSForwarderBot:
                             monitor_capable += 1
                     except Exception:
                         pass
-                chosen = (candidates if candidates else (pairs or []))[:limit]
+                base = (candidates if candidates else (pairs or []))
+                if dry_run:
+                    chosen = base[:limit]
+                else:
+                    chosen = base[:max_per_run]
 
                 if dry_run and out_ch and hasattr(out_ch, "send"):
                     try:
@@ -1327,6 +1347,19 @@ class RSForwarderBot:
                 rows = [[e.store, e.sku, e.title] for e in entries]
                 ok, msg, added = await self._rs_fs_sheet.append_rows(rows)
 
+                # Optional status output
+                try:
+                    status_ch_raw = str((self.config or {}).get("rs_fs_sheet_status_channel_id") or "").strip()
+                    if status_ch_raw:
+                        sch = await self._resolve_channel_by_id(int(status_ch_raw))
+                        if sch and hasattr(sch, "send"):
+                            if ok and added > 0:
+                                await sch.send(f"RS-FS Sheet: ✅ added {added} row(s).", allowed_mentions=discord.AllowedMentions.none())
+                            elif not ok:
+                                await sch.send(f"RS-FS Sheet: ❌ {msg}", allowed_mentions=discord.AllowedMentions.none())
+                except Exception:
+                    pass
+
             # Mark message processed to avoid reprocessing the same embed.
             if mid:
                 try:
@@ -1365,7 +1398,8 @@ class RSForwarderBot:
                 value_parts: List[str] = []
                 if title:
                     value_parts.append(title)
-                if url:
+                # Avoid duplicate lines when title fallback equals url
+                if url and url != title:
                     value_parts.append(url)
                 else:
                     value_parts.append("(no url)")
@@ -2141,6 +2175,25 @@ class RSForwarderBot:
                 return
 
             await self._send_rs_fs_preview_embed(out_ch, [entry])
+
+        @self.bot.command(name="rsfscheck", aliases=["fscheck", "rsfsstatus"])
+        async def rsfs_check(ctx):
+            """
+            Validate Google Sheets configuration/credentials (non-mutating).
+            """
+            try:
+                if not getattr(self, "_rs_fs_sheet", None):
+                    await ctx.send("❌ RS-FS sheet sync not initialized.")
+                    return
+                ok, msg, tab, n = await self._rs_fs_sheet.preflight()
+                sid = str((self.config or {}).get("rs_fs_sheet_spreadsheet_id") or "").strip()
+                gid = str((self.config or {}).get("rs_fs_sheet_tab_gid") or "").strip()
+                if ok:
+                    await ctx.send(f"✅ RS-FS sheet OK. spreadsheet_id=`{sid}` tab=`{tab}` (gid={gid}) existing_skus≈{n}")
+                else:
+                    await ctx.send(f"❌ RS-FS sheet NOT ready: {msg}. spreadsheet_id=`{sid}` tab_gid=`{gid}`")
+            except Exception as e:
+                await ctx.send(f"❌ RS-FS check failed: {str(e)[:200]}")
         
         @self.bot.command(name='rsremove', aliases=['remove'])
         async def remove_channel(ctx, source_channel: discord.TextChannel = None):

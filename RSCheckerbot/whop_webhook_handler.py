@@ -1667,6 +1667,11 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                     "discord_user_id": str(discord_user_id),
                     "email": email_value,
                 }
+                with suppress(Exception):
+                    event_data["_source_jump_url"] = str(getattr(message, "jump_url", "") or "").strip()
+                with suppress(Exception):
+                    if getattr(message, "created_at", None):
+                        event_data["_occurred_at_iso"] = message.created_at.astimezone(timezone.utc).isoformat()
                 if membership_id_hint:
                     event_data["membership_id"] = membership_id_hint
                 if isinstance(summary_from_native, dict) and summary_from_native:
@@ -1681,6 +1686,11 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                     "discord_user_id": str(discord_user_id),
                     "email": email_value,
                 }
+                with suppress(Exception):
+                    event_data["_source_jump_url"] = str(getattr(message, "jump_url", "") or "").strip()
+                with suppress(Exception):
+                    if getattr(message, "created_at", None):
+                        event_data["_occurred_at_iso"] = message.created_at.astimezone(timezone.utc).isoformat()
                 if membership_id_hint:
                     event_data["membership_id"] = membership_id_hint
                 if isinstance(summary_from_native, dict) and summary_from_native:
@@ -1737,6 +1747,11 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                     "email": email_value,
                     "cancellation_reason": "Whop native cancel action",
                 }
+                with suppress(Exception):
+                    event_data["_source_jump_url"] = str(getattr(message, "jump_url", "") or "").strip()
+                with suppress(Exception):
+                    if getattr(message, "created_at", None):
+                        event_data["_occurred_at_iso"] = message.created_at.astimezone(timezone.utc).isoformat()
                 if isinstance(summary_from_native, dict) and summary_from_native:
                     event_data["_whop_summary"] = summary_from_native
                 await handle_membership_deactivated(member, event_data)
@@ -1753,6 +1768,11 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                         "email": email_value,
                         "status": "active",
                     }
+                    with suppress(Exception):
+                        event_data["_source_jump_url"] = str(getattr(message, "jump_url", "") or "").strip()
+                    with suppress(Exception):
+                        if getattr(message, "created_at", None):
+                            event_data["_occurred_at_iso"] = message.created_at.astimezone(timezone.utc).isoformat()
                     if isinstance(summary_from_native, dict) and summary_from_native:
                         event_data["_whop_summary"] = summary_from_native
                     await handle_membership_activated(member, event_data)

@@ -91,7 +91,9 @@ def build_store_link(store: str, sku: str) -> str:
 
 
 def _strip_title_suffix(title: str) -> str:
-    t = (title or "").strip()
+    import html as _html
+
+    t = _html.unescape((title or "").strip())
     if not t:
         return ""
     # Common store suffixes
@@ -307,6 +309,7 @@ class RsFsSheetSync:
         self._tab_name_cache: Optional[str] = None
         self._dedupe_skus: Set[str] = set()
         self._dedupe_last_fetch_ts: float = 0.0
+        self._last_service_error: str = ""
 
     def refresh_config(self, cfg: Dict[str, Any]) -> None:
         self.cfg = cfg or {}
@@ -315,6 +318,7 @@ class RsFsSheetSync:
         self._tab_name_cache = None
         self._dedupe_skus = set()
         self._dedupe_last_fetch_ts = 0.0
+        self._last_service_error = ""
 
     def enabled(self) -> bool:
         return bool(self._sheet_cfg.enabled)
@@ -324,12 +328,59 @@ class RsFsSheetSync:
             return self._service
         info = _load_service_account_info(self.cfg)
         if not info:
+            self._last_service_error = "missing google service account json/file"
             return None
         try:
             self._service = _build_sheets_service(info)
+            self._last_service_error = ""
         except Exception:
+            self._last_service_error = "failed to initialize google sheets client (missing deps or invalid credentials)"
             self._service = None
         return self._service
+
+    def last_service_error(self) -> str:
+        return (self._last_service_error or "").strip()
+
+    async def preflight(self) -> Tuple[bool, str, Optional[str], int]:
+        """
+        Non-mutating check: validate credentials + access to spreadsheet/tab and count existing SKUs.
+        Returns: (ok, message, tab_name, existing_sku_count)
+        """
+        if not self.enabled():
+            return False, "disabled", None, 0
+        if not self._sheet_cfg.spreadsheet_id:
+            return False, "missing spreadsheet id", None, 0
+        service = self._get_service()
+        if not service:
+            err = self.last_service_error() or "missing google service / deps"
+            return False, err, None, 0
+        tab = await self._resolve_tab_name()
+        if not tab:
+            return False, "missing tab name/gid", None, 0
+        try:
+            await self._fetch_existing_skus_if_needed()
+        except Exception as e:
+            return False, f"failed to read existing SKUs: {e}", tab, 0
+        return True, "ok", tab, len(self._dedupe_skus or set())
+
+    async def filter_new_pairs(self, pairs: Sequence[Tuple[str, str]]) -> List[Tuple[str, str]]:
+        """
+        Filter (store, sku) pairs down to only SKUs not already present in the sheet.
+        If sheet isn't enabled or we can't read the sheet, returns the input pairs unchanged.
+        """
+        if not self.enabled():
+            return list(pairs or [])
+        try:
+            await self._fetch_existing_skus_if_needed()
+        except Exception:
+            return list(pairs or [])
+        out: List[Tuple[str, str]] = []
+        for st, sk in (pairs or []):
+            sku = str(sk or "").strip().lower()
+            if sku and sku in (self._dedupe_skus or set()):
+                continue
+            out.append((st, sk))
+        return out
 
     async def _resolve_tab_name(self) -> Optional[str]:
         if self._tab_name_cache:

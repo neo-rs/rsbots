@@ -930,7 +930,8 @@ async def export_transcript_for_channel_id(channel_id: int, *, close_reason: str
     e.add_field(name="Member", value=member_label, inline=False)
     e.add_field(name="Discord ID", value=_format_discord_id(user_id), inline=False)
     e.add_field(name="Ticket Type", value=str(ticket_type), inline=False)
-    e.add_field(name="Ticket Channel", value=_embed_link("Open", str(getattr(ch, "jump_url", "") or "")), inline=False)
+    ch_url = f"https://discord.com/channels/{int(guild.id)}/{int(ch.id)}"
+    e.add_field(name="Ticket Channel", value=_embed_link("Open", ch_url), inline=False)
     e.add_field(name="Created At", value=str(created_at_iso or "—")[:1024], inline=False)
     e.add_field(name="Closed At", value=str(closed_at_iso)[:1024], inline=False)
     ref_lines: list[str] = []
