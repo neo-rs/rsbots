@@ -182,6 +182,8 @@
     "movement_log_webhook_url": "",
     "_comment_unlinked_note": "Shown when a Whop webhook event is detected but the member has not connected Discord in Whop.",
     "unlinked_note": "Discord not linked. Ask the member to connect Discord in Whop: Dashboard -> Connected accounts -> Discord.",
+    "_comment_not_in_guild_note": "Shown when Whop shows a linked Discord account, but that Discord user is not found in the Discord server (or cannot be fetched).",
+    "not_in_guild_note": "Discord is linked in Whop, but the user is not in the Discord server. Ask them to join/rejoin with the linked Discord account.",
     "_comment_sync_summary": "Optional: mirror Whop sync summary into Neo Test Server.",
     "sync_summary_enabled": true,
     "sync_summary_output_guild_id": 1451275225512546497,

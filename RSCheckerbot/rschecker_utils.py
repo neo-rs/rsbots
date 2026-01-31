@@ -89,6 +89,9 @@ def extract_discord_id_from_whop_member_record(rec: dict) -> str:
         m = re.search(r"\b(\d{17,19})\b", str(v or ""))
         return m.group(1) if m else ""
 
+    # Avoid common false-positives (Discord guild/channel/role IDs can also be 17-19 digits).
+    _EXCLUDED_KEYWORDS = ("guild", "server", "channel", "role")
+
     def _walk(obj: object, *, discord_context: bool, depth: int) -> str:
         if depth > 6:
             return ""
@@ -97,7 +100,19 @@ def extract_discord_id_from_whop_member_record(rec: dict) -> str:
             try:
                 prov = str(obj.get("provider") or obj.get("service") or "").strip().lower()
                 if prov == "discord":
-                    for k in ("user_id", "id", "uid", "account_id", "snowflake"):
+                    for k in (
+                        # Most common
+                        "user_id",
+                        "discord_user_id",
+                        "discordUserId",
+                        "discord_id",
+                        "discordId",
+                        # Fallbacks
+                        "id",
+                        "uid",
+                        "account_id",
+                        "snowflake",
+                    ):
                         cand = _as_discord_id(obj.get(k))
                         if cand:
                             return cand
@@ -110,7 +125,8 @@ def extract_discord_id_from_whop_member_record(rec: dict) -> str:
                 pass
             for k, v in obj.items():
                 k_low = str(k or "").lower()
-                ctx = discord_context or ("discord" in k_low)
+                excluded_key = any(w in k_low for w in _EXCLUDED_KEYWORDS)
+                ctx = (discord_context or ("discord" in k_low)) and (not excluded_key)
                 if ctx:
                     cand = _as_discord_id(v)
                     if cand:

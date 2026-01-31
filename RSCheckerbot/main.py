@@ -2670,6 +2670,11 @@ WHOP_UNLINKED_NOTE = str(
     or "Discord not linked. Ask the member to connect Discord in Whop: Dashboard -> Connected accounts -> Discord."
 ).strip()
 
+WHOP_NOT_IN_GUILD_NOTE = str(
+    WHOP_API_CONFIG.get("not_in_guild_note")
+    or "Discord is linked in Whop, but the user is not in this Discord server. Ask them to join the server with the linked Discord account (or rejoin if they left)."
+).strip()
+
 # Dispute / resolution per-case channels (main guild only).
 try:
     DISPUTE_CASE_CATEGORY_ID = int(WHOP_API_CONFIG.get("dispute_case_category_id") or 0)
@@ -4950,7 +4955,8 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
             return
 
         title, color, embed_kind = _title_for_event(kind)
-        did = _extract_discord_id_from_connected(str(brief.get("connected_discord") or ""))
+        connected_disp = str((brief or {}).get("connected_discord") or "").strip()
+        did = _extract_discord_id_from_connected(connected_disp)
         member_obj: discord.Member | None = None
         if did:
             member_obj = guild.get_member(int(did))
@@ -4964,8 +4970,17 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                 record_member_whop_summary(int(did), brief, event_type=f"whop.webhook.{evt or kind}", membership_id=str(mid2))
 
         if member_obj is None:
-            title2 = f"{title} (Discord not linked)"
-            e_unlinked = _linked_hint_embed(title=title2, color=color, brief=brief, note=WHOP_UNLINKED_NOTE)
+            # Important: "not linked" should mean "Whop has no Discord connection",
+            # not "Discord member not found in the guild".
+            if connected_disp:
+                title2 = f"{title} (Discord linked, not in server)"
+                note = WHOP_NOT_IN_GUILD_NOTE
+                discord_value = connected_disp
+            else:
+                title2 = f"{title} (Discord not linked)"
+                note = WHOP_UNLINKED_NOTE
+                discord_value = "Not linked"
+            e_unlinked = _linked_hint_embed(title=title2, color=color, brief=brief, note=note, discord_value=discord_value)
             await log_member_status("", embed=e_unlinked)
             with suppress(Exception):
                 await _whop_api_events_log(f"[Whop Webhook][detected] kind={kind} linked=no mid={mid2} type={evt or '—'}")
@@ -6476,8 +6491,8 @@ async def _whop_api_events_log(msg: str) -> None:
             await ch.send(content=raw[:1900], allowed_mentions=discord.AllowedMentions.none(), silent=True)
 
 
-def _linked_hint_embed(*, title: str, color: int, brief: dict, note: str) -> discord.Embed:
-    """Staff-only embed for Whop events with no connected Discord."""
+def _linked_hint_embed(*, title: str, color: int, brief: dict, note: str, discord_value: str = "") -> discord.Embed:
+    """Staff-only embed for Whop events where no Discord member is resolved."""
     e = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
     user_name = str((brief or {}).get("user_name") or "").strip() or "—"
     email = str((brief or {}).get("email") or "").strip() or "—"
@@ -6486,9 +6501,11 @@ def _linked_hint_embed(*, title: str, color: int, brief: dict, note: str) -> dis
     spent = str((brief or {}).get("total_spent") or "").strip() or "—"
     dash = str((brief or {}).get("dashboard_url") or "").strip() or "—"
     renew = str((brief or {}).get("renewal_window") or "").strip() or "—"
+    discord_disp = str(discord_value or "").strip() or str((brief or {}).get("connected_discord") or "").strip()
     e.add_field(name="Member (Whop)", value=user_name[:1024], inline=True)
     e.add_field(name="Email", value=email[:1024], inline=True)
-    e.add_field(name="Discord", value="Not linked", inline=True)
+    # Use Whop-linked display if we have it; otherwise show "Not linked".
+    e.add_field(name="Discord", value=(discord_disp[:1024] if discord_disp else "Not linked"), inline=True)
     e.add_field(name="Membership", value=product[:1024], inline=True)
     e.add_field(name="Status", value=status[:1024], inline=True)
     e.add_field(name="Total Spent (lifetime)", value=spent[:1024], inline=True)

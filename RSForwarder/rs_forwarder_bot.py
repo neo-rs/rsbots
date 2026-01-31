@@ -832,13 +832,8 @@ class RSForwarderBot:
             except Exception:
                 pass
 
-            if not zephyr_release_feed_parser.looks_like_release_feed_embed_text(text):
-                try:
-                    print(f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Skip: no 'Release Feed(s)' header detected in collected text")
-                except Exception:
-                    pass
-                return
-
+            # Always attempt parsing. Zephyr splits long lists into multiple embeds and
+            # continuation chunks often omit the "Release Feed(s)" header.
             pairs = zephyr_release_feed_parser.parse_release_feed_pairs(text)
             if not pairs:
                 try:
@@ -852,10 +847,10 @@ class RSForwarderBot:
                     test_enabled = False
                 if test_enabled:
                     try:
-                        out_ch = await self._resolve_channel_by_id(int(self._zephyr_release_feed_channel_id() or 0))
+                        out_ch = await self._resolve_channel_by_id(int(out_ch_id or (self._zephyr_release_feed_channel_id() or 0) or 0))
                         if out_ch and hasattr(out_ch, "send"):
                             await out_ch.send(
-                                "RS-FS: ❌ Parsed 0 items from the Zephyr embed text. (Embed format may have changed.)",
+                                "RS-FS: ❌ Parsed 0 items from the Zephyr embed text (this chunk had no parseable store+sku pairs).",
                                 allowed_mentions=discord.AllowedMentions.none(),
                             )
                     except Exception:
