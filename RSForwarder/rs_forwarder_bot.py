@@ -702,6 +702,21 @@ class RSForwarderBot:
         except Exception:
             return None
 
+    async def _resolve_channel_by_id(self, channel_id: int):
+        """
+        Resolve a channel object even if not cached.
+        """
+        try:
+            ch = self.bot.get_channel(int(channel_id))
+            if ch is not None:
+                return ch
+        except Exception:
+            ch = None
+        try:
+            return await self.bot.fetch_channel(int(channel_id))
+        except Exception:
+            return None
+
     def _collect_embed_text(self, message: discord.Message) -> str:
         parts: List[str] = []
         try:
@@ -758,6 +773,16 @@ class RSForwarderBot:
             if int(getattr(message.channel, "id", 0) or 0) != int(target_ch):
                 return
 
+            # Debug: confirm we are seeing messages in the target channel.
+            try:
+                embeds_n = len(message.embeds or [])
+                a = getattr(message, "author", None)
+                aid = getattr(a, "id", None)
+                aname = getattr(a, "name", None)
+                print(f"{Colors.CYAN}[RS-FS Sheet]{Colors.RESET} Seen msg in zephyr channel id={target_ch} msg_id={getattr(message,'id',None)} author={aname}({aid}) embeds={embeds_n}")
+            except Exception:
+                pass
+
             mid = int(getattr(message, "id", 0) or 0)
             if mid and mid in (self._rs_fs_seen_message_ids or set()):
                 return
@@ -794,7 +819,7 @@ class RSForwarderBot:
 
             if dry_run:
                 try:
-                    out_ch = self.bot.get_channel(int(out_ch_id))
+                    out_ch = await self._resolve_channel_by_id(int(out_ch_id))
                 except Exception:
                     out_ch = None
                 if out_ch and hasattr(out_ch, "send"):
@@ -806,6 +831,8 @@ class RSForwarderBot:
                         "(No Google Sheet writes.)"
                     )
                     await out_ch.send(embed=header, allowed_mentions=discord.AllowedMentions.none())
+                else:
+                    print(f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Cannot resolve output channel id={out_ch_id} (no send permission or not cached)")
 
             raw_entries = await rs_fs_sheet_sync.build_preview_entries(pairs[:limit], self.config)
             entries = [e for e in raw_entries if (e.url or "").strip()]
@@ -813,7 +840,7 @@ class RSForwarderBot:
 
             if dry_run:
                 try:
-                    out_ch = self.bot.get_channel(int(out_ch_id))
+                    out_ch = await self._resolve_channel_by_id(int(out_ch_id))
                 except Exception:
                     out_ch = None
                 if out_ch and hasattr(out_ch, "send"):
@@ -835,6 +862,8 @@ class RSForwarderBot:
                             chunk = []
                     if chunk:
                         await self._send_rs_fs_preview_embed(out_ch, chunk)
+                else:
+                    print(f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Cannot resolve output channel id={out_ch_id} for results send")
 
             ok, msg, added = True, "dry-run", 0
             if (not dry_run) and sheet_enabled:
@@ -1512,6 +1541,55 @@ class RSForwarderBot:
             embed.set_footer(text="Use !rsupdate to modify or !rsremove to delete")
             
             await ctx.send(embed=embed)
+
+        @self.bot.command(name="rsfstest", aliases=["fstest", "rsfs"])
+        async def rsfs_test(ctx, limit: str = "25"):
+            """
+            Manual dry-run: fetch the most recent Zephyr "Release Feed(s)" embed from the configured channel
+            and post the preview output into that same channel.
+            """
+            try:
+                try:
+                    lim = int(str(limit or "").strip() or "25")
+                except Exception:
+                    lim = 25
+                lim = max(1, min(lim, 120))
+                self.config["rs_fs_sheet_test_limit"] = lim
+                self.config["rs_fs_sheet_test_output_enabled"] = True
+                self.config["rs_fs_sheet_dry_run"] = True
+
+                ch_id = self._zephyr_release_feed_channel_id()
+                if not ch_id:
+                    await ctx.send("❌ `zephyr_release_feed_channel_id` is not configured.")
+                    return
+
+                ch = await self._resolve_channel_by_id(int(ch_id))
+                if not ch or not hasattr(ch, "history"):
+                    await ctx.send(f"❌ Could not access Zephyr channel `{ch_id}` (no permission or not found).")
+                    return
+
+                await ctx.send(f"✅ Running RS-FS dry-run preview from <#{ch_id}> (limit={lim})…")
+
+                found = None
+                try:
+                    async for m in ch.history(limit=50):
+                        if not (getattr(m, "embeds", None) or []):
+                            continue
+                        t = self._collect_embed_text(m)
+                        if zephyr_release_feed_parser.looks_like_release_feed_embed_text(t):
+                            found = m
+                            break
+                except Exception:
+                    found = None
+
+                if not found:
+                    await ctx.send("❌ Could not find a recent Zephyr `Release Feed(s)` embed in that channel.")
+                    return
+
+                # Run the same handler against that message.
+                await self._maybe_sync_rs_fs_sheet_from_message(found)
+            except Exception as e:
+                await ctx.send(f"❌ RS-FS test failed: {str(e)[:200]}")
         
         @self.bot.command(name='rsremove', aliases=['remove'])
         async def remove_channel(ctx, source_channel: discord.TextChannel = None):
