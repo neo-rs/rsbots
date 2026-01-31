@@ -32,9 +32,11 @@ class SupportTicketConfig:
     guild_id: int
     staff_role_ids: list[int]
     admin_role_ids: list[int]
+    include_ticket_owner_in_channel: bool
     cancellation_category_id: int
     billing_category_id: int
     free_pass_category_id: int
+    transcript_category_id: int
     cancellation_transcript_channel_id: int
     billing_transcript_channel_id: int
     free_pass_transcript_channel_id: int
@@ -151,9 +153,11 @@ def initialize(
         guild_id=_as_int(st.get("guild_id")),
         staff_role_ids=_int_list(perms.get("staff_role_ids")),
         admin_role_ids=_int_list(perms.get("admin_role_ids")),
+        include_ticket_owner_in_channel=_as_bool(perms.get("include_ticket_owner_in_channel", True)),
         cancellation_category_id=_as_int(cats.get("cancellation_category_id")),
         billing_category_id=_as_int(cats.get("billing_category_id")),
         free_pass_category_id=_as_int(cats.get("free_pass_category_id")),
+        transcript_category_id=_as_int(tx.get("transcript_category_id")),
         cancellation_transcript_channel_id=_as_int(tx.get("cancellation_transcript_channel_id")),
         billing_transcript_channel_id=_as_int(tx.get("billing_transcript_channel_id")),
         free_pass_transcript_channel_id=_as_int(tx.get("free_pass_transcript_channel_id")),
@@ -267,6 +271,7 @@ def _build_overwrites(
     owner: discord.Member,
     staff_role_ids: list[int],
     admin_role_ids: list[int],
+    include_owner: bool,
 ) -> dict[discord.abc.Snowflake, discord.PermissionOverwrite]:
     overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {}
     overwrites[guild.default_role] = discord.PermissionOverwrite(view_channel=False)
@@ -294,13 +299,14 @@ def _build_overwrites(
         if role:
             overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
 
-    # Ticket owner
-    overwrites[owner] = discord.PermissionOverwrite(
-        view_channel=True,
-        send_messages=True,
-        read_message_history=True,
-        attach_files=True,
-    )
+    # Ticket owner (optional; can be disabled during setup/testing)
+    if include_owner:
+        overwrites[owner] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            attach_files=True,
+        )
     return overwrites
 
 
@@ -448,6 +454,7 @@ async def _open_or_update_ticket(
             owner=owner,
             staff_role_ids=cfg.staff_role_ids,
             admin_role_ids=cfg.admin_role_ids,
+            include_owner=bool(cfg.include_ticket_owner_in_channel),
         )
 
         ch = await _ensure_ticket_like_channel(
@@ -465,8 +472,12 @@ async def _open_or_update_ticket(
             return None
 
         # Initial messages (minimal)
-        with suppress(Exception):
-            await ch.send(content=f"<@{int(owner.id)}>", allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+        if cfg.include_ticket_owner_in_channel:
+            with suppress(Exception):
+                await ch.send(
+                    content=f"<@{int(owner.id)}>",
+                    allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+                )
         with suppress(Exception):
             await ch.send(embed=preview_embed, silent=True)
         with suppress(Exception):
@@ -839,6 +850,39 @@ def _transcript_channel_id_for(ticket_type: str) -> int:
     return int(cfg.free_pass_transcript_channel_id)
 
 
+async def _get_or_create_transcript_channel(*, guild: discord.Guild, ticket_type: str) -> discord.TextChannel | None:
+    cfg = _cfg()
+    if not cfg:
+        return None
+
+    # Prefer explicit channel IDs.
+    ch_id = _transcript_channel_id_for(ticket_type)
+    if ch_id:
+        base = guild.get_channel(int(ch_id))
+        return base if isinstance(base, discord.TextChannel) else None
+
+    # Fallback: create/find channel under transcript category by name.
+    cat_id = int(cfg.transcript_category_id or 0)
+    if cat_id <= 0:
+        return None
+    cat = guild.get_channel(int(cat_id))
+    if not isinstance(cat, discord.CategoryChannel):
+        return None
+
+    suffix = str(ticket_type or "").strip().lower()
+    if suffix not in {"cancellation", "billing", "free_pass"}:
+        suffix = "tickets"
+    nm = _slug_channel_name(f"transcripts-{suffix}", max_len=90)
+
+    for ch in list(cat.channels):
+        if isinstance(ch, discord.TextChannel) and str(ch.name or "").lower() == str(nm).lower():
+            return ch
+    with suppress(Exception):
+        created = await guild.create_text_channel(name=nm, category=cat, reason="RSCheckerbot: create transcript channel")
+        return created if isinstance(created, discord.TextChannel) else None
+    return None
+
+
 async def export_transcript_for_channel_id(channel_id: int, *, close_reason: str) -> bool:
     if not _ensure_cfg_loaded():
         return False
@@ -866,8 +910,7 @@ async def export_transcript_for_channel_id(channel_id: int, *, close_reason: str
         ref_url = str(rec.get("reference_jump_url") or "")
         wym_url = str(rec.get("what_you_missed_jump_url") or "")
 
-    tx_ch_id = _transcript_channel_id_for(ticket_type)
-    tx_ch = guild.get_channel(int(tx_ch_id)) if tx_ch_id else None
+    tx_ch = await _get_or_create_transcript_channel(guild=guild, ticket_type=ticket_type)
     if not isinstance(tx_ch, discord.TextChannel):
         await _log(f"⚠️ support_tickets: transcript channel not configured for type={ticket_type}")
         return False

@@ -219,19 +219,23 @@
   }
   ,
   "support_tickets": {
-    "_comment": "Discord-native Support CRM tickets (Neo Test Server). All IDs are config-driven; leave 0 until you create categories/channels and paste their IDs.",
-    "guild_id": 1451275225512546497,
+    "_comment": "Discord-native Support CRM tickets (main RS server for now). All IDs are config-driven.",
+    "guild_id": 876528050081251379,
     "permissions": {
       "_comment": "Staff can run !transcript/!close and view all ticket channels. Admin roles are optional; administrators are always treated as allowed.",
-      "staff_role_ids": [],
-      "admin_role_ids": []
+      "staff_role_ids": [876588092927115284],
+      "admin_role_ids": [876598078092754985],
+      "_comment_include_owner": "Temporarily disable adding the member to the ticket channel (staff-only) until finalized.",
+      "include_ticket_owner_in_channel": false
     },
     "ticket_categories": {
-      "cancellation_category_id": 0,
-      "billing_category_id": 0,
-      "free_pass_category_id": 0
+      "billing_category_id": 1467157354977165537,
+      "free_pass_category_id": 1467157711685681214,
+      "cancellation_category_id": 1467169698608320542
     },
     "transcripts": {
+      "_comment": "If per-type transcript channel IDs are 0, RSCheckerbot will create/find channels under transcript_category_id by name.",
+      "transcript_category_id": 1467169998454788341,
       "cancellation_transcript_channel_id": 0,
       "billing_transcript_channel_id": 0,
       "free_pass_transcript_channel_id": 0
