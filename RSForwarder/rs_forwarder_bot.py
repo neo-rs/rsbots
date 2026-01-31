@@ -820,9 +820,6 @@ class RSForwarderBot:
             if mid and mid in (self._rs_fs_seen_message_ids or set()):
                 return
 
-            if not (message.embeds or []):
-                return
-
             text = self._collect_embed_text(message)
             try:
                 short = (text or "").replace("\n", " ").strip()
@@ -831,6 +828,13 @@ class RSForwarderBot:
                 print(f"{Colors.CYAN}[RS-FS Sheet]{Colors.RESET} Collected_text_len={len(text or '')} sample={short!r}")
             except Exception:
                 pass
+
+            if not text:
+                try:
+                    print(f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Skip: empty collected text (no content/embeds)")
+                except Exception:
+                    pass
+                return
 
             # Always attempt parsing. Zephyr splits long lists into multiple embeds and
             # continuation chunks often omit the "Release Feed(s)" header.
