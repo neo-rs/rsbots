@@ -3517,11 +3517,47 @@ async def _fetch_whop_brief_by_membership_id(membership_id: str) -> dict:
     mid = (membership_id or "").strip()
     if not mid:
         return {}
-    return await fetch_whop_brief(
+    brief = await fetch_whop_brief(
         whop_api_client,
         mid,
         enable_enrichment=bool(WHOP_API_CONFIG.get("enable_enrichment", True)),
     )
+    if not isinstance(brief, dict) or not brief:
+        return {}
+
+    # IMPORTANT: Whop Company API does not expose connected accounts (Discord) in /members or /users.
+    # The Whop dashboard UI shows this, but the API payloads do not.
+    #
+    # We therefore treat the native Whop log cards in `whop-logs` as source-of-truth for Discord ID
+    # and opportunistically enrich `connected_discord` for *all* staff card paths.
+    try:
+        connected_disp = str(brief.get("connected_discord") or "").strip()
+    except Exception:
+        connected_disp = ""
+    if not connected_disp:
+        try:
+            email_hint = str(brief.get("email") or "").strip()
+        except Exception:
+            email_hint = ""
+        if email_hint:
+            try:
+                lim = int(WHOP_API_CONFIG.get("logs_lookup_limit") or 50)
+            except Exception:
+                lim = 50
+            lim = max(10, min(lim, 250))
+            with suppress(Exception):
+                g = bot.get_guild(int(GUILD_ID)) if int(GUILD_ID or 0) else None
+                resolved = await _resolve_discord_id_from_whop_logs(
+                    g,
+                    email=email_hint,
+                    membership_id_hint=mid,
+                    whop_key="",
+                    limit=lim,
+                )
+                if str(resolved or "").strip().isdigit():
+                    brief["connected_discord"] = str(resolved).strip()
+
+    return brief
 
 
 def _whop_placeholder_brief(state: str) -> dict:
@@ -4870,8 +4906,8 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                 return
             sent[dkey] = now.isoformat().replace("+00:00", "Z")
 
-        # Fetch authoritative state via API (builds connected Discord + totals + dashboard).
-        brief = await fetch_whop_brief(whop_api_client, mid, enable_enrichment=True)
+        # Fetch authoritative state via API (totals + dashboard). Discord linkage is enriched via whop-logs fallback.
+        brief = await _fetch_whop_brief_by_membership_id(mid)
         if not isinstance(brief, dict) or not brief:
             return
 
@@ -4957,6 +4993,7 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
         title, color, embed_kind = _title_for_event(kind)
         connected_disp = str((brief or {}).get("connected_discord") or "").strip()
         did = _extract_discord_id_from_connected(connected_disp)
+
         member_obj: discord.Member | None = None
         if did:
             member_obj = guild.get_member(int(did))

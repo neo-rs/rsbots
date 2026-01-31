@@ -201,6 +201,7 @@ class RsFsPreviewEntry:
     url: str
     title: str
     error: str
+    source: str = ""
 
 
 def _try_parse_service_account_json(raw: str) -> Optional[dict]:
@@ -507,7 +508,7 @@ async def build_preview_entries(
                 err = "no store url"
         if not (title or "").strip():
             title = url or ""
-        return RsFsPreviewEntry(store=st, sku=sk, url=url, title=title, error=err)
+        return RsFsPreviewEntry(store=st, sku=sk, url=url, title=title, error=err, source="website")
 
     total = len(unique)
     results: List[Optional[RsFsPreviewEntry]] = [None] * total

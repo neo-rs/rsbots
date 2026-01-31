@@ -730,6 +730,161 @@ class RSForwarderBot:
         except Exception:
             return f"{done}/{total}"
 
+    def _rs_fs_monitor_lookup_enabled(self) -> bool:
+        try:
+            v = (self.config or {}).get("rs_fs_monitor_lookup_enabled")
+            if v is None:
+                return True
+            if isinstance(v, bool):
+                return v
+            return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+        except Exception:
+            return True
+
+    def _rs_fs_monitor_history_limit(self) -> int:
+        try:
+            v = int((self.config or {}).get("rs_fs_monitor_lookup_history_limit") or 120)
+        except Exception:
+            v = 120
+        return max(20, min(v, 500))
+
+    def _monitor_channel_name_for_store(self, store: str) -> Optional[str]:
+        s = (store or "").strip().lower()
+        mapping = {
+            "amazon": "amazon-monitor",
+            "walmart": "walmart-monitor",
+            "target": "target-monitor",
+            "gamestop": "gamestop-monitor",
+            "costco": "costco-monitor",
+            "bestbuy": "bestbuy-monitor",
+            "homedepot": "homedepot-monitor",
+            "topps": "topps-monitor",
+        }
+        for key, name in mapping.items():
+            if key in s:
+                return name
+        return None
+
+    async def _resolve_text_channel_by_name(self, name: str) -> Optional[discord.TextChannel]:
+        """
+        Resolve a text channel by name within the configured guild.
+        """
+        target = (name or "").strip().lower()
+        if not target:
+            return None
+        try:
+            guild_id = int((self.config or {}).get("guild_id") or 0)
+        except Exception:
+            guild_id = 0
+        guild = self.bot.get_guild(guild_id) if guild_id else None
+        if not guild:
+            return None
+        try:
+            for ch in getattr(guild, "text_channels", []) or []:
+                if str(getattr(ch, "name", "") or "").strip().lower() == target:
+                    return ch
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _clean_sku_text(value: str) -> str:
+        s = (value or "").strip().strip("`").strip()
+        # keep alnum only, lower
+        out = "".join([c for c in s if c.isalnum() or c in {"-", "_"}]).strip().lower()
+        return out
+
+    @staticmethod
+    def _first_url_in_text(text: str) -> str:
+        t = (text or "").strip()
+        if not t:
+            return ""
+        import re
+
+        m = re.search(r"(https?://[^\s<>()]+)", t)
+        return (m.group(1) or "").strip() if m else ""
+
+    async def _monitor_lookup_for_store(self, store: str, sku: str) -> Optional[rs_fs_sheet_sync.RsFsPreviewEntry]:
+        """
+        Try to find a matching monitor embed for (store, sku) and extract title + url from that embed.
+        Returns None if not found / not accessible.
+        """
+        if not self._rs_fs_monitor_lookup_enabled():
+            return None
+        ch_name = self._monitor_channel_name_for_store(store)
+        if not ch_name:
+            return None
+        ch = await self._resolve_text_channel_by_name(ch_name)
+        if not ch:
+            return None
+
+        target = self._clean_sku_text(sku)
+        if not target:
+            return None
+
+        limit = self._rs_fs_monitor_history_limit()
+        try:
+            async for m in ch.history(limit=limit):
+                embeds = getattr(m, "embeds", None) or []
+                for e in embeds:
+                    # Look for SKU field
+                    fields = getattr(e, "fields", None) or []
+                    for f in fields:
+                        name = str(getattr(f, "name", "") or "").strip().lower()
+                        val = str(getattr(f, "value", "") or "").strip()
+                        if not val:
+                            continue
+                        if ("sku" in name) or ("tcin" in name) or ("asin" in name) or ("upc" in name):
+                            cand = self._clean_sku_text(val)
+                            if cand == target:
+                                title = str(getattr(e, "title", "") or "").strip()
+                                url = str(getattr(e, "url", "") or "").strip()
+                                if not url:
+                                    # Try pull first URL from any field values
+                                    for f2 in fields:
+                                        url = self._first_url_in_text(str(getattr(f2, "value", "") or ""))
+                                        if url:
+                                            break
+                                if not url:
+                                    # Try description
+                                    url = self._first_url_in_text(str(getattr(e, "description", "") or ""))
+                                if not title:
+                                    title = url or ""
+                                return rs_fs_sheet_sync.RsFsPreviewEntry(
+                                    store=store,
+                                    sku=sku,
+                                    url=url,
+                                    title=title,
+                                    error="",
+                                    source=f"monitor:{ch_name}",
+                                )
+                    # Fallback: raw text match anywhere in embed
+                    blob = " ".join(
+                        [
+                            str(getattr(e, "title", "") or ""),
+                            str(getattr(e, "description", "") or ""),
+                            " ".join([str(getattr(f, "name", "") or "") + " " + str(getattr(f, "value", "") or "") for f in fields]),
+                        ]
+                    )
+                    if target and target in self._clean_sku_text(blob):
+                        title = str(getattr(e, "title", "") or "").strip()
+                        url = str(getattr(e, "url", "") or "").strip()
+                        if not url:
+                            url = self._first_url_in_text(blob)
+                        if not title:
+                            title = url or ""
+                        return rs_fs_sheet_sync.RsFsPreviewEntry(
+                            store=store,
+                            sku=sku,
+                            url=url,
+                            title=title,
+                            error="",
+                            source=f"monitor:{ch_name}",
+                        )
+        except Exception:
+            return None
+        return None
+
     def _collect_embed_text(self, message: discord.Message) -> str:
         parts: List[str] = []
         try:
@@ -939,12 +1094,62 @@ class RSForwarderBot:
                 except Exception:
                     return
 
+            # Prefer items where we can build a URL (so small limits like 1 still show something useful).
             try:
-                raw_entries = await rs_fs_sheet_sync.build_preview_entries(
-                    pairs[:limit],
-                    self.config,
-                    on_progress=_on_progress if progress_msg else None,
-                )
+                # Pick items that have a store URL first.
+                candidates = []
+                for (st, sk) in (pairs or []):
+                    try:
+                        if rs_fs_sheet_sync.build_store_link(st, sk):
+                            candidates.append((st, sk))
+                    except Exception:
+                        pass
+                chosen = (candidates if candidates else (pairs or []))[:limit]
+
+                if dry_run and out_ch and hasattr(out_ch, "send"):
+                    try:
+                        await out_ch.send(
+                            f"RS-FS: parsed {len(pairs)} item(s); eligible_with_url={len(candidates)}; processing {len(chosen)}.",
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    except Exception:
+                        pass
+
+                # Stage 1: try monitor-channel lookup (fast + accurate when monitor embeds exist).
+                monitor_hits: List[rs_fs_sheet_sync.RsFsPreviewEntry] = []
+                remaining: List[Tuple[str, str]] = []
+                if self._rs_fs_monitor_lookup_enabled():
+                    if dry_run and out_ch and hasattr(out_ch, "send"):
+                        try:
+                            await out_ch.send("RS-FS: Stage 1/2 monitor lookup…", allowed_mentions=discord.AllowedMentions.none())
+                        except Exception:
+                            pass
+                    for st, sk in chosen:
+                        found = await self._monitor_lookup_for_store(st, sk)
+                        if found:
+                            monitor_hits.append(found)
+                        else:
+                            remaining.append((st, sk))
+                else:
+                    remaining = list(chosen)
+
+                # Stage 2: website fallback for anything not found in monitor channel.
+                offset_done = len(monitor_hits)
+
+                async def _on_progress2(done: int, total: int, errors: int, entry) -> None:
+                    # Rebase progress onto overall total.
+                    await _on_progress(offset_done + done, offset_done + total, errors, entry)
+
+                if remaining:
+                    web_entries = await rs_fs_sheet_sync.build_preview_entries(
+                        remaining,
+                        self.config,
+                        on_progress=_on_progress2 if progress_msg else None,
+                    )
+                else:
+                    web_entries = []
+
+                raw_entries = list(monitor_hits) + list(web_entries)
             except Exception as e:
                 if progress_msg:
                     try:
@@ -953,8 +1158,8 @@ class RSForwarderBot:
                         pass
                 raise
 
-            entries = [e for e in raw_entries if (e.url or "").strip()]
-            skipped_no_url = len(raw_entries) - len(entries)
+            entries = list(raw_entries or [])
+            skipped_no_url = sum(1 for e in entries if not (getattr(e, "url", "") or "").strip())
 
             if dry_run:
                 try:
@@ -1038,6 +1243,11 @@ class RSForwarderBot:
                     value_parts.append(title)
                 if url:
                     value_parts.append(url)
+                else:
+                    value_parts.append("(no url)")
+                src = str(getattr(e, "source", "") or "").strip()
+                if src:
+                    value_parts.append(f"(source: {src})")
                 if err and err.lower() not in {"", "title not found"}:
                     value_parts.append(f"(err: {err})")
                 value = "\n".join(value_parts).strip() or "(no data)"
