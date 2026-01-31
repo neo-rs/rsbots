@@ -1838,14 +1838,11 @@ async def _startup_canceling_members_snapshot() -> None:
                         color=0xFEE75C,
                         timestamp=datetime.now(timezone.utc),
                     )
-                    # Make the Discord identity clickable even when the user isn't in this guild.
+                    # In fallback mode the user often isn't in-guild; avoid mentions/links that show as @unknown-user
+                    # or open external tabs. Keep it plain + include Discord ID separately.
                     if did:
                         link_name = (discord_user if discord_user and discord_user != "—" else user_name) or "Member"
-                        e.add_field(
-                            name="Member",
-                            value=f"[{link_name}](https://discord.com/users/{did})",
-                            inline=True,
-                        )
+                        e.add_field(name="Member", value=link_name[:1024], inline=True)
                     e.add_field(name="Email", value=email_s[:1024], inline=False)
                     e.add_field(name="Discord ID", value=(f"`{did}`" if did else "—"), inline=True)
                     e.add_field(name="Membership", value=product_s[:1024], inline=True)
