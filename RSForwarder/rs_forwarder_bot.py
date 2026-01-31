@@ -720,11 +720,25 @@ class RSForwarderBot:
     def _collect_embed_text(self, message: discord.Message) -> str:
         parts: List[str] = []
         try:
+            # Some bots put all content in message.content (not in embeds).
+            c = getattr(message, "content", None)
+            if isinstance(c, str) and c.strip():
+                parts.append(c.strip())
+        except Exception:
+            pass
+        try:
             for e in (message.embeds or []):
                 try:
                     t = getattr(e, "title", None)
                     if isinstance(t, str) and t.strip():
                         parts.append(t.strip())
+                except Exception:
+                    pass
+                try:
+                    a = getattr(e, "author", None)
+                    an = getattr(a, "name", None) if a is not None else None
+                    if isinstance(an, str) and an.strip():
+                        parts.append(an.strip())
                 except Exception:
                     pass
                 try:
@@ -745,6 +759,12 @@ class RSForwarderBot:
                             parts.append(n.strip())
                         if isinstance(v, str) and v.strip():
                             parts.append(v.strip())
+                except Exception:
+                    pass
+                try:
+                    ft = getattr(getattr(e, "footer", None), "text", None)
+                    if isinstance(ft, str) and ft.strip():
+                        parts.append(ft.strip())
                 except Exception:
                     pass
         except Exception:
@@ -791,11 +811,27 @@ class RSForwarderBot:
                 return
 
             text = self._collect_embed_text(message)
+            try:
+                short = (text or "").replace("\n", " ").strip()
+                if len(short) > 220:
+                    short = short[:220] + "..."
+                print(f"{Colors.CYAN}[RS-FS Sheet]{Colors.RESET} Collected_text_len={len(text or '')} sample={short!r}")
+            except Exception:
+                pass
+
             if not zephyr_release_feed_parser.looks_like_release_feed_embed_text(text):
+                try:
+                    print(f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Skip: no 'Release Feed(s)' header detected in collected text")
+                except Exception:
+                    pass
                 return
 
             pairs = zephyr_release_feed_parser.parse_release_feed_pairs(text)
             if not pairs:
+                try:
+                    print(f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Skip: parsed 0 items from embed text")
+                except Exception:
+                    pass
                 return
 
             # Dry-run/preview: send output into the same channel (or configured override).
