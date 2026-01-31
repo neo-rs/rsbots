@@ -1694,24 +1694,38 @@ class RSForwarderBot:
 
                 await ctx.send(f"✅ Running RS-FS dry-run preview from <#{ch_id}> (limit={lim})…")
 
-                found = None
+                # Zephyr often posts the list across multiple chunks. Collect a few recent chunks and merge.
+                merged_text_parts: List[str] = []
                 try:
-                    async for m in ch.history(limit=50):
-                        if not (getattr(m, "embeds", None) or []):
+                    async for m in ch.history(limit=80):
+                        if not (getattr(m, "embeds", None) or []) and not (getattr(m, "content", None) or ""):
                             continue
                         t = self._collect_embed_text(m)
+                        if not t:
+                            continue
+                        # Keep only chunks that look like Zephyr list content (monitor tags + numbered items)
                         if zephyr_release_feed_parser.looks_like_release_feed_embed_text(t):
-                            found = m
+                            merged_text_parts.append(t)
+                        if len(merged_text_parts) >= 4:
                             break
                 except Exception:
-                    found = None
+                    merged_text_parts = []
 
-                if not found:
-                    await ctx.send("❌ Could not find a recent Zephyr `Release Feed(s)` embed in that channel.")
+                if not merged_text_parts:
+                    await ctx.send("❌ Could not find recent Zephyr `Release Feed(s)` embed chunks in that channel.")
                     return
 
-                # Run the same handler against that message.
-                await self._maybe_sync_rs_fs_sheet_from_message(found)
+                # Create a lightweight shim message-like object and reuse the same handler.
+                class _Shim:
+                    def __init__(self, channel, text: str):
+                        self.channel = channel
+                        self.id = int(time.time() * 1000)
+                        self.author = ctx.author
+                        self.content = text
+                        self.embeds = []
+
+                shim = _Shim(ch, "\n".join(reversed(merged_text_parts)))
+                await self._maybe_sync_rs_fs_sheet_from_message(shim)  # type: ignore[arg-type]
             except Exception as e:
                 await ctx.send(f"❌ RS-FS test failed: {str(e)[:200]}")
         
