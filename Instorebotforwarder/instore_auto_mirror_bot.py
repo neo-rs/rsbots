@@ -2585,7 +2585,11 @@ class InstorebotForwarder:
                         if not affiliate_rewriter.is_amazon_like_url(final_url):
                             continue
 
+                    # Only treat it as a valid Amazon lead if we have a real ASIN from a product URL.
+                    # (Avoids false positives like a 10-char keyword from /s?k=... search URLs.)
                     asin = affiliate_rewriter.extract_asin(final_url) or affiliate_rewriter.extract_asin(url_used) or ""
+                    if not asin:
+                        continue
                     return AmazonDetection(asin=asin, url_used=url_used, final_url=final_url)
         except Exception:
             return None
@@ -2604,7 +2608,16 @@ class InstorebotForwarder:
 
         det = await self._detect_amazon(urls)
         if not det:
-            _log_flow("AMZ_DETECT", found="0")
+            # If we saw Amazon URLs but none contained a real ASIN, call that out.
+            saw_amazon = False
+            try:
+                saw_amazon = any(affiliate_rewriter.is_amazon_like_url(u) for u in (urls or []))
+            except Exception:
+                saw_amazon = False
+            if saw_amazon:
+                _log_flow("AMZ_DETECT", found="0", reason="no_valid_asin")
+            else:
+                _log_flow("AMZ_DETECT", found="0")
             return None, {"urls": urls, "amazon": None}
 
         _log_flow("AMZ_DETECT", found="1", asin=(det.asin or ""), url_used=det.url_used)

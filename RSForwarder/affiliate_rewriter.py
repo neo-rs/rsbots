@@ -284,16 +284,31 @@ def is_amazon_like_url(url: str) -> bool:
 
 
 def extract_asin(text_or_url: str) -> Optional[str]:
-    if not text_or_url:
+    s = (text_or_url or "").strip()
+    if not s:
         return None
-    m = re.search(r"/dp/([A-Z0-9]{10})", text_or_url, re.IGNORECASE)
-    if m:
-        return m.group(1).upper()
-    m = re.search(r"/gp/product/([A-Z0-9]{10})", text_or_url, re.IGNORECASE)
-    if m:
-        return m.group(1).upper()
-    m = re.search(r"\b([A-Z0-9]{10})\b", text_or_url.upper())
-    return m.group(1).upper() if m else None
+
+    # Prefer extracting ASINs ONLY from well-known Amazon product URL path forms.
+    # This avoids false positives like matching a 10-char keyword in a search query.
+    for pat in (
+        r"/dp/([A-Z0-9]{10})(?:[/?]|$)",
+        r"/gp/product/([A-Z0-9]{10})(?:[/?]|$)",
+        r"/gp/aw/d/([A-Z0-9]{10})(?:[/?]|$)",
+        r"/product/([A-Z0-9]{10})(?:[/?]|$)",
+    ):
+        m = re.search(pat, s, re.IGNORECASE)
+        if m:
+            return (m.group(1) or "").upper()
+
+    # Only fall back to "bare token" extraction when the input does NOT look like a URL.
+    # (Prevents matching e.g. SMARTPHONE in ".../s?k=...Smartphone...")
+    low = s.lower()
+    looks_like_url = ("://" in low) or ("amazon." in low) or ("amzn.to" in low) or ("www." in low) or ("/" in low) or ("?" in low)
+    if looks_like_url:
+        return None
+
+    m2 = re.search(r"\b([A-Z0-9]{10})\b", s.upper())
+    return (m2.group(1) or "").upper() if m2 else None
 
 
 def build_amazon_affiliate_url(cfg: dict, raw_url: str) -> Optional[str]:

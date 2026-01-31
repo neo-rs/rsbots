@@ -57,6 +57,7 @@ _CFG: SupportTicketConfig | None = None
 _LOG_FUNC = None  # async callable(str) -> None
 _IS_WHOP_LINKED = None  # callable(discord_id:int) -> bool
 _TZ_NAME = "UTC"
+_CONTROLS_VIEW: "SupportTicketControlsView | None" = None
 
 
 def _as_int(v: object) -> int:
@@ -172,6 +173,13 @@ def initialize(
         cooldown_billing_seconds=max(0, _as_int((dd.get("billing") or {}).get("cooldown_seconds")) or 21600),
         cooldown_cancellation_seconds=max(0, _as_int((dd.get("cancellation") or {}).get("cooldown_seconds")) or 86400),
     )
+
+    # Register persistent view so buttons survive restarts.
+    global _CONTROLS_VIEW
+    if _BOT and _CONTROLS_VIEW is None:
+        with suppress(Exception):
+            _CONTROLS_VIEW = SupportTicketControlsView()
+            _BOT.add_view(_CONTROLS_VIEW)
 
 
 def _cfg() -> SupportTicketConfig | None:
@@ -472,10 +480,10 @@ async def _open_or_update_ticket(
                     content=f"<@{int(owner.id)}>",
                     allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
                 )
+        # Preview + controls (single message, buttons attached)
         with suppress(Exception):
-            await ch.send(embed=preview_embed, silent=True)
-        with suppress(Exception):
-            await ch.send(controls_text, silent=True)
+            view = _CONTROLS_VIEW or SupportTicketControlsView()
+            await ch.send(content=str(controls_text or ""), embed=preview_embed, view=view, silent=True)
         for content, emb in (extra_sends or []):
             with suppress(Exception):
                 if emb is None:
@@ -517,10 +525,78 @@ def _controls_text() -> str:
 
 
 def _embed_link(label: str, url: str) -> str:
-    u = str(url or "").strip()
-    if not u:
+    raw = str(url or "").strip()
+    if not raw:
+        return "—"
+    # Avoid nested markdown links like: [Open]([Open](https://...))
+    m = re.search(r"\((https?://[^)]+)\)", raw)
+    if m:
+        raw = m.group(1).strip()
+    m2 = re.search(r"(https?://\S+)", raw)
+    u = (m2.group(1) if m2 else raw).strip()
+    u = u.rstrip(").,")
+    if not u.startswith(("http://", "https://")):
         return "—"
     return f"[{label}]({u})"
+
+
+class SupportTicketControlsView(discord.ui.View):
+    """Persistent buttons for ticket controls."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    def _allowed(self, user: discord.abc.User | discord.Member) -> bool:
+        try:
+            if isinstance(user, discord.Member):
+                return _is_staff_member(user)
+        except Exception:
+            return False
+        return False
+
+    async def _deny(self, interaction: discord.Interaction) -> None:
+        with suppress(Exception):
+            await interaction.response.send_message("❌ Not allowed (staff only).", ephemeral=True)
+
+    @discord.ui.button(
+        label="Transcript & Close",
+        style=discord.ButtonStyle.primary,
+        custom_id="rsticket:transcript",
+    )
+    async def transcript(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        if not self._allowed(interaction.user):
+            await self._deny(interaction)
+            return
+        with suppress(Exception):
+            await interaction.response.send_message("⏳ Exporting transcript and closing…", ephemeral=True)
+        ch_id = int(getattr(getattr(interaction, "channel", None), "id", 0) or 0)
+        if ch_id:
+            await close_ticket_by_channel_id(
+                ch_id,
+                close_reason="manual_transcript",
+                do_transcript=True,
+                delete_channel=True,
+            )
+
+    @discord.ui.button(
+        label="Close",
+        style=discord.ButtonStyle.danger,
+        custom_id="rsticket:close",
+    )
+    async def close(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        if not self._allowed(interaction.user):
+            await self._deny(interaction)
+            return
+        with suppress(Exception):
+            await interaction.response.send_message("⏳ Closing ticket…", ephemeral=True)
+        ch_id = int(getattr(getattr(interaction, "channel", None), "id", 0) or 0)
+        if ch_id:
+            await close_ticket_by_channel_id(
+                ch_id,
+                close_reason="manual_close",
+                do_transcript=True,
+                delete_channel=True,
+            )
 
 
 def _format_discord_id(uid: int) -> str:
@@ -535,19 +611,18 @@ def build_cancellation_preview_embed(
     reference_jump_url: str = "",
 ) -> discord.Embed:
     b = whop_brief if isinstance(whop_brief, dict) else {}
-    e = discord.Embed(title="Cancellation", color=0xFEE75C, timestamp=_now_utc())
-    e.add_field(name="Member", value=str(getattr(member, "display_name", "") or str(member))[:1024], inline=False)
-    e.add_field(name="Discord ID", value=_format_discord_id(int(member.id)), inline=False)
-    e.add_field(name="Membership", value=str(b.get("product") or "—")[:1024], inline=False)
-    e.add_field(name="Remaining Days", value=str(b.get("remaining_days") or "—")[:1024], inline=False)
-    e.add_field(name="Access Ends On", value=str(b.get("renewal_end") or "—")[:1024], inline=False)
+    e = discord.Embed(title="Cancellation", color=0xFEE75C)
+    e.add_field(name="Member", value=str(getattr(member, "display_name", "") or str(member))[:1024], inline=True)
+    e.add_field(name="Discord ID", value=_format_discord_id(int(member.id)), inline=True)
+    e.add_field(name="Membership", value=str(b.get("product") or "—")[:1024], inline=True)
+    e.add_field(name="Remaining Days", value=str(b.get("remaining_days") or "—")[:1024], inline=True)
+    e.add_field(name="Access Ends On", value=str(b.get("renewal_end") or "—")[:1024], inline=True)
     reason = str(cancellation_reason or b.get("cancellation_reason") or "").strip()
     if reason:
         e.add_field(name="Cancellation Reason", value=f"```\n{reason[:950]}\n```", inline=False)
-    e.add_field(name="Whop Dashboard", value=_embed_link("Open", str(b.get("dashboard_url") or "")), inline=False)
+    e.add_field(name="Whop Dashboard", value=_embed_link("Open", str(b.get("dashboard_url") or "")), inline=True)
     if reference_jump_url:
-        e.add_field(name="Message Reference", value=_embed_link("View Full Log", reference_jump_url), inline=False)
-    e.set_footer(text="RSCheckerbot • Support")
+        e.add_field(name="Message Reference", value=_embed_link("View Full Log", reference_jump_url), inline=True)
     return e
 
 
@@ -558,18 +633,17 @@ def build_billing_preview_embed(
     status: str,
     reference_jump_url: str = "",
 ) -> discord.Embed:
-    e = discord.Embed(title="Billing", color=0xED4245, timestamp=_now_utc())
-    e.add_field(name="Member", value=str(getattr(member, "display_name", "") or str(member))[:1024], inline=False)
-    e.add_field(name="Discord ID", value=_format_discord_id(int(member.id)), inline=False)
+    e = discord.Embed(title="Billing", color=0xED4245)
+    e.add_field(name="Member", value=str(getattr(member, "display_name", "") or str(member))[:1024], inline=True)
+    e.add_field(name="Discord ID", value=_format_discord_id(int(member.id)), inline=True)
     with suppress(Exception):
         roles_txt = _access_roles_plain(member, {int(r.id) for r in (member.roles or [])})
         if roles_txt and roles_txt != "—":
             e.add_field(name="Current Roles", value=str(roles_txt)[:1024], inline=False)
-    e.add_field(name="Event", value=str(event_type or "—")[:1024], inline=False)
-    e.add_field(name="Status", value=str(status or "—")[:1024], inline=False)
+    e.add_field(name="Event", value=str(event_type or "—")[:1024], inline=True)
+    e.add_field(name="Status", value=str(status or "—")[:1024], inline=True)
     if reference_jump_url:
-        e.add_field(name="Message Reference", value=_embed_link("View Full Log", reference_jump_url), inline=False)
-    e.set_footer(text="RSCheckerbot • Support")
+        e.add_field(name="Message Reference", value=_embed_link("View Full Log", reference_jump_url), inline=True)
     return e
 
 
@@ -578,14 +652,10 @@ def build_free_pass_header_embed(
     member: discord.Member,
     what_you_missed_jump_url: str,
 ) -> discord.Embed:
-    e = discord.Embed(title="Free Pass", color=0x5865F2, timestamp=_now_utc())
-    e.add_field(name="Member", value=str(getattr(member, "display_name", "") or str(member))[:1024], inline=False)
-    e.add_field(name="Discord ID", value=_format_discord_id(int(member.id)), inline=False)
+    e = discord.Embed(title="Free Pass", color=0x5865F2)
+    e.add_field(name="Member", value=str(getattr(member, "display_name", "") or str(member))[:1024], inline=True)
+    e.add_field(name="Discord ID", value=_format_discord_id(int(member.id)), inline=True)
     e.add_field(name="Status", value="Free Pass – Not Linked to Whop", inline=False)
-    e.add_field(name="Preview Source", value="#what-you-missed", inline=False)
-    if what_you_missed_jump_url:
-        e.add_field(name="Message Reference", value=_embed_link("Open What-You-Missed", what_you_missed_jump_url), inline=False)
-    e.set_footer(text="RSCheckerbot • Support")
     return e
 
 
@@ -666,26 +736,26 @@ async def open_billing_ticket(
 
 
 def _guide_text() -> str:
-    # Exact guide text (links kept in <> to avoid embed previews)
+    # Exact format requested (no extra blank lines; links in <> to avoid previews).
     return (
-        "### How to Access Reselling Secrets (7-Day Trial)\n\n"
-        "### 1️⃣ Join & Claim Access\n\n"
-        "<https://whop.com/profits-pass/profits-pass/>\n\n"
-        "- Complete checkout\n"
-        "- Connect Discord when prompted\n"
-        "- Access is granted automatically\n\n"
-        "### 2️⃣ Not Seeing the Server?\n\n"
-        "<https://whop.com/account/connected-accounts/>\n\n"
-        "- Make sure Discord is connected\n"
-        "- Confirm you’re logged into the correct Discord account\n\n"
-        "### 3️⃣ Discord Verification (If Needed)\n\n"
-        "- Discord → ⚙️ Settings → My Account\n"
-        "- Verify Email\n"
-        "- Click the link sent to your inbox\n\n"
-        "### 4️⃣ Still Stuck?\n\n"
-        "<https://whop.com/@me/settings/memberships/>\n\n"
-        "- Move membership to the correct Whop account\n\n"
-        "Welcome to **Reselling Secrets** :rocket:"
+        "## Welcome to **Reselling Secrets 🚀\n"
+        "### How to Access Reselling Secrets (7-Day Trial)\n"
+        "### 1️⃣ Join & Claim Access\n"
+        "<https://whop.com/profits-pass/profits-pass/>\n"
+        "* Complete checkout\n"
+        "* Connect Discord when prompted\n"
+        "* Access is granted automatically\n"
+        "### 2️⃣ Not Seeing the Server?\n"
+        "<https://whop.com/account/connected-accounts/>\n"
+        "* Make sure Discord is connected\n"
+        "* Confirm you’re logged into the correct Discord account\n"
+        "### 3️⃣ Discord Verification (If Needed)\n"
+        "* Discord → ⚙️ Settings → My Account\n"
+        "* Verify Email\n"
+        "* Click the link sent to your inbox\n"
+        "### 4️⃣ Still Stuck?\n"
+        "<https://whop.com/@me/settings/memberships/>\n"
+        "* Move membership to the correct Whop account"
     )
 
 
@@ -700,78 +770,67 @@ async def _build_what_you_missed_preview_embed() -> tuple[discord.Embed | None, 
     if not isinstance(ch, discord.TextChannel):
         return (None, "")
 
-    msgs: list[discord.Message] = []
+    # Only 1 sample message (most recent post with content/embed/attachment).
+    src: discord.Message | None = None
     with suppress(Exception):
-        async for m in ch.history(limit=int(cfg.preview_limit)):
+        async for m in ch.history(limit=max(10, int(cfg.preview_limit or 1))):
             if not m:
                 continue
             has_content = bool(str(m.content or "").strip())
             has_embeds = bool(getattr(m, "embeds", None))
             has_files = bool(getattr(m, "attachments", None))
             if has_content or has_embeds or has_files:
-                msgs.append(m)
+                src = m
+                break
 
-    if not msgs:
+    if not src:
         return (None, "")
 
-    # newest-first -> reverse for nicer display? spec wants 1..N newest to older in field.
-    msgs_sorted = list(msgs)
-    # Determine jump URL to the channel (use newest message jump as “open source”)
-    source_jump = str(getattr(msgs_sorted[0], "jump_url", "") or "")
+    source_jump = str(getattr(src, "jump_url", "") or "")
 
-    def _title_for(m: discord.Message) -> str:
-        try:
-            if m.embeds and getattr(m.embeds[0], "title", None):
-                t = str(m.embeds[0].title or "").strip()
-                if t:
-                    return t
-        except Exception:
-            pass
-        try:
-            first_line = str(m.content or "").strip().splitlines()[0].strip()
-            if first_line:
-                return first_line
-        except Exception:
-            pass
-        return "New post"
-
-    def _time_for(m: discord.Message) -> str:
-        try:
-            dt = m.created_at.astimezone(timezone.utc)
-            # human time; keep it short
-            return dt.strftime("%Y-%m-%d %H:%M UTC")
-        except Exception:
-            return ""
-
-    lines: list[str] = []
-    newest_img_url = ""
-    newest_msg = msgs_sorted[0]
+    # Build a preview embed that looks like the original post (best-effort).
+    preview: discord.Embed | None = None
     with suppress(Exception):
-        # Prefer image attachment
-        for a in (newest_msg.attachments or []):
-            ctype = str(getattr(a, "content_type", "") or "").lower()
-            if "image" in ctype or str(a.filename or "").lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
-                newest_img_url = str(getattr(a, "url", "") or "")
-                break
-    if not newest_img_url:
-        with suppress(Exception):
-            if newest_msg.embeds and getattr(newest_msg.embeds[0], "image", None):
-                newest_img_url = str(newest_msg.embeds[0].image.url or "")
+        if src.embeds:
+            d = src.embeds[0].to_dict()
+            # Remove noisy footer/timestamp so it matches RSCheckerbot-style cards.
+            d.pop("footer", None)
+            d.pop("timestamp", None)
+            preview = discord.Embed.from_dict(d)
+    if preview is None:
+        txt = str(src.content or "").strip()
+        preview = discord.Embed(description=(txt[:3500] if txt else "—"), color=0x5865F2)
 
-    for i, m in enumerate(msgs_sorted, start=1):
-        title = _title_for(m)
-        author = str(getattr(getattr(m, "author", None), "display_name", "") or "Unknown")
-        when = _time_for(m)
-        jump = str(getattr(m, "jump_url", "") or "")
-        lines.append(f"{i}. **{title}**\n   Posted by {author} • {when}\n   {_embed_link('View Post', jump)}")
+    # Ensure we always have a clear header label.
+    with suppress(Exception):
+        if not str(getattr(preview, "title", "") or "").strip():
+            first_line = str(src.content or "").strip().splitlines()[0].strip() if str(src.content or "").strip() else ""
+            if first_line:
+                preview.title = first_line[:256]
+            else:
+                preview.title = "Latest from #what-you-missed"
 
-    e = discord.Embed(color=0x5865F2, timestamp=_now_utc())
-    e.add_field(name="Latest from #what-you-missed", value="\n".join(lines)[:1024], inline=False)
-    if newest_img_url:
+    # Attach image from attachments if needed (only if embed lacks one).
+    has_img = False
+    with suppress(Exception):
+        has_img = bool(getattr(getattr(preview, "image", None), "url", None))
+    if not has_img:
+        img_url = ""
         with suppress(Exception):
-            e.set_image(url=newest_img_url)
-    e.set_footer(text="RSCheckerbot • Free Pass Preview")
-    return (e, source_jump)
+            for a in (src.attachments or []):
+                ctype = str(getattr(a, "content_type", "") or "").lower()
+                if "image" in ctype or str(a.filename or "").lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+                    img_url = str(getattr(a, "url", "") or "")
+                    break
+        if img_url:
+            with suppress(Exception):
+                preview.set_image(url=img_url)
+
+    # Include a clean link (no pings; no extra footer).
+    with suppress(Exception):
+        preview.add_field(name="View Post", value=_embed_link("Open", source_jump), inline=False)
+
+    return (preview, source_jump)
 
 
 async def open_free_pass_ticket(
@@ -786,9 +845,10 @@ async def open_free_pass_ticket(
     preview_embed, source_jump = await _build_what_you_missed_preview_embed()
     header = build_free_pass_header_embed(member=member, what_you_missed_jump_url=source_jump)
     extra: list[tuple[str, discord.Embed | None]] = []
-    if preview_embed:
-        extra.append(("", preview_embed))
     extra.append((_guide_text(), None))
+    # Put the preview LAST (cleaner; matches requested layout).
+    if preview_embed:
+        extra.append(("**Latest from #what-you-missed**", preview_embed))
 
     return await _open_or_update_ticket(
         ticket_type="free_pass",
