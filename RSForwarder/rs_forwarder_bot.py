@@ -768,27 +768,24 @@ class RSForwarderBot:
             emb.add_field(name="Latest /listreleases", value="❌ no recent release-feed embeds found", inline=False)
             return emb
 
-        # Count enumerated items, parseable pairs, duplicates, and unparseable lines.
-        import re as _re
+        # Analyze the merged run using the robust record parser (handles chunk splits + non-SKU entries).
+        recs = zephyr_release_feed_parser.parse_release_feed_records(merged_text) or []
+        all_ids = sorted({int(getattr(r, "release_id", 0) or 0) for r in recs if int(getattr(r, "release_id", 0) or 0) > 0})
+        total_items = len(all_ids)
 
-        nums = set(_re.findall(r"(?:^|\n)\s*(?:\*\*)?(\d{1,4})\.(?:\*\*)?\s*\+", merged_text, flags=_re.IGNORECASE))
-        total_items = len(nums)
-        items = zephyr_release_feed_parser.parse_release_feed_items(merged_text) or []
-        pairs = [(it.store, it.sku) for it in items]
+        sku_candidate_recs = [r for r in recs if int(getattr(r, "release_id", 0) or 0) > 0 and bool(getattr(r, "is_sku_candidate", True))]
+        non_sku_recs = [r for r in recs if int(getattr(r, "release_id", 0) or 0) > 0 and (not bool(getattr(r, "is_sku_candidate", True)))]
+        parseable_recs = [r for r in sku_candidate_recs if str(getattr(r, "store", "") or "").strip()]
+        sku_unknown_store_recs = [r for r in sku_candidate_recs if not str(getattr(r, "store", "") or "").strip()]
+
+        # SKU maps (public sheet uses SKU uniqueness)
         sku_to_store: Dict[str, str] = {}
         sku_to_rid: Dict[str, int] = {}
-        skus = []
-        parsed_release_ids: Set[int] = set()
-        for it in items:
-            st = str(getattr(it, "store", "") or "").strip()
-            sk = str(getattr(it, "sku", "") or "").strip()
-            rid = 0
-            try:
-                rid = int(getattr(it, "release_id", 0) or 0)
-            except Exception:
-                rid = 0
-            if rid > 0:
-                parsed_release_ids.add(rid)
+        skus: List[str] = []
+        for r in parseable_recs:
+            st = str(getattr(r, "store", "") or "").strip()
+            sk = str(getattr(r, "sku", "") or "").strip()
+            rid = int(getattr(r, "release_id", 0) or 0)
             k = sk.lower()
             if not k:
                 continue
@@ -797,18 +794,9 @@ class RSForwarderBot:
             if k not in sku_to_rid and rid > 0:
                 sku_to_rid[k] = rid
             skus.append(k)
+
         unique_skus = set(skus)
         dupes = max(0, len(skus) - len(unique_skus))
-
-        all_ids = set()
-        for s_id in _re.findall(r"(?:^|\n)\s*(?:\*\*)?(\d{1,4})\.(?:\*\*)?\s*\+", merged_text, flags=_re.IGNORECASE):
-            try:
-                all_ids.add(int(str(s_id or "0").strip() or "0"))
-            except Exception:
-                continue
-        total_items = len([i for i in all_ids if int(i or 0) > 0]) or total_items
-        unparseable_ids = sorted([i for i in all_ids if int(i or 0) > 0 and int(i) not in parsed_release_ids])
-        unparseable_count = len(unparseable_ids)
 
         # Compare to what's currently in the sheet (if enabled)
         existing_set: Set[str] = set()
@@ -827,20 +815,34 @@ class RSForwarderBot:
             value="\n".join(
                 [
                     f"items `{total_items}` • chunks `{chunk_n}`",
-                    f"parseable store+sku `{len(pairs)}` (unique `{len(unique_skus)}`, dupes `{dupes}`)",
-                    f"unparseable `{unparseable_count}`",
+                    f"SKU candidates `{len(sku_candidate_recs)}`",
+                    f"parseable store+sku `{len(parseable_recs)}` (unique `{len(unique_skus)}`, dupes `{dupes}`)",
+                    f"non-SKU `{len(non_sku_recs)}`",
+                    f"SKU but unknown store `{len(sku_unknown_store_recs)}`",
                 ]
             ),
             inline=False,
         )
-        if unparseable_ids:
-            up_lines = []
-            for rid in unparseable_ids[:10]:
-                up_lines.append(f"- `{rid}` `/removereleaseid release_id: {rid}`")
+
+        # Explain why items are not expected to appear in the public sheet.
+        why_lines: List[str] = []
+        cmd_lines: List[str] = []
+        for r in (sku_unknown_store_recs[:6] + non_sku_recs[:6]):
+            rid = int(getattr(r, "release_id", 0) or 0)
+            sk = str(getattr(r, "sku", "") or "").strip()
+            st = str(getattr(r, "store", "") or "").strip()
+            is_sku = bool(getattr(r, "is_sku_candidate", True))
+            kind = "non-SKU" if not is_sku else "unknown-store"
+            why_lines.append(f"- `{rid}` `{kind}` {('`'+st+'`' if st else '')} `{sk}`")
+            if rid:
+                cmd_lines.append(f"/removereleaseid release_id: {rid}")
+        if why_lines:
+            why_val = "\n".join(why_lines).strip()
+            if cmd_lines:
+                why_val = (why_val + "\n\nCommands (copy):\n```\n" + "\n".join(cmd_lines) + "\n```").strip()
             emb.add_field(
-                name="Why some items aren’t in the sheet",
-                value="These release IDs couldn’t be parsed into a store+SKU (often because the monitor tag is missing or formatting changed):\n"
-                + "\n".join(up_lines),
+                name="Why some items aren’t in the public sheet",
+                value=why_val,
                 inline=False,
             )
         if missing:
@@ -848,11 +850,14 @@ class RSForwarderBot:
             for k in missing[:12]:
                 st = sku_to_store.get(k) or "?"
                 rid = int(sku_to_rid.get(k) or 0)
-                cmd = f"/removereleaseid release_id: {rid}" if rid else "/removereleaseid release_id: ?"
-                sample.append(f"- `{rid}` `{st}` `{k}`  `{cmd}`")
+                sample.append(f"- `{rid}` `{st}` `{k}`")
+            cmd_lines2 = [f"/removereleaseid release_id: {int(sku_to_rid.get(k) or 0)}" for k in missing[:12] if int(sku_to_rid.get(k) or 0) > 0]
+            val2 = f"`{len(missing)}`\n" + "\n".join(sample)
+            if cmd_lines2:
+                val2 = (val2 + "\n\nCommands (copy):\n```\n" + "\n".join(cmd_lines2) + "\n```").strip()
             emb.add_field(
                 name="Missing from sheet (parseable SKUs)",
-                value=f"`{len(missing)}`\n" + "\n".join(sample),
+                value=val2,
                 inline=False,
             )
         if extra:
@@ -2442,7 +2447,10 @@ class RSForwarderBot:
 
                     for e in entries:
                         u0 = (getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
+                        prev_aff = str(getattr(e, "affiliate_url", "") or "").strip()
                         aff = (aff_map.get(u0) or "").strip() if u0 else ""
+                        if not aff:
+                            aff = prev_aff
                         enriched.append(
                             rs_fs_sheet_sync.RsFsPreviewEntry(
                                 store=getattr(e, "store", "") or "",
@@ -3865,7 +3873,10 @@ class RSForwarderBot:
                             enriched: List[rs_fs_sheet_sync.RsFsPreviewEntry] = []
                             for e in entries:
                                 u0 = (getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
+                                prev_aff = str(getattr(e, "affiliate_url", "") or "").strip()
                                 aff = (aff_map.get(u0) or "").strip() if u0 else ""
+                                if not aff:
+                                    aff = prev_aff
                                 enriched.append(
                                     rs_fs_sheet_sync.RsFsPreviewEntry(
                                         store=getattr(e, "store", "") or "",
@@ -3965,24 +3976,29 @@ class RSForwarderBot:
                                 st = str(getattr(e, "store", "") or "").strip() or "Unknown"
                                 by_store.setdefault(st, []).append(e)
 
-                            # Collect "unparseable" release IDs as: IDs present in the merged list that
-                            # did NOT parse into a (store, sku) ZephyrReleaseFeedItem.
-                            import re as _re
-
-                            all_ids: Set[int] = set()
-                            for s_id in _re.findall(r"(?:^|\n)\s*(?:\*\*)?(\d{1,4})\.(?:\*\*)?\s*\+", merged_text, flags=_re.IGNORECASE):
-                                try:
-                                    v = int(str(s_id or "0").strip() or "0")
-                                    if v > 0:
-                                        all_ids.add(v)
-                                except Exception:
-                                    continue
+                            # Collect "unparseable" records as: release IDs present in the merged list that
+                            # did NOT parse into a (store, sku) item for the public sheet.
                             parsed_ids: Set[int] = set()
                             try:
                                 parsed_ids = {int(v) for v in (rid_by_key or {}).values() if int(v or 0) > 0}
                             except Exception:
                                 parsed_ids = set()
-                            unparseable_ids = sorted([i for i in all_ids if i not in parsed_ids])
+                            recs0 = zephyr_release_feed_parser.parse_release_feed_records(merged_text) or []
+                            unparseable_recs = [
+                                r
+                                for r in recs0
+                                if int(getattr(r, "release_id", 0) or 0) > 0 and int(getattr(r, "release_id", 0) or 0) not in parsed_ids
+                            ]
+                            # Deduplicate by release_id (keep first).
+                            seen_rid: Set[int] = set()
+                            unparseable_recs2 = []
+                            for r in unparseable_recs:
+                                ridv = int(getattr(r, "release_id", 0) or 0)
+                                if ridv in seen_rid:
+                                    continue
+                                seen_rid.add(ridv)
+                                unparseable_recs2.append(r)
+                            unparseable_recs = unparseable_recs2
 
                             # Sort stores for stability.
                             for st in sorted(by_store.keys(), key=lambda s: s.lower()):
@@ -4018,7 +4034,7 @@ class RSForwarderBot:
                                     cmd_block = "\n".join(cmd_lines).strip()
                                     if not cmd_block:
                                         return info_block
-                                    return (info_block + "\n\nCommands (copy):\n```" + cmd_block + "```").strip()
+                                    return (info_block + "\n\nCommands (copy):\n```\n" + cmd_block + "\n```").strip()
 
                                 for info_ln, cmd_ln in pairs2:
                                     next_info = cur_info + [info_ln]
@@ -4048,19 +4064,25 @@ class RSForwarderBot:
                                     emb2.set_footer(text="Use the code block copy button")
                                     await ctx.send(embed=emb2, allowed_mentions=discord.AllowedMentions.none())
 
-                            if unparseable_ids:
+                            if unparseable_recs:
                                 up_info: List[str] = []
                                 up_cmds: List[str] = []
-                                for rid2 in unparseable_ids[:25]:
-                                    up_info.append(f"`{rid2}`")
-                                    up_cmds.append(f"/removereleaseid release_id: {rid2}")
+                                for r in unparseable_recs[:25]:
+                                    rid2 = int(getattr(r, "release_id", 0) or 0)
+                                    sk2 = str(getattr(r, "sku", "") or "").strip()
+                                    st2 = str(getattr(r, "store", "") or "").strip()
+                                    is_sku2 = bool(getattr(r, "is_sku_candidate", True))
+                                    kind = "non-SKU" if not is_sku2 else ("unknown-store" if not st2 else "unknown")
+                                    up_info.append(f"`{rid2}` `{kind}` `{sk2}`")
+                                    if rid2:
+                                        up_cmds.append(f"/removereleaseid release_id: {rid2}")
                                 emb_u = discord.Embed(
                                     title="RS-FS Remove Helper — Unparseable (could not parse store/SKU)",
                                     color=discord.Color.orange(),
                                 )
                                 desc = "\n".join(up_info).strip()
                                 if up_cmds:
-                                    desc = (desc + "\n\nCommands (copy):\n```" + "\n".join(up_cmds) + "```").strip()
+                                    desc = (desc + "\n\nCommands (copy):\n```\n" + "\n".join(up_cmds) + "\n```").strip()
                                 emb_u.description = desc
                                 emb_u.set_footer(text="These release IDs could not be mapped to a store/SKU automatically • Use code block copy")
                                 await ctx.send(embed=emb_u, allowed_mentions=discord.AllowedMentions.none())
