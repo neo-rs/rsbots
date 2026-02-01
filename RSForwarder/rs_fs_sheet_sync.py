@@ -332,6 +332,9 @@ class RsFsSheetSync:
         self._dedupe_skus: Set[str] = set()
         self._dedupe_last_fetch_ts: float = 0.0
         self._last_service_error: str = ""
+        # IMPORTANT: googleapiclient/httplib2 are not reliably thread-safe across concurrent calls.
+        # RSForwarder can process multiple Zephyr chunks rapidly; serialize all Sheets API usage.
+        self._api_lock: asyncio.Lock = asyncio.Lock()
 
     def refresh_config(self, cfg: Dict[str, Any]) -> None:
         self.cfg = cfg or {}
@@ -373,41 +376,43 @@ class RsFsSheetSync:
         Non-mutating check: validate credentials + access to spreadsheet/tab and count existing SKUs.
         Returns: (ok, message, tab_name, existing_sku_count)
         """
-        if not self.enabled():
-            return False, "disabled", None, 0
-        if not self._sheet_cfg.spreadsheet_id:
-            return False, "missing spreadsheet id", None, 0
-        service = self._get_service()
-        if not service:
-            err = self.last_service_error() or "missing google service / deps"
-            return False, err, None, 0
-        tab = await self._resolve_tab_name()
-        if not tab:
-            return False, "missing tab name/gid", None, 0
-        try:
-            await self._fetch_existing_skus_if_needed()
-        except Exception as e:
-            return False, f"failed to read existing SKUs: {e}", tab, 0
-        return True, "ok", tab, len(self._dedupe_skus or set())
+        async with self._api_lock:
+            if not self.enabled():
+                return False, "disabled", None, 0
+            if not self._sheet_cfg.spreadsheet_id:
+                return False, "missing spreadsheet id", None, 0
+            service = self._get_service()
+            if not service:
+                err = self.last_service_error() or "missing google service / deps"
+                return False, err, None, 0
+            tab = await self._resolve_tab_name()
+            if not tab:
+                return False, "missing tab name/gid", None, 0
+            try:
+                await self._fetch_existing_skus_if_needed()
+            except Exception as e:
+                return False, f"failed to read existing SKUs: {e}", tab, 0
+            return True, "ok", tab, len(self._dedupe_skus or set())
 
     async def filter_new_pairs(self, pairs: Sequence[Tuple[str, str]]) -> List[Tuple[str, str]]:
         """
         Filter (store, sku) pairs down to only SKUs not already present in the sheet.
         If sheet isn't enabled or we can't read the sheet, returns the input pairs unchanged.
         """
-        if not self.enabled():
-            return list(pairs or [])
-        try:
-            await self._fetch_existing_skus_if_needed()
-        except Exception:
-            return list(pairs or [])
-        out: List[Tuple[str, str]] = []
-        for st, sk in (pairs or []):
-            sku = str(sk or "").strip().lower()
-            if sku and sku in (self._dedupe_skus or set()):
-                continue
-            out.append((st, sk))
-        return out
+        async with self._api_lock:
+            if not self.enabled():
+                return list(pairs or [])
+            try:
+                await self._fetch_existing_skus_if_needed()
+            except Exception:
+                return list(pairs or [])
+            out: List[Tuple[str, str]] = []
+            for st, sk in (pairs or []):
+                sku = str(sk or "").strip().lower()
+                if sku and sku in (self._dedupe_skus or set()):
+                    continue
+                out.append((st, sk))
+            return out
 
     async def _resolve_tab_name(self) -> Optional[str]:
         if self._tab_name_cache:
@@ -599,7 +604,8 @@ class RsFsSheetSync:
             return False, "missing tab name/gid", 0, 0, 0
 
         # Current sheet rows keyed by SKU (column B)
-        existing = await self._fetch_existing_sku_row_map()
+        async with self._api_lock:
+            existing = await self._fetch_existing_sku_row_map()
 
         desired_keys: Set[str] = set()
         to_update: List[Tuple[int, List[str], List[str]]] = []
@@ -641,7 +647,8 @@ class RsFsSheetSync:
                 ).execute()
 
             try:
-                await asyncio.to_thread(_do_update)
+                async with self._api_lock:
+                    await asyncio.to_thread(_do_update)
                 updated_count = len(to_update)
             except Exception as e:
                 return False, f"update failed: {e}", 0, 0, 0
@@ -653,7 +660,8 @@ class RsFsSheetSync:
 
         # Delete stale SKUs (rows present in sheet but not in desired list)
         stale_rows = [row_i for (sku, row_i) in (existing or {}).items() if sku not in desired_keys]
-        deleted_count = await self._delete_rows_by_indices(stale_rows)
+        async with self._api_lock:
+            deleted_count = await self._delete_rows_by_indices(stale_rows)
 
         # Reset dedupe cache so subsequent runs see fresh sheet state.
         self._dedupe_skus = set()
@@ -684,7 +692,8 @@ class RsFsSheetSync:
         if not tab:
             return False, "missing tab name/gid", 0, 0
 
-        existing = await self._fetch_existing_sku_row_map()
+        async with self._api_lock:
+            existing = await self._fetch_existing_sku_row_map()
 
         to_update: List[Tuple[int, List[str], List[str]]] = []
         to_add: List[List[str]] = []
@@ -722,7 +731,8 @@ class RsFsSheetSync:
                 ).execute()
 
             try:
-                await asyncio.to_thread(_do_update)
+                async with self._api_lock:
+                    await asyncio.to_thread(_do_update)
                 updated_count = len(to_update)
             except Exception as e:
                 return False, f"update failed: {e}", 0, 0
@@ -740,253 +750,254 @@ class RsFsSheetSync:
         """
         Append rows. Returns (ok, message, added_count).
         """
-        if not self.enabled():
-            return False, "disabled", 0
-        if not rows:
-            return True, "no rows", 0
-        if not self._sheet_cfg.spreadsheet_id:
-            return False, "missing spreadsheet id", 0
+        async with self._api_lock:
+            if not self.enabled():
+                return False, "disabled", 0
+            if not rows:
+                return True, "no rows", 0
+            if not self._sheet_cfg.spreadsheet_id:
+                return False, "missing spreadsheet id", 0
 
-        service = self._get_service()
-        if not service:
-            err = self.last_service_error() or "missing google service account / deps"
-            return False, f"google sheets client not ready: {err}", 0
+            service = self._get_service()
+            if not service:
+                err = self.last_service_error() or "missing google service account / deps"
+                return False, f"google sheets client not ready: {err}", 0
 
-        tab = await self._resolve_tab_name()
-        if not tab:
-            return False, "missing tab name/gid", 0
+            tab = await self._resolve_tab_name()
+            if not tab:
+                return False, "missing tab name/gid", 0
 
-        # Dedupe by SKU (column B)
-        await self._fetch_existing_skus_if_needed()
-        new_rows: List[List[str]] = []
-        new_rows_gh: List[List[str]] = []
-        for r in rows:
-            row = [str(c or "") for c in r]
-            sku = (row[1] if len(row) > 1 else "").strip().lower()
-            if sku and sku in self._dedupe_skus:
-                continue
-            # A/B/C are required; G/H are optional (row[3], row[4])
-            abc = row[:3] + ([""] * max(0, 3 - len(row)))
-            aff = (row[3] if len(row) > 3 else "").strip()
-            mon = (row[4] if len(row) > 4 else "").strip()
-            new_rows.append(abc)
-            new_rows_gh.append([aff, mon])
+            # Dedupe by SKU (column B)
+            await self._fetch_existing_skus_if_needed()
+            new_rows: List[List[str]] = []
+            new_rows_gh: List[List[str]] = []
+            for r in rows:
+                row = [str(c or "") for c in r]
+                sku = (row[1] if len(row) > 1 else "").strip().lower()
+                if sku and sku in self._dedupe_skus:
+                    continue
+                # A/B/C are required; G/H are optional (row[3], row[4])
+                abc = row[:3] + ([""] * max(0, 3 - len(row)))
+                aff = (row[3] if len(row) > 3 else "").strip()
+                mon = (row[4] if len(row) > 4 else "").strip()
+                new_rows.append(abc)
+                new_rows_gh.append([aff, mon])
 
-        if not new_rows:
-            return True, "all rows already exist", 0
+            if not new_rows:
+                return True, "all rows already exist", 0
 
-        rng = f"'{tab}'!A:C"
+            rng = f"'{tab}'!A:C"
 
-        def _do() -> dict:
-            return service.spreadsheets().values().append(
-                spreadsheetId=self._sheet_cfg.spreadsheet_id,
-                range=rng,
-                valueInputOption="USER_ENTERED",
-                insertDataOption="INSERT_ROWS",
-                body={"values": new_rows},
-            ).execute()
+            def _do() -> dict:
+                return service.spreadsheets().values().append(
+                    spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                    range=rng,
+                    valueInputOption="USER_ENTERED",
+                    insertDataOption="INSERT_ROWS",
+                    body={"values": new_rows},
+                ).execute()
 
-        try:
-            resp = await asyncio.to_thread(_do)
-        except Exception as e:
-            return False, f"append failed: {e}", 0
+            try:
+                resp = await asyncio.to_thread(_do)
+            except Exception as e:
+                return False, f"append failed: {e}", 0
 
-        # Try to copy down formulas/validation/formatting for D/E/I/J/K from a template row,
-        # so newly inserted rows behave like manual sheet entry (STORE LINK, dropdowns, etc.).
-        try:
-            sheet_id = int(self._sheet_cfg.tab_gid or 0)
-        except Exception:
-            sheet_id = 0
-        try:
-            updated_range = ""
-            if isinstance(resp, dict):
-                updates = resp.get("updates") if isinstance(resp.get("updates"), dict) else {}
-                updated_range = str((updates or {}).get("updatedRange") or "").strip()
-            m = re.search(r"!A(\d+):C(\d+)", updated_range)
-            if sheet_id and m:
-                start_row = int(m.group(1))
-                end_row = int(m.group(2))
-                if end_row >= start_row:
-                    # Template row:
-                    # - Prefer the row immediately above (most common: last populated row)
-                    # - If we just inserted into row 2 (empty sheet case), try the row immediately below.
-                    template_row = start_row - 1
-                    if template_row < 2:
-                        template_row = end_row + 1
+            # Try to copy down formulas/validation/formatting for D/E/I/J/K from a template row,
+            # so newly inserted rows behave like manual sheet entry (STORE LINK, dropdowns, etc.).
+            try:
+                sheet_id = int(self._sheet_cfg.tab_gid or 0)
+            except Exception:
+                sheet_id = 0
+            try:
+                updated_range = ""
+                if isinstance(resp, dict):
+                    updates = resp.get("updates") if isinstance(resp.get("updates"), dict) else {}
+                    updated_range = str((updates or {}).get("updatedRange") or "").strip()
+                m = re.search(r"!A(\d+):C(\d+)", updated_range)
+                if sheet_id and m:
+                    start_row = int(m.group(1))
+                    end_row = int(m.group(2))
+                    if end_row >= start_row:
+                        # Template row:
+                        # - Prefer the row immediately above (most common: last populated row)
+                        # - If we just inserted into row 2 (empty sheet case), try the row immediately below.
+                        template_row = start_row - 1
+                        if template_row < 2:
+                            template_row = end_row + 1
 
-                    # Lazy import for Sheets batchUpdate request shapes (same deps).
-                    service = self._get_service()
-                    if service and template_row >= 2:
-                        # 0-based indices for GridRange
-                        src_row_start = template_row - 1
-                        src_row_end = template_row
-                        dst_row_start = start_row - 1
-                        dst_row_end = end_row
+                        # Lazy import for Sheets batchUpdate request shapes (same deps).
+                        service = self._get_service()
+                        if service and template_row >= 2:
+                            # 0-based indices for GridRange
+                            src_row_start = template_row - 1
+                            src_row_end = template_row
+                            dst_row_start = start_row - 1
+                            dst_row_end = end_row
 
-                        # Column indices (0-based): A=0 ... K=10
-                        # We copy:
-                        # - Formulas: D, I, J, K
-                        # - Validation + formatting: D:K
-                        reqs = [
-                            {
-                                "copyPaste": {
-                                    "source": {
-                                        "sheetId": sheet_id,
-                                        "startRowIndex": src_row_start,
-                                        "endRowIndex": src_row_end,
-                                        "startColumnIndex": 3,
-                                        "endColumnIndex": 4,
-                                    },
-                                    "destination": {
-                                        "sheetId": sheet_id,
-                                        "startRowIndex": dst_row_start,
-                                        "endRowIndex": dst_row_end,
-                                        "startColumnIndex": 3,
-                                        "endColumnIndex": 4,
-                                    },
-                                    "pasteType": "PASTE_FORMULA",
-                                }
-                            },
-                            {
-                                "copyPaste": {
-                                    "source": {
-                                        "sheetId": sheet_id,
-                                        "startRowIndex": src_row_start,
-                                        "endRowIndex": src_row_end,
-                                        "startColumnIndex": 8,
-                                        "endColumnIndex": 9,
-                                    },
-                                    "destination": {
-                                        "sheetId": sheet_id,
-                                        "startRowIndex": dst_row_start,
-                                        "endRowIndex": dst_row_end,
-                                        "startColumnIndex": 8,
-                                        "endColumnIndex": 9,
-                                    },
-                                    "pasteType": "PASTE_FORMULA",
-                                }
-                            },
-                            {
-                                "copyPaste": {
-                                    "source": {
-                                        "sheetId": sheet_id,
-                                        "startRowIndex": src_row_start,
-                                        "endRowIndex": src_row_end,
-                                        "startColumnIndex": 9,
-                                        "endColumnIndex": 10,
-                                    },
-                                    "destination": {
-                                        "sheetId": sheet_id,
-                                        "startRowIndex": dst_row_start,
-                                        "endRowIndex": dst_row_end,
-                                        "startColumnIndex": 9,
-                                        "endColumnIndex": 10,
-                                    },
-                                    "pasteType": "PASTE_FORMULA",
-                                }
-                            },
-                            {
-                                "copyPaste": {
-                                    "source": {
-                                        "sheetId": sheet_id,
-                                        "startRowIndex": src_row_start,
-                                        "endRowIndex": src_row_end,
-                                        "startColumnIndex": 10,
-                                        "endColumnIndex": 11,
-                                    },
-                                    "destination": {
-                                        "sheetId": sheet_id,
-                                        "startRowIndex": dst_row_start,
-                                        "endRowIndex": dst_row_end,
-                                        "startColumnIndex": 10,
-                                        "endColumnIndex": 11,
-                                    },
-                                    "pasteType": "PASTE_FORMULA",
-                                }
-                            },
-                            # Data validation + formatting for D:K (no values)
-                            {
-                                "copyPaste": {
-                                    "source": {
-                                        "sheetId": sheet_id,
-                                        "startRowIndex": src_row_start,
-                                        "endRowIndex": src_row_end,
-                                        "startColumnIndex": 3,
-                                        "endColumnIndex": 11,
-                                    },
-                                    "destination": {
-                                        "sheetId": sheet_id,
-                                        "startRowIndex": dst_row_start,
-                                        "endRowIndex": dst_row_end,
-                                        "startColumnIndex": 3,
-                                        "endColumnIndex": 11,
-                                    },
-                                    "pasteType": "PASTE_DATA_VALIDATION",
-                                }
-                            },
-                            {
-                                "copyPaste": {
-                                    "source": {
-                                        "sheetId": sheet_id,
-                                        "startRowIndex": src_row_start,
-                                        "endRowIndex": src_row_end,
-                                        "startColumnIndex": 3,
-                                        "endColumnIndex": 11,
-                                    },
-                                    "destination": {
-                                        "sheetId": sheet_id,
-                                        "startRowIndex": dst_row_start,
-                                        "endRowIndex": dst_row_end,
-                                        "startColumnIndex": 3,
-                                        "endColumnIndex": 11,
-                                    },
-                                    "pasteType": "PASTE_FORMAT",
-                                }
-                            },
-                        ]
+                            # Column indices (0-based): A=0 ... K=10
+                            # We copy:
+                            # - Formulas: D, I, J, K
+                            # - Validation + formatting: D:K
+                            reqs = [
+                                {
+                                    "copyPaste": {
+                                        "source": {
+                                            "sheetId": sheet_id,
+                                            "startRowIndex": src_row_start,
+                                            "endRowIndex": src_row_end,
+                                            "startColumnIndex": 3,
+                                            "endColumnIndex": 4,
+                                        },
+                                        "destination": {
+                                            "sheetId": sheet_id,
+                                            "startRowIndex": dst_row_start,
+                                            "endRowIndex": dst_row_end,
+                                            "startColumnIndex": 3,
+                                            "endColumnIndex": 4,
+                                        },
+                                        "pasteType": "PASTE_FORMULA",
+                                    }
+                                },
+                                {
+                                    "copyPaste": {
+                                        "source": {
+                                            "sheetId": sheet_id,
+                                            "startRowIndex": src_row_start,
+                                            "endRowIndex": src_row_end,
+                                            "startColumnIndex": 8,
+                                            "endColumnIndex": 9,
+                                        },
+                                        "destination": {
+                                            "sheetId": sheet_id,
+                                            "startRowIndex": dst_row_start,
+                                            "endRowIndex": dst_row_end,
+                                            "startColumnIndex": 8,
+                                            "endColumnIndex": 9,
+                                        },
+                                        "pasteType": "PASTE_FORMULA",
+                                    }
+                                },
+                                {
+                                    "copyPaste": {
+                                        "source": {
+                                            "sheetId": sheet_id,
+                                            "startRowIndex": src_row_start,
+                                            "endRowIndex": src_row_end,
+                                            "startColumnIndex": 9,
+                                            "endColumnIndex": 10,
+                                        },
+                                        "destination": {
+                                            "sheetId": sheet_id,
+                                            "startRowIndex": dst_row_start,
+                                            "endRowIndex": dst_row_end,
+                                            "startColumnIndex": 9,
+                                            "endColumnIndex": 10,
+                                        },
+                                        "pasteType": "PASTE_FORMULA",
+                                    }
+                                },
+                                {
+                                    "copyPaste": {
+                                        "source": {
+                                            "sheetId": sheet_id,
+                                            "startRowIndex": src_row_start,
+                                            "endRowIndex": src_row_end,
+                                            "startColumnIndex": 10,
+                                            "endColumnIndex": 11,
+                                        },
+                                        "destination": {
+                                            "sheetId": sheet_id,
+                                            "startRowIndex": dst_row_start,
+                                            "endRowIndex": dst_row_end,
+                                            "startColumnIndex": 10,
+                                            "endColumnIndex": 11,
+                                        },
+                                        "pasteType": "PASTE_FORMULA",
+                                    }
+                                },
+                                # Data validation + formatting for D:K (no values)
+                                {
+                                    "copyPaste": {
+                                        "source": {
+                                            "sheetId": sheet_id,
+                                            "startRowIndex": src_row_start,
+                                            "endRowIndex": src_row_end,
+                                            "startColumnIndex": 3,
+                                            "endColumnIndex": 11,
+                                        },
+                                        "destination": {
+                                            "sheetId": sheet_id,
+                                            "startRowIndex": dst_row_start,
+                                            "endRowIndex": dst_row_end,
+                                            "startColumnIndex": 3,
+                                            "endColumnIndex": 11,
+                                        },
+                                        "pasteType": "PASTE_DATA_VALIDATION",
+                                    }
+                                },
+                                {
+                                    "copyPaste": {
+                                        "source": {
+                                            "sheetId": sheet_id,
+                                            "startRowIndex": src_row_start,
+                                            "endRowIndex": src_row_end,
+                                            "startColumnIndex": 3,
+                                            "endColumnIndex": 11,
+                                        },
+                                        "destination": {
+                                            "sheetId": sheet_id,
+                                            "startRowIndex": dst_row_start,
+                                            "endRowIndex": dst_row_end,
+                                            "startColumnIndex": 3,
+                                            "endColumnIndex": 11,
+                                        },
+                                        "pasteType": "PASTE_FORMAT",
+                                    }
+                                },
+                            ]
 
-                        def _do_copy() -> None:
-                            service.spreadsheets().batchUpdate(
+                            def _do_copy() -> None:
+                                service.spreadsheets().batchUpdate(
+                                    spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                                    body={"requests": reqs},
+                                ).execute()
+
+                            await asyncio.to_thread(_do_copy)
+            except Exception:
+                # Never fail the append just because formatting copy didn't work.
+                pass
+
+            # Best-effort: populate G/H for the appended rows without touching D/E/F (avoids breaking arrayformulas).
+            try:
+                updated_range = ""
+                if isinstance(resp, dict):
+                    updates = resp.get("updates") if isinstance(resp.get("updates"), dict) else {}
+                    updated_range = str((updates or {}).get("updatedRange") or "").strip()
+                m = re.search(r"!A(\d+):C(\d+)", updated_range)
+                if m:
+                    start_row = int(m.group(1))
+                    end_row = int(m.group(2))
+                    if start_row > 0 and end_row >= start_row and (end_row - start_row + 1) == len(new_rows_gh):
+                        rng_gh = f"'{tab}'!G{start_row}:H{end_row}"
+
+                        def _do_gh() -> None:
+                            service.spreadsheets().values().update(
                                 spreadsheetId=self._sheet_cfg.spreadsheet_id,
-                                body={"requests": reqs},
+                                range=rng_gh,
+                                valueInputOption="USER_ENTERED",
+                                body={"values": new_rows_gh},
                             ).execute()
 
-                        await asyncio.to_thread(_do_copy)
-        except Exception:
-            # Never fail the append just because formatting copy didn't work.
-            pass
+                        await asyncio.to_thread(_do_gh)
+            except Exception:
+                # Don't fail the whole append if G/H write fails (sheet can be fixed manually).
+                pass
 
-        # Best-effort: populate G/H for the appended rows without touching D/E/F (avoids breaking arrayformulas).
-        try:
-            updated_range = ""
-            if isinstance(resp, dict):
-                updates = resp.get("updates") if isinstance(resp.get("updates"), dict) else {}
-                updated_range = str((updates or {}).get("updatedRange") or "").strip()
-            m = re.search(r"!A(\d+):C(\d+)", updated_range)
-            if m:
-                start_row = int(m.group(1))
-                end_row = int(m.group(2))
-                if start_row > 0 and end_row >= start_row and (end_row - start_row + 1) == len(new_rows_gh):
-                    rng_gh = f"'{tab}'!G{start_row}:H{end_row}"
-
-                    def _do_gh() -> None:
-                        service.spreadsheets().values().update(
-                            spreadsheetId=self._sheet_cfg.spreadsheet_id,
-                            range=rng_gh,
-                            valueInputOption="USER_ENTERED",
-                            body={"values": new_rows_gh},
-                        ).execute()
-
-                    await asyncio.to_thread(_do_gh)
-        except Exception:
-            # Don't fail the whole append if G/H write fails (sheet can be fixed manually).
-            pass
-
-        for r in new_rows:
-            sku = (r[1] or "").strip().lower()
-            if sku:
-                self._dedupe_skus.add(sku)
-        return True, "ok", len(new_rows)
+            for r in new_rows:
+                sku = (r[1] or "").strip().lower()
+                if sku:
+                    self._dedupe_skus.add(sku)
+            return True, "ok", len(new_rows)
 
 
 async def build_rows_with_titles(pairs: Iterable[Tuple[str, str]], cfg: Dict[str, Any]) -> List[List[str]]:
