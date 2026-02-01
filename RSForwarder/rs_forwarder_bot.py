@@ -2191,7 +2191,13 @@ class RSForwarderBot:
                 if ok:
                     await ctx.send(f"✅ RS-FS sheet OK. spreadsheet_id=`{sid}` tab=`{tab}` (gid={gid}) existing_skus≈{n}")
                 else:
-                    await ctx.send(f"❌ RS-FS sheet NOT ready: {msg}. spreadsheet_id=`{sid}` tab_gid=`{gid}`")
+                    extra = ""
+                    try:
+                        extra = (self._rs_fs_sheet.last_service_error() or "").strip()
+                    except Exception:
+                        extra = ""
+                    hint = f" ({extra})" if extra and extra not in msg else ""
+                    await ctx.send(f"❌ RS-FS sheet NOT ready: {msg}{hint}. spreadsheet_id=`{sid}` tab_gid=`{gid}`")
             except Exception as e:
                 await ctx.send(f"❌ RS-FS check failed: {str(e)[:200]}")
         

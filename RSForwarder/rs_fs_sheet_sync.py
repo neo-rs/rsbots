@@ -331,10 +331,15 @@ class RsFsSheetSync:
             self._last_service_error = "missing google service account json/file"
             return None
         try:
-            self._service = _build_sheets_service(info)
+            try:
+                self._service = _build_sheets_service(info)
+            except ImportError as e:
+                self._service = None
+                self._last_service_error = f"missing google libs: {e}"
+                return None
             self._last_service_error = ""
-        except Exception:
-            self._last_service_error = "failed to initialize google sheets client (missing deps or invalid credentials)"
+        except Exception as e:
+            self._last_service_error = f"failed to initialize google sheets client: {e}"
             self._service = None
         return self._service
 
@@ -464,7 +469,8 @@ class RsFsSheetSync:
 
         service = self._get_service()
         if not service:
-            return False, "missing google service account / deps", 0
+            err = self.last_service_error() or "missing google service account / deps"
+            return False, f"google sheets client not ready: {err}", 0
 
         tab = await self._resolve_tab_name()
         if not tab:
