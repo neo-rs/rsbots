@@ -414,6 +414,45 @@ def _ticket_case_key(*, ticket_id: str) -> str:
     return f"rschecker_support_ticket:{str(ticket_id or '').strip()}"
 
 
+def _support_ping_role_mention() -> str:
+    """Single support ping role mention (first staff_role_id)."""
+    cfg = _cfg()
+    if not cfg:
+        return ""
+    rid = 0
+    with suppress(Exception):
+        rid = next((int(x) for x in (cfg.staff_role_ids or []) if int(x) > 0), 0)
+    return f"<@&{int(rid)}>" if int(rid or 0) > 0 else ""
+
+
+async def _ensure_staff_roles_can_view_channel(
+    *,
+    guild: discord.Guild,
+    channel: discord.TextChannel,
+    staff_role_ids: list[int],
+) -> None:
+    """Best-effort: ensure staff roles in config can view the ticket channel."""
+    if not isinstance(guild, discord.Guild) or not isinstance(channel, discord.TextChannel):
+        return
+    for rid in list(dict.fromkeys([int(x) for x in (staff_role_ids or []) if int(x) > 0])):
+        role = guild.get_role(int(rid))
+        if not role:
+            await _log(f"⚠️ support_tickets: staff_role_id not found in guild (role_id={rid})")
+            continue
+        with suppress(Exception):
+            perms = channel.permissions_for(role)
+            if bool(getattr(perms, "view_channel", False)):
+                continue
+        with suppress(Exception):
+            await channel.set_permissions(
+                role,
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                reason="RSCheckerbot: ensure support role access",
+            )
+
+
 def _build_overwrites(
     *,
     guild: discord.Guild,
@@ -613,12 +652,18 @@ async def _open_or_update_ticket(
             await _log(f"❌ support_tickets: failed to create ticket channel type={ticket_type} user_id={owner.id}")
             return None
 
+        # Safety: ensure configured staff roles can view the channel (especially if a channel was found pre-existing).
+        with suppress(Exception):
+            await _ensure_staff_roles_can_view_channel(guild=guild, channel=ch, staff_role_ids=cfg.staff_role_ids)
+
         # Initial messages (minimal)
         if cfg.include_ticket_owner_in_channel:
             with suppress(Exception):
+                role_mention = _support_ping_role_mention()
+                ping = " ".join([x for x in [f"<@{int(owner.id)}>", role_mention] if str(x or "").strip()])
                 await ch.send(
-                    content=f"<@{int(owner.id)}>",
-                    allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+                    content=ping,
+                    allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
                 )
         # Preview + controls (single message, buttons attached; no command text)
         with suppress(Exception):

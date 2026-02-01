@@ -225,8 +225,8 @@
       "_comment": "Staff can run !transcript/!close and view all ticket channels. Admin roles are optional; administrators are always treated as allowed.",
       "staff_role_ids": [876588092927115284],
       "admin_role_ids": [876598078092754985],
-      "_comment_include_owner": "Temporarily disable adding the member to the ticket channel (staff-only) until finalized.",
-      "include_ticket_owner_in_channel": false
+      "_comment_include_owner": "When true, the ticket owner can see/respond in their ticket channel.",
+      "include_ticket_owner_in_channel": true
     },
     "ticket_categories": {
       "billing_category_id": 1467157354977165537,
