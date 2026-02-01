@@ -11,6 +11,12 @@ class ZephyrReleaseFeedItem:
     sku: str
     store: str
     source_tag: str
+    # Extra metadata for robust downstream behavior (Current List tab, reporting, etc.)
+    monitor_tag: str = ""
+    category: str = ""
+    channel_id: str = ""
+    raw_text: str = ""
+    is_sku_candidate: bool = True
 
 
 _HEADER_RE = re.compile(r"release\s+feed\(s\)", re.IGNORECASE)
@@ -19,6 +25,7 @@ _MONITOR_RE = re.compile(r"\b([a-z0-9]+(?:[-_][a-z0-9]+)*)-monitor\b", re.IGNORE
 _BRACKET_RE = re.compile(r"\[([^\]]+)\]")
 _ITEM_START_INLINE_RE = re.compile(r"(?:^|\s)(\d{1,4})\s*\.\s*([+-]{1,2})\s*([^|\[]+?)(?=\s*(?:\||\[))")
 _MD_BOLD_RE = re.compile(r"\*\*")
+_CHANNEL_ID_RE = re.compile(r"\bchannel\s*id\s*:\s*(\d{10,})\b", re.IGNORECASE)
 
 
 def looks_like_release_feed_embed_text(text: str) -> bool:
@@ -28,8 +35,20 @@ def looks_like_release_feed_embed_text(text: str) -> bool:
     if _HEADER_RE.search(t):
         return True
     low = t.lower()
-    # Zephyr often splits the list across multiple embeds; continuation parts may not include the header.
-    if "zephyr companion bot" in low and "-monitor" in low and re.search(r"\b\d{1,4}\s*\.", low):
+    # Zephyr often splits the list across multiple messages/embeds.
+    # Continuation parts may:
+    # - omit the "Release Feed(s)" header
+    # - place the `[*-monitor]` tag on a separate message
+    # - include numbered release lines without an inline `-monitor` token (tag appears on next line/message)
+    if "zephyr companion bot" in low:
+        # Tag-only continuation message (no numbers).
+        if "-monitor" in low:
+            return True
+        # Numbered list lines (e.g. "61. +2025 topps chrome ... | Channel ID: ...")
+        if re.search(r"\b\d{1,4}\s*\.\s*[+-]", low):
+            return True
+    # Also accept any text that clearly contains monitor tags (even if author string differs).
+    if "-monitor" in low and (_BRACKET_RE.search(t) or _MONITOR_RE.search(t)):
         return True
     return False
 
@@ -132,98 +151,119 @@ def _strip_markdown(s: str) -> str:
     return t
 
 
-def parse_release_feed_items(text: str) -> List[ZephyrReleaseFeedItem]:
+def _is_sku_candidate(token: str) -> bool:
     """
-    Parse Zephyr "Release Feed(s) in this server:" embed text into (sku, store, monitor).
-
-    Expected shape (example):
-      Release Feed(s) in this server:
-      1. +20023800 | 💶┃full-send-🤖
-      [🤖┃gamestop-monitor]
+    Heuristic: detect whether the "+token" looks like a real SKU/ID (vs a product title label).
     """
-    items: List[ZephyrReleaseFeedItem] = []
-    pending_sku: Optional[str] = None
-    pending_release_id: Optional[int] = None
-    pending_sign: Optional[str] = None
+    t = (token or "").strip()
+    if not t:
+        return False
+    if any(c.isspace() for c in t):
+        return False
+    # Pure digits (most stores)
+    if t.isdigit():
+        return len(t) >= 5
+    # Alpha-numeric ids like ASIN / handles (no spaces)
+    cleaned = "".join([c for c in t if c.isalnum()])
+    if len(cleaned) < 4:
+        return False
+    # Reject heavy punctuation (likely title-ish)
+    allowed = set("-_")
+    if any((not c.isalnum()) and (c not in allowed) for c in t):
+        return False
+    return True
 
-    # First try line-based parsing (older embed formatting).
+
+def parse_release_feed_records(text: str) -> List[ZephyrReleaseFeedItem]:
+    """
+    Parse the merged Zephyr /listreleases output into one record per release_id.
+    Includes non-SKU items (e.g. Topps titles with Channel ID lines).
+    """
+    records: List[ZephyrReleaseFeedItem] = []
+
+    cur_rid: Optional[int] = None
+    cur_sign: str = ""
+    cur_token: str = ""
+    cur_lines: List[str] = []
+
+    def _finalize() -> None:
+        nonlocal cur_rid, cur_sign, cur_token, cur_lines
+        if not cur_rid or not cur_token:
+            cur_rid, cur_sign, cur_token, cur_lines = None, "", "", []
+            return
+
+        # Ignore removals (sign starts with "-")
+        if cur_sign.strip().startswith("-"):
+            cur_rid, cur_sign, cur_token, cur_lines = None, "", "", []
+            return
+
+        monitor_tag = ""
+        category = ""
+        channel_id = ""
+        raw_seg = "\n".join(cur_lines).strip()
+
+        for ln in cur_lines:
+            m_c = _CHANNEL_ID_RE.search(ln or "")
+            if m_c and not channel_id:
+                channel_id = (m_c.group(1) or "").strip()
+
+            bt = _extract_bracket_tag(ln)
+            if bt:
+                if "-monitor" in bt.lower():
+                    monitor_tag = bt
+                else:
+                    category = bt
+
+        if not monitor_tag:
+            m_mon = _MONITOR_RE.search(raw_seg)
+            if m_mon:
+                monitor_tag = f"{m_mon.group(1)}-monitor"
+
+        store = tag_to_store(monitor_tag) if monitor_tag else None
+        store_s = store or ""
+        is_sku = _is_sku_candidate(cur_token)
+
+        records.append(
+            ZephyrReleaseFeedItem(
+                release_id=int(cur_rid or 0),
+                sku=cur_token,
+                store=store_s,
+                source_tag=_norm_token(monitor_tag) if monitor_tag else "",
+                monitor_tag=_norm_token(monitor_tag) if monitor_tag else "",
+                category=(category or "").strip(),
+                channel_id=(channel_id or "").strip(),
+                raw_text=raw_seg,
+                is_sku_candidate=bool(is_sku),
+            )
+        )
+        cur_rid, cur_sign, cur_token, cur_lines = None, "", "", []
+
+    # Line-based segmentation first (preferred; preserves next-line monitor tags).
+    saw_any = False
     for line in _iter_lines(text):
         m_sku = _SKU_LINE_RE.match(line)
         if m_sku:
+            saw_any = True
+            _finalize()
             try:
-                rid = int(str(m_sku.group(1) or "0").strip() or "0")
+                cur_rid = int(str(m_sku.group(1) or "0").strip() or "0")
             except Exception:
-                rid = 0
-            sign = (m_sku.group(2) or "").strip()
-            token = _clean_sku_token(m_sku.group(3) or "")
-            # Ignore removals (e.g. "-15558409905")
-            if sign.startswith("-"):
-                pending_sku = None
-                pending_release_id = None
-                pending_sign = None
-                continue
-
-            pending_sku = token
-            pending_release_id = rid if rid > 0 else None
-            pending_sign = sign
-            if not pending_sku:
-                pending_sku = None
-                pending_release_id = None
-                pending_sign = None
-                continue
-
-            # Sometimes the tag/monitor is present on the same line.
-            tag_inline = _extract_bracket_tag(line)
-            if not tag_inline:
-                m_mon_inline = _MONITOR_RE.search(line)
-                if m_mon_inline:
-                    tag_inline = f"{m_mon_inline.group(1)}-monitor"
-            if tag_inline:
-                store = tag_to_store(tag_inline)
-                if store:
-                    items.append(
-                        ZephyrReleaseFeedItem(
-                            release_id=int(pending_release_id or 0),
-                            sku=pending_sku,
-                            store=store,
-                            source_tag=_norm_token(tag_inline),
-                        )
-                    )
-                pending_sku = None
-                pending_release_id = None
-                pending_sign = None
+                cur_rid = None
+            cur_sign = (m_sku.group(2) or "").strip()
+            cur_token = _clean_sku_token(m_sku.group(3) or "")
+            cur_lines = [line]
             continue
+        if cur_rid is not None:
+            cur_lines.append(line)
 
-        # Monitor usually comes on the next line.
-        if pending_sku:
-            tag = _extract_bracket_tag(line)
-            if not tag:
-                m_mon = _MONITOR_RE.search(line)
-                if m_mon:
-                    tag = f"{m_mon.group(1)}-monitor"
-            if tag:
-                store = tag_to_store(tag)
-                if store:
-                    items.append(
-                        ZephyrReleaseFeedItem(
-                            release_id=int(pending_release_id or 0),
-                            sku=pending_sku,
-                            store=store,
-                            source_tag=_norm_token(tag),
-                        )
-                    )
-                pending_sku = None
-                pending_release_id = None
-                pending_sign = None
+    if saw_any:
+        _finalize()
+        return records
 
-    if items:
-        return items
-
-    # Inline parsing for Discord Companion / Zephyr formatting (everything in one line).
+    # Inline fallback for Discord Companion formatting (everything in one line).
     t = _strip_markdown(text)
     if not t:
         return []
-
     starts = list(_ITEM_START_INLINE_RE.finditer(t))
     if not starts:
         return []
@@ -235,7 +275,7 @@ def parse_release_feed_items(text: str) -> List[ZephyrReleaseFeedItem]:
             rid = 0
         sign = (m.group(2) or "").strip()
         token = _clean_sku_token(m.group(3) or "")
-        if not token:
+        if not token or rid <= 0:
             continue
         if sign.startswith("-"):
             continue
@@ -247,21 +287,43 @@ def parse_release_feed_items(text: str) -> List[ZephyrReleaseFeedItem]:
             m_mon = _MONITOR_RE.search(seg)
             if m_mon:
                 tag = f"{m_mon.group(1)}-monitor"
-        if not tag:
-            continue
-        store = tag_to_store(tag)
-        if not store:
-            continue
-        items.append(
+        store = tag_to_store(tag or "") if tag else None
+        m_c = _CHANNEL_ID_RE.search(seg or "")
+        ch_id = (m_c.group(1) or "").strip() if m_c else ""
+        records.append(
             ZephyrReleaseFeedItem(
-                release_id=int(rid or 0),
+                release_id=int(rid),
                 sku=token,
-                store=store,
-                source_tag=_norm_token(tag),
+                store=str(store or ""),
+                source_tag=_norm_token(tag) if tag else "",
+                monitor_tag=_norm_token(tag) if tag else "",
+                category="",
+                channel_id=ch_id,
+                raw_text=seg.strip(),
+                is_sku_candidate=_is_sku_candidate(token),
             )
         )
 
-    return items
+    return records
+
+
+def parse_release_feed_items(text: str) -> List[ZephyrReleaseFeedItem]:
+    """
+    Parse Zephyr "Release Feed(s) in this server:" embed text into (sku, store, monitor).
+
+    Expected shape (example):
+      Release Feed(s) in this server:
+      1. +20023800 | 💶┃full-send-🤖
+      [🤖┃gamestop-monitor]
+    """
+    # Backward-compatible behavior: return only rows suitable for sheet writes
+    # (must have a store mapping and a token that looks like an ID/SKU).
+    out: List[ZephyrReleaseFeedItem] = []
+    for r in parse_release_feed_records(text):
+        if not (r.store and r.is_sku_candidate):
+            continue
+        out.append(r)
+    return out
 
 
 def parse_release_feed_pairs(text: str) -> List[Tuple[str, str]]:

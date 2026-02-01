@@ -5,6 +5,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -335,6 +336,9 @@ class RsFsSheetSync:
         # IMPORTANT: googleapiclient/httplib2 are not reliably thread-safe across concurrent calls.
         # RSForwarder can process multiple Zephyr chunks rapidly; serialize all Sheets API usage.
         self._api_lock: asyncio.Lock = asyncio.Lock()
+        # History tab cache (store+sku -> cached fields)
+        self._history_cache: Dict[str, Dict[str, str]] = {}
+        self._history_cache_ts: float = 0.0
 
     def refresh_config(self, cfg: Dict[str, Any]) -> None:
         self.cfg = cfg or {}
@@ -344,6 +348,350 @@ class RsFsSheetSync:
         self._dedupe_skus = set()
         self._dedupe_last_fetch_ts = 0.0
         self._last_service_error = ""
+        self._history_cache = {}
+        self._history_cache_ts = 0.0
+
+    def _current_tab_title(self) -> str:
+        return _cfg_str(self.cfg, "rs_fs_current_tab_name", "Full-Send-Current-List")
+
+    def _history_tab_title(self) -> str:
+        return _cfg_str(self.cfg, "rs_fs_history_tab_name", "Full-Send-History")
+
+    @staticmethod
+    def _utc_now_iso() -> str:
+        try:
+            return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        except Exception:
+            return ""
+
+    async def _ensure_sheet_tab(self, title: str) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+        """
+        Ensure a tab exists, returning (sheetId, tab_title, error).
+        """
+        t = str(title or "").strip()
+        if not t:
+            return None, None, "missing tab title"
+        if not self._sheet_cfg.spreadsheet_id:
+            return None, None, "missing spreadsheet id"
+        service = self._get_service()
+        if not service:
+            return None, None, self.last_service_error() or "missing google service / deps"
+
+        async with self._api_lock:
+            def _do_get() -> Dict[str, Any]:
+                return (
+                    service.spreadsheets()
+                    .get(
+                        spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                        fields="sheets.properties(sheetId,title)",
+                    )
+                    .execute()
+                )
+
+            try:
+                resp = await asyncio.to_thread(_do_get)
+            except Exception as e:
+                return None, None, f"spreadsheets.get failed: {e}"
+
+            sheets = resp.get("sheets") if isinstance(resp, dict) else None
+            if isinstance(sheets, list):
+                for sh in sheets:
+                    props = sh.get("properties") if isinstance(sh, dict) else None
+                    if not isinstance(props, dict):
+                        continue
+                    title2 = str(props.get("title") or "").strip()
+                    if title2 == t:
+                        try:
+                            sid = int(props.get("sheetId") or 0)
+                        except Exception:
+                            sid = 0
+                        return (sid if sid > 0 else None), title2, None
+
+            # Not found -> create
+            def _do_add() -> Dict[str, Any]:
+                return (
+                    service.spreadsheets()
+                    .batchUpdate(
+                        spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                        body={
+                            "requests": [
+                                {
+                                    "addSheet": {
+                                        "properties": {
+                                            "title": t,
+                                            "gridProperties": {"frozenRowCount": 1},
+                                        }
+                                    }
+                                }
+                            ]
+                        },
+                    )
+                    .execute()
+                )
+
+            try:
+                resp2 = await asyncio.to_thread(_do_add)
+            except Exception as e:
+                return None, None, f"addSheet failed: {e}"
+            try:
+                replies = resp2.get("replies") if isinstance(resp2, dict) else None
+                if isinstance(replies, list) and replies:
+                    props = replies[0].get("addSheet", {}).get("properties", {})
+                    sid2 = int(props.get("sheetId") or 0)
+                    title2 = str(props.get("title") or t).strip()
+                    return (sid2 if sid2 > 0 else None), title2, None
+            except Exception:
+                pass
+            return None, t, None
+
+    async def write_current_list_mirror(self, rows: Sequence[Sequence[str]]) -> Tuple[bool, str, int]:
+        """
+        Mirror-write the `Full-Send-Current-List` tab.
+        Expects rows without headers; this method writes headers + rows.
+        """
+        headers = [
+            "Release ID",
+            "Store",
+            "SKU/Label",
+            "Monitor Tag",
+            "Category",
+            "Channel ID",
+            "Resolved Title",
+            "Resolved URL",
+            "Affiliate URL",
+            "Status",
+            "Remove Command",
+            "Last Seen (UTC)",
+        ]
+        tab_title = self._current_tab_title()
+        sheet_id, tab, err = await self._ensure_sheet_tab(tab_title)
+        if err:
+            return False, err, 0
+        if not tab:
+            return False, "missing current tab title", 0
+        service = self._get_service()
+        if not service:
+            return False, self.last_service_error() or "missing google service / deps", 0
+
+        values = [headers] + [[str(c or "") for c in r] for r in (rows or [])]
+        rng = f"'{tab}'!A1:L{max(1, len(values))}"
+
+        async with self._api_lock:
+            def _do_clear() -> None:
+                service.spreadsheets().values().clear(
+                    spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                    range=f"'{tab}'!A:Z",
+                    body={},
+                ).execute()
+
+            def _do_update() -> None:
+                service.spreadsheets().values().update(
+                    spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                    range=rng,
+                    valueInputOption="USER_ENTERED",
+                    body={"values": values},
+                ).execute()
+
+            try:
+                await asyncio.to_thread(_do_clear)
+                await asyncio.to_thread(_do_update)
+            except Exception as e:
+                return False, f"write current list failed: {e}", 0
+        return True, "ok", max(0, len(values) - 1)
+
+    async def fetch_history_cache(self, *, force: bool = False) -> Dict[str, Dict[str, str]]:
+        """
+        Return mapping key -> record where key is `store_lower|sku_lower`.
+        Cached in-memory with TTL.
+        """
+        try:
+            ttl = int((self.cfg or {}).get("rs_fs_history_cache_ttl_s") or 900)
+        except Exception:
+            ttl = 900
+        ttl = max(60, min(ttl, 12 * 3600))
+
+        now = time.time()
+        if (not force) and self._history_cache and (now - float(self._history_cache_ts or 0.0)) < float(ttl):
+            return dict(self._history_cache)
+
+        tab_title = self._history_tab_title()
+        _sheet_id, tab, err = await self._ensure_sheet_tab(tab_title)
+        if err:
+            return {}
+        if not tab:
+            return {}
+        service = self._get_service()
+        if not service:
+            return {}
+
+        rng = f"'{tab}'!A:I"
+
+        async with self._api_lock:
+            def _do_get() -> Dict[str, Any]:
+                return service.spreadsheets().values().get(
+                    spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                    range=rng,
+                ).execute()
+
+            try:
+                resp = await asyncio.to_thread(_do_get)
+            except Exception:
+                return {}
+
+        values = resp.get("values") if isinstance(resp, dict) else None
+        out: Dict[str, Dict[str, str]] = {}
+        if isinstance(values, list):
+            for i, row in enumerate(values, start=1):
+                if i == 1:
+                    continue
+                if not isinstance(row, list) or len(row) < 2:
+                    continue
+                store = str(row[0] or "").strip()
+                sku = str(row[1] or "").strip()
+                if not (store and sku):
+                    continue
+                key = f"{store.lower()}|{sku.lower()}"
+                out[key] = {
+                    "store": store,
+                    "sku": sku,
+                    "title": str(row[2] or "").strip() if len(row) > 2 else "",
+                    "url": str(row[3] or "").strip() if len(row) > 3 else "",
+                    "affiliate_url": str(row[4] or "").strip() if len(row) > 4 else "",
+                    "first_seen": str(row[5] or "").strip() if len(row) > 5 else "",
+                    "last_seen": str(row[6] or "").strip() if len(row) > 6 else "",
+                    "last_release_id": str(row[7] or "").strip() if len(row) > 7 else "",
+                    "source": str(row[8] or "").strip() if len(row) > 8 else "",
+                    "row_index_1_based": str(i),
+                }
+
+        self._history_cache = dict(out)
+        self._history_cache_ts = now
+        return dict(out)
+
+    async def upsert_history_rows(self, rows: Sequence[Sequence[str]]) -> Tuple[bool, str, int, int]:
+        """
+        Upsert into `Full-Send-History`.\n
+        Expected row columns (A:I):\n
+          Store, SKU, Title, URL, Affiliate URL, First Seen (UTC), Last Seen (UTC), Last Release ID, Source\n
+        Returns (ok, msg, added, updated).
+        """
+        tab_title = self._history_tab_title()
+        _sheet_id, tab, err = await self._ensure_sheet_tab(tab_title)
+        if err:
+            return False, err, 0, 0
+        if not tab:
+            return False, "missing history tab title", 0, 0
+        service = self._get_service()
+        if not service:
+            return False, self.last_service_error() or "missing google service / deps", 0, 0
+
+        # Ensure header exists via mirror write if the sheet is empty.
+        headers = [
+            "Store",
+            "SKU",
+            "Title",
+            "URL",
+            "Affiliate URL",
+            "First Seen (UTC)",
+            "Last Seen (UTC)",
+            "Last Release ID",
+            "Source",
+        ]
+
+        # Load existing map (forces refresh)
+        existing = await self.fetch_history_cache(force=True)
+
+        to_update: List[Tuple[int, List[str]]] = []
+        to_add: List[List[str]] = []
+
+        now_iso = self._utc_now_iso()
+        for r in (rows or []):
+            row = [str(c or "") for c in r]
+            store = (row[0] if len(row) > 0 else "").strip()
+            sku = (row[1] if len(row) > 1 else "").strip()
+            if not (store and sku):
+                continue
+            key = f"{store.lower()}|{sku.lower()}"
+            if key in existing:
+                ex = existing.get(key) or {}
+                # Preserve First Seen if present
+                if len(row) < 6:
+                    row = row + ([""] * (6 - len(row)))
+                if not (row[5] or "").strip():
+                    row[5] = str(ex.get("first_seen") or "").strip() or now_iso
+                if len(row) < 7:
+                    row = row + ([""] * (7 - len(row)))
+                if not (row[6] or "").strip():
+                    row[6] = now_iso
+                try:
+                    ri = int(str(ex.get("row_index_1_based") or "0").strip() or "0")
+                except Exception:
+                    ri = 0
+                if ri >= 2:
+                    to_update.append((ri, row[:9] + ([""] * max(0, 9 - len(row)))))
+            else:
+                # Fill first/last seen defaults
+                row2 = row[:9] + ([""] * max(0, 9 - len(row)))
+                if not row2[5].strip():
+                    row2[5] = now_iso
+                if not row2[6].strip():
+                    row2[6] = now_iso
+                to_add.append(row2)
+
+        async with self._api_lock:
+            # Ensure header if needed (if empty or only headers)
+            if not existing:
+                try:
+                    service.spreadsheets().values().update(
+                        spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                        range=f"'{tab}'!A1:I1",
+                        valueInputOption="USER_ENTERED",
+                        body={"values": [headers]},
+                    ).execute()
+                except Exception:
+                    pass
+
+            updated = 0
+            if to_update:
+                data = []
+                for row_i, row_vals in to_update:
+                    data.append({"range": f"'{tab}'!A{row_i}:I{row_i}", "values": [row_vals[:9]]})
+
+                def _do_update() -> None:
+                    service.spreadsheets().values().batchUpdate(
+                        spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                        body={"valueInputOption": "USER_ENTERED", "data": data},
+                    ).execute()
+
+                try:
+                    await asyncio.to_thread(_do_update)
+                    updated = len(to_update)
+                except Exception as e:
+                    return False, f"history update failed: {e}", 0, 0
+
+            added = 0
+            if to_add:
+                def _do_add() -> None:
+                    service.spreadsheets().values().append(
+                        spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                        range=f"'{tab}'!A:I",
+                        valueInputOption="USER_ENTERED",
+                        insertDataOption="INSERT_ROWS",
+                        body={"values": to_add},
+                    ).execute()
+
+                try:
+                    await asyncio.to_thread(_do_add)
+                    added = len(to_add)
+                except Exception as e:
+                    return False, f"history append failed: {e}", 0, updated
+
+        # Refresh cache
+        try:
+            await self.fetch_history_cache(force=True)
+        except Exception:
+            pass
+        return True, "ok", int(added), int(updated)
 
     def enabled(self) -> bool:
         return bool(self._sheet_cfg.enabled)

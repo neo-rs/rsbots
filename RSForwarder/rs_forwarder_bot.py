@@ -19,6 +19,7 @@ import platform
 import subprocess
 import shlex
 import time
+import hashlib
 from urllib.parse import urlparse
 
 from RSForwarder import affiliate_rewriter
@@ -430,6 +431,9 @@ class RSForwarderBot:
         self._rs_fs_manual_run_in_progress: bool = False
         # Debounce for auto check/status messages (avoid spamming on multi-chunk listreleases).
         self._rs_fs_last_auto_check_ts: float = 0.0
+        # Debounce for auto Current List writes (avoid re-writing on every chunk message).
+        self._rs_fs_last_current_list_hash: str = ""
+        self._rs_fs_last_current_list_ts: float = 0.0
         
         # Validate required config
         if not self.config.get("bot_token"):
@@ -520,6 +524,158 @@ class RSForwarderBot:
         except Exception:
             v = 45.0
         return max(10.0, min(v, 300.0))
+
+    def _rsfs_auto_write_current_list(self) -> bool:
+        try:
+            return bool((self.config or {}).get("rs_fs_auto_write_current_list", True))
+        except Exception:
+            return True
+
+    def _rsfs_current_list_debounce_s(self) -> float:
+        try:
+            v = float((self.config or {}).get("rs_fs_current_list_debounce_s", 20.0) or 20.0)
+        except Exception:
+            v = 20.0
+        return max(5.0, min(v, 180.0))
+
+    @staticmethod
+    def _rsfs_key_store_sku(store: str, sku: str) -> str:
+        return f"{str(store or '').strip().lower()}|{str(sku or '').strip().lower()}"
+
+    async def _rsfs_write_current_list(
+        self,
+        merged_text: str,
+        *,
+        resolved_by_key: Optional[Dict[str, Dict[str, str]]] = None,
+        reason: str = "auto",
+    ) -> Tuple[bool, str, int]:
+        """
+        Mirror the latest /listreleases run into the Current List tab.
+        `resolved_by_key` keys: store_lower|sku_lower -> {title,url,affiliate_url,source,last_release_id}
+        """
+        if not getattr(self, "_rs_fs_sheet", None):
+            return False, "sheet sync not initialized", 0
+        if not self._rs_fs_sheet.enabled():
+            return False, "sheet disabled", 0
+        if not self._rsfs_auto_write_current_list():
+            return True, "auto current list disabled", 0
+
+        txt = (merged_text or "").strip()
+        if not txt:
+            return False, "empty merged text", 0
+
+        # Debounce by content hash (avoid rewriting on every chunk)
+        h = hashlib.sha1(txt.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        now = time.time()
+        force_write = bool(resolved_by_key) or (str(reason or "").strip().lower() != "auto")
+        if (
+            (not force_write)
+            and h == (self._rs_fs_last_current_list_hash or "")
+            and (now - float(self._rs_fs_last_current_list_ts or 0.0)) < self._rsfs_current_list_debounce_s()
+        ):
+            return True, "debounced", 0
+        self._rs_fs_last_current_list_hash = h
+        self._rs_fs_last_current_list_ts = now
+
+        # Pull cached history once (cheap) so we can pre-fill title/url without scanning.
+        history = {}
+        try:
+            history = await self._rs_fs_sheet.fetch_history_cache(force=False)
+        except Exception:
+            history = {}
+        overrides = {}
+        try:
+            overrides = self._load_rs_fs_manual_overrides()
+        except Exception:
+            overrides = {}
+
+        recs = zephyr_release_feed_parser.parse_release_feed_records(txt) or []
+        rows: List[List[str]] = []
+        last_seen = rs_fs_sheet_sync.RsFsSheetSync._utc_now_iso()  # type: ignore[attr-defined]
+
+        for r in recs:
+            rid = int(getattr(r, "release_id", 0) or 0)
+            store = str(getattr(r, "store", "") or "").strip()
+            sku_label = str(getattr(r, "sku", "") or "").strip()
+            monitor_tag = str(getattr(r, "monitor_tag", "") or "").strip()
+            category = str(getattr(r, "category", "") or "").strip()
+            ch_id = str(getattr(r, "channel_id", "") or "").strip()
+            is_sku = bool(getattr(r, "is_sku_candidate", True))
+
+            key = self._rsfs_key_store_sku(store, sku_label) if (store and sku_label) else ""
+
+            title = ""
+            url = ""
+            aff = ""
+            status_bits: List[str] = []
+            status_bits.append("sku" if is_sku else "non_sku")
+            if store:
+                status_bits.append("store")
+            else:
+                status_bits.append("no_store")
+            if monitor_tag:
+                status_bits.append("monitor")
+            else:
+                status_bits.append("no_monitor")
+
+            # Prefer explicit resolved map (used by rsfsrun end-of-run)
+            src = ""
+            if key and resolved_by_key and key in resolved_by_key:
+                d = resolved_by_key.get(key) or {}
+                title = str(d.get("title") or "").strip()
+                url = str(d.get("url") or "").strip()
+                aff = str(d.get("affiliate_url") or "").strip()
+                src = str(d.get("source") or "").strip()
+                status_bits.append("resolved")
+            # Manual overrides
+            if key and not url:
+                ov = overrides.get(self._rs_fs_override_key(store, sku_label)) if store and sku_label else None
+                if isinstance(ov, dict) and str(ov.get("url") or "").strip():
+                    url = str(ov.get("url") or "").strip()
+                    title = str(ov.get("title") or "").strip() or title or url
+                    status_bits.append("manual")
+                    src = src or "manual"
+            # History cache
+            if key and not url and key in (history or {}):
+                hrec = history.get(key) or {}
+                url = str(hrec.get("url") or "").strip()
+                title = str(hrec.get("title") or "").strip() or title
+                aff = str(hrec.get("affiliate_url") or "").strip()
+                if url or title:
+                    status_bits.append("history")
+                    src = src or "history"
+
+            if title and len(title) > 140:
+                title = title[:137] + "..."
+
+            remove_cmd = f"/removereleaseid release_id: {rid}" if rid else "/removereleaseid release_id: ?"
+            status = ",".join([s for s in status_bits if s])
+            if src:
+                status = (status + f",src={src}").strip(",")
+
+            rows.append(
+                [
+                    str(rid or ""),
+                    store,
+                    sku_label,
+                    monitor_tag,
+                    category,
+                    ch_id,
+                    title,
+                    url,
+                    aff,
+                    status,
+                    remove_cmd,
+                    last_seen,
+                ]
+            )
+
+        ok, msg, n = await self._rs_fs_sheet.write_current_list_mirror(rows)
+        try:
+            print(f"{Colors.CYAN}[RS-FS Current]{Colors.RESET} mirror ok={ok} rows={n} reason={reason} hash={h} msg={msg}")
+        except Exception:
+            pass
+        return ok, msg, n
 
     async def _collect_latest_zephyr_release_feed_text(
         self,
@@ -1832,7 +1988,14 @@ class RSForwarderBot:
 
     async def _maybe_sync_rs_fs_sheet_from_message(self, message: discord.Message) -> None:
         """
-        If enabled, parse Zephyr "Release Feed(s)" embed messages and append rows to the RS - FS List sheet.
+        Auto handler for Zephyr /listreleases output.\n
+        Behavior:\n
+        - Always rebuild the latest merged run (chunks + tag-only continuation messages)\n
+        - Write ONLY the Current List tab (mirror)\n
+        - Post the RS-FS Check card\n
+        - Never touch the public list tab unless a user runs `!rsfsrun`\n
+        \n
+        In dry-run/test mode (`!rsfstest`), it keeps the old preview behavior.\n
         """
         try:
             if not getattr(self, "_rs_fs_sheet", None):
@@ -1986,21 +2149,45 @@ class RSForwarderBot:
             except Exception:
                 text_for_parse = text
 
+            # Decide mode early.
+            try:
+                dry_run = bool((self.config or {}).get("rs_fs_sheet_dry_run"))
+            except Exception:
+                dry_run = False
+            dry_run = bool(dry_run or test_enabled)
+
+            # Normal mode: update Current List only + post check; no public-sheet writes.
+            if not dry_run:
+                try:
+                    await self._rsfs_write_current_list(text_for_parse, reason="auto")
+                except Exception:
+                    pass
+                await _maybe_post_auto_check()
+
+                # Mark message processed and return (no more work).
+                if mid:
+                    try:
+                        self._rs_fs_seen_message_ids.add(mid)
+                        if len(self._rs_fs_seen_message_ids) > 2000:
+                            self._rs_fs_seen_message_ids = set(list(self._rs_fs_seen_message_ids)[-1200:])
+                    except Exception:
+                        pass
+                return
+
+            # Dry-run path below uses SKU-only pairs for preview output.
             items = zephyr_release_feed_parser.parse_release_feed_items(text_for_parse)
             pairs = [(it.store, it.sku) for it in (items or [])]
             rid_by_key: Dict[str, int] = {}
             try:
                 for it in (items or []):
                     try:
-                        rid_by_key[self._rs_fs_override_key(getattr(it, "store", ""), getattr(it, "sku", ""))] = int(
-                            getattr(it, "release_id", 0) or 0
-                        )
+                        rid_by_key[self._rs_fs_override_key(getattr(it, "store", ""), getattr(it, "sku", ""))] = int(getattr(it, "release_id", 0) or 0)
                     except Exception:
                         continue
             except Exception:
                 rid_by_key = {}
 
-            # Post a visible check card early (even if there are no new SKUs to append).
+            # Post a visible check card early (even in dry-run, debounced).
             await _maybe_post_auto_check()
 
             if not pairs:
@@ -2015,7 +2202,12 @@ class RSForwarderBot:
                     test_enabled = False
                 if test_enabled:
                     try:
-                        out_ch = await self._resolve_channel_by_id(int(out_ch_id or (self._zephyr_release_feed_channel_id() or 0) or 0))
+                        try:
+                            out_ch_raw = str((self.config or {}).get("rs_fs_sheet_test_output_channel_id") or "").strip()
+                            out_ch_id2 = int(out_ch_raw) if out_ch_raw else int(target_ch)
+                        except Exception:
+                            out_ch_id2 = int(target_ch)
+                        out_ch = await self._resolve_channel_by_id(int(out_ch_id2 or 0))
                         if out_ch and hasattr(out_ch, "send"):
                             await out_ch.send(
                                 "RS-FS: ❌ Parsed 0 items from the Zephyr embed text (this chunk had no parseable store+sku pairs).",
@@ -2024,13 +2216,6 @@ class RSForwarderBot:
                     except Exception:
                         pass
                 return
-
-            # Dry-run/preview: send output into the same channel (or configured override).
-            try:
-                dry_run = bool((self.config or {}).get("rs_fs_sheet_dry_run"))
-            except Exception:
-                dry_run = False
-            dry_run = bool(dry_run or test_enabled)
 
             try:
                 limit = int((self.config or {}).get("rs_fs_sheet_test_limit") or 25)
@@ -3379,6 +3564,12 @@ class RSForwarderBot:
                     if not merged_text:
                         await ctx.send("❌ Could not find recent Zephyr `Release Feed(s)` embed chunks in that channel.")
                         return
+
+                    # Keep Current List in sync with the merged run (no scraping here; just mirror + cache fill).
+                    try:
+                        await self._rsfs_write_current_list(merged_text, reason="rsfsrun-start")
+                    except Exception:
+                        pass
                     items = zephyr_release_feed_parser.parse_release_feed_items(merged_text)
                     if not items:
                         await ctx.send("❌ Parsed 0 items from the merged Zephyr text.")
@@ -3402,11 +3593,40 @@ class RSForwarderBot:
                         except Exception:
                             pass
 
-                    # Apply manual overrides (persisted runtime JSON). These bypass monitor/website scanning.
+                    # Stage 0: History cache (fast, avoids monitor/website scanning when already known)
+                    history_hits: List[rs_fs_sheet_sync.RsFsPreviewEntry] = []
+                    remaining_pairs_0: List[Tuple[str, str]] = []
+                    try:
+                        hist = await self._rs_fs_sheet.fetch_history_cache(force=False)
+                    except Exception:
+                        hist = {}
+                    for st, sk in (pairs or []):
+                        key = self._rsfs_key_store_sku(st, sk)
+                        hrec = (hist or {}).get(key) if key else None
+                        if isinstance(hrec, dict) and str(hrec.get("url") or "").strip():
+                            u0 = str(hrec.get("url") or "").strip()
+                            t0 = str(hrec.get("title") or "").strip() or u0
+                            a0 = str(hrec.get("affiliate_url") or "").strip()
+                            history_hits.append(
+                                rs_fs_sheet_sync.RsFsPreviewEntry(
+                                    store=st,
+                                    sku=sk,
+                                    url=u0,
+                                    title=t0,
+                                    error="",
+                                    source="history",
+                                    monitor_url=u0,
+                                    affiliate_url=a0,
+                                )
+                            )
+                        else:
+                            remaining_pairs_0.append((st, sk))
+
+                    # Stage 0.5: Manual overrides (persisted runtime JSON). These bypass monitor/website scanning.
                     overrides = self._load_rs_fs_manual_overrides()
                     manual_hits: List[rs_fs_sheet_sync.RsFsPreviewEntry] = []
                     remaining_pairs: List[Tuple[str, str]] = []
-                    for st, sk in (pairs or []):
+                    for st, sk in (remaining_pairs_0 or []):
                         k = self._rs_fs_override_key(st, sk)
                         ov = (overrides or {}).get(k)
                         if isinstance(ov, dict) and str(ov.get("url") or "").strip():
@@ -3426,16 +3646,17 @@ class RSForwarderBot:
                             )
                         else:
                             remaining_pairs.append((st, sk))
+
                     pairs = remaining_pairs
-                    total = len(remaining_pairs) + len(manual_hits)
+                    total = len(remaining_pairs) + len(manual_hits) + len(history_hits)
                     if progress_msg:
                         try:
                             await progress_msg.edit(
                                 embed=_progress_embed(
                                     "resolve (monitor first)",
-                                    len(manual_hits),
+                                    len(manual_hits) + len(history_hits),
                                     total,
-                                    monitor_hits=len(manual_hits),
+                                    monitor_hits=len(manual_hits) + len(history_hits),
                                     remaining=len(remaining_pairs),
                                 )
                             )
@@ -3449,8 +3670,8 @@ class RSForwarderBot:
                     except Exception:
                         self.config["rs_fs_monitor_lookup_history_limit"] = 600
 
-                    # Stage 1: monitor lookup (manual overrides count as hits)
-                    monitor_hits: List[rs_fs_sheet_sync.RsFsPreviewEntry] = list(manual_hits)
+                    # Stage 1: monitor lookup (history+manual overrides count as hits)
+                    monitor_hits: List[rs_fs_sheet_sync.RsFsPreviewEntry] = list(history_hits) + list(manual_hits)
                     remaining: List[Tuple[str, str]] = []
                     g_obj = getattr(ch, "guild", None)
                     done = 0
@@ -3670,6 +3891,52 @@ class RSForwarderBot:
 
                     rows = [[e.store, e.sku, e.title, e.affiliate_url, e.monitor_url] for e in entries]
                     ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(rows)
+
+                    # Write back to History cache + update Current List with resolved columns.
+                    try:
+                        now_iso = rs_fs_sheet_sync.RsFsSheetSync._utc_now_iso()  # type: ignore[attr-defined]
+                    except Exception:
+                        now_iso = ""
+                    resolved_by_key: Dict[str, Dict[str, str]] = {}
+                    history_rows: List[List[str]] = []
+                    for e in (entries or []):
+                        st0 = str(getattr(e, "store", "") or "").strip()
+                        sk0 = str(getattr(e, "sku", "") or "").strip()
+                        if not (st0 and sk0):
+                            continue
+                        k0 = self._rsfs_key_store_sku(st0, sk0)
+                        u0 = str(getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
+                        t0 = str(getattr(e, "title", "") or "").strip()
+                        a0 = str(getattr(e, "affiliate_url", "") or "").strip()
+                        src0 = str(getattr(e, "source", "") or "").strip()
+                        try:
+                            rid0 = int(rid_by_key.get(self._rs_fs_override_key(st0, sk0)) or 0)
+                        except Exception:
+                            rid0 = 0
+                        resolved_by_key[k0] = {
+                            "title": t0,
+                            "url": u0,
+                            "affiliate_url": a0,
+                            "source": src0,
+                            "last_release_id": str(rid0 or ""),
+                        }
+                        history_rows.append([st0, sk0, t0, u0, a0, "", now_iso, str(rid0 or ""), src0])
+
+                    if history_rows:
+                        try:
+                            ok_h, msg_h, added_h, updated_h = await self._rs_fs_sheet.upsert_history_rows(history_rows)
+                            try:
+                                print(
+                                    f"{Colors.CYAN}[RS-FS History]{Colors.RESET} upsert ok={ok_h} added={added_h} updated={updated_h} msg={msg_h}"
+                                )
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                    try:
+                        await self._rsfs_write_current_list(merged_text, resolved_by_key=resolved_by_key, reason="rsfsrun-end")
+                    except Exception:
+                        pass
 
                     if ok:
                         # Summary embed

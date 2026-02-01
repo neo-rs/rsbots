@@ -6797,7 +6797,7 @@ async def on_ready():
         except Exception:
             return False
 
-    with suppress(Exception):
+    try:
         support_tickets.initialize(
             bot=bot,
             config=config,
@@ -6805,6 +6805,10 @@ async def on_ready():
             is_whop_linked=_is_whop_linked,
             timezone_name=tz_name,
         )
+    except Exception as e:
+        # Don't silently disable the whole ticket system.
+        with suppress(Exception):
+            await log_other(f"❌ support_tickets.initialize failed: `{str(e)[:400]}`")
     
     # Backfill Whop timeline from whop_history.json (before initializing whop handler)
     _backfill_whop_timeline_from_whop_history()
@@ -7803,6 +7807,13 @@ async def on_message(message: discord.Message):
         e0 = msg.embeds[0]
         if not isinstance(e0, discord.Embed):
             return
+        # Guard: only process RSCheckerbot-format member-status embeds (even if posted via webhook / renamed bot).
+        try:
+            ft = str(getattr(getattr(e0, "footer", None), "text", "") or "")
+        except Exception:
+            ft = ""
+        if "rscheckerbot" not in ft.lower():
+            return
 
         ts_i, kind, did, whop_brief = _extract_reporting_from_member_status_embed(
             e0,
@@ -7845,7 +7856,9 @@ async def on_message(message: discord.Message):
             if not _membership_id_from_history(int(did_i)):
                 fp = f"{int(did_i)}|freepass|{_tz_now().date().isoformat()}"
                 with suppress(Exception):
-                    await support_tickets.open_free_pass_ticket(member=member, fingerprint=fp)
+                    ch_created = await support_tickets.open_free_pass_ticket(member=member, fingerprint=fp)
+                    if not ch_created:
+                        await log_other(f"❌ SupportTickets: failed to open free-pass ticket for `{did_i}` (member_joined)")
             return
 
         # Billing (payment failed / billing issue)
@@ -7854,7 +7867,7 @@ async def on_message(message: discord.Message):
             fp = f"{mid or int(did_i)}|billing|{occurred_at.date().isoformat()}"
             st = str((whop_brief or {}).get("status") or "Past Due").strip() if isinstance(whop_brief, dict) else "Past Due"
             with suppress(Exception):
-                await support_tickets.open_billing_ticket(
+                ch_created = await support_tickets.open_billing_ticket(
                     member=member,
                     event_type="payment.failed",
                     status=st or "Past Due",
@@ -7862,6 +7875,8 @@ async def on_message(message: discord.Message):
                     occurred_at=occurred_at,
                     reference_jump_url=ref_url,
                 )
+                if not ch_created:
+                    await log_other(f"❌ SupportTickets: failed to open billing ticket for `{did_i}` (kind={kind})")
             return
 
         # Cancellation
@@ -7877,24 +7892,33 @@ async def on_message(message: discord.Message):
                         reason = v
                         break
             with suppress(Exception):
-                await support_tickets.open_cancellation_ticket(
+                ch_created = await support_tickets.open_cancellation_ticket(
                     member=member,
                     whop_brief=whop_brief if isinstance(whop_brief, dict) else {},
                     cancellation_reason=reason,
                     fingerprint=fp,
                     reference_jump_url=ref_url,
                 )
+                if not ch_created:
+                    await log_other(f"❌ SupportTickets: failed to open cancellation ticket for `{did_i}` (kind={kind})")
             return
 
-    # Allow bot-authored member-status-logs cards to trigger tickets.
-    if bot.user and message.author and message.author.id == bot.user.id:
+    # Ticket triggers from member-status-logs channel (regardless of author),
+    # but only if the embed footer identifies RSCheckerbot.
+    if MEMBER_STATUS_LOGS_CHANNEL_ID and int(getattr(getattr(message, "channel", None), "id", 0) or 0) == int(MEMBER_STATUS_LOGS_CHANNEL_ID):
         with suppress(Exception):
             await _maybe_open_tickets_from_member_status_logs(message)
+        # Ticket audit logs (member-status-logs messages too).
+        with suppress(Exception):
+            await support_tickets.audit_message_create(message)
         return
 
     # Support tickets: track last_activity for non-bot messages (always, even when webhooks are enabled).
     with suppress(Exception):
         await support_tickets.record_activity_from_message(message)
+    # Ticket audit logs (human messages in ticket categories).
+    with suppress(Exception):
+        await support_tickets.audit_message_create(message)
 
     # Also allow non-bot messages in member-status-logs to be ignored (tickets trigger only from bot cards).
 
@@ -7914,6 +7938,48 @@ async def on_message(message: discord.Message):
     
     # Message processing continues here if needed for other handlers
     # (Currently no other message handlers, but this preserves extensibility)
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    with suppress(Exception):
+        await support_tickets.audit_message_edit(before, after)
+
+
+@bot.event
+async def on_raw_message_edit(payload):
+    with suppress(Exception):
+        await support_tickets.audit_raw_message_edit(payload)
+
+
+@bot.event
+async def on_message_delete(message: discord.Message):
+    with suppress(Exception):
+        await support_tickets.audit_message_delete(message)
+
+
+@bot.event
+async def on_raw_message_delete(payload):
+    with suppress(Exception):
+        await support_tickets.audit_raw_message_delete(payload)
+
+
+@bot.event
+async def on_guild_channel_create(channel: discord.abc.GuildChannel):
+    with suppress(Exception):
+        await support_tickets.audit_channel_create(channel)
+
+
+@bot.event
+async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
+    with suppress(Exception):
+        await support_tickets.audit_channel_delete(channel)
+
+
+@bot.event
+async def on_guild_channel_update(before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
+    with suppress(Exception):
+        await support_tickets.audit_channel_update(before, after)
 
 # -----------------------------
 # Data Cleanup Functions

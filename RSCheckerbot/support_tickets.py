@@ -54,6 +54,10 @@ class SupportTicketConfig:
     startup_delay_seconds: int
     startup_recent_history_limit: int
     startup_templates: dict[str, str]
+    audit_enabled: bool
+    audit_channel_id: int
+    audit_channel_name: str
+    audit_include_transcript_category: bool
 
 
 _BOT: commands.Bot | None = None
@@ -147,6 +151,7 @@ def initialize(
     dd = st.get("dedupe") if isinstance(st.get("dedupe"), dict) else {}
     sm = st.get("startup_messages") if isinstance(st.get("startup_messages"), dict) else {}
     sm_templates = sm.get("templates") if isinstance(sm.get("templates"), dict) else {}
+    al = st.get("audit_logs") if isinstance(st.get("audit_logs"), dict) else {}
 
     def _int_list(obj: object) -> list[int]:
         out: list[int] = []
@@ -182,6 +187,10 @@ def initialize(
         startup_delay_seconds=max(5, _as_int(sm.get("delay_seconds")) or 300),
         startup_recent_history_limit=max(10, min(200, _as_int(sm.get("recent_history_limit")) or 50)),
         startup_templates={str(k).strip().lower(): str(v) for k, v in (sm_templates or {}).items() if str(k or "").strip()},
+        audit_enabled=_as_bool(al.get("enabled")),
+        audit_channel_id=_as_int(al.get("channel_id")),
+        audit_channel_name=str(al.get("channel_name") or "tickets-logs").strip() or "tickets-logs",
+        audit_include_transcript_category=_as_bool(al.get("include_transcript_category")),
     )
 
     # Register persistent view so buttons survive restarts.
@@ -190,6 +199,14 @@ def initialize(
         with suppress(Exception):
             _CONTROLS_VIEW = SupportTicketControlsView()
             _BOT.add_view(_CONTROLS_VIEW)
+
+    # Best-effort: ensure ticket index file is writable (avoid silent failures later).
+    try:
+        _index_save(_index_load())
+    except Exception as e:
+        # Keep the bot running, but surface why tickets might not open.
+        with suppress(Exception):
+            asyncio.create_task(_log(f"❌ support_tickets: failed to init tickets_index.json (OneDrive lock?) err={str(e)[:220]}"))
 
 
 def _cfg() -> SupportTicketConfig | None:
@@ -453,6 +470,317 @@ async def _ensure_staff_roles_can_view_channel(
             )
 
 
+def _ticket_category_ids_for_audit() -> set[int]:
+    cfg = _cfg()
+    if not cfg or not cfg.audit_enabled:
+        return set()
+    ids = {
+        int(cfg.cancellation_category_id or 0),
+        int(cfg.billing_category_id or 0),
+        int(cfg.free_pass_category_id or 0),
+    }
+    if bool(cfg.audit_include_transcript_category):
+        ids.add(int(cfg.transcript_category_id or 0))
+    return {int(x) for x in ids if int(x) > 0}
+
+
+def _is_ticket_category_channel_for_audit(ch: discord.abc.GuildChannel | None) -> bool:
+    cfg = _cfg()
+    if not cfg or not cfg.audit_enabled:
+        return False
+    if not ch:
+        return False
+    cat_ids = _ticket_category_ids_for_audit()
+    if not cat_ids:
+        return False
+    # Category channel itself
+    if isinstance(ch, discord.CategoryChannel):
+        return int(ch.id) in cat_ids
+    # Text/other channels: match by category_id
+    cid = int(getattr(ch, "category_id", 0) or 0)
+    return cid in cat_ids
+
+
+async def _get_or_create_audit_channel(*, guild: discord.Guild) -> discord.TextChannel | None:
+    cfg = _cfg()
+    if not cfg or not cfg.audit_enabled or not _BOT:
+        return None
+    if not isinstance(guild, discord.Guild):
+        return None
+
+    cid = int(cfg.audit_channel_id or 0)
+    if cid > 0:
+        ch = guild.get_channel(cid)
+        if isinstance(ch, discord.TextChannel):
+            return ch
+        with suppress(Exception):
+            fetched = await _BOT.fetch_channel(cid)
+            return fetched if isinstance(fetched, discord.TextChannel) else None
+
+    name = str(cfg.audit_channel_name or "tickets-logs").strip() or "tickets-logs"
+    with suppress(Exception):
+        for ch in list(getattr(guild, "text_channels", []) or []):
+            if isinstance(ch, discord.TextChannel) and str(getattr(ch, "name", "") or "") == name:
+                return ch
+
+    me = getattr(guild, "me", None) or guild.get_member(int(getattr(getattr(_BOT, "user", None), "id", 0) or 0))
+    if not (me and getattr(me, "guild_permissions", None) and bool(getattr(me.guild_permissions, "manage_channels", False))):
+        return None
+    with suppress(Exception):
+        created = await guild.create_text_channel(name=name, reason="RSCheckerbot: ticket audit logs")
+        return created if isinstance(created, discord.TextChannel) else None
+    return None
+
+
+def _clip(s: object, n: int) -> str:
+    out = str(s or "")
+    out = out.replace("```", "`\u200b``")  # avoid breaking code blocks
+    return (out[:n] + "…") if len(out) > n else out
+
+
+async def _audit_send(
+    *,
+    guild_id: int,
+    embed: discord.Embed,
+) -> None:
+    if not _ensure_cfg_loaded() or not _BOT:
+        return
+    cfg = _cfg()
+    if not cfg or not cfg.audit_enabled:
+        return
+    g = _BOT.get_guild(int(guild_id or 0))
+    if not isinstance(g, discord.Guild):
+        return
+    ch = await _get_or_create_audit_channel(guild=g)
+    if not isinstance(ch, discord.TextChannel):
+        return
+    with suppress(Exception):
+        await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none(), silent=True)
+
+
+async def audit_message_create(message: discord.Message) -> None:
+    """Audit: message sent in ticket categories."""
+    if not _ensure_cfg_loaded() or not _BOT:
+        return
+    cfg = _cfg()
+    if not cfg or not cfg.audit_enabled:
+        return
+    if not message or not getattr(message, "guild", None):
+        return
+    if int(message.guild.id) != int(cfg.guild_id):
+        return
+    ch = getattr(message, "channel", None)
+    if not isinstance(ch, discord.TextChannel):
+        return
+    # Avoid logging the log channel itself
+    if int(getattr(ch, "id", 0) or 0) == int(cfg.audit_channel_id or 0):
+        return
+    if not _is_ticket_category_channel_for_audit(ch):
+        return
+
+    author = getattr(message, "author", None)
+    author_id = int(getattr(author, "id", 0) or 0)
+    author_mention = str(getattr(author, "mention", "") or f"`{author_id}`")
+    e = discord.Embed(title="Message Sent", color=0x5865F2, timestamp=_now_utc())
+    e.add_field(name="Channel", value=f"<#{int(ch.id)}>", inline=True)
+    e.add_field(name="Author", value=f"{author_mention} (`{author_id}`)", inline=True)
+    e.add_field(name="Message ID", value=f"`{int(getattr(message, 'id', 0) or 0)}`", inline=True)
+    content = _clip(getattr(message, "content", "") or "", 900).strip()
+    if content:
+        e.add_field(name="Content", value=content[:1024], inline=False)
+    atts = list(getattr(message, "attachments", []) or [])
+    if atts:
+        names = ", ".join(_clip(getattr(a, "filename", "") or "file", 64) for a in atts[:6])
+        e.add_field(name="Attachments", value=_clip(names, 1024) or "—", inline=False)
+    await _audit_send(guild_id=int(cfg.guild_id), embed=e)
+
+
+async def audit_message_delete(message: discord.Message) -> None:
+    """Audit: cached message delete in ticket categories."""
+    if not _ensure_cfg_loaded() or not _BOT:
+        return
+    cfg = _cfg()
+    if not cfg or not cfg.audit_enabled:
+        return
+    if not message or not getattr(message, "guild", None):
+        return
+    if int(message.guild.id) != int(cfg.guild_id):
+        return
+    ch = getattr(message, "channel", None)
+    if not isinstance(ch, discord.TextChannel):
+        return
+    if int(getattr(ch, "id", 0) or 0) == int(cfg.audit_channel_id or 0):
+        return
+    if not _is_ticket_category_channel_for_audit(ch):
+        return
+
+    author = getattr(message, "author", None)
+    author_id = int(getattr(author, "id", 0) or 0)
+    author_mention = str(getattr(author, "mention", "") or f"`{author_id}`")
+    e = discord.Embed(title="Message Deleted", color=0xED4245, timestamp=_now_utc())
+    e.add_field(name="Channel", value=f"<#{int(ch.id)}>", inline=True)
+    e.add_field(name="Author", value=f"{author_mention} (`{author_id}`)", inline=True)
+    e.add_field(name="Message ID", value=f"`{int(getattr(message, 'id', 0) or 0)}`", inline=True)
+    content = _clip(getattr(message, "content", "") or "", 900).strip()
+    if content:
+        e.add_field(name="Content", value=content[:1024], inline=False)
+    await _audit_send(guild_id=int(cfg.guild_id), embed=e)
+
+
+async def audit_raw_message_delete(payload: object) -> None:
+    """Audit: raw message delete (content may be unavailable)."""
+    if not _ensure_cfg_loaded() or not _BOT:
+        return
+    cfg = _cfg()
+    if not cfg or not cfg.audit_enabled:
+        return
+    gid = int(getattr(payload, "guild_id", 0) or 0)
+    if not gid or int(gid) != int(cfg.guild_id):
+        return
+    ch_id = int(getattr(payload, "channel_id", 0) or 0)
+    msg_id = int(getattr(payload, "message_id", 0) or 0)
+    g = _BOT.get_guild(int(cfg.guild_id))
+    if not isinstance(g, discord.Guild):
+        return
+    ch = g.get_channel(int(ch_id)) if ch_id else None
+    if not isinstance(ch, discord.TextChannel):
+        return
+    if int(getattr(ch, "id", 0) or 0) == int(cfg.audit_channel_id or 0):
+        return
+    if not _is_ticket_category_channel_for_audit(ch):
+        return
+    e = discord.Embed(title="Message Deleted", color=0xED4245, timestamp=_now_utc())
+    e.add_field(name="Channel", value=f"<#{int(ch.id)}>", inline=True)
+    e.add_field(name="Message ID", value=f"`{int(msg_id)}`", inline=True)
+    e.add_field(name="Note", value="Message content not cached.", inline=True)
+    await _audit_send(guild_id=int(cfg.guild_id), embed=e)
+
+
+async def audit_message_edit(before: discord.Message, after: discord.Message) -> None:
+    """Audit: cached message edit in ticket categories."""
+    if not _ensure_cfg_loaded() or not _BOT:
+        return
+    cfg = _cfg()
+    if not cfg or not cfg.audit_enabled:
+        return
+    msg = after or before
+    if not msg or not getattr(msg, "guild", None):
+        return
+    if int(msg.guild.id) != int(cfg.guild_id):
+        return
+    ch = getattr(msg, "channel", None)
+    if not isinstance(ch, discord.TextChannel):
+        return
+    if int(getattr(ch, "id", 0) or 0) == int(cfg.audit_channel_id or 0):
+        return
+    if not _is_ticket_category_channel_for_audit(ch):
+        return
+    btxt = _clip(getattr(before, "content", "") or "", 700).strip()
+    atxt = _clip(getattr(after, "content", "") or "", 700).strip()
+    if btxt == atxt:
+        return
+    author = getattr(msg, "author", None)
+    author_id = int(getattr(author, "id", 0) or 0)
+    author_mention = str(getattr(author, "mention", "") or f"`{author_id}`")
+    e = discord.Embed(title="Message Edited", color=0xFEE75C, timestamp=_now_utc())
+    e.add_field(name="Channel", value=f"<#{int(ch.id)}>", inline=True)
+    e.add_field(name="Author", value=f"{author_mention} (`{author_id}`)", inline=True)
+    e.add_field(name="Message ID", value=f"`{int(getattr(msg, 'id', 0) or 0)}`", inline=True)
+    if btxt:
+        e.add_field(name="Before", value=btxt[:1024], inline=False)
+    if atxt:
+        e.add_field(name="After", value=atxt[:1024], inline=False)
+    await _audit_send(guild_id=int(cfg.guild_id), embed=e)
+
+
+async def audit_raw_message_edit(payload: object) -> None:
+    """Audit: raw message edit (content may be unavailable)."""
+    if not _ensure_cfg_loaded() or not _BOT:
+        return
+    cfg = _cfg()
+    if not cfg or not cfg.audit_enabled:
+        return
+    gid = int(getattr(payload, "guild_id", 0) or 0)
+    if not gid or int(gid) != int(cfg.guild_id):
+        return
+    ch_id = int(getattr(payload, "channel_id", 0) or 0)
+    msg_id = int(getattr(payload, "message_id", 0) or 0)
+    g = _BOT.get_guild(int(cfg.guild_id))
+    if not isinstance(g, discord.Guild):
+        return
+    ch = g.get_channel(int(ch_id)) if ch_id else None
+    if not isinstance(ch, discord.TextChannel):
+        return
+    if int(getattr(ch, "id", 0) or 0) == int(cfg.audit_channel_id or 0):
+        return
+    if not _is_ticket_category_channel_for_audit(ch):
+        return
+    e = discord.Embed(title="Message Edited", color=0xFEE75C, timestamp=_now_utc())
+    e.add_field(name="Channel", value=f"<#{int(ch.id)}>", inline=True)
+    e.add_field(name="Message ID", value=f"`{int(msg_id)}`", inline=True)
+    e.add_field(name="Note", value="Edit payload received (content not cached).", inline=True)
+    await _audit_send(guild_id=int(cfg.guild_id), embed=e)
+
+
+async def audit_channel_create(channel: discord.abc.GuildChannel) -> None:
+    if not _ensure_cfg_loaded() or not _BOT:
+        return
+    cfg = _cfg()
+    if not cfg or not cfg.audit_enabled:
+        return
+    if not channel or int(getattr(getattr(channel, "guild", None), "id", 0) or 0) != int(cfg.guild_id):
+        return
+    if not _is_ticket_category_channel_for_audit(channel):
+        return
+    e = discord.Embed(title="Channel Created", color=0x57F287, timestamp=_now_utc())
+    e.add_field(name="Channel", value=f"<#{int(getattr(channel, 'id', 0) or 0)}>", inline=True)
+    e.add_field(name="ID", value=f"`{int(getattr(channel, 'id', 0) or 0)}`", inline=True)
+    await _audit_send(guild_id=int(cfg.guild_id), embed=e)
+
+
+async def audit_channel_delete(channel: discord.abc.GuildChannel) -> None:
+    if not _ensure_cfg_loaded() or not _BOT:
+        return
+    cfg = _cfg()
+    if not cfg or not cfg.audit_enabled:
+        return
+    if not channel or int(getattr(getattr(channel, "guild", None), "id", 0) or 0) != int(cfg.guild_id):
+        return
+    if not _is_ticket_category_channel_for_audit(channel):
+        return
+    name = str(getattr(channel, "name", "") or "—")
+    e = discord.Embed(title="Channel Deleted", color=0xED4245, timestamp=_now_utc())
+    e.add_field(name="Channel", value=f"#{_clip(name, 90)}", inline=True)
+    e.add_field(name="ID", value=f"`{int(getattr(channel, 'id', 0) or 0)}`", inline=True)
+    await _audit_send(guild_id=int(cfg.guild_id), embed=e)
+
+
+async def audit_channel_update(before: discord.abc.GuildChannel, after: discord.abc.GuildChannel) -> None:
+    if not _ensure_cfg_loaded() or not _BOT:
+        return
+    cfg = _cfg()
+    if not cfg or not cfg.audit_enabled:
+        return
+    ch = after or before
+    if not ch or int(getattr(getattr(ch, "guild", None), "id", 0) or 0) != int(cfg.guild_id):
+        return
+    if not (_is_ticket_category_channel_for_audit(before) or _is_ticket_category_channel_for_audit(after)):
+        return
+    bname = str(getattr(before, "name", "") or "")
+    aname = str(getattr(after, "name", "") or "")
+    bcat = int(getattr(before, "category_id", 0) or 0)
+    acat = int(getattr(after, "category_id", 0) or 0)
+    if bname == aname and bcat == acat:
+        return
+    e = discord.Embed(title="Channel Updated", color=0xFEE75C, timestamp=_now_utc())
+    e.add_field(name="ID", value=f"`{int(getattr(ch, 'id', 0) or 0)}`", inline=True)
+    if bname != aname and aname:
+        e.add_field(name="Name", value=f"#{_clip(bname or '—', 70)} → #{_clip(aname, 70)}", inline=False)
+    if bcat != acat:
+        e.add_field(name="Category", value=f"`{bcat}` → `{acat}`", inline=False)
+    await _audit_send(guild_id=int(cfg.guild_id), embed=e)
+
+
 def _build_overwrites(
     *,
     guild: discord.Guild,
@@ -611,6 +939,31 @@ async def _open_or_update_ticket(
     if not guild:
         await _log(f"⚠️ support_tickets: guild not found (guild_id={cfg.guild_id})")
         return None
+
+    # Preflight: category existence + bot perms (this is the #1 reason tickets "stop" after role/category changes).
+    try:
+        cat = guild.get_channel(int(category_id))
+    except Exception:
+        cat = None
+    if not isinstance(cat, discord.CategoryChannel):
+        await _log(f"❌ support_tickets: category not found type={ticket_type} category_id={int(category_id)}")
+    else:
+        me = getattr(guild, "me", None) or guild.get_member(int(getattr(getattr(_BOT, "user", None), "id", 0) or 0))
+        if isinstance(me, discord.Member):
+            with suppress(Exception):
+                p = cat.permissions_for(me)
+                if not bool(getattr(p, "view_channel", False)):
+                    await _log(
+                        f"❌ support_tickets: bot cannot view category type={ticket_type} category_id={int(category_id)}"
+                    )
+                if not bool(getattr(p, "manage_channels", False)):
+                    await _log(
+                        f"❌ support_tickets: bot cannot manage_channels in category type={ticket_type} category_id={int(category_id)}"
+                    )
+                if not bool(getattr(p, "manage_permissions", False)):
+                    await _log(
+                        f"⚠️ support_tickets: bot cannot manage_permissions in category type={ticket_type} category_id={int(category_id)}"
+                    )
 
     # Dedupe / cooldown: single open ticket per (type,user) or fingerprint.
     async with _INDEX_LOCK:
