@@ -79,6 +79,42 @@ RSForwarder is a standalone bot for forwarding messages from RS Server channels 
 - **Admin Only**: Yes (can spam test channel)
 - **Returns**: Summary counts (ok/fail)
 
+#### `!rsfscheck`
+- **Description**: Validate RS-FS Google Sheet configuration/credentials (non-mutating)
+- **Aliases**: `fscheck`, `rsfsstatus`
+- **Parameters**: None
+- **Usage**: `!rsfscheck`
+- **Admin Only**: Yes (recommended)
+- **Returns**: ✅/❌ status including spreadsheet ID, tab name, and existing SKU count
+
+#### `!rsfstest`
+- **Description**: Dry-run preview of the latest Zephyr Release Feed parse + title resolution (NO sheet writes)
+- **Aliases**: `fstest`, `rsfs`
+- **Parameters**:
+  - `limit` (optional): Max items to preview (default: 25, max: 120)
+- **Usage**: `!rsfstest 50`
+- **Admin Only**: Yes (can spam output)
+- **Returns**: Preview embeds with resolved title + URLs
+
+#### `!rsfstestsku`
+- **Description**: Dry-run ONE (store, sku) lookup (monitor lookup first, then website fallback)
+- **Aliases**: `fstestsku`, `rsfssku`
+- **Parameters**:
+  - `store` (required)
+  - `sku` (required)
+- **Usage**: `!rsfstestsku gamestop 20023800`
+- **Admin Only**: Yes
+- **Returns**: Preview embed showing title + URLs
+
+#### `!rsfsrun`
+- **Description**: LIVE sync Zephyr Release Feed -> Google Sheet (writes A/B/C and also G/H)
+- **Aliases**: `rsfslive`, `rsfswrite`
+- **Parameters**:
+  - `limit` (optional): Max items per run (default: 120, max: 500)
+- **Usage**: `!rsfsrun 120`
+- **Admin Only**: Yes
+- **Returns**: Status messages and writes new rows into the sheet
+
 ### Status Commands
 
 #### `!rsstatus`
@@ -127,9 +163,9 @@ RSForwarder is a standalone bot for forwarding messages from RS Server channels 
 
 ## Command Summary
 
-- **Total Commands**: 14
-- **Admin Commands**: 2 (`!rsstartadminbot`, `!rsrestartadminbot`)
-- **Public Commands**: 10
+- **Total Commands**: 18
+- **Admin Commands**: 6 (`!rstestall`, `!rsfscheck`, `!rsfstest`, `!rsfstestsku`, `!rsfsrun`, `!rsrestartadminbot`, `!rsstartadminbot`)
+- **Public Commands**: 12
 - **Commands with Aliases**: 10
 - **Command Prefix**: `!rs` (unique prefix to avoid conflicts)
 

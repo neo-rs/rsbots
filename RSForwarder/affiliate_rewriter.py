@@ -159,6 +159,11 @@ def _strip_tracking_params(url: str) -> str:
             continue
         if kl.startswith("utm_"):
             continue
+        # Branch.io / deep-link tracking params (often huge and can break downstream brand resolution)
+        if kl.startswith("_branch"):
+            continue
+        if kl.startswith("branch_"):
+            continue
         if kl in deny_exact:
             continue
         kept.append((k, v))
@@ -169,6 +174,45 @@ def _strip_tracking_params(url: str) -> str:
         return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_q, ""))
     except Exception:
         return u
+
+
+def coerce_plain_url(value: str) -> str:
+    """
+    Coerce an affiliate rewrite output into a plain URL string.
+
+    - If given a Discord markdown masked link like: [amzn.to/xxxx](<https://...>)
+      returns the target URL.
+    - If wrapped like <https://...>, unwraps it.
+    - Otherwise returns the stripped string.
+    """
+    s = (value or "").strip()
+    if not s:
+        return ""
+    try:
+        target = _extract_markdown_link_target(s)
+        if target:
+            s = target.strip()
+    except Exception:
+        pass
+    if s.startswith("<") and s.endswith(">") and len(s) > 2:
+        inner = s[1:-1].strip()
+        if inner.startswith("http://") or inner.startswith("https://"):
+            return inner
+    return s
+
+
+async def compute_affiliate_rewrites_plain(cfg: dict, urls: List[str]) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """
+    Like compute_affiliate_rewrites, but ensures mapped values are plain URLs
+    (no Discord markdown masked links).
+    """
+    mapped, notes = await compute_affiliate_rewrites(cfg, urls)
+    if not mapped:
+        return {}, notes
+    out: Dict[str, str] = {}
+    for k, v in (mapped or {}).items():
+        out[k] = coerce_plain_url(v)
+    return out, notes
 
 
 _URL_RE = re.compile(
@@ -1002,7 +1046,8 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
         if is_mavely_link(raw):
             # Expand mavely.app.link to destination, then generate our own link for that destination.
             if target and (not is_mavely_link(target)) and (target != raw):
-                link, err = await mavely_create_link(cfg, target)
+                target_for_mavely = _strip_tracking_params(target) or target
+                link, err = await mavely_create_link(cfg, target_for_mavely)
                 if link and not err and link != raw:
                     mapped[u] = link
                     notes[u] = "rewrapped mavely link"
@@ -1090,7 +1135,8 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
             continue
 
         # Non-Amazon: try Mavely
-        link, err = await mavely_create_link(cfg, target)
+        target_for_mavely = _strip_tracking_params(target) or target
+        link, err = await mavely_create_link(cfg, target_for_mavely)
         if link and not err:
             mapped[u] = link
             notes[u] = "mavely affiliate"

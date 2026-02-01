@@ -204,6 +204,8 @@ class RsFsPreviewEntry:
     title: str
     error: str
     source: str = ""
+    monitor_url: str = ""
+    affiliate_url: str = ""
 
 
 def _try_parse_service_account_json(raw: str) -> Optional[dict]:
@@ -256,6 +258,17 @@ def _load_service_account_info(cfg: Dict[str, Any]) -> Optional[dict]:
 
 def _build_sheets_service(service_account_info: dict):
     # Lazy import so RSForwarder can run without these deps when feature disabled.
+    # Also silence noisy upstream Python EOL warnings in journald; this bot does not control system Python upgrades.
+    try:
+        import warnings
+
+        warnings.filterwarnings(
+            "ignore",
+            category=FutureWarning,
+            module=r"google\.api_core\._python_version_support",
+        )
+    except Exception:
+        pass
     from google.oauth2.service_account import Credentials  # type: ignore
     from googleapiclient.discovery import build  # type: ignore
 
@@ -300,6 +313,8 @@ class RsFsSheetSync:
       A: STORE
       B: SKU-UPC
       C: Product Title
+      G: affliated link
+      H: monitor url link
     """
 
     def __init__(self, cfg: Dict[str, Any]):
@@ -456,6 +471,188 @@ class RsFsSheetSync:
         self._dedupe_skus = await asyncio.to_thread(_do)
         self._dedupe_last_fetch_ts = now
 
+    async def _fetch_existing_sku_row_map(self) -> Dict[str, int]:
+        """
+        Return mapping: sku_lower -> 1-based row index in the sheet (based on column B).
+        Header row ("SKU-UPC") and blanks are ignored.
+        """
+        if not self.enabled():
+            return {}
+        tab = await self._resolve_tab_name()
+        service = self._get_service()
+        if not (service and tab and self._sheet_cfg.spreadsheet_id):
+            return {}
+
+        rng = f"'{tab}'!B:B"
+
+        def _do() -> Dict[str, int]:
+            resp = service.spreadsheets().values().get(spreadsheetId=self._sheet_cfg.spreadsheet_id, range=rng).execute()
+            values = resp.get("values") if isinstance(resp, dict) else None
+            out: Dict[str, int] = {}
+            if isinstance(values, list):
+                for i, row in enumerate(values, start=1):
+                    if not isinstance(row, list) or not row:
+                        continue
+                    sku = str(row[0] or "").strip()
+                    if not sku:
+                        continue
+                    if sku.lower() == "sku-upc":
+                        continue
+                    out[sku.lower()] = i
+            return out
+
+        return await asyncio.to_thread(_do)
+
+    async def _delete_rows_by_indices(self, row_indices_1_based: Sequence[int]) -> int:
+        """
+        Delete entire rows by 1-based indices (data rows). Returns deleted row count.
+        Requires tab_gid (sheetId).
+        """
+        if not self.enabled():
+            return 0
+        if not row_indices_1_based:
+            return 0
+        service = self._get_service()
+        if not service:
+            return 0
+        try:
+            sheet_id = int(self._sheet_cfg.tab_gid or 0)
+        except Exception:
+            sheet_id = 0
+        if not sheet_id:
+            return 0
+
+        rows = sorted({int(r) for r in row_indices_1_based if int(r) >= 2})
+        if not rows:
+            return 0
+
+        # Merge contiguous runs, then delete bottom-up (so indices remain valid).
+        runs: List[Tuple[int, int]] = []
+        start = rows[0]
+        prev = rows[0]
+        for r in rows[1:]:
+            if r == prev + 1:
+                prev = r
+                continue
+            runs.append((start, prev))
+            start = r
+            prev = r
+        runs.append((start, prev))
+        runs = sorted(runs, key=lambda t: t[0], reverse=True)
+
+        reqs = []
+        for a, b in runs:
+            # 0-based, endIndex exclusive
+            reqs.append(
+                {
+                    "deleteDimension": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "ROWS",
+                            "startIndex": int(a) - 1,
+                            "endIndex": int(b),
+                        }
+                    }
+                }
+            )
+
+        def _do() -> None:
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                body={"requests": reqs},
+            ).execute()
+
+        try:
+            await asyncio.to_thread(_do)
+        except Exception:
+            return 0
+
+        deleted = sum((b - a + 1) for a, b in runs)
+        return int(deleted)
+
+    async def sync_rows_mirror(self, rows: Sequence[Sequence[str]]) -> Tuple[bool, str, int, int, int]:
+        """
+        Mirror-mode sync:
+        - Update A/B/C + G/H for existing SKUs (by column B match)
+        - Append missing SKUs
+        - Delete rows for SKUs no longer present in `rows`
+
+        Returns: (ok, message, added_count, updated_count, deleted_count)
+        """
+        if not self.enabled():
+            return False, "disabled", 0, 0, 0
+        if not self._sheet_cfg.spreadsheet_id:
+            return False, "missing spreadsheet id", 0, 0, 0
+        service = self._get_service()
+        if not service:
+            err = self.last_service_error() or "missing google service account / deps"
+            return False, f"google sheets client not ready: {err}", 0, 0, 0
+        tab = await self._resolve_tab_name()
+        if not tab:
+            return False, "missing tab name/gid", 0, 0, 0
+
+        # Current sheet rows keyed by SKU (column B)
+        existing = await self._fetch_existing_sku_row_map()
+
+        desired_keys: Set[str] = set()
+        to_update: List[Tuple[int, List[str], List[str]]] = []
+        to_add: List[List[str]] = []
+
+        for r in (rows or []):
+            row = [str(c or "") for c in r]
+            store = (row[0] if len(row) > 0 else "").strip()
+            sku_raw = (row[1] if len(row) > 1 else "").strip()
+            title = (row[2] if len(row) > 2 else "").strip()
+            aff = (row[3] if len(row) > 3 else "").strip()
+            mon = (row[4] if len(row) > 4 else "").strip()
+            if not (store and sku_raw):
+                continue
+            key = sku_raw.lower()
+            desired_keys.add(key)
+            abc = [store, sku_raw, title]
+            gh = [aff, mon]
+            if key in existing:
+                to_update.append((int(existing[key]), abc, gh))
+            else:
+                # append_rows expects [A,B,C, G, H]
+                to_add.append([store, sku_raw, title, aff, mon])
+
+        # Update existing rows in batch (A:C and G:H), without touching D/E/F.
+        updated_count = 0
+        if to_update:
+            data = []
+            for row_i, abc, gh in to_update:
+                if row_i < 2:
+                    continue
+                data.append({"range": f"'{tab}'!A{row_i}:C{row_i}", "values": [abc]})
+                data.append({"range": f"'{tab}'!G{row_i}:H{row_i}", "values": [gh]})
+
+            def _do_update() -> None:
+                service.spreadsheets().values().batchUpdate(
+                    spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                    body={"valueInputOption": "USER_ENTERED", "data": data},
+                ).execute()
+
+            try:
+                await asyncio.to_thread(_do_update)
+                updated_count = len(to_update)
+            except Exception as e:
+                return False, f"update failed: {e}", 0, 0, 0
+
+        # Append new rows
+        ok_add, msg_add, added_count = await self.append_rows(to_add)
+        if not ok_add:
+            return False, msg_add, 0, updated_count, 0
+
+        # Delete stale SKUs (rows present in sheet but not in desired list)
+        stale_rows = [row_i for (sku, row_i) in (existing or {}).items() if sku not in desired_keys]
+        deleted_count = await self._delete_rows_by_indices(stale_rows)
+
+        # Reset dedupe cache so subsequent runs see fresh sheet state.
+        self._dedupe_skus = set()
+        self._dedupe_last_fetch_ts = 0.0
+        return True, "ok", int(added_count), int(updated_count), int(deleted_count)
+
     async def append_rows(self, rows: Sequence[Sequence[str]]) -> Tuple[bool, str, int]:
         """
         Append rows. Returns (ok, message, added_count).
@@ -479,20 +676,26 @@ class RsFsSheetSync:
         # Dedupe by SKU (column B)
         await self._fetch_existing_skus_if_needed()
         new_rows: List[List[str]] = []
+        new_rows_gh: List[List[str]] = []
         for r in rows:
             row = [str(c or "") for c in r]
             sku = (row[1] if len(row) > 1 else "").strip().lower()
             if sku and sku in self._dedupe_skus:
                 continue
-            new_rows.append(row[:3] + ([""] * max(0, 3 - len(row))))
+            # A/B/C are required; G/H are optional (row[3], row[4])
+            abc = row[:3] + ([""] * max(0, 3 - len(row)))
+            aff = (row[3] if len(row) > 3 else "").strip()
+            mon = (row[4] if len(row) > 4 else "").strip()
+            new_rows.append(abc)
+            new_rows_gh.append([aff, mon])
 
         if not new_rows:
             return True, "all rows already exist", 0
 
         rng = f"'{tab}'!A:C"
 
-        def _do() -> None:
-            service.spreadsheets().values().append(
+        def _do() -> dict:
+            return service.spreadsheets().values().append(
                 spreadsheetId=self._sheet_cfg.spreadsheet_id,
                 range=rng,
                 valueInputOption="USER_ENTERED",
@@ -501,9 +704,140 @@ class RsFsSheetSync:
             ).execute()
 
         try:
-            await asyncio.to_thread(_do)
+            resp = await asyncio.to_thread(_do)
         except Exception as e:
             return False, f"append failed: {e}", 0
+
+        # Try to copy down formulas/validation/formatting for D/E/F from the previous row,
+        # so the newly inserted rows behave like manual sheet entry (STORE LINK, dropdowns, etc.).
+        try:
+            sheet_id = int(self._sheet_cfg.tab_gid or 0)
+        except Exception:
+            sheet_id = 0
+        try:
+            updated_range = ""
+            if isinstance(resp, dict):
+                updates = resp.get("updates") if isinstance(resp.get("updates"), dict) else {}
+                updated_range = str((updates or {}).get("updatedRange") or "").strip()
+            m = re.search(r"!A(\d+):C(\d+)", updated_range)
+            if sheet_id and m:
+                start_row = int(m.group(1))
+                end_row = int(m.group(2))
+                if end_row >= start_row:
+                    # Template row:
+                    # - Prefer the row immediately above (most common: last populated row)
+                    # - If we just inserted into row 2 (empty sheet case), try the row immediately below.
+                    template_row = start_row - 1
+                    if template_row < 2:
+                        template_row = end_row + 1
+
+                    # Lazy import for Sheets batchUpdate request shapes (same deps).
+                    service = self._get_service()
+                    if service and template_row >= 2:
+                        # 0-based indices for GridRange
+                        src_row_start = template_row - 1
+                        src_row_end = template_row
+                        dst_row_start = start_row - 1
+                        dst_row_end = end_row
+
+                        # D column formula copy (D=3)
+                        reqs = [
+                            {
+                                "copyPaste": {
+                                    "source": {
+                                        "sheetId": sheet_id,
+                                        "startRowIndex": src_row_start,
+                                        "endRowIndex": src_row_end,
+                                        "startColumnIndex": 3,
+                                        "endColumnIndex": 4,
+                                    },
+                                    "destination": {
+                                        "sheetId": sheet_id,
+                                        "startRowIndex": dst_row_start,
+                                        "endRowIndex": dst_row_end,
+                                        "startColumnIndex": 3,
+                                        "endColumnIndex": 4,
+                                    },
+                                    "pasteType": "PASTE_FORMULA",
+                                }
+                            },
+                            # Data validation + formatting for D/E/F (no values)
+                            {
+                                "copyPaste": {
+                                    "source": {
+                                        "sheetId": sheet_id,
+                                        "startRowIndex": src_row_start,
+                                        "endRowIndex": src_row_end,
+                                        "startColumnIndex": 3,
+                                        "endColumnIndex": 6,
+                                    },
+                                    "destination": {
+                                        "sheetId": sheet_id,
+                                        "startRowIndex": dst_row_start,
+                                        "endRowIndex": dst_row_end,
+                                        "startColumnIndex": 3,
+                                        "endColumnIndex": 6,
+                                    },
+                                    "pasteType": "PASTE_DATA_VALIDATION",
+                                }
+                            },
+                            {
+                                "copyPaste": {
+                                    "source": {
+                                        "sheetId": sheet_id,
+                                        "startRowIndex": src_row_start,
+                                        "endRowIndex": src_row_end,
+                                        "startColumnIndex": 3,
+                                        "endColumnIndex": 6,
+                                    },
+                                    "destination": {
+                                        "sheetId": sheet_id,
+                                        "startRowIndex": dst_row_start,
+                                        "endRowIndex": dst_row_end,
+                                        "startColumnIndex": 3,
+                                        "endColumnIndex": 6,
+                                    },
+                                    "pasteType": "PASTE_FORMAT",
+                                }
+                            },
+                        ]
+
+                        def _do_copy() -> None:
+                            service.spreadsheets().batchUpdate(
+                                spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                                body={"requests": reqs},
+                            ).execute()
+
+                        await asyncio.to_thread(_do_copy)
+        except Exception:
+            # Never fail the append just because formatting copy didn't work.
+            pass
+
+        # Best-effort: populate G/H for the appended rows without touching D/E/F (avoids breaking arrayformulas).
+        try:
+            updated_range = ""
+            if isinstance(resp, dict):
+                updates = resp.get("updates") if isinstance(resp.get("updates"), dict) else {}
+                updated_range = str((updates or {}).get("updatedRange") or "").strip()
+            m = re.search(r"!A(\d+):C(\d+)", updated_range)
+            if m:
+                start_row = int(m.group(1))
+                end_row = int(m.group(2))
+                if start_row > 0 and end_row >= start_row and (end_row - start_row + 1) == len(new_rows_gh):
+                    rng_gh = f"'{tab}'!G{start_row}:H{end_row}"
+
+                    def _do_gh() -> None:
+                        service.spreadsheets().values().update(
+                            spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                            range=rng_gh,
+                            valueInputOption="USER_ENTERED",
+                            body={"values": new_rows_gh},
+                        ).execute()
+
+                    await asyncio.to_thread(_do_gh)
+        except Exception:
+            # Don't fail the whole append if G/H write fails (sheet can be fixed manually).
+            pass
 
         for r in new_rows:
             sku = (r[1] or "").strip().lower()
@@ -565,7 +899,16 @@ async def build_preview_entries(
                 err = "no store url"
         if not (title or "").strip():
             title = url or ""
-        return RsFsPreviewEntry(store=st, sku=sk, url=url, title=title, error=err, source="website")
+        return RsFsPreviewEntry(
+            store=st,
+            sku=sk,
+            url=url,
+            title=title,
+            error=err,
+            source="website",
+            monitor_url=url,
+            affiliate_url="",
+        )
 
     async def _one_indexed(i: int, st: str, sk: str) -> Tuple[int, RsFsPreviewEntry]:
         return i, await _one(st, sk)

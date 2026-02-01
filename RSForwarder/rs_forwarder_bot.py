@@ -941,6 +941,8 @@ class RSForwarderBot:
                                 title=title,
                                 error="" if url else "no url in monitor embed",
                                 source=f"monitor:{ch_name}",
+                                monitor_url=url,
+                                affiliate_url="",
                             )
 
                     # Pass 2: exact match anywhere in values (avoid false positives on short numbers)
@@ -960,6 +962,8 @@ class RSForwarderBot:
                                 title=title,
                                 error="" if url else "no url in monitor embed",
                                 source=f"monitor:{ch_name}",
+                                monitor_url=url,
+                                affiliate_url="",
                             )
 
                     # Fallback: raw text match anywhere in embed
@@ -984,6 +988,8 @@ class RSForwarderBot:
                             title=title,
                             error="" if url else "no url in monitor embed",
                             source=f"monitor:{ch_name}",
+                            monitor_url=url,
+                            affiliate_url="",
                         )
         except Exception:
             return None
@@ -1136,6 +1142,16 @@ class RSForwarderBot:
                 dry_run = False
             dry_run = bool(dry_run or test_enabled)
 
+            # Sheet sync mode:
+            # - append: add only new SKUs (default, safe for chunked messages)
+            # - mirror: make sheet match the full list (ONLY safe when we have the full list, e.g. `!rsfsrun`)
+            try:
+                sync_mode = str((self.config or {}).get("rs_fs_sheet_sync_mode") or "append").strip().lower()
+            except Exception:
+                sync_mode = "append"
+            if sync_mode not in {"append", "mirror"}:
+                sync_mode = "append"
+
             try:
                 limit = int((self.config or {}).get("rs_fs_sheet_test_limit") or 25)
             except Exception:
@@ -1217,7 +1233,7 @@ class RSForwarderBot:
             # Prefer items where we can build a URL (so small limits like 1 still show something useful).
             try:
                 # If we're actually writing to the sheet, pre-dedupe first (saves work).
-                if sheet_enabled and (not dry_run):
+                if sheet_enabled and (not dry_run) and sync_mode != "mirror":
                     try:
                         pairs = await self._rs_fs_sheet.filter_new_pairs(list(pairs or []))
                     except Exception:
@@ -1305,6 +1321,53 @@ class RSForwarderBot:
             entries = list(raw_entries or [])
             skipped_no_url = sum(1 for e in entries if not (getattr(e, "url", "") or "").strip())
 
+            # Compute affiliate links for the resolved URL (column G), and persist the resolved/monitor URL (column H).
+            # Use the canonical affiliate rewriter so behavior matches forwarding.
+            try:
+                rewrite_enabled = bool(self.config.get("affiliate_rewrite_enabled", True))
+            except Exception:
+                rewrite_enabled = True
+            if entries:
+                try:
+                    enriched: List[rs_fs_sheet_sync.RsFsPreviewEntry] = []
+                    url_list: List[str] = []
+                    for e in entries:
+                        u0 = (getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
+                        if u0:
+                            url_list.append(u0)
+                    aff_map: Dict[str, str] = {}
+                    if rewrite_enabled and url_list:
+                        # De-dupe while preserving order
+                        seen_u: Set[str] = set()
+                        unique_urls: List[str] = []
+                        for u in url_list:
+                            if u in seen_u:
+                                continue
+                            seen_u.add(u)
+                            unique_urls.append(u)
+                        mapped, _notes = await affiliate_rewriter.compute_affiliate_rewrites_plain(self.config, unique_urls)
+                        aff_map = {str(k or "").strip(): str(v or "").strip() for k, v in (mapped or {}).items()}
+
+                    for e in entries:
+                        u0 = (getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
+                        aff = (aff_map.get(u0) or "").strip() if u0 else ""
+                        enriched.append(
+                            rs_fs_sheet_sync.RsFsPreviewEntry(
+                                store=getattr(e, "store", "") or "",
+                                sku=getattr(e, "sku", "") or "",
+                                url=getattr(e, "url", "") or "",
+                                title=getattr(e, "title", "") or "",
+                                error=getattr(e, "error", "") or "",
+                                source=getattr(e, "source", "") or "",
+                                monitor_url=u0,
+                                affiliate_url=aff,
+                            )
+                        )
+                    entries = enriched
+                except Exception:
+                    # Never let affiliate computation break RS-FS flow
+                    pass
+
             if dry_run:
                 try:
                     out_ch = await self._resolve_channel_by_id(int(out_ch_id))
@@ -1343,9 +1406,14 @@ class RSForwarderBot:
                     print(f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Cannot resolve output channel id={out_ch_id} for results send")
 
             ok, msg, added = True, "dry-run", 0
+            updated = 0
+            deleted = 0
             if (not dry_run) and sheet_enabled:
-                rows = [[e.store, e.sku, e.title] for e in entries]
-                ok, msg, added = await self._rs_fs_sheet.append_rows(rows)
+                rows = [[e.store, e.sku, e.title, e.affiliate_url, e.monitor_url] for e in entries]
+                if sync_mode == "mirror":
+                    ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(rows)
+                else:
+                    ok, msg, added = await self._rs_fs_sheet.append_rows(rows)
 
                 # Optional status output
                 try:
@@ -1353,7 +1421,12 @@ class RSForwarderBot:
                     if status_ch_raw:
                         sch = await self._resolve_channel_by_id(int(status_ch_raw))
                         if sch and hasattr(sch, "send"):
-                            if ok and added > 0:
+                            if ok and sync_mode == "mirror":
+                                await sch.send(
+                                    f"RS-FS Sheet (mirror): ✅ added {added}, updated {updated}, removed {deleted}.",
+                                    allowed_mentions=discord.AllowedMentions.none(),
+                                )
+                            elif ok and added > 0:
                                 await sch.send(f"RS-FS Sheet: ✅ added {added} row(s).", allowed_mentions=discord.AllowedMentions.none())
                             elif not ok:
                                 await sch.send(f"RS-FS Sheet: ❌ {msg}", allowed_mentions=discord.AllowedMentions.none())
@@ -1390,6 +1463,8 @@ class RSForwarderBot:
                     name = name[:253] + "..."
                 title = (e.title or "").strip()
                 url = (e.url or "").strip()
+                monitor_url = (getattr(e, "monitor_url", "") or url).strip()
+                affiliate_url = (getattr(e, "affiliate_url", "") or "").strip()
                 err = (e.error or "").strip()
                 if len(title) > 800:
                     title = title[:800] + "..."
@@ -1398,11 +1473,16 @@ class RSForwarderBot:
                 value_parts: List[str] = []
                 if title:
                     value_parts.append(title)
-                # Avoid duplicate lines when title fallback equals url
-                if url and url != title:
-                    value_parts.append(url)
+                if monitor_url:
+                    if len(monitor_url) > 420:
+                        monitor_url = monitor_url[:420] + "..."
+                    value_parts.append(f"Monitor: {monitor_url}")
                 else:
                     value_parts.append("(no url)")
+                if affiliate_url and affiliate_url != monitor_url:
+                    if len(affiliate_url) > 420:
+                        affiliate_url = affiliate_url[:420] + "..."
+                    value_parts.append(f"Affiliate: {affiliate_url}")
                 src = str(getattr(e, "source", "") or "").strip()
                 if src:
                     value_parts.append(f"(source: {src})")
@@ -2200,6 +2280,92 @@ class RSForwarderBot:
                     await ctx.send(f"❌ RS-FS sheet NOT ready: {msg}{hint}. spreadsheet_id=`{sid}` tab_gid=`{gid}`")
             except Exception as e:
                 await ctx.send(f"❌ RS-FS check failed: {str(e)[:200]}")
+
+        @self.bot.command(name="rsfsrun", aliases=["rsfslive", "rsfswrite"])
+        async def rsfs_run(ctx, limit: str = "120"):
+            """
+            Live sync: fetch recent Zephyr Release Feed chunks and WRITE rows into the Google Sheet.
+            This is the "real data" test (not dry-run).
+            """
+            try:
+                try:
+                    lim = int(str(limit or "").strip() or "120")
+                except Exception:
+                    lim = 120
+                lim = max(10, min(lim, 500))
+
+                if not getattr(self, "_rs_fs_sheet", None) or not self._rs_fs_sheet.enabled():
+                    await ctx.send("❌ RS-FS sheet sync is not enabled.")
+                    return
+
+                ch_id = self._zephyr_release_feed_channel_id()
+                if not ch_id:
+                    await ctx.send("❌ `zephyr_release_feed_channel_id` is not configured.")
+                    return
+
+                ch = await self._resolve_channel_by_id(int(ch_id))
+                if not ch or not hasattr(ch, "history"):
+                    await ctx.send(f"❌ Could not access Zephyr channel `{ch_id}` (no permission or not found).")
+                    return
+
+                await ctx.send(f"✅ Running RS-FS LIVE sync from <#{ch_id}> (max={lim})… this will write to the sheet.")
+
+                # Collect recent Zephyr chunks and merge (Zephyr often splits across multiple messages).
+                merged_text_parts: List[str] = []
+                try:
+                    async for m in ch.history(limit=240):
+                        if not (getattr(m, "embeds", None) or []) and not (getattr(m, "content", None) or ""):
+                            continue
+                        t = self._collect_embed_text(m)
+                        if not t:
+                            continue
+                        if zephyr_release_feed_parser.looks_like_release_feed_embed_text(t):
+                            merged_text_parts.append(t)
+                        if len(merged_text_parts) >= 20:
+                            break
+                except Exception:
+                    merged_text_parts = []
+
+                if not merged_text_parts:
+                    await ctx.send("❌ Could not find recent Zephyr `Release Feed(s)` embed chunks in that channel.")
+                    return
+
+                # Temporarily force live mode + set max per run; also post status into the invoking channel.
+                prev_dry = bool((self.config or {}).get("rs_fs_sheet_dry_run", False))
+                prev_test = bool((self.config or {}).get("rs_fs_sheet_test_output_enabled", False))
+                prev_max = int((self.config or {}).get("rs_fs_sheet_max_per_run") or 250)
+                prev_status = str((self.config or {}).get("rs_fs_sheet_status_channel_id") or "").strip()
+                prev_mode = str((self.config or {}).get("rs_fs_sheet_sync_mode") or "append").strip()
+                try:
+                    self.config["rs_fs_sheet_dry_run"] = False
+                    self.config["rs_fs_sheet_test_output_enabled"] = False
+                    self.config["rs_fs_sheet_max_per_run"] = lim
+                    self.config["rs_fs_sheet_status_channel_id"] = str(getattr(ctx.channel, "id", "") or "")
+                    # Mirror mode: make the sheet match the full list (adds/updates/removes).
+                    self.config["rs_fs_sheet_sync_mode"] = "mirror"
+
+                    class _Shim:
+                        def __init__(self, channel, text: str):
+                            self.channel = channel
+                            self.id = int(time.time() * 1000)
+                            self.author = ctx.author
+                            self.content = text
+                            self.embeds = []
+
+                    shim = _Shim(ch, "\n".join(reversed(merged_text_parts)))
+                    await self._maybe_sync_rs_fs_sheet_from_message(shim)  # type: ignore[arg-type]
+                    await ctx.send("✅ RS-FS LIVE sync finished. Check the sheet (and this channel for the added-row count).")
+                finally:
+                    try:
+                        self.config["rs_fs_sheet_dry_run"] = prev_dry
+                        self.config["rs_fs_sheet_test_output_enabled"] = prev_test
+                        self.config["rs_fs_sheet_max_per_run"] = prev_max
+                        self.config["rs_fs_sheet_status_channel_id"] = prev_status
+                        self.config["rs_fs_sheet_sync_mode"] = prev_mode
+                    except Exception:
+                        pass
+            except Exception as e:
+                await ctx.send(f"❌ RS-FS live run failed: {str(e)[:200]}")
         
         @self.bot.command(name='rsremove', aliases=['remove'])
         async def remove_channel(ctx, source_channel: discord.TextChannel = None):
