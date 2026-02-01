@@ -617,27 +617,42 @@ class RSForwarderBot:
 
         nums = set(_re.findall(r"(?:^|\n)\s*(?:\*\*)?(\d{1,4})\.(?:\*\*)?\s*\+", merged_text, flags=_re.IGNORECASE))
         total_items = len(nums)
-        pairs = zephyr_release_feed_parser.parse_release_feed_pairs(merged_text) or []
+        items = zephyr_release_feed_parser.parse_release_feed_items(merged_text) or []
+        pairs = [(it.store, it.sku) for it in items]
         sku_to_store: Dict[str, str] = {}
+        sku_to_rid: Dict[str, int] = {}
         skus = []
-        for st, sk in pairs:
-            k = str(sk or "").strip().lower()
+        parsed_release_ids: Set[int] = set()
+        for it in items:
+            st = str(getattr(it, "store", "") or "").strip()
+            sk = str(getattr(it, "sku", "") or "").strip()
+            rid = 0
+            try:
+                rid = int(getattr(it, "release_id", 0) or 0)
+            except Exception:
+                rid = 0
+            if rid > 0:
+                parsed_release_ids.add(rid)
+            k = sk.lower()
             if not k:
                 continue
             if k not in sku_to_store:
-                sku_to_store[k] = str(st or "").strip()
+                sku_to_store[k] = st
+            if k not in sku_to_rid and rid > 0:
+                sku_to_rid[k] = rid
             skus.append(k)
         unique_skus = set(skus)
         dupes = max(0, len(skus) - len(unique_skus))
 
-        unparseable_lines: List[str] = []
-        for m in _re.finditer(r"(?:^|\n)\s*(?:\*\*)?(\d{1,4})\.(?:\*\*)?\s*\+([^\n]+)", merged_text, flags=_re.IGNORECASE):
-            line = (m.group(0) or "").strip()
-            # Heuristic: parseable entries usually include a `*-monitor` bracket.
-            if "-monitor" not in line.lower():
-                unparseable_lines.append(line)
-        unparseable_count = len(unparseable_lines)
-        unparseable_sample = unparseable_lines[:8]
+        all_ids = set()
+        for s_id in _re.findall(r"(?:^|\n)\s*(?:\*\*)?(\d{1,4})\.(?:\*\*)?\s*\+", merged_text, flags=_re.IGNORECASE):
+            try:
+                all_ids.add(int(str(s_id or "0").strip() or "0"))
+            except Exception:
+                continue
+        total_items = len([i for i in all_ids if int(i or 0) > 0]) or total_items
+        unparseable_ids = sorted([i for i in all_ids if int(i or 0) > 0 and int(i) not in parsed_release_ids])
+        unparseable_count = len(unparseable_ids)
 
         # Compare to what's currently in the sheet (if enabled)
         existing_set: Set[str] = set()
@@ -662,18 +677,23 @@ class RSForwarderBot:
             ),
             inline=False,
         )
-        if unparseable_sample:
+        if unparseable_ids:
+            up_lines = []
+            for rid in unparseable_ids[:10]:
+                up_lines.append(f"- `{rid}` `/removereleaseid release_id: {rid}`")
             emb.add_field(
                 name="Why some items aren’t in the sheet",
-                value="These lines don’t contain a `*-monitor` tag, so we can’t reliably map store+SKU:\n"
-                + "\n".join([f"- {ln[:180]}" for ln in unparseable_sample]),
+                value="These release IDs don’t map to a `*-monitor` tag, so we can’t reliably map store+SKU:\n"
+                + "\n".join(up_lines),
                 inline=False,
             )
         if missing:
             sample = []
             for k in missing[:12]:
                 st = sku_to_store.get(k) or "?"
-                sample.append(f"- `{st}` `{k}`")
+                rid = int(sku_to_rid.get(k) or 0)
+                cmd = f"/removereleaseid release_id: {rid}" if rid else "/removereleaseid release_id: ?"
+                sample.append(f"- `{rid}` `{st}` `{k}`  `{cmd}`")
             emb.add_field(
                 name="Missing from sheet (parseable SKUs)",
                 value=f"`{len(missing)}`\n" + "\n".join(sample),
@@ -1876,9 +1896,97 @@ class RSForwarderBot:
             except Exception:
                 pass
 
+            async def _maybe_post_auto_check() -> None:
+                """
+                Post an RS-FS Check card automatically after /listreleases chunks arrive.
+                Debounced to avoid multi-chunk spam.
+                """
+                try:
+                    if not self._rsfs_auto_check_on_zephyr():
+                        return
+                    if not zephyr_release_feed_parser.looks_like_release_feed_embed_text(text or ""):
+                        return
+                    now = time.time()
+                    if (now - float(getattr(self, "_rs_fs_last_auto_check_ts", 0.0) or 0.0)) < self._rsfs_auto_check_debounce_s():
+                        return
+                    self._rs_fs_last_auto_check_ts = now
+
+                    out_id_raw = str((self.config or {}).get("rs_fs_sheet_status_channel_id") or "").strip()
+                    out_id = int(out_id_raw) if out_id_raw else int(target_ch)
+                    out_ch2 = await self._resolve_channel_by_id(int(out_id))
+                    if not (out_ch2 and hasattr(out_ch2, "send")):
+                        try:
+                            print(
+                                f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Auto check: cannot resolve sendable channel id={out_id}"
+                            )
+                        except Exception:
+                            pass
+                        return
+                    emb = await self._build_rsfs_check_embed()
+                    try:
+                        run_lim = int((self.config or {}).get("rs_fs_sheet_max_per_run") or 250)
+                    except Exception:
+                        run_lim = 250
+                    run_lim = max(10, min(run_lim, 500))
+                    try:
+                        print(
+                            f"{Colors.CYAN}[RS-FS Sheet]{Colors.RESET} Auto check: attempting send to channel_id={out_id} (debounce={self._rsfs_auto_check_debounce_s():.0f}s)"
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        await out_ch2.send(
+                            embed=emb,
+                            view=_RsFsCheckView(self, owner_id=0, run_limit=run_lim),
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                        try:
+                            print(f"{Colors.CYAN}[RS-FS Sheet]{Colors.RESET} Auto check: sent embed+buttons")
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        # Fallback: still send buttons even if embed permissions are missing.
+                        msg0 = (str(e) or "send failed").replace("\n", " ").strip()
+                        if len(msg0) > 220:
+                            msg0 = msg0[:220] + "..."
+                        try:
+                            print(f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Auto check: send failed: {msg0}")
+                        except Exception:
+                            pass
+                        try:
+                            await out_ch2.send(
+                                content="RS-FS Check: (embed failed) use the buttons below or run `!rsfscheck`.",
+                                view=_RsFsCheckView(self, owner_id=0, run_limit=run_lim),
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+                            try:
+                                print(f"{Colors.CYAN}[RS-FS Sheet]{Colors.RESET} Auto check: sent fallback text+buttons")
+                            except Exception:
+                                pass
+                        except Exception:
+                            return
+                except Exception:
+                    return
+
             # Always attempt parsing. Zephyr splits long lists into multiple embeds and
             # continuation chunks often omit the "Release Feed(s)" header.
-            pairs = zephyr_release_feed_parser.parse_release_feed_pairs(text)
+            items = zephyr_release_feed_parser.parse_release_feed_items(text)
+            pairs = [(it.store, it.sku) for it in (items or [])]
+            rid_by_key: Dict[str, int] = {}
+            try:
+                for it in (items or []):
+                    try:
+                        rid_by_key[self._rs_fs_override_key(getattr(it, "store", ""), getattr(it, "sku", ""))] = int(
+                            getattr(it, "release_id", 0) or 0
+                        )
+                    except Exception:
+                        continue
+            except Exception:
+                rid_by_key = {}
+
+            # Post a visible check card early (even if there are no new SKUs to append).
+            await _maybe_post_auto_check()
+
             if not pairs:
                 try:
                     print(f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Skip: parsed 0 items from embed text")
@@ -2213,36 +2321,47 @@ class RSForwarderBot:
                         sch = await self._resolve_channel_by_id(int(status_ch_raw))
                         if sch and hasattr(sch, "send"):
                             if ok and added > 0:
-                                await sch.send(f"RS-FS Sheet: ✅ added {added} row(s).", allowed_mentions=discord.AllowedMentions.none())
+                                sample_lines: List[str] = []
+                                try:
+                                    for e in (entries or [])[: min(10, len(entries or []))]:
+                                        st2 = str(getattr(e, "store", "") or "").strip()
+                                        sk2 = str(getattr(e, "sku", "") or "").strip()
+                                        rid2 = int(rid_by_key.get(self._rs_fs_override_key(st2, sk2)) or 0)
+                                        cmd = f"/removereleaseid release_id: {rid2}" if rid2 else "/removereleaseid release_id: ?"
+                                        sample_lines.append(f"`{rid2}` `{st2}` `{sk2}`  {cmd}")
+                                except Exception:
+                                    sample_lines = []
+                                try:
+                                    await sch.send(
+                                        embed=_rsfs_embed(
+                                            "RS-FS Sheet (auto)",
+                                            status=f"✅ added {added} row(s)",
+                                            color=discord.Color.green(),
+                                            fields=[
+                                                ("Sample", "\n".join(sample_lines) if sample_lines else "—", False),
+                                            ],
+                                            footer="RS-FS • Auto append from /listreleases",
+                                        ),
+                                        allowed_mentions=discord.AllowedMentions.none(),
+                                    )
+                                except Exception:
+                                    # Fallback if embed links are blocked in this channel.
+                                    txt = "RS-FS Sheet (auto): ✅ added {n} row(s).".format(n=int(added or 0))
+                                    if sample_lines:
+                                        txt += "\n" + "\n".join(sample_lines[:6])
+                                    await sch.send(txt, allowed_mentions=discord.AllowedMentions.none())
                             elif not ok:
-                                await sch.send(f"RS-FS Sheet: ❌ {msg}", allowed_mentions=discord.AllowedMentions.none())
+                                await sch.send(
+                                    embed=_rsfs_embed(
+                                        "RS-FS Sheet (auto)",
+                                        status=f"❌ {msg}",
+                                        color=discord.Color.red(),
+                                        footer="RS-FS",
+                                    ),
+                                    allowed_mentions=discord.AllowedMentions.none(),
+                                )
                 except Exception:
                     pass
-
-            # Optional: after a fresh /listreleases header chunk arrives, post a visible RS-FS Check card
-            # (debounced so multi-chunk lists don't spam).
-            try:
-                if self._rsfs_auto_check_on_zephyr() and ("release feed" in (text or "").lower()):
-                    now = time.time()
-                    if (now - float(getattr(self, "_rs_fs_last_auto_check_ts", 0.0) or 0.0)) >= self._rsfs_auto_check_debounce_s():
-                        self._rs_fs_last_auto_check_ts = now
-                        out_id_raw = str((self.config or {}).get("rs_fs_sheet_status_channel_id") or "").strip()
-                        out_id = int(out_id_raw) if out_id_raw else int(target_ch)
-                        out_ch = await self._resolve_channel_by_id(int(out_id))
-                        if out_ch and hasattr(out_ch, "send"):
-                            emb = await self._build_rsfs_check_embed()
-                            try:
-                                run_lim = int((self.config or {}).get("rs_fs_sheet_max_per_run") or 250)
-                            except Exception:
-                                run_lim = 250
-                            run_lim = max(10, min(run_lim, 500))
-                            await out_ch.send(
-                                embed=emb,
-                                view=_RsFsCheckView(self, owner_id=0, run_limit=run_lim),
-                                allowed_mentions=discord.AllowedMentions.none(),
-                            )
-            except Exception:
-                pass
 
             # Mark message processed to avoid reprocessing the same embed.
             if mid:
