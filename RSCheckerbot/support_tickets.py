@@ -565,6 +565,39 @@ async def _audit_send(
         await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none(), silent=True)
 
 
+async def _audit_ticket_deduped(
+    *,
+    ticket_type: str,
+    owner: discord.Member,
+    existing_channel: discord.TextChannel,
+    ticket_id: str,
+    fingerprint: str,
+    reference_jump_url: str = "",
+) -> None:
+    """Log a dedupe hit to tickets-logs (do not spam the ticket channel)."""
+    cfg = _cfg()
+    if not cfg or not cfg.audit_enabled:
+        return
+    try:
+        g = getattr(existing_channel, "guild", None)
+        gid = int(getattr(g, "id", 0) or 0)
+    except Exception:
+        gid = int(cfg.guild_id or 0)
+    if gid <= 0:
+        gid = int(cfg.guild_id or 0)
+    e = discord.Embed(title="Ticket Deduped", color=0x5865F2, timestamp=_now_utc())
+    e.add_field(name="Type", value=str(ticket_type or "—")[:1024], inline=True)
+    e.add_field(name="Member", value=f"{getattr(owner, 'mention', '')} (`{int(owner.id)}`)", inline=True)
+    e.add_field(name="Existing Ticket", value=f"<#{int(existing_channel.id)}>", inline=True)
+    if ticket_id:
+        e.add_field(name="Ticket ID", value=f"`{str(ticket_id)[:128]}`", inline=True)
+    if fingerprint:
+        e.add_field(name="Fingerprint", value=f"`{str(fingerprint)[:256]}`", inline=False)
+    if reference_jump_url:
+        e.add_field(name="Source", value=_embed_link("View Full Log", str(reference_jump_url)), inline=False)
+    await _audit_send(guild_id=gid, embed=e)
+
+
 async def audit_message_create(message: discord.Message) -> None:
     """Audit: message sent in ticket categories."""
     if not _ensure_cfg_loaded() or not _BOT:
@@ -1018,13 +1051,22 @@ async def _open_or_update_ticket(
         if existing and cfg.dedupe_enabled:
             _tid, rec = existing
             ch_id = _as_int(rec.get("channel_id"))
+            existing_ticket_id = str(rec.get("ticket_id") or _tid or "").strip()
             ch = guild.get_channel(int(ch_id)) if ch_id else None
             if isinstance(ch, discord.TextChannel):
                 # Ensure the correct per-ticket role is applied even on dedupe.
                 with suppress(Exception):
                     await _set_ticket_role_for_member(guild=guild, member=owner, ticket_type=ticket_type, add=True)
+                # Log dedupe to tickets-logs instead of posting inside the ticket.
                 with suppress(Exception):
-                    await ch.send("ℹ️ Ticket already open (deduped).", silent=True)
+                    await _audit_ticket_deduped(
+                        ticket_type=ticket_type,
+                        owner=owner,
+                        existing_channel=ch,
+                        ticket_id=existing_ticket_id,
+                        fingerprint=fingerprint,
+                        reference_jump_url=reference_jump_url,
+                    )
                 # Important: do NOT bump last_activity for bot messages.
                 return ch
 
