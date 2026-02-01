@@ -61,6 +61,9 @@ class SupportTicketConfig:
     billing_role_id: int
     cancellation_role_id: int
     free_pass_no_whop_role_id: int
+    resolution_followup_enabled: bool
+    resolution_followup_auto_close_after_seconds: int
+    resolution_followup_templates: dict[str, str]
 
 
 _BOT: commands.Bot | None = None
@@ -154,6 +157,8 @@ def initialize(
     dd = st.get("dedupe") if isinstance(st.get("dedupe"), dict) else {}
     sm = st.get("startup_messages") if isinstance(st.get("startup_messages"), dict) else {}
     sm_templates = sm.get("templates") if isinstance(sm.get("templates"), dict) else {}
+    rf = st.get("resolution_followup") if isinstance(st.get("resolution_followup"), dict) else {}
+    rf_templates = rf.get("templates") if isinstance(rf.get("templates"), dict) else {}
     al = st.get("audit_logs") if isinstance(st.get("audit_logs"), dict) else {}
     tr = st.get("ticket_roles") if isinstance(st.get("ticket_roles"), dict) else {}
 
@@ -198,6 +203,9 @@ def initialize(
         billing_role_id=_as_int(tr.get("billing_role_id")),
         cancellation_role_id=_as_int(tr.get("cancellation_role_id")),
         free_pass_no_whop_role_id=_as_int(tr.get("free_pass_no_whop_role_id")),
+        resolution_followup_enabled=_as_bool(rf.get("enabled")),
+        resolution_followup_auto_close_after_seconds=max(0, _as_int(rf.get("auto_close_after_seconds")) or 1800),
+        resolution_followup_templates={str(k).strip().lower(): str(v) for k, v in (rf_templates or {}).items() if str(k or "").strip()},
     )
 
     # Register persistent view so buttons survive restarts.
@@ -251,6 +259,15 @@ def _startup_template(ticket_type: str) -> str:
         return ""
     key = str(ticket_type or "").strip().lower()
     tmpl = (cfg.startup_templates or {}).get(key) if isinstance(cfg.startup_templates, dict) else ""
+    return str(tmpl or "").strip()
+
+
+def _resolution_followup_template(ticket_type: str) -> str:
+    cfg = _cfg()
+    if not cfg:
+        return ""
+    key = str(ticket_type or "").strip().lower()
+    tmpl = (cfg.resolution_followup_templates or {}).get(key) if isinstance(cfg.resolution_followup_templates, dict) else ""
     return str(tmpl or "").strip()
 
 
@@ -598,6 +615,36 @@ async def _audit_ticket_deduped(
     await _audit_send(guild_id=gid, embed=e)
 
 
+async def _audit_ticket_resolved(
+    *,
+    ticket_type: str,
+    owner: discord.Member,
+    ticket_channel: discord.TextChannel,
+    resolution_event: str,
+    reference_jump_url: str = "",
+) -> None:
+    """Log a resolution signal to tickets-logs (with ticket reference)."""
+    cfg = _cfg()
+    if not cfg or not cfg.audit_enabled:
+        return
+    try:
+        g = getattr(ticket_channel, "guild", None)
+        gid = int(getattr(g, "id", 0) or 0)
+    except Exception:
+        gid = int(cfg.guild_id or 0)
+    if gid <= 0:
+        gid = int(cfg.guild_id or 0)
+    e = discord.Embed(title="Ticket Resolved (Follow-up Posted)", color=0x57F287, timestamp=_now_utc())
+    e.add_field(name="Type", value=str(ticket_type or "—")[:1024], inline=True)
+    e.add_field(name="Member", value=f"{getattr(owner, 'mention', '')} (`{int(owner.id)}`)", inline=True)
+    e.add_field(name="Ticket", value=f"<#{int(ticket_channel.id)}>", inline=True)
+    if resolution_event:
+        e.add_field(name="Trigger", value=str(resolution_event)[:1024], inline=True)
+    if reference_jump_url:
+        e.add_field(name="Source", value=_embed_link("View Full Log", str(reference_jump_url)), inline=False)
+    await _audit_send(guild_id=gid, embed=e)
+
+
 async def audit_message_create(message: discord.Message) -> None:
     """Audit: message sent in ticket categories."""
     if not _ensure_cfg_loaded() or not _BOT:
@@ -926,6 +973,133 @@ async def _set_ticket_role_for_member(*, guild: discord.Guild, member: discord.M
             await member.remove_roles(role, reason=f"RSCheckerbot: close {ticket_type} ticket")
 
 
+async def post_resolution_followup_and_remove_role(
+    *,
+    discord_id: int,
+    ticket_type: str,
+    resolution_event: str,
+    reference_jump_url: str = "",
+) -> bool:
+    """Mark an open ticket as resolved, remove its role, and post follow-up inside the ticket channel."""
+    if not _ensure_cfg_loaded() or not _BOT:
+        return False
+    cfg = _cfg()
+    if not cfg or not cfg.resolution_followup_enabled:
+        return False
+    guild = _BOT.get_guild(int(cfg.guild_id))
+    if not isinstance(guild, discord.Guild):
+        return False
+
+    uid = int(discord_id or 0)
+    if uid <= 0:
+        return False
+    ttype = str(ticket_type or "").strip().lower()
+    if ttype not in {"billing", "cancellation", "free_pass"}:
+        return False
+
+    # Find the open ticket channel (copy under lock).
+    ch_id = 0
+    already_sent = False
+    async with _INDEX_LOCK:
+        db = _index_load()
+        found = _ticket_find_open(db, ticket_type=ttype, user_id=uid, fingerprint="")
+        if not found:
+            return False
+        tid, rec = found
+        ch_id = _as_int(rec.get("channel_id"))
+        already_sent = bool(str(rec.get("resolved_followup_sent_at_iso") or "").strip())
+        if already_sent:
+            return True
+        # mark resolved now (persist even if send fails; we don't want to spam)
+        rec["resolved_at_iso"] = _now_iso()
+        rec["resolved_event"] = str(resolution_event or "")[:200]
+        rec["resolved_followup_sent_at_iso"] = _now_iso()
+        # keep latest source reference
+        if reference_jump_url:
+            rec["reference_jump_url"] = str(reference_jump_url or "")
+        db["tickets"][tid] = rec  # type: ignore[index]
+        _index_save(db)
+
+    ch = guild.get_channel(int(ch_id)) if ch_id else None
+    if not isinstance(ch, discord.TextChannel):
+        return False
+
+    owner = guild.get_member(uid)
+    if not isinstance(owner, discord.Member):
+        with suppress(Exception):
+            owner = await guild.fetch_member(uid)
+    if not isinstance(owner, discord.Member):
+        return False
+
+    # Remove the ticket role now (resolved state).
+    with suppress(Exception):
+        await _set_ticket_role_for_member(guild=guild, member=owner, ticket_type=ttype, add=False)
+
+    # Follow-up embed + buttons in-ticket (ping member + support).
+    tmpl = _resolution_followup_template(ttype)
+    desc = tmpl.strip() if tmpl else "Update: this ticket appears resolved. If you still have concerns, reply here — otherwise Support can close."
+    e = discord.Embed(title="Update", description=desc[:4096], color=0x57F287)
+    if resolution_event:
+        e.add_field(name="Trigger", value=str(resolution_event)[:1024], inline=True)
+    if reference_jump_url:
+        e.add_field(name="Source", value=_embed_link("View Full Log", str(reference_jump_url)), inline=True)
+    view = _CONTROLS_VIEW or SupportTicketControlsView()
+    role_mention = _support_ping_role_mention()
+    ping = " ".join([x for x in [f"<@{uid}>", role_mention] if str(x or "").strip()])
+    with suppress(Exception):
+        await ch.send(
+            content=ping,
+            embed=e,
+            view=view,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
+        )
+
+    with suppress(Exception):
+        await _audit_ticket_resolved(
+            ticket_type=ttype,
+            owner=owner,
+            ticket_channel=ch,
+            resolution_event=resolution_event,
+            reference_jump_url=reference_jump_url,
+        )
+    return True
+
+
+async def reconcile_open_ticket_roles() -> None:
+    """One-time best-effort: ensure legacy open tickets have correct ticket-roles applied."""
+    if not _ensure_cfg_loaded() or not _BOT:
+        return
+    cfg = _cfg()
+    if not cfg:
+        return
+    guild = _BOT.get_guild(int(cfg.guild_id))
+    if not isinstance(guild, discord.Guild):
+        return
+
+    # Copy under lock to avoid holding lock across awaits.
+    tickets: list[tuple[int, str, str]] = []  # (user_id, ticket_type, resolved_followup_sent_at_iso)
+    async with _INDEX_LOCK:
+        db = _index_load()
+        for _tid, rec in _ticket_iter(db):
+            if not _ticket_is_open(rec):
+                continue
+            uid = _as_int(rec.get("user_id"))
+            ttype = str(rec.get("ticket_type") or "").strip().lower()
+            if uid <= 0 or ttype not in {"billing", "cancellation", "free_pass"}:
+                continue
+            r_iso = str(rec.get("resolved_followup_sent_at_iso") or "").strip()
+            tickets.append((uid, ttype, r_iso))
+
+    for uid, ttype, r_iso in tickets:
+        m = guild.get_member(int(uid))
+        if not isinstance(m, discord.Member):
+            continue
+        # If we already posted a resolved follow-up, ensure role is removed; otherwise ensure role is present.
+        should_add = not bool(r_iso)
+        with suppress(Exception):
+            await _set_ticket_role_for_member(guild=guild, member=m, ticket_type=ttype, add=should_add)
+
+
 def is_ticket_channel(channel_id: int) -> bool:
     """Fast check used by main.on_message (best-effort)."""
     if int(channel_id or 0) <= 0:
@@ -1139,6 +1313,9 @@ async def _open_or_update_ticket(
             "closed_at_iso": "",
             "startup_sent_at_iso": "",
             "startup_skipped_at_iso": "",
+            "resolved_at_iso": "",
+            "resolved_event": "",
+            "resolved_followup_sent_at_iso": "",
         }
         if isinstance(extra_record_fields, dict):
             for k, v in extra_record_fields.items():
@@ -1229,6 +1406,70 @@ def _format_discord_id(uid: int) -> str:
     return f"`{int(uid)}`" if int(uid) > 0 else "—"
 
 
+def _norm_whop_status_key(s: str) -> str:
+    raw = str(s or "").strip().lower()
+    if not raw:
+        return "unknown"
+    raw = raw.replace(" ", "_")
+    if raw in {"pastdue"}:
+        raw = "past_due"
+    if raw in {"cancelled"}:
+        raw = "canceled"
+    if raw in {"canceling", "cancelling"}:
+        raw = "canceling"
+    if raw in {"deactivated", "inactive"}:
+        raw = "deactivated"
+    return raw
+
+
+def _whop_status_label(key: str) -> str:
+    k = _norm_whop_status_key(key)
+    if k == "past_due":
+        return "Past Due"
+    if k == "canceled":
+        return "Canceled"
+    if k == "canceling":
+        return "Cancelling"
+    if k == "trialing":
+        return "Trialing"
+    if k == "active":
+        return "Active"
+    if k == "deactivated":
+        return "Deactivated"
+    return (key or "Unknown").strip() or "Unknown"
+
+
+def _whop_date_any(b: dict) -> str:
+    if not isinstance(b, dict):
+        return ""
+    # Prefer the human-friendly field captured from member-status-logs.
+    s = str(b.get("renewal_end") or "").strip()
+    if s and s != "—":
+        return s
+    iso = str(b.get("renewal_end_iso") or "").strip()
+    if iso:
+        return _fmt_date_any(iso)
+    return ""
+
+
+def _whop_status_display(*, ticket_type: str, whop_brief: dict | None, status_override: str = "") -> str:
+    b = whop_brief if isinstance(whop_brief, dict) else {}
+    raw_status = str(status_override or b.get("status") or "").strip()
+    key = _norm_whop_status_key(raw_status)
+
+    # Cancellation scheduled can appear as "active" + cancel_at_period_end=yes.
+    cap = str(b.get("cancel_at_period_end") or "").strip().lower()
+    if ticket_type == "cancellation" and key == "active" and cap in {"yes", "true", "1"}:
+        key = "canceling"
+
+    label = _whop_status_label(key)
+    d = _whop_date_any(b)
+    if d:
+        # Keep generic "(date)" per your spec.
+        return f"{label} ({d})"
+    return label
+
+
 def build_cancellation_preview_embed(
     *,
     member: discord.Member,
@@ -1241,8 +1482,17 @@ def build_cancellation_preview_embed(
     e.add_field(name="Member", value=str(getattr(member, "display_name", "") or str(member))[:1024], inline=True)
     e.add_field(name="Discord ID", value=_format_discord_id(int(member.id)), inline=True)
     e.add_field(name="Membership", value=str(b.get("product") or "—")[:1024], inline=True)
-    e.add_field(name="Remaining Days", value=str(b.get("remaining_days") or "—")[:1024], inline=True)
-    e.add_field(name="Access Ends On", value=str(b.get("renewal_end") or "—")[:1024], inline=True)
+    e.add_field(name="Whop Status", value=_whop_status_display(ticket_type="cancellation", whop_brief=b), inline=True)
+
+    # Only show Remaining Days / Access Ends On when they are both present and meaningful.
+    st_key = _norm_whop_status_key(str(b.get("status") or ""))
+    cap = str(b.get("cancel_at_period_end") or "").strip().lower()
+    is_canceling = st_key == "canceling" or (st_key == "active" and cap in {"yes", "true", "1"})
+    days = str(b.get("remaining_days") or "").strip()
+    end = str(b.get("renewal_end") or "").strip()
+    if is_canceling and days and days != "—" and end and end != "—":
+        e.add_field(name="Remaining Days", value=days[:1024], inline=True)
+        e.add_field(name="Access Ends On", value=end[:1024], inline=True)
     reason = str(cancellation_reason or b.get("cancellation_reason") or "").strip()
     if reason:
         e.add_field(name="Cancellation Reason", value=f"```\n{reason[:950]}\n```", inline=False)
@@ -1257,8 +1507,10 @@ def build_billing_preview_embed(
     member: discord.Member,
     event_type: str,
     status: str,
+    whop_brief: dict | None = None,
     reference_jump_url: str = "",
 ) -> discord.Embed:
+    b = whop_brief if isinstance(whop_brief, dict) else {}
     e = discord.Embed(title="Billing", color=0xED4245)
     e.add_field(name="Member", value=str(getattr(member, "display_name", "") or str(member))[:1024], inline=True)
     e.add_field(name="Discord ID", value=_format_discord_id(int(member.id)), inline=True)
@@ -1267,7 +1519,11 @@ def build_billing_preview_embed(
         if roles_txt and roles_txt != "—":
             e.add_field(name="Current Roles", value=str(roles_txt)[:1024], inline=False)
     e.add_field(name="Event", value=str(event_type or "—")[:1024], inline=True)
-    e.add_field(name="Status", value=str(status or "—")[:1024], inline=True)
+    e.add_field(
+        name="Whop Status",
+        value=_whop_status_display(ticket_type="billing", whop_brief=b, status_override=str(status or ""))[:1024],
+        inline=True,
+    )
     if reference_jump_url:
         e.add_field(name="Message Reference", value=_embed_link("View Full Log", reference_jump_url), inline=True)
     return e
@@ -1281,7 +1537,7 @@ def build_free_pass_header_embed(
     e = discord.Embed(title="Free Pass", color=0x5865F2)
     e.add_field(name="Member", value=str(getattr(member, "display_name", "") or str(member))[:1024], inline=True)
     e.add_field(name="Discord ID", value=_format_discord_id(int(member.id)), inline=True)
-    e.add_field(name="Status", value="Free Pass – Not Linked to Whop", inline=False)
+    e.add_field(name="Whop Status", value="Not linked", inline=True)
     return e
 
 
@@ -1334,6 +1590,7 @@ async def open_billing_ticket(
     member: discord.Member,
     event_type: str,
     status: str,
+    whop_brief: dict | None = None,
     fingerprint: str,
     occurred_at: datetime,
     reference_jump_url: str = "",
@@ -1347,6 +1604,7 @@ async def open_billing_ticket(
         member=member,
         event_type=event_type,
         status=status,
+        whop_brief=whop_brief,
         reference_jump_url=reference_jump_url,
     )
     return await _open_or_update_ticket(
@@ -1770,12 +2028,25 @@ async def close_ticket_by_channel_id(
     return True
 
 
-async def close_free_pass_if_whop_linked(discord_id: int) -> None:
-    """Immediate close hook called from Whop events (best-effort)."""
+async def close_free_pass_if_whop_linked(
+    discord_id: int,
+    *,
+    resolution_event: str = "whop_linked",
+    reference_jump_url: str = "",
+) -> None:
+    """Resolve Free Pass only when Whop-linked (best-effort)."""
     if not _ensure_cfg_loaded():
         return
     uid = int(discord_id or 0)
     if uid <= 0:
+        return
+    # Only proceed when we can confirm linkage (prevents false "resolved" on noisy cards).
+    if not _IS_WHOP_LINKED:
+        return
+    linked = False
+    with suppress(Exception):
+        linked = bool(_IS_WHOP_LINKED(int(uid)))
+    if not linked:
         return
     # Never hold the index lock while awaiting close_ticket_by_channel_id (it also needs the lock).
     ch_id = 0
@@ -1790,8 +2061,16 @@ async def close_free_pass_if_whop_linked(discord_id: int) -> None:
                 continue
             ch_id = _as_int(rec.get("channel_id"))
             break
-    if ch_id:
-        await close_ticket_by_channel_id(int(ch_id), close_reason="whop_linked", do_transcript=True, delete_channel=True)
+    if not ch_id:
+        return
+    # Prefer follow-up + role removal, then let the sweeper auto-close after grace.
+    with suppress(Exception):
+        await post_resolution_followup_and_remove_role(
+            discord_id=int(uid),
+            ticket_type="free_pass",
+            resolution_event=str(resolution_event or "whop_linked"),
+            reference_jump_url=str(reference_jump_url or ""),
+        )
     return
 
 
@@ -1829,13 +2108,70 @@ async def sweep_free_pass_tickets() -> None:
             with suppress(Exception):
                 linked = bool(_IS_WHOP_LINKED(int(uid)))
             if linked:
-                await close_ticket_by_channel_id(int(ch_id), close_reason="whop_linked", do_transcript=True, delete_channel=True)
+                # Post follow-up + role removal; channel will be auto-closed by resolved sweeper.
+                with suppress(Exception):
+                    await post_resolution_followup_and_remove_role(
+                        discord_id=int(uid),
+                        ticket_type="free_pass",
+                        resolution_event="whop_linked",
+                    )
                 continue
 
         # Condition A: inactivity
         last_dt = _parse_iso(last_iso) or now
         if (now - last_dt) >= timedelta(seconds=int(cfg.inactivity_seconds)):
             await close_ticket_by_channel_id(int(ch_id), close_reason="inactivity", do_transcript=True, delete_channel=True)
+
+    # Auto-close resolved tickets after grace (all types).
+    with suppress(Exception):
+        await sweep_resolved_tickets()
+
+
+async def sweep_resolved_tickets() -> None:
+    """Auto-close tickets that have a resolved follow-up and no human replies after grace."""
+    if not _ensure_cfg_loaded() or not _BOT:
+        return
+    cfg = _cfg()
+    if not cfg or not cfg.resolution_followup_enabled:
+        return
+    delay_s = int(cfg.resolution_followup_auto_close_after_seconds or 0)
+    if delay_s <= 0:
+        return
+    guild = _BOT.get_guild(int(cfg.guild_id))
+    if not isinstance(guild, discord.Guild):
+        return
+    now = _now_utc()
+
+    to_close: list[tuple[int, str]] = []  # (channel_id, close_reason)
+    async with _INDEX_LOCK:
+        db = _index_load()
+        for _tid, rec in _ticket_iter(db):
+            if not _ticket_is_open(rec):
+                continue
+            ttype = str(rec.get("ticket_type") or "").strip().lower()
+            if ttype not in {"billing", "cancellation", "free_pass"}:
+                continue
+            sent_iso = str(rec.get("resolved_followup_sent_at_iso") or "").strip()
+            if not sent_iso:
+                continue
+            sent_dt = _parse_iso(sent_iso) or None
+            if not sent_dt:
+                continue
+            if (now - sent_dt) < timedelta(seconds=delay_s):
+                continue
+            last_iso = str(rec.get("last_activity_at_iso") or rec.get("created_at_iso") or "").strip()
+            last_dt = _parse_iso(last_iso) or now
+            # Only close if no human activity after the follow-up was posted.
+            if last_dt > sent_dt:
+                continue
+            ch_id = _as_int(rec.get("channel_id"))
+            ev = str(rec.get("resolved_event") or "").strip()
+            if ch_id:
+                to_close.append((int(ch_id), f"resolved:{ev or 'ok'}"))
+
+    for ch_id, reason in to_close:
+        with suppress(Exception):
+            await close_ticket_by_channel_id(int(ch_id), close_reason=reason, do_transcript=True, delete_channel=True)
 
 
 async def get_ticket_record_for_channel_id(channel_id: int) -> dict | None:

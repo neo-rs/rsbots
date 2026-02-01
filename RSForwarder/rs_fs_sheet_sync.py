@@ -866,6 +866,50 @@ class RsFsSheetSync:
 
         return await asyncio.to_thread(_do)
 
+    async def fetch_sheet_abc_map(self) -> Dict[str, Dict[str, str]]:
+        """
+        Fetch the public sheet tab A:C (store, sku, title) into a dict:
+          sku_lower -> {store, sku, title}
+        """
+        if not self.enabled():
+            return {}
+        tab = await self._resolve_tab_name()
+        service = self._get_service()
+        if not (service and tab and self._sheet_cfg.spreadsheet_id):
+            return {}
+
+        rng = f"'{tab}'!A:C"
+
+        async with self._api_lock:
+            def _do_get() -> Dict[str, Any]:
+                return service.spreadsheets().values().get(
+                    spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                    range=rng,
+                ).execute()
+
+            try:
+                resp = await asyncio.to_thread(_do_get)
+            except Exception:
+                return {}
+
+        values = resp.get("values") if isinstance(resp, dict) else None
+        out: Dict[str, Dict[str, str]] = {}
+        if isinstance(values, list):
+            for i, row in enumerate(values, start=1):
+                if i == 1:
+                    continue
+                if not isinstance(row, list) or len(row) < 2:
+                    continue
+                store = str(row[0] or "").strip()
+                sku = str(row[1] or "").strip()
+                title = str(row[2] or "").strip() if len(row) > 2 else ""
+                if not sku:
+                    continue
+                if sku.lower() == "sku-upc":
+                    continue
+                out[sku.lower()] = {"store": store, "sku": sku, "title": title}
+        return out
+
     async def _delete_rows_by_indices(self, row_indices_1_based: Sequence[int]) -> int:
         """
         Delete entire rows by 1-based indices (data rows). Returns deleted row count.

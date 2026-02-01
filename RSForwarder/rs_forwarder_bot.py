@@ -849,6 +849,29 @@ class RSForwarderBot:
         missing = sorted([k for k in unique_skus if k not in existing_set]) if existing_set else []
         extra = sorted([k for k in existing_set if k not in unique_skus]) if existing_set else []
 
+        # Detect "bad" titles already in the sheet (URL-as-title / placeholders).
+        bad_titles: List[Tuple[int, str, str, str]] = []  # (rid, store, sku_lower, title)
+        try:
+            abc_map: Dict[str, Dict[str, str]] = {}
+            if ok and getattr(self, "_rs_fs_sheet", None):
+                abc_map = await self._rs_fs_sheet.fetch_sheet_abc_map()  # type: ignore[attr-defined]
+            for sku_l in sorted(list(unique_skus)):
+                rec = (abc_map or {}).get(sku_l) or {}
+                title0 = str(rec.get("title") or "").strip()
+                store0 = str(rec.get("store") or "").strip() or str(sku_to_store.get(sku_l) or "").strip()
+                sku0 = str(rec.get("sku") or "").strip() or sku_l
+                url0 = ""
+                try:
+                    if store0 and sku0:
+                        url0 = rs_fs_sheet_sync.build_store_link(store0, sku0)
+                except Exception:
+                    url0 = ""
+                if self._rsfs_title_is_bad(title0, url=url0):
+                    rid0 = int(sku_to_rid.get(sku_l) or 0)
+                    bad_titles.append((rid0, store0 or "?", sku_l, title0))
+        except Exception:
+            bad_titles = []
+
         emb.add_field(
             name="Latest /listreleases",
             value="\n".join(
@@ -904,6 +927,20 @@ class RSForwarderBot:
             emb.add_field(
                 name="In sheet but not in latest list",
                 value=f"`{len(extra)}`\n" + "\n".join(sample),
+                inline=False,
+            )
+
+        if bad_titles:
+            # Keep this field short; this is a "diagnostic" list.
+            lines: List[str] = []
+            for rid0, store0, sku_l, title0 in bad_titles[:10]:
+                t = (title0 or "").replace("\n", " ").strip()
+                if len(t) > 60:
+                    t = t[:57] + "..."
+                lines.append(f"- `{rid0}` `{store0}` `{sku_l}` — {t if t else '(blank)'}")
+            emb.add_field(
+                name="Bad titles in sheet (will be re-resolved)",
+                value=f"`{len(bad_titles)}`\n" + "\n".join(lines),
                 inline=False,
             )
 

@@ -2363,6 +2363,8 @@ def _extract_reporting_from_member_status_embed(
                 whop_brief["product"] = v
             elif ln == "status":
                 whop_brief["status"] = v
+            elif ln in {"remaining days", "remaining_days"}:
+                whop_brief["remaining_days"] = v
             elif ln in {"whop dashboard", "dashboard"}:
                 whop_brief["dashboard_url"] = v
             elif ln in {"cancel at period end", "cancel_at_period_end"}:
@@ -2472,7 +2474,52 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
         # Require Members role for immediate close (safety): only act on current Members.
         if has_member_role(member):
             with suppress(Exception):
-                await support_tickets.close_free_pass_if_whop_linked(int(did_i))
+                await support_tickets.close_free_pass_if_whop_linked(
+                    int(did_i),
+                    resolution_event="access_restored",
+                    reference_jump_url=ref_url,
+                )
+
+            # Also post a follow-up + remove roles for resolved billing/cancellation tickets, if any.
+            # This is a soft-resolve: the ticket stays open until staff closes (or auto-close after grace).
+            with suppress(Exception):
+                await support_tickets.post_resolution_followup_and_remove_role(
+                    discord_id=int(did_i),
+                    ticket_type="billing",
+                    resolution_event="access_restored",
+                    reference_jump_url=ref_url,
+                )
+            with suppress(Exception):
+                await support_tickets.post_resolution_followup_and_remove_role(
+                    discord_id=int(did_i),
+                    ticket_type="cancellation",
+                    resolution_event="access_restored",
+                    reference_jump_url=ref_url,
+                )
+
+    # Payment succeeded is a strong resolve signal (post follow-ups).
+    if ("payment succeeded" in title_low or "payment received" in title_low) and has_member_role(member):
+        # Resolve Free Pass too if linkage is confirmed (will no-op if not linked).
+        with suppress(Exception):
+            await support_tickets.close_free_pass_if_whop_linked(
+                int(did_i),
+                resolution_event="payment_succeeded",
+                reference_jump_url=ref_url,
+            )
+        with suppress(Exception):
+            await support_tickets.post_resolution_followup_and_remove_role(
+                discord_id=int(did_i),
+                ticket_type="billing",
+                resolution_event="payment_succeeded",
+                reference_jump_url=ref_url,
+            )
+        with suppress(Exception):
+            await support_tickets.post_resolution_followup_and_remove_role(
+                discord_id=int(did_i),
+                ticket_type="cancellation",
+                resolution_event="payment_succeeded",
+                reference_jump_url=ref_url,
+            )
 
     # Open tickets based on canonical kinds/titles.
     if kind == "member_joined":
@@ -2495,6 +2542,7 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                 member=member,
                 event_type="payment.failed",
                 status=st or "Past Due",
+                whop_brief=whop_brief if isinstance(whop_brief, dict) else {},
                 fingerprint=fp,
                 occurred_at=occurred_at,
                 reference_jump_url=ref_url,
@@ -7177,6 +7225,10 @@ async def on_ready():
     with suppress(Exception):
         asyncio.create_task(support_tickets_startup_backfill_today())
         log.info("[SupportTickets] Startup backfill scheduled")
+    # Support tickets: ensure legacy open tickets have correct ticket-roles applied.
+    with suppress(Exception):
+        asyncio.create_task(support_tickets.reconcile_open_ticket_roles())
+        log.info("[SupportTickets] Role reconcile scheduled")
 
     if post_startup_report:
         startup_notes.append("Scheduler started and state restored.")

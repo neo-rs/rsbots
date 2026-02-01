@@ -267,6 +267,16 @@
         "free_pass": "Yo {mention}! Just checking in. This ticket is here to help you get full access. You’re already seeing some of what we post in what you missed. Once your Whop account is connected, you’ll have full access. Let us know if you need help."
       }
     },
+    "resolution_followup": {
+      "_comment": "When a ticket appears resolved (e.g. payment succeeded / membership activated), remove the ticket-role and post a follow-up message in the ticket with close buttons. Auto-close later if no human replies.",
+      "enabled": true,
+      "auto_close_after_seconds": 1800,
+      "templates": {
+        "billing": "Looks like your payment went through and your access is active again. If you’re still having issues, reply here — otherwise Support can close this ticket.",
+        "cancellation": "Looks like your access is active again. If you’re still having issues, reply here — otherwise Support can close this ticket.",
+        "free_pass": "Looks like your Whop is linked and access should be granted. If you’re still not seeing the server, reply here — otherwise Support can close this ticket."
+      }
+    },
     "audit_logs": {
       "_comment": "Dyno-style audit logs for ticket categories (message create/edit/delete + channel create/update/delete).",
       "enabled": true,
