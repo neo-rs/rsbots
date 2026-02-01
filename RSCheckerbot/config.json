@@ -261,6 +261,18 @@
         "free_pass": "Yo {mention}! Just checking in. This ticket is here to help you get full access. You’re already seeing some of what we post in what you missed. Once your Whop account is connected, you’ll have full access. Let us know if you need help."
       }
     },
+    "audit_logs": {
+      "_comment": "Dyno-style audit logs for ticket categories (message create/edit/delete + channel create/update/delete).",
+      "enabled": true,
+      "channel_id": 0,
+      "channel_name": "tickets-logs",
+      "include_transcript_category": false
+    },
+    "startup_backfill": {
+      "_comment": "On startup, scan today's member-status-logs messages and open any missing tickets (restart-safe).",
+      "enabled": true,
+      "max_messages": 500
+    },
     "dedupe": {
       "enabled": true,
       "free_pass": { "cooldown_seconds": 86400 },

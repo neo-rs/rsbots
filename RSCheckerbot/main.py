@@ -2414,6 +2414,118 @@ def _extract_reporting_from_member_status_embed(
     return (ts_i, kind, discord_id, whop_brief)
 
 
+async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> None:
+    """Open/close support tickets based on RSCheckerbot member-status-logs embeds."""
+    # Trigger tickets from the canonical member-status-logs cards (no extra Whop API).
+    if not MEMBER_STATUS_LOGS_CHANNEL_ID:
+        return
+    try:
+        if int(getattr(getattr(msg, "channel", None), "id", 0) or 0) != int(MEMBER_STATUS_LOGS_CHANNEL_ID):
+            return
+    except Exception:
+        return
+    if not getattr(msg, "embeds", None):
+        return
+    e0 = msg.embeds[0]
+    if not isinstance(e0, discord.Embed):
+        return
+    # Guard: only process RSCheckerbot-format member-status embeds (even if posted via webhook / renamed app).
+    try:
+        ft = str(getattr(getattr(e0, "footer", None), "text", "") or "")
+    except Exception:
+        ft = ""
+    if "rscheckerbot" not in ft.lower():
+        return
+
+    ts_i, kind, did, whop_brief = _extract_reporting_from_member_status_embed(
+        e0,
+        fallback_ts=int((getattr(msg, "created_at", None) or datetime.now(timezone.utc)).timestamp()),
+    )
+    if not did:
+        return
+    did_i = int(did)
+
+    guild = bot.get_guild(GUILD_ID)
+    if not guild:
+        return
+    member = guild.get_member(int(did_i))
+    if not isinstance(member, discord.Member):
+        with suppress(Exception):
+            member = await guild.fetch_member(int(did_i))
+    if not isinstance(member, discord.Member):
+        return
+
+    title = str(getattr(e0, "title", "") or "")
+    title_low = title.lower()
+    ref_url = str(getattr(msg, "jump_url", "") or "").strip()
+    occurred_at = getattr(msg, "created_at", None) or datetime.now(timezone.utc)
+
+    # Close Free Pass as soon as we see an access-confirmation style card in member-status-logs.
+    if (
+        kind in {"membership_activated_pending", "member_role_added", "trialing"}
+        or ("membership activated" in title_low)
+        or ("payment activated" in title_low)
+        or ("payment renewed" in title_low)
+        or ("payment resumed" in title_low)
+        or ("access restored" in title_low)
+    ):
+        with suppress(Exception):
+            await support_tickets.close_free_pass_if_whop_linked(int(did_i))
+
+    # Open tickets based on canonical kinds/titles.
+    if kind == "member_joined":
+        # Free Pass: only if not linked to Whop yet (no membership_id recorded).
+        if not _membership_id_from_history(int(did_i)):
+            fp = f"{int(did_i)}|freepass|{_tz_now().date().isoformat()}"
+            with suppress(Exception):
+                ch_created = await support_tickets.open_free_pass_ticket(member=member, fingerprint=fp)
+                if not ch_created:
+                    await log_other(f"❌ SupportTickets: failed to open free-pass ticket for `{did_i}` (member_joined)")
+        return
+
+    # Billing (payment failed / billing issue)
+    if (kind == "payment_failed") or ("billing issue" in title_low) or ("past due" in title_low) or ("payment failed" in title_low):
+        mid = _membership_id_from_history(int(did_i))
+        fp = f"{mid or int(did_i)}|billing|{occurred_at.date().isoformat()}"
+        st = str((whop_brief or {}).get("status") or "Past Due").strip() if isinstance(whop_brief, dict) else "Past Due"
+        with suppress(Exception):
+            ch_created = await support_tickets.open_billing_ticket(
+                member=member,
+                event_type="payment.failed",
+                status=st or "Past Due",
+                fingerprint=fp,
+                occurred_at=occurred_at,
+                reference_jump_url=ref_url,
+            )
+            if not ch_created:
+                await log_other(f"❌ SupportTickets: failed to open billing ticket for `{did_i}` (kind={kind})")
+        return
+
+    # Cancellation
+    if kind in {"cancellation_scheduled", "deactivated"} or ("cancellation" in title_low) or ("deactivated" in title_low):
+        mid = _membership_id_from_history(int(did_i))
+        fp = f"{mid or int(did_i)}|cancel|{occurred_at.date().isoformat()}"
+        reason = ""
+        with suppress(Exception):
+            for f in (getattr(e0, "fields", None) or []):
+                n = str(getattr(f, "name", "") or "").strip().lower()
+                v = str(getattr(f, "value", "") or "").strip()
+                if "cancellation reason" in n or (n == "reason"):
+                    reason = v
+                    break
+        with suppress(Exception):
+            ch_created = await support_tickets.open_cancellation_ticket(
+                member=member,
+                whop_brief=whop_brief if isinstance(whop_brief, dict) else {},
+                cancellation_reason=reason,
+                fingerprint=fp,
+                reference_jump_url=ref_url,
+            )
+            if not ch_created:
+                await log_other(f"❌ SupportTickets: failed to open cancellation ticket for `{did_i}` (kind={kind})")
+        return
+
+
 @tasks.loop(seconds=60)
 async def reporting_loop() -> None:
     """Weekly report + daily reminders (DM Neo)."""
@@ -5532,7 +5644,14 @@ async def delayed_assign_former_member(member: discord.Member):
                         footer=f"ID: {refreshed.id}",
                         color=0xFEE75C,
                     )
-                    e.add_field(name="Reason", value="Member role not regained within grace period", inline=False)
+                    whop_status = ""
+                    with suppress(Exception):
+                        hist = get_member_history(refreshed.id) or {}
+                        wh = hist.get("whop") if isinstance(hist, dict) else None
+                        if isinstance(wh, dict):
+                            whop_status = str(wh.get("last_status") or "").strip().lower()
+                    reason_txt = f"Member role not regained within grace period (whop_status={whop_status or 'unknown'})"
+                    e.add_field(name="Reason", value=reason_txt[:1024], inline=False)
                     await log_role_event(embed=e)
                 except Exception as e:
                     await log_role_event(f"⚠️ **Failed to assign Former Member role** to {_fmt_user(refreshed)}\n   ❌ Error: `{e}`")
@@ -5576,6 +5695,93 @@ async def support_ticket_sweeper_loop_error(error):
     await asyncio.sleep(5)
     with suppress(Exception):
         support_ticket_sweeper_loop.start()
+
+# -----------------------------
+# Support tickets: startup backfill (member-status-logs)
+# -----------------------------
+SUPPORT_TICKETS_BACKFILL_STATE_FILE = BASE_DIR / "data" / "support_tickets_member_status_backfill.json"
+_SUPPORT_TICKETS_BACKFILL_RAN: bool = False
+
+
+def _support_tickets_backfill_state_load() -> dict:
+    raw = load_json(SUPPORT_TICKETS_BACKFILL_STATE_FILE)
+    return raw if isinstance(raw, dict) else {}
+
+
+def _support_tickets_backfill_state_save(state: dict) -> None:
+    save_json(SUPPORT_TICKETS_BACKFILL_STATE_FILE, state if isinstance(state, dict) else {})
+
+
+async def support_tickets_startup_backfill_today() -> None:
+    """On boot: scan today's member-status-logs messages and open any missing tickets (dedupe-safe)."""
+    global _SUPPORT_TICKETS_BACKFILL_RAN
+    if _SUPPORT_TICKETS_BACKFILL_RAN:
+        return
+    _SUPPORT_TICKETS_BACKFILL_RAN = True
+
+    try:
+        st_cfg = config.get("support_tickets") if isinstance(config, dict) else {}
+        bf = (st_cfg.get("startup_backfill") if isinstance(st_cfg, dict) else {}) if isinstance(st_cfg, dict) else {}
+        enabled = bool(bf.get("enabled", False))
+        max_messages = int(bf.get("max_messages") or 500)
+    except Exception:
+        enabled = False
+        max_messages = 500
+    max_messages = max(50, min(5000, int(max_messages)))
+
+    if not enabled:
+        return
+    if not MEMBER_STATUS_LOGS_CHANNEL_ID:
+        return
+
+    ch = bot.get_channel(int(MEMBER_STATUS_LOGS_CHANNEL_ID))
+    if not isinstance(ch, discord.TextChannel):
+        with suppress(Exception):
+            fetched = await bot.fetch_channel(int(MEMBER_STATUS_LOGS_CHANNEL_ID))
+            ch = fetched if isinstance(fetched, discord.TextChannel) else None
+    if not isinstance(ch, discord.TextChannel):
+        with suppress(Exception):
+            await log_other(f"⚠️ SupportTickets backfill: member-status-logs channel not found (id={MEMBER_STATUS_LOGS_CHANNEL_ID})")
+        return
+
+    now_local = _tz_now()
+    since_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    since_utc = since_local.astimezone(timezone.utc)
+    today_local = now_local.date().isoformat()
+
+    state = _support_tickets_backfill_state_load()
+    if str(state.get("date_local") or "") != today_local:
+        state = {"date_local": today_local, "last_message_id": 0}
+
+    last_id = 0
+    with suppress(Exception):
+        last_id = int(state.get("last_message_id") or 0)
+    after_arg = None
+    if last_id > 0:
+        after_arg = discord.Object(id=int(last_id))
+    else:
+        after_arg = since_utc
+
+    scanned = 0
+    with suppress(Exception):
+        async for m in ch.history(limit=int(max_messages), oldest_first=True, after=after_arg):
+            scanned += 1
+            # Persist progress even if ticket open fails (so we don't loop forever).
+            state["date_local"] = today_local
+            state["last_message_id"] = int(getattr(m, "id", 0) or 0)
+            if scanned % 25 == 0:
+                with suppress(Exception):
+                    _support_tickets_backfill_state_save(state)
+            # Only scan today's messages (guard against snowflake-after edge cases)
+            if getattr(m, "created_at", None) and m.created_at.replace(tzinfo=timezone.utc) < since_utc:
+                continue
+            with suppress(Exception):
+                await _maybe_open_tickets_from_member_status_logs(m)
+
+    with suppress(Exception):
+        _support_tickets_backfill_state_save(state)
+    with suppress(Exception):
+        await log_other(f"📌 SupportTickets backfill: scanned={scanned} since={today_local} last_id={state.get('last_message_id')}")
 
 # -----------------------------
 # Scheduler loop
@@ -6955,6 +7161,11 @@ async def on_ready():
             support_ticket_sweeper_loop.start()
             log.info(f"[SupportTickets] Free Pass sweeper started (every {max(30, int(sweeper_interval))}s)")
 
+    # Support tickets: on-boot backfill from today's member-status-logs (restart-safe).
+    with suppress(Exception):
+        asyncio.create_task(support_tickets_startup_backfill_today())
+        log.info("[SupportTickets] Startup backfill scheduled")
+
     if post_startup_report:
         startup_notes.append("Scheduler started and state restored.")
     
@@ -7792,116 +8003,6 @@ async def on_message(message: discord.Message):
     """
     # Process commands first (canonical pattern)
     await bot.process_commands(message)
-    
-    async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> None:
-        # Trigger tickets from the canonical member-status-logs cards (no extra Whop API).
-        if not MEMBER_STATUS_LOGS_CHANNEL_ID:
-            return
-        try:
-            if int(getattr(getattr(msg, "channel", None), "id", 0) or 0) != int(MEMBER_STATUS_LOGS_CHANNEL_ID):
-                return
-        except Exception:
-            return
-        if not getattr(msg, "embeds", None):
-            return
-        e0 = msg.embeds[0]
-        if not isinstance(e0, discord.Embed):
-            return
-        # Guard: only process RSCheckerbot-format member-status embeds (even if posted via webhook / renamed bot).
-        try:
-            ft = str(getattr(getattr(e0, "footer", None), "text", "") or "")
-        except Exception:
-            ft = ""
-        if "rscheckerbot" not in ft.lower():
-            return
-
-        ts_i, kind, did, whop_brief = _extract_reporting_from_member_status_embed(
-            e0,
-            fallback_ts=int((getattr(msg, "created_at", None) or datetime.now(timezone.utc)).timestamp()),
-        )
-        if not did:
-            return
-        did_i = int(did)
-
-        guild = bot.get_guild(GUILD_ID)
-        if not guild:
-            return
-        member = guild.get_member(int(did_i))
-        if not isinstance(member, discord.Member):
-            with suppress(Exception):
-                member = await guild.fetch_member(int(did_i))
-        if not isinstance(member, discord.Member):
-            return
-
-        title = str(getattr(e0, "title", "") or "")
-        title_low = title.lower()
-        ref_url = str(getattr(msg, "jump_url", "") or "").strip()
-        occurred_at = getattr(msg, "created_at", None) or datetime.now(timezone.utc)
-
-        # Close Free Pass as soon as we see an access-confirmation style card in member-status-logs.
-        if (
-            kind in {"membership_activated_pending", "member_role_added", "trialing"}
-            or ("membership activated" in title_low)
-            or ("payment activated" in title_low)
-            or ("payment renewed" in title_low)
-            or ("payment resumed" in title_low)
-            or ("access restored" in title_low)
-        ):
-            with suppress(Exception):
-                await support_tickets.close_free_pass_if_whop_linked(int(did_i))
-
-        # Open tickets based on canonical kinds/titles.
-        if kind == "member_joined":
-            # Free Pass: only if not linked to Whop yet (no membership_id recorded).
-            if not _membership_id_from_history(int(did_i)):
-                fp = f"{int(did_i)}|freepass|{_tz_now().date().isoformat()}"
-                with suppress(Exception):
-                    ch_created = await support_tickets.open_free_pass_ticket(member=member, fingerprint=fp)
-                    if not ch_created:
-                        await log_other(f"❌ SupportTickets: failed to open free-pass ticket for `{did_i}` (member_joined)")
-            return
-
-        # Billing (payment failed / billing issue)
-        if (kind == "payment_failed") or ("billing issue" in title_low) or ("past due" in title_low) or ("payment failed" in title_low):
-            mid = _membership_id_from_history(int(did_i))
-            fp = f"{mid or int(did_i)}|billing|{occurred_at.date().isoformat()}"
-            st = str((whop_brief or {}).get("status") or "Past Due").strip() if isinstance(whop_brief, dict) else "Past Due"
-            with suppress(Exception):
-                ch_created = await support_tickets.open_billing_ticket(
-                    member=member,
-                    event_type="payment.failed",
-                    status=st or "Past Due",
-                    fingerprint=fp,
-                    occurred_at=occurred_at,
-                    reference_jump_url=ref_url,
-                )
-                if not ch_created:
-                    await log_other(f"❌ SupportTickets: failed to open billing ticket for `{did_i}` (kind={kind})")
-            return
-
-        # Cancellation
-        if kind in {"cancellation_scheduled", "deactivated"} or ("cancellation" in title_low) or ("deactivated" in title_low):
-            mid = _membership_id_from_history(int(did_i))
-            fp = f"{mid or int(did_i)}|cancel|{occurred_at.date().isoformat()}"
-            reason = ""
-            with suppress(Exception):
-                for f in (getattr(e0, "fields", None) or []):
-                    n = str(getattr(f, "name", "") or "").strip().lower()
-                    v = str(getattr(f, "value", "") or "").strip()
-                    if "cancellation reason" in n or (n == "reason"):
-                        reason = v
-                        break
-            with suppress(Exception):
-                ch_created = await support_tickets.open_cancellation_ticket(
-                    member=member,
-                    whop_brief=whop_brief if isinstance(whop_brief, dict) else {},
-                    cancellation_reason=reason,
-                    fingerprint=fp,
-                    reference_jump_url=ref_url,
-                )
-                if not ch_created:
-                    await log_other(f"❌ SupportTickets: failed to open cancellation ticket for `{did_i}` (kind={kind})")
-            return
 
     # Ticket triggers from member-status-logs channel (regardless of author),
     # but only if the embed footer identifies RSCheckerbot.
