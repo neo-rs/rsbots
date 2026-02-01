@@ -2352,6 +2352,31 @@ class RSAdminSlashCog(commands.Cog):
         embed = discord.Embed(title=title, description=description, color=discord.Color.blurple())
         await self.admin_bot._interaction_reply(interaction, embed=embed, view=view, ephemeral=True)
 
+    def _category_options(self, guild: discord.Guild, *, limit: int = 25) -> List[discord.SelectOption]:
+        cats = [c for c in (guild.categories or []) if isinstance(c, discord.CategoryChannel)]
+        cats = sorted(cats, key=lambda c: c.position)
+        opts: List[discord.SelectOption] = []
+        for c in cats[:limit]:
+            label = str(c.name)[:100] or "category"
+            opts.append(discord.SelectOption(label=label, value=str(c.id), description=f"id={c.id}"))
+        return opts
+
+    def _channel_options(self, guild: discord.Guild, *, current_channel_id: Optional[int] = None, limit: int = 25) -> List[discord.SelectOption]:
+        chans = [ch for ch in (guild.text_channels or []) if isinstance(ch, discord.TextChannel)]
+        chans = sorted(chans, key=lambda c: c.position)
+        opts: List[discord.SelectOption] = []
+        if current_channel_id:
+            cur = guild.get_channel(int(current_channel_id))
+            if isinstance(cur, discord.TextChannel):
+                opts.append(discord.SelectOption(label=f"⭐ {cur.name}"[:100], value=str(cur.id), description="current channel"))
+        for ch in chans:
+            if len(opts) >= limit:
+                break
+            if current_channel_id and int(ch.id) == int(current_channel_id):
+                continue
+            opts.append(discord.SelectOption(label=str(ch.name)[:100] or "channel", value=str(ch.id), description=f"id={ch.id}"))
+        return opts
+
     @app_commands.command(name="ping", description="Check RSAdminBot latency (owner-only).")
     async def ping(self, interaction: discord.Interaction) -> None:
         if not await self._guard(interaction):
@@ -2425,6 +2450,464 @@ class RSAdminSlashCog(commands.Cog):
             interaction,
             content="Restart RSAdminBot service now? (This will temporarily disconnect the bot.)",
             view=_RestartView(),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="delete", description="Delete a channel (owner-only).")
+    async def delete(self, interaction: discord.Interaction) -> None:
+        if not await self._guard(interaction):
+            return
+        if not interaction.guild:
+            await self.admin_bot._interaction_reply(interaction, content="❌ Guild required.", ephemeral=True)
+            return
+
+        admin_bot = self.admin_bot
+        guild = interaction.guild
+        current_channel_id = getattr(getattr(interaction, "channel", None), "id", None)
+
+        class _DeleteView(ui.View):
+            def __init__(self):
+                super().__init__(timeout=120)
+                self.channel_id: Optional[int] = int(current_channel_id) if current_channel_id else None
+                self.confirm_btn.disabled = self.channel_id is None  # type: ignore[attr-defined]
+
+                opts = self._opts()
+                self.channel_select = ui.Select(placeholder="Select a channel to delete…", options=opts, min_values=1, max_values=1)
+                self.channel_select.callback = self.on_channel_selected
+                self.add_item(self.channel_select)
+
+            def _opts(self) -> List[discord.SelectOption]:
+                return self.parent._channel_options(guild, current_channel_id=current_channel_id)  # type: ignore[attr-defined]
+
+            async def on_channel_selected(self, i: discord.Interaction):
+                ok, err = admin_bot._slash_owner_guard(i)
+                if not ok:
+                    await admin_bot._interaction_reply(i, content=err, ephemeral=True)
+                    return
+                try:
+                    self.channel_id = int(self.channel_select.values[0])
+                except Exception:
+                    self.channel_id = None
+                self.confirm_btn.disabled = self.channel_id is None  # type: ignore[attr-defined]
+                await i.response.edit_message(view=self)
+
+            @ui.button(label="Delete now", style=discord.ButtonStyle.danger)
+            async def confirm_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
+                ok, err = admin_bot._slash_owner_guard(i)
+                if not ok:
+                    await admin_bot._interaction_reply(i, content=err, ephemeral=True)
+                    return
+                if not self.channel_id:
+                    await admin_bot._interaction_reply(i, content="❌ Select a channel first.", ephemeral=True)
+                    return
+                ch = guild.get_channel(int(self.channel_id))
+                if not isinstance(ch, discord.TextChannel):
+                    await admin_bot._interaction_reply(i, content="❌ Channel not found or not a text channel.", ephemeral=True)
+                    return
+                me = guild.me
+                if not me or not ch.permissions_for(me).manage_channels:
+                    await admin_bot._interaction_reply(i, content="❌ Missing permission: Manage Channels.", ephemeral=True)
+                    return
+                for child in self.children:
+                    if isinstance(child, ui.Button) or isinstance(child, ui.Select):
+                        child.disabled = True
+                await i.response.edit_message(content=f"🗑️ Deleting {ch.mention}…", view=self)
+                try:
+                    await ch.delete(reason=f"Deleted by {i.user} via RSAdminBot")
+                except Exception as e:
+                    await admin_bot._interaction_reply(i, content=f"❌ Delete failed: {str(e)[:200]}", ephemeral=True)
+                    return
+
+            @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+            async def cancel_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
+                ok, err = admin_bot._slash_owner_guard(i)
+                if not ok:
+                    await admin_bot._interaction_reply(i, content=err, ephemeral=True)
+                    return
+                for child in self.children:
+                    if isinstance(child, ui.Button) or isinstance(child, ui.Select):
+                        child.disabled = True
+                await i.response.edit_message(content="Cancelled.", view=self)
+
+        # Bind view to cog for helpers
+        v = _DeleteView()
+        v.parent = self  # type: ignore[attr-defined]
+
+        await self.admin_bot._interaction_reply(
+            interaction,
+            content="Select a channel to delete. This cannot be undone.",
+            view=v,
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="transfer", description="Move a channel to a category (owner-only).")
+    async def transfer(self, interaction: discord.Interaction) -> None:
+        if not await self._guard(interaction):
+            return
+        if not interaction.guild:
+            await self.admin_bot._interaction_reply(interaction, content="❌ Guild required.", ephemeral=True)
+            return
+
+        admin_bot = self.admin_bot
+        guild = interaction.guild
+        current_channel_id = getattr(getattr(interaction, "channel", None), "id", None)
+
+        class _TransferView(ui.View):
+            def __init__(self):
+                super().__init__(timeout=180)
+                self.channel_id: Optional[int] = int(current_channel_id) if current_channel_id else None
+                self.category_id: Optional[int] = None
+
+                self.channel_select = ui.Select(
+                    placeholder="Select channel…",
+                    options=self.parent._channel_options(guild, current_channel_id=current_channel_id),  # type: ignore[attr-defined]
+                    min_values=1,
+                    max_values=1,
+                )
+                self.category_select = ui.Select(
+                    placeholder="Select destination category…",
+                    options=self.parent._category_options(guild),  # type: ignore[attr-defined]
+                    min_values=1,
+                    max_values=1,
+                )
+                self.channel_select.callback = self.on_channel_selected
+                self.category_select.callback = self.on_category_selected
+                self.add_item(self.channel_select)
+                self.add_item(self.category_select)
+
+                self.confirm_btn.disabled = not (self.channel_id and self.category_id)  # type: ignore[attr-defined]
+
+            async def on_channel_selected(self, i: discord.Interaction):
+                ok, err = admin_bot._slash_owner_guard(i)
+                if not ok:
+                    await admin_bot._interaction_reply(i, content=err, ephemeral=True)
+                    return
+                try:
+                    self.channel_id = int(self.channel_select.values[0])
+                except Exception:
+                    self.channel_id = None
+                self.confirm_btn.disabled = not (self.channel_id and self.category_id)  # type: ignore[attr-defined]
+                await i.response.edit_message(view=self)
+
+            async def on_category_selected(self, i: discord.Interaction):
+                ok, err = admin_bot._slash_owner_guard(i)
+                if not ok:
+                    await admin_bot._interaction_reply(i, content=err, ephemeral=True)
+                    return
+                try:
+                    self.category_id = int(self.category_select.values[0])
+                except Exception:
+                    self.category_id = None
+                self.confirm_btn.disabled = not (self.channel_id and self.category_id)  # type: ignore[attr-defined]
+                await i.response.edit_message(view=self)
+
+            @ui.button(label="Confirm transfer", style=discord.ButtonStyle.primary)
+            async def confirm_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
+                ok, err = admin_bot._slash_owner_guard(i)
+                if not ok:
+                    await admin_bot._interaction_reply(i, content=err, ephemeral=True)
+                    return
+                if not self.channel_id or not self.category_id:
+                    await admin_bot._interaction_reply(i, content="❌ Select both channel and category.", ephemeral=True)
+                    return
+                ch = guild.get_channel(int(self.channel_id))
+                cat = guild.get_channel(int(self.category_id))
+                if not isinstance(ch, discord.TextChannel):
+                    await admin_bot._interaction_reply(i, content="❌ Channel not found or not a text channel.", ephemeral=True)
+                    return
+                if not isinstance(cat, discord.CategoryChannel):
+                    await admin_bot._interaction_reply(i, content="❌ Category not found.", ephemeral=True)
+                    return
+                me = guild.me
+                if not me or not ch.permissions_for(me).manage_channels:
+                    await admin_bot._interaction_reply(i, content="❌ Missing permission: Manage Channels.", ephemeral=True)
+                    return
+
+                for child in self.children:
+                    if isinstance(child, ui.Button) or isinstance(child, ui.Select):
+                        child.disabled = True
+                await i.response.edit_message(content=f"📦 Moving {ch.mention} → **{cat.name}**…", view=self)
+                try:
+                    await ch.edit(category=cat, sync_permissions=True, reason=f"Transferred by {i.user} via RSAdminBot")
+                except Exception as e:
+                    await admin_bot._interaction_reply(i, content=f"❌ Transfer failed: {str(e)[:200]}", ephemeral=True)
+                    return
+
+            @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+            async def cancel_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
+                ok, err = admin_bot._slash_owner_guard(i)
+                if not ok:
+                    await admin_bot._interaction_reply(i, content=err, ephemeral=True)
+                    return
+                for child in self.children:
+                    if isinstance(child, ui.Button) or isinstance(child, ui.Select):
+                        child.disabled = True
+                await i.response.edit_message(content="Cancelled.", view=self)
+
+        v = _TransferView()
+        v.parent = self  # type: ignore[attr-defined]
+        await self.admin_bot._interaction_reply(
+            interaction,
+            content="Pick a channel + a destination category, then confirm transfer.",
+            view=v,
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="archive", description="Mirror-archive a channel into an archive category (owner-only).")
+    async def archive(self, interaction: discord.Interaction) -> None:
+        if not await self._guard(interaction):
+            return
+        if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
+            await self.admin_bot._interaction_reply(interaction, content="❌ Run this in a server text channel.", ephemeral=True)
+            return
+
+        admin_bot = self.admin_bot
+        guild = interaction.guild
+        src: discord.TextChannel = interaction.channel
+
+        cfg = admin_bot.config.get("archive") if isinstance(admin_bot.config, dict) else {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        delay_ms = int(cfg.get("replay_delay_ms") or 350)
+        delay_ms = max(0, min(delay_ms, 2000))
+
+        class _ArchiveView(ui.View):
+            def __init__(self):
+                super().__init__(timeout=180)
+                self.category_id: Optional[int] = None
+                self.mode: str = ""  # "lock_move" | "delete"
+
+                self.category_select = ui.Select(
+                    placeholder="Select archive category…",
+                    options=self.parent._category_options(guild),  # type: ignore[attr-defined]
+                    min_values=1,
+                    max_values=1,
+                )
+                self.category_select.callback = self.on_category_selected
+                self.add_item(self.category_select)
+                self._refresh_buttons()
+
+            def _refresh_buttons(self) -> None:
+                has_cat = bool(self.category_id)
+                self.archive_lock_move.disabled = not has_cat  # type: ignore[attr-defined]
+                self.archive_delete.disabled = not has_cat  # type: ignore[attr-defined]
+                self.start_btn.disabled = not bool(self.category_id and self.mode)  # type: ignore[attr-defined]
+
+            async def on_category_selected(self, i: discord.Interaction):
+                ok, err = admin_bot._slash_owner_guard(i)
+                if not ok:
+                    await admin_bot._interaction_reply(i, content=err, ephemeral=True)
+                    return
+                try:
+                    self.category_id = int(self.category_select.values[0])
+                except Exception:
+                    self.category_id = None
+                self._refresh_buttons()
+                await i.response.edit_message(view=self)
+
+            @ui.button(label="Archive (lock + move)", style=discord.ButtonStyle.primary)
+            async def archive_lock_move(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
+                self.mode = "lock_move"
+                self._refresh_buttons()
+                await i.response.edit_message(view=self)
+
+            @ui.button(label="Archive (delete source)", style=discord.ButtonStyle.danger)
+            async def archive_delete(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
+                self.mode = "delete"
+                self._refresh_buttons()
+                await i.response.edit_message(view=self)
+
+            @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+            async def cancel_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
+                ok, err = admin_bot._slash_owner_guard(i)
+                if not ok:
+                    await admin_bot._interaction_reply(i, content=err, ephemeral=True)
+                    return
+                for child in self.children:
+                    if isinstance(child, ui.Button) or isinstance(child, ui.Select):
+                        child.disabled = True
+                await i.response.edit_message(content="Cancelled.", view=self)
+
+            @ui.button(label="Start archive", style=discord.ButtonStyle.success)
+            async def start_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
+                ok, err = admin_bot._slash_owner_guard(i)
+                if not ok:
+                    await admin_bot._interaction_reply(i, content=err, ephemeral=True)
+                    return
+                if not self.category_id or not self.mode:
+                    await admin_bot._interaction_reply(i, content="❌ Select an archive category and an action mode first.", ephemeral=True)
+                    return
+
+                cat = guild.get_channel(int(self.category_id))
+                if not isinstance(cat, discord.CategoryChannel):
+                    await admin_bot._interaction_reply(i, content="❌ Archive category not found.", ephemeral=True)
+                    return
+
+                me = guild.me
+                if not me:
+                    await admin_bot._interaction_reply(i, content="❌ Cannot resolve bot member in this guild.", ephemeral=True)
+                    return
+                if not src.permissions_for(me).read_message_history:
+                    await admin_bot._interaction_reply(i, content="❌ Missing permission: Read Message History.", ephemeral=True)
+                    return
+                if not src.permissions_for(me).manage_channels:
+                    await admin_bot._interaction_reply(i, content="❌ Missing permission: Manage Channels.", ephemeral=True)
+                    return
+
+                # Disable UI
+                for child in self.children:
+                    if isinstance(child, ui.Button) or isinstance(child, ui.Select):
+                        child.disabled = True
+                await i.response.edit_message(content="📦 Starting mirror archive…", view=self)
+
+                # Create destination channel
+                base = f"arch-{src.name}".lower()
+                safe = "".join(ch if (ch.isalnum() or ch == "-") else "-" for ch in base).strip("-")
+                safe = safe[:90] or "arch-channel"
+                dest_name = safe
+                n = 1
+                while discord.utils.get(guild.text_channels, name=dest_name):
+                    n += 1
+                    dest_name = f"{safe}-{n}"[:100]
+
+                try:
+                    dest = await guild.create_text_channel(name=dest_name, category=cat, reason=f"Archived by {i.user} via RSAdminBot")
+                    await dest.edit(sync_permissions=True)
+                except Exception as e:
+                    await admin_bot._interaction_reply(i, content=f"❌ Failed to create archive channel: {str(e)[:200]}", ephemeral=True)
+                    return
+
+                try:
+                    webhook = await dest.create_webhook(name="RSAdminBot Archive Mirror", reason="Mirror archive webhook")
+                except Exception as e:
+                    await admin_bot._interaction_reply(i, content=f"❌ Failed to create webhook: {str(e)[:200]}", ephemeral=True)
+                    return
+
+                await dest.send(
+                    embed=discord.Embed(
+                        title="🗄️ Mirror Archive Started",
+                        description=(
+                            f"**Source:** {src.mention}\n"
+                            f"**Archived By:** {i.user.mention}\n"
+                            f"Note: Discord cannot backdate timestamps; original timestamps are appended to each message."
+                        ),
+                        color=discord.Color.blurple(),
+                        timestamp=discord.utils.utcnow(),
+                    )
+                )
+
+                replayed = 0
+                failed = 0
+
+                async for msg in src.history(limit=None, oldest_first=True):
+                    try:
+                        author_name = getattr(msg.author, "display_name", None) or getattr(msg.author, "name", "Unknown")
+                        avatar_url = None
+                        try:
+                            avatar_url = msg.author.display_avatar.url
+                        except Exception:
+                            avatar_url = None
+
+                        ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+                        content = (msg.content or "").strip()
+                        stamp = f"`(original: {ts})`"
+                        if content:
+                            content = f"{content}\n{stamp}"
+                        else:
+                            content = stamp
+                        if len(content) > 1900:
+                            content = content[:1800] + "\n…(truncated)…\n" + stamp
+
+                        embeds_to_send: List[discord.Embed] = []
+                        # original embeds best-effort
+                        for e in (msg.embeds or [])[:6]:
+                            try:
+                                embeds_to_send.append(e)
+                            except Exception:
+                                pass
+
+                        file_links: List[str] = []
+                        image_urls: List[str] = []
+                        for att in (msg.attachments or []):
+                            ct = str(getattr(att, "content_type", "") or "").lower()
+                            fn = str(getattr(att, "filename", "") or "").lower()
+                            is_img = ct.startswith("image/") or fn.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+                            if is_img:
+                                image_urls.append(att.url)
+                            else:
+                                file_links.append(att.url)
+                        if file_links:
+                            content += "\n\n**Attachments:**\n" + "\n".join(file_links[:10])
+                        for u in image_urls[:4]:
+                            em = discord.Embed()
+                            em.set_image(url=u)
+                            embeds_to_send.append(em)
+
+                        if getattr(msg, "stickers", None):
+                            st_lines: List[str] = []
+                            for st in (msg.stickers or []):
+                                u = getattr(st, "url", None)
+                                st_lines.append(str(u or getattr(st, "name", "sticker")))
+                            if st_lines:
+                                content += "\n\n**Stickers:**\n" + "\n".join(st_lines[:10])
+
+                        if msg.reference and msg.reference.message_id:
+                            content = f"↪️ *replying to message ID {msg.reference.message_id}*\n" + content
+
+                        await webhook.send(
+                            content=content,
+                            username=author_name,
+                            avatar_url=avatar_url,
+                            embeds=embeds_to_send[:10] if embeds_to_send else None,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                        replayed += 1
+                    except Exception:
+                        failed += 1
+                    if delay_ms:
+                        await asyncio.sleep(delay_ms / 1000.0)
+                    if replayed and replayed % 100 == 0:
+                        try:
+                            await dest.send(f"…progress… replayed={replayed} failed={failed}")
+                        except Exception:
+                            pass
+
+                await dest.send(
+                    embed=discord.Embed(
+                        title="✅ Mirror Archive Completed",
+                        description=f"Replayed: **{replayed}**\nFailed: **{failed}**",
+                        color=discord.Color.green(),
+                        timestamp=discord.utils.utcnow(),
+                    )
+                )
+
+                # Post-archive source handling
+                try:
+                    if self.mode == "delete":
+                        await asyncio.sleep(1)
+                        await src.delete(reason=f"Mirror archived by {i.user} via RSAdminBot → {dest.id}")
+                    else:
+                        # lock + move
+                        overwrites = src.overwrites_for(guild.default_role)
+                        overwrites.send_messages = False
+                        await src.set_permissions(guild.default_role, overwrite=overwrites, reason="Locked after mirror archive")
+                        await src.edit(category=cat, sync_permissions=True, reason="Moved after mirror archive")
+                except Exception as e:
+                    try:
+                        await dest.send(f"⚠️ Post-archive source handling failed: `{str(e)[:200]}`")
+                    except Exception:
+                        pass
+
+        v = _ArchiveView()
+        v.parent = self  # type: ignore[attr-defined]
+        await self.admin_bot._interaction_reply(
+            interaction,
+            content=(
+                f"Mirror-archive **#{src.name}**.\n"
+                f"Pick an archive category, choose lock+move vs delete, then click **Start archive**.\n"
+                f"Delay: {delay_ms}ms"
+            ),
+            view=v,
             ephemeral=True,
         )
 
@@ -4303,14 +4786,8 @@ echo "TARGET=$TARGET"
                 pass
             return
 
-        # Sync app commands only to neo-test-server (slash-only policy).
-        guild_ids: List[int] = []
-        try:
-            gid = int(self.config.get("test_server_guild_id") or 0)
-        except Exception:
-            gid = 0
-        if gid:
-            guild_ids.append(gid)
+        # Sync app commands only to allowed guild(s) (owner-only policy).
+        guild_ids: List[int] = list(self._get_allowed_slash_guild_ids())
 
         # Debug: do we actually have the command in the tree?
         try:
@@ -4374,7 +4851,7 @@ echo "TARGET=$TARGET"
                 pass
 
     async def _initialize_admin_slash_commands(self) -> None:
-        """Register RSAdminBot slash commands and sync only to neo-test-server."""
+        """Register RSAdminBot slash commands and sync to allowed guild(s)."""
         if getattr(self, "_admin_slash_initialized", False):
             return
         self._admin_slash_initialized = True
@@ -4387,31 +4864,32 @@ echo "TARGET=$TARGET"
             except Exception:
                 pass
 
-        gid = self._get_test_server_guild_id()
-        if not gid:
+        guild_ids = list(self._get_allowed_slash_guild_ids())
+        if not guild_ids:
             try:
-                print(f"{Colors.YELLOW}[Slash] No test_server_guild_id configured; skipping slash sync{Colors.RESET}")
+                print(f"{Colors.YELLOW}[Slash] No allowed guild ids configured; skipping slash sync{Colors.RESET}")
             except Exception:
                 pass
             return
 
-        try:
-            # Make commands appear quickly by syncing as guild-scoped.
+        for gid in guild_ids:
             try:
-                self.bot.tree.copy_global_to(guild=discord.Object(id=gid))
-            except Exception:
-                pass
-            synced = await self.bot.tree.sync(guild=discord.Object(id=gid))
-            try:
-                names = sorted({str(getattr(x, "name", "") or "") for x in (synced or []) if getattr(x, "name", None)})
-                print(f"{Colors.GREEN}[Slash] Sync OK: guild={gid} commands={len(names)}{Colors.RESET}")
-            except Exception:
-                pass
-        except Exception as e:
-            try:
-                print(f"{Colors.YELLOW}[Slash] Sync failed: guild={gid} err={type(e).__name__}: {str(e)[:200]}{Colors.RESET}")
-            except Exception:
-                pass
+                # Make commands appear quickly by syncing as guild-scoped.
+                try:
+                    self.bot.tree.copy_global_to(guild=discord.Object(id=gid))
+                except Exception:
+                    pass
+                synced = await self.bot.tree.sync(guild=discord.Object(id=gid))
+                try:
+                    names = sorted({str(getattr(x, "name", "") or "") for x in (synced or []) if getattr(x, "name", None)})
+                    print(f"{Colors.GREEN}[Slash] Sync OK: guild={gid} commands={len(names)}{Colors.RESET}")
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    print(f"{Colors.YELLOW}[Slash] Sync failed: guild={gid} err={type(e).__name__}: {str(e)[:200]}{Colors.RESET}")
+                except Exception:
+                    pass
     
     async def _initialize_monitor_channels(self) -> None:
         """Initialize monitor category and per-bot channels in test server."""
@@ -6456,16 +6934,29 @@ echo "CHANGED_END"
         except Exception:
             return 0
 
+    def _get_allowed_slash_guild_ids(self) -> List[int]:
+        """Guild ids where RSAdminBot slash commands are enabled."""
+        ids: List[int] = []
+        for key in ("test_server_guild_id", "rs_server_guild_id"):
+            try:
+                gid = int(self.config.get(key) or 0)
+            except Exception:
+                gid = 0
+            if gid and gid not in ids:
+                ids.append(gid)
+        return ids
+
     def _slash_owner_guard(self, interaction: discord.Interaction) -> tuple[bool, str]:
-        """Guard for all RSAdminBot slash commands: test-server + server-owner only."""
+        """Guard for all RSAdminBot slash commands: allowed guild(s) + server-owner only."""
         if not interaction or not getattr(interaction, "user", None):
             return False, "❌ Missing interaction user."
         if not getattr(interaction, "guild", None):
             return False, "❌ This command can only be used in the server."
 
-        expected_gid = self._get_test_server_guild_id()
-        if expected_gid and int(getattr(interaction.guild, "id", 0) or 0) != expected_gid:
-            return False, "❌ This command is only enabled in the neo-test-server."
+        allowed = self._get_allowed_slash_guild_ids()
+        guild_id = int(getattr(interaction.guild, "id", 0) or 0)
+        if allowed and guild_id not in allowed:
+            return False, "❌ This command is not enabled in this guild."
 
         owner_id = int(getattr(interaction.guild, "owner_id", 0) or 0)
         if owner_id and int(getattr(interaction.user, "id", 0) or 0) != owner_id:

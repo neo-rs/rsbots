@@ -9,7 +9,9 @@ RSAdminBot is the central administrative bot for managing all RS/MW bots on the 
 - **Slash-only**: no `!` prefix commands.
 - **Ephemeral-only**: command responses are visible only to you.
 - **Owner-only**: commands run only for the **Discord server owner**.
-- **Test-guild-only**: commands are registered and allowed only in **neo-test-server** (ID comes from `RSAdminBot/config.json:test_server_guild_id`).
+- **Guild-scoped**: commands are registered and allowed only in the configured guild(s):
+  - **Reselling Secrets**: `RSAdminBot/config.json:rs_server_guild_id`
+  - **Neo Test Server**: `RSAdminBot/config.json:test_server_guild_id`
 
 ## Slash commands
 
@@ -71,6 +73,16 @@ These commands open a **dropdown** to pick a bot. All outputs are ephemeral.
 - **Implementation**: writes `RSAdminBot/.pending_update.json`; applied by `RSAdminBot/run_bot.sh` on boot
 
 ### Diagnostics / logs
+
+#### `/delete`
+- **What**: delete a selected text channel (dropdown + confirm)
+
+#### `/transfer`
+- **What**: move a selected channel into a selected category (dropdowns + confirm)
+
+#### `/archive`
+- **What**: “true mirror” archive (webhook replay) into an archive category
+- **Notes**: Discord can’t backdate timestamps; RSAdminBot appends the original timestamp to each replayed message.
 
 #### `/details`
 - **What**: systemd details for a bot
