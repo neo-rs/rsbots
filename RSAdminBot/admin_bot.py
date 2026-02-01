@@ -5848,12 +5848,7 @@ echo \"CHANGED_END\"
             code_root = str(checkouts.get("rsbots_code_root") or "/home/rsadmin/bots/rsbots-code").strip()
             live_root = str(getattr(self, "remote_root", "") or "/home/rsadmin/bots/mirror-world").strip()
 
-            cmd = f"""
-set -euo pipefail
-
-CODE_ROOT={shlex.quote(code_root)}
-LIVE_ROOT={shlex.quote(live_root)}
-
+            cmd_body = """
 if [ ! -d "$CODE_ROOT/.git" ]; then
   echo "ERR=missing_code_root"
   echo "DETAIL=$CODE_ROOT/.git not found"
@@ -5958,6 +5953,18 @@ echo "CHANGED_BEGIN"
 head -n 30 "$TMP_CHANGED" || true
 echo "CHANGED_END"
 """
+
+            # NOTE: cmd_body is a plain triple-quoted string because it contains many literal `{}` (bash/python)
+            # that must not be interpreted by Python f-string formatting.
+            cmd = "\n".join(
+                [
+                    "set -euo pipefail",
+                    "",
+                    f"CODE_ROOT={shlex.quote(code_root)}",
+                    f"LIVE_ROOT={shlex.quote(live_root)}",
+                    "",
+                ]
+            ) + cmd_body
 
             ok, stdout, stderr = self._execute_ssh_command(cmd, timeout=180)
             out = (stdout or "").strip()
