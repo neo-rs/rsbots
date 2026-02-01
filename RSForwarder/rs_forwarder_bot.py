@@ -84,8 +84,9 @@ class RSForwarderBot:
         intents.message_content = True
         intents.guilds = True
         
-        # Use unique prefix to avoid conflicts with other bots
-        self.bot = commands.Bot(command_prefix='!rs', intents=intents)
+        # Use "!" as the command prefix. Commands are already namespaced (rsadd, rsfsrun, etc.)
+        # so there is no need to double-prefix as "!rs" (which would require typing "!rsrsfsrun").
+        self.bot = commands.Bot(command_prefix='!', intents=intents)
         self._setup_events()
         self._setup_commands()
 

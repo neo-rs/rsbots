@@ -171,7 +171,7 @@ RSForwarder is a standalone bot for forwarding messages from RS Server channels 
 
 ## Notes
 
-- All commands use the `!rs` prefix (or aliases without prefix)
+- All commands use the `!` prefix and are namespaced with `rs...` (example: `!rsadd`, `!rsfsrun`)
 - Commands that manage channels require access to the source channel
 - Webhook URLs must be valid Discord webhook URLs (format: `https://discord.com/api/webhooks/...`)
 - Role IDs must be valid numeric Discord role IDs
