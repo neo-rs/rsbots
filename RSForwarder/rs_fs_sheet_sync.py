@@ -201,6 +201,9 @@ async def fetch_product_title(store: str, sku: str) -> Tuple[str, Optional[str]]
         return "", "blocked (anti-bot)"
     if "access denied" in t0_l or "verify you are a human" in t0_l:
         return "", "blocked (anti-bot)"
+    # Generic/non-product titles (treat as missing to avoid writing junk like "Amazon.com" or "Target")
+    if t0_l in {"amazon.com", "amazon", "target", "walmart", "best buy", "bestbuy", "costco", "gamestop"}:
+        return "", "title not found"
     return title, None if title else "title not found"
 
 
@@ -383,7 +386,7 @@ class RsFsSheetSync:
                     service.spreadsheets()
                     .get(
                         spreadsheetId=self._sheet_cfg.spreadsheet_id,
-                        fields="sheets.properties(sheetId,title)",
+                        fields="sheets(properties(sheetId,title))",
                     )
                     .execute()
                 )
@@ -780,7 +783,7 @@ class RsFsSheetSync:
                 service.spreadsheets()
                 .get(
                     spreadsheetId=self._sheet_cfg.spreadsheet_id,
-                    fields="sheets.properties(sheetId,title)",
+                    fields="sheets(properties(sheetId,title))",
                 )
                 .execute()
             )
@@ -1399,8 +1402,10 @@ async def build_preview_entries(
                 err = err2 or ""
             else:
                 err = "no store url"
+        # IMPORTANT: never write the URL into the title column.
+        # If title extraction fails, keep title blank and rely on monitor/manual resolution.
         if not (title or "").strip():
-            title = url or ""
+            title = ""
         return RsFsPreviewEntry(
             store=st,
             sku=sk,

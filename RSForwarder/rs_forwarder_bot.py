@@ -225,9 +225,17 @@ class _RsFsManualResolveView(discord.ui.View):
 
         # Advance to next item
         self._idx = min(self._idx + 1, len(self._items))
+        # If we're done, keep the view visible but disable navigation buttons (Finish stays available).
+        if self._idx >= len(self._items):
+            for child in self.children:
+                try:
+                    if getattr(child, "label", "") in {"Provide link", "Next"}:
+                        child.disabled = True  # type: ignore[attr-defined]
+                except Exception:
+                    pass
         try:
             if interaction.message:
-                await interaction.message.edit(embed=self._render_embed(), view=self if self._idx < len(self._items) else None)
+                await interaction.message.edit(embed=self._render_embed(), view=self)
         except Exception:
             pass
 
@@ -261,8 +269,15 @@ class _RsFsManualResolveView(discord.ui.View):
         if not await self._guard(interaction):
             return
         self._idx = min(self._idx + 1, len(self._items))
+        if self._idx >= len(self._items):
+            for child in self.children:
+                try:
+                    if getattr(child, "label", "") in {"Provide link", "Next"}:
+                        child.disabled = True  # type: ignore[attr-defined]
+                except Exception:
+                    pass
         try:
-            await interaction.response.edit_message(embed=self._render_embed(), view=self if self._idx < len(self._items) else None)
+            await interaction.response.edit_message(embed=self._render_embed(), view=self)
         except Exception:
             pass
 
@@ -3732,8 +3747,9 @@ class RSForwarderBot:
                                     url_candidates.extend(_all_urls(str(getattr(ff, "value", "") or "")))
                                 url_candidates.extend(_all_urls(str(getattr(ee, "description", "") or "")))
                                 url2 = _pick_url([u for u in url_candidates if u])
+                                # IMPORTANT: never use URL as "title". Leave it blank if we can't extract a title.
                                 if not title2:
-                                    title2 = url2 or ""
+                                    title2 = ""
 
                                 for ff in fields2:
                                     name = str(getattr(ff, "name", "") or "").strip()
@@ -3781,8 +3797,8 @@ class RSForwarderBot:
                                         store=st,
                                         sku=sk,
                                         url=u2 or "",
-                                        title=(t2 or "").strip() or (u2 or "").strip(),
-                                        error="" if (u2 or "").strip() else "no url in monitor embed",
+                                        title=(t2 or "").strip(),
+                                        error=("" if (t2 or "").strip() else "title not found (monitor embed)") if (u2 or "").strip() else "no url in monitor embed",
                                         source=f"monitor:{getattr(ch2,'name',ch_name)}",
                                         monitor_url=(u2 or "").strip(),
                                         affiliate_url="",
