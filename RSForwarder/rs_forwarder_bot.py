@@ -683,7 +683,7 @@ class RSForwarderBot:
                 up_lines.append(f"- `{rid}` `/removereleaseid release_id: {rid}`")
             emb.add_field(
                 name="Why some items aren’t in the sheet",
-                value="These release IDs don’t map to a `*-monitor` tag, so we can’t reliably map store+SKU:\n"
+                value="These release IDs couldn’t be parsed into a store+SKU (often because the monitor tag is missing or formatting changed):\n"
                 + "\n".join(up_lines),
                 inline=False,
             )
@@ -1968,9 +1968,25 @@ class RSForwarderBot:
                 except Exception:
                     return
 
-            # Always attempt parsing. Zephyr splits long lists into multiple embeds and
-            # continuation chunks often omit the "Release Feed(s)" header.
-            items = zephyr_release_feed_parser.parse_release_feed_items(text)
+            # Always parse from the MOST RECENT merged listreleases text, not a single chunk.
+            # Zephyr splits output into multiple messages/embeds and often places the `*-monitor`
+            # tag on the next line. Parsing per-chunk can misclassify entries as "missing monitor tag".
+            text_for_parse = text
+            try:
+                if zephyr_release_feed_parser.looks_like_release_feed_embed_text(text or ""):
+                    merged_text, chunk_n, _found_header = await self._collect_latest_zephyr_release_feed_text(message.channel)  # type: ignore[arg-type]
+                    if merged_text:
+                        text_for_parse = merged_text
+                        try:
+                            print(
+                                f"{Colors.CYAN}[RS-FS Sheet]{Colors.RESET} Using merged listreleases text (chunks={chunk_n}, len={len(merged_text)})"
+                            )
+                        except Exception:
+                            pass
+            except Exception:
+                text_for_parse = text
+
+            items = zephyr_release_feed_parser.parse_release_feed_items(text_for_parse)
             pairs = [(it.store, it.sku) for it in (items or [])]
             rid_by_key: Dict[str, int] = {}
             try:
@@ -3682,19 +3698,24 @@ class RSForwarderBot:
                                 st = str(getattr(e, "store", "") or "").strip() or "Unknown"
                                 by_store.setdefault(st, []).append(e)
 
-                            # Also collect non-monitor/unparseable lines for visibility (e.g. [ubiquiti] entries).
+                            # Collect "unparseable" release IDs as: IDs present in the merged list that
+                            # did NOT parse into a (store, sku) ZephyrReleaseFeedItem.
                             import re as _re
 
-                            unparseable: List[Tuple[int, str]] = []
-                            for m2 in _re.finditer(r"(?:^|\n)\s*(?:\*\*)?(\d{1,4})\.(?:\*\*)?\s*\+([^\n]+)", merged_text, flags=_re.IGNORECASE):
-                                rid2 = 0
+                            all_ids: Set[int] = set()
+                            for s_id in _re.findall(r"(?:^|\n)\s*(?:\*\*)?(\d{1,4})\.(?:\*\*)?\s*\+", merged_text, flags=_re.IGNORECASE):
                                 try:
-                                    rid2 = int(str(m2.group(1) or "0").strip() or "0")
+                                    v = int(str(s_id or "0").strip() or "0")
+                                    if v > 0:
+                                        all_ids.add(v)
                                 except Exception:
-                                    rid2 = 0
-                                line = (m2.group(0) or "").strip()
-                                if "-monitor" not in line.lower():
-                                    unparseable.append((rid2, line))
+                                    continue
+                            parsed_ids: Set[int] = set()
+                            try:
+                                parsed_ids = {int(v) for v in (rid_by_key or {}).values() if int(v or 0) > 0}
+                            except Exception:
+                                parsed_ids = set()
+                            unparseable_ids = sorted([i for i in all_ids if i not in parsed_ids])
 
                             # Sort stores for stability.
                             for st in sorted(by_store.keys(), key=lambda s: s.lower()):
@@ -3707,51 +3728,74 @@ class RSForwarderBot:
                                         return 0
 
                                 es = sorted(es, key=lambda e2: (_rid_for(e2) or 10**9, str(getattr(e2, "sku", "") or "")))
-                                lines: List[str] = []
+
+                                # Build (info_line, cmd_line) pairs so we can show commands in a code block (copy button).
+                                pairs2: List[Tuple[str, str]] = []
                                 for e2 in es:
                                     sku2 = str(getattr(e2, "sku", "") or "").strip()
                                     title2 = str(getattr(e2, "title", "") or "").strip()
                                     rid2 = _rid_for(e2)
                                     if len(title2) > 60:
                                         title2 = title2[:57] + "..."
-                                    cmd = f"/removereleaseid release_id: {rid2}" if rid2 else "/removereleaseid release_id: ?"
-                                    if title2:
-                                        lines.append(f"`{rid2}` `{sku2}` — {title2}  {cmd}")
-                                    else:
-                                        lines.append(f"`{rid2}` `{sku2}`  {cmd}")
+                                    info = f"`{rid2}` `{sku2}`" + (f" — {title2}" if title2 else "")
+                                    cmd_line = f"/removereleaseid release_id: {rid2}" if rid2 else "/removereleaseid release_id: ?"
+                                    pairs2.append((info, cmd_line))
 
                                 # Split across multiple embeds if needed.
-                                chunk: List[str] = []
-                                char_budget = 0
                                 part = 1
-                                for ln in lines:
-                                    if char_budget + len(ln) + 1 > 3800 and chunk:
-                                        emb2 = discord.Embed(title=f"RS-FS Remove Helper — {st} (part {part})", color=discord.Color.dark_teal())
-                                        emb2.description = "\n".join(chunk)
-                                        emb2.set_footer(text="Copy the /removereleaseid line")
+                                cur_info: List[str] = []
+                                cur_cmds: List[str] = []
+
+                                def _render_desc(info_lines: List[str], cmd_lines: List[str]) -> str:
+                                    info_block = "\n".join(info_lines).strip()
+                                    cmd_block = "\n".join(cmd_lines).strip()
+                                    if not cmd_block:
+                                        return info_block
+                                    return (info_block + "\n\nCommands (copy):\n```" + cmd_block + "```").strip()
+
+                                for info_ln, cmd_ln in pairs2:
+                                    next_info = cur_info + [info_ln]
+                                    next_cmds = cur_cmds + [cmd_ln]
+                                    desc_try = _render_desc(next_info, next_cmds)
+                                    if len(desc_try) > 3800 and cur_info:
+                                        emb2 = discord.Embed(
+                                            title=f"RS-FS Remove Helper — {st}" + (f" (part {part})" if part > 1 else ""),
+                                            color=discord.Color.dark_teal(),
+                                        )
+                                        emb2.description = _render_desc(cur_info, cur_cmds)
+                                        emb2.set_footer(text="Use the code block copy button")
                                         await ctx.send(embed=emb2, allowed_mentions=discord.AllowedMentions.none())
                                         part += 1
-                                        chunk = []
-                                        char_budget = 0
-                                    chunk.append(ln)
-                                    char_budget += len(ln) + 1
-                                if chunk:
-                                    emb2 = discord.Embed(title=f"RS-FS Remove Helper — {st}" + (f" (part {part})" if part > 1 else ""), color=discord.Color.dark_teal())
-                                    emb2.description = "\n".join(chunk)
-                                    emb2.set_footer(text="Copy the /removereleaseid line")
+                                        cur_info = [info_ln]
+                                        cur_cmds = [cmd_ln]
+                                    else:
+                                        cur_info.append(info_ln)
+                                        cur_cmds.append(cmd_ln)
+
+                                if cur_info:
+                                    emb2 = discord.Embed(
+                                        title=f"RS-FS Remove Helper — {st}" + (f" (part {part})" if part > 1 else ""),
+                                        color=discord.Color.dark_teal(),
+                                    )
+                                    emb2.description = _render_desc(cur_info, cur_cmds)
+                                    emb2.set_footer(text="Use the code block copy button")
                                     await ctx.send(embed=emb2, allowed_mentions=discord.AllowedMentions.none())
 
-                            if unparseable:
-                                up_lines = []
-                                for rid2, line in unparseable[:25]:
-                                    cmd = f"/removereleaseid release_id: {rid2}" if rid2 else "/removereleaseid release_id: ?"
-                                    txt = line
-                                    if len(txt) > 140:
-                                        txt = txt[:137] + "..."
-                                    up_lines.append(f"`{rid2}` — {txt}  {cmd}")
-                                emb_u = discord.Embed(title="RS-FS Remove Helper — Unparseable (no -monitor tag)", color=discord.Color.orange())
-                                emb_u.description = "\n".join(up_lines)
-                                emb_u.set_footer(text="These items cannot be mapped to a store/SKU automatically")
+                            if unparseable_ids:
+                                up_info: List[str] = []
+                                up_cmds: List[str] = []
+                                for rid2 in unparseable_ids[:25]:
+                                    up_info.append(f"`{rid2}`")
+                                    up_cmds.append(f"/removereleaseid release_id: {rid2}")
+                                emb_u = discord.Embed(
+                                    title="RS-FS Remove Helper — Unparseable (could not parse store/SKU)",
+                                    color=discord.Color.orange(),
+                                )
+                                desc = "\n".join(up_info).strip()
+                                if up_cmds:
+                                    desc = (desc + "\n\nCommands (copy):\n```" + "\n".join(up_cmds) + "```").strip()
+                                emb_u.description = desc
+                                emb_u.set_footer(text="These release IDs could not be mapped to a store/SKU automatically • Use code block copy")
                                 await ctx.send(embed=emb_u, allowed_mentions=discord.AllowedMentions.none())
                         except Exception:
                             pass
