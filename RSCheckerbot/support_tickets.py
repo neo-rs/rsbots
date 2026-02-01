@@ -645,6 +645,43 @@ async def _audit_ticket_resolved(
     await _audit_send(guild_id=gid, embed=e)
 
 
+async def _audit_ticket_suppressed_cooldown(
+    *,
+    ticket_type: str,
+    owner: discord.Member,
+    last_ticket_id: str,
+    last_channel_id: int,
+    last_channel_name: str,
+    last_closed_at_iso: str,
+    cooldown_seconds: int,
+    fingerprint: str,
+    reference_jump_url: str = "",
+) -> None:
+    """Log a cooldown suppression to tickets-logs (prevents spam/reopen loops)."""
+    cfg = _cfg()
+    if not cfg or not cfg.audit_enabled:
+        return
+    gid = int(cfg.guild_id or 0)
+    if gid <= 0:
+        return
+    e = discord.Embed(title="Ticket Suppressed (Cooldown)", color=0xFEE75C, timestamp=_now_utc())
+    e.add_field(name="Type", value=str(ticket_type or "—")[:1024], inline=True)
+    e.add_field(name="Member", value=f"{getattr(owner, 'mention', '')} (`{int(owner.id)}`)", inline=True)
+    if last_ticket_id:
+        e.add_field(name="Last Ticket ID", value=f"`{str(last_ticket_id)[:128]}`", inline=True)
+    if last_channel_id:
+        ch_label = f"#{str(last_channel_name or '').strip()}" if str(last_channel_name or "").strip() else "unknown"
+        e.add_field(name="Last Ticket", value=f"{ch_label} (`{int(last_channel_id)}`)", inline=False)
+    if last_closed_at_iso:
+        e.add_field(name="Last Closed At", value=str(last_closed_at_iso)[:1024], inline=False)
+    e.add_field(name="Cooldown", value=f"`{int(cooldown_seconds)}`s", inline=True)
+    if fingerprint:
+        e.add_field(name="Fingerprint", value=f"`{str(fingerprint)[:256]}`", inline=False)
+    if reference_jump_url:
+        e.add_field(name="Source", value=_embed_link("View Full Log", str(reference_jump_url)), inline=False)
+    await _audit_send(guild_id=gid, embed=e)
+
+
 async def audit_message_create(message: discord.Message) -> None:
     """Audit: message sent in ticket categories."""
     if not _ensure_cfg_loaded() or not _BOT:
@@ -957,20 +994,37 @@ async def _set_ticket_role_for_member(*, guild: discord.Guild, member: discord.M
         return
     role = guild.get_role(int(rid))
     if not role:
+        await _log(f"⚠️ support_tickets: role not found for type={ticket_type} role_id={rid}")
         return
+
+    me = getattr(guild, "me", None) or guild.get_member(int(getattr(getattr(_BOT, "user", None), "id", 0) or 0))
+    if isinstance(me, discord.Member):
+        with suppress(Exception):
+            if not bool(getattr(me.guild_permissions, "manage_roles", False)):
+                await _log(f"❌ support_tickets: bot lacks manage_roles (cannot {'add' if add else 'remove'} role_id={rid})")
+                return
+            if getattr(me, "top_role", None) and getattr(me.top_role, "position", 0) <= getattr(role, "position", 0):
+                await _log(
+                    f"❌ support_tickets: role hierarchy prevents {'add' if add else 'remove'} role_id={rid} (bot_top={me.top_role.position} role_pos={role.position})"
+                )
+                return
     has_it = False
     with suppress(Exception):
         has_it = any(int(getattr(r, "id", 0) or 0) == int(rid) for r in (member.roles or []))
     if add:
         if has_it:
             return
-        with suppress(Exception):
+        try:
             await member.add_roles(role, reason=f"RSCheckerbot: open {ticket_type} ticket")
+        except Exception as ex:
+            await _log(f"❌ support_tickets: failed to add role_id={rid} to user_id={int(member.id)} ({str(ex)[:200]})")
     else:
         if not has_it:
             return
-        with suppress(Exception):
+        try:
             await member.remove_roles(role, reason=f"RSCheckerbot: close {ticket_type} ticket")
+        except Exception as ex:
+            await _log(f"❌ support_tickets: failed to remove role_id={rid} from user_id={int(member.id)} ({str(ex)[:200]})")
 
 
 async def post_resolution_followup_and_remove_role(
@@ -1290,6 +1344,46 @@ async def _open_or_update_ticket(
                 # Important: do NOT bump last_activity for bot messages.
                 return ch
 
+        # Cooldown: if a ticket was recently CLOSED, do not re-open another one immediately.
+        cd_s = int(_cooldown_seconds_for(ticket_type) or 0) if cfg.dedupe_enabled else 0
+        if cd_s > 0:
+            fp = str(fingerprint or "").strip()
+            last_ts: datetime | None = None
+            last_tid = ""
+            last_rec: dict | None = None
+            for tid0, rec0 in _ticket_iter(db):
+                if str(rec0.get("ticket_type") or "").strip().lower() != str(ticket_type or "").strip().lower():
+                    continue
+                uid0 = _as_int(rec0.get("user_id"))
+                if uid0 != int(owner.id):
+                    if not (fp and str(rec0.get("fingerprint") or "").strip() == fp):
+                        continue
+                closed_iso = str(rec0.get("closed_at_iso") or "").strip()
+                if not closed_iso:
+                    continue
+                dt0 = _parse_iso(closed_iso)
+                if not dt0:
+                    continue
+                if (last_ts is None) or (dt0 > last_ts):
+                    last_ts = dt0
+                    last_tid = str(tid0 or "")
+                    last_rec = rec0
+            if last_ts and last_rec and (_now_utc() - last_ts) < timedelta(seconds=int(cd_s)):
+                with suppress(Exception):
+                    await _audit_ticket_suppressed_cooldown(
+                        ticket_type=ticket_type,
+                        owner=owner,
+                        last_ticket_id=str(last_rec.get("ticket_id") or last_tid or "").strip(),
+                        last_channel_id=int(_as_int(last_rec.get("channel_id"))),
+                        last_channel_name=str(last_rec.get("channel_name") or "").strip(),
+                        last_closed_at_iso=str(last_rec.get("closed_at_iso") or "").strip(),
+                        cooldown_seconds=int(cd_s),
+                        fingerprint=fingerprint,
+                        reference_jump_url=reference_jump_url,
+                    )
+                # Return a truthy sentinel so callers don't log this as a "failed open".
+                return discord.Object(id=int(_as_int(last_rec.get("channel_id")) or owner.id))
+
         ticket_id = _make_ticket_id()
         case_key = _ticket_case_key(ticket_id=ticket_id)
         ch_name = _ticket_channel_name(ticket_type, owner)
@@ -1349,6 +1443,8 @@ async def _open_or_update_ticket(
             "ticket_type": str(ticket_type),
             "user_id": int(owner.id),
             "channel_id": int(ch.id),
+            "channel_name": str(getattr(ch, "name", "") or ""),
+            "guild_id": int(getattr(getattr(ch, "guild", None), "id", 0) or int(cfg.guild_id)),
             "created_at_iso": _now_iso(),
             "last_activity_at_iso": _now_iso(),
             "status": "OPEN",

@@ -1446,8 +1446,11 @@ async def _startup_canceling_members_snapshot() -> None:
                                     fingerprint=fp,
                                     reference_jump_url="",
                                 )
-                                if ch_created:
+                                if isinstance(ch_created, discord.TextChannel):
                                     tickets_opened += 1
+                                elif ch_created:
+                                    # Cooldown suppression returns a truthy sentinel (not a real channel).
+                                    tickets_skipped += 1
                                 else:
                                     tickets_failed += 1
                             else:
