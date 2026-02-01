@@ -11,11 +11,14 @@ RSForwarder is a standalone bot for forwarding messages from RS Server channels 
 - **Description**: Add a new source channel to destination mapping
 - **Aliases**: `add`
 - **Parameters**: 
-  - `source_channel`: Discord channel mention or channel ID (required)
-  - `destination_webhook_url`: Discord webhook URL (required)
+  - `source_channel`: Discord channel mention or channel ID (manual mode)
+  - `destination_webhook_url`: Discord webhook URL (manual mode)
   - `role_id`: Role ID to mention (optional)
   - `text`: Text to include with role mention (optional)
-- **Usage**: `!rsadd #personal-deals <WEBHOOK_URL> 886824827745337374 "leads found!"`
+- **Usage**:
+  - `!rsadd` (interactive mapper: select source channels → **Map → destination**; auto-creates/uses webhook)
+  - Manual: `!rsadd #personal-deals <WEBHOOK_URL> 886824827745337374 "leads found!"`
+  - Manual: `!rsadd 1446174806981480578 <WEBHOOK_URL>`
 - **Admin Only**: No (but requires channel access)
 - **Returns**: Confirmation embed. The webhook is saved server-side in `config.secrets.json -> destination_webhooks` (not in `config.json`).
 

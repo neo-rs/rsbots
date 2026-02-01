@@ -473,6 +473,62 @@ class RSForwarderBot:
             v = 300
         return max(60, min(v, 3600))
 
+    def _rs_server_guild_id(self) -> int:
+        """
+        RS Server guild ID (used for branding/icon fetch). Canonical config keys:
+        - rs_server_guild_id (preferred)
+        - guild_id (legacy)
+        """
+        try:
+            return int((self.config or {}).get("rs_server_guild_id") or (self.config or {}).get("guild_id") or 0)
+        except Exception:
+            return 0
+
+    def _test_server_guild_id(self) -> int:
+        """
+        Neo Test Server guild ID (diagnostic / optional features).
+        """
+        try:
+            return int((self.config or {}).get("test_server_guild_id") or 0)
+        except Exception:
+            return 0
+
+    async def _startup_validate_visibility(self) -> None:
+        """
+        Best-effort startup diagnostics:
+        - verify bot is in RS server / test server (if configured)
+        - verify configured source channel IDs are accessible
+        """
+        try:
+            rs_gid = self._rs_server_guild_id()
+            test_gid = self._test_server_guild_id()
+            if rs_gid and (self.bot.get_guild(int(rs_gid)) is None):
+                print(f"{Colors.YELLOW}[Startup] ⚠️ Bot is NOT in RS Server guild_id={rs_gid}{Colors.RESET}")
+            if test_gid and (self.bot.get_guild(int(test_gid)) is None):
+                print(f"{Colors.YELLOW}[Startup] ⚠️ Bot is NOT in Neo Test Server guild_id={test_gid}{Colors.RESET}")
+
+            channels = (self.config or {}).get("channels") or []
+            bad: List[str] = []
+            okc = 0
+            for ch in channels:
+                try:
+                    cid = str((ch or {}).get("source_channel_id") or "").strip()
+                    if not cid or not cid.isdigit():
+                        continue
+                    obj = await self._resolve_channel_by_id(int(cid))
+                    if obj is None:
+                        bad.append(cid)
+                    else:
+                        okc += 1
+                except Exception:
+                    continue
+            if okc or bad:
+                print(f"{Colors.CYAN}[Startup] Channel access: ok={okc} missing={len(bad)}{Colors.RESET}")
+                if bad:
+                    print(f"{Colors.YELLOW}[Startup] Missing/unreadable channels (first 6): {', '.join(bad[:6])}{Colors.RESET}")
+        except Exception:
+            pass
+
     def _mavely_alert_cooldown_s(self) -> int:
         try:
             v = int((self.config or {}).get("mavely_alert_cooldown_s") or 1800)
@@ -1516,6 +1572,201 @@ class RSForwarderBot:
             return await self.bot.fetch_channel(int(channel_id))
         except Exception:
             return None
+
+    def _extract_channel_id_from_ref(self, channel_ref: str) -> Optional[int]:
+        """
+        Parse a channel reference into an ID.
+
+        Accepts:
+        - "<#123...>" channel mention
+        - "123..." raw channel ID
+        """
+        s = str(channel_ref or "").strip()
+        if not s:
+            return None
+        try:
+            if s.startswith("<#") and s.endswith(">"):
+                s = s[2:-1].strip()
+        except Exception:
+            pass
+        try:
+            return int(s) if s.isdigit() else None
+        except Exception:
+            return None
+
+    def _get_destination_channel_webhook_url(self, destination_channel_id: int) -> str:
+        """
+        Cache: destination channel id -> webhook url (stored server-side in config.secrets.json).
+        Used by the rsadd mapper so users never paste webhook URLs.
+        """
+        try:
+            secrets = self._load_secrets_dict()
+            d = secrets.get("destination_channel_webhooks")
+            if not isinstance(d, dict):
+                return ""
+            return str(d.get(str(int(destination_channel_id))) or "").strip()
+        except Exception:
+            return ""
+
+    def _set_destination_channel_webhook_url(self, destination_channel_id: int, webhook_url: str) -> bool:
+        try:
+            dest_id = str(int(destination_channel_id))
+            url = str(webhook_url or "").strip()
+            if not (dest_id and url):
+                return False
+            secrets = self._load_secrets_dict()
+            d = secrets.get("destination_channel_webhooks")
+            if not isinstance(d, dict):
+                d = {}
+            d[dest_id] = url
+            secrets["destination_channel_webhooks"] = d
+            return self._save_secrets_dict(secrets)
+        except Exception:
+            return False
+
+    async def _get_or_create_destination_webhook_url(self, destination_channel: discord.TextChannel) -> Tuple[bool, str, str]:
+        """
+        Return (ok, message, webhook_url) for a destination channel.
+        Requires Manage Webhooks permission in the destination channel.
+        """
+        try:
+            dest_id = int(getattr(destination_channel, "id", 0) or 0)
+        except Exception:
+            dest_id = 0
+        if not dest_id:
+            return False, "Invalid destination channel.", ""
+
+        cached = self._get_destination_channel_webhook_url(dest_id)
+        if cached:
+            return True, "ok", cached
+
+        # Try to reuse an existing webhook created by this bot.
+        try:
+            hooks = await destination_channel.webhooks()
+        except Exception:
+            hooks = []
+
+        try:
+            bot_user = getattr(self.bot, "user", None)
+            bot_id = int(getattr(bot_user, "id", 0) or 0)
+        except Exception:
+            bot_id = 0
+
+        for h in hooks or []:
+            try:
+                creator_id = int(getattr(getattr(h, "user", None), "id", 0) or 0)
+                if bot_id and creator_id and creator_id != bot_id:
+                    continue
+                url = str(getattr(h, "url", "") or "").strip()
+                if url:
+                    self._set_destination_channel_webhook_url(dest_id, url)
+                    return True, "ok", url
+            except Exception:
+                continue
+
+        # Create a new webhook.
+        try:
+            wh = await destination_channel.create_webhook(
+                name="RSForwarder",
+                reason="RSForwarder mapping (auto-created destination webhook)",
+            )
+            url = str(getattr(wh, "url", "") or "").strip()
+            if not url:
+                return False, "Webhook created but URL was not available.", ""
+            self._set_destination_channel_webhook_url(dest_id, url)
+            return True, "ok", url
+        except Exception as e:
+            return False, f"Failed to create webhook in destination channel (need Manage Webhooks): {str(e)[:180]}", ""
+
+    async def _rsadd_apply(
+        self,
+        *,
+        source_channel_id: int,
+        destination_webhook_url: str,
+        role_id: str = "",
+        text: str = "",
+    ) -> Tuple[bool, str, Optional[discord.Embed]]:
+        """
+        Canonical implementation for adding a forwarding job.
+        Used by both:
+        - manual `!rsadd <channel> <webhook_url> ...`
+        - interactive mapper `!rsadd` (auto webhook)
+        """
+        try:
+            src_id = int(source_channel_id or 0)
+        except Exception:
+            src_id = 0
+        if src_id <= 0:
+            return False, "Invalid source channel id.", None
+
+        wh_url = str(destination_webhook_url or "").strip()
+        if not wh_url.startswith("https://discord.com/api/webhooks/"):
+            return False, "Invalid webhook URL format.", None
+
+        src_key = str(src_id)
+        if self.get_channel_config(src_key):
+            return False, f"Source channel `{src_key}` is already configured (use `!rsupdate` / `!rsremove`).", None
+
+        ch_obj = await self._resolve_channel_by_id(int(src_id))
+        ch_name = str(getattr(ch_obj, "name", "") or f"channel-{src_id}") if ch_obj else f"channel-{src_id}"
+
+        rid = str(role_id or "").strip()
+        rtext = str(text or "").strip()
+        if rid:
+            try:
+                int(rid)
+            except Exception:
+                return False, "Invalid role_id (must be numeric).", None
+
+        if not self._set_destination_webhook_secret(src_key, wh_url):
+            return False, "Failed to write webhook into config.secrets.json on the server.", None
+
+        new_channel = {
+            "source_channel_id": src_key,
+            "source_channel_name": ch_name,
+            "role_mention": {"role_id": rid, "text": rtext},
+        }
+        if "channels" not in self.config:
+            self.config["channels"] = []
+        self.config["channels"].append(new_channel)
+        self.save_config()
+        self.load_config()
+
+        emb = discord.Embed(
+            title="✅ New Forwarding Job Added",
+            color=discord.Color.green(),
+            description="Forwarding is now enabled for this source channel.",
+        )
+        emb.add_field(name="📥 Source", value=f"`{ch_name}`\nID: `{src_key}`", inline=True)
+        emb.add_field(name="📤 Destination", value="Webhook configured (server-only secrets)", inline=True)
+        if rid:
+            emb.add_field(name="📢 Role Mention", value=f"<@&{rid}> {rtext}", inline=False)
+        emb.set_footer(text="Use !rslist / !rsview / !rsupdate / !rsremove")
+        return True, "ok", emb
+
+    def _rsremove_apply(self, *, source_channel_id: int) -> Tuple[bool, str]:
+        try:
+            src_id = int(source_channel_id or 0)
+        except Exception:
+            src_id = 0
+        if src_id <= 0:
+            return False, "Invalid source channel id."
+
+        channels = (self.config or {}).get("channels")
+        if not isinstance(channels, list):
+            return False, "No channels configured."
+
+        src_key = str(src_id)
+        before = len(channels)
+        channels2 = [c for c in channels if str((c or {}).get("source_channel_id") or "").strip() != src_key]
+        if len(channels2) == before:
+            return False, "That source channel is not configured."
+
+        self.config["channels"] = channels2
+        self.save_config()
+        self.load_config()
+        self._delete_destination_webhook_secret(src_key)
+        return True, "ok"
 
     def _format_progress_bar(self, done: int, total: int, *, width: int = 18) -> str:
         try:
@@ -2830,7 +3081,7 @@ class RSForwarderBot:
             print(f"{Colors.GREEN}[Bot] Ready as {self.bot.user}{Colors.RESET}")
             
             # Get RS Server guild - try multiple times as guilds may not be cached immediately
-            guild_id = self.config.get("guild_id", 0)
+            guild_id = self._rs_server_guild_id()
             if guild_id:
                 # Try to get guild, wait a bit if not immediately available
                 for attempt in range(3):
@@ -2866,6 +3117,12 @@ class RSForwarderBot:
                             print(f"{Colors.RED}[Icon]   3. RS Server has an icon set{Colors.RESET}")
                 else:
                     print(f"{Colors.GREEN}[Icon] Using saved RS Server icon from config{Colors.RESET}")
+
+            # Startup diagnostics (guild/channel visibility). Helpful when “nothing happens”.
+            try:
+                await self._startup_validate_visibility()
+            except Exception:
+                pass
             
             # Display config information
             print(f"\n{Colors.CYAN}[Config] Configuration Information:{Colors.RESET}")
@@ -3024,114 +3281,301 @@ class RSForwarderBot:
     def _setup_commands(self):
         """Setup bot commands"""
         
-        @self.bot.command(name='rsadd', aliases=['add'])
-        async def add_channel(ctx, source_channel: discord.TextChannel = None, destination_webhook_url: str = None, 
-                             role_id: str = None, *, text: str = None):
-            """Add a new source channel to destination mapping
-            
-            Usage: !rsadd <#channel|channel_id> <webhook_url> [role_id] [text]
-            
-            Examples:
-            !rsadd #personal-deals <WEBHOOK_URL> 886824827745337374 "leads found!"
-            !rsadd 1446174806981480578 <WEBHOOK_URL> 886824827745337374
+        @self.bot.command(name="rsadd", aliases=["add"])
+        async def add_channel(ctx, source_channel: str = None, destination_webhook_url: str = None, role_id: str = None, *, text: str = None):
             """
-            if not source_channel:
-                await ctx.send(
-                    "❌ **Usage:** `!rsadd <#channel|channel_id> <webhook_url> [role_id] [text]`\n\n"
-                    "**Examples:**\n"
-                    "`!rsadd #personal-deals <WEBHOOK_URL> 886824827745337374 \"leads found!\"`\n"
-                    "`!rsadd 1446174806981480578 <WEBHOOK_URL> 886824827745337374`"
-                )
-                return
-            
-            source_channel_id = str(source_channel.id)
-            channel_name = source_channel.name
-            
-            if not destination_webhook_url:
-                await ctx.send(
-                    "❌ **Missing webhook URL!**\n"
-                    "**Usage:** `!rsadd <#channel|channel_id> <webhook_url> [role_id] [text]`"
-                )
-                return
-            
-            # Validate webhook URL format
-            if not destination_webhook_url.startswith('https://discord.com/api/webhooks/'):
-                await ctx.send("❌ Invalid webhook URL format. Must be a Discord webhook URL.")
-                return
-            
-            # Check if channel already exists
-            existing = self.get_channel_config(source_channel_id)
-            if existing:
-                await ctx.send(
-                    f"❌ Channel `{channel_name}` ({source_channel_id}) is already configured!\n"
-                    f"Use `!rsupdate` to modify it or `!rsremove` to remove it first."
-                )
-                return
-            
-            # Validate role_id if provided
-            if role_id:
-                try:
-                    # Just validate it's a valid number format
-                    int(role_id)
-                except ValueError:
-                    await ctx.send("❌ Invalid role ID format. Role ID must be a number.")
+            Add a forwarding job.
+
+            Preferred workflow (DiscumBot-style):
+              - run `!rsadd` in the destination channel
+              - select source guild/category/channels
+              - click "Map → destination" (auto-creates/uses a webhook)
+
+            Manual mode:
+              `!rsadd <#channel|channel_id> <webhook_url> [role_id] [text]`
+            """
+            # Interactive mapper
+            if not source_channel and not destination_webhook_url:
+                if not isinstance(getattr(ctx, "channel", None), discord.TextChannel):
+                    await ctx.send("❌ Run `!rsadd` inside a server text channel.")
                     return
-            
-            # Persist webhook into config.secrets.json (server-only) so RSForwarder startup validation passes.
-            ok = self._set_destination_webhook_secret(source_channel_id, destination_webhook_url.strip())
-            if not ok:
-                await ctx.send("❌ Failed to write webhook into `config.secrets.json`. Check file permissions on the server.")
+
+                owner_id = int(getattr(getattr(ctx, "author", None), "id", 0) or 0)
+                dest_channel: discord.TextChannel = ctx.channel  # type: ignore[assignment]
+
+                class _RsAddMapView(discord.ui.View):
+                    def __init__(self, bot_obj: "RSForwarderBot"):
+                        super().__init__(timeout=900)
+                        self._bot = bot_obj
+                        self._owner_id = int(owner_id or 0)
+                        self.dest_channel_id = int(dest_channel.id)
+                        # default guild: current guild (if bot is in it)
+                        self.source_guild_id = int(getattr(getattr(ctx, "guild", None), "id", 0) or 0) or 0
+                        if not self.source_guild_id and bot_obj.bot.guilds:
+                            self.source_guild_id = int(bot_obj.bot.guilds[0].id)
+                        self.category_index = 0
+                        self.channel_page = 0
+                        self.selected_channel_ids: Set[int] = set()
+
+                        self.guild_select = discord.ui.Select(placeholder="Select source guild…", min_values=1, max_values=1, options=[])
+                        self.channel_select = discord.ui.Select(placeholder="Select source channels (page)…", min_values=0, max_values=25, options=[])
+                        self.guild_select.callback = self._on_select_guild  # type: ignore[assignment]
+                        self.channel_select.callback = self._on_select_channels  # type: ignore[assignment]
+                        self.add_item(self.guild_select)
+                        self.add_item(self.channel_select)
+                        self._rebuild_options()
+
+                    async def _guard(self, interaction: discord.Interaction) -> bool:
+                        try:
+                            if self._owner_id and int(interaction.user.id) != self._owner_id:
+                                await interaction.response.send_message("❌ This mapper is not for you. Run `!rsadd` yourself.", ephemeral=True)
+                                return False
+                        except Exception:
+                            return False
+                        return True
+
+                    def _current_guild(self) -> Optional[discord.Guild]:
+                        try:
+                            return self._bot.bot.get_guild(int(self.source_guild_id))
+                        except Exception:
+                            return None
+
+                    def _categories(self) -> List[Optional[discord.CategoryChannel]]:
+                        g = self._current_guild()
+                        if not g:
+                            return [None]
+                        cats = list(getattr(g, "categories", []) or [])
+                        cats_sorted = sorted(cats, key=lambda c: int(getattr(c, "position", 0) or 0))
+                        return [None] + cats_sorted
+
+                    def _channels_for_category(self) -> List[discord.TextChannel]:
+                        g = self._current_guild()
+                        if not g:
+                            return []
+                        cats = self._categories()
+                        idx = max(0, min(int(self.category_index), len(cats) - 1))
+                        cat = cats[idx]
+                        if cat is None:
+                            chans = [c for c in (getattr(g, "text_channels", []) or [])]
+                        else:
+                            chans = [c for c in (getattr(cat, "channels", []) or []) if isinstance(c, discord.TextChannel)]
+                        return sorted(chans, key=lambda c: int(getattr(c, "position", 0) or 0))
+
+                    def _current_channel_page(self) -> List[discord.TextChannel]:
+                        chans = self._channels_for_category()
+                        page_size = 25
+                        max_page = max(0, (len(chans) - 1) // page_size) if chans else 0
+                        self.channel_page = max(0, min(int(self.channel_page), int(max_page)))
+                        start = int(self.channel_page) * page_size
+                        return chans[start:start + page_size]
+
+                    def _mapped_count(self) -> int:
+                        try:
+                            return len((self._bot.config or {}).get("channels") or [])
+                        except Exception:
+                            return 0
+
+                    def _rebuild_options(self) -> None:
+                        # guild options
+                        guild_opts: List[discord.SelectOption] = []
+                        for g in (self._bot.bot.guilds or [])[:25]:
+                            try:
+                                guild_opts.append(discord.SelectOption(label=str(g.name)[:100], value=str(int(g.id))))
+                            except Exception:
+                                pass
+                        self.guild_select.options = guild_opts
+                        if not self.source_guild_id and guild_opts:
+                            try:
+                                self.source_guild_id = int(guild_opts[0].value)
+                            except Exception:
+                                pass
+
+                        # channel options
+                        ch_opts: List[discord.SelectOption] = []
+                        for ch in self._current_channel_page():
+                            try:
+                                name = str(getattr(ch, "name", "") or f"channel-{int(ch.id)}")
+                                label = f"#{name}"
+                                if len(label) > 100:
+                                    label = label[:97] + "..."
+                                ch_opts.append(discord.SelectOption(label=label, value=str(int(ch.id))))
+                            except Exception:
+                                pass
+                        self.channel_select.options = ch_opts[:25]
+
+                    async def _build_embed(self) -> discord.Embed:
+                        g = self._current_guild()
+                        cats = self._categories()
+                        idx = max(0, min(int(self.category_index), len(cats) - 1))
+                        cat = cats[idx]
+                        cat_name = "All channels" if cat is None else str(getattr(cat, "name", "") or "Category")
+                        emb = discord.Embed(
+                            title="RSForwarder Mapper",
+                            color=discord.Color.blurple(),
+                            description="Select source channels, then click **Map → destination**.\n(Automatically creates/uses a webhook in the destination channel.)",
+                        )
+                        emb.add_field(name="Destination", value=f"<#{self.dest_channel_id}>", inline=False)
+                        if g:
+                            emb.add_field(name="Source guild", value=f"`{g.name}` ({int(g.id)})", inline=False)
+                        else:
+                            emb.add_field(name="Source guild", value=f"`unknown` ({int(self.source_guild_id)})", inline=False)
+                        emb.add_field(name="Category", value=f"`{cat_name}`", inline=True)
+                        emb.add_field(name="Mapped", value=str(self._mapped_count()), inline=True)
+                        if self.selected_channel_ids:
+                            shown = ", ".join([f"<#{cid}>" for cid in list(self.selected_channel_ids)[:10]])
+                            emb.add_field(name="Selected", value=shown, inline=False)
+                        emb.set_footer(text="Prev/Next Category • Prev/Next Channels • Map → destination")
+                        return emb
+
+                    async def _refresh(self, interaction: discord.Interaction) -> None:
+                        self._rebuild_options()
+                        emb = await self._build_embed()
+                        try:
+                            await interaction.response.edit_message(embed=emb, view=self)
+                        except Exception:
+                            try:
+                                await interaction.followup.send(embed=emb, view=self, ephemeral=True)
+                            except Exception:
+                                pass
+
+                    async def _on_select_guild(self, interaction: discord.Interaction):
+                        if not await self._guard(interaction):
+                            return
+                        try:
+                            self.source_guild_id = int(self.guild_select.values[0])
+                            self.category_index = 0
+                            self.channel_page = 0
+                            self.selected_channel_ids = set()
+                        except Exception:
+                            pass
+                        await self._refresh(interaction)
+
+                    async def _on_select_channels(self, interaction: discord.Interaction):
+                        if not await self._guard(interaction):
+                            return
+                        try:
+                            self.selected_channel_ids = set(int(v) for v in (self.channel_select.values or []) if str(v).isdigit())
+                        except Exception:
+                            self.selected_channel_ids = set()
+                        await self._refresh(interaction)
+
+                    @discord.ui.button(label="Prev category", style=discord.ButtonStyle.secondary, row=2)
+                    async def prev_category(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+                        if not await self._guard(interaction):
+                            return
+                        self.category_index = max(0, int(self.category_index) - 1)
+                        self.channel_page = 0
+                        self.selected_channel_ids = set()
+                        await self._refresh(interaction)
+
+                    @discord.ui.button(label="Next category", style=discord.ButtonStyle.secondary, row=2)
+                    async def next_category(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+                        if not await self._guard(interaction):
+                            return
+                        cats = self._categories()
+                        self.category_index = min(len(cats) - 1, int(self.category_index) + 1)
+                        self.channel_page = 0
+                        self.selected_channel_ids = set()
+                        await self._refresh(interaction)
+
+                    @discord.ui.button(label="Prev channels", style=discord.ButtonStyle.secondary, row=2)
+                    async def prev_channels(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+                        if not await self._guard(interaction):
+                            return
+                        self.channel_page = max(0, int(self.channel_page) - 1)
+                        self.selected_channel_ids = set()
+                        await self._refresh(interaction)
+
+                    @discord.ui.button(label="Next channels", style=discord.ButtonStyle.secondary, row=2)
+                    async def next_channels(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+                        if not await self._guard(interaction):
+                            return
+                        self.channel_page = int(self.channel_page) + 1
+                        self.selected_channel_ids = set()
+                        await self._refresh(interaction)
+
+                    @discord.ui.button(label="Map → destination", style=discord.ButtonStyle.success, row=3)
+                    async def map_to_destination(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+                        if not await self._guard(interaction):
+                            return
+                        if not self.selected_channel_ids:
+                            await interaction.response.send_message("❌ Select at least one source channel first.", ephemeral=True)
+                            return
+                        dest = self._bot.bot.get_channel(int(self.dest_channel_id))
+                        if not isinstance(dest, discord.TextChannel):
+                            await interaction.response.send_message("❌ Destination channel not accessible.", ephemeral=True)
+                            return
+
+                        ok_wh, msg_wh, wh_url = await self._bot._get_or_create_destination_webhook_url(dest)
+                        if not ok_wh:
+                            await interaction.response.send_message(f"❌ {msg_wh}", ephemeral=True)
+                            return
+
+                        added = 0
+                        skipped = 0
+                        for cid in list(self.selected_channel_ids):
+                            ok2, _msg2, _emb2 = await self._bot._rsadd_apply(source_channel_id=int(cid), destination_webhook_url=wh_url)
+                            if ok2:
+                                added += 1
+                            else:
+                                skipped += 1
+                        await interaction.response.send_message(f"✅ Mapped: {added} ok, {skipped} skipped.", ephemeral=True)
+                        self.selected_channel_ids = set()
+                        await self._refresh(interaction)
+
+                    @discord.ui.button(label="Unmap selected", style=discord.ButtonStyle.danger, row=3)
+                    async def unmap_selected(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+                        if not await self._guard(interaction):
+                            return
+                        if not self.selected_channel_ids:
+                            await interaction.response.send_message("❌ Select at least one source channel first.", ephemeral=True)
+                            return
+                        removed = 0
+                        skipped = 0
+                        for cid in list(self.selected_channel_ids):
+                            ok2, _msg2 = self._bot._rsremove_apply(source_channel_id=int(cid))
+                            if ok2:
+                                removed += 1
+                            else:
+                                skipped += 1
+                        await interaction.response.send_message(f"✅ Unmapped: {removed} ok, {skipped} skipped.", ephemeral=True)
+                        self.selected_channel_ids = set()
+                        await self._refresh(interaction)
+
+                    @discord.ui.button(label="Close", style=discord.ButtonStyle.secondary, row=3)
+                    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+                        if not await self._guard(interaction):
+                            return
+                        try:
+                            await interaction.response.defer()
+                        except Exception:
+                            pass
+                        self.stop()
+
+                view = _RsAddMapView(self)
+                emb = await view._build_embed()
+                await ctx.send(embed=emb, view=view)
                 return
 
-            # Create new channel config (no secret URL stored in config.json)
-            new_channel = {
-                "source_channel_id": source_channel_id,
-                "source_channel_name": channel_name,
-                "role_mention": {
-                    "role_id": role_id.strip() if role_id else "",
-                    "text": text.strip() if text else ""
-                }
-            }
-            
-            # Add to config
-            if "channels" not in self.config:
-                self.config["channels"] = []
-            self.config["channels"].append(new_channel)
-            self.save_config()
-            
-            # Reload config
-            self.load_config()
-            
-            # Build confirmation message
-            role_info = ""
-            if role_id:
-                role_text = text if text else ""
-                role_info = f"\n📢 Role Mention: <@&{role_id}> {role_text}"
-            
-            embed = discord.Embed(
-                title="✅ New Forwarding Job Added",
-                color=discord.Color.green(),
-                description=f"Bot will start forwarding messages from this channel."
+            # Manual mode
+            cid = self._extract_channel_id_from_ref(str(source_channel or ""))
+            if not cid:
+                await ctx.send("❌ Invalid source channel. Use `#channel` or a numeric channel ID.")
+                return
+            if not destination_webhook_url:
+                await ctx.send("❌ Missing webhook URL. Tip: run `!rsadd` with no args for the mapper UI.")
+                return
+
+            ok, msg, emb = await self._rsadd_apply(
+                source_channel_id=int(cid),
+                destination_webhook_url=str(destination_webhook_url or ""),
+                role_id=str(role_id or ""),
+                text=str(text or ""),
             )
-            embed.add_field(
-                name="📥 Source Channel",
-                value=f"`{channel_name}`\nID: `{source_channel_id}`",
-                inline=True
-            )
-            embed.add_field(
-                name="📤 Destination",
-                value="Webhook configured (saved to secrets)",
-                inline=True
-            )
-            if role_info:
-                embed.add_field(
-                    name="📢 Role Mention",
-                    value=f"<@&{role_id}> {text if text else ''}",
-                    inline=False
-                )
-            embed.set_footer(text="Use !rslist to view all jobs or !rsview to see details")
-            
-            await ctx.send(embed=embed)
+            if not ok or not emb:
+                await ctx.send(f"❌ {msg}")
+                return
+            await ctx.send(embed=emb)
         
         @self.bot.command(name='rslist', aliases=['list'])
         async def list_channels(ctx):
@@ -4523,7 +4967,7 @@ class RSForwarderBot:
             )
             
             # RS Server info
-            guild_id = self.config.get("guild_id", 0)
+            guild_id = self._rs_server_guild_id()
             if self.rs_guild:
                 embed.add_field(
                     name="RS Server",
@@ -4536,6 +4980,23 @@ class RSForwarderBot:
                     value=f"❌ Not found\nID: {guild_id}",
                     inline=True
                 )
+
+            # Neo Test Server info (diagnostic)
+            test_gid = self._test_server_guild_id()
+            if test_gid:
+                test_g = self.bot.get_guild(int(test_gid))
+                if test_g:
+                    embed.add_field(
+                        name="Neo Test Server",
+                        value=f"✅ Connected\nName: {test_g.name}\nID: {test_gid}",
+                        inline=True,
+                    )
+                else:
+                    embed.add_field(
+                        name="Neo Test Server",
+                        value=f"❌ Not found\nID: {test_gid}",
+                        inline=True,
+                    )
             
             # Icon status
             if self.rs_icon_url:
@@ -4562,7 +5023,13 @@ class RSForwarderBot:
             channels = self.config.get("channels", [])
             channels_info = []
             for ch in channels:
-                status = "✅" if ch.get("destination_webhook_url") else "❌"
+                try:
+                    if bool((ch or {}).get("repost_in_place")):
+                        status = "♻️"
+                    else:
+                        status = "✅" if (ch or {}).get("destination_webhook_url") else "❌"
+                except Exception:
+                    status = "❌"
                 channels_info.append(f"{status} {ch.get('source_channel_name', 'unknown')}")
             
             embed.add_field(
@@ -4577,7 +5044,7 @@ class RSForwarderBot:
         @self.bot.command(name='rsfetchicon', aliases=['fetchicon'])
         async def fetch_icon(ctx):
             """Manually fetch RS Server icon"""
-            guild_id = self.config.get("guild_id", 0)
+            guild_id = self._rs_server_guild_id()
             if not guild_id:
                 await ctx.send("❌ No `guild_id` configured in config.json")
                 return
@@ -5329,7 +5796,7 @@ class RSForwarderBot:
         """
         try:
             if not self.rs_guild:
-                guild_id = int(self.config.get("guild_id", 0) or 0)
+                guild_id = int(self._rs_server_guild_id() or 0)
                 if guild_id:
                     self.rs_guild = self.bot.get_guild(guild_id)
             g = self.rs_guild
@@ -5476,12 +5943,19 @@ class RSForwarderBot:
             rewrite_enabled = bool(self.config.get("affiliate_rewrite_enabled", True))
             if not rewrite_enabled:
                 return
+            debug = bool((channel_config or {}).get("repost_debug"))
+            if debug:
+                try:
+                    mid = int(getattr(message, "id", 0) or 0)
+                    aid = int(getattr(getattr(message, "author", None), "id", 0) or 0)
+                    print(f"{Colors.CYAN}[Repost] saw message id={mid} author={aid} channel={channel_id}{Colors.RESET}")
+                except Exception:
+                    pass
 
             any_changed = False
 
             # Content rewrite
             content = message.content or ""
-            content_original = content
 
             where_only = bool((channel_config or {}).get("repost_affiliate_where_only"))
             where_marker = str((channel_config or {}).get("repost_affiliate_where_marker") or "`Where:`").strip()
@@ -5520,6 +5994,11 @@ class RSForwarderBot:
                 embeds_raw = rewritten
 
             if not any_changed:
+                if debug:
+                    try:
+                        print(f"{Colors.YELLOW}[Repost] no affiliate rewrite for message in channel={channel_id}{Colors.RESET}")
+                    except Exception:
+                        pass
                 return
 
             # Discord limits
@@ -5567,6 +6046,11 @@ class RSForwarderBot:
             except Exception as e:
                 print(f"{Colors.RED}[Repost] Failed to repost in-place for channel {channel_id}: {e}{Colors.RESET}")
                 return
+            if debug:
+                try:
+                    print(f"{Colors.GREEN}[Repost] reposted affiliate-updated message in channel={channel_id}{Colors.RESET}")
+                except Exception:
+                    pass
 
             # Delete original only after repost succeeded.
             delete_original = (channel_config or {}).get("repost_delete_original")
@@ -5577,6 +6061,12 @@ class RSForwarderBot:
                     await message.delete()
                 except Exception as e:
                     print(f"{Colors.YELLOW}[Repost] Reposted but could not delete original: {e}{Colors.RESET}")
+                else:
+                    if debug:
+                        try:
+                            print(f"{Colors.GREEN}[Repost] deleted original message in channel={channel_id}{Colors.RESET}")
+                        except Exception:
+                            pass
         except Exception as e:
             print(f"{Colors.RED}[Repost] Exception: {e}{Colors.RESET}")
     
@@ -5706,7 +6196,7 @@ class RSForwarderBot:
             # ALWAYS set avatar from RS Server icon (for ALL message types)
             # If icon not loaded yet, try to fetch it now
             if not self.rs_icon_url:
-                guild_id = self.config.get("guild_id", 0)
+                guild_id = self._rs_server_guild_id()
                 if guild_id:
                     # Try to get from cached guild first
                     self.rs_guild = self.bot.get_guild(guild_id)
@@ -5753,7 +6243,7 @@ class RSForwarderBot:
                 # Log warning if icon still not available
                 if self.stats['messages_forwarded'] == 0:
                     print(f"{Colors.RED}[Warn] RS Server icon not available - webhook will use default avatar{Colors.RESET}")
-                    print(f"{Colors.YELLOW}[Warn] Check that bot is in RS Server (ID: {self.config.get('guild_id', 0)}){Colors.RESET}")
+                    print(f"{Colors.YELLOW}[Warn] Check that bot is in RS Server (ID: {self._rs_server_guild_id()}){Colors.RESET}")
             
             # Build content with role mention if needed
             # Since we're converting everything to embeds, role mention goes in content before embed

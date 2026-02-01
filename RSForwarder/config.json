@@ -1,5 +1,8 @@
 {
   "guild_id": 876528050081251379,
+  "rs_server_guild_id": 876528050081251379,
+  "test_server_guild_id": 1451275225512546497,
+  "guild_ids": [876528050081251379, 1451275225512546497],
   "brand_name": "Reselling Secrets",
   "affiliate_rewrite_enabled": true,
   "forwarding_logs_channel_id": "1446374766180307015",
@@ -43,6 +46,7 @@
       "repost_affiliate_where_only": true,
       "repost_affiliate_where_marker": "`Where:`",
       "repost_delete_original": true,
+      "repost_debug": true,
       "role_mention": {
         "role_id": "",
         "text": ""
