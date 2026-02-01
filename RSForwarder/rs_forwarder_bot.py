@@ -557,6 +557,25 @@ class RSForwarderBot:
     def _rsfs_key_store_sku(store: str, sku: str) -> str:
         return f"{str(store or '').strip().lower()}|{str(sku or '').strip().lower()}"
 
+    @staticmethod
+    def _rsfs_title_is_bad(title: str, *, url: str = "") -> bool:
+        """
+        Detect cached "titles" that are actually URLs or generic placeholders.
+        If true, we should re-resolve (monitor/website/manual) instead of trusting cache.
+        """
+        t = str(title or "").strip()
+        if not t:
+            return True
+        tl = t.lower()
+        if tl.startswith("http://") or tl.startswith("https://"):
+            return True
+        u = str(url or "").strip()
+        if u and t.strip() == u.strip():
+            return True
+        if tl in {"amazon.com", "amazon", "target", "walmart", "best buy", "bestbuy", "costco", "gamestop"}:
+            return True
+        return False
+
     async def _rsfs_write_current_list(
         self,
         merged_text: str,
@@ -647,14 +666,19 @@ class RSForwarderBot:
                 ov = overrides.get(self._rs_fs_override_key(store, sku_label)) if store and sku_label else None
                 if isinstance(ov, dict) and str(ov.get("url") or "").strip():
                     url = str(ov.get("url") or "").strip()
-                    title = str(ov.get("title") or "").strip() or title or url
+                    # Never use the URL as a title.
+                    ov_t = str(ov.get("title") or "").strip()
+                    if ov_t and not self._rsfs_title_is_bad(ov_t, url=url):
+                        title = ov_t
                     status_bits.append("manual")
                     src = src or "manual"
             # History cache
             if key and not url and key in (history or {}):
                 hrec = history.get(key) or {}
                 url = str(hrec.get("url") or "").strip()
-                title = str(hrec.get("title") or "").strip() or title
+                ht = str(hrec.get("title") or "").strip()
+                if ht and not self._rsfs_title_is_bad(ht, url=url):
+                    title = ht
                 aff = str(hrec.get("affiliate_url") or "").strip()
                 if url or title:
                     status_bits.append("history")
@@ -3628,20 +3652,25 @@ class RSForwarderBot:
                         hrec = (hist or {}).get(key) if key else None
                         if isinstance(hrec, dict) and str(hrec.get("url") or "").strip():
                             u0 = str(hrec.get("url") or "").strip()
-                            t0 = str(hrec.get("title") or "").strip() or u0
+                            t0 = str(hrec.get("title") or "").strip()
                             a0 = str(hrec.get("affiliate_url") or "").strip()
-                            history_hits.append(
-                                rs_fs_sheet_sync.RsFsPreviewEntry(
-                                    store=st,
-                                    sku=sk,
-                                    url=u0,
-                                    title=t0,
-                                    error="",
-                                    source="history",
-                                    monitor_url=u0,
-                                    affiliate_url=a0,
+                            # Only treat as a "history hit" if the cached title looks real.
+                            # If the title is actually a URL (old bad data), re-resolve to fix it.
+                            if not self._rsfs_title_is_bad(t0, url=u0):
+                                history_hits.append(
+                                    rs_fs_sheet_sync.RsFsPreviewEntry(
+                                        store=st,
+                                        sku=sk,
+                                        url=u0,
+                                        title=t0,
+                                        error="",
+                                        source="history",
+                                        monitor_url=u0,
+                                        affiliate_url=a0,
+                                    )
                                 )
-                            )
+                            else:
+                                remaining_pairs_0.append((st, sk))
                         else:
                             remaining_pairs_0.append((st, sk))
 
