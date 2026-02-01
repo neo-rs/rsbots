@@ -19,6 +19,7 @@ import platform
 import subprocess
 import shlex
 import time
+from urllib.parse import urlparse
 
 from RSForwarder import affiliate_rewriter
 from RSForwarder import novnc_stack
@@ -42,6 +43,227 @@ class Colors:
     BLUE = '\033[94m'
     BOLD = '\033[1m'
     RESET = '\033[0m'
+
+
+def _rsfs_embed(
+    title: str,
+    *,
+    status: str = "",
+    description: str = "",
+    color: Optional[discord.Color] = None,
+    fields: Optional[List[Tuple[str, str, bool]]] = None,
+    footer: str = "RS-FS",
+) -> discord.Embed:
+    """
+    Canonical RS-FS embed format for all `!rsfs*` commands.
+    """
+    c = color or discord.Color.dark_teal()
+    emb = discord.Embed(title=title, color=c)
+    if description:
+        emb.description = description
+    if status:
+        emb.add_field(name="Status", value=status, inline=False)
+    for (n, v, inline) in (fields or []):
+        if not n:
+            continue
+        vv = str(v or "").strip() or "—"
+        if len(vv) > 1024:
+            vv = vv[:1021] + "..."
+        emb.add_field(name=str(n), value=vv, inline=bool(inline))
+    if footer:
+        emb.set_footer(text=footer)
+    return emb
+
+
+class _RsFsManualResolveModal(discord.ui.Modal):
+    def __init__(self, view: "_RsFsManualResolveView"):
+        super().__init__(title="RS-FS: Provide store link")
+        self._view = view
+        self.url = discord.ui.TextInput(label="Store URL", placeholder="https://www.walmart.com/ip/...", required=True)
+        self.title_in = discord.ui.TextInput(
+            label="Product title (optional)",
+            placeholder="Leave blank to keep current title",
+            required=False,
+            max_length=200,
+        )
+        self.add_item(self.url)
+        self.add_item(self.title_in)
+
+    async def on_submit(self, interaction: discord.Interaction):  # type: ignore[override]
+        await self._view._handle_modal_submit(interaction, str(self.url.value or ""), str(self.title_in.value or ""))
+
+
+class _RsFsManualResolveView(discord.ui.View):
+    def __init__(self, bot_obj: "RSForwarderBot", ctx, entries: List[rs_fs_sheet_sync.RsFsPreviewEntry]):
+        super().__init__(timeout=900)
+        self._bot = bot_obj
+        self._owner_id = int(getattr(getattr(ctx, "author", None), "id", 0) or 0)
+        self._channel = getattr(ctx, "channel", None)
+        self._items: List[Dict[str, str]] = []
+        for e in entries or []:
+            self._items.append(
+                {
+                    "store": str(getattr(e, "store", "") or ""),
+                    "sku": str(getattr(e, "sku", "") or ""),
+                    "title": str(getattr(e, "title", "") or ""),
+                    "url": str(getattr(e, "monitor_url", "") or getattr(e, "url", "") or ""),
+                    "error": str(getattr(e, "error", "") or ""),
+                    "resolved_url": "",
+                    "resolved_title": "",
+                }
+            )
+        self._idx = 0
+
+    def _current(self) -> Optional[Dict[str, str]]:
+        if 0 <= self._idx < len(self._items):
+            return self._items[self._idx]
+        return None
+
+    def _render_embed(self) -> discord.Embed:
+        it = self._current() or {}
+        store = str(it.get("store") or "").strip()
+        sku = str(it.get("sku") or "").strip()
+        title = str(it.get("title") or "").strip()
+        url = str(it.get("url") or "").strip()
+        err = str(it.get("error") or "").strip()
+        rurl = str(it.get("resolved_url") or "").strip()
+        rtitle = str(it.get("resolved_title") or "").strip()
+        fields: List[Tuple[str, str, bool]] = [
+            ("Item", f"`{self._idx + 1}` / `{len(self._items)}`", True),
+            ("Store / SKU", f"`{store}` / `{sku}`", False),
+        ]
+        if title:
+            fields.append(("Current title", title[:900], False))
+        if url:
+            fields.append(("Current URL", url[:900], False))
+        if err:
+            fields.append(("Reason", err[:500], False))
+        if rurl:
+            fields.append(("Resolved URL", rurl[:900], False))
+        if rtitle:
+            fields.append(("Resolved title", rtitle[:900], False))
+        return _rsfs_embed(
+            "RS-FS Manual Resolve",
+            status="Action required",
+            color=discord.Color.orange(),
+            fields=fields,
+            footer="RS-FS • Provide link saves override and updates sheet",
+        )
+
+    async def _guard(self, interaction: discord.Interaction) -> bool:
+        try:
+            uid = int(getattr(getattr(interaction, "user", None), "id", 0) or 0)
+        except Exception:
+            uid = 0
+        if self._owner_id and uid and uid != self._owner_id:
+            try:
+                await interaction.response.send_message("❌ This resolver session belongs to the command invoker.", ephemeral=True)
+            except Exception:
+                pass
+            return False
+        return True
+
+    async def _handle_modal_submit(self, interaction: discord.Interaction, url: str, title: str) -> None:
+        if not await self._guard(interaction):
+            return
+        it = self._current()
+        if not it:
+            try:
+                await interaction.response.send_message("Done.", ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        u = (url or "").strip()
+        if not (u.startswith("http://") or u.startswith("https://")):
+            try:
+                await interaction.response.send_message("❌ URL must start with http:// or https://", ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        t = (title or "").strip() or (it.get("title") or "").strip() or u
+
+        # Compute affiliate URL (plain) and upsert into sheet immediately.
+        aff = u
+        try:
+            mapped, _notes = await affiliate_rewriter.compute_affiliate_rewrites_plain(self._bot.config, [u])
+            aff = str((mapped or {}).get(u) or u).strip()
+        except Exception:
+            aff = u
+
+        store = str(it.get("store") or "")
+        sku = str(it.get("sku") or "")
+        ok, msg, added, updated = await self._bot._rs_fs_sheet.upsert_rows([[store, sku, t, aff, u]])
+
+        # Persist override
+        try:
+            overrides = self._bot._load_rs_fs_manual_overrides()
+            overrides[self._bot._rs_fs_override_key(store, sku)] = {"url": u, "title": t}
+            self._bot._save_rs_fs_manual_overrides(overrides)
+        except Exception:
+            pass
+
+        it["resolved_url"] = u
+        it["resolved_title"] = t
+
+        try:
+            await interaction.response.send_message(
+                f"✅ Saved. sheet_added={added} sheet_updated={updated}",
+                ephemeral=True,
+            )
+        except Exception:
+            pass
+
+        # Advance to next item
+        self._idx = min(self._idx + 1, len(self._items))
+        try:
+            if interaction.message:
+                await interaction.message.edit(embed=self._render_embed(), view=self if self._idx < len(self._items) else None)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="Provide link", style=discord.ButtonStyle.primary)
+    async def provide_link(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        if not await self._guard(interaction):
+            return
+        if self._idx >= len(self._items):
+            try:
+                await interaction.response.send_message("✅ Nothing left to resolve.", ephemeral=True)
+            except Exception:
+                pass
+            return
+        try:
+            await interaction.response.send_modal(_RsFsManualResolveModal(self))
+        except Exception:
+            try:
+                await interaction.response.send_message("❌ Could not open modal.", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Skip", style=discord.ButtonStyle.secondary)
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        if not await self._guard(interaction):
+            return
+        self._idx = min(self._idx + 1, len(self._items))
+        try:
+            await interaction.response.edit_message(embed=self._render_embed(), view=self if self._idx < len(self._items) else None)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="Finish", style=discord.ButtonStyle.danger)
+    async def finish(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        if not await self._guard(interaction):
+            return
+        for child in self.children:
+            try:
+                child.disabled = True  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        try:
+            await interaction.response.edit_message(embed=self._render_embed(), view=self)
+        except Exception:
+            pass
 
 
 class RSForwarderBot:
@@ -73,6 +295,8 @@ class RSForwarderBot:
         # RS - Full Send List sheet sync (Zephyr release feed -> Google Sheet)
         self._rs_fs_sheet = rs_fs_sheet_sync.RsFsSheetSync(self.config)
         self._rs_fs_seen_message_ids: Set[int] = set()
+        # Guard to prevent concurrent sheet syncs during manual runs (avoids partial-chunk thrash)
+        self._rs_fs_manual_run_in_progress: bool = False
         
         # Validate required config
         if not self.config.get("bot_token"):
@@ -769,6 +993,136 @@ class RSForwarderBot:
                 return name
         return None
 
+    @staticmethod
+    def _normalize_monitor_channel_name(name: str) -> str:
+        """
+        Normalize monitor channel names so we can match:
+          "🤖┃walmart-monitor" -> "walmart-monitor"
+          "walmart-monitor"    -> "walmart-monitor"
+        """
+        import re
+
+        s = (name or "").strip().lower()
+        if not s:
+            return ""
+        s = s.replace("┃", "|").replace("│", "|").replace("丨", "|")
+        parts = [p.strip() for p in re.split(r"[|]+", s) if p.strip()]
+        if parts:
+            s = parts[-1]
+        s = re.sub(r"^[^a-z0-9]+", "", s)
+        return s
+
+    def _rs_fs_monitor_channel_ids(self) -> Dict[str, int]:
+        """
+        Config mapping of monitor channel base-name -> channel_id.
+        Example:
+          {
+            "walmart-monitor": 1411756672891748422,
+            "costco-monitor": 1411757054908960819
+          }
+        """
+        raw = (self.config or {}).get("rs_fs_monitor_channel_ids")
+        if not isinstance(raw, dict):
+            return {}
+        out: Dict[str, int] = {}
+        for k, v in raw.items():
+            key = self._normalize_monitor_channel_name(str(k or ""))
+            if not key:
+                continue
+            try:
+                out[key] = int(v)
+            except Exception:
+                continue
+        return out
+
+    def _rs_fs_manual_overrides_path(self) -> Path:
+        # Runtime JSON (server-side). Not intended to be committed.
+        return (Path(__file__).resolve().parent / "rs_fs_manual_overrides.json").resolve()
+
+    @staticmethod
+    def _rs_fs_override_key(store: str, sku: str) -> str:
+        return f"{(store or '').strip().lower()}|{(sku or '').strip().lower()}"
+
+    def _load_rs_fs_manual_overrides(self) -> Dict[str, Dict[str, str]]:
+        """
+        Load manual overrides: key "store|sku" -> {"url": "...", "title": "..."}.
+        """
+        try:
+            p = self._rs_fs_manual_overrides_path()
+            if not p.exists():
+                return {}
+            obj = json.loads(p.read_text(encoding="utf-8", errors="replace") or "{}")
+            if not isinstance(obj, dict):
+                return {}
+            out: Dict[str, Dict[str, str]] = {}
+            for k, v in obj.items():
+                if not isinstance(k, str):
+                    continue
+                if not isinstance(v, dict):
+                    continue
+                url = str(v.get("url") or "").strip()
+                title = str(v.get("title") or "").strip()
+                if not url:
+                    continue
+                out[str(k).strip().lower()] = {"url": url, "title": title}
+            return out
+        except Exception:
+            return {}
+
+    def _save_rs_fs_manual_overrides(self, overrides: Dict[str, Dict[str, str]]) -> bool:
+        try:
+            p = self._rs_fs_manual_overrides_path()
+            tmp = dict(overrides or {})
+            p.write_text(json.dumps(tmp, ensure_ascii=False, indent=2), encoding="utf-8")
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _preferred_store_domains(store: str) -> List[str]:
+        s = (store or "").strip().lower()
+        if "walmart" in s:
+            return ["walmart.com"]
+        if "costco" in s:
+            return ["costco.com"]
+        if "target" in s:
+            return ["target.com"]
+        if "gamestop" in s:
+            return ["gamestop.com"]
+        if "bestbuy" in s or "best buy" in s:
+            return ["bestbuy.com"]
+        if "homedepot" in s or "home depot" in s:
+            return ["homedepot.com"]
+        if "amazon" in s:
+            return ["amazon."]
+        if "topps" in s:
+            return ["topps.com"]
+        return []
+
+    async def _resolve_monitor_channel_for_store(
+        self,
+        store: str,
+        *,
+        guild: Optional[discord.Guild] = None,
+    ) -> Optional[discord.TextChannel]:
+        """
+        Resolve a monitor channel for this store.
+        Preference:
+          1) explicit channel_id mapping in config (rs_fs_monitor_channel_ids)
+          2) name-based resolution fallback
+        """
+        ch_name = self._monitor_channel_name_for_store(store)
+        if not ch_name:
+            return None
+        base = self._normalize_monitor_channel_name(ch_name)
+        cid = (self._rs_fs_monitor_channel_ids() or {}).get(base)
+        if cid:
+            ch = await self._resolve_channel_by_id(int(cid))
+            if isinstance(ch, discord.TextChannel):
+                return ch
+        # Fallback: name match (handles emoji prefixes too)
+        return await self._resolve_text_channel_by_name(ch_name, guild=guild)
+
     async def _resolve_text_channel_by_name(self, name: str, *, guild: Optional[discord.Guild] = None) -> Optional[discord.TextChannel]:
         """
         Resolve a text channel by name.
@@ -787,7 +1141,13 @@ class RSForwarderBot:
                 return None
             try:
                 for ch in getattr(g, "text_channels", []) or []:
-                    if str(getattr(ch, "name", "") or "").strip().lower() == target:
+                    raw = str(getattr(ch, "name", "") or "").strip().lower()
+                    if not raw:
+                        continue
+                    if raw == target:
+                        return ch
+                    nrm = self._normalize_monitor_channel_name(raw)
+                    if nrm == target or nrm.endswith(target):
                         return ch
             except Exception:
                 return None
@@ -851,8 +1211,13 @@ class RSForwarderBot:
         ch_name = self._monitor_channel_name_for_store(store)
         if not ch_name:
             return None
-        ch = await self._resolve_text_channel_by_name(ch_name, guild=guild)
+        ch = await self._resolve_monitor_channel_for_store(store, guild=guild)
         if not ch:
+            try:
+                if bool((self.config or {}).get("rs_fs_monitor_debug")):
+                    print(f"{Colors.YELLOW}[RS-FS Monitor]{Colors.RESET} channel not found for store={store!r} wanted_name={ch_name!r}")
+            except Exception:
+                pass
             return None
 
         target = self._clean_sku_text(sku)
@@ -904,23 +1269,51 @@ class RSForwarderBot:
             return False
 
         limit = self._rs_fs_monitor_history_limit()
+        debug_enabled = False
+        try:
+            debug_enabled = bool((self.config or {}).get("rs_fs_monitor_debug"))
+        except Exception:
+            debug_enabled = False
+        scanned_msgs = 0
+        scanned_embeds = 0
         try:
             async for m in ch.history(limit=limit):
+                scanned_msgs += 1
                 embeds = getattr(m, "embeds", None) or []
                 for e in embeds:
+                    scanned_embeds += 1
                     fields = getattr(e, "fields", None) or []
 
                     def _extract_title_url() -> Tuple[str, str]:
                         title = str(getattr(e, "title", "") or "").strip()
-                        url = str(getattr(e, "url", "") or "").strip()
+                        urls: List[str] = []
+                        u0 = str(getattr(e, "url", "") or "").strip()
+                        if u0:
+                            urls.append(u0)
+                        # Pull URLs from any field values
+                        for f2 in fields:
+                            vv = str(getattr(f2, "value", "") or "")
+                            uu = self._first_url_in_text(vv)
+                            if uu:
+                                urls.append(uu)
+                        dd = str(getattr(e, "description", "") or "")
+                        uu2 = self._first_url_in_text(dd)
+                        if uu2:
+                            urls.append(uu2)
+
+                        # Prefer store-domain URLs when possible
+                        preferred = self._preferred_store_domains(store)
+                        url = ""
+                        for u in urls:
+                            try:
+                                host = (urlparse(u).netloc or "").lower()
+                            except Exception:
+                                host = ""
+                            if any(d in host for d in preferred):
+                                url = u
+                                break
                         if not url:
-                            # Try pull first URL from any field values
-                            for f2 in fields:
-                                url = self._first_url_in_text(str(getattr(f2, "value", "") or ""))
-                                if url:
-                                    break
-                        if not url:
-                            url = self._first_url_in_text(str(getattr(e, "description", "") or ""))
+                            url = (urls[0] if urls else "").strip()
                         if not title:
                             title = url or ""
                         return title, url
@@ -935,6 +1328,21 @@ class RSForwarderBot:
                             continue
                         if _value_matches_target(val):
                             title, url = _extract_title_url()
+                            if debug_enabled:
+                                try:
+                                    g_id = int(getattr(getattr(ch, "guild", None), "id", 0) or 0)
+                                    jump = (
+                                        f"https://discord.com/channels/{g_id}/{int(getattr(ch,'id',0) or 0)}/{int(getattr(m,'id',0) or 0)}"
+                                        if g_id and int(getattr(ch,'id',0) or 0) and int(getattr(m,'id',0) or 0)
+                                        else ""
+                                    )
+                                    print(
+                                        f"{Colors.CYAN}[RS-FS Monitor]{Colors.RESET} HIT store={store} sku={sku} "
+                                        f"channel={getattr(ch,'name',ch_name)} method=field name={name!r} scanned_msgs={scanned_msgs} scanned_embeds={scanned_embeds}"
+                                        + (f" jump={jump}" if jump else "")
+                                    )
+                                except Exception:
+                                    pass
                             return rs_fs_sheet_sync.RsFsPreviewEntry(
                                 store=store,
                                 sku=sku,
@@ -956,6 +1364,21 @@ class RSForwarderBot:
                             continue
                         if _value_matches_target(val):
                             title, url = _extract_title_url()
+                            if debug_enabled:
+                                try:
+                                    g_id = int(getattr(getattr(ch, "guild", None), "id", 0) or 0)
+                                    jump = (
+                                        f"https://discord.com/channels/{g_id}/{int(getattr(ch,'id',0) or 0)}/{int(getattr(m,'id',0) or 0)}"
+                                        if g_id and int(getattr(ch,'id',0) or 0) and int(getattr(m,'id',0) or 0)
+                                        else ""
+                                    )
+                                    print(
+                                        f"{Colors.CYAN}[RS-FS Monitor]{Colors.RESET} HIT store={store} sku={sku} "
+                                        f"channel={getattr(ch,'name',ch_name)} method=any_value scanned_msgs={scanned_msgs} scanned_embeds={scanned_embeds}"
+                                        + (f" jump={jump}" if jump else "")
+                                    )
+                                except Exception:
+                                    pass
                             return rs_fs_sheet_sync.RsFsPreviewEntry(
                                 store=store,
                                 sku=sku,
@@ -982,6 +1405,21 @@ class RSForwarderBot:
                             url = self._first_url_in_text(blob)
                         if not title:
                             title = url or ""
+                        if debug_enabled:
+                            try:
+                                g_id = int(getattr(getattr(ch, "guild", None), "id", 0) or 0)
+                                jump = (
+                                    f"https://discord.com/channels/{g_id}/{int(getattr(ch,'id',0) or 0)}/{int(getattr(m,'id',0) or 0)}"
+                                    if g_id and int(getattr(ch,'id',0) or 0) and int(getattr(m,'id',0) or 0)
+                                    else ""
+                                )
+                                print(
+                                    f"{Colors.CYAN}[RS-FS Monitor]{Colors.RESET} HIT store={store} sku={sku} "
+                                    f"channel={getattr(ch,'name',ch_name)} method=blob scanned_msgs={scanned_msgs} scanned_embeds={scanned_embeds}"
+                                    + (f" jump={jump}" if jump else "")
+                                )
+                            except Exception:
+                                pass
                         return rs_fs_sheet_sync.RsFsPreviewEntry(
                             store=store,
                             sku=sku,
@@ -994,6 +1432,14 @@ class RSForwarderBot:
                         )
         except Exception:
             return None
+        if debug_enabled:
+            try:
+                print(
+                    f"{Colors.YELLOW}[RS-FS Monitor]{Colors.RESET} MISS store={store} sku={sku} "
+                    f"channel={getattr(ch,'name',ch_name)} scanned_msgs={scanned_msgs} scanned_embeds={scanned_embeds} limit={limit}"
+                )
+            except Exception:
+                pass
         return None
 
     def _collect_embed_text(self, message: discord.Message) -> str:
@@ -1072,6 +1518,11 @@ class RSForwarderBot:
             if int(getattr(message.channel, "id", 0) or 0) != int(target_ch):
                 return
 
+            # If a manual rsfsrun is in progress, do not process live Zephyr messages here.
+            # Manual runs build a single merged list and sync once (prevents add/remove thrash).
+            if bool(getattr(self, "_rs_fs_manual_run_in_progress", False)):
+                return
+
             # Debug: confirm we are seeing messages in the target channel.
             try:
                 embeds_n = len(message.embeds or [])
@@ -1143,16 +1594,6 @@ class RSForwarderBot:
                 dry_run = False
             dry_run = bool(dry_run or test_enabled)
 
-            # Sheet sync mode:
-            # - append: add only new SKUs (default, safe for chunked messages)
-            # - mirror: make sheet match the full list (ONLY safe when we have the full list, e.g. `!rsfsrun`)
-            try:
-                sync_mode = str((self.config or {}).get("rs_fs_sheet_sync_mode") or "append").strip().lower()
-            except Exception:
-                sync_mode = "append"
-            if sync_mode not in {"append", "mirror"}:
-                sync_mode = "append"
-
             try:
                 limit = int((self.config or {}).get("rs_fs_sheet_test_limit") or 25)
             except Exception:
@@ -1191,16 +1632,33 @@ class RSForwarderBot:
                     out_ch = None
                 if out_ch and hasattr(out_ch, "send"):
                     title = "RS-FS Preview (dry-run)" if sheet_enabled else "RS-FS Preview (no-sheet)"
-                    header = discord.Embed(title=title, color=discord.Color.blurple())
-                    header.description = (
-                        f"Parsed `{len(pairs)}` item(s). Fetching titles for up to `{min(len(pairs), limit)}`…\n"
-                        "(No Google Sheet writes.)"
+                    await out_ch.send(
+                        embed=_rsfs_embed(
+                            title,
+                            status="Running",
+                            color=discord.Color.blurple(),
+                            description="(No Google Sheet writes.)",
+                            fields=[
+                                ("Parsed", str(len(pairs)), True),
+                                ("Will process", str(min(len(pairs), limit)), True),
+                            ],
+                            footer="RS-FS",
+                        ),
+                        allowed_mentions=discord.AllowedMentions.none(),
                     )
-                    await out_ch.send(embed=header, allowed_mentions=discord.AllowedMentions.none())
                     if progress_enabled:
                         try:
                             progress_msg = await out_ch.send(
-                                f"RS-FS progress: {self._format_progress_bar(0, min(len(pairs), limit))} | errors: 0",
+                                embed=_rsfs_embed(
+                                    "RS-FS Progress",
+                                    status="Running",
+                                    fields=[
+                                        ("Stage", "resolve", True),
+                                        ("Progress", self._format_progress_bar(0, min(len(pairs), limit)), False),
+                                        ("Errors", "0", True),
+                                    ],
+                                    footer="RS-FS",
+                                ),
                                 allowed_mentions=discord.AllowedMentions.none(),
                             )
                         except Exception:
@@ -1226,7 +1684,17 @@ class RSForwarderBot:
                     except Exception:
                         last = ""
                     await progress_msg.edit(
-                        content=f"RS-FS progress: {self._format_progress_bar(done, total)} | errors: {errors}{last}"
+                        embed=_rsfs_embed(
+                            "RS-FS Progress",
+                            status="Running",
+                            fields=[
+                                ("Stage", "resolve", True),
+                                ("Progress", self._format_progress_bar(done, total), False),
+                                ("Errors", str(errors), True),
+                                ("Last", last or "—", False),
+                            ],
+                            footer="RS-FS",
+                        )
                     )
                 except Exception:
                     return
@@ -1234,7 +1702,7 @@ class RSForwarderBot:
             # Prefer items where we can build a URL (so small limits like 1 still show something useful).
             try:
                 # If we're actually writing to the sheet, pre-dedupe first (saves work).
-                if sheet_enabled and (not dry_run) and sync_mode != "mirror":
+                if sheet_enabled and (not dry_run):
                     try:
                         pairs = await self._rs_fs_sheet.filter_new_pairs(list(pairs or []))
                     except Exception:
@@ -1381,19 +1849,32 @@ class RSForwarderBot:
                             elapsed = time.monotonic() - started
                             err_count = sum(1 for e in raw_entries if (e.error or "").strip())
                             await progress_msg.edit(
-                                content=f"RS-FS progress: ✅ done {total_show}/{total_show} in {elapsed:.1f}s | errors: {err_count}"
+                                embed=_rsfs_embed(
+                                    "RS-FS Progress",
+                                    status="✅ done",
+                                    color=discord.Color.green(),
+                                    fields=[
+                                        ("Progress", f"`{total_show}/{total_show}` in `{elapsed:.1f}s`", False),
+                                        ("Errors", str(err_count), True),
+                                    ],
+                                    footer="RS-FS",
+                                )
                             )
                         except Exception:
                             pass
-                    done = discord.Embed(
-                        title="RS-FS Preview (results)",
-                        description=(
-                            f"Showing `{len(entries)}` item(s)."
-                            + (f" (skipped `{skipped_no_url}` with no URL)" if skipped_no_url else "")
+                    await out_ch.send(
+                        embed=_rsfs_embed(
+                            "RS-FS Preview (results)",
+                            status="Complete",
+                            fields=[
+                                ("Showing", str(len(entries)), True),
+                                ("Skipped (no URL)", str(skipped_no_url), True),
+                            ],
+                            color=discord.Color.dark_teal(),
+                            footer="RS-FS",
                         ),
-                        color=discord.Color.dark_teal(),
+                        allowed_mentions=discord.AllowedMentions.none(),
                     )
-                    await out_ch.send(embed=done, allowed_mentions=discord.AllowedMentions.none())
 
                     chunk: List[rs_fs_sheet_sync.RsFsPreviewEntry] = []
                     for e in entries:
@@ -1407,14 +1888,9 @@ class RSForwarderBot:
                     print(f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Cannot resolve output channel id={out_ch_id} for results send")
 
             ok, msg, added = True, "dry-run", 0
-            updated = 0
-            deleted = 0
             if (not dry_run) and sheet_enabled:
                 rows = [[e.store, e.sku, e.title, e.affiliate_url, e.monitor_url] for e in entries]
-                if sync_mode == "mirror":
-                    ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(rows)
-                else:
-                    ok, msg, added = await self._rs_fs_sheet.append_rows(rows)
+                ok, msg, added = await self._rs_fs_sheet.append_rows(rows)
 
                 # Optional status output
                 try:
@@ -1422,12 +1898,7 @@ class RSForwarderBot:
                     if status_ch_raw:
                         sch = await self._resolve_channel_by_id(int(status_ch_raw))
                         if sch and hasattr(sch, "send"):
-                            if ok and sync_mode == "mirror":
-                                await sch.send(
-                                    f"RS-FS Sheet (mirror): ✅ added {added}, updated {updated}, removed {deleted}.",
-                                    allowed_mentions=discord.AllowedMentions.none(),
-                                )
-                            elif ok and added > 0:
+                            if ok and added > 0:
                                 await sch.send(f"RS-FS Sheet: ✅ added {added} row(s).", allowed_mentions=discord.AllowedMentions.none())
                             elif not ok:
                                 await sch.send(f"RS-FS Sheet: ❌ {msg}", allowed_mentions=discord.AllowedMentions.none())
@@ -1457,7 +1928,7 @@ class RSForwarderBot:
 
     async def _send_rs_fs_preview_embed(self, channel: discord.abc.Messageable, entries: List[rs_fs_sheet_sync.RsFsPreviewEntry]) -> None:
         try:
-            emb = discord.Embed(color=discord.Color.dark_teal())
+            emb = discord.Embed(title="RS-FS Results", color=discord.Color.dark_teal())
             for e in entries:
                 name = f"{e.store} | {e.sku}".strip()
                 if len(name) > 256:
@@ -2192,7 +2663,15 @@ class RSForwarderBot:
             st_in = (store or "").strip()
             sk_in = (sku or "").strip()
             if not (st_in and sk_in):
-                await ctx.send("❌ Usage: `!rsfstestsku <store> <sku>` (example: `!rsfstestsku gamestop 20023800`)")
+                await ctx.send(
+                    embed=_rsfs_embed(
+                        "RS-FS Test SKU",
+                        status="❌ missing args",
+                        description="Usage: `!rsfstestsku <store> <sku>` (example: `!rsfstestsku gamestop 20023800`)",
+                        color=discord.Color.red(),
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
                 return
 
             # Ensure we output to the invoking channel for this test.
@@ -2205,57 +2684,135 @@ class RSForwarderBot:
                 pass
 
             out_ch = ctx.channel
-            await ctx.send(f"✅ RS-FS dry-run for `{st_in}` / `{sk_in}`… (monitor lookup first, then website fallback)")
+            await ctx.send(
+                embed=_rsfs_embed(
+                    "RS-FS Test SKU",
+                    status="Running",
+                    fields=[
+                        ("Store", f"`{st_in}`", True),
+                        ("SKU", f"`{sk_in}`", True),
+                        ("Mode", "monitor → website", True),
+                    ],
+                ),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
 
-            # Progress message
-            progress_msg = None
+            # Make monitor lookup verbose for this command (journald + clearer behavior).
+            prev_dbg = (self.config or {}).get("rs_fs_monitor_debug")
+            prev_hist = (self.config or {}).get("rs_fs_monitor_lookup_history_limit")
             try:
-                progress_msg = await out_ch.send(
-                    f"RS-FS progress: {self._format_progress_bar(0, 1)} | errors: 0",
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            except Exception:
-                progress_msg = None
-
-            # Stage 1: monitor lookup
-            entry = None
-            try:
-                entry = await self._monitor_lookup_for_store(st_in, sk_in, guild=getattr(ctx, "guild", None))
-            except Exception:
-                entry = None
-
-            if entry is None:
-                # Stage 2: website fallback
+                self.config["rs_fs_monitor_debug"] = True
                 try:
-                    if progress_msg:
-                        await progress_msg.edit(content=f"RS-FS progress: {self._format_progress_bar(0, 1)} | errors: 0 | stage: website")
+                    self.config["rs_fs_monitor_lookup_history_limit"] = max(int(prev_hist or 0), 2000)
                 except Exception:
-                    pass
-                try:
-                    web_entries = await rs_fs_sheet_sync.build_preview_entries([(st_in, sk_in)], self.config)
-                    entry = web_entries[0] if web_entries else None
-                except Exception as e:
-                    entry = rs_fs_sheet_sync.RsFsPreviewEntry(
-                        store=st_in,
-                        sku=sk_in,
-                        url=rs_fs_sheet_sync.build_store_link(st_in, sk_in),
-                        title="",
-                        error=str(e)[:200],
-                        source="website",
+                    self.config["rs_fs_monitor_lookup_history_limit"] = 2000
+            except Exception:
+                pass
+
+            # Show which monitor channel we will use (name resolution is a common failure mode).
+            try:
+                ch_name = self._monitor_channel_name_for_store(st_in) or ""
+                ch_hit = await self._resolve_monitor_channel_for_store(st_in, guild=getattr(ctx, "guild", None)) if ch_name else None
+                if ch_hit:
+                    await ctx.send(
+                        embed=_rsfs_embed(
+                            "RS-FS Test SKU",
+                            status="Monitor channel resolved",
+                            fields=[("Channel", f"#{getattr(ch_hit,'name','')} (`{getattr(ch_hit,'id','')}`)", False)],
+                        ),
+                        allowed_mentions=discord.AllowedMentions.none(),
                     )
+                else:
+                    await ctx.send(
+                        embed=_rsfs_embed(
+                            "RS-FS Test SKU",
+                            status="⚠️ monitor channel not found",
+                            color=discord.Color.orange(),
+                            fields=[("Expected", f"`{ch_name}`", True)],
+                        ),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+            except Exception:
+                pass
 
-            if progress_msg:
+            try:
+
+                # Progress message
+                progress_msg = None
                 try:
-                    err_count = 1 if (entry and (entry.error or "").strip()) else 0
-                    await progress_msg.edit(content=f"RS-FS progress: ✅ done 1/1 | errors: {err_count}")
+                    progress_msg = await out_ch.send(
+                        f"RS-FS progress: {self._format_progress_bar(0, 1)} | errors: 0",
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except Exception:
+                    progress_msg = None
+
+                # Stage 1: monitor lookup
+                entry = None
+                try:
+                    entry = await self._monitor_lookup_for_store(st_in, sk_in, guild=getattr(ctx, "guild", None))
+                except Exception:
+                    entry = None
+
+                if entry is None:
+                    try:
+                        await ctx.send(
+                            embed=_rsfs_embed(
+                                "RS-FS Test SKU",
+                                status="Monitor MISS → website fallback",
+                                color=discord.Color.orange(),
+                            ),
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    except Exception:
+                        pass
+                    # Stage 2: website fallback
+                    try:
+                        if progress_msg:
+                            await progress_msg.edit(content=f"RS-FS progress: {self._format_progress_bar(0, 1)} | errors: 0 | stage: website")
+                    except Exception:
+                        pass
+                    try:
+                        web_entries = await rs_fs_sheet_sync.build_preview_entries([(st_in, sk_in)], self.config)
+                        entry = web_entries[0] if web_entries else None
+                    except Exception as e:
+                        entry = rs_fs_sheet_sync.RsFsPreviewEntry(
+                            store=st_in,
+                            sku=sk_in,
+                            url=rs_fs_sheet_sync.build_store_link(st_in, sk_in),
+                            title="",
+                            error=str(e)[:200],
+                            source="website",
+                        )
+
+                if progress_msg:
+                    try:
+                        err_count = 1 if (entry and (entry.error or "").strip()) else 0
+                        await progress_msg.edit(content=f"RS-FS progress: ✅ done 1/1 | errors: {err_count}")
+                    except Exception:
+                        pass
+
+                if not entry:
+                    await ctx.send(
+                        embed=_rsfs_embed("RS-FS Test SKU", status="❌ no result", color=discord.Color.red()),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return
+
+                await self._send_rs_fs_preview_embed(out_ch, [entry])
+            finally:
+                try:
+                    # Restore debug knobs
+                    if prev_dbg is None:
+                        (self.config or {}).pop("rs_fs_monitor_debug", None)
+                    else:
+                        self.config["rs_fs_monitor_debug"] = prev_dbg
+                    if prev_hist is None:
+                        (self.config or {}).pop("rs_fs_monitor_lookup_history_limit", None)
+                    else:
+                        self.config["rs_fs_monitor_lookup_history_limit"] = prev_hist
                 except Exception:
                     pass
-
-            if not entry:
-                await ctx.send("RS-FS: ❌ No result.")
-                return
-
-            await self._send_rs_fs_preview_embed(out_ch, [entry])
 
         @self.bot.command(name="rsfscheck", aliases=["fscheck", "rsfsstatus"])
         async def rsfs_check(ctx):
@@ -2264,23 +2821,61 @@ class RSForwarderBot:
             """
             try:
                 if not getattr(self, "_rs_fs_sheet", None):
-                    await ctx.send("❌ RS-FS sheet sync not initialized.")
+                    await ctx.send(
+                        embed=_rsfs_embed(
+                            "RS-FS Check",
+                            status="❌ not initialized",
+                            color=discord.Color.red(),
+                        ),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
                     return
                 ok, msg, tab, n = await self._rs_fs_sheet.preflight()
                 sid = str((self.config or {}).get("rs_fs_sheet_spreadsheet_id") or "").strip()
                 gid = str((self.config or {}).get("rs_fs_sheet_tab_gid") or "").strip()
                 if ok:
-                    await ctx.send(f"✅ RS-FS sheet OK. spreadsheet_id=`{sid}` tab=`{tab}` (gid={gid}) existing_skus≈{n}")
+                    await ctx.send(
+                        embed=_rsfs_embed(
+                            "RS-FS Check",
+                            status="✅ OK",
+                            color=discord.Color.green(),
+                            fields=[
+                                ("Spreadsheet", f"`{sid}`", False),
+                                ("Tab", f"`{tab}` (gid={gid})", False),
+                                ("Existing SKUs", str(n), True),
+                            ],
+                        ),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
                 else:
                     extra = ""
                     try:
                         extra = (self._rs_fs_sheet.last_service_error() or "").strip()
                     except Exception:
                         extra = ""
-                    hint = f" ({extra})" if extra and extra not in msg else ""
-                    await ctx.send(f"❌ RS-FS sheet NOT ready: {msg}{hint}. spreadsheet_id=`{sid}` tab_gid=`{gid}`")
+                    hint = f"{extra}".strip()
+                    await ctx.send(
+                        embed=_rsfs_embed(
+                            "RS-FS Check",
+                            status=f"❌ NOT ready: {msg}",
+                            color=discord.Color.red(),
+                            fields=[
+                                ("Spreadsheet", f"`{sid}`", False),
+                                ("Tab GID", f"`{gid}`", True),
+                                ("Details", hint or "—", False),
+                            ],
+                        ),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
             except Exception as e:
-                await ctx.send(f"❌ RS-FS check failed: {str(e)[:200]}")
+                await ctx.send(
+                    embed=_rsfs_embed(
+                        "RS-FS Check",
+                        status=f"❌ failed: {str(e)[:200]}",
+                        color=discord.Color.red(),
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
 
         @self.bot.command(name="rsfsrun", aliases=["rsfslive", "rsfswrite"])
         async def rsfs_run(ctx, limit: str = "120"):
@@ -2309,64 +2904,512 @@ class RSForwarderBot:
                     await ctx.send(f"❌ Could not access Zephyr channel `{ch_id}` (no permission or not found).")
                     return
 
-                await ctx.send(f"✅ Running RS-FS LIVE sync from <#{ch_id}> (max={lim})… this will write to the sheet.")
-
-                # Collect recent Zephyr chunks and merge (Zephyr often splits across multiple messages).
-                merged_text_parts: List[str] = []
+                # Single merged-run, single mirror sync.
+                # Prevent live Zephyr message chunks from also being processed while we run.
+                prev_manual = bool(getattr(self, "_rs_fs_manual_run_in_progress", False))
+                self._rs_fs_manual_run_in_progress = True
+                prev_hist = None
                 try:
-                    async for m in ch.history(limit=240):
-                        if not (getattr(m, "embeds", None) or []) and not (getattr(m, "content", None) or ""):
-                            continue
-                        t = self._collect_embed_text(m)
-                        if not t:
-                            continue
-                        if zephyr_release_feed_parser.looks_like_release_feed_embed_text(t):
-                            merged_text_parts.append(t)
-                        if len(merged_text_parts) >= 20:
-                            break
-                except Exception:
-                    merged_text_parts = []
+                    await ctx.send(f"✅ Running RS-FS LIVE mirror sync from <#{ch_id}> (max={lim})…")
 
-                if not merged_text_parts:
-                    await ctx.send("❌ Could not find recent Zephyr `Release Feed(s)` embed chunks in that channel.")
-                    return
+                    def _progress_embed(stage: str, done: int, total: int, *, monitor_hits: int = 0, remaining: int = 0, web_errors: int = 0) -> discord.Embed:
+                        emb = discord.Embed(title="RS-FS Live Sync", color=discord.Color.dark_teal())
+                        emb.add_field(name="Stage", value=stage or "…", inline=False)
+                        emb.add_field(name="Progress", value=self._format_progress_bar(done, total), inline=False)
+                        emb.add_field(name="Monitor hits", value=str(int(monitor_hits)), inline=True)
+                        emb.add_field(name="Remaining", value=str(int(remaining)), inline=True)
+                        if web_errors:
+                            emb.add_field(name="Website errors", value=str(int(web_errors)), inline=True)
+                        emb.set_footer(text="This message updates live.")
+                        return emb
 
-                # Temporarily force live mode + set max per run; also post status into the invoking channel.
-                prev_dry = bool((self.config or {}).get("rs_fs_sheet_dry_run", False))
-                prev_test = bool((self.config or {}).get("rs_fs_sheet_test_output_enabled", False))
-                prev_max = int((self.config or {}).get("rs_fs_sheet_max_per_run") or 250)
-                prev_status = str((self.config or {}).get("rs_fs_sheet_status_channel_id") or "").strip()
-                prev_mode = str((self.config or {}).get("rs_fs_sheet_sync_mode") or "append").strip()
-                try:
-                    self.config["rs_fs_sheet_dry_run"] = False
-                    self.config["rs_fs_sheet_test_output_enabled"] = False
-                    self.config["rs_fs_sheet_max_per_run"] = lim
-                    self.config["rs_fs_sheet_status_channel_id"] = str(getattr(ctx.channel, "id", "") or "")
-                    # Mirror mode: make the sheet match the full list (adds/updates/removes).
-                    self.config["rs_fs_sheet_sync_mode"] = "mirror"
-
-                    class _Shim:
-                        def __init__(self, channel, text: str):
-                            self.channel = channel
-                            self.id = int(time.time() * 1000)
-                            self.author = ctx.author
-                            self.content = text
-                            self.embeds = []
-
-                    shim = _Shim(ch, "\n".join(reversed(merged_text_parts)))
-                    await self._maybe_sync_rs_fs_sheet_from_message(shim)  # type: ignore[arg-type]
-                    await ctx.send("✅ RS-FS LIVE sync finished. Check the sheet (and this channel for the added-row count).")
-                finally:
+                    progress_msg = None
                     try:
-                        self.config["rs_fs_sheet_dry_run"] = prev_dry
-                        self.config["rs_fs_sheet_test_output_enabled"] = prev_test
-                        self.config["rs_fs_sheet_max_per_run"] = prev_max
-                        self.config["rs_fs_sheet_status_channel_id"] = prev_status
-                        self.config["rs_fs_sheet_sync_mode"] = prev_mode
+                        progress_msg = await ctx.send(
+                            embed=_progress_embed("collect", 0, lim),
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    except Exception:
+                        progress_msg = None
+
+                    # Collect the most recent listreleases run.
+                    merged_text_parts: List[str] = []
+                    found_header = False
+                    try:
+                        async for m in ch.history(limit=350):
+                            if not (getattr(m, "embeds", None) or []) and not (getattr(m, "content", None) or ""):
+                                continue
+                            t = self._collect_embed_text(m)
+                            if not t:
+                                continue
+                            if not zephyr_release_feed_parser.looks_like_release_feed_embed_text(t):
+                                continue
+                            merged_text_parts.append(t)
+                            if "release feed" in t.lower():
+                                found_header = True
+                                break
+                            if len(merged_text_parts) >= 30:
+                                break
+                    except Exception:
+                        merged_text_parts = []
+
+                    if not merged_text_parts:
+                        await ctx.send("❌ Could not find recent Zephyr `Release Feed(s)` embed chunks in that channel.")
+                        return
+
+                    merged_text = "\n".join(reversed(merged_text_parts))
+                    pairs = zephyr_release_feed_parser.parse_release_feed_pairs(merged_text)
+                    if not pairs:
+                        await ctx.send("❌ Parsed 0 items from the merged Zephyr text.")
+                        return
+
+                    # Limit to the requested max (preserve order).
+                    pairs = list(pairs)[:lim]
+                    total = len(pairs)
+
+                    if progress_msg:
+                        try:
+                            await progress_msg.edit(embed=_progress_embed("resolve (monitor first)", 0, total))
+                        except Exception:
+                            pass
+
+                    # Apply manual overrides (persisted runtime JSON). These bypass monitor/website scanning.
+                    overrides = self._load_rs_fs_manual_overrides()
+                    manual_hits: List[rs_fs_sheet_sync.RsFsPreviewEntry] = []
+                    remaining_pairs: List[Tuple[str, str]] = []
+                    for st, sk in (pairs or []):
+                        k = self._rs_fs_override_key(st, sk)
+                        ov = (overrides or {}).get(k)
+                        if isinstance(ov, dict) and str(ov.get("url") or "").strip():
+                            u0 = str(ov.get("url") or "").strip()
+                            t0 = str(ov.get("title") or "").strip() or u0
+                            manual_hits.append(
+                                rs_fs_sheet_sync.RsFsPreviewEntry(
+                                    store=st,
+                                    sku=sk,
+                                    url=u0,
+                                    title=t0,
+                                    error="",
+                                    source="manual",
+                                    monitor_url=u0,
+                                    affiliate_url="",
+                                )
+                            )
+                        else:
+                            remaining_pairs.append((st, sk))
+                    pairs = remaining_pairs
+                    total = len(remaining_pairs) + len(manual_hits)
+                    if progress_msg:
+                        try:
+                            await progress_msg.edit(
+                                embed=_progress_embed(
+                                    "resolve (monitor first)",
+                                    len(manual_hits),
+                                    total,
+                                    monitor_hits=len(manual_hits),
+                                    remaining=len(remaining_pairs),
+                                )
+                            )
+                        except Exception:
+                            pass
+
+                    # Temporarily increase monitor lookup history (improves hit rate; reduces website scraping).
+                    prev_hist = (self.config or {}).get("rs_fs_monitor_lookup_history_limit")
+                    try:
+                        self.config["rs_fs_monitor_lookup_history_limit"] = max(int(prev_hist or 0), 600)
+                    except Exception:
+                        self.config["rs_fs_monitor_lookup_history_limit"] = 600
+
+                    # Stage 1: monitor lookup (manual overrides count as hits)
+                    monitor_hits: List[rs_fs_sheet_sync.RsFsPreviewEntry] = list(manual_hits)
+                    remaining: List[Tuple[str, str]] = []
+                    g_obj = getattr(ch, "guild", None)
+                    done = 0
+                    errors = 0
+                    # Build per-channel index once (avoid scanning history per SKU).
+                    monitor_cache: Dict[str, Tuple[Optional[discord.TextChannel], Dict[str, Tuple[str, str]]]] = {}
+
+                    import re as _re
+
+                    def _id_like_field_name(name: str) -> bool:
+                        n = (name or "").strip().lower()
+                        if not n:
+                            return False
+                        hints = ("sku", "pid", "tcin", "asin", "upc", "item", "product", "model", "mpn", "id")
+                        return any(h in n for h in hints)
+
+                    async def _build_index(ch2: discord.TextChannel, *, limit_n: int) -> Dict[str, Tuple[str, str]]:
+                        idx: Dict[str, Tuple[str, str]] = {}
+                        base_name = self._normalize_monitor_channel_name(str(getattr(ch2, "name", "") or ""))
+                        preferred_domains = self._preferred_store_domains(base_name)
+
+                        def _all_urls(text: str) -> List[str]:
+                            try:
+                                return [u.strip() for u in _re.findall(r"(https?://[^\\s<>()]+)", text or "") if u.strip()]
+                            except Exception:
+                                return []
+
+                        def _pick_url(cands: List[str]) -> str:
+                            if not cands:
+                                return ""
+                            for u in cands:
+                                try:
+                                    host = (urlparse(u).netloc or "").lower()
+                                except Exception:
+                                    host = ""
+                                if any(d in host for d in preferred_domains):
+                                    return u
+                            return cands[0]
+
+                        async for mm in ch2.history(limit=limit_n):
+                            embeds2 = getattr(mm, "embeds", None) or []
+                            for ee in embeds2:
+                                fields2 = getattr(ee, "fields", None) or []
+                                title2 = str(getattr(ee, "title", "") or "").strip()
+                                url_candidates: List[str] = []
+                                u0 = str(getattr(ee, "url", "") or "").strip()
+                                if u0:
+                                    url_candidates.append(u0)
+                                for ff in fields2:
+                                    url_candidates.extend(_all_urls(str(getattr(ff, "value", "") or "")))
+                                url_candidates.extend(_all_urls(str(getattr(ee, "description", "") or "")))
+                                url2 = _pick_url([u for u in url_candidates if u])
+                                if not title2:
+                                    title2 = url2 or ""
+
+                                for ff in fields2:
+                                    name = str(getattr(ff, "name", "") or "").strip()
+                                    if not _id_like_field_name(name):
+                                        continue
+                                    val = str(getattr(ff, "value", "") or "").strip()
+                                    if not val:
+                                        continue
+                                    cleaned = self._clean_sku_text(val)
+                                    if cleaned and len(cleaned) >= 6 and cleaned not in idx:
+                                        idx[cleaned] = (title2, url2)
+                                    digits = "".join([c for c in cleaned if c.isdigit()])
+                                    if digits and len(digits) >= 6 and digits not in idx:
+                                        idx[digits] = (title2, url2)
+                        return idx
+
+                    # Use a larger history limit for manual runs (better hit rate).
+                    try:
+                        limit_mon = max(int((self.config or {}).get("rs_fs_monitor_lookup_history_limit") or 0), 2000)
+                    except Exception:
+                        limit_mon = 2000
+
+                    for st, sk in pairs:
+                        found = None
+                        if self._rs_fs_monitor_lookup_enabled():
+                            ch_name = self._monitor_channel_name_for_store(st)
+                            if ch_name:
+                                base = self._normalize_monitor_channel_name(ch_name)
+                                if base not in monitor_cache:
+                                    ch2 = await self._resolve_monitor_channel_for_store(st, guild=g_obj)
+                                    idx = {}
+                                    if ch2:
+                                        try:
+                                            idx = await _build_index(ch2, limit_n=limit_mon)
+                                        except Exception:
+                                            idx = {}
+                                    monitor_cache[base] = (ch2, idx)
+                                ch2, idx = monitor_cache.get(base) or (None, {})
+                                target_clean = self._clean_sku_text(sk)
+                                target_digits = "".join([c for c in target_clean if c.isdigit()])
+                                hit = idx.get(target_clean) or (idx.get(target_digits) if target_digits else None)
+                                if hit:
+                                    t2, u2 = hit
+                                    found = rs_fs_sheet_sync.RsFsPreviewEntry(
+                                        store=st,
+                                        sku=sk,
+                                        url=u2 or "",
+                                        title=(t2 or "").strip() or (u2 or "").strip(),
+                                        error="" if (u2 or "").strip() else "no url in monitor embed",
+                                        source=f"monitor:{getattr(ch2,'name',ch_name)}",
+                                        monitor_url=(u2 or "").strip(),
+                                        affiliate_url="",
+                                    )
+
+                        if found:
+                            monitor_hits.append(found)
+                        else:
+                            remaining.append((st, sk))
+
+                        done += 1
+                        if progress_msg and (done % 5 == 0 or done == total):
+                            try:
+                                await progress_msg.edit(
+                                    embed=_progress_embed(
+                                        "monitor",
+                                        len(monitor_hits),
+                                        total,
+                                        monitor_hits=len(monitor_hits),
+                                        remaining=len(remaining),
+                                    )
+                                )
+                            except Exception:
+                                pass
+
+                    # Stage 2: website fallback for anything not found in monitor channel.
+                    offset_done = len(monitor_hits)
+
+                    async def _on_web_progress(web_done: int, web_total: int, web_errors: int, entry) -> None:
+                        if not progress_msg:
+                            return
+                        try:
+                            await progress_msg.edit(
+                                embed=_progress_embed(
+                                    "website",
+                                    offset_done + web_done,
+                                    offset_done + web_total,
+                                    monitor_hits=offset_done,
+                                    remaining=max(0, offset_done + web_total - (offset_done + web_done)),
+                                    web_errors=web_errors,
+                                )
+                            )
+                        except Exception:
+                            return
+
+                    if remaining:
+                        web_entries = await rs_fs_sheet_sync.build_preview_entries(
+                            remaining,
+                            self.config,
+                            on_progress=_on_web_progress if progress_msg else None,
+                        )
+                    else:
+                        web_entries = []
+
+                    raw_entries = list(monitor_hits) + list(web_entries)
+
+                    # Stage 3: affiliate links (plain URL for sheet)
+                    if progress_msg:
+                        try:
+                            await progress_msg.edit(embed=_progress_embed("affiliate", total, total, monitor_hits=len(monitor_hits), remaining=0))
+                        except Exception:
+                            pass
+
+                    entries = list(raw_entries or [])
+                    try:
+                        rewrite_enabled = bool(self.config.get("affiliate_rewrite_enabled", True))
+                    except Exception:
+                        rewrite_enabled = True
+                    if entries:
+                        try:
+                            url_list: List[str] = []
+                            for e in entries:
+                                u0 = (getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
+                                if u0:
+                                    url_list.append(u0)
+                            aff_map: Dict[str, str] = {}
+                            if rewrite_enabled and url_list:
+                                seen_u: Set[str] = set()
+                                unique_urls: List[str] = []
+                                for u in url_list:
+                                    if u in seen_u:
+                                        continue
+                                    seen_u.add(u)
+                                    unique_urls.append(u)
+                                mapped, _notes = await affiliate_rewriter.compute_affiliate_rewrites_plain(self.config, unique_urls)
+                                aff_map = {str(k or "").strip(): str(v or "").strip() for k, v in (mapped or {}).items()}
+
+                            enriched: List[rs_fs_sheet_sync.RsFsPreviewEntry] = []
+                            for e in entries:
+                                u0 = (getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
+                                aff = (aff_map.get(u0) or "").strip() if u0 else ""
+                                enriched.append(
+                                    rs_fs_sheet_sync.RsFsPreviewEntry(
+                                        store=getattr(e, "store", "") or "",
+                                        sku=getattr(e, "sku", "") or "",
+                                        url=getattr(e, "url", "") or "",
+                                        title=getattr(e, "title", "") or "",
+                                        error=getattr(e, "error", "") or "",
+                                        source=getattr(e, "source", "") or "",
+                                        monitor_url=u0,
+                                        affiliate_url=aff,
+                                    )
+                                )
+                            entries = enriched
+                        except Exception:
+                            pass
+
+                    # Stage 4: mirror sync (single call)
+                    if progress_msg:
+                        try:
+                            await progress_msg.edit(embed=_progress_embed("sheet sync", total, total, monitor_hits=len(monitor_hits), remaining=0))
+                        except Exception:
+                            pass
+
+                    rows = [[e.store, e.sku, e.title, e.affiliate_url, e.monitor_url] for e in entries]
+                    ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(rows)
+
+                    if ok:
+                        # Summary embed
+                        try:
+                            n_manual = sum(1 for e in entries if str(getattr(e, "source", "") or "").startswith("manual"))
+                            n_monitor = sum(1 for e in entries if str(getattr(e, "source", "") or "").startswith("monitor"))
+                            n_web = sum(1 for e in entries if str(getattr(e, "source", "") or "").strip() == "website")
+                            n_blocked = sum(1 for e in entries if "blocked" in str(getattr(e, "error", "") or "").lower())
+                            summ = discord.Embed(title="RS-FS Sheet Sync (mirror)", color=discord.Color.green())
+                            summ.add_field(name="Sheet changes", value=f"added `{added}`\nupdated `{updated}`\nremoved `{deleted}`", inline=True)
+                            summ.add_field(name="Resolution", value=f"manual `{n_manual}`\nmonitor `{n_monitor}`\nwebsite `{n_web}`", inline=True)
+                            if n_blocked:
+                                summ.add_field(name="Blocked pages", value=str(n_blocked), inline=True)
+                            await ctx.send(embed=summ, allowed_mentions=discord.AllowedMentions.none())
+                        except Exception:
+                            await ctx.send(
+                                f"RS-FS Sheet (mirror): ✅ added {added}, updated {updated}, removed {deleted}.",
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+
+                        # Offer manual resolution for any remaining blocked/empty items.
+                        needs_manual = [
+                            e
+                            for e in entries
+                            if str(getattr(e, "source", "") or "").strip() == "website"
+                            and ("blocked" in str(getattr(e, "error", "") or "").lower() or "title not found" in str(getattr(e, "error", "") or "").lower())
+                        ]
+                        if needs_manual:
+                            await ctx.send(
+                                embed=discord.Embed(
+                                    title="RS-FS: Manual resolve needed",
+                                    description=f"{len(needs_manual)} item(s) were blocked/missing titles. Click **Provide link** to paste the correct store URL.",
+                                    color=discord.Color.orange(),
+                                ),
+                                view=_RsFsManualResolveView(self, ctx, needs_manual),  # type: ignore[name-defined]
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+                        else:
+                            await ctx.send("✅ RS-FS LIVE sync finished. Check the sheet.", allowed_mentions=discord.AllowedMentions.none())
+                    else:
+                        await ctx.send(f"❌ RS-FS live run failed: {msg}", allowed_mentions=discord.AllowedMentions.none())
+                finally:
+                    # Restore monitor lookup limit and manual-run guard
+                    try:
+                        if prev_hist is None:
+                            (self.config or {}).pop("rs_fs_monitor_lookup_history_limit", None)
+                        else:
+                            self.config["rs_fs_monitor_lookup_history_limit"] = prev_hist
                     except Exception:
                         pass
+                    self._rs_fs_manual_run_in_progress = prev_manual
             except Exception as e:
                 await ctx.send(f"❌ RS-FS live run failed: {str(e)[:200]}")
+
+        @self.bot.command(name="rsfsmonitorscan", aliases=["rsfsmonitor", "rsfsmonitors"])
+        async def rsfs_monitor_scan(ctx, *category_ids: str):
+            """
+            Scan monitor categories in this guild and store monitor channel IDs in config.json.
+            This makes monitor lookup deterministic (uses channel_id instead of name matching).
+
+            Usage:
+              !rsfsmonitorscan 1350953333069713528 1411757054908960819
+            """
+            try:
+                if not getattr(ctx.author, "guild_permissions", None) or not ctx.author.guild_permissions.administrator:
+                    await ctx.send(
+                        embed=_rsfs_embed("RS-FS Monitor Scan", status="❌ admins only", color=discord.Color.red()),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return
+
+                g = getattr(ctx, "guild", None)
+                if not g:
+                    await ctx.send(
+                        embed=_rsfs_embed("RS-FS Monitor Scan", status="❌ must be run in a guild", color=discord.Color.red()),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return
+
+                ids: List[int] = []
+                if category_ids:
+                    for s in category_ids:
+                        try:
+                            ids.append(int(str(s or "").strip()))
+                        except Exception:
+                            continue
+                else:
+                    raw = (self.config or {}).get("rs_fs_monitor_category_ids")
+                    if isinstance(raw, list):
+                        for x in raw:
+                            try:
+                                ids.append(int(str(x or "").strip()))
+                            except Exception:
+                                continue
+                ids = [i for i in ids if i > 0]
+                if not ids:
+                    await ctx.send(
+                        embed=_rsfs_embed(
+                            "RS-FS Monitor Scan",
+                            status="❌ missing category IDs",
+                            description="Provide category IDs, or set `rs_fs_monitor_category_ids` in `RSForwarder/config.json`.",
+                            color=discord.Color.red(),
+                        ),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return
+
+                found: Dict[str, int] = {}
+                # Iterate channels under those categories
+                for ch in getattr(g, "channels", []) or []:
+                    try:
+                        if not isinstance(ch, discord.TextChannel):
+                            continue
+                        cat_id = int(getattr(ch, "category_id", 0) or 0)
+                        if cat_id not in ids:
+                            continue
+                        base = self._normalize_monitor_channel_name(str(getattr(ch, "name", "") or ""))
+                        if not base.endswith("-monitor"):
+                            continue
+                        found[base] = int(getattr(ch, "id", 0) or 0)
+                    except Exception:
+                        continue
+
+                if not found:
+                    await ctx.send(
+                        embed=_rsfs_embed(
+                            "RS-FS Monitor Scan",
+                            status="❌ no monitor channels found",
+                            description="No `*-monitor` channels were found under the provided categories.",
+                            color=discord.Color.red(),
+                        ),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return
+
+                # Persist mapping
+                self.config["rs_fs_monitor_category_ids"] = [str(i) for i in ids]
+                self.config["rs_fs_monitor_channel_ids"] = {k: int(v) for k, v in sorted(found.items()) if int(v) > 0}
+                try:
+                    self.save_config()
+                    self.load_config()
+                except Exception:
+                    pass
+
+                # Report summary (truncate)
+                sample_lines = [f"`{k}` → `{v}`" for k, v in sorted(found.items())][:20]
+                more = max(0, len(found) - len(sample_lines))
+                await ctx.send(
+                    embed=_rsfs_embed(
+                        "RS-FS Monitor Scan",
+                        status="✅ saved channel ids",
+                        color=discord.Color.green(),
+                        fields=[
+                            ("Categories", ", ".join([f"`{i}`" for i in ids]), False),
+                            ("Channels found", str(len(found)), True),
+                            ("Sample", "\n".join(sample_lines) + (f"\n… and {more} more" if more else ""), False),
+                        ],
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except Exception as e:
+                await ctx.send(
+                    embed=_rsfs_embed(
+                        "RS-FS Monitor Scan",
+                        status=f"❌ failed: {str(e)[:200]}",
+                        color=discord.Color.red(),
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
         
         @self.bot.command(name='rsremove', aliases=['remove'])
         async def remove_channel(ctx, source_channel: discord.TextChannel = None):
