@@ -1146,6 +1146,18 @@ def is_ticket_channel(channel_id: int) -> bool:
         return False
 
 
+async def has_open_ticket_for_user(*, ticket_type: str, user_id: int) -> bool:
+    """Check if a user has an OPEN ticket of a given type (best-effort)."""
+    t = str(ticket_type or "").strip().lower()
+    uid = int(user_id or 0)
+    if not t or uid <= 0:
+        return False
+    async with _INDEX_LOCK:
+        db = _index_load()
+        found = _ticket_find_open(db, ticket_type=t, user_id=uid, fingerprint="")
+        return bool(found and _ticket_is_open(found[1]))
+
+
 async def record_activity_from_message(message: discord.Message) -> None:
     """Update last_activity_at for ticket channels (non-bot messages only)."""
     if not _ensure_cfg_loaded():

@@ -5477,21 +5477,50 @@ class RSForwarderBot:
             if not rewrite_enabled:
                 return
 
+            any_changed = False
+
             # Content rewrite
             content = message.content or ""
-            if content:
-                content2, _changed, _notes = await affiliate_rewriter.rewrite_text(self.config, content)
+            content_original = content
+
+            where_only = bool((channel_config or {}).get("repost_affiliate_where_only"))
+            where_marker = str((channel_config or {}).get("repost_affiliate_where_marker") or "`Where:`").strip()
+            if where_only and content and where_marker:
+                try:
+                    lines = content.splitlines()
+                except Exception:
+                    lines = [content]
+                out_lines: List[str] = []
+                for ln in lines:
+                    # Only affiliate-rewrite URLs in the `Where:` line.
+                    if where_marker and (ln.lstrip().startswith(where_marker)):
+                        new_ln, changed, _notes = await affiliate_rewriter.rewrite_text(self.config, ln)
+                        if changed:
+                            any_changed = True
+                        out_lines.append(new_ln)
+                    else:
+                        out_lines.append(ln)
+                content = "\n".join(out_lines)
+            elif content:
+                content2, changed, _notes = await affiliate_rewriter.rewrite_text(self.config, content)
+                if changed:
+                    any_changed = True
                 content = content2
 
             # Embed rewrite (rich embeds only)
             embeds_raw_all = [e.to_dict() for e in message.embeds] if message.embeds else []
             embeds_raw = [e for e in embeds_raw_all if self._is_resendable_embed_dict(e)]
-            if embeds_raw:
+            if embeds_raw and (not where_only):
                 rewritten = []
                 for e in embeds_raw:
-                    ee, _ch, _notes = await affiliate_rewriter.rewrite_embed_dict(self.config, e)
+                    ee, ch, _notes = await affiliate_rewriter.rewrite_embed_dict(self.config, e)
+                    if ch:
+                        any_changed = True
                     rewritten.append(ee)
                 embeds_raw = rewritten
+
+            if not any_changed:
+                return
 
             # Discord limits
             if content and len(content) > 2000:

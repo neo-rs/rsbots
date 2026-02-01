@@ -5916,30 +5916,7 @@ env -u TAR_OPTIONS /bin/tar -cf - -T "$TMP_SYNC" | (cd "$STAGING_DIR" && env -u 
 
 # Write pending update marker for run_bot.sh
 PENDING_JSON="$LIVE_ROOT/RSAdminBot/.pending_update.json"
-TS="$TS" STAGING_DIR="$STAGING_DIR" BACKUP_TAR="$BACKUP_TAR" CHANGED_COUNT="$CHANGED_COUNT" SYNC_COUNT="$SYNC_COUNT" OLD="$OLD" NEW="$NEW" PENDING_JSON="$PENDING_JSON" python3 - <<'PY'
-import json, os
-staging = os.environ.get("STAGING_DIR","")
-ts = os.environ.get("TS","")
-backup = os.environ.get("BACKUP_TAR","")
-changed_count = int(os.environ.get("CHANGED_COUNT","0") or "0")
-sync_count = int(os.environ.get("SYNC_COUNT","0") or "0")
-old = os.environ.get("OLD","")
-new = os.environ.get("NEW","")
-pending = os.environ.get("PENDING_JSON","")
-data = {
-  "timestamp": ts,
-  "staging_dir": staging,
-  "remote_backup": backup,
-  "git_old": old,
-  "git_new": new,
-  "changes": {
-    "total": changed_count,
-    "sync_total": sync_count,
-  },
-}
-with open(pending, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2, ensure_ascii=True)
-PY
+TS="$TS" STAGING_DIR="$STAGING_DIR" BACKUP_TAR="$BACKUP_TAR" CHANGED_COUNT="$CHANGED_COUNT" SYNC_COUNT="$SYNC_COUNT" OLD="$OLD" NEW="$NEW" PENDING_JSON="$PENDING_JSON" python3 -c 'import json,os; staging=os.environ.get(\"STAGING_DIR\",\"\"); ts=os.environ.get(\"TS\",\"\"); backup=os.environ.get(\"BACKUP_TAR\",\"\"); changed=int(os.environ.get(\"CHANGED_COUNT\",\"0\") or \"0\"); sync=int(os.environ.get(\"SYNC_COUNT\",\"0\") or \"0\"); old=os.environ.get(\"OLD\",\"\"); new=os.environ.get(\"NEW\",\"\"); pending=os.environ.get(\"PENDING_JSON\",\"\"); data={\"timestamp\":ts,\"staging_dir\":staging,\"remote_backup\":backup,\"git_old\":old,\"git_new\":new,\"changes\":{\"total\":changed,\"sync_total\":sync}}; f=open(pending,\"w\",encoding=\"utf-8\"); f.write(json.dumps(data,indent=2,ensure_ascii=True)); f.close()'
 
 echo "OK=1"
 echo "OLD=$OLD"
@@ -5970,7 +5947,12 @@ echo "CHANGED_END"
             out = (stdout or "").strip()
             err = (stderr or "").strip()
             if not ok:
-                msg = err or out or "unknown error"
+                # IMPORTANT: include BOTH streams.
+                # Git often writes progress/info to stderr, while the actual failure may be on stdout.
+                if err and out:
+                    msg = (err + "\n" + out).strip()
+                else:
+                    msg = err or out or "unknown error"
                 return False, {"error": msg[:1200]}
 
             stats: Dict[str, Any] = {"raw": out[-1600:]}
@@ -6140,7 +6122,10 @@ echo "CHANGED_END"
             out = (stdout or "").strip()
             err = (stderr or "").strip()
             if not ok:
-                msg = err or out or "unknown error"
+                if err and out:
+                    msg = (err + "\n" + out).strip()
+                else:
+                    msg = err or out or "unknown error"
                 return False, {"error": msg[:1200]}
 
             stats: Dict[str, Any] = {"raw": out[-1600:]}

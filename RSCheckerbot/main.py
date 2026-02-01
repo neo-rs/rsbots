@@ -973,24 +973,34 @@ async def _startup_canceling_members_snapshot() -> None:
         if not whop_api_client:
             return
 
+        # New behavior: create cancellation tickets instead of spamming snapshot channels.
+        create_tickets = bool(REPORTING_CONFIG.get("startup_canceling_snapshot_create_tickets", False))
+        post_to_channels = bool(REPORTING_CONFIG.get("startup_canceling_snapshot_post_to_channels", True))
+        if create_tickets:
+            # If we are creating tickets, default to NOT posting to channels unless explicitly enabled.
+            if not bool(REPORTING_CONFIG.get("startup_canceling_snapshot_post_to_channels", False)):
+                post_to_channels = False
+
         # Output channel (Neo): reuse the same config used for cancellation reminders mirror.
         try:
             out_gid = int(REPORTING_CONFIG.get("cancel_reminders_output_guild_id") or 0)
         except Exception:
             out_gid = 0
         out_name = str(REPORTING_CONFIG.get("cancel_reminders_output_channel_name") or "").strip()
-        if not out_gid or not out_name:
-            return
+        ch: discord.TextChannel | None = None
+        if post_to_channels:
+            if not out_gid or not out_name:
+                return
 
-        g = bot.get_guild(int(out_gid))
-        if not g:
-            log.warning("[BOOT][Canceling] output guild not found: %s", out_gid)
-            return
+            g = bot.get_guild(int(out_gid))
+            if not g:
+                log.warning("[BOOT][Canceling] output guild not found: %s", out_gid)
+                return
 
-        ch = await _get_or_create_text_channel(g, name=out_name, category_id=STAFF_ALERTS_CATEGORY_ID)
-        if not isinstance(ch, discord.TextChannel):
-            log.warning("[BOOT][Canceling] output channel not found/creatable: %s", out_name)
-            return
+            ch = await _get_or_create_text_channel(g, name=out_name, category_id=STAFF_ALERTS_CATEGORY_ID)
+            if not isinstance(ch, discord.TextChannel):
+                log.warning("[BOOT][Canceling] output channel not found/creatable: %s", out_name)
+                return
 
         # Optional mirror channels (e.g. main guild case channel).
         mirror_chs: list[discord.TextChannel] = []
@@ -1308,24 +1318,31 @@ async def _startup_canceling_members_snapshot() -> None:
                 log.warning("[BOOT][Canceling] clear channel failed: %s", str(ex)[:240])
 
         # Optional: clear recent bot messages in the snapshot channels (keep channels tidy).
-        await _maybe_clear_channel(ch, do_clear=clear_first, limit_n=clear_limit)
+        if isinstance(ch, discord.TextChannel):
+            await _maybe_clear_channel(ch, do_clear=clear_first, limit_n=clear_limit)
         for mch in mirror_chs:
             await _maybe_clear_channel(mch, do_clear=mirror_clear_first, limit_n=mirror_clear_limit)
 
         # Live progress message in primary snapshot channel (edited as we scan/post).
         progress_msg: discord.Message | None = None
-        try:
-            txt = _progress_text(
-                label="Canceling Snapshot",
-                step=(1, 1),
-                done=0,
-                total=max_rows,
-                stats={"pages": f"{scanned_pages}/{max_pages}", "rows": 0, "errors": 0},
-                stage="start",
-            )
-            progress_msg = await ch.send(content=txt, allowed_mentions=discord.AllowedMentions.none())
-        except Exception:
-            progress_msg = None
+        if isinstance(ch, discord.TextChannel):
+            try:
+                txt = _progress_text(
+                    label="Canceling Snapshot",
+                    step=(1, 1),
+                    done=0,
+                    total=max_rows,
+                    stats={"pages": f"{scanned_pages}/{max_pages}", "rows": 0, "errors": 0},
+                    stage="start",
+                )
+                progress_msg = await ch.send(content=txt, allowed_mentions=discord.AllowedMentions.none())
+            except Exception:
+                progress_msg = None
+
+        # Ticket creation stats
+        tickets_opened = 0
+        tickets_skipped = 0
+        tickets_failed = 0
 
         while scanned_pages < max_pages and len(rows) < max_rows:
             batch, page_info = await whop_api_client.list_memberships(
@@ -1397,6 +1414,65 @@ async def _startup_canceling_members_snapshot() -> None:
                     if isinstance(did2, int) and did2:
                         did = int(did2)
                         did_src = "whop_logs"
+
+                # If we can create tickets, do it as soon as we have a Discord ID (dedupe-safe).
+                if create_tickets and did:
+                    try:
+                        if await support_tickets.has_open_ticket_for_user(ticket_type="cancellation", user_id=int(did)):
+                            tickets_skipped += 1
+                        else:
+                            if not isinstance(src_guild, discord.Guild):
+                                src_guild = bot.get_guild(int(GUILD_ID)) if str(GUILD_ID or "").strip().isdigit() else None
+                            member_obj = src_guild.get_member(int(did)) if isinstance(src_guild, discord.Guild) else None
+                            if not isinstance(member_obj, discord.Member):
+                                with suppress(Exception):
+                                    member_obj = await src_guild.fetch_member(int(did)) if isinstance(src_guild, discord.Guild) else None
+                            if isinstance(member_obj, discord.Member):
+                                # Build a brief compatible with ticket preview embeds.
+                                brief = {
+                                    "status": "canceling",
+                                    "product": str(m_use.get("product") or m_use.get("product_title") or m_use.get("name") or "Reselling Secrets"),
+                                    "remaining_days": str(m_use.get("remaining_days") or ""),
+                                    "renewal_end": str(m_use.get("renewal_end") or m_use.get("renewal_period_end") or ""),
+                                    "renewal_end_iso": str(m_use.get("renewal_end_iso") or m_use.get("renewal_period_end") or ""),
+                                    "dashboard_url": str(m_use.get("dashboard_url") or ""),
+                                    "cancel_at_period_end": "yes" if bool(cape) else "no",
+                                }
+                                fp = f"{mid or int(did)}|cancel|{_tz_now().date().isoformat()}"
+                                ch_created = await support_tickets.open_cancellation_ticket(
+                                    member=member_obj,
+                                    whop_brief=brief,
+                                    cancellation_reason="Set to cancel",
+                                    fingerprint=fp,
+                                    reference_jump_url="",
+                                )
+                                if ch_created:
+                                    tickets_opened += 1
+                                else:
+                                    tickets_failed += 1
+                            else:
+                                tickets_failed += 1
+                    except Exception:
+                        tickets_failed += 1
+
+            # Keep the progress message updated (when posting is enabled).
+            if progress_msg:
+                with suppress(Exception):
+                    txt = _progress_text(
+                        label="Canceling Snapshot",
+                        step=(1, 1),
+                        done=len(rows),
+                        total=max_rows,
+                        stats={
+                            "pages": f"{scanned_pages + 1}/{max_pages}",
+                            "rows": len(rows),
+                            "tickets_opened": tickets_opened,
+                            "tickets_skipped": tickets_skipped,
+                            "tickets_failed": tickets_failed,
+                        },
+                        stage="scan",
+                    )
+                    await progress_msg.edit(content=txt)
 
                 # Total spend: use explicit *_cents fields when present; otherwise treat as USD.
                 mem_spend_usd, mem_spend_found = _total_spend_usd(m_use)
@@ -1675,6 +1751,21 @@ async def _startup_canceling_members_snapshot() -> None:
             return 9e18
 
         rows.sort(key=_sort_key)
+
+        # If we are not posting snapshot embeds, stop here (tickets/roles were handled during scan).
+        if (not post_to_channels) and create_tickets:
+            with suppress(Exception):
+                await log_other(
+                    f"📌 [BOOT][Canceling] tickets_mode rows={len(rows)} opened={tickets_opened} skipped_existing={tickets_skipped} failed={tickets_failed}"
+                )
+            log.info(
+                "[BOOT][Canceling] tickets_mode rows=%s opened=%s skipped_existing=%s failed=%s",
+                len(rows),
+                tickets_opened,
+                tickets_skipped,
+                tickets_failed,
+            )
+            return
 
         # Render (embed layout aligned to Whop table columns).
         now = datetime.now(timezone.utc)

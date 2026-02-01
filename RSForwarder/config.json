@@ -40,6 +40,8 @@
       "source_channel_id": "1467585427589435472",
       "source_channel_name": "neo-test-affiliate-repost",
       "repost_in_place": true,
+      "repost_affiliate_where_only": true,
+      "repost_affiliate_where_marker": "`Where:`",
       "repost_delete_original": true,
       "role_mention": {
         "role_id": "",
