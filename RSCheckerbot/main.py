@@ -2469,8 +2469,10 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
         or ("payment resumed" in title_low)
         or ("access restored" in title_low)
     ):
-        with suppress(Exception):
-            await support_tickets.close_free_pass_if_whop_linked(int(did_i))
+        # Require Members role for immediate close (safety): only act on current Members.
+        if has_member_role(member):
+            with suppress(Exception):
+                await support_tickets.close_free_pass_if_whop_linked(int(did_i))
 
     # Open tickets based on canonical kinds/titles.
     if kind == "member_joined":
@@ -6999,7 +7001,17 @@ async def on_ready():
 
     def _is_whop_linked(did: int) -> bool:
         try:
-            return bool(_membership_id_from_history(int(did)))
+            # Only treat as "linked" when:
+            # - we have a membership_id recorded for this discord_id, AND
+            # - the member currently has the Members role in this guild (ROLE_CANCEL_A).
+            did_i = int(did)
+            if not _membership_id_from_history(did_i):
+                return False
+            g = bot.get_guild(GUILD_ID)
+            if not g:
+                return False
+            m = g.get_member(int(did_i))
+            return bool(isinstance(m, discord.Member) and has_member_role(m))
         except Exception:
             return False
 

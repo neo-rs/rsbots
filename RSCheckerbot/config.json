@@ -228,6 +228,12 @@
       "_comment_include_owner": "When true, the ticket owner can see/respond in their ticket channel.",
       "include_ticket_owner_in_channel": true
     },
+    "ticket_roles": {
+      "_comment": "Auto-assign roles when a ticket is OPEN; remove on close.",
+      "billing_role_id": 1354146761853108225,
+      "cancellation_role_id": 1467494664088064174,
+      "free_pass_no_whop_role_id": 1467500050341957725
+    },
     "ticket_categories": {
       "billing_category_id": 1467157354977165537,
       "free_pass_category_id": 1467157711685681214,
@@ -264,7 +270,8 @@
     "audit_logs": {
       "_comment": "Dyno-style audit logs for ticket categories (message create/edit/delete + channel create/update/delete).",
       "enabled": true,
-      "channel_id": 0,
+      "_comment_channel_id": "Set to an existing #tickets-logs channel to prevent duplicates.",
+      "channel_id": 1467506723790262464,
       "channel_name": "tickets-logs",
       "include_transcript_category": false
     },

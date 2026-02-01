@@ -58,6 +58,9 @@ class SupportTicketConfig:
     audit_channel_id: int
     audit_channel_name: str
     audit_include_transcript_category: bool
+    billing_role_id: int
+    cancellation_role_id: int
+    free_pass_no_whop_role_id: int
 
 
 _BOT: commands.Bot | None = None
@@ -152,6 +155,7 @@ def initialize(
     sm = st.get("startup_messages") if isinstance(st.get("startup_messages"), dict) else {}
     sm_templates = sm.get("templates") if isinstance(sm.get("templates"), dict) else {}
     al = st.get("audit_logs") if isinstance(st.get("audit_logs"), dict) else {}
+    tr = st.get("ticket_roles") if isinstance(st.get("ticket_roles"), dict) else {}
 
     def _int_list(obj: object) -> list[int]:
         out: list[int] = []
@@ -191,6 +195,9 @@ def initialize(
         audit_channel_id=_as_int(al.get("channel_id")),
         audit_channel_name=str(al.get("channel_name") or "tickets-logs").strip() or "tickets-logs",
         audit_include_transcript_category=_as_bool(al.get("include_transcript_category")),
+        billing_role_id=_as_int(tr.get("billing_role_id")),
+        cancellation_role_id=_as_int(tr.get("cancellation_role_id")),
+        free_pass_no_whop_role_id=_as_int(tr.get("free_pass_no_whop_role_id")),
     )
 
     # Register persistent view so buttons survive restarts.
@@ -847,6 +854,45 @@ def _is_staff_member(member: discord.Member) -> bool:
     return False
 
 
+def _ticket_role_id_for_type(ticket_type: str) -> int:
+    cfg = _cfg()
+    if not cfg:
+        return 0
+    t = str(ticket_type or "").strip().lower()
+    if t == "billing":
+        return int(cfg.billing_role_id or 0)
+    if t == "cancellation":
+        return int(cfg.cancellation_role_id or 0)
+    if t == "free_pass":
+        return int(cfg.free_pass_no_whop_role_id or 0)
+    return 0
+
+
+async def _set_ticket_role_for_member(*, guild: discord.Guild, member: discord.Member, ticket_type: str, add: bool) -> None:
+    """Auto-add/remove the per-ticket role for the owner."""
+    if not isinstance(guild, discord.Guild) or not isinstance(member, discord.Member):
+        return
+    rid = int(_ticket_role_id_for_type(ticket_type) or 0)
+    if rid <= 0:
+        return
+    role = guild.get_role(int(rid))
+    if not role:
+        return
+    has_it = False
+    with suppress(Exception):
+        has_it = any(int(getattr(r, "id", 0) or 0) == int(rid) for r in (member.roles or []))
+    if add:
+        if has_it:
+            return
+        with suppress(Exception):
+            await member.add_roles(role, reason=f"RSCheckerbot: open {ticket_type} ticket")
+    else:
+        if not has_it:
+            return
+        with suppress(Exception):
+            await member.remove_roles(role, reason=f"RSCheckerbot: close {ticket_type} ticket")
+
+
 def is_ticket_channel(channel_id: int) -> bool:
     """Fast check used by main.on_message (best-effort)."""
     if int(channel_id or 0) <= 0:
@@ -974,6 +1020,9 @@ async def _open_or_update_ticket(
             ch_id = _as_int(rec.get("channel_id"))
             ch = guild.get_channel(int(ch_id)) if ch_id else None
             if isinstance(ch, discord.TextChannel):
+                # Ensure the correct per-ticket role is applied even on dedupe.
+                with suppress(Exception):
+                    await _set_ticket_role_for_member(guild=guild, member=owner, ticket_type=ticket_type, add=True)
                 with suppress(Exception):
                     await ch.send("ℹ️ Ticket already open (deduped).", silent=True)
                 # Important: do NOT bump last_activity for bot messages.
@@ -1008,6 +1057,10 @@ async def _open_or_update_ticket(
         # Safety: ensure configured staff roles can view the channel (especially if a channel was found pre-existing).
         with suppress(Exception):
             await _ensure_staff_roles_can_view_channel(guild=guild, channel=ch, staff_role_ids=cfg.staff_role_ids)
+
+        # Auto-assign per-ticket role to the owner (billing/cancellation/no-whop).
+        with suppress(Exception):
+            await _set_ticket_role_for_member(guild=guild, member=owner, ticket_type=ticket_type, add=True)
 
         # Initial messages (minimal)
         if cfg.include_ticket_owner_in_channel:
@@ -1603,6 +1656,18 @@ async def close_ticket_by_channel_id(
     guild = _BOT.get_guild(int(cfg.guild_id))
     if not guild:
         return False
+
+    # Capture ticket metadata up-front (for role removal / fallback close).
+    ticket_type = ""
+    ticket_user_id = 0
+    async with _INDEX_LOCK:
+        db0 = _index_load()
+        found0 = _ticket_by_channel_id(db0, int(channel_id))
+        if found0:
+            _tid0, rec0 = found0
+            ticket_type = str(rec0.get("ticket_type") or "").strip().lower()
+            ticket_user_id = _as_int(rec0.get("user_id"))
+
     ch = guild.get_channel(int(channel_id))
     if not isinstance(ch, discord.TextChannel):
         # Channel gone; mark closed
@@ -1617,6 +1682,15 @@ async def close_ticket_by_channel_id(
                     rec["closed_at_iso"] = _now_iso()
                     db["tickets"][tid] = rec  # type: ignore[index]
                     _index_save(db)
+        # Auto-remove the role tied to this ticket type.
+        if ticket_user_id and ticket_type:
+            mobj = guild.get_member(int(ticket_user_id))
+            if not isinstance(mobj, discord.Member):
+                with suppress(Exception):
+                    mobj = await guild.fetch_member(int(ticket_user_id))
+            if isinstance(mobj, discord.Member):
+                with suppress(Exception):
+                    await _set_ticket_role_for_member(guild=guild, member=mobj, ticket_type=ticket_type, add=False)
         return True
 
     if do_transcript:
@@ -1624,6 +1698,29 @@ async def close_ticket_by_channel_id(
         if not ok:
             await _log(f"❌ support_tickets: transcript failed; refusing to delete ticket channel_id={channel_id}")
             return False
+    else:
+        # No transcript requested: still mark closed (keeps index + role state consistent).
+        async with _INDEX_LOCK:
+            db = _index_load()
+            found = _ticket_by_channel_id(db, int(channel_id))
+            if found:
+                tid, rec = found
+                if _ticket_is_open(rec):
+                    rec["status"] = "CLOSED"
+                    rec["close_reason"] = str(close_reason or "")
+                    rec["closed_at_iso"] = _now_iso()
+                    db["tickets"][tid] = rec  # type: ignore[index]
+                    _index_save(db)
+
+    # Auto-remove the role tied to this ticket type (remove only that role).
+    if ticket_user_id and ticket_type:
+        mobj = guild.get_member(int(ticket_user_id))
+        if not isinstance(mobj, discord.Member):
+            with suppress(Exception):
+                mobj = await guild.fetch_member(int(ticket_user_id))
+        if isinstance(mobj, discord.Member):
+            with suppress(Exception):
+                await _set_ticket_role_for_member(guild=guild, member=mobj, ticket_type=ticket_type, add=False)
 
     if delete_channel:
         with suppress(Exception):
@@ -1638,6 +1735,8 @@ async def close_free_pass_if_whop_linked(discord_id: int) -> None:
     uid = int(discord_id or 0)
     if uid <= 0:
         return
+    # Never hold the index lock while awaiting close_ticket_by_channel_id (it also needs the lock).
+    ch_id = 0
     async with _INDEX_LOCK:
         db = _index_load()
         for _tid, rec in _ticket_iter(db):
@@ -1648,9 +1747,10 @@ async def close_free_pass_if_whop_linked(discord_id: int) -> None:
             if _as_int(rec.get("user_id")) != uid:
                 continue
             ch_id = _as_int(rec.get("channel_id"))
-            if ch_id:
-                await close_ticket_by_channel_id(ch_id, close_reason="whop_linked", do_transcript=True, delete_channel=True)
-            return
+            break
+    if ch_id:
+        await close_ticket_by_channel_id(int(ch_id), close_reason="whop_linked", do_transcript=True, delete_channel=True)
+    return
 
 
 async def sweep_free_pass_tickets() -> None:
