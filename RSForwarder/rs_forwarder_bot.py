@@ -1344,6 +1344,10 @@ class RSForwarderBot:
                     src_id = str(ch.get("source_channel_id", "")).strip()
                     if not src_id:
                         continue
+                    # In-place repost channels do not forward to an external webhook, so they
+                    # do not require destination_webhooks entries in config.secrets.json.
+                    if bool((ch or {}).get("repost_in_place")):
+                        continue
                     hook = webhooks.get(src_id)
                     if not hook:
                         missing_hooks.append(src_id)
@@ -5445,10 +5449,116 @@ class RSForwarderBot:
         except Exception as e:
             # Don't fail forwarding if logging fails
             print(f"{Colors.YELLOW}[Log] Failed to send forwarding log: {e}{Colors.RESET}")
+
+    def _is_resendable_embed_dict(self, embed_dict: Dict[str, Any]) -> bool:
+        """
+        Discord "link preview" embeds are not generally re-sendable as custom embeds.
+        For in-place reposting, we only resend "rich" embeds (typically bot-made).
+        Link previews will be regenerated naturally from the reposted content URLs.
+        """
+        try:
+            t = str((embed_dict or {}).get("type") or "").strip().lower()
+            return (not t) or (t == "rich")
+        except Exception:
+            return False
+
+    async def _repost_in_place_message(self, message: discord.Message, channel_id: str, channel_config: Dict[str, Any]) -> None:
+        """
+        In-place affiliate rewrite:
+        - Rewrite affiliate URLs in message content + resendable embeds
+        - Repost into the SAME channel (as the bot)
+        - Delete the original message (only after successful repost)
+
+        NOTE: This only triggers when a rewrite actually changes something, to avoid
+        pointless churn for plain text messages.
+        """
+        try:
+            rewrite_enabled = bool(self.config.get("affiliate_rewrite_enabled", True))
+            if not rewrite_enabled:
+                return
+
+            # Content rewrite
+            content = message.content or ""
+            if content:
+                content2, _changed, _notes = await affiliate_rewriter.rewrite_text(self.config, content)
+                content = content2
+
+            # Embed rewrite (rich embeds only)
+            embeds_raw_all = [e.to_dict() for e in message.embeds] if message.embeds else []
+            embeds_raw = [e for e in embeds_raw_all if self._is_resendable_embed_dict(e)]
+            if embeds_raw:
+                rewritten = []
+                for e in embeds_raw:
+                    ee, _ch, _notes = await affiliate_rewriter.rewrite_embed_dict(self.config, e)
+                    rewritten.append(ee)
+                embeds_raw = rewritten
+
+            # Discord limits
+            if content and len(content) > 2000:
+                content = content[:1997] + "..."
+
+            embeds: List[discord.Embed] = []
+            for e in embeds_raw[:10]:
+                try:
+                    embeds.append(discord.Embed.from_dict(e))
+                except Exception:
+                    pass
+
+            files: List[discord.File] = []
+            for att in (message.attachments or [])[:10]:
+                try:
+                    files.append(await att.to_file())
+                except Exception:
+                    pass
+
+            # Prevent double-pings: original already pinged; repost should not.
+            allowed_mentions = discord.AllowedMentions.none()
+
+            send_kwargs: Dict[str, Any] = {"allowed_mentions": allowed_mentions}
+            if content:
+                send_kwargs["content"] = content
+            if embeds:
+                send_kwargs["embeds"] = embeds
+            if files:
+                send_kwargs["files"] = files
+            if not send_kwargs.get("content") and not send_kwargs.get("embeds") and not send_kwargs.get("files"):
+                return
+
+            # Preserve reply chain (reply to the same referenced message, not to the original).
+            try:
+                if message.reference and getattr(message.reference, "message_id", None):
+                    send_kwargs["reference"] = message.reference
+                    send_kwargs["mention_author"] = False
+            except Exception:
+                pass
+
+            # Send the repost
+            try:
+                await message.channel.send(**send_kwargs)
+            except Exception as e:
+                print(f"{Colors.RED}[Repost] Failed to repost in-place for channel {channel_id}: {e}{Colors.RESET}")
+                return
+
+            # Delete original only after repost succeeded.
+            delete_original = (channel_config or {}).get("repost_delete_original")
+            if delete_original is None:
+                delete_original = True
+            if bool(delete_original):
+                try:
+                    await message.delete()
+                except Exception as e:
+                    print(f"{Colors.YELLOW}[Repost] Reposted but could not delete original: {e}{Colors.RESET}")
+        except Exception as e:
+            print(f"{Colors.RED}[Repost] Exception: {e}{Colors.RESET}")
     
     async def forward_message(self, message: discord.Message, channel_id: str, channel_config: Dict[str, Any]):
         """Forward a message to the configured webhook"""
         try:
+            # In-place repost mode (same channel): rewrite affiliate links and delete original.
+            if bool((channel_config or {}).get("repost_in_place")):
+                await self._repost_in_place_message(message, channel_id, channel_config)
+                return
+
             webhook_url = channel_config.get("destination_webhook_url", "").strip()
             source_channel_name = channel_config.get("source_channel_name", f"Channel {channel_id}")
             
@@ -5741,6 +5851,8 @@ def main():
             missing = []
             for ch in channels:
                 src = str((ch or {}).get("source_channel_id", "")).strip()
+                if bool((ch or {}).get("repost_in_place")):
+                    continue
                 if src and not (webhooks or {}).get(src):
                     missing.append(src)
             if missing:
