@@ -77,6 +77,8 @@
   "rs_fs_monitor_lookup_enabled": true,
   "rs_fs_monitor_lookup_history_limit": 150,
   "rs_fs_sheet_max_per_run": 250,
-  "rs_fs_sheet_status_channel_id": "",
+  "rs_fs_sheet_status_channel_id": "1438893232686895194",
+  "rs_fs_auto_check_on_zephyr": true,
+  "rs_fs_auto_check_debounce_s": 45.0,
   "zephyr_release_feed_channel_id": "1438893232686895194"
 }

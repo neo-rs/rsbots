@@ -76,8 +76,15 @@ def _rsfs_embed(
 
 
 class _RsFsManualResolveModal(discord.ui.Modal):
-    def __init__(self, view: "_RsFsManualResolveView"):
-        super().__init__(title="RS-FS: Provide store link")
+    def __init__(self, view: "_RsFsManualResolveView", *, store: str = "", sku: str = ""):
+        st = (store or "").strip()
+        sk = (sku or "").strip()
+        t = "RS-FS: Provide store link"
+        if st and sk:
+            t = f"RS-FS: {st} {sk}"
+        # Discord modal title is limited; keep it safe.
+        t = (t[:42] + "...") if len(t) > 45 else t
+        super().__init__(title=t)
         self._view = view
         self.url = discord.ui.TextInput(label="Store URL", placeholder="https://www.walmart.com/ip/...", required=True)
         self.title_in = discord.ui.TextInput(
@@ -147,7 +154,7 @@ class _RsFsManualResolveView(discord.ui.View):
             status="Action required",
             color=discord.Color.orange(),
             fields=fields,
-            footer="RS-FS • Provide link saves override and updates sheet",
+            footer="RS-FS • Provide link saves + updates sheet • Next = view next item",
         )
 
     async def _guard(self, interaction: discord.Interaction) -> bool:
@@ -234,14 +241,21 @@ class _RsFsManualResolveView(discord.ui.View):
                 pass
             return
         try:
-            await interaction.response.send_modal(_RsFsManualResolveModal(self))
+            it = self._current() or {}
+            await interaction.response.send_modal(
+                _RsFsManualResolveModal(
+                    self,
+                    store=str(it.get("store") or ""),
+                    sku=str(it.get("sku") or ""),
+                )
+            )
         except Exception:
             try:
                 await interaction.response.send_message("❌ Could not open modal.", ephemeral=True)
             except Exception:
                 pass
 
-    @discord.ui.button(label="Skip", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
         if not await self._guard(interaction):
             return
@@ -264,6 +278,123 @@ class _RsFsManualResolveView(discord.ui.View):
             await interaction.response.edit_message(embed=self._render_embed(), view=self)
         except Exception:
             pass
+
+
+class _RsFsInteractionCtx:
+    """
+    Minimal ctx-like wrapper so we can re-use existing command callbacks from button clicks.
+    Uses interaction.followup for all sends (caller should defer first).
+    """
+
+    def __init__(self, interaction: discord.Interaction):
+        self._interaction = interaction
+        self.author = getattr(interaction, "user", None)
+        self.guild = getattr(interaction, "guild", None)
+        self.channel = getattr(interaction, "channel", None)
+
+    async def send(self, content: Optional[str] = None, **kwargs):
+        return await self._interaction.followup.send(content=content, **kwargs)
+
+
+class _RsFsCheckView(discord.ui.View):
+    def __init__(self, bot_obj: "RSForwarderBot", *, owner_id: int = 0, run_limit: int = 250):
+        super().__init__(timeout=900)
+        self._bot = bot_obj
+        self._owner_id = int(owner_id or 0)
+        self._run_limit = int(run_limit or 0)
+
+    async def _guard(self, interaction: discord.Interaction) -> bool:
+        try:
+            uid = int(getattr(getattr(interaction, "user", None), "id", 0) or 0)
+        except Exception:
+            uid = 0
+        # Allow server admins to use the buttons even if not the owner.
+        try:
+            perms = getattr(getattr(interaction, "user", None), "guild_permissions", None)
+            is_admin = bool(getattr(perms, "administrator", False))
+        except Exception:
+            is_admin = False
+        if self._owner_id and uid and uid != self._owner_id and not is_admin:
+            try:
+                await interaction.response.send_message("❌ This RS-FS session belongs to the command invoker.", ephemeral=True)
+            except Exception:
+                pass
+            return False
+        return True
+
+    @discord.ui.button(label="Run mirror sync", style=discord.ButtonStyle.primary)
+    async def run_sync(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        if not await self._guard(interaction):
+            return
+        # Require admin to start writes from a button (prevents accidental runs).
+        try:
+            perms = getattr(getattr(interaction, "user", None), "guild_permissions", None)
+            if not bool(getattr(perms, "administrator", False)):
+                await interaction.response.send_message("❌ Admins only: run `!rsfsrun` if you need a live write.", ephemeral=True)
+                return
+        except Exception:
+            pass
+        try:
+            await interaction.response.defer(thinking=False)
+        except Exception:
+            pass
+        cmd = None
+        try:
+            cmd = self._bot.bot.get_command("rsfsrun")
+        except Exception:
+            cmd = None
+        if not cmd:
+            await interaction.followup.send("❌ `rsfsrun` command not found.", ephemeral=True)
+            return
+        ctx2 = _RsFsInteractionCtx(interaction)
+        try:
+            await cmd.callback(ctx2, str(self._run_limit))  # type: ignore[misc]
+        except Exception as e:
+            await interaction.followup.send(f"❌ Failed to run sync: {str(e)[:200]}", ephemeral=True)
+
+    @discord.ui.button(label="Monitor scan", style=discord.ButtonStyle.secondary)
+    async def scan_monitors(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        if not await self._guard(interaction):
+            return
+        try:
+            perms = getattr(getattr(interaction, "user", None), "guild_permissions", None)
+            if not bool(getattr(perms, "administrator", False)):
+                await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+                return
+        except Exception:
+            pass
+        try:
+            await interaction.response.defer(thinking=False)
+        except Exception:
+            pass
+        cmd = None
+        try:
+            cmd = self._bot.bot.get_command("rsfsmonitorscan")
+        except Exception:
+            cmd = None
+        if not cmd:
+            await interaction.followup.send("❌ `rsfsmonitorscan` command not found.", ephemeral=True)
+            return
+        ctx2 = _RsFsInteractionCtx(interaction)
+        try:
+            await cmd.callback(ctx2)  # type: ignore[misc]
+        except Exception as e:
+            await interaction.followup.send(f"❌ Failed to scan monitors: {str(e)[:200]}", ephemeral=True)
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.success)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        if not await self._guard(interaction):
+            return
+        try:
+            await interaction.response.defer(thinking=False)
+        except Exception:
+            pass
+        try:
+            emb = await self._bot._build_rsfs_check_embed()
+            if interaction.message:
+                await interaction.message.edit(embed=emb, view=self)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Refresh failed: {str(e)[:200]}", ephemeral=True)
 
 
 class RSForwarderBot:
@@ -297,6 +428,8 @@ class RSForwarderBot:
         self._rs_fs_seen_message_ids: Set[int] = set()
         # Guard to prevent concurrent sheet syncs during manual runs (avoids partial-chunk thrash)
         self._rs_fs_manual_run_in_progress: bool = False
+        # Debounce for auto check/status messages (avoid spamming on multi-chunk listreleases).
+        self._rs_fs_last_auto_check_ts: float = 0.0
         
         # Validate required config
         if not self.config.get("bot_token"):
@@ -374,6 +507,187 @@ class RSForwarderBot:
                 pass
 
         return email, password
+
+    def _rsfs_auto_check_on_zephyr(self) -> bool:
+        try:
+            return bool((self.config or {}).get("rs_fs_auto_check_on_zephyr", False))
+        except Exception:
+            return False
+
+    def _rsfs_auto_check_debounce_s(self) -> float:
+        try:
+            v = float((self.config or {}).get("rs_fs_auto_check_debounce_s", 45.0) or 45.0)
+        except Exception:
+            v = 45.0
+        return max(10.0, min(v, 300.0))
+
+    async def _collect_latest_zephyr_release_feed_text(
+        self,
+        ch: discord.TextChannel,
+        *,
+        history_limit: int = 350,
+        max_chunks: int = 30,
+    ) -> Tuple[str, int, bool]:
+        """
+        Collect the most recent Zephyr /listreleases embed chunks and return merged text.
+        Returns (merged_text, chunk_count, found_header).
+        """
+        parts: List[str] = []
+        found_header = False
+        try:
+            async for m in ch.history(limit=int(history_limit or 350)):
+                if not (getattr(m, "embeds", None) or []) and not (getattr(m, "content", None) or ""):
+                    continue
+                t = self._collect_embed_text(m)
+                if not t:
+                    continue
+                if not zephyr_release_feed_parser.looks_like_release_feed_embed_text(t):
+                    continue
+                parts.append(t)
+                if "release feed" in t.lower():
+                    found_header = True
+                    break
+                if len(parts) >= int(max_chunks or 30):
+                    break
+        except Exception:
+            parts = []
+            found_header = False
+
+        if not parts:
+            return "", 0, False
+        merged = "\n".join(reversed(parts))
+        return merged, len(parts), bool(found_header)
+
+    async def _build_rsfs_check_embed(self) -> discord.Embed:
+        """
+        Build a rich RS-FS status/check embed:
+        - Google Sheets readiness
+        - Sheet SKU count
+        - Latest /listreleases counts (and why they may differ)
+        """
+        sid = str((self.config or {}).get("rs_fs_sheet_spreadsheet_id") or "").strip()
+        gid = str((self.config or {}).get("rs_fs_sheet_tab_gid") or "").strip()
+
+        ok = False
+        msg = "not initialized"
+        tab = None
+        n = 0
+        try:
+            if getattr(self, "_rs_fs_sheet", None):
+                ok, msg, tab, n = await self._rs_fs_sheet.preflight()
+        except Exception as e:
+            ok, msg, tab, n = False, f"failed: {str(e)[:200]}", None, 0
+
+        emb = _rsfs_embed(
+            "RS-FS Check",
+            status=("✅ OK" if ok else f"❌ NOT ready: {msg}"),
+            color=(discord.Color.green() if ok else discord.Color.red()),
+            fields=[
+                ("Spreadsheet", f"`{sid}`" if sid else "—", False),
+                ("Tab", f"`{tab}` (gid={gid})" if (tab and gid) else (f"gid={gid}" if gid else "—"), False),
+                ("Existing SKUs (sheet)", str(int(n or 0)), True),
+            ],
+            footer="RS-FS • Buttons below run actions",
+        )
+
+        # Best-effort: analyze the latest /listreleases output (why counts differ)
+        try:
+            ch_id = self._zephyr_release_feed_channel_id()
+        except Exception:
+            ch_id = None
+        if not ch_id:
+            return emb
+
+        ch = None
+        try:
+            ch = await self._resolve_channel_by_id(int(ch_id))
+        except Exception:
+            ch = None
+        if not ch or not hasattr(ch, "history"):
+            emb.add_field(name="Latest /listreleases", value="❌ cannot access Zephyr channel", inline=False)
+            return emb
+
+        merged_text, chunk_n, _found_header = await self._collect_latest_zephyr_release_feed_text(ch)
+        if not merged_text:
+            emb.add_field(name="Latest /listreleases", value="❌ no recent release-feed embeds found", inline=False)
+            return emb
+
+        # Count enumerated items, parseable pairs, duplicates, and unparseable lines.
+        import re as _re
+
+        nums = set(_re.findall(r"(?:^|\n)\s*(?:\*\*)?(\d{1,4})\.(?:\*\*)?\s*\+", merged_text, flags=_re.IGNORECASE))
+        total_items = len(nums)
+        pairs = zephyr_release_feed_parser.parse_release_feed_pairs(merged_text) or []
+        sku_to_store: Dict[str, str] = {}
+        skus = []
+        for st, sk in pairs:
+            k = str(sk or "").strip().lower()
+            if not k:
+                continue
+            if k not in sku_to_store:
+                sku_to_store[k] = str(st or "").strip()
+            skus.append(k)
+        unique_skus = set(skus)
+        dupes = max(0, len(skus) - len(unique_skus))
+
+        unparseable_lines: List[str] = []
+        for m in _re.finditer(r"(?:^|\n)\s*(?:\*\*)?(\d{1,4})\.(?:\*\*)?\s*\+([^\n]+)", merged_text, flags=_re.IGNORECASE):
+            line = (m.group(0) or "").strip()
+            # Heuristic: parseable entries usually include a `*-monitor` bracket.
+            if "-monitor" not in line.lower():
+                unparseable_lines.append(line)
+        unparseable_count = len(unparseable_lines)
+        unparseable_sample = unparseable_lines[:8]
+
+        # Compare to what's currently in the sheet (if enabled)
+        existing_set: Set[str] = set()
+        try:
+            if ok and getattr(self, "_rs_fs_sheet", None):
+                await self._rs_fs_sheet._fetch_existing_skus_if_needed()  # type: ignore[attr-defined]
+                existing_set = set(getattr(self._rs_fs_sheet, "_dedupe_skus", set()) or set())
+        except Exception:
+            existing_set = set()
+
+        missing = sorted([k for k in unique_skus if k not in existing_set]) if existing_set else []
+        extra = sorted([k for k in existing_set if k not in unique_skus]) if existing_set else []
+
+        emb.add_field(
+            name="Latest /listreleases",
+            value="\n".join(
+                [
+                    f"items `{total_items}` • chunks `{chunk_n}`",
+                    f"parseable store+sku `{len(pairs)}` (unique `{len(unique_skus)}`, dupes `{dupes}`)",
+                    f"unparseable `{unparseable_count}`",
+                ]
+            ),
+            inline=False,
+        )
+        if unparseable_sample:
+            emb.add_field(
+                name="Why some items aren’t in the sheet",
+                value="These lines don’t contain a `*-monitor` tag, so we can’t reliably map store+SKU:\n"
+                + "\n".join([f"- {ln[:180]}" for ln in unparseable_sample]),
+                inline=False,
+            )
+        if missing:
+            sample = []
+            for k in missing[:12]:
+                st = sku_to_store.get(k) or "?"
+                sample.append(f"- `{st}` `{k}`")
+            emb.add_field(
+                name="Missing from sheet (parseable SKUs)",
+                value=f"`{len(missing)}`\n" + "\n".join(sample),
+                inline=False,
+            )
+        if extra:
+            sample = [f"- `{k}`" for k in extra[:12]]
+            emb.add_field(
+                name="In sheet but not in latest list",
+                value=f"`{len(extra)}`\n" + "\n".join(sample),
+                inline=False,
+            )
+
+        return emb
 
     def _mavely_autologin_cooldown_s(self) -> int:
         try:
@@ -1905,6 +2219,31 @@ class RSForwarderBot:
                 except Exception:
                     pass
 
+            # Optional: after a fresh /listreleases header chunk arrives, post a visible RS-FS Check card
+            # (debounced so multi-chunk lists don't spam).
+            try:
+                if self._rsfs_auto_check_on_zephyr() and ("release feed" in (text or "").lower()):
+                    now = time.time()
+                    if (now - float(getattr(self, "_rs_fs_last_auto_check_ts", 0.0) or 0.0)) >= self._rsfs_auto_check_debounce_s():
+                        self._rs_fs_last_auto_check_ts = now
+                        out_id_raw = str((self.config or {}).get("rs_fs_sheet_status_channel_id") or "").strip()
+                        out_id = int(out_id_raw) if out_id_raw else int(target_ch)
+                        out_ch = await self._resolve_channel_by_id(int(out_id))
+                        if out_ch and hasattr(out_ch, "send"):
+                            emb = await self._build_rsfs_check_embed()
+                            try:
+                                run_lim = int((self.config or {}).get("rs_fs_sheet_max_per_run") or 250)
+                            except Exception:
+                                run_lim = 250
+                            run_lim = max(10, min(run_lim, 500))
+                            await out_ch.send(
+                                embed=emb,
+                                view=_RsFsCheckView(self, owner_id=0, run_limit=run_lim),
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+            except Exception:
+                pass
+
             # Mark message processed to avoid reprocessing the same embed.
             if mid:
                 try:
@@ -2820,53 +3159,21 @@ class RSForwarderBot:
             Validate Google Sheets configuration/credentials (non-mutating).
             """
             try:
-                if not getattr(self, "_rs_fs_sheet", None):
-                    await ctx.send(
-                        embed=_rsfs_embed(
-                            "RS-FS Check",
-                            status="❌ not initialized",
-                            color=discord.Color.red(),
-                        ),
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                    return
-                ok, msg, tab, n = await self._rs_fs_sheet.preflight()
-                sid = str((self.config or {}).get("rs_fs_sheet_spreadsheet_id") or "").strip()
-                gid = str((self.config or {}).get("rs_fs_sheet_tab_gid") or "").strip()
-                if ok:
-                    await ctx.send(
-                        embed=_rsfs_embed(
-                            "RS-FS Check",
-                            status="✅ OK",
-                            color=discord.Color.green(),
-                            fields=[
-                                ("Spreadsheet", f"`{sid}`", False),
-                                ("Tab", f"`{tab}` (gid={gid})", False),
-                                ("Existing SKUs", str(n), True),
-                            ],
-                        ),
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                else:
-                    extra = ""
-                    try:
-                        extra = (self._rs_fs_sheet.last_service_error() or "").strip()
-                    except Exception:
-                        extra = ""
-                    hint = f"{extra}".strip()
-                    await ctx.send(
-                        embed=_rsfs_embed(
-                            "RS-FS Check",
-                            status=f"❌ NOT ready: {msg}",
-                            color=discord.Color.red(),
-                            fields=[
-                                ("Spreadsheet", f"`{sid}`", False),
-                                ("Tab GID", f"`{gid}`", True),
-                                ("Details", hint or "—", False),
-                            ],
-                        ),
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
+                emb = await self._build_rsfs_check_embed()
+                try:
+                    run_lim = int((self.config or {}).get("rs_fs_sheet_max_per_run") or 250)
+                except Exception:
+                    run_lim = 250
+                run_lim = max(10, min(run_lim, 500))
+                try:
+                    owner_id = int(getattr(getattr(ctx, "author", None), "id", 0) or 0)
+                except Exception:
+                    owner_id = 0
+                await ctx.send(
+                    embed=emb,
+                    view=_RsFsCheckView(self, owner_id=owner_id, run_limit=run_lim),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
             except Exception as e:
                 await ctx.send(
                     embed=_rsfs_embed(
@@ -2932,39 +3239,26 @@ class RSForwarderBot:
                     except Exception:
                         progress_msg = None
 
-                    # Collect the most recent listreleases run.
-                    merged_text_parts: List[str] = []
-                    found_header = False
-                    try:
-                        async for m in ch.history(limit=350):
-                            if not (getattr(m, "embeds", None) or []) and not (getattr(m, "content", None) or ""):
-                                continue
-                            t = self._collect_embed_text(m)
-                            if not t:
-                                continue
-                            if not zephyr_release_feed_parser.looks_like_release_feed_embed_text(t):
-                                continue
-                            merged_text_parts.append(t)
-                            if "release feed" in t.lower():
-                                found_header = True
-                                break
-                            if len(merged_text_parts) >= 30:
-                                break
-                    except Exception:
-                        merged_text_parts = []
-
-                    if not merged_text_parts:
+                    # Collect the most recent listreleases run (merged from Zephyr chunks).
+                    merged_text, _chunk_n, _found_header = await self._collect_latest_zephyr_release_feed_text(ch)
+                    if not merged_text:
                         await ctx.send("❌ Could not find recent Zephyr `Release Feed(s)` embed chunks in that channel.")
                         return
-
-                    merged_text = "\n".join(reversed(merged_text_parts))
-                    pairs = zephyr_release_feed_parser.parse_release_feed_pairs(merged_text)
-                    if not pairs:
+                    items = zephyr_release_feed_parser.parse_release_feed_items(merged_text)
+                    if not items:
                         await ctx.send("❌ Parsed 0 items from the merged Zephyr text.")
                         return
 
                     # Limit to the requested max (preserve order).
-                    pairs = list(pairs)[:lim]
+                    items = list(items)[:lim]
+                    pairs = [(it.store, it.sku) for it in items]
+                    # Release id lookup for reporting (/removereleaseid helper).
+                    rid_by_key: Dict[str, int] = {}
+                    for it in items:
+                        try:
+                            rid_by_key[self._rs_fs_override_key(it.store, it.sku)] = int(getattr(it, "release_id", 0) or 0)
+                        except Exception:
+                            continue
                     total = len(pairs)
 
                     if progress_msg:
@@ -3261,6 +3555,88 @@ class RSForwarderBot:
                                 allowed_mentions=discord.AllowedMentions.none(),
                             )
 
+                        # Management output: one embed per store with release_id + sku (+ short title) and
+                        # a copy-ready /removereleaseid command.
+                        try:
+                            by_store: Dict[str, List[rs_fs_sheet_sync.RsFsPreviewEntry]] = {}
+                            for e in entries or []:
+                                st = str(getattr(e, "store", "") or "").strip() or "Unknown"
+                                by_store.setdefault(st, []).append(e)
+
+                            # Also collect non-monitor/unparseable lines for visibility (e.g. [ubiquiti] entries).
+                            import re as _re
+
+                            unparseable: List[Tuple[int, str]] = []
+                            for m2 in _re.finditer(r"(?:^|\n)\s*(?:\*\*)?(\d{1,4})\.(?:\*\*)?\s*\+([^\n]+)", merged_text, flags=_re.IGNORECASE):
+                                rid2 = 0
+                                try:
+                                    rid2 = int(str(m2.group(1) or "0").strip() or "0")
+                                except Exception:
+                                    rid2 = 0
+                                line = (m2.group(0) or "").strip()
+                                if "-monitor" not in line.lower():
+                                    unparseable.append((rid2, line))
+
+                            # Sort stores for stability.
+                            for st in sorted(by_store.keys(), key=lambda s: s.lower()):
+                                es = by_store.get(st) or []
+
+                                def _rid_for(e2) -> int:
+                                    try:
+                                        return int(rid_by_key.get(self._rs_fs_override_key(getattr(e2, "store", ""), getattr(e2, "sku", ""))) or 0)
+                                    except Exception:
+                                        return 0
+
+                                es = sorted(es, key=lambda e2: (_rid_for(e2) or 10**9, str(getattr(e2, "sku", "") or "")))
+                                lines: List[str] = []
+                                for e2 in es:
+                                    sku2 = str(getattr(e2, "sku", "") or "").strip()
+                                    title2 = str(getattr(e2, "title", "") or "").strip()
+                                    rid2 = _rid_for(e2)
+                                    if len(title2) > 60:
+                                        title2 = title2[:57] + "..."
+                                    cmd = f"/removereleaseid release_id: {rid2}" if rid2 else "/removereleaseid release_id: ?"
+                                    if title2:
+                                        lines.append(f"`{rid2}` `{sku2}` — {title2}  {cmd}")
+                                    else:
+                                        lines.append(f"`{rid2}` `{sku2}`  {cmd}")
+
+                                # Split across multiple embeds if needed.
+                                chunk: List[str] = []
+                                char_budget = 0
+                                part = 1
+                                for ln in lines:
+                                    if char_budget + len(ln) + 1 > 3800 and chunk:
+                                        emb2 = discord.Embed(title=f"RS-FS Remove Helper — {st} (part {part})", color=discord.Color.dark_teal())
+                                        emb2.description = "\n".join(chunk)
+                                        emb2.set_footer(text="Copy the /removereleaseid line")
+                                        await ctx.send(embed=emb2, allowed_mentions=discord.AllowedMentions.none())
+                                        part += 1
+                                        chunk = []
+                                        char_budget = 0
+                                    chunk.append(ln)
+                                    char_budget += len(ln) + 1
+                                if chunk:
+                                    emb2 = discord.Embed(title=f"RS-FS Remove Helper — {st}" + (f" (part {part})" if part > 1 else ""), color=discord.Color.dark_teal())
+                                    emb2.description = "\n".join(chunk)
+                                    emb2.set_footer(text="Copy the /removereleaseid line")
+                                    await ctx.send(embed=emb2, allowed_mentions=discord.AllowedMentions.none())
+
+                            if unparseable:
+                                up_lines = []
+                                for rid2, line in unparseable[:25]:
+                                    cmd = f"/removereleaseid release_id: {rid2}" if rid2 else "/removereleaseid release_id: ?"
+                                    txt = line
+                                    if len(txt) > 140:
+                                        txt = txt[:137] + "..."
+                                    up_lines.append(f"`{rid2}` — {txt}  {cmd}")
+                                emb_u = discord.Embed(title="RS-FS Remove Helper — Unparseable (no -monitor tag)", color=discord.Color.orange())
+                                emb_u.description = "\n".join(up_lines)
+                                emb_u.set_footer(text="These items cannot be mapped to a store/SKU automatically")
+                                await ctx.send(embed=emb_u, allowed_mentions=discord.AllowedMentions.none())
+                        except Exception:
+                            pass
+
                         # Offer manual resolution for any remaining blocked/empty items.
                         needs_manual = [
                             e
@@ -3269,13 +3645,10 @@ class RSForwarderBot:
                             and ("blocked" in str(getattr(e, "error", "") or "").lower() or "title not found" in str(getattr(e, "error", "") or "").lower())
                         ]
                         if needs_manual:
+                            view = _RsFsManualResolveView(self, ctx, needs_manual)  # type: ignore[name-defined]
                             await ctx.send(
-                                embed=discord.Embed(
-                                    title="RS-FS: Manual resolve needed",
-                                    description=f"{len(needs_manual)} item(s) were blocked/missing titles. Click **Provide link** to paste the correct store URL.",
-                                    color=discord.Color.orange(),
-                                ),
-                                view=_RsFsManualResolveView(self, ctx, needs_manual),  # type: ignore[name-defined]
+                                embed=view._render_embed(),
+                                view=view,
                                 allowed_mentions=discord.AllowedMentions.none(),
                             )
                         else:

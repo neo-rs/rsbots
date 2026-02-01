@@ -7,6 +7,7 @@ from typing import Iterable, List, Optional, Tuple
 
 @dataclass(frozen=True)
 class ZephyrReleaseFeedItem:
+    release_id: int
     sku: str
     store: str
     source_tag: str
@@ -142,24 +143,32 @@ def parse_release_feed_items(text: str) -> List[ZephyrReleaseFeedItem]:
     """
     items: List[ZephyrReleaseFeedItem] = []
     pending_sku: Optional[str] = None
+    pending_release_id: Optional[int] = None
     pending_sign: Optional[str] = None
 
     # First try line-based parsing (older embed formatting).
     for line in _iter_lines(text):
         m_sku = _SKU_LINE_RE.match(line)
         if m_sku:
+            try:
+                rid = int(str(m_sku.group(1) or "0").strip() or "0")
+            except Exception:
+                rid = 0
             sign = (m_sku.group(2) or "").strip()
             token = _clean_sku_token(m_sku.group(3) or "")
             # Ignore removals (e.g. "-15558409905")
             if sign.startswith("-"):
                 pending_sku = None
+                pending_release_id = None
                 pending_sign = None
                 continue
 
             pending_sku = token
+            pending_release_id = rid if rid > 0 else None
             pending_sign = sign
             if not pending_sku:
                 pending_sku = None
+                pending_release_id = None
                 pending_sign = None
                 continue
 
@@ -172,8 +181,16 @@ def parse_release_feed_items(text: str) -> List[ZephyrReleaseFeedItem]:
             if tag_inline:
                 store = tag_to_store(tag_inline)
                 if store:
-                    items.append(ZephyrReleaseFeedItem(sku=pending_sku, store=store, source_tag=_norm_token(tag_inline)))
+                    items.append(
+                        ZephyrReleaseFeedItem(
+                            release_id=int(pending_release_id or 0),
+                            sku=pending_sku,
+                            store=store,
+                            source_tag=_norm_token(tag_inline),
+                        )
+                    )
                 pending_sku = None
+                pending_release_id = None
                 pending_sign = None
             continue
 
@@ -187,8 +204,16 @@ def parse_release_feed_items(text: str) -> List[ZephyrReleaseFeedItem]:
             if tag:
                 store = tag_to_store(tag)
                 if store:
-                    items.append(ZephyrReleaseFeedItem(sku=pending_sku, store=store, source_tag=_norm_token(tag)))
+                    items.append(
+                        ZephyrReleaseFeedItem(
+                            release_id=int(pending_release_id or 0),
+                            sku=pending_sku,
+                            store=store,
+                            source_tag=_norm_token(tag),
+                        )
+                    )
                 pending_sku = None
+                pending_release_id = None
                 pending_sign = None
 
     if items:
@@ -204,6 +229,10 @@ def parse_release_feed_items(text: str) -> List[ZephyrReleaseFeedItem]:
         return []
 
     for i, m in enumerate(starts):
+        try:
+            rid = int(str(m.group(1) or "0").strip() or "0")
+        except Exception:
+            rid = 0
         sign = (m.group(2) or "").strip()
         token = _clean_sku_token(m.group(3) or "")
         if not token:
@@ -223,7 +252,14 @@ def parse_release_feed_items(text: str) -> List[ZephyrReleaseFeedItem]:
         store = tag_to_store(tag)
         if not store:
             continue
-        items.append(ZephyrReleaseFeedItem(sku=token, store=store, source_tag=_norm_token(tag)))
+        items.append(
+            ZephyrReleaseFeedItem(
+                release_id=int(rid or 0),
+                sku=token,
+                store=store,
+                source_tag=_norm_token(tag),
+            )
+        )
 
     return items
 
