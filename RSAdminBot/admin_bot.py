@@ -28,7 +28,7 @@ import re
 from collections import deque
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from contextlib import suppress
 
 import aiohttp
@@ -52,6 +52,7 @@ from rsbots_manifest import DEFAULT_EXCLUDE_GLOBS as RS_DEFAULT_EXCLUDE_GLOBS
 import discord
 from discord.ext import commands
 from discord import ui
+from discord import app_commands
 
 # Colors for terminal
 class Colors:
@@ -546,11 +547,7 @@ import importlib.util as _importlib_util
 
 # Avoid import-time side effects. We only check module availability here; actual imports are lazy.
 INSPECTOR_AVAILABLE = _importlib_util.find_spec("bot_inspector") is not None
-TRACKER_AVAILABLE = (
-    _importlib_util.find_spec("whop_tracker") is not None
-    and _importlib_util.find_spec("bot_movement_tracker") is not None
-    and _importlib_util.find_spec("test_server_organizer") is not None
-)
+ORGANIZER_AVAILABLE = _importlib_util.find_spec("test_server_organizer") is not None
 
 
 class ServiceManager:
@@ -822,8 +819,9 @@ class ChannelTransferView(ui.View):
             self.category_select = None
     
     async def on_channel_select(self, interaction: discord.Interaction):
-        if not interaction.user or not self.admin_bot.is_admin(interaction.user):
-            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        if not ok:
+            await self.admin_bot._interaction_reply(interaction, content=err, ephemeral=True)
             return
         
         try:
@@ -846,8 +844,9 @@ class ChannelTransferView(ui.View):
             await interaction.response.send_message(f"❌ Error: {str(e)[:200]}", ephemeral=True)
     
     async def on_category_select(self, interaction: discord.Interaction):
-        if not interaction.user or not self.admin_bot.is_admin(interaction.user):
-            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        if not ok:
+            await self.admin_bot._interaction_reply(interaction, content=err, ephemeral=True)
             return
         
         try:
@@ -894,10 +893,7 @@ class ChannelTransferView(ui.View):
             await channel.edit(category=category, reason=f"Transferred by {interaction.user} via RSAdminBot")
             
             success_msg = f"✅ **Channel Transferred**\n`{channel.name}` → `{category.name}`"
-            if not interaction.response.is_done():
-                await interaction.response.send_message(success_msg, ephemeral=False)
-            else:
-                await interaction.followup.send(success_msg, ephemeral=False)
+            await self.admin_bot._interaction_reply(interaction, content=success_msg, ephemeral=True)
         except discord.Forbidden:
             msg = "❌ I don't have permission to edit this channel"
             if not interaction.response.is_done():
@@ -931,7 +927,7 @@ class BotSelectView(ui.View):
         """
         Args:
             admin_bot_instance: RSAdminBot instance
-            action: Action name ('start', 'stop', 'restart', 'status', 'update', 'sync', 'details', 'logs', 'info', 'config', 'commands', 'movements', 'diagnose')
+            action: Action name ('start', 'stop', 'restart', 'status', 'update', 'sync', 'details', 'logs', 'info', 'config', 'secrets', 'commands', 'fileview', 'diagnose')
             action_display: Display name for action ('Start', 'Stop', etc.)
             action_kwargs: Optional extra params for handlers (e.g. logs lines)
             bot_keys: Optional subset of bot keys to show in the dropdown
@@ -1003,14 +999,28 @@ class BotSelectView(ui.View):
     
     async def on_select(self, interaction: discord.Interaction):
         """Handle bot selection"""
-        if not self.admin_bot.is_admin(interaction.user):
-            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        if not ok:
+            await self.admin_bot._interaction_reply(interaction, content=err, ephemeral=True)
             return
         
         bot_name = interaction.data['values'][0]
         
-        # Defer to prevent timeout
-        await interaction.response.defer(ephemeral=False)
+        # Defer to prevent timeout (slash-only: always ephemeral)
+        await interaction.response.defer(ephemeral=True)
+
+        # Enforce ephemeral followups for every handler call below, even if the call site
+        # forgets to pass ephemeral=True.
+        try:
+            _orig_send = interaction.followup.send
+
+            async def _ephemeral_send(*args, **kwargs):
+                kwargs.setdefault("ephemeral", True)
+                return await _orig_send(*args, **kwargs)
+
+            interaction.followup.send = _ephemeral_send  # type: ignore[assignment]
+        except Exception:
+            pass
         
         # Route to appropriate command handler (supports single bot or "all_bots")
         if self.action == "start":
@@ -1045,12 +1055,15 @@ class BotSelectView(ui.View):
         elif self.action == "config":
             bot_info = self.admin_bot.BOTS[bot_name]
             await self._handle_config(interaction, bot_name, bot_info)
+        elif self.action == "secrets":
+            bot_info = self.admin_bot.BOTS[bot_name]
+            await self._handle_secrets(interaction, bot_name, bot_info)
         elif self.action == "commands":
             bot_info = self.admin_bot.BOTS[bot_name]
             await self._handle_commands(interaction, bot_name, bot_info)
-        elif self.action == "movements":
+        elif self.action == "fileview":
             bot_info = self.admin_bot.BOTS[bot_name]
-            await self._handle_movements(interaction, bot_name, bot_info)
+            await self._handle_fileview(interaction, bot_name, bot_info)
         elif self.action == "diagnose":
             bot_info = self.admin_bot.BOTS[bot_name]
             await self._handle_diagnose(interaction, bot_name, bot_info)
@@ -1058,7 +1071,7 @@ class BotSelectView(ui.View):
     async def _handle_start(self, interaction, bot_name):
         """Handle bot start (supports single bot or 'all_bots')"""
         if not self.admin_bot.service_manager:
-            await interaction.followup.send("❌ ServiceManager not available")
+            await interaction.followup.send("❌ ServiceManager not available", ephemeral=True)
             return
         
         # Handle "all_bots" case - use group-specific scripts for efficiency
@@ -1072,7 +1085,8 @@ class BotSelectView(ui.View):
                         {"name": "Mode", "value": "group scripts", "inline": True},
                     ],
                     footer=f"Triggered by {interaction.user}",
-                )
+                ),
+                ephemeral=True,
             )
             
             results = []
@@ -1143,7 +1157,8 @@ class BotSelectView(ui.View):
                     {"name": "Service", "value": service_name, "inline": True},
                 ],
                 footer=f"Triggered by {interaction.user}",
-            )
+            ),
+            ephemeral=True,
         )
         before_exists, before_state, _ = self.admin_bot.service_manager.get_status(service_name, bot_name=bot_name)
         before_pid = self.admin_bot.service_manager.get_pid(service_name)
@@ -1176,7 +1191,8 @@ class BotSelectView(ui.View):
                         message=f"{bot_info['name']} started successfully.",
                         fields=fields,
                         footer=f"Triggered by {interaction.user}",
-                    )
+                    ),
+                    ephemeral=True,
                 )
             try:
                 fields = [
@@ -1214,7 +1230,8 @@ class BotSelectView(ui.View):
                             {"name": "Service", "value": service_name, "inline": True},
                         ],
                         footer=f"Triggered by {interaction.user}",
-                    )
+                    ),
+                    ephemeral=True,
                 )
         else:
             error_msg = stderr or stdout or "Unknown error"
@@ -1228,13 +1245,14 @@ class BotSelectView(ui.View):
                         {"name": "Service", "value": service_name, "inline": True},
                     ],
                     footer=f"Triggered by {interaction.user}",
-                )
+                ),
+                ephemeral=True,
             )
     
     async def _handle_stop(self, interaction, bot_name):
         """Handle bot stop (supports single bot or 'all_bots')"""
         if not self.admin_bot.service_manager:
-            await interaction.followup.send("❌ ServiceManager not available")
+            await interaction.followup.send("❌ ServiceManager not available", ephemeral=True)
             return
         
         # Handle "all_bots" case - use group-specific scripts for efficiency
@@ -1248,7 +1266,8 @@ class BotSelectView(ui.View):
                         {"name": "Mode", "value": "group scripts", "inline": True},
                     ],
                     footer=f"Triggered by {interaction.user}",
-                )
+                ),
+                ephemeral=True,
             )
             
             results = []
@@ -1320,7 +1339,8 @@ class BotSelectView(ui.View):
                     {"name": "Service", "value": service_name, "inline": True},
                 ],
                 footer=f"Triggered by {interaction.user}",
-            )
+            ),
+            ephemeral=True,
         )
         before_exists, before_state, _ = self.admin_bot.service_manager.get_status(service_name, bot_name=bot_name)
         before_pid = self.admin_bot.service_manager.get_pid(service_name)
@@ -1349,7 +1369,8 @@ class BotSelectView(ui.View):
                     message=f"{bot_info['name']} stopped successfully.",
                     fields=fields,
                     footer=f"Triggered by {interaction.user}",
-                )
+                ),
+                ephemeral=True,
             )
             try:
                 fields = [
@@ -1384,13 +1405,14 @@ class BotSelectView(ui.View):
                         {"name": "Service", "value": service_name, "inline": True},
                     ],
                     footer=f"Triggered by {interaction.user}",
-                )
+                ),
+                ephemeral=True,
             )
     
     async def _handle_restart(self, interaction, bot_name):
         """Handle bot restart (supports single bot or 'all_bots')"""
         if not self.admin_bot.service_manager:
-            await interaction.followup.send("❌ ServiceManager not available")
+            await interaction.followup.send("❌ ServiceManager not available", ephemeral=True)
             return
         
         # Handle "all_bots" case - use group-specific scripts for efficiency
@@ -1404,7 +1426,8 @@ class BotSelectView(ui.View):
                         {"name": "Mode", "value": "group scripts", "inline": True},
                     ],
                     footer=f"Triggered by {interaction.user}",
-                )
+                ),
+                ephemeral=True,
             )
             
             results = []
@@ -1476,7 +1499,8 @@ class BotSelectView(ui.View):
                     {"name": "Service", "value": service_name, "inline": True},
                 ],
                 footer=f"Triggered by {interaction.user}",
-            )
+            ),
+            ephemeral=True,
         )
         before_exists, before_state, _ = self.admin_bot.service_manager.get_status(service_name, bot_name=bot_name)
         before_pid = self.admin_bot.service_manager.get_pid(service_name)
@@ -1511,7 +1535,8 @@ class BotSelectView(ui.View):
                         message=f"{bot_info['name']} restarted successfully.",
                         fields=fields,
                         footer=f"Triggered by {interaction.user}",
-                    )
+                    ),
+                    ephemeral=True,
                 )
             try:
                 fields = [
@@ -1549,7 +1574,8 @@ class BotSelectView(ui.View):
                             {"name": "Service", "value": service_name, "inline": True},
                         ],
                         footer=f"Triggered by {interaction.user}",
-                    )
+                    ),
+                    ephemeral=True,
                 )
         else:
             error_msg = stderr or stdout or "Unknown error"
@@ -1563,7 +1589,8 @@ class BotSelectView(ui.View):
                         {"name": "Service", "value": service_name, "inline": True},
                     ],
                     footer=f"Triggered by {interaction.user}",
-                )
+                ),
+                ephemeral=True,
             )
     
     async def _handle_status(self, interaction, bot_name, bot_info):
@@ -1594,7 +1621,7 @@ class BotSelectView(ui.View):
             else:
                 embed.add_field(name="Error", value=f"```{error or 'Status check failed'}```", inline=False)
         
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(embed=embed, ephemeral=True)
     
     async def _handle_update(self, interaction, bot_name, bot_info):
         """Handle bot update (GitHub python-only) from the dropdown."""
@@ -1602,7 +1629,7 @@ class BotSelectView(ui.View):
         group = self.admin_bot._get_bot_group(bot_key) or ""
 
         if bot_key == "rsadminbot" or group == "rsadminbot":
-            await interaction.followup.send("ℹ️ Use `!selfupdate` to update RSAdminBot.")
+            await interaction.followup.send("ℹ️ Use `/selfupdate` to update RSAdminBot.", ephemeral=True)
             return
 
         if group == "rs_bots":
@@ -1610,6 +1637,8 @@ class BotSelectView(ui.View):
             await interaction.followup.send(
                 f"📦 **Updating {bot_info['name']} from GitHub (python-only)...**\n"
                 f"```\nPulling + copying tracked files from {code_root}\n```"
+            ,
+                ephemeral=True,
             )
             ok, result = self.admin_bot._botupdate_one_py_only(bot_key)
         elif group == "mirror_bots":
@@ -1617,29 +1646,31 @@ class BotSelectView(ui.View):
             await interaction.followup.send(
                 f"📦 **Updating {bot_info['name']} from GitHub (python-only)...**\n"
                 f"```\nPulling + copying tracked files from {code_root}\n```"
+            ,
+                ephemeral=True,
             )
             ok, result = self.admin_bot._mwupdate_one_py_only(bot_key)
         else:
-            await interaction.followup.send(f"❌ `{bot_key}` is not in an updatable bot group.")
+            await interaction.followup.send(f"❌ `{bot_key}` is not in an updatable bot group.", ephemeral=True)
             return
 
         if not ok:
-            await interaction.followup.send(f"❌ Update failed:\n```{str(result.get('error') or 'unknown error')[:900]}```")
+            await interaction.followup.send(f"❌ Update failed:\n```{str(result.get('error') or 'unknown error')[:900]}```", ephemeral=True)
             return
 
         summary = str(result.get("summary") or "")[:1900]
-        await interaction.followup.send(summary)
+        await interaction.followup.send(summary, ephemeral=True)
 
     async def _handle_update_all_rs_bots(self, interaction) -> None:
         """Update all RS bots (python-only) from the dropdown."""
         ssh_ok, error_msg = self.admin_bot._check_ssh_available()
         if not ssh_ok:
-            await interaction.followup.send(f"❌ SSH not configured: {error_msg}")
+            await interaction.followup.send(f"❌ SSH not configured: {error_msg}", ephemeral=True)
             return
 
         rs_keys = [k for k in self.admin_bot._get_rs_bot_keys() if k in self.admin_bot.BOTS and k != "rsadminbot"]
         if not rs_keys:
-            await interaction.followup.send("❌ No RS bots configured.")
+            await interaction.followup.send("❌ No RS bots configured.", ephemeral=True)
             return
 
         code_root = self.admin_bot._get_update_code_root_for_group("rs_bots")
@@ -1652,7 +1683,8 @@ class BotSelectView(ui.View):
                     {"name": "Note", "value": "RSAdminBot is excluded (use !selfupdate).", "inline": False},
                 ],
                 footer=f"Triggered by {interaction.user}",
-            )
+            ),
+            ephemeral=True,
         )
 
         ok_count = 0
@@ -1684,12 +1716,12 @@ class BotSelectView(ui.View):
         """Update all Mirror-World bots (python-only) from the dropdown."""
         ssh_ok, error_msg = self.admin_bot._check_ssh_available()
         if not ssh_ok:
-            await interaction.followup.send(f"❌ SSH not configured: {error_msg}")
+            await interaction.followup.send(f"❌ SSH not configured: {error_msg}", ephemeral=True)
             return
 
         mw_keys = [k for k in self.admin_bot._get_mw_bot_keys() if k in self.admin_bot.BOTS]
         if not mw_keys:
-            await interaction.followup.send("❌ No Mirror-World bots configured.")
+            await interaction.followup.send("❌ No Mirror-World bots configured.", ephemeral=True)
             return
 
         code_root = self.admin_bot._get_update_code_root_for_group("mirror_bots")
@@ -1701,7 +1733,8 @@ class BotSelectView(ui.View):
                     {"name": "Bots", "value": str(len(mw_keys)), "inline": True},
                 ],
                 footer=f"Triggered by {interaction.user}",
-            )
+            ),
+            ephemeral=True,
         )
 
         ok_count = 0
@@ -1732,18 +1765,18 @@ class BotSelectView(ui.View):
     async def _handle_sync(self, interaction, bot_name, bot_info):
         """Handle bot sync from dropdown."""
         if bot_name == "all_bots":
-            await interaction.followup.send("❌ Cannot sync all bots at once. Please select a specific bot.")
+            await interaction.followup.send("❌ Cannot sync all bots at once. Please select a specific bot.", ephemeral=True)
             return
         
         ssh_ok, error_msg = self.admin_bot._check_ssh_available()
         if not ssh_ok:
-            await interaction.followup.send(f"❌ SSH not configured: {error_msg}")
+            await interaction.followup.send(f"❌ SSH not configured: {error_msg}", ephemeral=True)
             return
         
         bot_folder = str(bot_info.get("folder") or "")
         local_bot_path = self.admin_bot.base_path.parent / bot_folder
         if not local_bot_path.exists():
-            await interaction.followup.send(f"❌ Local bot folder not found: {local_bot_path}")
+            await interaction.followup.send(f"❌ Local bot folder not found: {local_bot_path}", ephemeral=True)
             return
         
         remote_root = getattr(self.admin_bot, "remote_root", "") or "/home/rsadmin/bots/mirror-world"
@@ -1753,10 +1786,12 @@ class BotSelectView(ui.View):
             f"📤 **Syncing {bot_info['name']} to server...**\n"
             f"Local: `{local_bot_path}`\n"
             f"Remote: `{remote_bot_path}`"
+            ,
+            ephemeral=True,
         )
         
         # Use the admin_bot's sync method
-        status_msg = await interaction.followup.send("⏳ Starting sync...")
+        status_msg = await interaction.followup.send("⏳ Starting sync...", ephemeral=True)
         rsync_script = self.admin_bot.base_path.parent / "Rsync" / "rsync_sync.py"
         
         if not rsync_script.exists():
@@ -1765,31 +1800,190 @@ class BotSelectView(ui.View):
             await self.admin_bot._sync_bot_via_script(None, status_msg, bot_info, bot_folder, local_bot_path, remote_bot_path, rsync_script, False, False)
     
     async def _handle_info(self, interaction, bot_name, bot_info):
-        """Handle bot info"""
-        await interaction.followup.send("ℹ️ Use `!botinfo <botname>` for detailed information.")
+        """Handle bot info (dropdown)."""
+        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        if not ok:
+            await interaction.followup.send(err, ephemeral=True)
+            return
+
+        bot_key = str(bot_name or "").strip().lower()
+        info = self.admin_bot.BOTS.get(bot_key) or {}
+        folder = str(info.get("folder") or "").strip()
+        service = str(info.get("service") or "").strip()
+        script = str(info.get("script") or "").strip()
+        group = str(self.admin_bot._get_bot_group(bot_key) or "").strip()
+
+        repo_root = self.admin_bot.base_path.parent
+        local_folder = (repo_root / folder).resolve() if folder else None
+        exists_folder = bool(local_folder and local_folder.exists())
+        cfg_path = (local_folder / "config.json") if local_folder else None
+        secrets_path = (local_folder / "config.secrets.json") if local_folder else None
+
+        fields = [
+            {"name": "Key", "value": f"`{bot_key}`", "inline": True},
+            {"name": "Group", "value": f"`{group or '(unknown)'}`", "inline": True},
+            {"name": "Service", "value": f"`{service or '(missing)'}`", "inline": False},
+            {"name": "Folder", "value": f"`{folder or '(missing)'}`", "inline": True},
+            {"name": "Folder exists", "value": "YES" if exists_folder else "NO", "inline": True},
+        ]
+        if script:
+            fields.append({"name": "Script", "value": f"`{script}`", "inline": True})
+        if cfg_path:
+            fields.append({"name": "config.json", "value": "YES" if cfg_path.exists() else "NO", "inline": True})
+        if secrets_path:
+            fields.append({"name": "config.secrets.json", "value": "YES" if secrets_path.exists() else "NO", "inline": True})
+
+        if self.admin_bot.service_manager and service:
+            exists, state, _ = self.admin_bot.service_manager.get_status(service, bot_name=bot_key)
+            pid = self.admin_bot.service_manager.get_pid(service)
+            fields.append({"name": "Status", "value": str(state or "unknown") if exists else "not_found", "inline": True})
+            if pid:
+                fields.append({"name": "PID", "value": str(pid), "inline": True})
+
+        embed = MessageHelper.create_info_embed(
+            title=f"Bot Info: {info.get('name', bot_key)}",
+            message="",
+            fields=fields,
+            footer=f"Triggered by {interaction.user}",
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
     
     async def _handle_config(self, interaction, bot_name, bot_info):
         """Handle bot config"""
-        if not self.admin_bot.is_admin(interaction.user):
-            await interaction.followup.send("❌ You don't have permission to use this command.")
+        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        if not ok:
+            await interaction.followup.send(err, ephemeral=True)
             return
         embed = self.admin_bot._build_botconfig_embed(bot_name, triggered_by=interaction.user)
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(embed=embed, view=BotConfigActionsView(self.admin_bot, bot_name), ephemeral=True)
+
+    async def _handle_secrets(self, interaction, bot_name, bot_info):
+        """Handle bot secrets status (masked) + update flow."""
+        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        if not ok:
+            await interaction.followup.send(err, ephemeral=True)
+            return
+
+        folder = self.admin_bot._bot_folder_path(bot_name)
+        secrets_path = folder / "config.secrets.json"
+        ok_j, data, err_j = self.admin_bot._json_load_file(secrets_path)
+        if not ok_j:
+            await interaction.followup.send(
+                embed=MessageHelper.create_error_embed(
+                    title="Secrets Not Available",
+                    message=f"Failed to read `{bot_name}` secrets.",
+                    error_details=err_j[:900],
+                    footer=f"Triggered by {interaction.user}",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        lines: List[str] = []
+        for k in sorted(data.keys()):
+            v = data.get(k)
+            if isinstance(v, str):
+                lines.append(f"- **{k}**: `{mask_secret(v)}`")
+            elif isinstance(v, dict):
+                lines.append(f"- **{k}**: object ({len(v)} keys)")
+            elif isinstance(v, list):
+                lines.append(f"- **{k}**: list ({len(v)} items)")
+            else:
+                lines.append(f"- **{k}**: {type(v).__name__}")
+        body = "\n".join(lines) if lines else "(empty)"
+        if len(body) > 900:
+            body = body[:900] + "\n…(truncated)…"
+
+        embed = MessageHelper.create_info_embed(
+            title="Secrets Status (masked)",
+            message=body,
+            fields=[{"name": "File", "value": f"`{str(secrets_path)}`", "inline": False}],
+            footer=f"Triggered by {interaction.user}",
+        )
+        await interaction.followup.send(embed=embed, view=BotSecretsActionsView(self.admin_bot, bot_name), ephemeral=True)
 
     async def _handle_commands(self, interaction, bot_name, bot_info):
         """Handle COMMANDS.md view via dropdown selection."""
         try:
+            async def _send(**kwargs):
+                kwargs.setdefault("ephemeral", True)
+                return await interaction.followup.send(**kwargs)
+
             await self.admin_bot._commands_send_for_bot(
                 bot_key=bot_name,
-                send=interaction.followup.send,
+                send=_send,
                 triggered_by=interaction.user,
             )
         except Exception as e:
-            await interaction.followup.send(f"❌ Failed to show commands: {str(e)[:200]}")
-    
-    async def _handle_movements(self, interaction, bot_name, bot_info):
-        """Handle bot movements"""
-        await interaction.followup.send("ℹ️ Use `!botmovements <botname>` to view activity logs.")
+            await interaction.followup.send(f"❌ Failed to show commands: {str(e)[:200]}", ephemeral=True)
+
+    async def _handle_fileview(self, interaction, bot_name, bot_info):
+        """Show a quick file listing (sizes + mtimes) for a bot folder."""
+        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        if not ok:
+            await interaction.followup.send(err, ephemeral=True)
+            return
+
+        bot_key = str(bot_name or "").strip().lower()
+        folder = self.admin_bot._bot_folder_path(bot_key)
+        if not folder.exists():
+            await interaction.followup.send(f"❌ Folder not found: `{folder}`", ephemeral=True)
+            return
+
+        mode = str((self.action_kwargs or {}).get("mode") or "").strip().lower()
+        include = ["*.py", "*.sh", "*.md", "*.txt", "requirements.txt", "config.json", "messages.json", "vouch_config.json"]
+        if mode in ("alljson", "json", "all_json"):
+            include.append("*.json")
+
+        exclude_names = {"config.secrets.json"}
+        skip_dirs = {"__pycache__", ".git", ".venv", "venv", "backups"}
+
+        files: List[Path] = []
+        for pat in include:
+            try:
+                for p in folder.rglob(pat):
+                    if p.is_dir():
+                        continue
+                    if p.name in exclude_names:
+                        continue
+                    if any(part in skip_dirs for part in p.parts):
+                        continue
+                    files.append(p)
+            except Exception:
+                continue
+
+        uniq: Dict[str, Path] = {}
+        for p in files:
+            try:
+                rel = p.relative_to(folder).as_posix()
+            except Exception:
+                rel = str(p)
+            uniq[rel] = p
+        rows: List[tuple[float, str]] = []
+        for rel, p in uniq.items():
+            try:
+                st = p.stat()
+                mtime = st.st_mtime
+                size = st.st_size
+                ts = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+                rows.append((mtime, f"{size:>10}  {ts}  {rel}"))
+            except Exception:
+                continue
+        rows.sort(key=lambda x: x[0], reverse=True)
+        body = "\n".join([r for _, r in rows[:60]]) if rows else "(no matching files)"
+        if len(body) > 1800:
+            body = "…(truncated)…\n" + body[-1800:]
+
+        embed = MessageHelper.create_info_embed(
+            title=f"Fileview: {bot_key}",
+            message=self.admin_bot._codeblock(body, limit=1800),
+            fields=[
+                {"name": "Folder", "value": f"`{str(folder)}`", "inline": False},
+                {"name": "Mode", "value": mode or "default", "inline": True},
+            ],
+            footer=f"Triggered by {interaction.user}",
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
     
     async def _handle_diagnose(self, interaction, bot_name, bot_info):
         """Handle bot diagnose"""
@@ -1819,29 +2013,202 @@ class BotSelectView(ui.View):
             else:
                 embed.add_field(name="Service Status", value="⚠️ Service not found", inline=False)
         
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     async def _handle_details(self, interaction, bot_name, bot_info):
         """Show systemd details via botctl.sh (dropdown action)."""
-        if not self.admin_bot.is_admin(interaction.user):
-            await interaction.followup.send("❌ You don't have permission to use this command.")
+        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        if not ok:
+            await interaction.followup.send(err, ephemeral=True)
             return
         svc = str(bot_info.get("service") or "")
-        await interaction.followup.send(f"🧾 **Details: {bot_info.get('name', bot_name)}**\nService: `{svc}`")
+        await interaction.followup.send(f"🧾 **Details: {bot_info.get('name', bot_name)}**\nService: `{svc}`", ephemeral=True)
         success, out, err = self.admin_bot._execute_sh_script("botctl.sh", "details", bot_name)
-        await interaction.followup.send(self.admin_bot._codeblock(out or err or ""))
+        await interaction.followup.send(self.admin_bot._codeblock(out or err or ""), ephemeral=True)
 
     async def _handle_logs(self, interaction, bot_name, bot_info):
         """Show journalctl logs via botctl.sh (dropdown action)."""
-        if not self.admin_bot.is_admin(interaction.user):
-            await interaction.followup.send("❌ You don't have permission to use this command.")
+        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        if not ok:
+            await interaction.followup.send(err, ephemeral=True)
             return
         svc = str(bot_info.get("service") or "")
         lines = int(self.action_kwargs.get("lines") or 80)
         lines = max(10, min(lines, 400))
-        await interaction.followup.send(f"📜 **Logs: {bot_info.get('name', bot_name)}**\nService: `{svc}`\nLines: `{lines}`")
+        await interaction.followup.send(f"📜 **Logs: {bot_info.get('name', bot_name)}**\nService: `{svc}`\nLines: `{lines}`", ephemeral=True)
         success, out, err = self.admin_bot._execute_sh_script("botctl.sh", "logs", bot_name, str(lines))
-        await interaction.followup.send(self.admin_bot._codeblock(out or err or ""))
+        await interaction.followup.send(self.admin_bot._codeblock(out or err or ""), ephemeral=True)
+
+
+class BotConfigEditModal(ui.Modal):
+    def __init__(self, admin_bot_instance: "RSAdminBot", bot_key: str):
+        super().__init__(title=f"Edit {bot_key} config.json")
+        self.admin_bot = admin_bot_instance
+        self.bot_key = str(bot_key or "").strip().lower()
+
+        self.key_path = ui.TextInput(
+            label="Key path (dot notation)",
+            placeholder="example: dm_sequence.send_spacing_seconds",
+            required=True,
+            max_length=200,
+        )
+        self.json_value = ui.TextInput(
+            label="JSON value",
+            placeholder='example: 10  (or "text", true, [1,2], {"a":1})',
+            required=True,
+            max_length=1000,
+            style=discord.TextStyle.paragraph,
+        )
+        self.add_item(self.key_path)
+        self.add_item(self.json_value)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        if not ok:
+            await self.admin_bot._interaction_reply(interaction, content=err, ephemeral=True)
+            return
+
+        ok_u, result = self.admin_bot._update_bot_config_json(self.bot_key, str(self.key_path.value), str(self.json_value.value))
+        if not ok_u:
+            await self.admin_bot._interaction_reply(
+                interaction,
+                embed=MessageHelper.create_error_embed(
+                    title="Config Update Failed",
+                    message="Failed to update config.json.",
+                    error_details=str((result or {}).get("error") or "unknown error")[:900],
+                    footer=f"Triggered by {interaction.user}",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await self.admin_bot._interaction_reply(
+            interaction,
+            embed=MessageHelper.create_success_embed(
+                title="Config Updated",
+                message=f"Updated `{self.bot_key}` config.json.",
+                fields=[
+                    {"name": "Path", "value": f"`{(result or {}).get('key_path')}`", "inline": False},
+                    {"name": "Backup", "value": f"`{str((result or {}).get('backup') or '')[:200]}`" or "(none)", "inline": False},
+                ],
+                footer=f"Triggered by {interaction.user}",
+            ),
+            ephemeral=True,
+        )
+
+
+class BotConfigActionsView(ui.View):
+    def __init__(self, admin_bot_instance: "RSAdminBot", bot_key: str):
+        super().__init__(timeout=300)
+        self.admin_bot = admin_bot_instance
+        self.bot_key = str(bot_key or "").strip().lower()
+
+    async def _deny_if_needed(self, interaction: discord.Interaction) -> bool:
+        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        if not ok:
+            await self.admin_bot._interaction_reply(interaction, content=err, ephemeral=True)
+            return True
+        return False
+
+    @ui.button(label="Edit config.json", style=discord.ButtonStyle.primary)
+    async def edit_config(self, interaction: discord.Interaction, button: ui.Button) -> None:
+        if await self._deny_if_needed(interaction):
+            return
+        await interaction.response.send_modal(BotConfigEditModal(self.admin_bot, self.bot_key))
+
+    @ui.button(label="Restart bot", style=discord.ButtonStyle.secondary)
+    async def restart_bot(self, interaction: discord.Interaction, button: ui.Button) -> None:
+        if await self._deny_if_needed(interaction):
+            return
+        info = self.admin_bot.BOTS.get(self.bot_key) or {}
+        service = str(info.get("service") or "").strip()
+        if not service or not self.admin_bot.service_manager:
+            await self.admin_bot._interaction_reply(interaction, content="❌ ServiceManager not available or missing service mapping.", ephemeral=True)
+            return
+        ok_r, out_r, err_r = self.admin_bot.service_manager.restart(service, bot_name=self.bot_key)
+        if not ok_r:
+            msg = (err_r or out_r or "restart failed")[:500]
+            await self.admin_bot._interaction_reply(interaction, content=f"❌ Restart failed: {msg}", ephemeral=True)
+            return
+        await self.admin_bot._interaction_reply(interaction, content="✅ Restart initiated.", ephemeral=True)
+
+
+class BotSecretsEditModal(ui.Modal):
+    def __init__(self, admin_bot_instance: "RSAdminBot", bot_key: str):
+        super().__init__(title=f"Edit {bot_key} config.secrets.json")
+        self.admin_bot = admin_bot_instance
+        self.bot_key = str(bot_key or "").strip().lower()
+
+        self.key_path = ui.TextInput(
+            label="Secret key path (dot notation)",
+            placeholder="example: bot_token  (or whop_webhook.secret)",
+            required=True,
+            max_length=200,
+        )
+        self.json_value = ui.TextInput(
+            label="JSON value",
+            placeholder='example: "my-secret-string"',
+            required=True,
+            max_length=1000,
+            style=discord.TextStyle.paragraph,
+        )
+        self.add_item(self.key_path)
+        self.add_item(self.json_value)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        if not ok:
+            await self.admin_bot._interaction_reply(interaction, content=err, ephemeral=True)
+            return
+
+        ok_u, result = self.admin_bot._update_bot_secrets_json(self.bot_key, str(self.key_path.value), str(self.json_value.value))
+        if not ok_u:
+            await self.admin_bot._interaction_reply(
+                interaction,
+                embed=MessageHelper.create_error_embed(
+                    title="Secrets Update Failed",
+                    message="Failed to update config.secrets.json.",
+                    error_details=str((result or {}).get("error") or "unknown error")[:900],
+                    footer=f"Triggered by {interaction.user}",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await self.admin_bot._interaction_reply(
+            interaction,
+            embed=MessageHelper.create_success_embed(
+                title="Secrets Updated",
+                message=f"Updated `{self.bot_key}` config.secrets.json.",
+                fields=[
+                    {"name": "Path", "value": f"`{(result or {}).get('key_path')}`", "inline": False},
+                    {"name": "Value (masked)", "value": f"`{str((result or {}).get('value_masked') or '')[:200]}`", "inline": False},
+                    {"name": "Backup", "value": f"`{str((result or {}).get('backup') or '')[:200]}`" or "(none)", "inline": False},
+                ],
+                footer=f"Triggered by {interaction.user}",
+            ),
+            ephemeral=True,
+        )
+
+
+class BotSecretsActionsView(ui.View):
+    def __init__(self, admin_bot_instance: "RSAdminBot", bot_key: str):
+        super().__init__(timeout=300)
+        self.admin_bot = admin_bot_instance
+        self.bot_key = str(bot_key or "").strip().lower()
+
+    async def _deny_if_needed(self, interaction: discord.Interaction) -> bool:
+        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        if not ok:
+            await self.admin_bot._interaction_reply(interaction, content=err, ephemeral=True)
+            return True
+        return False
+
+    @ui.button(label="Edit config.secrets.json", style=discord.ButtonStyle.danger)
+    async def edit_secrets(self, interaction: discord.Interaction, button: ui.Button) -> None:
+        if await self._deny_if_needed(interaction):
+            return
+        await interaction.response.send_modal(BotSecretsEditModal(self.admin_bot, self.bot_key))
 
 
 class StartBotView(ui.View):
@@ -1856,9 +2223,9 @@ class StartBotView(ui.View):
     @ui.button(label="🟢 Start Bot", style=discord.ButtonStyle.success)
     async def start_bot(self, interaction: discord.Interaction, button: ui.Button):
         """Start the bot when button is clicked"""
-        # Check if user is admin
-        if not self.admin_bot.is_admin(interaction.user):
-            await interaction.response.send_message("❌ You don't have permission to start bots.", ephemeral=True)
+        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        if not ok:
+            await self.admin_bot._interaction_reply(interaction, content=err, ephemeral=True)
             return
         
         # Disable button to prevent multiple clicks
@@ -1887,7 +2254,7 @@ class StartBotView(ui.View):
         
         # Start service using ServiceManager
         if not self.admin_bot.service_manager:
-            await interaction.followup.send("❌ SSH not available", ephemeral=False)
+            await interaction.followup.send("❌ ServiceManager not available", ephemeral=True)
             return
         
         success, stdout, stderr = self.admin_bot.service_manager.start(service_name, unmask=True, bot_name=self.bot_name)
@@ -1898,7 +2265,7 @@ class StartBotView(ui.View):
             if is_running:
                 button.label = "✅ Started"
                 button.style = discord.ButtonStyle.success
-                await interaction.followup.send(f"✅ **{bot_info['name']}** started successfully!", ephemeral=False)
+                await interaction.followup.send(f"✅ **{bot_info['name']}** started successfully!", ephemeral=True)
                 try:
                     ok_embed = MessageHelper.create_success_embed(
                         title="Bot Started",
@@ -1916,7 +2283,7 @@ class StartBotView(ui.View):
                 button.label = "❌ Failed"
                 button.style = discord.ButtonStyle.danger
                 error_msg = verify_error or stderr or stdout or "Unknown error"
-                await interaction.followup.send(f"❌ Failed to start {bot_info['name']}:\n```{error_msg[:500]}```", ephemeral=False)
+                await interaction.followup.send(f"❌ Failed to start {bot_info['name']}:\n```{error_msg[:500]}```", ephemeral=True)
                 try:
                     err_embed = MessageHelper.create_error_embed(
                         title="Failed to Start Bot",
@@ -1935,7 +2302,7 @@ class StartBotView(ui.View):
             button.label = "❌ Failed"
             button.style = discord.ButtonStyle.danger
             error_msg = stderr or stdout or "Unknown error"
-            await interaction.followup.send(f"❌ Failed to start {bot_info['name']}:\n```{error_msg[:500]}```", ephemeral=False)
+            await interaction.followup.send(f"❌ Failed to start {bot_info['name']}:\n```{error_msg[:500]}```", ephemeral=True)
             try:
                 err_embed = MessageHelper.create_error_embed(
                     title="Failed to Start Bot",
@@ -1953,6 +2320,766 @@ class StartBotView(ui.View):
         
         # Update the message
         await interaction.edit_original_response(view=self)
+
+
+class RSAdminSlashCog(commands.Cog):
+    """Slash-only command surface for RSAdminBot (ephemeral, test-server, owner-only)."""
+
+    def __init__(self, admin_bot_instance: "RSAdminBot"):
+        self.admin_bot = admin_bot_instance
+
+    async def _guard(self, interaction: discord.Interaction) -> bool:
+        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        if not ok:
+            await self.admin_bot._interaction_reply(interaction, content=err, ephemeral=True)
+            return False
+        return True
+
+    async def _send_bot_select(
+        self,
+        interaction: discord.Interaction,
+        *,
+        action: str,
+        action_display: str,
+        title: str,
+        description: str,
+        bot_keys: Optional[List[str]] = None,
+        action_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not await self._guard(interaction):
+            return
+        view = BotSelectView(self.admin_bot, action, action_display, action_kwargs=action_kwargs, bot_keys=bot_keys)
+        embed = discord.Embed(title=title, description=description, color=discord.Color.blurple())
+        await self.admin_bot._interaction_reply(interaction, embed=embed, view=view, ephemeral=True)
+
+    @app_commands.command(name="ping", description="Check RSAdminBot latency (owner-only).")
+    async def ping(self, interaction: discord.Interaction) -> None:
+        if not await self._guard(interaction):
+            return
+        latency_ms = round(self.admin_bot.bot.latency * 1000)
+        embed = MessageHelper.create_info_embed(
+            title="Pong",
+            message="RSAdminBot is responding.",
+            fields=[{"name": "Latency", "value": f"{latency_ms}ms", "inline": True}],
+            footer=f"Triggered by {interaction.user}",
+        )
+        await self.admin_bot._interaction_reply(interaction, embed=embed, ephemeral=True)
+
+    @app_commands.command(name="reload", description="Reload RSAdminBot config (owner-only).")
+    async def reload(self, interaction: discord.Interaction) -> None:
+        if not await self._guard(interaction):
+            return
+        try:
+            self.admin_bot.load_config()
+            self.admin_bot._load_ssh_config()
+            await self.admin_bot._interaction_reply(interaction, content="✅ Configuration reloaded.", ephemeral=True)
+        except Exception as e:
+            await self.admin_bot._interaction_reply(interaction, content=f"❌ Reload failed: {str(e)[:200]}", ephemeral=True)
+
+    @app_commands.command(name="restart", description="Restart RSAdminBot service (owner-only).")
+    async def restart(self, interaction: discord.Interaction) -> None:
+        if not await self._guard(interaction):
+            return
+
+        admin_bot = self.admin_bot
+
+        class _RestartView(ui.View):
+            def __init__(self):
+                super().__init__(timeout=60)
+                self._started = False
+
+            async def _deny_if_needed(self, i: discord.Interaction) -> bool:
+                ok, err = admin_bot._slash_owner_guard(i)
+                if not ok:
+                    await admin_bot._interaction_reply(i, content=err, ephemeral=True)
+                    return True
+                return False
+
+            @ui.button(label="Restart now", style=discord.ButtonStyle.danger)
+            async def do_restart(self, i: discord.Interaction, button: ui.Button) -> None:
+                if await self._deny_if_needed(i):
+                    return
+                if self._started:
+                    await admin_bot._interaction_reply(i, content="Already running.", ephemeral=True)
+                    return
+                self._started = True
+                for child in self.children:
+                    if isinstance(child, ui.Button):
+                        child.disabled = True
+                await admin_bot._interaction_reply(i, content="🔄 Restarting RSAdminBot service…", view=self, ephemeral=True)
+                try:
+                    subprocess.run(["sudo", "systemctl", "restart", "mirror-world-rsadminbot.service"], timeout=10)
+                except Exception:
+                    pass
+
+            @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+            async def cancel(self, i: discord.Interaction, button: ui.Button) -> None:
+                if await self._deny_if_needed(i):
+                    return
+                for child in self.children:
+                    if isinstance(child, ui.Button):
+                        child.disabled = True
+                await admin_bot._interaction_reply(i, content="Cancelled.", view=self, ephemeral=True)
+
+        await admin_bot._interaction_reply(
+            interaction,
+            content="Restart RSAdminBot service now? (This will temporarily disconnect the bot.)",
+            view=_RestartView(),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="status", description="Show RSAdminBot runtime status (owner-only).")
+    async def status(self, interaction: discord.Interaction) -> None:
+        if not await self._guard(interaction):
+            return
+        try:
+            srv = self.admin_bot.current_server or {}
+            host = str(srv.get("host") or "").strip()
+            user = str(srv.get("user") or "").strip()
+            local_exec_cfg = bool((self.admin_bot.config.get("local_exec") or {}).get("enabled", True))
+            local_exec = bool((os.name != "nt") and local_exec_cfg)
+            embed = MessageHelper.create_info_embed(
+                title="RSAdminBot Status",
+                message="Slash-only (ephemeral) admin surface is active.",
+                fields=[
+                    {"name": "Guild", "value": str(getattr(getattr(interaction, "guild", None), "id", "") or ""), "inline": True},
+                    {"name": "Local exec", "value": "YES" if local_exec else "NO", "inline": True},
+                    {"name": "SSH target", "value": f"{user}@{host}" if host else "(none)", "inline": False},
+                    {"name": "ServiceManager", "value": "YES" if bool(self.admin_bot.service_manager) else "NO", "inline": True},
+                    {"name": "Inspector", "value": "YES" if bool(self.admin_bot.inspector) else "NO", "inline": True},
+                    {"name": "Organizer", "value": "YES" if bool(self.admin_bot.test_server_organizer) else "NO", "inline": True},
+                ],
+                footer=f"Triggered by {interaction.user}",
+            )
+            await self.admin_bot._interaction_reply(interaction, embed=embed, ephemeral=True)
+        except Exception as e:
+            await self.admin_bot._interaction_reply(interaction, content=f"❌ status failed: {str(e)[:200]}", ephemeral=True)
+
+    @app_commands.command(name="ssh", description="Run an SSH command (owner-only).")
+    @app_commands.describe(command="Command to run on the Oracle host (use carefully).")
+    async def ssh(self, interaction: discord.Interaction, command: str) -> None:
+        if not await self._guard(interaction):
+            return
+        cmd = str(command or "").strip()
+        if not cmd:
+            await self.admin_bot._interaction_reply(interaction, content="❌ command is required.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        ok, out, err = self.admin_bot._execute_ssh_command(cmd, timeout=30)
+        payload = (out or err or "").strip()
+        if not payload:
+            payload = "(no output)"
+        title = "SSH OK" if ok else "SSH FAILED"
+        embed = MessageHelper.create_status_embed(
+            title=title,
+            description=self.admin_bot._codeblock(payload, limit=1800),
+            color=discord.Color.green() if ok else discord.Color.red(),
+            fields=[{"name": "Command", "value": f"`{cmd[:180]}`", "inline": False}],
+            footer=f"Triggered by {interaction.user}",
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="syncstatus", description="Compare rsbots-code vs live tree (owner-only).")
+    async def syncstatus(self, interaction: discord.Interaction) -> None:
+        if not await self._guard(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        code_root = Path(self.admin_bot._get_update_code_root_for_group("rs_bots") or "").expanduser()
+        live_root = Path(str(getattr(self.admin_bot, "remote_root", "") or "")).expanduser()
+        if not code_root.exists():
+            await interaction.followup.send(f"❌ Missing rsbots-code root: `{code_root}`", ephemeral=True)
+            return
+        if not live_root.exists():
+            await interaction.followup.send(f"❌ Missing live root: `{live_root}`", ephemeral=True)
+            return
+
+        try:
+            local_manifest = rs_generate_manifest(code_root, normalize_text_eol=True)
+            live_manifest = rs_generate_manifest(live_root, normalize_text_eol=True)
+            diff = rs_compare_manifests(local_manifest, live_manifest)
+        except Exception as e:
+            await interaction.followup.send(f"❌ syncstatus failed: {str(e)[:200]}", ephemeral=True)
+            return
+
+        lines: List[str] = []
+        folders = (diff.get("folders") or {}) if isinstance(diff, dict) else {}
+        for folder, d in folders.items():
+            if not isinstance(d, dict):
+                continue
+            if d.get("missing_local") or d.get("missing_remote"):
+                lines.append(f"⚠️ {folder}: missing_local={bool(d.get('missing_local'))} missing_remote={bool(d.get('missing_remote'))}")
+                continue
+            changed = len(d.get("changed") or [])
+            only_local = len(d.get("only_local") or [])
+            only_remote = len(d.get("only_remote") or [])
+            if changed or only_local or only_remote:
+                lines.append(f"❌ {folder}: changed={changed} only_local={only_local} only_remote={only_remote}")
+            else:
+                lines.append(f"✅ {folder}: OK")
+
+        txt = "\n".join(lines)
+        if len(txt) > 1800:
+            txt = "…(truncated)…\n" + txt[-1800:]
+
+        embed = MessageHelper.create_info_embed(
+            title="Sync Status (rsbots-code vs live)",
+            message=self.admin_bot._codeblock(txt, limit=1800),
+            fields=[
+                {"name": "rsbots-code", "value": f"`{str(code_root)}`", "inline": False},
+                {"name": "live_root", "value": f"`{str(live_root)}`", "inline": False},
+            ],
+            footer=f"Triggered by {interaction.user}",
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="oraclefilesupdate", description="Push a bots-only snapshot to neo-rs/oraclefiles (owner-only).")
+    async def oraclefilesupdate(self, interaction: discord.Interaction) -> None:
+        if not await self._guard(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+        ok, stats = self.admin_bot._oraclefiles_sync_once(trigger="manual")
+        if not ok:
+            err = str((stats or {}).get("error") or "oraclefiles sync failed")[:900]
+            await interaction.followup.send(
+                embed=MessageHelper.create_error_embed(
+                    title="OracleFiles Sync Failed",
+                    message="OracleFiles snapshot push failed.",
+                    error_details=err,
+                    footer=f"Triggered by {interaction.user}",
+                ),
+                ephemeral=True,
+            )
+            return
+        head = str((stats or {}).get("head") or "")[:12]
+        pushed = "YES" if str((stats or {}).get("pushed") or "").strip() else "NO"
+        no_changes = "YES" if str((stats or {}).get("no_changes") or "").strip() else "NO"
+        embed = MessageHelper.create_success_embed(
+            title="OracleFiles Sync Complete",
+            message="OracleFiles snapshot pushed successfully.",
+            fields=[
+                {"name": "Head", "value": head or "(unknown)", "inline": True},
+                {"name": "Pushed", "value": pushed, "inline": True},
+                {"name": "No changes", "value": no_changes, "inline": True},
+            ],
+            footer=f"Triggered by {interaction.user}",
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="systemcheck", description="Quick health check (owner-only).")
+    async def systemcheck(self, interaction: discord.Interaction) -> None:
+        if not await self._guard(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        local_exec_cfg = bool((self.admin_bot.config.get("local_exec") or {}).get("enabled", True))
+        local_exec = bool((os.name != "nt") and local_exec_cfg)
+        rs_code = Path(self.admin_bot._get_update_code_root_for_group("rs_bots") or "")
+        mw_code = Path(self.admin_bot._get_update_code_root_for_group("mirror_bots") or "")
+        live_root = Path(str(getattr(self.admin_bot, "remote_root", "") or ""))
+
+        svc_ok = bool(self.admin_bot.service_manager)
+        total = len(self.admin_bot.BOTS)
+        running = 0
+        stopped = 0
+        unknown = 0
+        if svc_ok:
+            for k, info in self.admin_bot.BOTS.items():
+                service = str((info or {}).get("service") or "").strip()
+                if not service:
+                    unknown += 1
+                    continue
+                exists, state, _ = self.admin_bot.service_manager.get_status(service, bot_name=k)
+                if not exists:
+                    unknown += 1
+                elif state == "active":
+                    running += 1
+                else:
+                    stopped += 1
+
+        embed = MessageHelper.create_info_embed(
+            title="System Check",
+            message="",
+            fields=[
+                {"name": "Local exec", "value": "YES" if local_exec else "NO", "inline": True},
+                {"name": "ServiceManager", "value": "YES" if svc_ok else "NO", "inline": True},
+                {"name": "rsbots-code", "value": f"{'✅' if rs_code.exists() else '❌'} `{rs_code}`", "inline": False},
+                {"name": "mwbots-code", "value": f"{'✅' if mw_code.exists() else '❌'} `{mw_code}`", "inline": False},
+                {"name": "live_root", "value": f"{'✅' if live_root.exists() else '❌'} `{live_root}`", "inline": False},
+                {"name": "Services", "value": f"total={total} running={running} stopped={stopped} unknown={unknown}", "inline": False},
+            ],
+            footer=f"Triggered by {interaction.user}",
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="botlist", description="List configured bots (owner-only).")
+    async def botlist(self, interaction: discord.Interaction) -> None:
+        if not await self._guard(interaction):
+            return
+
+        rs_keys = self.admin_bot._get_rs_bot_keys()
+        mw_keys = self.admin_bot._get_mw_bot_keys()
+
+        def _fmt(keys: List[str]) -> str:
+            out = []
+            for k in keys:
+                info = self.admin_bot.BOTS.get(k) or {}
+                out.append(f"- `{k}`: {info.get('name', k)}")
+            return "\n".join(out) if out else "(none)"
+
+        embed = MessageHelper.create_info_embed(
+            title="Bot List",
+            message="Configured bots (from canonical registry).",
+            fields=[
+                {"name": "RS bots", "value": _fmt(rs_keys)[:1000], "inline": False},
+                {"name": "MW bots", "value": _fmt(mw_keys)[:1000], "inline": False},
+            ],
+            footer=f"Triggered by {interaction.user}",
+        )
+        await self.admin_bot._interaction_reply(interaction, embed=embed, ephemeral=True)
+
+    @app_commands.command(name="botstatus", description="Check bot status (owner-only).")
+    async def botstatus(self, interaction: discord.Interaction) -> None:
+        await self._send_bot_select(
+            interaction,
+            action="status",
+            action_display="Status",
+            title="📊 Bot Status",
+            description="Pick a bot to view its service status.",
+            bot_keys=self.admin_bot._get_rs_bot_keys() + self.admin_bot._get_mw_bot_keys(),
+        )
+
+    @app_commands.command(name="botinfo", description="Show bot metadata + service status (owner-only).")
+    async def botinfo(self, interaction: discord.Interaction) -> None:
+        await self._send_bot_select(
+            interaction,
+            action="info",
+            action_display="Info",
+            title="ℹ️ Bot Info",
+            description="Pick a bot to view metadata + status.",
+            bot_keys=self.admin_bot._get_rs_bot_keys() + self.admin_bot._get_mw_bot_keys(),
+        )
+
+    @app_commands.command(name="botstart", description="Start a bot (owner-only).")
+    async def botstart(self, interaction: discord.Interaction) -> None:
+        await self._send_bot_select(
+            interaction,
+            action="start",
+            action_display="Start",
+            title="🟢 Start Bot",
+            description="Pick a bot (or All Bots) to start.",
+        )
+
+    @app_commands.command(name="botstop", description="Stop a bot (owner-only).")
+    async def botstop(self, interaction: discord.Interaction) -> None:
+        await self._send_bot_select(
+            interaction,
+            action="stop",
+            action_display="Stop",
+            title="🛑 Stop Bot",
+            description="Pick a bot (or All Bots) to stop.",
+        )
+
+    @app_commands.command(name="botrestart", description="Restart a bot (owner-only).")
+    async def botrestart(self, interaction: discord.Interaction) -> None:
+        await self._send_bot_select(
+            interaction,
+            action="restart",
+            action_display="Restart",
+            title="🔄 Restart Bot",
+            description="Pick a bot (or All Bots) to restart.",
+        )
+
+    @app_commands.command(name="botsync", description="Sync a bot folder to Oracle (owner-only).")
+    async def botsync(self, interaction: discord.Interaction) -> None:
+        await self._send_bot_select(
+            interaction,
+            action="sync",
+            action_display="Sync",
+            title="📤 Sync Bot",
+            description="Pick a bot to sync local files to the server.",
+        )
+
+    @app_commands.command(name="botupdate", description="Update an RS bot from GitHub (python-only) and restart (owner-only).")
+    async def botupdate(self, interaction: discord.Interaction) -> None:
+        await self._send_bot_select(
+            interaction,
+            action="update",
+            action_display="Update",
+            title="📦 Update RS Bot (python-only)",
+            description="Pick an RS bot (or All RS Bots) to update from GitHub.",
+            bot_keys=self.admin_bot._get_rs_bot_keys(),
+        )
+
+    @app_commands.command(name="mwupdate", description="Update an MW bot from GitHub (python-only) and restart (owner-only).")
+    async def mwupdate(self, interaction: discord.Interaction) -> None:
+        await self._send_bot_select(
+            interaction,
+            action="update",
+            action_display="Update",
+            title="📦 Update MW Bot (python-only)",
+            description="Pick an MW bot (or All MW Bots) to update from GitHub.",
+            bot_keys=self.admin_bot._get_mw_bot_keys(),
+        )
+
+    @app_commands.command(name="selfupdate", description="Update RSAdminBot safely (staged) and restart to apply (owner-only).")
+    async def selfupdate(self, interaction: discord.Interaction) -> None:
+        if not await self._guard(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        status = await interaction.followup.send(
+            embed=MessageHelper.create_info_embed(
+                title="Selfupdate (staged)",
+                message="Staging RSAdminBot update from GitHub checkout. A restart will apply it.",
+                footer=f"Triggered by {interaction.user}",
+            ),
+            ephemeral=True,
+        )
+
+        ok, stats = self.admin_bot._stage_rsadminbot_selfupdate()
+        if not ok:
+            err = str((stats or {}).get("error") or "unknown error")[:1000]
+            await status.edit(
+                embed=MessageHelper.create_error_embed(
+                    title="Selfupdate Failed",
+                    message="Failed to stage RSAdminBot update.",
+                    error_details=err,
+                    footer=f"Triggered by {interaction.user}",
+                )
+            )
+            return
+
+        no_changes = str((stats or {}).get("no_changes") or "").strip() in ("1", "true", "yes")
+        old = str((stats or {}).get("old") or "").strip()
+        new = str((stats or {}).get("new") or "").strip()
+        changed = str((stats or {}).get("changed_count") or "0").strip()
+        backup = str((stats or {}).get("backup") or "").strip()
+        sample = (stats or {}).get("changed_sample") or []
+
+        if no_changes:
+            await status.edit(
+                embed=MessageHelper.create_success_embed(
+                    title="Up to Date",
+                    message="No changes detected. No restart needed.",
+                    fields=[{"name": "Git", "value": old[:12] if old else "(unknown)", "inline": True}],
+                    footer=f"Triggered by {interaction.user}",
+                )
+            )
+            return
+
+        fields = [
+            {"name": "Git", "value": f"{old[:12]} -> {new[:12]}" if old and new else "(unknown)", "inline": False},
+            {"name": "Changed", "value": changed, "inline": True},
+            {"name": "Backup", "value": backup[:60] + ("…" if len(backup) > 60 else ""), "inline": False},
+            {"name": "Next", "value": "Restarting service to apply staged update", "inline": False},
+        ]
+        ok_embed = MessageHelper.create_success_embed(
+            title="Staged",
+            message="RSAdminBot update is staged. Restarting now to apply.",
+            fields=fields,
+            footer=f"Triggered by {interaction.user}",
+        )
+        if sample:
+            ok_embed.add_field(name="Changed sample", value=f"```{chr(10).join(str(x) for x in sample[:15])[:900]}```", inline=False)
+        await status.edit(embed=ok_embed)
+
+        # Restart after sending the message. This will terminate the current process.
+        try:
+            subprocess.run(["sudo", "systemctl", "restart", "mirror-world-rsadminbot.service"], timeout=10)
+        except Exception:
+            pass
+
+    @app_commands.command(name="details", description="Show systemd details for a bot (owner-only).")
+    async def details(self, interaction: discord.Interaction) -> None:
+        await self._send_bot_select(
+            interaction,
+            action="details",
+            action_display="Details",
+            title="🧾 Details",
+            description="Pick a bot to show systemd details.",
+        )
+
+    @app_commands.command(name="logs", description="Show journal logs for a bot (owner-only).")
+    @app_commands.describe(lines="Number of log lines to show (10-400).")
+    async def logs(self, interaction: discord.Interaction, lines: int = 80) -> None:
+        lines = max(10, min(int(lines or 80), 400))
+        await self._send_bot_select(
+            interaction,
+            action="logs",
+            action_display="Logs",
+            title="📜 Logs",
+            description=f"Pick a bot to show journal logs (lines={lines}).",
+            action_kwargs={"lines": lines},
+        )
+
+    @app_commands.command(name="fileview", description="Show file sizes + mtimes for a bot folder (owner-only).")
+    @app_commands.describe(mode="Optional: alljson to include all *.json (excluding secrets).")
+    async def fileview(self, interaction: discord.Interaction, mode: str = "") -> None:
+        mode = str(mode or "").strip().lower()
+        await self._send_bot_select(
+            interaction,
+            action="fileview",
+            action_display="Fileview",
+            title="🗂️ Fileview",
+            description="Pick a bot to list files (sizes + mtimes).",
+            action_kwargs={"mode": mode},
+            bot_keys=self.admin_bot._get_rs_bot_keys() + self.admin_bot._get_mw_bot_keys(),
+        )
+
+    @app_commands.command(name="botconfig", description="View a bot's config.json summary (owner-only).")
+    async def botconfig(self, interaction: discord.Interaction) -> None:
+        await self._send_bot_select(
+            interaction,
+            action="config",
+            action_display="Config",
+            title="⚙️ Bot Config",
+            description="Pick a bot to view its config summary.",
+            bot_keys=self.admin_bot._get_rs_bot_keys() + self.admin_bot._get_mw_bot_keys(),
+        )
+
+    @app_commands.command(name="secretsstatus", description="View/update bot secrets (masked; owner-only).")
+    async def secretsstatus(self, interaction: discord.Interaction) -> None:
+        await self._send_bot_select(
+            interaction,
+            action="secrets",
+            action_display="Secrets",
+            title="🔐 Secrets Status",
+            description="Pick a bot to view masked secrets and update keys securely.",
+            bot_keys=self.admin_bot._get_rs_bot_keys() + self.admin_bot._get_mw_bot_keys(),
+        )
+
+    @app_commands.command(name="commands", description="Show COMMANDS.md for a bot (owner-only).")
+    async def commands(self, interaction: discord.Interaction) -> None:
+        await self._send_bot_select(
+            interaction,
+            action="commands",
+            action_display="Commands",
+            title="📚 Commands",
+            description="Pick a bot to view its COMMANDS.md.",
+            bot_keys=sorted(list(self.admin_bot.BOTS.keys())),
+        )
+
+    @app_commands.command(name="botdiagnose", description="Diagnose a bot (owner-only).")
+    async def botdiagnose(self, interaction: discord.Interaction) -> None:
+        await self._send_bot_select(
+            interaction,
+            action="diagnose",
+            action_display="Diagnose",
+            title="🔍 Diagnose Bot",
+            description="Pick a bot to run a quick diagnosis.",
+        )
+
+    @app_commands.command(name="whereami", description="Runtime proof: show where RSAdminBot is running (owner-only).")
+    async def whereami(self, interaction: discord.Interaction) -> None:
+        if not await self._guard(interaction):
+            return
+        try:
+            cwd = os.getcwd()
+            file_path = str(Path(__file__).resolve())
+            py_exec = sys.executable
+            py_ver = platform.python_version()
+            local_exec_cfg = bool((self.admin_bot.config.get("local_exec") or {}).get("enabled", True))
+            local_exec = "yes" if (os.name != "nt" and local_exec_cfg) else "no"
+            live_repo = str(getattr(self.admin_bot, "remote_root", "") or self.admin_bot.base_path.parent)
+            code_repo = str(self.admin_bot._get_update_code_root_for_group("rs_bots") or "")
+
+            def _git_head(path: str) -> str:
+                try:
+                    if not path:
+                        return "unknown"
+                    if not (Path(path) / ".git").exists():
+                        return "no_git"
+                    res = subprocess.run(["git", "-C", path, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5)
+                    if res.returncode != 0:
+                        return "error"
+                    return (res.stdout or "").strip()[:40] or "error"
+                except Exception:
+                    return "error"
+
+            head_code = _git_head(code_repo)
+            head_live = _git_head(live_repo)
+            payload = "\n".join(
+                [
+                    "WHEREAMI",
+                    f"cwd={cwd}",
+                    f"file={file_path}",
+                    f"os={platform.system()} {platform.release()}",
+                    f"python={py_exec}",
+                    f"python_version={py_ver}",
+                    f"local_exec={local_exec}",
+                    f"live_root={live_repo}",
+                    f"rsbots_code_head={head_code}",
+                    f"live_tree_head={head_live}",
+                ]
+            )
+            embed = MessageHelper.create_info_embed(
+                title="Where Am I",
+                message=self.admin_bot._codeblock(payload, limit=1800),
+                footer=f"Triggered by {interaction.user}",
+            )
+            await self.admin_bot._interaction_reply(interaction, embed=embed, ephemeral=True)
+        except Exception as e:
+            await self.admin_bot._interaction_reply(interaction, content=f"❌ whereami failed: {str(e)[:200]}", ephemeral=True)
+
+    @app_commands.command(name="clear", description="Clear messages in the current channel (owner-only).")
+    @app_commands.describe(include_pins="Also delete pinned messages (dangerous).")
+    async def clear(self, interaction: discord.Interaction, include_pins: bool = False) -> None:
+        if not await self._guard(interaction):
+            return
+        if not interaction.channel or not isinstance(interaction.channel, discord.TextChannel):
+            await self.admin_bot._interaction_reply(interaction, content="❌ Channel must be a server text channel.", ephemeral=True)
+            return
+
+        ch: discord.TextChannel = interaction.channel
+        perms = ch.permissions_for(ch.guild.me) if ch.guild and ch.guild.me else None
+        if not perms or not perms.manage_messages:
+            await self.admin_bot._interaction_reply(interaction, content="❌ Missing permission: Manage Messages.", ephemeral=True)
+            return
+
+        admin_bot = self.admin_bot
+
+        class _ClearConfirmView(ui.View):
+            def __init__(self):
+                super().__init__(timeout=60)
+                self._started = False
+
+            async def _deny_if_needed(self, i: discord.Interaction) -> bool:
+                ok, err = admin_bot._slash_owner_guard(i)
+                if not ok:
+                    await admin_bot._interaction_reply(i, content=err, ephemeral=True)
+                    return True
+                return False
+
+            @ui.button(label="Confirm clear", style=discord.ButtonStyle.danger)
+            async def confirm(self, i: discord.Interaction, btn: ui.Button) -> None:
+                if await self._deny_if_needed(i):
+                    return
+                if self._started:
+                    await admin_bot._interaction_reply(i, content="Already running.", ephemeral=True)
+                    return
+                self._started = True
+                for child in self.children:
+                    if isinstance(child, ui.Button):
+                        child.disabled = True
+                await admin_bot._interaction_reply(i, content="🧹 Clearing messages… (running)", view=self, ephemeral=True)
+
+                # Discord bulk delete rule: messages older than 14 days cannot be bulk-deleted.
+                BULK_DELETE_MAX_AGE_DAYS = 14
+                cutoff = discord.utils.utcnow() - timedelta(days=BULK_DELETE_MAX_AGE_DAYS)
+
+                total = 0
+                bulk = 0
+                single = 0
+                skipped = 0
+                failures = 0
+
+                # We delete newest-first.
+                recent_batch: List[discord.Message] = []
+                try:
+                    async for msg in ch.history(limit=None, oldest_first=False):
+                        try:
+                            if msg.pinned and not include_pins:
+                                skipped += 1
+                                continue
+                            # Never try to delete system messages that are not deletable
+                            if not getattr(msg, "deletable", True):
+                                skipped += 1
+                                continue
+                        except Exception:
+                            pass
+
+                        created = getattr(msg, "created_at", None)
+                        is_recent = bool(created and created.replace(tzinfo=timezone.utc) >= cutoff)
+
+                        if is_recent:
+                            recent_batch.append(msg)
+                            if len(recent_batch) >= 100:
+                                try:
+                                    await ch.delete_messages(recent_batch)
+                                    bulk += len(recent_batch)
+                                    total += len(recent_batch)
+                                except Exception:
+                                    for m in recent_batch:
+                                        try:
+                                            await m.delete()
+                                            single += 1
+                                            total += 1
+                                        except Exception:
+                                            failures += 1
+                                recent_batch = []
+                        else:
+                            # Flush any remaining recent batch before individual deletes.
+                            if recent_batch:
+                                try:
+                                    await ch.delete_messages(recent_batch)
+                                    bulk += len(recent_batch)
+                                    total += len(recent_batch)
+                                except Exception:
+                                    for m in recent_batch:
+                                        try:
+                                            await m.delete()
+                                            single += 1
+                                            total += 1
+                                        except Exception:
+                                            failures += 1
+                                recent_batch = []
+
+                            try:
+                                await msg.delete()
+                                single += 1
+                                total += 1
+                            except Exception:
+                                failures += 1
+
+                        # Progress ping every ~50 deletions (ephemeral edit)
+                        if total and total % 50 == 0:
+                            await admin_bot._interaction_reply(
+                                i,
+                                content=f"🧹 Clearing… deleted={total} (bulk={bulk}, single={single}) skipped={skipped} failures={failures}",
+                                ephemeral=True,
+                            )
+                    # Flush any remaining recent batch at the end.
+                    if recent_batch:
+                        try:
+                            await ch.delete_messages(recent_batch)
+                            bulk += len(recent_batch)
+                            total += len(recent_batch)
+                        except Exception:
+                            for m in recent_batch:
+                                try:
+                                    await m.delete()
+                                    single += 1
+                                    total += 1
+                                except Exception:
+                                    failures += 1
+                except Exception as e:
+                    await admin_bot._interaction_reply(i, content=f"❌ Clear failed: {str(e)[:200]}", ephemeral=True)
+                    return
+
+                await admin_bot._interaction_reply(
+                    i,
+                    content=f"✅ Clear complete. deleted={total} (bulk={bulk}, single={single}) skipped={skipped} failures={failures}",
+                    ephemeral=True,
+                )
+
+            @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+            async def cancel(self, i: discord.Interaction, btn: ui.Button) -> None:
+                if await self._deny_if_needed(i):
+                    return
+                for child in self.children:
+                    if isinstance(child, ui.Button):
+                        child.disabled = True
+                await admin_bot._interaction_reply(i, content="Cancelled.", view=self, ephemeral=True)
+
+        warn = (
+            f"Channel: {ch.mention}\n"
+            f"- This will delete messages in this channel.\n"
+            f"- Bulk-delete works only for messages newer than ~14 days; older messages are deleted one-by-one.\n"
+            f"- Pinned messages will {'also be deleted' if include_pins else 'be kept'}.\n\n"
+            f"Proceed?"
+        )
+        await admin_bot._interaction_reply(interaction, content=warn, view=_ClearConfirmView(), ephemeral=True)
 
 
 class RSAdminBot:
@@ -2086,10 +3213,13 @@ class RSAdminBot:
             except Exception as e:
                 print(f"{Colors.YELLOW}[Inspector] Failed to initialize: {e}{Colors.RESET}")
         
-        # Trackers will be initialized in on_ready (after bot is created)
+        # Optional modules initialized in on_ready (after bot is created)
+        self.test_server_organizer: Optional[Any] = None
+
+        # Removed suites (Whop tracking + bot movement tracking).
+        # Keep these attributes present (as None) so legacy code paths don't crash during the slash-only migration.
         self.whop_tracker: Optional[Any] = None
         self.bot_movement_tracker: Optional[Any] = None
-        self.test_server_organizer: Optional[Any] = None
         
         # Monitor channel mappings (per-bot channels in test server)
         self._bot_monitor_channel_ids: Dict[str, int] = {}
@@ -2106,12 +3236,12 @@ class RSAdminBot:
         
         # Setup bot with required intents
         intents = discord.Intents.default()
-        intents.message_content = True
+        intents.message_content = False
         intents.guilds = True
         intents.members = True  # For admin commands
         
-        # Primary interface: prefix commands ("!").
-        # Optional: RSNotes loads a private slash command (/rsnote) for per-user notes.
+        # Primary interface: slash commands (ephemeral; test-server; owner-only).
+        # Optional: RSNotes adds `/rsnote` (also synced to test server only).
         self.bot = commands.Bot(command_prefix='!', intents=intents)
 
         # Ensure RSNotes slash command registration runs once per process start.
@@ -2119,6 +3249,7 @@ class RSAdminBot:
         async def _mw_setup_hook():
             try:
                 await self._initialize_rsnotes()
+                await self._initialize_admin_slash_commands()
             except Exception as e:
                 try:
                     print(f"{Colors.YELLOW}[RSNotes] setup_hook init failed: {type(e).__name__}: {str(e)[:200]}{Colors.RESET}")
@@ -2130,7 +3261,7 @@ class RSAdminBot:
             self.bot.setup_hook = _mw_setup_hook  # type: ignore
         
         self._setup_events()
-        self._setup_commands()
+        # Prefix commands are intentionally not registered (slash-only).
     
     def _load_ssh_config(self):
         """Load SSH server configuration from the canonical oraclekeys/servers.json.
@@ -3172,33 +4303,14 @@ echo "TARGET=$TARGET"
                 pass
             return
 
-        # Sync app commands to guild(s) for fast availability.
+        # Sync app commands only to neo-test-server (slash-only policy).
         guild_ids: List[int] = []
-        # Prefer the real RS server guild id if present.
-        for key in ("rs_server_guild_id",):
-            try:
-                gid = int(self.config.get(key) or 0)
-            except Exception:
-                gid = 0
-            if gid and gid not in guild_ids:
-                guild_ids.append(gid)
-
-        raw = self.config.get("guild_ids") or []
-        if isinstance(raw, list):
-            for x in raw:
-                try:
-                    gid = int(x)
-                except Exception:
-                    continue
-                if gid and gid not in guild_ids:
-                    guild_ids.append(gid)
-        if not guild_ids:
-            try:
-                gid = int(self.config.get("guild_id") or 0)
-            except Exception:
-                gid = 0
-            if gid:
-                guild_ids.append(gid)
+        try:
+            gid = int(self.config.get("test_server_guild_id") or 0)
+        except Exception:
+            gid = 0
+        if gid:
+            guild_ids.append(gid)
 
         # Debug: do we actually have the command in the tree?
         try:
@@ -3258,6 +4370,46 @@ echo "TARGET=$TARGET"
             try:
                 ext_loaded = "RSNotes.rsnote" in set(getattr(self.bot, "extensions", {}).keys())
                 self._rsnotes_status_line = f"[RSNotes] status=no_guilds ext_loaded={ext_loaded} guild_ids={guild_ids}"
+            except Exception:
+                pass
+
+    async def _initialize_admin_slash_commands(self) -> None:
+        """Register RSAdminBot slash commands and sync only to neo-test-server."""
+        if getattr(self, "_admin_slash_initialized", False):
+            return
+        self._admin_slash_initialized = True
+
+        try:
+            await self.bot.add_cog(RSAdminSlashCog(self))
+        except Exception as e:
+            try:
+                print(f"{Colors.YELLOW}[Slash] Failed to add slash cog: {type(e).__name__}: {str(e)[:200]}{Colors.RESET}")
+            except Exception:
+                pass
+
+        gid = self._get_test_server_guild_id()
+        if not gid:
+            try:
+                print(f"{Colors.YELLOW}[Slash] No test_server_guild_id configured; skipping slash sync{Colors.RESET}")
+            except Exception:
+                pass
+            return
+
+        try:
+            # Make commands appear quickly by syncing as guild-scoped.
+            try:
+                self.bot.tree.copy_global_to(guild=discord.Object(id=gid))
+            except Exception:
+                pass
+            synced = await self.bot.tree.sync(guild=discord.Object(id=gid))
+            try:
+                names = sorted({str(getattr(x, "name", "") or "") for x in (synced or []) if getattr(x, "name", None)})
+                print(f"{Colors.GREEN}[Slash] Sync OK: guild={gid} commands={len(names)}{Colors.RESET}")
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                print(f"{Colors.YELLOW}[Slash] Sync failed: guild={gid} err={type(e).__name__}: {str(e)[:200]}{Colors.RESET}")
             except Exception:
                 pass
     
@@ -4203,6 +5355,164 @@ echo \"CHANGED_END\"
             print(f"{Colors.YELLOW}[Startup] Error checking channel history: {e}{Colors.RESET}")
             # On error, assume content doesn't exist (will send to be safe)
         return False
+
+    def _stage_rsadminbot_selfupdate(self) -> Tuple[bool, Dict[str, Any]]:
+        """Stage an RSAdminBot update for safe apply on next restart.
+
+        RSAdminBot must NOT overwrite its own running folder in-place.
+        This stages into a temp dir and writes `RSAdminBot/.pending_update.json` so `RSAdminBot/run_bot.sh`
+        applies the update before launching Python after restart.
+        """
+        try:
+            checkouts = self.config.get("code_checkouts") if isinstance(self.config, dict) else {}
+            if not isinstance(checkouts, dict):
+                checkouts = {}
+            code_root = str(checkouts.get("rsbots_code_root") or "/home/rsadmin/bots/rsbots-code").strip()
+            live_root = str(getattr(self, "remote_root", "") or "/home/rsadmin/bots/mirror-world").strip()
+
+            cmd = f"""
+set -euo pipefail
+
+CODE_ROOT={shlex.quote(code_root)}
+LIVE_ROOT={shlex.quote(live_root)}
+
+if [ ! -d "$CODE_ROOT/.git" ]; then
+  echo "ERR=missing_code_root"
+  echo "DETAIL=$CODE_ROOT/.git not found"
+  exit 2
+fi
+if [ ! -d "$LIVE_ROOT/RSAdminBot" ]; then
+  echo "ERR=missing_live_rsadminbot"
+  echo "DETAIL=$LIVE_ROOT/RSAdminBot not found"
+  exit 2
+fi
+
+cd "$CODE_ROOT"
+OLD="$(git rev-parse HEAD 2>/dev/null || echo '')"
+git fetch origin
+git pull --ff-only origin main
+NEW="$(git rev-parse HEAD 2>/dev/null || echo '')"
+
+TS="$(date +%Y%m%d_%H%M%S)"
+STAGING_DIR="/tmp/mw_rsadminbot_stage_${{TS}}"
+mkdir -p "$STAGING_DIR"
+
+# Tracked file list for RSAdminBot only (safe types; never secrets)
+TMP_ALL="/tmp/mw_rsadminbot_all_${{TS}}.txt"
+git ls-files "RSAdminBot" 2>/dev/null > "$TMP_ALL" || true
+
+TMP_SYNC="/tmp/mw_rsadminbot_sync_${{TS}}.txt"
+grep -E "(\\.py$|\\.md$|\\.json$|\\.txt$|\\.sh$|(^|/)requirements\\.txt$)" "$TMP_ALL" | grep -v -E "(^|/)config\\.secrets\\.json$" > "$TMP_SYNC" || true
+sort -u "$TMP_SYNC" -o "$TMP_SYNC" || true
+SYNC_COUNT="$(wc -l < "$TMP_SYNC" | tr -d ' ')"
+if [ "$SYNC_COUNT" = "" ]; then SYNC_COUNT="0"; fi
+if [ "$SYNC_COUNT" = "0" ]; then
+  echo "ERR=no_files"
+  echo "DETAIL=no tracked RSAdminBot files to stage"
+  exit 3
+fi
+
+# Change list (git)
+TMP_CHANGED="/tmp/mw_rsadminbot_changed_${{TS}}.txt"
+git diff --name-only "$OLD" "$NEW" -- "RSAdminBot" 2>/dev/null > "$TMP_CHANGED" || true
+CHANGED_COUNT="$(sed '/^$/d' "$TMP_CHANGED" | wc -l | tr -d ' ')"
+if [ "$CHANGED_COUNT" = "" ]; then CHANGED_COUNT="0"; fi
+
+if [ "$OLD" != "" ] && [ "$NEW" != "" ] && [ "$OLD" = "$NEW" ] && [ "$CHANGED_COUNT" = "0" ]; then
+  echo "OK=1"
+  echo "OLD=$OLD"
+  echo "NEW=$NEW"
+  echo "SYNC_COUNT=$SYNC_COUNT"
+  echo "CHANGED_COUNT=0"
+  echo "NO_CHANGES=1"
+  echo "STAGING_DIR="
+  echo "BACKUP="
+  echo "CHANGED_BEGIN"
+  echo "CHANGED_END"
+  exit 0
+fi
+
+# Remote backup (server-side only)
+BACKUP_DIR="$LIVE_ROOT/backups"
+mkdir -p "$BACKUP_DIR"
+BACKUP_TAR="$BACKUP_DIR/RSAdminBot_preupdate_${{TS}}.tar.gz"
+env -u TAR_OPTIONS /bin/tar -czf "$BACKUP_TAR" -C "$LIVE_ROOT" "RSAdminBot" || true
+
+# Stage tracked files into STAGING_DIR (preserve paths like RSAdminBot/...)
+env -u TAR_OPTIONS /bin/tar -cf - -T "$TMP_SYNC" | (cd "$STAGING_DIR" && env -u TAR_OPTIONS /bin/tar -xf - --overwrite)
+
+# Write pending update marker for run_bot.sh
+PENDING_JSON="$LIVE_ROOT/RSAdminBot/.pending_update.json"
+python3 - <<'PY'
+import json, os
+staging = os.environ.get("STAGING_DIR","")
+ts = os.environ.get("TS","")
+backup = os.environ.get("BACKUP_TAR","")
+changed_count = int(os.environ.get("CHANGED_COUNT","0") or "0")
+sync_count = int(os.environ.get("SYNC_COUNT","0") or "0")
+old = os.environ.get("OLD","")
+new = os.environ.get("NEW","")
+pending = os.environ.get("PENDING_JSON","")
+data = {
+  "timestamp": ts,
+  "staging_dir": staging,
+  "remote_backup": backup,
+  "git_old": old,
+  "git_new": new,
+  "changes": {
+    "total": changed_count,
+    "sync_total": sync_count,
+  },
+}
+with open(pending, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, ensure_ascii=True)
+PY
+
+echo "OK=1"
+echo "OLD=$OLD"
+echo "NEW=$NEW"
+echo "SYNC_COUNT=$SYNC_COUNT"
+echo "CHANGED_COUNT=$CHANGED_COUNT"
+echo "NO_CHANGES=0"
+echo "STAGING_DIR=$STAGING_DIR"
+echo "BACKUP=$BACKUP_TAR"
+echo "CHANGED_BEGIN"
+head -n 30 "$TMP_CHANGED" || true
+echo "CHANGED_END"
+"""
+
+            ok, stdout, stderr = self._execute_ssh_command(cmd, timeout=180)
+            out = (stdout or "").strip()
+            err = (stderr or "").strip()
+            if not ok:
+                msg = err or out or "unknown error"
+                return False, {"error": msg[:1200]}
+
+            stats: Dict[str, Any] = {"raw": out[-1600:]}
+            lines = [ln.rstrip("\r") for ln in out.splitlines()]
+            in_changed = False
+            changed_lines: List[str] = []
+            for ln in lines:
+                if ln == "CHANGED_BEGIN":
+                    in_changed = True
+                    continue
+                if ln == "CHANGED_END":
+                    in_changed = False
+                    continue
+                if in_changed:
+                    if ln.strip():
+                        changed_lines.append(ln.strip())
+                    continue
+                if "=" in ln:
+                    k, v = ln.split("=", 1)
+                    k = k.strip().lower()
+                    v = v.strip()
+                    if k:
+                        stats[k] = v
+            stats["changed_sample"] = changed_lines[:30]
+            return True, stats
+        except Exception as e:
+            return False, {"error": f"rsadminbot stage update failed: {str(e)[:300]}"}
     
     def _github_py_only_update(self, bot_folder: str, *, code_root: Optional[str] = None) -> Tuple[bool, Dict[str, Any]]:
         """Pull python-only bot code from the server-side GitHub checkout and overwrite live code files.
@@ -5139,6 +6449,168 @@ echo "CHANGED_END"
         
         return False
 
+    def _get_test_server_guild_id(self) -> int:
+        """Return the configured neo-test-server guild id (0 if missing)."""
+        try:
+            return int(self.config.get("test_server_guild_id") or 0)
+        except Exception:
+            return 0
+
+    def _slash_owner_guard(self, interaction: discord.Interaction) -> tuple[bool, str]:
+        """Guard for all RSAdminBot slash commands: test-server + server-owner only."""
+        if not interaction or not getattr(interaction, "user", None):
+            return False, "❌ Missing interaction user."
+        if not getattr(interaction, "guild", None):
+            return False, "❌ This command can only be used in the server."
+
+        expected_gid = self._get_test_server_guild_id()
+        if expected_gid and int(getattr(interaction.guild, "id", 0) or 0) != expected_gid:
+            return False, "❌ This command is only enabled in the neo-test-server."
+
+        owner_id = int(getattr(interaction.guild, "owner_id", 0) or 0)
+        if owner_id and int(getattr(interaction.user, "id", 0) or 0) != owner_id:
+            return False, "❌ Owner-only command."
+
+        # If we couldn't determine an owner id, fail closed.
+        if not owner_id:
+            return False, "❌ Server owner is unknown; refusing to run."
+
+        return True, ""
+
+    async def _interaction_reply(
+        self,
+        interaction: discord.Interaction,
+        *,
+        content: str | None = None,
+        embed: discord.Embed | None = None,
+        view: ui.View | None = None,
+        ephemeral: bool = True,
+    ) -> None:
+        """Send a reply to an interaction (handles response vs followup)."""
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(content=content, embed=embed, view=view, ephemeral=ephemeral)
+            else:
+                await interaction.followup.send(content=content, embed=embed, view=view, ephemeral=ephemeral)
+        except Exception:
+            # Never raise from a response helper.
+            return
+
+    def _bot_folder_path(self, bot_key: str) -> Path:
+        info = self.BOTS.get(str(bot_key or "").strip().lower()) or {}
+        folder = str(info.get("folder") or "").strip()
+        return (self.base_path.parent / folder).resolve()
+
+    def _json_load_file(self, path: Path) -> Tuple[bool, Dict[str, Any], str]:
+        try:
+            if not path.exists():
+                return False, {}, f"Missing file: {path}"
+            data = json.loads(path.read_text(encoding="utf-8") or "{}")
+            if not isinstance(data, dict):
+                return False, {}, "JSON root must be an object"
+            return True, data, ""
+        except Exception as e:
+            return False, {}, str(e)
+
+    def _json_write_file(self, path: Path, data: Dict[str, Any]) -> Tuple[bool, str]:
+        try:
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+            tmp.replace(path)
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
+    def _set_json_path(self, root: Dict[str, Any], key_path: str, value: Any) -> Tuple[bool, str]:
+        path = str(key_path or "").strip()
+        if not path:
+            return False, "key_path is required"
+        parts = [p for p in path.split(".") if p.strip()]
+        if not parts:
+            return False, "key_path is required"
+        cur: Any = root
+        for p in parts[:-1]:
+            if not isinstance(cur, dict):
+                return False, f"Cannot descend into non-object at '{p}'"
+            if p not in cur or not isinstance(cur.get(p), dict):
+                cur[p] = {}
+            cur = cur[p]
+        last = parts[-1]
+        if not isinstance(cur, dict):
+            return False, f"Cannot set '{last}' on non-object"
+        cur[last] = value
+        return True, ""
+
+    def _update_bot_config_json(self, bot_key: str, key_path: str, json_value_text: str) -> Tuple[bool, Dict[str, Any]]:
+        bot_key = str(bot_key or "").strip().lower()
+        folder = self._bot_folder_path(bot_key)
+        cfg_path = folder / "config.json"
+        ok, data, err = self._json_load_file(cfg_path)
+        if not ok:
+            return False, {"error": err}
+
+        try:
+            new_value = json.loads(str(json_value_text or "").strip())
+        except Exception as e:
+            return False, {"error": f"Value must be valid JSON: {e}"}
+
+        ok_set, err_set = self._set_json_path(data, key_path, new_value)
+        if not ok_set:
+            return False, {"error": err_set}
+
+        # Backup then write
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_dir = folder / "backups"
+        try:
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_path = backup_dir / f"config.json.{ts}.bak"
+            backup_path.write_text(cfg_path.read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception:
+            backup_path = None
+
+        ok_w, err_w = self._json_write_file(cfg_path, data)
+        if not ok_w:
+            return False, {"error": err_w}
+
+        return True, {"path": str(cfg_path), "backup": str(backup_path) if backup_path else "", "key_path": key_path, "value_masked": str(new_value)[:200]}
+
+    def _update_bot_secrets_json(self, bot_key: str, key_path: str, json_value_text: str) -> Tuple[bool, Dict[str, Any]]:
+        bot_key = str(bot_key or "").strip().lower()
+        folder = self._bot_folder_path(bot_key)
+        secrets_path = folder / "config.secrets.json"
+        ok, data, err = self._json_load_file(secrets_path)
+        if not ok:
+            return False, {"error": err}
+
+        try:
+            new_value = json.loads(str(json_value_text or "").strip())
+        except Exception as e:
+            return False, {"error": f"Value must be valid JSON: {e}"}
+
+        ok_set, err_set = self._set_json_path(data, key_path, new_value)
+        if not ok_set:
+            return False, {"error": err_set}
+
+        # Backup then write
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_dir = folder / "backups"
+        try:
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_path = backup_dir / f"config.secrets.json.{ts}.bak"
+            backup_path.write_text(secrets_path.read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception:
+            backup_path = None
+
+        ok_w, err_w = self._json_write_file(secrets_path, data)
+        if not ok_w:
+            return False, {"error": err_w}
+        try:
+            os.chmod(secrets_path, 0o600)
+        except Exception:
+            pass
+
+        return True, {"path": str(secrets_path), "backup": str(backup_path) if backup_path else "", "key_path": key_path, "value_masked": mask_secret(str(new_value)) if isinstance(new_value, str) else "(non-string)"}
+
     def _get_rs_bot_keys(self) -> List[str]:
         """Return RS-only bot keys (rsadminbot + bot_groups.rs_bots)."""
         bot_groups = self.config.get("bot_groups") or {}
@@ -5834,46 +7306,7 @@ echo "CHANGED_END"
             print(f"{Colors.GREEN}[Startup] ✓ on_ready completed successfully{Colors.RESET}")
             print(f"{Colors.GREEN}[Startup] ✓ Bot is ready and accepting commands{Colors.RESET}\n")
         
-        # Bot movement tracking event listeners
-        @self.bot.event
-        async def on_message(message: discord.Message):
-            """Track bot write operations"""
-            # Skip bot's own messages to prevent loops
-            if message.author == self.bot.user:
-                return
-
-            # Lightweight command visibility debug (helps diagnose "no response" cases).
-            # Only logs for a tiny allowlist to avoid spam.
-            try:
-                raw = (message.content or "").strip()
-                low = raw.lower()
-                if low.startswith("!commands") or low.startswith("!testcards") or low.startswith("!whereami"):
-                    who = f"{getattr(message.author, 'name', '')}({getattr(message.author, 'id', '')})"
-                    ch = getattr(getattr(message, "channel", None), "name", "") or ""
-                    guild_id = getattr(getattr(message, "guild", None), "id", None)
-                    gid = str(guild_id) if guild_id is not None else ""
-                    print(f"{Colors.CYAN}[Msg] saw={raw.splitlines()[0][:80]} user={who} channel={ch} guild={gid}{Colors.RESET}")
-            except Exception:
-                pass
-            
-            # Process commands first (required for bot commands to work)
-            await self.bot.process_commands(message)
-            
-            # Then track bot movements
-            if self.bot_movement_tracker:
-                await self.bot_movement_tracker.track_message(message)
-        
-        @self.bot.event
-        async def on_message_edit(before: discord.Message, after: discord.Message):
-            """Track bot message edits"""
-            if self.bot_movement_tracker:
-                await self.bot_movement_tracker.track_message_edit(before, after)
-        
-        @self.bot.event
-        async def on_message_delete(message: discord.Message):
-            """Track bot message deletes"""
-            if self.bot_movement_tracker:
-                await self.bot_movement_tracker.track_message_delete(message)
+        # No on_message-based tracking: RSAdminBot is slash-only and avoids channel spam.
         
         @self.bot.event
         async def on_command_error(ctx, error):
@@ -6065,8 +7498,6 @@ echo "CHANGED_END"
             # Module status
             modules_status = []
             modules_status.append("✅ Service Manager" if self.service_manager else "❌ Service Manager")
-            modules_status.append("✅ Whop Tracker" if self.whop_tracker else "❌ Whop Tracker")
-            modules_status.append("✅ Movement Tracker" if self.bot_movement_tracker else "❌ Movement Tracker")
             modules_status.append("✅ Bot Inspector" if self.inspector else "❌ Bot Inspector")
             
             embed.add_field(
@@ -10951,23 +12382,6 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
         
         print(f"{Colors.GREEN}[Startup] Command prefix: {prefix_str}{Colors.RESET}")
         print(f"{Colors.GREEN}[Startup] Registered {command_count} commands: {command_list_str}{Colors.RESET}")
-    
-    def _start_whop_scanning_task(self):
-        """Start periodic whop scanning task"""
-        from discord.ext import tasks
-        
-        @tasks.loop(hours=self.config.get("whop_scan_interval_hours", 24))
-        async def periodic_whop_scan():
-            if self.whop_tracker:
-                try:
-                    print(f"{Colors.CYAN}[WhopTracker] Starting periodic scan...{Colors.RESET}")
-                    result = await self.whop_tracker.scan_whop_logs(limit=2000, lookback_days=1)
-                    print(f"{Colors.GREEN}[WhopTracker] Scan complete: {result.get('events_found', 0)} events found{Colors.RESET}")
-                except Exception as e:
-                    print(f"{Colors.RED}[WhopTracker] Periodic scan error: {e}{Colors.RESET}")
-        
-        periodic_whop_scan.start()
-        print(f"{Colors.GREEN}[WhopTracker] Periodic scanning task started (every {self.config.get('whop_scan_interval_hours', 24)} hours){Colors.RESET}")
     
     async def start(self):
         """Start the bot"""

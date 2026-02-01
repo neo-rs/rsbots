@@ -25,32 +25,19 @@ async def run(admin_bot):
     )
     print(f"{Colors.GREEN}[Phase 6] [6.1] ✓ Bot presence set to invisible{Colors.RESET}\n")
     
-    print(f"{Colors.CYAN}[Phase 6] [6.2] Starting periodic whop scanning task...{Colors.RESET}")
-    # Start periodic whop scanning task
-    try:
-        if admin_bot.whop_tracker:
-            admin_bot._start_whop_scanning_task()
-            print(f"{Colors.GREEN}[Phase 6] [6.2] ✓ Periodic whop scanning task started{Colors.RESET}")
-        else:
-            print(f"{Colors.YELLOW}[Phase 6] [6.2] ⚠️  Whop tracker not available - skipping periodic scan{Colors.RESET}")
-    except Exception as e:
-        print(f"{Colors.YELLOW}[Phase 6] [6.2] ⚠️  Failed to start periodic scan (non-critical): {e}{Colors.RESET}")
-        import traceback
-        print(f"{Colors.RED}[Phase 6] [6.2] Traceback: {traceback.format_exc()[:200]}{Colors.RESET}")
-
-    print(f"{Colors.CYAN}[Phase 6] [6.3] Starting RS service monitor task...{Colors.RESET}")
+    print(f"{Colors.CYAN}[Phase 6] [6.2] Starting RS service monitor task...{Colors.RESET}")
     try:
         admin_bot._start_service_monitor_task()
-        print(f"{Colors.GREEN}[Phase 6] [6.3] ✓ RS service monitor task started{Colors.RESET}")
+        print(f"{Colors.GREEN}[Phase 6] [6.2] ✓ RS service monitor task started{Colors.RESET}")
     except Exception as e:
-        print(f"{Colors.YELLOW}[Phase 6] [6.3] ⚠️  Failed to start service monitor (non-critical): {e}{Colors.RESET}")
+        print(f"{Colors.YELLOW}[Phase 6] [6.2] ⚠️  Failed to start service monitor (non-critical): {e}{Colors.RESET}")
 
-    print(f"{Colors.CYAN}[Phase 6] [6.4] Starting OracleFiles snapshot sync task...{Colors.RESET}")
+    print(f"{Colors.CYAN}[Phase 6] [6.3] Starting OracleFiles snapshot sync task...{Colors.RESET}")
     try:
         admin_bot._start_oraclefiles_sync_task()
-        print(f"{Colors.GREEN}[Phase 6] [6.4] ✓ OracleFiles snapshot sync task started{Colors.RESET}")
+        print(f"{Colors.GREEN}[Phase 6] [6.3] ✓ OracleFiles snapshot sync task started{Colors.RESET}")
     except Exception as e:
-        print(f"{Colors.YELLOW}[Phase 6] [6.4] ⚠️  Failed to start OracleFiles sync (non-critical): {e}{Colors.RESET}")
+        print(f"{Colors.YELLOW}[Phase 6] [6.3] ⚠️  Failed to start OracleFiles sync (non-critical): {e}{Colors.RESET}")
     
     # Phase 6 completion
     print(f"\n{Colors.GREEN}[Phase 6] ✓ Background tasks initialized{Colors.RESET}\n")
@@ -70,13 +57,10 @@ async def run(admin_bot):
         print(f"{Colors.GREEN}  ✓ SSH server configured: {admin_bot.current_server.get('name', 'Unknown')}{Colors.RESET}")
     if admin_bot.service_manager:
         print(f"{Colors.GREEN}  ✓ Service management ready{Colors.RESET}")
-    if admin_bot.whop_tracker:
-        print(f"{Colors.GREEN}  ✓ Whop tracking active{Colors.RESET}")
-    if admin_bot.bot_movement_tracker:
-        print(f"{Colors.GREEN}  ✓ Bot movement tracking active{Colors.RESET}")
+    if admin_bot.test_server_organizer:
+        print(f"{Colors.GREEN}  ✓ Test server organizer ready{Colors.RESET}")
     
     print(f"\n{Colors.CYAN}🎮 Bot is now ready to manage RS bots!{Colors.RESET}")
-    print(f"{Colors.YELLOW}  Use Discord commands: !botlist, !botstatus, !botstart, !botstop, etc.{Colors.RESET}")
-    print(f"{Colors.YELLOW}  Use !status to check bot status anytime{Colors.RESET}")
+    print(f"{Colors.YELLOW}  Use slash commands in the test server (ephemeral) to manage bots.{Colors.RESET}")
     print(f"{Colors.GREEN}{'='*60}{Colors.RESET}\n")
 
