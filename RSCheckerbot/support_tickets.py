@@ -1090,14 +1090,25 @@ async def reconcile_open_ticket_roles() -> None:
             r_iso = str(rec.get("resolved_followup_sent_at_iso") or "").strip()
             tickets.append((uid, ttype, r_iso))
 
+    processed = 0
+    fetched = 0
     for uid, ttype, r_iso in tickets:
+        processed += 1
         m = guild.get_member(int(uid))
         if not isinstance(m, discord.Member):
+            with suppress(Exception):
+                m = await guild.fetch_member(int(uid))
+        if isinstance(m, discord.Member):
+            fetched += 1
+        else:
             continue
         # If we already posted a resolved follow-up, ensure role is removed; otherwise ensure role is present.
         should_add = not bool(r_iso)
         with suppress(Exception):
             await _set_ticket_role_for_member(guild=guild, member=m, ticket_type=ttype, add=should_add)
+
+    with suppress(Exception):
+        await _log(f"🧩 support_tickets: role_reconcile processed={processed} fetched={fetched}")
 
 
 def is_ticket_channel(channel_id: int) -> bool:
