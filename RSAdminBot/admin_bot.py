@@ -6629,6 +6629,15 @@ echo "CHANGED_END"
         Uses shell=False to prevent PowerShell parsing on Windows.
         Commands are executed inside remote bash shell.
         """
+        # Normalize newlines (CRLF -> LF) before execution.
+        #
+        # Why: On Oracle Ubuntu, if this file was ever copied from Windows with CRLF,
+        # multi-line command strings can carry `\r` into bash and cause confusing non-zero exits
+        # (e.g., `exit 0\r`), while still printing "OK=1" lines.
+        cmd_txt = str(command or "")
+        if "\r" in cmd_txt:
+            cmd_txt = cmd_txt.replace("\r\n", "\n").replace("\r", "\n")
+
         # Check if server is configured (canonical: oraclekeys/servers.json + ssh_server_name selector)
         if not self.current_server:
             error_msg = "No SSH server configured (missing ssh_server_name / servers.json selection)"
@@ -6640,10 +6649,10 @@ echo "CHANGED_END"
             try:
                 # Log SSH command before execution
                 if log_it and hasattr(self, 'logger') and self.logger:
-                    self.logger.log_ssh_command(command, None, None, None, None)
+                    self.logger.log_ssh_command(cmd_txt, None, None, None, None)
                 
                 result = subprocess.run(
-                    ["bash", "-lc", command],
+                    ["bash", "-lc", cmd_txt],
                     shell=False,
                     capture_output=True,
                     text=True,
@@ -6657,10 +6666,10 @@ echo "CHANGED_END"
                 
                 # Log SSH command result
                 if log_it and hasattr(self, 'logger') and self.logger:
-                    self.logger.log_ssh_command(command, success, stdout_clean, stderr_clean, None)
+                    self.logger.log_ssh_command(cmd_txt, success, stdout_clean, stderr_clean, None)
                 
                 if not success:
-                    print(f"{Colors.RED}[Local Exec Error] Command failed: {command[:100]}{Colors.RESET}")
+                    print(f"{Colors.RED}[Local Exec Error] Command failed: {cmd_txt[:100]}{Colors.RESET}")
                     if stderr_clean:
                         print(f"{Colors.RED}[Local Exec Error] {stderr_clean[:200]}{Colors.RESET}")
                 return success, stdout_clean, stderr_clean
@@ -6690,7 +6699,7 @@ echo "CHANGED_END"
         try:
             # Log SSH command before execution
             if log_it and hasattr(self, 'logger') and self.logger:
-                self.logger.log_ssh_command(command, None, None, None, None)
+                self.logger.log_ssh_command(cmd_txt, None, None, None, None)
             
             # Build SSH base command locally (self-contained)
             base = self._build_ssh_base(self.current_server)
@@ -6702,7 +6711,7 @@ echo "CHANGED_END"
                 return False, "", error_msg
             
             # Escape command for bash -c
-            escaped_cmd = shlex.quote(command)
+            escaped_cmd = shlex.quote(cmd_txt)
             
             # Build command as list (no shell parsing on Windows)
             cmd = base + ["-t", "-o", "ConnectTimeout=10", "bash", "-lc", escaped_cmd]
