@@ -6707,7 +6707,7 @@ echo "CHANGED_END"
                 error_msg = "Failed to build SSH base command (check server config)"
                 print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
                 if log_it and hasattr(self, 'logger') and self.logger:
-                    self.logger.log_ssh_command(command, False, None, error_msg, None)
+                    self.logger.log_ssh_command(cmd_txt, False, None, error_msg, None)
                 return False, "", error_msg
             
             # Escape command for bash -c
@@ -6717,7 +6717,7 @@ echo "CHANGED_END"
             cmd = base + ["-t", "-o", "ConnectTimeout=10", "bash", "-lc", escaped_cmd]
             
             # Suppress verbose output - only log errors
-            is_validation = command.strip() == "sudo -n true"
+            is_validation = cmd_txt.strip() == "sudo -n true"
             
             result = subprocess.run(
                 cmd,
@@ -6736,12 +6736,12 @@ echo "CHANGED_END"
             
             # Log SSH command result
             if log_it and hasattr(self, 'logger') and self.logger:
-                self.logger.log_ssh_command(command, success, stdout_clean, stderr_clean, None)
+                self.logger.log_ssh_command(cmd_txt, success, stdout_clean, stderr_clean, None)
             
             # Only log errors, not every command execution
             if not success:
                 if not is_validation:
-                    print(f"{Colors.RED}[SSH Error] Command failed: {command[:100]}{Colors.RESET}")
+                    print(f"{Colors.RED}[SSH Error] Command failed: {cmd_txt[:100]}{Colors.RESET}")
                     if stderr_clean:
                         print(f"{Colors.RED}[SSH Error] {stderr_clean[:200]}{Colors.RESET}")
                     if stdout_clean:
@@ -6751,25 +6751,25 @@ echo "CHANGED_END"
         except subprocess.TimeoutExpired:
             error_msg = f"Command timed out after {timeout}s"
             print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
-            print(f"{Colors.RED}[SSH Error] Command: {command[:200]}{Colors.RESET}")
+            print(f"{Colors.RED}[SSH Error] Command: {cmd_txt[:200]}{Colors.RESET}")
             if log_it and hasattr(self, 'logger') and self.logger:
-                self.logger.log_ssh_command(command, False, None, error_msg, None)
+                self.logger.log_ssh_command(cmd_txt, False, None, error_msg, None)
             return False, "", error_msg
         except FileNotFoundError as e:
             error_msg = f"SSH executable not found: {e}"
             print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
             print(f"{Colors.YELLOW}[SSH Error] Make sure SSH is installed and in PATH{Colors.RESET}")
             if log_it and hasattr(self, 'logger') and self.logger:
-                self.logger.log_ssh_command(command, False, None, error_msg, None)
+                self.logger.log_ssh_command(cmd_txt, False, None, error_msg, None)
             return False, "", error_msg
         except Exception as e:
             error_msg = f"Unexpected error executing SSH command: {str(e)}"
             print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
-            print(f"{Colors.RED}[SSH Error] Command: {command[:200]}{Colors.RESET}")
+            print(f"{Colors.RED}[SSH Error] Command: {cmd_txt[:200]}{Colors.RESET}")
             import traceback
             print(f"{Colors.RED}[SSH Error] Traceback: {traceback.format_exc()[:500]}{Colors.RESET}")
             if log_it and hasattr(self, 'logger') and self.logger:
-                self.logger.log_ssh_command(command, False, None, error_msg, None)
+                self.logger.log_ssh_command(cmd_txt, False, None, error_msg, None)
             return False, "", error_msg
     
     def _service_name_to_bot_name(self, service_name: str) -> Optional[str]:
@@ -6907,8 +6907,16 @@ echo "CHANGED_END"
         except Exception as e:
             print(f"{Colors.RED}[Config] Failed to save config: {e}{Colors.RESET}")
     
-    def is_admin(self, user: discord.Member) -> bool:
-        """Check if user is an admin"""
+    def is_admin(self, user: discord.Member, *, allow_administrator_permission: bool = True) -> bool:
+        """Check if user is an admin.
+
+        Config-driven checks:
+        - config.admin_user_ids
+        - config.admin_role_ids
+
+        Optionally:
+        - allow_administrator_permission=True also treats Discord "Administrator" permission as admin.
+        """
         admin_role_ids = self.config.get("admin_role_ids", [])
         admin_user_ids = self.config.get("admin_user_ids", [])
         
@@ -6922,8 +6930,8 @@ echo "CHANGED_END"
             if str(admin_role_id) in user_role_ids:
                 return True
         
-        # Check if user has administrator permission
-        if user.guild_permissions.administrator:
+        # Optional: Check if user has administrator permission
+        if allow_administrator_permission and user.guild_permissions.administrator:
             return True
         
         return False
@@ -6948,7 +6956,7 @@ echo "CHANGED_END"
         return ids
 
     def _slash_owner_guard(self, interaction: discord.Interaction) -> tuple[bool, str]:
-        """Guard for all RSAdminBot slash commands: allowed guild(s) + server-owner only."""
+        """Guard for all RSAdminBot slash commands: allowed guild(s) + owner/admin only."""
         if not interaction or not getattr(interaction, "user", None):
             return False, "❌ Missing interaction user."
         if not getattr(interaction, "guild", None):
@@ -6960,8 +6968,26 @@ echo "CHANGED_END"
             return False, "❌ This command is not enabled in this guild."
 
         owner_id = int(getattr(interaction.guild, "owner_id", 0) or 0)
-        if owner_id and int(getattr(interaction.user, "id", 0) or 0) != owner_id:
-            return False, "❌ Owner-only command."
+        user_id = int(getattr(interaction.user, "id", 0) or 0)
+
+        # Allow server owner.
+        if owner_id and user_id == owner_id:
+            return True, ""
+
+        # Allow configured admins (role/user allowlist). Do NOT auto-allow "Administrator" permission here.
+        member: Optional[discord.Member] = None
+        try:
+            if isinstance(interaction.user, discord.Member):
+                member = interaction.user
+            else:
+                member = interaction.guild.get_member(user_id)
+        except Exception:
+            member = None
+
+        if member and self.is_admin(member, allow_administrator_permission=False):
+            return True, ""
+
+        return False, "❌ Owner/Admin-only command."
 
         # If we couldn't determine an owner id, fail closed.
         if not owner_id:
