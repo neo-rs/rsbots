@@ -288,7 +288,9 @@
     "startup_backfill": {
       "_comment": "On startup, scan today's member-status-logs messages and open any missing tickets (restart-safe).",
       "enabled": true,
-      "max_messages": 500
+      "max_messages": 500,
+      "_comment_always_scan_today": "When true, re-scan today's member-status-logs on every restart (safe: ticket dedupe + resolved followup dedupe prevent spam).",
+      "always_scan_today": true
     },
     "dedupe": {
       "enabled": true,

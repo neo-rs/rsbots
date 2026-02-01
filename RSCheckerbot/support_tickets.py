@@ -1010,10 +1010,22 @@ async def post_resolution_followup_and_remove_role(
         already_sent = bool(str(rec.get("resolved_followup_sent_at_iso") or "").strip())
         if already_sent:
             return True
-        # mark resolved now (persist even if send fails; we don't want to spam)
-        rec["resolved_at_iso"] = _now_iso()
+
+        # Throttle retries (prevents spam if multiple resolve signals arrive).
+        now_iso = _now_iso()
+        last_try = _parse_iso(str(rec.get("resolved_followup_last_attempt_at_iso") or "").strip() or "")
+        if last_try and (_now_utc() - last_try) < timedelta(seconds=300):
+            return True
+
+        # Mark resolved + record an attempt (we'll mark "sent" only after successful post).
+        if not str(rec.get("resolved_at_iso") or "").strip():
+            rec["resolved_at_iso"] = now_iso
         rec["resolved_event"] = str(resolution_event or "")[:200]
-        rec["resolved_followup_sent_at_iso"] = _now_iso()
+        rec["resolved_followup_last_attempt_at_iso"] = now_iso
+        try:
+            rec["resolved_followup_attempts"] = int(rec.get("resolved_followup_attempts") or 0) + 1
+        except Exception:
+            rec["resolved_followup_attempts"] = 1
         # keep latest source reference
         if reference_jump_url:
             rec["reference_jump_url"] = str(reference_jump_url or "")
@@ -1053,6 +1065,17 @@ async def post_resolution_followup_and_remove_role(
             view=view,
             allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
         )
+
+    # Mark "sent" after posting succeeds (best-effort).
+    async with _INDEX_LOCK:
+        db2 = _index_load()
+        found2 = _ticket_by_channel_id(db2, int(ch.id))
+        if found2:
+            tid2, rec2 = found2
+            if _ticket_is_open(rec2) and (not str(rec2.get("resolved_followup_sent_at_iso") or "").strip()):
+                rec2["resolved_followup_sent_at_iso"] = _now_iso()
+                db2["tickets"][tid2] = rec2  # type: ignore[index]
+                _index_save(db2)
 
     with suppress(Exception):
         await _audit_ticket_resolved(
@@ -1327,6 +1350,8 @@ async def _open_or_update_ticket(
             "resolved_at_iso": "",
             "resolved_event": "",
             "resolved_followup_sent_at_iso": "",
+            "resolved_followup_last_attempt_at_iso": "",
+            "resolved_followup_attempts": 0,
         }
         if isinstance(extra_record_fields, dict):
             for k, v in extra_record_fields.items():

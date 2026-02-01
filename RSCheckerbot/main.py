@@ -5774,9 +5774,11 @@ async def support_tickets_startup_backfill_today() -> None:
         bf = (st_cfg.get("startup_backfill") if isinstance(st_cfg, dict) else {}) if isinstance(st_cfg, dict) else {}
         enabled = bool(bf.get("enabled", False))
         max_messages = int(bf.get("max_messages") or 500)
+        always_scan_today = bool(bf.get("always_scan_today", False))
     except Exception:
         enabled = False
         max_messages = 500
+        always_scan_today = False
     max_messages = max(50, min(5000, int(max_messages)))
 
     if not enabled:
@@ -5806,11 +5808,7 @@ async def support_tickets_startup_backfill_today() -> None:
     last_id = 0
     with suppress(Exception):
         last_id = int(state.get("last_message_id") or 0)
-    after_arg = None
-    if last_id > 0:
-        after_arg = discord.Object(id=int(last_id))
-    else:
-        after_arg = since_utc
+    after_arg = since_utc if always_scan_today else (discord.Object(id=int(last_id)) if last_id > 0 else since_utc)
 
     scanned = 0
     with suppress(Exception):

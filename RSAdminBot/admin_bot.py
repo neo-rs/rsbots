@@ -5872,14 +5872,14 @@ git pull --ff-only origin main
 NEW="$(git rev-parse HEAD 2>/dev/null || echo '')"
 
 TS="$(date +%Y%m%d_%H%M%S)"
-STAGING_DIR="/tmp/mw_rsadminbot_stage_${{TS}}"
+STAGING_DIR="/tmp/mw_rsadminbot_stage_$TS"
 mkdir -p "$STAGING_DIR"
 
 # Tracked file list for RSAdminBot only (safe types; never secrets)
-TMP_ALL="/tmp/mw_rsadminbot_all_${{TS}}.txt"
+TMP_ALL="/tmp/mw_rsadminbot_all_$TS.txt"
 git ls-files "RSAdminBot" 2>/dev/null > "$TMP_ALL" || true
 
-TMP_SYNC="/tmp/mw_rsadminbot_sync_${{TS}}.txt"
+TMP_SYNC="/tmp/mw_rsadminbot_sync_$TS.txt"
 grep -E "(\\.py$|\\.md$|\\.json$|\\.txt$|\\.sh$|(^|/)requirements\\.txt$)" "$TMP_ALL" | grep -v -E "(^|/)config\\.secrets\\.json$" > "$TMP_SYNC" || true
 sort -u "$TMP_SYNC" -o "$TMP_SYNC" || true
 SYNC_COUNT="$(wc -l < "$TMP_SYNC" | tr -d ' ')"
@@ -5891,7 +5891,7 @@ if [ "$SYNC_COUNT" = "0" ]; then
 fi
 
 # Change list (git)
-TMP_CHANGED="/tmp/mw_rsadminbot_changed_${{TS}}.txt"
+TMP_CHANGED="/tmp/mw_rsadminbot_changed_$TS.txt"
 git diff --name-only "$OLD" "$NEW" -- "RSAdminBot" 2>/dev/null > "$TMP_CHANGED" || true
 CHANGED_COUNT="$(sed '/^$/d' "$TMP_CHANGED" | wc -l | tr -d ' ')"
 if [ "$CHANGED_COUNT" = "" ]; then CHANGED_COUNT="0"; fi
@@ -5913,7 +5913,7 @@ fi
 # Remote backup (server-side only)
 BACKUP_DIR="$LIVE_ROOT/backups"
 mkdir -p "$BACKUP_DIR"
-BACKUP_TAR="$BACKUP_DIR/RSAdminBot_preupdate_${{TS}}.tar.gz"
+BACKUP_TAR="$BACKUP_DIR/RSAdminBot_preupdate_$TS.tar.gz"
 env -u TAR_OPTIONS /bin/tar -czf "$BACKUP_TAR" -C "$LIVE_ROOT" "RSAdminBot" || true
 
 # Stage tracked files into STAGING_DIR (preserve paths like RSAdminBot/...)
@@ -5921,7 +5921,7 @@ env -u TAR_OPTIONS /bin/tar -cf - -T "$TMP_SYNC" | (cd "$STAGING_DIR" && env -u 
 
 # Write pending update marker for run_bot.sh
 PENDING_JSON="$LIVE_ROOT/RSAdminBot/.pending_update.json"
-python3 - <<'PY'
+TS="$TS" STAGING_DIR="$STAGING_DIR" BACKUP_TAR="$BACKUP_TAR" CHANGED_COUNT="$CHANGED_COUNT" SYNC_COUNT="$SYNC_COUNT" OLD="$OLD" NEW="$NEW" PENDING_JSON="$PENDING_JSON" python3 - <<'PY'
 import json, os
 staging = os.environ.get("STAGING_DIR","")
 ts = os.environ.get("TS","")
@@ -5990,7 +5990,7 @@ echo "CHANGED_END"
             stats["changed_sample"] = changed_lines[:30]
             return True, stats
         except Exception as e:
-            return False, {"error": f"rsadminbot stage update failed: {str(e)[:300]}"}
+            return False, {"error": f"rsadminbot stage update failed ({type(e).__name__}): {str(e)[:300]}"}
     
     def _github_py_only_update(self, bot_folder: str, *, code_root: Optional[str] = None) -> Tuple[bool, Dict[str, Any]]:
         """Pull python-only bot code from the server-side GitHub checkout and overwrite live code files.
