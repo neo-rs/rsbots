@@ -3298,8 +3298,9 @@ class RSForwarderBot:
                 ch_id = int(getattr(getattr(ctx, "channel", None), "id", 0) or 0)
                 g_id = int(getattr(getattr(ctx, "guild", None), "id", 0) or 0)
                 u_id = int(getattr(getattr(ctx, "author", None), "id", 0) or 0)
-                et = type(error).__name__
-                msg = str(error or "").replace("\r", " ").replace("\n", " ").strip()
+                orig = getattr(error, "original", None)
+                et = type(orig).__name__ if orig is not None else type(error).__name__
+                msg = str(orig or error or "").replace("\r", " ").replace("\n", " ").strip()
                 if len(msg) > 260:
                     msg = msg[:260] + "..."
                 print(f"{Colors.RED}[CmdErr] {cmd} user={u_id} guild={g_id} channel={ch_id} {et}: {msg}{Colors.RESET}")
@@ -3360,14 +3361,29 @@ class RSForwarderBot:
                         self.channel_page = 0
                         self.selected_channel_ids: Set[int] = set()
 
+                        # NOTE: Select menus consume the full row in Discord (width=5).
+                        # Keep each select on its own row to avoid "could not find open space for item".
                         self.dest_select = discord.ui.Select(
                             placeholder="Select destination channel (page)…",
                             min_values=1,
                             max_values=1,
                             options=[],
+                            row=0,
                         )
-                        self.guild_select = discord.ui.Select(placeholder="Select source guild…", min_values=1, max_values=1, options=[])
-                        self.channel_select = discord.ui.Select(placeholder="Select source channels (page)…", min_values=0, max_values=25, options=[])
+                        self.guild_select = discord.ui.Select(
+                            placeholder="Select source guild…",
+                            min_values=1,
+                            max_values=1,
+                            options=[],
+                            row=1,
+                        )
+                        self.channel_select = discord.ui.Select(
+                            placeholder="Select source channels (page)…",
+                            min_values=0,
+                            max_values=25,
+                            options=[],
+                            row=2,
+                        )
                         self.dest_select.callback = self._on_select_destination  # type: ignore[assignment]
                         self.guild_select.callback = self._on_select_guild  # type: ignore[assignment]
                         self.channel_select.callback = self._on_select_channels  # type: ignore[assignment]
@@ -3562,21 +3578,21 @@ class RSForwarderBot:
                             self.selected_channel_ids = set()
                         await self._refresh(interaction)
 
-                    @discord.ui.button(label="Prev destination", style=discord.ButtonStyle.secondary, row=1)
+                    @discord.ui.button(label="Prev destination", style=discord.ButtonStyle.secondary, row=3)
                     async def prev_destination(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
                         if not await self._guard(interaction):
                             return
                         self.dest_channel_page = max(0, int(self.dest_channel_page) - 1)
                         await self._refresh(interaction)
 
-                    @discord.ui.button(label="Next destination", style=discord.ButtonStyle.secondary, row=1)
+                    @discord.ui.button(label="Next destination", style=discord.ButtonStyle.secondary, row=3)
                     async def next_destination(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
                         if not await self._guard(interaction):
                             return
                         self.dest_channel_page = int(self.dest_channel_page) + 1
                         await self._refresh(interaction)
 
-                    @discord.ui.button(label="Prev category", style=discord.ButtonStyle.secondary, row=2)
+                    @discord.ui.button(label="Prev category", style=discord.ButtonStyle.secondary, row=3)
                     async def prev_category(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
                         if not await self._guard(interaction):
                             return
@@ -3585,7 +3601,7 @@ class RSForwarderBot:
                         self.selected_channel_ids = set()
                         await self._refresh(interaction)
 
-                    @discord.ui.button(label="Next category", style=discord.ButtonStyle.secondary, row=2)
+                    @discord.ui.button(label="Next category", style=discord.ButtonStyle.secondary, row=3)
                     async def next_category(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
                         if not await self._guard(interaction):
                             return
@@ -3595,7 +3611,7 @@ class RSForwarderBot:
                         self.selected_channel_ids = set()
                         await self._refresh(interaction)
 
-                    @discord.ui.button(label="Prev channels", style=discord.ButtonStyle.secondary, row=2)
+                    @discord.ui.button(label="Prev channels", style=discord.ButtonStyle.secondary, row=3)
                     async def prev_channels(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
                         if not await self._guard(interaction):
                             return
@@ -3603,7 +3619,7 @@ class RSForwarderBot:
                         self.selected_channel_ids = set()
                         await self._refresh(interaction)
 
-                    @discord.ui.button(label="Next channels", style=discord.ButtonStyle.secondary, row=2)
+                    @discord.ui.button(label="Next channels", style=discord.ButtonStyle.secondary, row=4)
                     async def next_channels(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
                         if not await self._guard(interaction):
                             return
@@ -3611,7 +3627,7 @@ class RSForwarderBot:
                         self.selected_channel_ids = set()
                         await self._refresh(interaction)
 
-                    @discord.ui.button(label="Map → destination", style=discord.ButtonStyle.success, row=3)
+                    @discord.ui.button(label="Map → destination", style=discord.ButtonStyle.success, row=4)
                     async def map_to_destination(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
                         if not await self._guard(interaction):
                             return
@@ -3640,7 +3656,7 @@ class RSForwarderBot:
                         self.selected_channel_ids = set()
                         await self._refresh(interaction)
 
-                    @discord.ui.button(label="Unmap selected", style=discord.ButtonStyle.danger, row=3)
+                    @discord.ui.button(label="Unmap selected", style=discord.ButtonStyle.danger, row=4)
                     async def unmap_selected(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
                         if not await self._guard(interaction):
                             return
@@ -3659,7 +3675,7 @@ class RSForwarderBot:
                         self.selected_channel_ids = set()
                         await self._refresh(interaction)
 
-                    @discord.ui.button(label="Close", style=discord.ButtonStyle.secondary, row=3)
+                    @discord.ui.button(label="Close", style=discord.ButtonStyle.secondary, row=4)
                     async def close(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
                         if not await self._guard(interaction):
                             return
