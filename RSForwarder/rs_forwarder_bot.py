@@ -3278,6 +3278,46 @@ class RSForwarderBot:
             if channel_config:
                 # Forward the message
                 await self.forward_message(message, channel_id, channel_config)
+
+        @self.bot.event
+        async def on_command(ctx):  # type: ignore[override]
+            try:
+                cmd = getattr(getattr(ctx, "command", None), "qualified_name", None) or getattr(getattr(ctx, "command", None), "name", None) or "?"
+                ch_id = int(getattr(getattr(ctx, "channel", None), "id", 0) or 0)
+                g_id = int(getattr(getattr(ctx, "guild", None), "id", 0) or 0)
+                u_id = int(getattr(getattr(ctx, "author", None), "id", 0) or 0)
+                print(f"{Colors.CYAN}[Cmd] {cmd} user={u_id} guild={g_id} channel={ch_id}{Colors.RESET}")
+            except Exception:
+                pass
+
+        @self.bot.event
+        async def on_command_error(ctx, error):  # type: ignore[override]
+            # Make command failures visible in journal + (best-effort) to the invoking user.
+            try:
+                cmd = getattr(getattr(ctx, "command", None), "qualified_name", None) or getattr(getattr(ctx, "command", None), "name", None) or "?"
+                ch_id = int(getattr(getattr(ctx, "channel", None), "id", 0) or 0)
+                g_id = int(getattr(getattr(ctx, "guild", None), "id", 0) or 0)
+                u_id = int(getattr(getattr(ctx, "author", None), "id", 0) or 0)
+                et = type(error).__name__
+                msg = str(error or "").replace("\r", " ").replace("\n", " ").strip()
+                if len(msg) > 260:
+                    msg = msg[:260] + "..."
+                print(f"{Colors.RED}[CmdErr] {cmd} user={u_id} guild={g_id} channel={ch_id} {et}: {msg}{Colors.RESET}")
+            except Exception:
+                pass
+
+            # Try to send a short message. If channel send fails, DM the user.
+            short = f"❌ `{getattr(getattr(ctx, 'command', None), 'name', 'cmd')}` failed: {type(error).__name__}"
+            try:
+                await ctx.send(short)
+                return
+            except Exception:
+                pass
+            try:
+                if getattr(ctx, "author", None):
+                    await ctx.author.send(short)
+            except Exception:
+                pass
     
     def _setup_commands(self):
         """Setup bot commands"""
