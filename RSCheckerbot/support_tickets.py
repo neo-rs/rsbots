@@ -466,6 +466,81 @@ def _support_ping_role_mention() -> str:
     return f"<@&{int(rid)}>" if int(rid or 0) > 0 else ""
 
 
+def _ticket_ping_content(*, owner_id: int, include_owner: bool) -> str:
+    """Ticket header ping content (member + support role)."""
+    if not bool(include_owner):
+        return ""
+    uid = int(owner_id or 0)
+    role_mention = _support_ping_role_mention()
+    return " ".join([x for x in [f"<@{uid}>" if uid else "", role_mention] if str(x or "").strip()])
+
+
+async def _ensure_ticket_header_message(
+    *,
+    channel: discord.TextChannel,
+    owner_id: int,
+    include_owner: bool,
+    preview_embed: discord.Embed,
+    header_message_id: int = 0,
+) -> int:
+    """Ensure a single 'header' message exists (ping + embed + buttons), and keep it updated."""
+    if not _ensure_cfg_loaded() or not _BOT or not isinstance(channel, discord.TextChannel):
+        return 0
+
+    view = _CONTROLS_VIEW or SupportTicketControlsView()
+    ping = _ticket_ping_content(owner_id=int(owner_id), include_owner=bool(include_owner))
+    bot_id = int(getattr(getattr(_BOT, "user", None), "id", 0) or 0)
+
+    # Prefer editing the stored message id.
+    mid = int(header_message_id or 0)
+    if mid > 0:
+        try:
+            msg = await channel.fetch_message(int(mid))
+        except Exception:
+            msg = None
+        if msg is not None and int(getattr(getattr(msg, "author", None), "id", 0) or 0) == bot_id:
+            with suppress(Exception):
+                await msg.edit(content=ping, embed=preview_embed, view=view)
+                return int(getattr(msg, "id", 0) or 0)
+
+    # Fallback: find an early bot-authored embed message in channel history.
+    embed_msg: discord.Message | None = None
+    ping_only_msg: discord.Message | None = None
+    try:
+        async for m in channel.history(limit=30, oldest_first=True):
+            if int(getattr(getattr(m, "author", None), "id", 0) or 0) != bot_id:
+                continue
+            has_embed = bool(getattr(m, "embeds", None) or [])
+            if has_embed and embed_msg is None:
+                embed_msg = m
+            if (not has_embed) and (not getattr(m, "attachments", None)) and ping and str(getattr(m, "content", "") or "").strip() == ping:
+                ping_only_msg = m
+    except Exception:
+        embed_msg = None
+        ping_only_msg = None
+
+    if embed_msg is not None:
+        with suppress(Exception):
+            await embed_msg.edit(content=ping, embed=preview_embed, view=view)
+        # Best-effort cleanup: delete the separate ping-only message if it exists.
+        if ping_only_msg is not None and int(getattr(ping_only_msg, "id", 0) or 0) != int(getattr(embed_msg, "id", 0) or 0):
+            with suppress(Exception):
+                await ping_only_msg.delete()
+        return int(getattr(embed_msg, "id", 0) or 0)
+
+    # Nothing to edit: send a fresh header.
+    try:
+        sent = await channel.send(
+            content=ping,
+            embed=preview_embed,
+            view=view,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
+        )
+        return int(getattr(sent, "id", 0) or 0)
+    except Exception:
+        return 0
+
+
 async def _ensure_staff_roles_can_view_channel(
     *,
     guild: discord.Guild,
@@ -1326,11 +1401,30 @@ async def _open_or_update_ticket(
             _tid, rec = existing
             ch_id = _as_int(rec.get("channel_id"))
             existing_ticket_id = str(rec.get("ticket_id") or _tid or "").strip()
+            header_mid = _as_int(rec.get("header_message_id") or 0)
             ch = guild.get_channel(int(ch_id)) if ch_id else None
             if isinstance(ch, discord.TextChannel):
                 # Ensure the correct per-ticket role is applied even on dedupe.
                 with suppress(Exception):
                     await _set_ticket_role_for_member(guild=guild, member=owner, ticket_type=ticket_type, add=True)
+                # Keep the ticket header up-to-date (single message: pings + embed + buttons).
+                with suppress(Exception):
+                    new_mid = await _ensure_ticket_header_message(
+                        channel=ch,
+                        owner_id=int(owner.id),
+                        include_owner=bool(cfg.include_ticket_owner_in_channel),
+                        preview_embed=preview_embed,
+                        header_message_id=int(header_mid),
+                    )
+                    if new_mid:
+                        rec["header_message_id"] = int(new_mid)
+                        rec["channel_name"] = str(getattr(ch, "name", "") or "")
+                        if reference_jump_url:
+                            rec["reference_jump_url"] = str(reference_jump_url or "")
+                        if whop_dashboard_url:
+                            rec["whop_dashboard_url"] = str(whop_dashboard_url or "")
+                        db["tickets"][_tid] = rec  # type: ignore[index]
+                        _index_save(db)
                 # Log dedupe to tickets-logs instead of posting inside the ticket.
                 with suppress(Exception):
                     await _audit_ticket_deduped(
@@ -1418,19 +1512,19 @@ async def _open_or_update_ticket(
         with suppress(Exception):
             await _set_ticket_role_for_member(guild=guild, member=owner, ticket_type=ticket_type, add=True)
 
-        # Initial messages (minimal)
-        if cfg.include_ticket_owner_in_channel:
-            with suppress(Exception):
-                role_mention = _support_ping_role_mention()
-                ping = " ".join([x for x in [f"<@{int(owner.id)}>", role_mention] if str(x or "").strip()])
-                await ch.send(
-                    content=ping,
-                    allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
-                )
-        # Preview + controls (single message, buttons attached; no command text)
+        # Header (single message: pings + embed + buttons)
+        header_mid = 0
         with suppress(Exception):
-            view = _CONTROLS_VIEW or SupportTicketControlsView()
-            await ch.send(content="", embed=preview_embed, view=view, silent=True)
+            header_mid = int(
+                await _ensure_ticket_header_message(
+                    channel=ch,
+                    owner_id=int(owner.id),
+                    include_owner=bool(cfg.include_ticket_owner_in_channel),
+                    preview_embed=preview_embed,
+                    header_message_id=0,
+                )
+                or 0
+            )
         for content, emb in (extra_sends or []):
             with suppress(Exception):
                 if emb is None:
@@ -1445,6 +1539,7 @@ async def _open_or_update_ticket(
             "channel_id": int(ch.id),
             "channel_name": str(getattr(ch, "name", "") or ""),
             "guild_id": int(getattr(getattr(ch, "guild", None), "id", 0) or int(cfg.guild_id)),
+            "header_message_id": int(header_mid or 0),
             "created_at_iso": _now_iso(),
             "last_activity_at_iso": _now_iso(),
             "status": "OPEN",
