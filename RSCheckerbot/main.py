@@ -8454,7 +8454,7 @@ async def rebuild_no_whop_link(ctx, confirm: str = ""):
 @bot.command(name="fixnowhoproles", aliases=["fix-nowhop-roles", "fixnowhop"])
 @commands.has_permissions(administrator=True)
 async def fix_no_whop_roles(ctx, billing_role_id: str = "", confirm: str = ""):
-    """One-time cleanup: remove Billing role from members who have No-Whop role.
+    """One-time cleanup: remove Billing role from members who have an OPEN no_whop_link ticket.
 
     Usage:
       .checker fixnowhoproles confirm
@@ -8467,7 +8467,7 @@ async def fix_no_whop_roles(ctx, billing_role_id: str = "", confirm: str = ""):
     if str(billing_role_id or "").strip().isdigit():
         bid = int(str(billing_role_id).strip())
     with suppress(Exception):
-        await ctx.send("⏳ Removing Billing role from No-Whop members…", delete_after=10)
+        await ctx.send("⏳ Removing Billing role from OPEN no_whop_link ticket owners…", delete_after=10)
     stats = await support_tickets.remove_billing_role_from_no_whop_members(billing_role_id=int(bid))
     await ctx.send(
         f"✅ fixnowhoproles complete — removed: {int((stats or {}).get('removed') or 0)}, failed: {int((stats or {}).get('failed') or 0)}",

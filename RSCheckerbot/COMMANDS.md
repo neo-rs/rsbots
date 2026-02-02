@@ -63,7 +63,7 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 - **Returns**: Purge deleted count + scan summary string
 
 #### `.checker fixnowhoproles`
-- **Description**: One-time cleanup: remove Billing role from members who currently have a No-Whop role
+- **Description**: One-time cleanup: remove Billing role from members who have an OPEN `no_whop_link` ticket
 - **Aliases**: `fix-nowhop-roles`, `fixnowhop`
 - **Parameters**:
   - `billing_role_id` (optional): Override the configured Billing role id

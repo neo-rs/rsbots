@@ -74,6 +74,7 @@ class SupportTicketConfig:
     no_whop_link_enabled: bool
     no_whop_link_scan_interval_seconds: int
     no_whop_link_members_role_id: int
+    no_whop_link_exclude_role_ids: list[int]
     no_whop_link_log_to_member_status_logs: bool
     no_whop_link_use_whop_api: bool
     no_whop_link_max_pages: int
@@ -236,6 +237,7 @@ def initialize(
         no_whop_link_enabled=_as_bool(nw.get("enabled")),
         no_whop_link_scan_interval_seconds=max(60, _as_int(nw.get("scan_interval_seconds")) or 21600),
         no_whop_link_members_role_id=_as_int(nw.get("members_role_id")),
+        no_whop_link_exclude_role_ids=_int_list(nw.get("exclude_role_ids")),
         no_whop_link_log_to_member_status_logs=_as_bool(nw.get("log_to_member_status_logs")),
         no_whop_link_use_whop_api=_as_bool(nw.get("use_whop_api")),
         no_whop_link_max_pages=max(1, min(200, _as_int(nw.get("max_pages")) or 50)),
@@ -2598,7 +2600,29 @@ async def sweep_no_whop_link_scan(*, force: bool = False) -> str:
         return ""
     _scan_state_set("no_whop_link", {"last_scan_at_iso": _now_iso(), "last_summary": "running"})
 
-    members = [m for m in (guild.members or []) if isinstance(m, discord.Member) and (not getattr(m, "bot", False)) and role in (m.roles or [])]
+    # Exclude staff/providers/admins from no_whop_link tickets (config-driven + safe defaults).
+    exclude_role_ids = set(int(x) for x in (cfg.no_whop_link_exclude_role_ids or []) if int(x) > 0)
+    exclude_role_ids |= set(int(x) for x in (cfg.staff_role_ids or []) if int(x) > 0)
+    exclude_role_ids |= set(int(x) for x in (cfg.admin_role_ids or []) if int(x) > 0)
+
+    members: list[discord.Member] = []
+    for m in (guild.members or []):
+        if not isinstance(m, discord.Member) or getattr(m, "bot", False):
+            continue
+        if role not in (m.roles or []):
+            continue
+        # Skip administrators / staff and any explicitly excluded roles.
+        with suppress(Exception):
+            perms = getattr(m, "guild_permissions", None)
+            if perms and bool(getattr(perms, "administrator", False)):
+                continue
+        try:
+            rids = {int(r.id) for r in (m.roles or [])}
+        except Exception:
+            rids = set()
+        if exclude_role_ids and (rids & exclude_role_ids):
+            continue
+        members.append(m)
     opened = 0
     already_open = 0
     suppressed = 0
@@ -2815,11 +2839,10 @@ async def purge_no_whop_link_open_tickets(
 
 
 async def remove_billing_role_from_no_whop_members(*, billing_role_id: int = 0) -> dict:
-    """One-time helper: remove Billing role from members who currently have a No-Whop role.
+    """One-time helper: remove Billing role from members who have an OPEN `no_whop_link` ticket.
 
-    Config-driven:
-    - Billing role defaults to `support_tickets.ticket_roles.billing_role_id` unless overridden.
-    - No-Whop roles: `no_whop_link_role_id` + `free_pass_no_whop_role_id`
+    This is ticket-index driven (no role heuristics) to avoid affecting users who do not currently have
+    an OPEN No-Whop-Link ticket.
     """
     if not _ensure_cfg_loaded() or not _BOT:
         return {"removed": 0, "skipped": 0, "failed": 0}
@@ -2839,39 +2862,52 @@ async def remove_billing_role_from_no_whop_members(*, billing_role_id: int = 0) 
         await _log(f"⚠️ support_tickets: fix_no_whop_roles skipped (billing role not found: {bid})")
         return {"removed": 0, "skipped": 0, "failed": 0}
 
-    nowhop_ids = {int(cfg.no_whop_link_role_id or 0), int(cfg.free_pass_no_whop_role_id or 0)}
-    nowhop_ids = {int(x) for x in nowhop_ids if int(x) > 0}
-    if not nowhop_ids:
-        await _log("⚠️ support_tickets: fix_no_whop_roles skipped (no_whop role ids not configured)")
-        return {"removed": 0, "skipped": 0, "failed": 0}
-    nowhop_roles = [guild.get_role(int(rid)) for rid in nowhop_ids]
-    nowhop_roles = [r for r in nowhop_roles if isinstance(r, discord.Role)]
-    if not nowhop_roles:
-        await _log("⚠️ support_tickets: fix_no_whop_roles skipped (no_whop roles not found in guild)")
+    # Build target user_ids from the ticket index (OPEN no_whop_link tickets only).
+    target_uids: set[int] = set()
+    async with _INDEX_LOCK:
+        db = _index_load()
+        for _tid, rec in _ticket_iter(db):
+            if not _ticket_is_open(rec):
+                continue
+            if str(rec.get("ticket_type") or "").strip().lower() != "no_whop_link":
+                continue
+            uid = _as_int(rec.get("user_id"))
+            if uid > 0:
+                target_uids.add(int(uid))
+    if not target_uids:
+        await _log("ℹ️ support_tickets: fix_no_whop_roles no targets (no OPEN no_whop_link tickets)")
         return {"removed": 0, "skipped": 0, "failed": 0}
 
     removed = 0
     skipped = 0
     failed = 0
 
-    for m in (guild.members or []):
-        if not isinstance(m, discord.Member) or getattr(m, "bot", False):
+    for uid in sorted(list(target_uids)):
+        m = guild.get_member(int(uid))
+        if not isinstance(m, discord.Member):
+            with suppress(Exception):
+                m = await guild.fetch_member(int(uid))
+        if not isinstance(m, discord.Member):
+            skipped += 1
             continue
         try:
             rids = {int(r.id) for r in (m.roles or [])}
         except Exception:
+            skipped += 1
             continue
         if int(bid) not in rids:
-            continue
-        if not (rids & nowhop_ids):
+            skipped += 1
             continue
         try:
-            await m.remove_roles(bill_role, reason="RSCheckerbot: one-time cleanup (No-Whop members should not have Billing role)")
+            await m.remove_roles(
+                bill_role,
+                reason="RSCheckerbot: one-time cleanup (OPEN no_whop_link ticket: remove Billing role)",
+            )
             removed += 1
         except Exception:
             failed += 1
 
-    await _log(f"🧹 support_tickets: fix_no_whop_roles removed={removed} failed={failed} billing_role_id={bid} no_whop_role_ids={sorted(list(nowhop_ids))}")
+    await _log(f"🧹 support_tickets: fix_no_whop_roles removed={removed} skipped={skipped} failed={failed} billing_role_id={bid} targets={len(target_uids)}")
     return {"removed": int(removed), "skipped": int(skipped), "failed": int(failed)}
 
 
