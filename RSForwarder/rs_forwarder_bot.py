@@ -3345,52 +3345,35 @@ class RSForwarderBot:
                 owner_id = int(getattr(getattr(ctx, "author", None), "id", 0) or 0)
                 dest_channel: discord.TextChannel = ctx.channel  # type: ignore[assignment]
 
-                class _RsAddMapView(discord.ui.View):
+                class _RsAddWizardView(discord.ui.View):
+                    """
+                    Step-by-step mapper (destination first):
+                    1) pick destination guild/category/channel
+                    2) pick source guild/category/channel(s)
+                    3) map
+                    """
+
                     def __init__(self, bot_obj: "RSForwarderBot"):
                         super().__init__(timeout=900)
                         self._bot = bot_obj
                         self._owner_id = int(owner_id or 0)
-                        self.dest_channel_id = int(dest_channel.id)
-                        self.dest_guild_id = int(getattr(getattr(ctx, "guild", None), "id", 0) or 0)
-                        self.dest_channel_page = 0
-                        # default guild: current guild (if bot is in it)
-                        self.source_guild_id = int(getattr(getattr(ctx, "guild", None), "id", 0) or 0) or 0
-                        if not self.source_guild_id and bot_obj.bot.guilds:
-                            self.source_guild_id = int(bot_obj.bot.guilds[0].id)
-                        self.category_index = 0
-                        self.channel_page = 0
-                        self.selected_channel_ids: Set[int] = set()
 
-                        # NOTE: Select menus consume the full row in Discord (width=5).
-                        # Keep each select on its own row to avoid "could not find open space for item".
-                        self.dest_select = discord.ui.Select(
-                            placeholder="Select destination channel (page)…",
-                            min_values=1,
-                            max_values=1,
-                            options=[],
-                            row=0,
-                        )
-                        self.guild_select = discord.ui.Select(
-                            placeholder="Select source guild…",
-                            min_values=1,
-                            max_values=1,
-                            options=[],
-                            row=1,
-                        )
-                        self.channel_select = discord.ui.Select(
-                            placeholder="Select source channels (page)…",
-                            min_values=0,
-                            max_values=25,
-                            options=[],
-                            row=2,
-                        )
-                        self.dest_select.callback = self._on_select_destination  # type: ignore[assignment]
-                        self.guild_select.callback = self._on_select_guild  # type: ignore[assignment]
-                        self.channel_select.callback = self._on_select_channels  # type: ignore[assignment]
-                        self.add_item(self.dest_select)
-                        self.add_item(self.guild_select)
-                        self.add_item(self.channel_select)
-                        self._rebuild_options()
+                        # Wizard stage: "dest" then "src"
+                        self.stage: str = "dest"
+
+                        # Destination selection
+                        self.dest_guild_id = int(getattr(getattr(ctx, "guild", None), "id", 0) or 0)
+                        self.dest_category_id: int = 0  # 0 == all
+                        self.dest_channel_id: int = 0
+                        self.dest_channel_page: int = 0
+
+                        # Source selection
+                        self.source_guild_id = int(getattr(getattr(ctx, "guild", None), "id", 0) or 0)
+                        self.source_category_id: int = 0  # 0 == all
+                        self.source_channel_page: int = 0
+                        self.selected_source_channel_ids: Set[int] = set()
+
+                        self._rebuild()
 
                     async def _guard(self, interaction: discord.Interaction) -> bool:
                         try:
@@ -3401,291 +3384,392 @@ class RSForwarderBot:
                             return False
                         return True
 
-                    def _current_guild(self) -> Optional[discord.Guild]:
+                    def _guild_by_id(self, guild_id: int) -> Optional[discord.Guild]:
                         try:
-                            return self._bot.bot.get_guild(int(self.source_guild_id))
+                            return self._bot.bot.get_guild(int(guild_id))
                         except Exception:
                             return None
 
-                    def _dest_guild(self) -> Optional[discord.Guild]:
+                    def _sorted_categories(self, guild: discord.Guild) -> List[discord.CategoryChannel]:
+                        cats = list(getattr(guild, "categories", []) or [])
+                        return sorted(cats, key=lambda c: int(getattr(c, "position", 0) or 0))
+
+                    def _sorted_text_channels(self, guild: discord.Guild) -> List[discord.TextChannel]:
+                        chans = [c for c in (getattr(guild, "text_channels", []) or []) if isinstance(c, discord.TextChannel)]
+                        return sorted(chans, key=lambda c: int(getattr(c, "position", 0) or 0))
+
+                    def _channels_in_category(self, guild: discord.Guild, category_id: int) -> List[discord.TextChannel]:
+                        if int(category_id or 0) <= 0:
+                            return self._sorted_text_channels(guild)
+                        cat = None
+                        for c in self._sorted_categories(guild):
+                            if int(getattr(c, "id", 0) or 0) == int(category_id):
+                                cat = c
+                                break
+                        if not cat:
+                            return self._sorted_text_channels(guild)
+                        return [c for c in (getattr(cat, "channels", []) or []) if isinstance(c, discord.TextChannel)]
+
+                    def _page_slice(self, items: List[Any], page: int, page_size: int = 25) -> Tuple[List[Any], int]:
+                        if not items:
+                            return [], 0
+                        max_page = max(0, (len(items) - 1) // page_size)
+                        p = max(0, min(int(page), int(max_page)))
+                        start = p * page_size
+                        return items[start:start + page_size], max_page
+
+                    async def _defer(self, interaction: discord.Interaction) -> None:
                         try:
-                            if self.dest_guild_id:
-                                return self._bot.bot.get_guild(int(self.dest_guild_id))
+                            await interaction.response.defer()
                         except Exception:
                             pass
-                        return None
 
-                    def _dest_channels(self) -> List[discord.TextChannel]:
-                        g = self._dest_guild()
-                        if not g:
-                            return []
-                        chans = [c for c in (getattr(g, "text_channels", []) or []) if isinstance(c, discord.TextChannel)]
-                        return sorted(chans, key=lambda c: int(getattr(c, "position", 0) or 0))
-
-                    def _current_dest_channel_page(self) -> List[discord.TextChannel]:
-                        chans = self._dest_channels()
-                        page_size = 25
-                        max_page = max(0, (len(chans) - 1) // page_size) if chans else 0
-                        self.dest_channel_page = max(0, min(int(self.dest_channel_page), int(max_page)))
-                        start = int(self.dest_channel_page) * page_size
-                        return chans[start:start + page_size]
-
-                    def _categories(self) -> List[Optional[discord.CategoryChannel]]:
-                        g = self._current_guild()
-                        if not g:
-                            return [None]
-                        cats = list(getattr(g, "categories", []) or [])
-                        cats_sorted = sorted(cats, key=lambda c: int(getattr(c, "position", 0) or 0))
-                        return [None] + cats_sorted
-
-                    def _channels_for_category(self) -> List[discord.TextChannel]:
-                        g = self._current_guild()
-                        if not g:
-                            return []
-                        cats = self._categories()
-                        idx = max(0, min(int(self.category_index), len(cats) - 1))
-                        cat = cats[idx]
-                        if cat is None:
-                            chans = [c for c in (getattr(g, "text_channels", []) or [])]
-                        else:
-                            chans = [c for c in (getattr(cat, "channels", []) or []) if isinstance(c, discord.TextChannel)]
-                        return sorted(chans, key=lambda c: int(getattr(c, "position", 0) or 0))
-
-                    def _current_channel_page(self) -> List[discord.TextChannel]:
-                        chans = self._channels_for_category()
-                        page_size = 25
-                        max_page = max(0, (len(chans) - 1) // page_size) if chans else 0
-                        self.channel_page = max(0, min(int(self.channel_page), int(max_page)))
-                        start = int(self.channel_page) * page_size
-                        return chans[start:start + page_size]
-
-                    def _mapped_count(self) -> int:
+                    async def _edit(self, interaction: discord.Interaction) -> None:
+                        emb = await self._build_embed()
                         try:
-                            return len((self._bot.config or {}).get("channels") or [])
+                            # After defer(), edit the message directly.
+                            if interaction.message:
+                                await interaction.message.edit(embed=emb, view=self)
                         except Exception:
-                            return 0
+                            pass
 
-                    def _rebuild_options(self) -> None:
-                        # destination channel options (in the guild where the command was run)
-                        dest_opts: List[discord.SelectOption] = []
-                        for ch in self._current_dest_channel_page():
-                            try:
-                                name = str(getattr(ch, "name", "") or f"channel-{int(ch.id)}")
-                                label = f"#{name}"
-                                if len(label) > 100:
-                                    label = label[:97] + "..."
-                                dest_opts.append(discord.SelectOption(label=label, value=str(int(ch.id))))
-                            except Exception:
-                                pass
-                        self.dest_select.options = dest_opts[:25]
-                        # If our current dest is not set/visible, snap to first option.
-                        if self.dest_select.options:
-                            try:
-                                if int(self.dest_channel_id or 0) <= 0:
-                                    self.dest_channel_id = int(self.dest_select.options[0].value)
-                            except Exception:
-                                pass
+                    async def _build_embed(self) -> discord.Embed:
+                        emb = discord.Embed(title="RSForwarder Mapper (wizard)", color=discord.Color.blurple())
+                        if self.stage == "dest":
+                            emb.description = "Step 1/2: **Destination**\nPick where messages should be forwarded to."
+                            g = self._guild_by_id(self.dest_guild_id)
+                            emb.add_field(name="Destination guild", value=f"`{g.name}` ({g.id})" if g else f"`unknown` ({self.dest_guild_id})", inline=False)
+                            emb.add_field(name="Destination channel", value=f"<#{self.dest_channel_id}>" if self.dest_channel_id else "Not set", inline=False)
+                            emb.set_footer(text="Select destination, then click Next")
+                        else:
+                            emb.description = "Step 2/2: **Source**\nPick which channel(s) to forward from."
+                            g = self._guild_by_id(self.source_guild_id)
+                            emb.add_field(name="Source guild", value=f"`{g.name}` ({g.id})" if g else f"`unknown` ({self.source_guild_id})", inline=False)
+                            if self.selected_source_channel_ids:
+                                shown = ", ".join([f"<#{cid}>" for cid in list(self.selected_source_channel_ids)[:12]])
+                                emb.add_field(name="Selected source", value=shown, inline=False)
+                            else:
+                                emb.add_field(name="Selected source", value="None", inline=False)
+                            emb.add_field(name="Destination", value=f"<#{self.dest_channel_id}>" if self.dest_channel_id else "Not set", inline=False)
+                            emb.set_footer(text="Select source, then click Map → destination")
+                        return emb
 
-                        # guild options
+                    def _rebuild(self) -> None:
+                        self.clear_items()
+
+                        # Shared: guild options
                         guild_opts: List[discord.SelectOption] = []
                         for g in (self._bot.bot.guilds or [])[:25]:
                             try:
                                 guild_opts.append(discord.SelectOption(label=str(g.name)[:100], value=str(int(g.id))))
                             except Exception:
                                 pass
-                        self.guild_select.options = guild_opts
-                        if not self.source_guild_id and guild_opts:
-                            try:
-                                self.source_guild_id = int(guild_opts[0].value)
-                            except Exception:
-                                pass
 
-                        # channel options
-                        ch_opts: List[discord.SelectOption] = []
-                        for ch in self._current_channel_page():
-                            try:
-                                name = str(getattr(ch, "name", "") or f"channel-{int(ch.id)}")
-                                label = f"#{name}"
-                                if len(label) > 100:
-                                    label = label[:97] + "..."
-                                ch_opts.append(discord.SelectOption(label=label, value=str(int(ch.id))))
-                            except Exception:
-                                pass
-                        self.channel_select.options = ch_opts[:25]
+                        if self.stage == "dest":
+                            # Destination guild select
+                            self.dest_guild_select = discord.ui.Select(
+                                placeholder="Select destination guild…",
+                                min_values=1,
+                                max_values=1,
+                                options=guild_opts,
+                                row=0,
+                            )
+                            self.dest_guild_select.callback = self._on_dest_guild  # type: ignore[assignment]
+                            self.add_item(self.dest_guild_select)
 
-                    async def _build_embed(self) -> discord.Embed:
-                        g = self._current_guild()
-                        cats = self._categories()
-                        idx = max(0, min(int(self.category_index), len(cats) - 1))
-                        cat = cats[idx]
-                        cat_name = "All channels" if cat is None else str(getattr(cat, "name", "") or "Category")
-                        emb = discord.Embed(
-                            title="RSForwarder Mapper",
-                            color=discord.Color.blurple(),
-                            description="Select source channels, then click **Map → destination**.\n(Automatically creates/uses a webhook in the destination channel.)",
-                        )
-                        emb.add_field(name="Destination", value=f"<#{self.dest_channel_id}>", inline=False)
-                        if g:
-                            emb.add_field(name="Source guild", value=f"`{g.name}` ({int(g.id)})", inline=False)
+                            # Destination category select
+                            g = self._guild_by_id(self.dest_guild_id) or self._guild_by_id(int(guild_opts[0].value)) if guild_opts else None
+                            if g and not self.dest_guild_id:
+                                self.dest_guild_id = int(g.id)
+                            cat_opts: List[discord.SelectOption] = [discord.SelectOption(label="All channels", value="0")]
+                            if g:
+                                for c in self._sorted_categories(g)[:24]:
+                                    cat_opts.append(discord.SelectOption(label=str(getattr(c, "name", "") or "category")[:100], value=str(int(c.id))))
+                            self.dest_cat_select = discord.ui.Select(
+                                placeholder="Select destination category…",
+                                min_values=1,
+                                max_values=1,
+                                options=cat_opts,
+                                row=1,
+                            )
+                            self.dest_cat_select.callback = self._on_dest_category  # type: ignore[assignment]
+                            self.add_item(self.dest_cat_select)
+
+                            # Destination channel select (paged)
+                            chan_opts: List[discord.SelectOption] = []
+                            if g:
+                                chans = self._channels_in_category(g, int(self.dest_category_id))
+                                page_items, max_page = self._page_slice(chans, self.dest_channel_page)
+                                for ch in page_items:
+                                    chan_opts.append(discord.SelectOption(label=f"#{str(getattr(ch, 'name', '') or ch.id)[:95]}", value=str(int(ch.id))))
+                                self._dest_max_page = int(max_page)
+                            else:
+                                self._dest_max_page = 0
+                            if not chan_opts:
+                                chan_opts = [discord.SelectOption(label="(no channels)", value="0")]
+                            self.dest_channel_select = discord.ui.Select(
+                                placeholder="Select destination channel…",
+                                min_values=1,
+                                max_values=1,
+                                options=chan_opts[:25],
+                                row=2,
+                            )
+                            self.dest_channel_select.callback = self._on_dest_channel  # type: ignore[assignment]
+                            self.add_item(self.dest_channel_select)
+
+                            # Page buttons (only if needed)
+                            if int(getattr(self, "_dest_max_page", 0) or 0) > 0:
+                                self.add_item(discord.ui.Button(label="Prev channels", style=discord.ButtonStyle.secondary, row=3))
+                                self.children[-1].callback = self._dest_prev  # type: ignore[attr-defined]
+                                self.add_item(discord.ui.Button(label="Next channels", style=discord.ButtonStyle.secondary, row=3))
+                                self.children[-1].callback = self._dest_next  # type: ignore[attr-defined]
+
+                            # Nav buttons
+                            self.add_item(discord.ui.Button(label="Next", style=discord.ButtonStyle.primary, row=4))
+                            self.children[-1].callback = self._go_next  # type: ignore[attr-defined]
+                            self.add_item(discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger, row=4))
+                            self.children[-1].callback = self._cancel  # type: ignore[attr-defined]
                         else:
-                            emb.add_field(name="Source guild", value=f"`unknown` ({int(self.source_guild_id)})", inline=False)
-                        emb.add_field(name="Category", value=f"`{cat_name}`", inline=True)
-                        emb.add_field(name="Mapped", value=str(self._mapped_count()), inline=True)
-                        if self.selected_channel_ids:
-                            shown = ", ".join([f"<#{cid}>" for cid in list(self.selected_channel_ids)[:10]])
-                            emb.add_field(name="Selected", value=shown, inline=False)
-                        emb.set_footer(text="Prev/Next Destination • Prev/Next Category • Prev/Next Channels • Map → destination")
-                        return emb
+                            # Source guild select
+                            self.src_guild_select = discord.ui.Select(
+                                placeholder="Select source guild…",
+                                min_values=1,
+                                max_values=1,
+                                options=guild_opts,
+                                row=0,
+                            )
+                            self.src_guild_select.callback = self._on_src_guild  # type: ignore[assignment]
+                            self.add_item(self.src_guild_select)
 
-                    async def _refresh(self, interaction: discord.Interaction) -> None:
-                        self._rebuild_options()
-                        emb = await self._build_embed()
-                        try:
-                            await interaction.response.edit_message(embed=emb, view=self)
-                        except Exception:
-                            try:
-                                await interaction.followup.send(embed=emb, view=self, ephemeral=True)
-                            except Exception:
-                                pass
+                            g = self._guild_by_id(self.source_guild_id) or self._guild_by_id(int(guild_opts[0].value)) if guild_opts else None
+                            if g and not self.source_guild_id:
+                                self.source_guild_id = int(g.id)
 
-                    async def _on_select_destination(self, interaction: discord.Interaction):
+                            # Source category select
+                            cat_opts: List[discord.SelectOption] = [discord.SelectOption(label="All channels", value="0")]
+                            if g:
+                                for c in self._sorted_categories(g)[:24]:
+                                    cat_opts.append(discord.SelectOption(label=str(getattr(c, "name", "") or "category")[:100], value=str(int(c.id))))
+                            self.src_cat_select = discord.ui.Select(
+                                placeholder="Select source category…",
+                                min_values=1,
+                                max_values=1,
+                                options=cat_opts,
+                                row=1,
+                            )
+                            self.src_cat_select.callback = self._on_src_category  # type: ignore[assignment]
+                            self.add_item(self.src_cat_select)
+
+                            # Source channel select (paged, multi)
+                            chan_opts: List[discord.SelectOption] = []
+                            if g:
+                                chans = self._channels_in_category(g, int(self.source_category_id))
+                                page_items, max_page = self._page_slice(chans, self.source_channel_page)
+                                for ch in page_items:
+                                    chan_opts.append(discord.SelectOption(label=f"#{str(getattr(ch, 'name', '') or ch.id)[:95]}", value=str(int(ch.id))))
+                                self._src_max_page = int(max_page)
+                            else:
+                                self._src_max_page = 0
+                            if not chan_opts:
+                                chan_opts = [discord.SelectOption(label="(no channels)", value="0")]
+                            self.src_channel_select = discord.ui.Select(
+                                placeholder="Select source channel(s)…",
+                                min_values=0,
+                                max_values=25,
+                                options=chan_opts[:25],
+                                row=2,
+                            )
+                            self.src_channel_select.callback = self._on_src_channels  # type: ignore[assignment]
+                            self.add_item(self.src_channel_select)
+
+                            if int(getattr(self, "_src_max_page", 0) or 0) > 0:
+                                self.add_item(discord.ui.Button(label="Prev channels", style=discord.ButtonStyle.secondary, row=3))
+                                self.children[-1].callback = self._src_prev  # type: ignore[attr-defined]
+                                self.add_item(discord.ui.Button(label="Next channels", style=discord.ButtonStyle.secondary, row=3))
+                                self.children[-1].callback = self._src_next  # type: ignore[attr-defined]
+
+                            self.add_item(discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary, row=4))
+                            self.children[-1].callback = self._go_back  # type: ignore[attr-defined]
+                            self.add_item(discord.ui.Button(label="Map → destination", style=discord.ButtonStyle.success, row=4))
+                            self.children[-1].callback = self._map  # type: ignore[attr-defined]
+                            self.add_item(discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger, row=4))
+                            self.children[-1].callback = self._cancel  # type: ignore[attr-defined]
+
+                    async def _on_dest_guild(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
+                        await self._defer(interaction)
                         try:
-                            self.dest_channel_id = int(self.dest_select.values[0])
+                            self.dest_guild_id = int(self.dest_guild_select.values[0])
+                            self.dest_category_id = 0
+                            self.dest_channel_id = 0
+                            self.dest_channel_page = 0
                         except Exception:
                             pass
-                        await self._refresh(interaction)
+                        self._rebuild()
+                        await self._edit(interaction)
 
-                    async def _on_select_guild(self, interaction: discord.Interaction):
+                    async def _on_dest_category(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
+                        await self._defer(interaction)
                         try:
-                            self.source_guild_id = int(self.guild_select.values[0])
-                            self.category_index = 0
-                            self.channel_page = 0
-                            self.selected_channel_ids = set()
+                            self.dest_category_id = int(self.dest_cat_select.values[0])
+                            self.dest_channel_page = 0
+                            self.dest_channel_id = 0
                         except Exception:
                             pass
-                        await self._refresh(interaction)
+                        self._rebuild()
+                        await self._edit(interaction)
 
-                    async def _on_select_channels(self, interaction: discord.Interaction):
+                    async def _on_dest_channel(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
+                        await self._defer(interaction)
                         try:
-                            self.selected_channel_ids = set(int(v) for v in (self.channel_select.values or []) if str(v).isdigit())
+                            v = int(self.dest_channel_select.values[0])
+                            self.dest_channel_id = v if v > 0 else 0
                         except Exception:
-                            self.selected_channel_ids = set()
-                        await self._refresh(interaction)
+                            pass
+                        await self._edit(interaction)
 
-                    @discord.ui.button(label="Prev destination", style=discord.ButtonStyle.secondary, row=3)
-                    async def prev_destination(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+                    async def _dest_prev(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
+                        await self._defer(interaction)
                         self.dest_channel_page = max(0, int(self.dest_channel_page) - 1)
-                        await self._refresh(interaction)
+                        self._rebuild()
+                        await self._edit(interaction)
 
-                    @discord.ui.button(label="Next destination", style=discord.ButtonStyle.secondary, row=3)
-                    async def next_destination(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+                    async def _dest_next(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
+                        await self._defer(interaction)
                         self.dest_channel_page = int(self.dest_channel_page) + 1
-                        await self._refresh(interaction)
+                        self._rebuild()
+                        await self._edit(interaction)
 
-                    @discord.ui.button(label="Prev category", style=discord.ButtonStyle.secondary, row=3)
-                    async def prev_category(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+                    async def _on_src_guild(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
-                        self.category_index = max(0, int(self.category_index) - 1)
-                        self.channel_page = 0
-                        self.selected_channel_ids = set()
-                        await self._refresh(interaction)
+                        await self._defer(interaction)
+                        try:
+                            self.source_guild_id = int(self.src_guild_select.values[0])
+                            self.source_category_id = 0
+                            self.source_channel_page = 0
+                            self.selected_source_channel_ids = set()
+                        except Exception:
+                            pass
+                        self._rebuild()
+                        await self._edit(interaction)
 
-                    @discord.ui.button(label="Next category", style=discord.ButtonStyle.secondary, row=3)
-                    async def next_category(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+                    async def _on_src_category(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
-                        cats = self._categories()
-                        self.category_index = min(len(cats) - 1, int(self.category_index) + 1)
-                        self.channel_page = 0
-                        self.selected_channel_ids = set()
-                        await self._refresh(interaction)
+                        await self._defer(interaction)
+                        try:
+                            self.source_category_id = int(self.src_cat_select.values[0])
+                            self.source_channel_page = 0
+                            self.selected_source_channel_ids = set()
+                        except Exception:
+                            pass
+                        self._rebuild()
+                        await self._edit(interaction)
 
-                    @discord.ui.button(label="Prev channels", style=discord.ButtonStyle.secondary, row=3)
-                    async def prev_channels(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+                    async def _on_src_channels(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
-                        self.channel_page = max(0, int(self.channel_page) - 1)
-                        self.selected_channel_ids = set()
-                        await self._refresh(interaction)
+                        await self._defer(interaction)
+                        try:
+                            self.selected_source_channel_ids = set(int(v) for v in (self.src_channel_select.values or []) if str(v).isdigit() and int(v) > 0)
+                        except Exception:
+                            self.selected_source_channel_ids = set()
+                        await self._edit(interaction)
 
-                    @discord.ui.button(label="Next channels", style=discord.ButtonStyle.secondary, row=4)
-                    async def next_channels(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+                    async def _src_prev(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
-                        self.channel_page = int(self.channel_page) + 1
-                        self.selected_channel_ids = set()
-                        await self._refresh(interaction)
+                        await self._defer(interaction)
+                        self.source_channel_page = max(0, int(self.source_channel_page) - 1)
+                        self._rebuild()
+                        await self._edit(interaction)
 
-                    @discord.ui.button(label="Map → destination", style=discord.ButtonStyle.success, row=4)
-                    async def map_to_destination(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+                    async def _src_next(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
-                        if not self.selected_channel_ids:
-                            await interaction.response.send_message("❌ Select at least one source channel first.", ephemeral=True)
+                        await self._defer(interaction)
+                        self.source_channel_page = int(self.source_channel_page) + 1
+                        self._rebuild()
+                        await self._edit(interaction)
+
+                    async def _go_next(self, interaction: discord.Interaction):
+                        if not await self._guard(interaction):
                             return
+                        if int(self.dest_channel_id or 0) <= 0:
+                            await interaction.response.send_message("❌ Pick a destination channel first.", ephemeral=True)
+                            return
+                        await self._defer(interaction)
+                        self.stage = "src"
+                        self._rebuild()
+                        await self._edit(interaction)
+
+                    async def _go_back(self, interaction: discord.Interaction):
+                        if not await self._guard(interaction):
+                            return
+                        await self._defer(interaction)
+                        self.stage = "dest"
+                        self._rebuild()
+                        await self._edit(interaction)
+
+                    async def _map(self, interaction: discord.Interaction):
+                        if not await self._guard(interaction):
+                            return
+                        if not self.selected_source_channel_ids:
+                            await interaction.response.send_message("❌ Pick at least one source channel first.", ephemeral=True)
+                            return
+                        if int(self.dest_channel_id or 0) <= 0:
+                            await interaction.response.send_message("❌ Destination channel not set.", ephemeral=True)
+                            return
+
+                        await self._defer(interaction)
                         dest_obj = await self._bot._resolve_channel_by_id(int(self.dest_channel_id))
                         if not isinstance(dest_obj, discord.TextChannel):
-                            await interaction.response.send_message("❌ Destination channel not accessible.", ephemeral=True)
+                            await interaction.followup.send("❌ Destination channel not accessible.", ephemeral=True)
                             return
-
                         ok_wh, msg_wh, wh_url = await self._bot._get_or_create_destination_webhook_url(dest_obj)
                         if not ok_wh:
-                            await interaction.response.send_message(f"❌ {msg_wh}", ephemeral=True)
+                            await interaction.followup.send(f"❌ {msg_wh}", ephemeral=True)
                             return
 
                         added = 0
                         skipped = 0
-                        for cid in list(self.selected_channel_ids):
+                        for cid in list(self.selected_source_channel_ids):
                             ok2, _msg2, _emb2 = await self._bot._rsadd_apply(source_channel_id=int(cid), destination_webhook_url=wh_url)
                             if ok2:
                                 added += 1
                             else:
                                 skipped += 1
-                        await interaction.response.send_message(f"✅ Mapped: {added} ok, {skipped} skipped.", ephemeral=True)
-                        self.selected_channel_ids = set()
-                        await self._refresh(interaction)
+                        await interaction.followup.send(f"✅ Mapped: {added} ok, {skipped} skipped.", ephemeral=True)
 
-                    @discord.ui.button(label="Unmap selected", style=discord.ButtonStyle.danger, row=4)
-                    async def unmap_selected(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+                        # Reset back to destination step for next mapping
+                        self.stage = "dest"
+                        self.selected_source_channel_ids = set()
+                        self.source_channel_page = 0
+                        self._rebuild()
+                        await self._edit(interaction)
+
+                    async def _cancel(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
-                        if not self.selected_channel_ids:
-                            await interaction.response.send_message("❌ Select at least one source channel first.", ephemeral=True)
-                            return
-                        removed = 0
-                        skipped = 0
-                        for cid in list(self.selected_channel_ids):
-                            ok2, _msg2 = self._bot._rsremove_apply(source_channel_id=int(cid))
-                            if ok2:
-                                removed += 1
-                            else:
-                                skipped += 1
-                        await interaction.response.send_message(f"✅ Unmapped: {removed} ok, {skipped} skipped.", ephemeral=True)
-                        self.selected_channel_ids = set()
-                        await self._refresh(interaction)
-
-                    @discord.ui.button(label="Close", style=discord.ButtonStyle.secondary, row=4)
-                    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
-                        if not await self._guard(interaction):
-                            return
+                        await self._defer(interaction)
+                        self.stop()
                         try:
-                            await interaction.response.defer()
+                            if interaction.message:
+                                await interaction.message.edit(view=None)
                         except Exception:
                             pass
-                        self.stop()
 
-                view = _RsAddMapView(self)
+                view = _RsAddWizardView(self)
                 emb = await view._build_embed()
                 await ctx.send(embed=emb, view=view)
                 return
