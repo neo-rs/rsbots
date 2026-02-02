@@ -228,10 +228,10 @@
       "_comment": "Staff can run !transcript/!close and view all ticket channels. Admin roles are optional; administrators are always treated as allowed.",
       "staff_role_ids": [1351371587617558539],
       "_comment_legacy_staff_role_ids": "Optional: remove these legacy staff role overwrites from existing ticket channels on startup (one-time migration).",
-      "legacy_staff_role_ids": [876588092927115284],
+      "legacy_staff_role_ids": [],
       "admin_role_ids": [876598078092754985],
       "_comment_include_owner": "When true, the ticket owner can see/respond in their ticket channel.",
-      "include_ticket_owner_in_channel": false
+      "include_ticket_owner_in_channel": true
     },
     "ticket_roles": {
       "_comment": "Auto-assign roles when a ticket is OPEN; remove on close.",

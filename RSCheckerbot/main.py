@@ -2527,18 +2527,30 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
     e0 = msg.embeds[0]
     if not isinstance(e0, discord.Embed):
         return
-    # Guard: only process RSCheckerbot-format member-status embeds (even if posted via webhook / renamed app).
+    # Guard: only process member-status cards (avoid false positives).
+    # Some cards may not have a stable footer (e.g. posted via webhook / renamed app),
+    # so fall back to a structural check: must contain a "Discord ID" field or parseable discord id.
     try:
         ft = str(getattr(getattr(e0, "footer", None), "text", "") or "")
     except Exception:
         ft = ""
-    if "rscheckerbot" not in ft.lower():
-        return
+    footer_ok = "rscheckerbot" in ft.lower()
+    has_discord_id_field = False
+    try:
+        for f in (getattr(e0, "fields", None) or []):
+            n = str(getattr(f, "name", "") or "").strip().lower()
+            if n == "discord id":
+                has_discord_id_field = True
+                break
+    except Exception:
+        has_discord_id_field = False
 
     ts_i, kind, did, whop_brief = _extract_reporting_from_member_status_embed(
         e0,
         fallback_ts=int((getattr(msg, "created_at", None) or datetime.now(timezone.utc)).timestamp()),
     )
+    if not footer_ok and not has_discord_id_field and not did:
+        return
     if not did:
         return
     did_i = int(did)
@@ -8385,6 +8397,58 @@ async def cleanup_data(ctx):
         await ctx.message.delete()
     except Exception:
         pass
+
+
+@bot.command(name="purgenowhop", aliases=["purgenowhoplink", "purgenowhoplinks", "wipe-nowhop", "wipe-nowhoplink"])
+@commands.has_permissions(administrator=True)
+async def purge_no_whop_link_tickets(ctx, confirm: str = ""):
+    """Delete ONLY open no_whop_link ticket channels.
+
+    Usage:
+      .checker purgenowhop confirm
+    """
+    if str(confirm or "").strip().lower() != "confirm":
+        await ctx.send("❌ Confirmation required. Use: `.checker purgenowhop confirm`", delete_after=20)
+        return
+    with suppress(Exception):
+        await ctx.send("⏳ Purging `no_whop_link` ticket channels…", delete_after=10)
+    stats = await support_tickets.purge_no_whop_link_open_tickets(do_transcript=True, delete_channel=True)
+    await ctx.send(
+        f"✅ purgenowhop complete — deleted: {int((stats or {}).get('deleted') or 0)}, "
+        f"skipped: {int((stats or {}).get('skipped') or 0)}, failed: {int((stats or {}).get('failed') or 0)}",
+        delete_after=30,
+    )
+
+
+@bot.command(name="scannowhop", aliases=["scan-nowhop", "nowhopscan", "scan_nowhop"])
+@commands.has_permissions(administrator=True)
+async def scan_no_whop_link_now(ctx):
+    """Force-run the no_whop_link scan immediately (bypasses interval throttling)."""
+    with suppress(Exception):
+        await ctx.send("⏳ Running `no_whop_link` scan now…", delete_after=10)
+    summary = await support_tickets.sweep_no_whop_link_scan(force=True)
+    await ctx.send(f"✅ scannowhop finished — {summary or 'done'}", delete_after=30)
+
+
+@bot.command(name="rebuildnowhop", aliases=["rebuild-nowhop", "rebuild-nowhoplink", "regen-nowhop"])
+@commands.has_permissions(administrator=True)
+async def rebuild_no_whop_link(ctx, confirm: str = ""):
+    """Purge + re-scan no_whop_link tickets (safe regen).
+
+    Usage:
+      .checker rebuildnowhop confirm
+    """
+    if str(confirm or "").strip().lower() != "confirm":
+        await ctx.send("❌ Confirmation required. Use: `.checker rebuildnowhop confirm`", delete_after=20)
+        return
+    with suppress(Exception):
+        await ctx.send("⏳ Rebuilding no_whop_link tickets (purge + scan)…", delete_after=10)
+    stats = await support_tickets.purge_no_whop_link_open_tickets(do_transcript=True, delete_channel=True)
+    summary = await support_tickets.sweep_no_whop_link_scan(force=True)
+    await ctx.send(
+        f"✅ rebuildnowhop complete — deleted: {int((stats or {}).get('deleted') or 0)} • {summary or 'scan done'}",
+        delete_after=45,
+    )
 
 
 @bot.command(name="transcript")

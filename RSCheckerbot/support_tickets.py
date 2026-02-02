@@ -306,20 +306,23 @@ def _ticket_owner_id_from_topic(topic: object) -> int:
 
 
 async def migrate_ticket_channel_owner_overwrites() -> None:
-    """One-time best-effort: remove ticket owner overwrite from existing tickets when include_owner is disabled."""
+    """Best-effort migration to align owner access with config.
+
+    This is restart-safe, keyed by the direction:
+    - `owner_overwrites:disable_owner` when owner visibility is disabled
+    - `owner_overwrites:enable_owner` when owner visibility is enabled
+    """
     if not _ensure_cfg_loaded() or not _BOT:
         return
     cfg = _cfg()
     if not cfg:
         return
-    # Only run this migration when owner visibility is disabled.
-    if bool(cfg.include_ticket_owner_in_channel):
-        return
     guild = _BOT.get_guild(int(cfg.guild_id))
     if not isinstance(guild, discord.Guild):
         return
 
-    mig_key = "owner_overwrites:disable_owner"
+    enable_owner = bool(cfg.include_ticket_owner_in_channel)
+    mig_key = "owner_overwrites:enable_owner" if enable_owner else "owner_overwrites:disable_owner"
     try:
         db = _migrations_load()
         done = str((db.get("done") or {}).get(mig_key) or "").strip()
@@ -343,7 +346,9 @@ async def migrate_ticket_channel_owner_overwrites() -> None:
 
     scanned = 0
     removed = 0
+    added = 0
     header_scrubbed = 0
+    header_restored = 0
     failed = 0
 
     for cid in cat_ids:
@@ -367,9 +372,23 @@ async def migrate_ticket_channel_owner_overwrites() -> None:
                         has_ow = False
                         with suppress(Exception):
                             has_ow = bool(mobj in (getattr(ch, "overwrites", {}) or {}))
-                        if has_ow:
-                            await ch.set_permissions(mobj, overwrite=None, reason="RSCheckerbot: disable ticket owner visibility")
-                            removed += 1
+                        if enable_owner:
+                            if not has_ow:
+                                await ch.set_permissions(
+                                    mobj,
+                                    view_channel=True,
+                                    send_messages=True,
+                                    read_message_history=True,
+                                    attach_files=True,
+                                    embed_links=True,
+                                    add_reactions=True,
+                                    reason="RSCheckerbot: enable ticket owner visibility",
+                                )
+                                added += 1
+                        else:
+                            if has_ow:
+                                await ch.set_permissions(mobj, overwrite=None, reason="RSCheckerbot: disable ticket owner visibility")
+                                removed += 1
 
                 # Scrub header message content (remove old pings) if we know the header id.
                 rec0 = await get_ticket_record_for_channel_id(int(ch.id))
@@ -377,13 +396,24 @@ async def migrate_ticket_channel_owner_overwrites() -> None:
                 if mid0 > 0:
                     with suppress(Exception):
                         msg = await ch.fetch_message(int(mid0))
-                        if msg and str(getattr(msg, "content", "") or "").strip():
-                            await msg.edit(content="")
-                            header_scrubbed += 1
+                        if msg:
+                            content = str(getattr(msg, "content", "") or "").strip()
+                            if enable_owner:
+                                ping = _ticket_ping_content(owner_id=int(uid), mention_owner=True, mention_staff=True).strip()
+                                if ping and content != ping:
+                                    await msg.edit(content=ping)
+                                    header_restored += 1
+                            else:
+                                if content:
+                                    await msg.edit(content="")
+                                    header_scrubbed += 1
             except Exception:
                 failed += 1
 
-    await _log(f"🧩 support_tickets: owner_overwrites_migrate scanned={scanned} owner_overwrites_removed={removed} header_scrubbed={header_scrubbed} failed={failed}")
+    if enable_owner:
+        await _log(f"🧩 support_tickets: owner_overwrites_enable scanned={scanned} owner_overwrites_added={added} header_restored={header_restored} failed={failed}")
+    else:
+        await _log(f"🧩 support_tickets: owner_overwrites_disable scanned={scanned} owner_overwrites_removed={removed} header_scrubbed={header_scrubbed} failed={failed}")
     try:
         db2 = _migrations_load()
         done_map = db2.get("done") if isinstance(db2.get("done"), dict) else {}
@@ -409,13 +439,11 @@ async def migrate_ticket_channel_staff_overwrites() -> None:
     if not cfg:
         return
     legacy = [int(x) for x in (cfg.legacy_staff_role_ids or []) if int(x) > 0]
-    if not legacy:
-        return
     guild = _BOT.get_guild(int(cfg.guild_id))
     if not isinstance(guild, discord.Guild):
         return
 
-    # Restart-safe: only run once per (legacy->new) migration key.
+    # Restart-safe: run once per config shape (ensures staff can view channels).
     mig_key = f"staff_overwrites:{','.join([str(x) for x in legacy])}->{','.join([str(x) for x in (cfg.staff_role_ids or [])])}"
     try:
         db = _migrations_load()
@@ -1437,15 +1465,28 @@ async def _set_ticket_role_for_member(*, guild: discord.Guild, member: discord.M
     with suppress(Exception):
         has_it = any(int(getattr(r, "id", 0) or 0) == int(rid) for r in (member.roles or []))
     if add:
-        # Special case: no_whop_link should never keep the Billing role.
-        if str(ticket_type or "").strip().lower() == "no_whop_link":
-            cfg = _cfg()
-            bid = int(getattr(cfg, "billing_role_id", 0) or 0) if cfg else 0
-            if bid > 0:
+        # Special case: whenever we're adding the "no-whop" role (free-pass-no-whop or no-whop-link),
+        # ensure the Billing role is removed (these should be mutually exclusive).
+        cfg = _cfg()
+        bid = int(getattr(cfg, "billing_role_id", 0) or 0) if cfg else 0
+        if bid > 0:
+            should_remove_billing = False
+            try:
+                nr = int(getattr(cfg, "no_whop_link_role_id", 0) or 0) if cfg else 0
+                fr = int(getattr(cfg, "free_pass_no_whop_role_id", 0) or 0) if cfg else 0
+                should_remove_billing = int(role.id) in {int(nr), int(fr)} or str(ticket_type or "").strip().lower() == "no_whop_link"
+            except Exception:
+                should_remove_billing = str(ticket_type or "").strip().lower() == "no_whop_link"
+            if should_remove_billing:
                 bill_role = guild.get_role(int(bid))
                 if bill_role and any(int(getattr(r, "id", 0) or 0) == int(bid) for r in (member.roles or [])):
-                    with suppress(Exception):
+                    try:
                         await member.remove_roles(bill_role, reason="RSCheckerbot: replace billing role with no-whop role")
+                    except Exception as ex:
+                        await _log(
+                            f"⚠️ support_tickets: failed to remove billing role_id={bid} from user_id={int(member.id)} "
+                            f"(hierarchy/perms?) err={str(ex)[:180]}"
+                        )
         if has_it:
             return
         try:
@@ -1763,9 +1804,10 @@ async def _open_or_update_ticket(
                     )
 
     # Dedupe / cooldown: single open ticket per (type,user) or fingerprint.
-    # For no_whop_link we want: ping member (but do NOT grant access) + no staff ping while testing.
-    ping_member = str(ticket_type or "").strip().lower() == "no_whop_link"
-    ping_staff = False
+    # no_whop_link: ping both member + staff on the header message.
+    is_nowhop = str(ticket_type or "").strip().lower() == "no_whop_link"
+    ping_member = bool(is_nowhop)
+    ping_staff = bool(is_nowhop)
 
     async with _INDEX_LOCK:
         db = _index_load()
@@ -2617,25 +2659,25 @@ def _linked_discord_id_from_identity_cache(email: str) -> int:
     return int(did) if did.isdigit() else 0
 
 
-async def sweep_no_whop_link_scan() -> None:
+async def sweep_no_whop_link_scan(*, force: bool = False) -> str:
     """Periodic scan: open no_whop_link tickets for Members-role users whose Whop membership has no Discord connection (or mismatch)."""
     if not _ensure_cfg_loaded() or not _BOT:
-        return
+        return ""
     cfg = _cfg()
     if not cfg or not cfg.no_whop_link_enabled:
-        return
+        return ""
     guild = _BOT.get_guild(int(cfg.guild_id))
     if not isinstance(guild, discord.Guild):
-        return
+        return ""
 
     rid = int(cfg.no_whop_link_members_role_id or 0)
     if rid <= 0:
         await _log("⚠️ support_tickets: no_whop_link scan skipped (members_role_id not configured)")
-        return
+        return ""
     role = guild.get_role(int(rid))
     if not isinstance(role, discord.Role):
         await _log(f"⚠️ support_tickets: no_whop_link scan skipped (members_role_id not found: {rid})")
-        return
+        return ""
     client_ok = bool(_WHOP_API_CLIENT) and bool(cfg.no_whop_link_use_whop_api)
 
     # Throttle by persisted scan state (restart-safe).
@@ -2644,8 +2686,8 @@ async def sweep_no_whop_link_scan() -> None:
     rec = state.get("no_whop_link") if isinstance(state.get("no_whop_link"), dict) else {}
     last_iso = str((rec or {}).get("last_scan_at_iso") or "").strip()
     last_dt = _parse_iso(last_iso) if last_iso else None
-    if last_dt and (now - last_dt) < timedelta(seconds=int(cfg.no_whop_link_scan_interval_seconds)):
-        return
+    if (not bool(force)) and last_dt and (now - last_dt) < timedelta(seconds=int(cfg.no_whop_link_scan_interval_seconds)):
+        return ""
     _scan_state_set("no_whop_link", {"last_scan_at_iso": _now_iso(), "last_summary": "running"})
 
     members = [m for m in (guild.members or []) if isinstance(m, discord.Member) and (not getattr(m, "bot", False)) and role in (m.roles or [])]
@@ -2769,6 +2811,99 @@ async def sweep_no_whop_link_scan() -> None:
     )
     await _log(f"🧾 support_tickets: no_whop_link scan {summary}")
     _scan_state_set("no_whop_link", {"last_scan_at_iso": _now_iso(), "last_summary": summary})
+    return summary
+
+
+def _ticket_type_from_topic(topic: object) -> str:
+    try:
+        m = re.search(r"(?im)^\s*ticket_type\s*=\s*([A-Za-z0-9_]+)\s*$", str(topic or ""))
+        return str(m.group(1) or "").strip().lower() if m else ""
+    except Exception:
+        return ""
+
+
+async def purge_no_whop_link_open_tickets(
+    *,
+    do_transcript: bool = True,
+    delete_channel: bool = True,
+    max_delete: int = 0,
+) -> dict:
+    """Delete ONLY open `no_whop_link` ticket channels (safe: by ticket index/topic)."""
+    if not _ensure_cfg_loaded() or not _BOT:
+        return {"deleted": 0, "skipped": 0, "failed": 0}
+    cfg = _cfg()
+    if not cfg:
+        return {"deleted": 0, "skipped": 0, "failed": 0}
+    guild = _BOT.get_guild(int(cfg.guild_id))
+    if not isinstance(guild, discord.Guild):
+        return {"deleted": 0, "skipped": 0, "failed": 0}
+
+    # Gather open no_whop_link tickets from index (no awaits under lock).
+    targets: list[int] = []
+    async with _INDEX_LOCK:
+        db = _index_load()
+        for _tid, rec in _ticket_iter(db):
+            if not _ticket_is_open(rec):
+                continue
+            if str(rec.get("ticket_type") or "").strip().lower() != "no_whop_link":
+                continue
+            cid = _as_int(rec.get("channel_id"))
+            if cid > 0:
+                targets.append(int(cid))
+
+    # Also include orphaned channels in the no-whop category that still have the marker topic.
+    with suppress(Exception):
+        cat_id = int(cfg.no_whop_link_category_id or 0)
+        if cat_id <= 0:
+            cat_id = int(await _get_or_create_no_whop_link_category_id(guild=guild) or 0)
+        cat = guild.get_channel(int(cat_id)) if cat_id > 0 else None
+        if isinstance(cat, discord.CategoryChannel):
+            for ch in list(getattr(cat, "channels", []) or []):
+                if not isinstance(ch, discord.TextChannel):
+                    continue
+                if int(ch.id) in set(targets):
+                    continue
+                top = getattr(ch, "topic", "") or ""
+                if _topic_is_support_ticket(top) and _ticket_type_from_topic(top) == "no_whop_link":
+                    targets.append(int(ch.id))
+
+    # Dedup targets, then purge.
+    seen: set[int] = set()
+    ordered: list[int] = []
+    for cid in targets:
+        if int(cid) <= 0 or int(cid) in seen:
+            continue
+        seen.add(int(cid))
+        ordered.append(int(cid))
+
+    deleted = 0
+    skipped = 0
+    failed = 0
+    for cid in ordered:
+        if int(max_delete or 0) > 0 and deleted >= int(max_delete):
+            break
+        try:
+            ch = guild.get_channel(int(cid))
+            if not isinstance(ch, discord.TextChannel):
+                skipped += 1
+                continue
+            # Hard safety: require marker + exact ticket_type.
+            top = getattr(ch, "topic", "") or ""
+            if (not _topic_is_support_ticket(top)) or (_ticket_type_from_topic(top) != "no_whop_link"):
+                skipped += 1
+                continue
+            await close_ticket_by_channel_id(
+                int(cid),
+                close_reason="purge_no_whop_link",
+                do_transcript=bool(do_transcript),
+                delete_channel=bool(delete_channel),
+            )
+            deleted += 1
+        except Exception:
+            failed += 1
+
+    await _log(f"🧹 support_tickets: purged no_whop_link tickets deleted={deleted} skipped={skipped} failed={failed}")
+    return {"deleted": int(deleted), "skipped": int(skipped), "failed": int(failed)}
 
 
 async def handle_free_pass_join_if_needed(
