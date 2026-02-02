@@ -205,6 +205,19 @@ class AmazonDetection:
     final_url: str
 
 
+@dataclass
+class _SimpleForwardBuffer:
+    src_channel_id: int
+    dest_channel_id: int
+    guild_id: int
+    author_id: int
+    parts: List[str]
+    shop_url_original: str
+    shop_url_expanded: str
+    last_ts: float
+    seq: int
+
+
 class InstorebotForwarder:
     _TEMPLATE_ROUTES = ("personal", "grocery", "deals", "default", "enrich_failed")
 
@@ -287,6 +300,11 @@ class InstorebotForwarder:
 
         self._amazon_scrape_cache: Dict[str, Dict[str, str]] = {}
         self._amazon_scrape_cache_ts: Dict[str, float] = {}
+
+        # Simple forward buffers (config-gated; does not affect existing Amazon mappings)
+        self._simple_forward_lock = asyncio.Lock()
+        self._simple_forward_buffers: Dict[int, _SimpleForwardBuffer] = {}
+        self._simple_forward_flush_tasks: Dict[int, asyncio.Task[None]] = {}
 
         # Guard against multiple processes posting duplicates.
         self._instance_lock_fh = None
@@ -2500,6 +2518,274 @@ class InstorebotForwarder:
             out.append(u)
         return out
 
+    async def _expand_url_best_effort(self, session: Any, url_used: str, *, timeout_s: float, max_redirects: int) -> str:
+        """
+        Best-effort URL expansion + unwrapping.
+        This is shared so both Amazon detection and simple forwarding behave consistently.
+        """
+        cand = affiliate_rewriter.unwrap_known_query_redirects((url_used or "").strip()) or (url_used or "").strip()
+        final_url = cand
+        if not final_url:
+            return ""
+
+        try:
+            if affiliate_rewriter.should_expand_url(cand):
+                final_url = await affiliate_rewriter.expand_url(
+                    session,
+                    cand,
+                    timeout_s=timeout_s,
+                    max_redirects=max_redirects,
+                )
+                final_url = affiliate_rewriter.unwrap_known_query_redirects(final_url) or final_url
+        except Exception:
+            final_url = cand
+
+        # Special-case: mavely.app.link often uses HTML/JS interstitials and doesn't always 3xx redirect.
+        # If we still have a Mavely link after expansion, fetch HTML and extract the first outbound URL.
+        try:
+            if affiliate_rewriter.is_mavely_link(final_url):
+                try:
+                    import aiohttp
+
+                    async with session.get(final_url, timeout=aiohttp.ClientTimeout(total=timeout_s)) as resp:
+                        html_txt = await resp.text(errors="ignore")
+                except Exception:
+                    html_txt = ""
+                out = ""
+                try:
+                    out = affiliate_rewriter._extract_first_outbound_url_from_html(html_txt) or ""  # type: ignore[attr-defined]
+                except Exception:
+                    out = ""
+                if out:
+                    out_abs = out
+                    if out_abs.startswith("/"):
+                        out_abs = urljoin(final_url, out_abs)
+                    out_abs = affiliate_rewriter.unwrap_known_query_redirects(out_abs) or out_abs
+                    final_url = out_abs
+                    # One more redirect-follow if needed
+                    if affiliate_rewriter.should_expand_url(final_url):
+                        try:
+                            final_url = await affiliate_rewriter.expand_url(
+                                session,
+                                final_url,
+                                timeout_s=timeout_s,
+                                max_redirects=max_redirects,
+                            )
+                            final_url = affiliate_rewriter.unwrap_known_query_redirects(final_url) or final_url
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        return (final_url or "").strip()
+
+    def _simple_forward_mappings(self) -> Dict[str, Any]:
+        try:
+            v = (self.config or {}).get("simple_forward_mappings") or {}
+        except Exception:
+            v = {}
+        return v if isinstance(v, dict) else {}
+
+    def _simple_forward_mapping_for_channel(self, src_channel_id: int) -> Optional[Dict[str, Any]]:
+        m = self._simple_forward_mappings()
+        raw = m.get(str(int(src_channel_id))) or m.get(int(src_channel_id)) or None
+        return raw if isinstance(raw, dict) else None
+
+    def _simple_extract_shop_link(self, text: str) -> str:
+        s = (text or "").strip()
+        if not s:
+            return ""
+        # Prefer explicit "Shop->URL" style.
+        m = re.search(r"(?i)\bshop\s*[-:>]+\s*(https?://\S+)", s)
+        if m:
+            return str(m.group(1) or "").strip().rstrip(").,")
+        # Fallback: line that contains "shop" and a URL.
+        for line in s.splitlines():
+            if "shop" not in line.lower():
+                continue
+            spans = affiliate_rewriter.extract_urls_with_spans(line)
+            if spans:
+                return str(spans[0][0] or "").strip()
+        return ""
+
+    def _simple_message_block(self, message: discord.Message) -> str:
+        lines: List[str] = []
+        content = (message.content or "").strip()
+        if content:
+            lines.append(content)
+
+        # Add attachments as raw CDN URLs so Discord renders visual embeds.
+        try:
+            for att in (message.attachments or []):
+                u = str(getattr(att, "url", "") or "").strip()
+                if u:
+                    lines.append(u)
+        except Exception:
+            pass
+
+        block = "\n".join([x for x in lines if str(x).strip()]).strip()
+        return block
+
+    async def _simple_flush_buffer(self, buf: _SimpleForwardBuffer) -> None:
+        if not buf or not buf.dest_channel_id:
+            return
+
+        ch = self.bot.get_channel(int(buf.dest_channel_id))
+        if ch is None:
+            try:
+                ch = await self.bot.fetch_channel(int(buf.dest_channel_id))
+            except Exception:
+                ch = None
+        if not isinstance(ch, (discord.TextChannel, discord.Thread, discord.DMChannel)):
+            return
+
+        parts = [p.strip() for p in (buf.parts or []) if str(p).strip()]
+        if not parts:
+            return
+
+        out = "\n\n".join(parts).strip()
+        if buf.shop_url_original and buf.shop_url_expanded:
+            try:
+                if buf.shop_url_original in out:
+                    out = out.replace(buf.shop_url_original, buf.shop_url_expanded)
+            except Exception:
+                pass
+
+        # Discord message limit: keep under 2000 chars.
+        if len(out) > 1950:
+            out = out[:1940] + "…"
+
+        try:
+            await ch.send(content=out, allowed_mentions=discord.AllowedMentions.none())
+        except Exception:
+            pass
+
+    def _simple_cancel_flush_task(self, src_channel_id: int) -> None:
+        t = self._simple_forward_flush_tasks.pop(int(src_channel_id), None)
+        if t and not t.done():
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+    def _simple_schedule_flush(self, *, src_channel_id: int, merge_window_s: float, expected_seq: int) -> None:
+        self._simple_cancel_flush_task(src_channel_id)
+
+        async def _runner() -> None:
+            try:
+                await asyncio.sleep(max(0.1, float(merge_window_s)))
+            except Exception:
+                return
+
+            to_flush: Optional[_SimpleForwardBuffer] = None
+            async with self._simple_forward_lock:
+                cur = self._simple_forward_buffers.get(int(src_channel_id))
+                if not cur:
+                    return
+                # Only flush if still the same buffer sequence (no newer message appended).
+                if int(cur.seq) != int(expected_seq):
+                    return
+                to_flush = self._simple_forward_buffers.pop(int(src_channel_id), None)
+            if to_flush:
+                await self._simple_flush_buffer(to_flush)
+
+        self._simple_forward_flush_tasks[int(src_channel_id)] = asyncio.create_task(_runner())
+
+    async def _maybe_simple_forward(self, message: discord.Message) -> bool:
+        """
+        Config-gated simple forwarding:
+        - merges consecutive messages from the same author (within merge_window_s)
+        - expands "Shop->" link to original store URL when it is an interstitial (e.g., Mavely)
+        - forwards as a single plain message (raw URLs) so Discord renders link/image embeds
+        """
+        try:
+            src_channel_id = int(getattr(getattr(message, "channel", None), "id", 0) or 0)
+        except Exception:
+            src_channel_id = 0
+        if not src_channel_id:
+            return False
+
+        mapping = self._simple_forward_mapping_for_channel(src_channel_id)
+        if not mapping:
+            return False
+
+        dest_channel_id = _safe_int(mapping.get("dest_channel_id"))
+        if not dest_channel_id:
+            return True
+
+        try:
+            merge_window_s = float(mapping.get("merge_window_s") or 0)
+        except Exception:
+            merge_window_s = 0.0
+        if merge_window_s <= 0:
+            merge_window_s = 3.0
+
+        if not message.guild:
+            return True
+
+        now = time.time()
+        msg_author_id = int(getattr(getattr(message, "author", None), "id", 0) or 0)
+        guild_id = int(getattr(getattr(message, "guild", None), "id", 0) or 0)
+
+        # Build this message block
+        block = self._simple_message_block(message)
+        if not block:
+            # Still keep buffering for attachments-only messages; _simple_message_block already handles.
+            return True
+
+        # Extract shop URL candidate (first seen wins)
+        shop_url = self._simple_extract_shop_link(message.content or "")
+
+        # Expand Shop link if needed (best-effort). Only do this once per buffer.
+        expanded_shop_url = ""
+        try:
+            import aiohttp
+
+            timeout_s = float((mapping.get("expand_timeout_s") or _cfg_float(self.config, "amazon_expand_timeout_s", "AMAZON_EXPAND_TIMEOUT_S") or 8.0))
+            max_redirects = int((mapping.get("expand_max_redirects") or _cfg_int(self.config, "amazon_expand_max_redirects", "AMAZON_EXPAND_MAX_REDIRECTS") or 8))
+            async with aiohttp.ClientSession() as session:
+                if shop_url:
+                    expanded_shop_url = await self._expand_url_best_effort(session, shop_url, timeout_s=timeout_s, max_redirects=max_redirects)
+        except Exception:
+            expanded_shop_url = ""
+
+        to_flush: Optional[_SimpleForwardBuffer] = None
+        async with self._simple_forward_lock:
+            cur = self._simple_forward_buffers.get(src_channel_id)
+            if cur and (cur.guild_id == guild_id) and (cur.author_id == msg_author_id) and ((now - float(cur.last_ts)) <= float(merge_window_s)):
+                cur.parts.append(block)
+                cur.last_ts = now
+                cur.seq += 1
+                if (not cur.shop_url_original) and shop_url:
+                    cur.shop_url_original = shop_url
+                if (not cur.shop_url_expanded) and expanded_shop_url:
+                    cur.shop_url_expanded = expanded_shop_url
+                self._simple_schedule_flush(src_channel_id=src_channel_id, merge_window_s=merge_window_s, expected_seq=cur.seq)
+                return True
+
+            # Different author (or stale) => flush old buffer and start a new one
+            if cur:
+                self._simple_cancel_flush_task(src_channel_id)
+                to_flush = self._simple_forward_buffers.pop(src_channel_id, None)
+
+            buf = _SimpleForwardBuffer(
+                src_channel_id=src_channel_id,
+                dest_channel_id=int(dest_channel_id),
+                guild_id=guild_id,
+                author_id=msg_author_id,
+                parts=[block],
+                shop_url_original=shop_url or "",
+                shop_url_expanded=expanded_shop_url or "",
+                last_ts=now,
+                seq=1,
+            )
+            self._simple_forward_buffers[src_channel_id] = buf
+            self._simple_schedule_flush(src_channel_id=src_channel_id, merge_window_s=merge_window_s, expected_seq=buf.seq)
+
+        if to_flush:
+            await self._simple_flush_buffer(to_flush)
+        return True
+
     async def _detect_amazon(self, urls: List[str]) -> Optional[AmazonDetection]:
         if not urls:
             return None
@@ -2516,55 +2802,10 @@ class InstorebotForwarder:
                     if not url_used:
                         continue
 
-                    cand = affiliate_rewriter.unwrap_known_query_redirects(url_used) or url_used
-                    final_url = cand
-
                     try:
-                        if affiliate_rewriter.should_expand_url(cand):
-                            final_url = await affiliate_rewriter.expand_url(
-                                session,
-                                cand,
-                                timeout_s=timeout_s,
-                                max_redirects=max_redirects,
-                            )
-                            final_url = affiliate_rewriter.unwrap_known_query_redirects(final_url) or final_url
+                        final_url = await self._expand_url_best_effort(session, url_used, timeout_s=timeout_s, max_redirects=max_redirects)
                     except Exception:
-                        final_url = cand
-
-                    # Special-case: mavely.app.link often uses HTML/JS interstitials and doesn't always 3xx redirect.
-                    # If we still have a Mavely link after expansion, fetch HTML and extract the first outbound URL.
-                    try:
-                        if affiliate_rewriter.is_mavely_link(final_url):
-                            try:
-                                async with session.get(final_url, timeout=aiohttp.ClientTimeout(total=timeout_s)) as resp:
-                                    html_txt = await resp.text(errors="ignore")
-                            except Exception:
-                                html_txt = ""
-                            out = ""
-                            try:
-                                out = affiliate_rewriter._extract_first_outbound_url_from_html(html_txt) or ""  # type: ignore[attr-defined]
-                            except Exception:
-                                out = ""
-                            if out:
-                                out_abs = out
-                                if out_abs.startswith("/"):
-                                    out_abs = urljoin(final_url, out_abs)
-                                out_abs = affiliate_rewriter.unwrap_known_query_redirects(out_abs) or out_abs
-                                final_url = out_abs
-                                # One more redirect-follow if needed
-                                if affiliate_rewriter.should_expand_url(final_url):
-                                    try:
-                                        final_url = await affiliate_rewriter.expand_url(
-                                            session,
-                                            final_url,
-                                            timeout_s=timeout_s,
-                                            max_redirects=max_redirects,
-                                        )
-                                        final_url = affiliate_rewriter.unwrap_known_query_redirects(final_url) or final_url
-                                    except Exception:
-                                        pass
-                    except Exception:
-                        pass
+                        final_url = affiliate_rewriter.unwrap_known_query_redirects(url_used) or url_used
 
                     if not affiliate_rewriter.is_amazon_like_url(final_url):
                         # Try deal-hub pages (dmflip/pricedoffers/etc) to locate the embedded Amazon /dp/ASIN link.
@@ -2989,6 +3230,14 @@ class InstorebotForwarder:
 
         if int(message.channel.id) in set(self._output_channel_ids()):
             return
+
+        # NEW: config-gated simple forwarding (does not affect existing Amazon mappings unless enabled per-channel)
+        try:
+            if await self._maybe_simple_forward(message):
+                return
+        except Exception:
+            # Never let the optional simple-forward path break existing behavior.
+            pass
 
         embed, meta = await self._analyze_message(message)
         if not embed:

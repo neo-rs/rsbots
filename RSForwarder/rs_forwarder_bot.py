@@ -6095,15 +6095,20 @@ class RSForwarderBot:
             if "author" in branded_embed:
                 del branded_embed["author"]
             
-            # Preserve title (this is often the product name on deal cards).
-            # Keep it within Discord limits.
-            try:
-                if isinstance(branded_embed.get("title"), str):
-                    t = (branded_embed.get("title") or "").strip()
-                    if len(t) > 256:
-                        branded_embed["title"] = t[:253] + "..."
-            except Exception:
-                pass
+            # Preserve title (this is often the product name on deal cards), but only
+            # if it's a valid non-empty string. Discord rejects `title: null`.
+            if "title" in branded_embed:
+                title_val = branded_embed.get("title")
+                if not isinstance(title_val, str):
+                    del branded_embed["title"]
+                else:
+                    t = title_val.strip()
+                    if not t:
+                        del branded_embed["title"]
+                    else:
+                        if len(t) > 256:
+                            t = t[:253] + "..."
+                        branded_embed["title"] = t
             
             # Set embed color to blue sidebar (branding blue)
             branded_embed["color"] = 0x0099FF  # Branding blue color

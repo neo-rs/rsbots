@@ -3,7 +3,8 @@
   "source_channel_ids": [
     1438969997178306661,
     1435066421133443174,
-    1435985494356918333
+    1435985494356918333,
+    1435268379521847369
   ],
   "source_channel_routes": {
     "1438969997178306661": "deals",
@@ -93,6 +94,12 @@
       "image": { "url": "{image_url}" },
       "description": "{card_body}",
       "timestamp": false
+    }
+  },
+  "simple_forward_mappings": {
+    "1435268379521847369": {
+      "dest_channel_id": 1457129505050202377,
+      "merge_window_s": 3.0
     }
   }
 }
