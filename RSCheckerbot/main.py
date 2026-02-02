@@ -2650,7 +2650,7 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
         if not _membership_id_from_history(int(did_i)):
             fp = f"{int(did_i)}|freepass|{_tz_now().date().isoformat()}"
             with suppress(Exception):
-                ch_created = await support_tickets.open_free_pass_ticket(member=member, fingerprint=fp)
+                ch_created = await support_tickets.open_free_pass_ticket(member=member, fingerprint=fp, reference_jump_url=ref_url)
                 if not ch_created:
                     await log_other(f"❌ SupportTickets: failed to open free-pass ticket for `{did_i}` (member_joined)")
         return

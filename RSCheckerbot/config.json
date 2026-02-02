@@ -282,6 +282,16 @@
         "delete_on_whop_linked": true
       }
     },
+    "header_messages": {
+      "_comment": "Immediate header message content for ticket channels (shown above the embed/buttons). Placeholders: {member}, {staff}.",
+      "templates": {
+        "default": "Yo {member}, share what you need help with and {staff} will take it from there.",
+        "free_pass": "Hey {member}, if you’re ready to get started, let us know.\nThe {staff} team will help you all the way until you have full access.",
+        "billing": "Hey {member}, it looks like there may be an issue with your subscription.\nLet us know what’s going on and {staff} will assist you.",
+        "cancellation": "Hey {member}, if you don’t mind, please share a bit about why you decided to cancel.\nOur {staff} team will take a look and see what we can work out.",
+        "no_whop_link": "Hey {member}, please link your Discord to Whop to avoid losing access.\n{staff} is here if you have any questions or need help."
+      }
+    },
     "startup_messages": {
       "_comment": "5-minute startup acknowledgement (Pattern A sweeper). Disabled by default.",
       "enabled": true,

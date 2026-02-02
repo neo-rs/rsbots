@@ -63,6 +63,7 @@ class SupportTicketConfig:
     startup_delay_seconds: int
     startup_recent_history_limit: int
     startup_templates: dict[str, str]
+    header_templates: dict[str, str]
     audit_enabled: bool
     audit_channel_id: int
     audit_channel_name: str
@@ -181,6 +182,8 @@ def initialize(
     dd = st.get("dedupe") if isinstance(st.get("dedupe"), dict) else {}
     sm = st.get("startup_messages") if isinstance(st.get("startup_messages"), dict) else {}
     sm_templates = sm.get("templates") if isinstance(sm.get("templates"), dict) else {}
+    hm = st.get("header_messages") if isinstance(st.get("header_messages"), dict) else {}
+    hm_templates = hm.get("templates") if isinstance(hm.get("templates"), dict) else {}
     rf = st.get("resolution_followup") if isinstance(st.get("resolution_followup"), dict) else {}
     rf_templates = rf.get("templates") if isinstance(rf.get("templates"), dict) else {}
     al = st.get("audit_logs") if isinstance(st.get("audit_logs"), dict) else {}
@@ -226,6 +229,7 @@ def initialize(
         startup_delay_seconds=max(5, _as_int(sm.get("delay_seconds")) or 300),
         startup_recent_history_limit=max(10, min(200, _as_int(sm.get("recent_history_limit")) or 50)),
         startup_templates={str(k).strip().lower(): str(v) for k, v in (sm_templates or {}).items() if str(k or "").strip()},
+        header_templates={str(k).strip().lower(): str(v) for k, v in (hm_templates or {}).items() if str(k or "").strip()},
         audit_enabled=_as_bool(al.get("enabled")),
         audit_channel_id=_as_int(al.get("channel_id")),
         audit_channel_name=str(al.get("channel_name") or "tickets-logs").strip() or "tickets-logs",
@@ -556,6 +560,16 @@ def _startup_template(ticket_type: str) -> str:
     return str(tmpl or "").strip()
 
 
+def _header_template(ticket_type: str) -> str:
+    cfg = _cfg()
+    if not cfg:
+        return ""
+    key = str(ticket_type or "").strip().lower()
+    hm = cfg.header_templates if isinstance(cfg.header_templates, dict) else {}
+    tmpl = hm.get(key) or hm.get("default") or ""
+    return str(tmpl or "").strip()
+
+
 def _resolution_followup_template(ticket_type: str) -> str:
     cfg = _cfg()
     if not cfg:
@@ -789,8 +803,24 @@ def _ticket_ping_content(*, owner_id: int, mention_owner: bool, mention_staff: b
     return " ".join([x for x in [owner_mention, role_mention] if str(x or "").strip()])
 
 
+def _ticket_header_content(*, ticket_type: str, owner_id: int, mention_owner: bool, mention_staff: bool) -> str:
+    """Ticket header message content (human-friendly, template-driven)."""
+    tmpl = _header_template(ticket_type)
+    if not tmpl:
+        # Fallback to old behavior.
+        return _ticket_ping_content(owner_id=int(owner_id), mention_owner=bool(mention_owner), mention_staff=bool(mention_staff))
+    uid = int(owner_id or 0)
+    member_txt = f"<@{uid}>" if (uid and bool(mention_owner)) else ""
+    staff_txt = _support_ping_role_mention() if bool(mention_staff) else ""
+    # Allow either placeholder spelling.
+    out = str(tmpl).replace("{member}", member_txt).replace("{mention}", member_txt)
+    out = out.replace("{staff}", staff_txt).replace("{staff_mention}", staff_txt)
+    return out.strip()
+
+
 async def _ensure_ticket_header_message(
     *,
+    ticket_type: str,
     channel: discord.TextChannel,
     owner_id: int,
     include_owner: bool,
@@ -806,8 +836,11 @@ async def _ensure_ticket_header_message(
     view = _CONTROLS_VIEW or SupportTicketControlsView()
     ping_owner = bool(mention_owner) or bool(include_owner)
     ping_staff = bool(mention_staff) or bool(include_owner)
-    ping = _ticket_ping_content(owner_id=int(owner_id), mention_owner=ping_owner, mention_staff=ping_staff)
+    content = _ticket_header_content(ticket_type=str(ticket_type or ""), owner_id=int(owner_id), mention_owner=ping_owner, mention_staff=ping_staff)
     bot_id = int(getattr(getattr(_BOT, "user", None), "id", 0) or 0)
+    allow_roles = "<@&" in str(content or "")
+    allow_users = "<@" in str(content or "")
+    allowed_mentions = discord.AllowedMentions(users=bool(allow_users), roles=bool(allow_roles), everyone=False)
 
     # Prefer editing the stored message id.
     mid = int(header_message_id or 0)
@@ -818,7 +851,7 @@ async def _ensure_ticket_header_message(
             msg = None
         if msg is not None and int(getattr(getattr(msg, "author", None), "id", 0) or 0) == bot_id:
             with suppress(Exception):
-                await msg.edit(content=ping, embed=preview_embed, view=view)
+                await msg.edit(content=content, embed=preview_embed, view=view, allowed_mentions=allowed_mentions)
                 return int(getattr(msg, "id", 0) or 0)
 
     # Fallback: find an early bot-authored embed message in channel history.
@@ -831,7 +864,7 @@ async def _ensure_ticket_header_message(
             has_embed = bool(getattr(m, "embeds", None) or [])
             if has_embed and embed_msg is None:
                 embed_msg = m
-            if (not has_embed) and (not getattr(m, "attachments", None)) and ping and str(getattr(m, "content", "") or "").strip() == ping:
+            if (not has_embed) and (not getattr(m, "attachments", None)) and content and str(getattr(m, "content", "") or "").strip() == content:
                 ping_only_msg = m
     except Exception:
         embed_msg = None
@@ -839,7 +872,7 @@ async def _ensure_ticket_header_message(
 
     if embed_msg is not None:
         with suppress(Exception):
-            await embed_msg.edit(content=ping, embed=preview_embed, view=view)
+            await embed_msg.edit(content=content, embed=preview_embed, view=view, allowed_mentions=allowed_mentions)
         # Best-effort cleanup: delete the separate ping-only message if it exists.
         if ping_only_msg is not None and int(getattr(ping_only_msg, "id", 0) or 0) != int(getattr(embed_msg, "id", 0) or 0):
             with suppress(Exception):
@@ -849,10 +882,10 @@ async def _ensure_ticket_header_message(
     # Nothing to edit: send a fresh header.
     try:
         sent = await channel.send(
-            content=ping,
+            content=content,
             embed=preview_embed,
             view=view,
-            allowed_mentions=discord.AllowedMentions(users=True, roles=bool(ping_staff), everyone=False),
+            allowed_mentions=allowed_mentions,
         )
         return int(getattr(sent, "id", 0) or 0)
     except Exception:
@@ -1767,6 +1800,7 @@ async def _open_or_update_ticket(
                 # Keep the ticket header up-to-date (single message: pings + embed + buttons).
                 with suppress(Exception):
                     new_mid = await _ensure_ticket_header_message(
+                        ticket_type=str(ticket_type or ""),
                         channel=ch,
                         owner_id=int(owner.id),
                         include_owner=bool(cfg.include_ticket_owner_in_channel),
@@ -1876,6 +1910,7 @@ async def _open_or_update_ticket(
         with suppress(Exception):
             header_mid = int(
                 await _ensure_ticket_header_message(
+                    ticket_type=str(ticket_type or ""),
                     channel=ch,
                     owner_id=int(owner.id),
                     include_owner=bool(cfg.include_ticket_owner_in_channel),
@@ -2002,64 +2037,6 @@ class SupportTicketControlsView(discord.ui.View):
                 delete_channel=True,
             )
 
-    @discord.ui.button(
-        label="Add Member",
-        style=discord.ButtonStyle.success,
-        custom_id="rsticket:add_member",
-    )
-    async def add_member(self, interaction: discord.Interaction, _button: discord.ui.Button):
-        if not self._allowed(interaction.user):
-            await self._deny(interaction)
-            return
-        ch = getattr(interaction, "channel", None)
-        if not isinstance(ch, discord.TextChannel):
-            with suppress(Exception):
-                await interaction.response.send_message("❌ Not a ticket text channel.", ephemeral=True)
-            return
-        # Defer so we can do network calls.
-        with suppress(Exception):
-            await interaction.response.send_message("⏳ Adding member to ticket…", ephemeral=True)
-
-        rec = await get_ticket_record_for_channel_id(int(ch.id))
-        if not isinstance(rec, dict):
-            with suppress(Exception):
-                await interaction.followup.send("❌ Ticket record not found.", ephemeral=True)
-            return
-        uid = int(rec.get("user_id") or 0)
-        if uid <= 0:
-            with suppress(Exception):
-                await interaction.followup.send("❌ Ticket has no owner user_id.", ephemeral=True)
-            return
-        guild = getattr(ch, "guild", None)
-        if not isinstance(guild, discord.Guild):
-            with suppress(Exception):
-                await interaction.followup.send("❌ Guild not available.", ephemeral=True)
-            return
-        member = guild.get_member(int(uid))
-        if not isinstance(member, discord.Member):
-            with suppress(Exception):
-                member = await guild.fetch_member(int(uid))
-        if not isinstance(member, discord.Member):
-            with suppress(Exception):
-                await interaction.followup.send("❌ Member not found in server.", ephemeral=True)
-            return
-
-        try:
-            await ch.set_permissions(
-                member,
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                attach_files=True,
-                reason="RSCheckerbot: staff added member to ticket",
-            )
-        except Exception as ex:
-            with suppress(Exception):
-                await interaction.followup.send(f"❌ Failed to add member: {str(ex)[:200]}", ephemeral=True)
-            return
-        with suppress(Exception):
-            await interaction.followup.send("✅ Member added to ticket.", ephemeral=True)
-
 
 def _format_discord_id(uid: int) -> str:
     return f"`{int(uid)}`" if int(uid) > 0 else "—"
@@ -2143,21 +2120,34 @@ def build_cancellation_preview_embed(
     e.add_field(name="Membership", value=str(b.get("product") or "—")[:1024], inline=True)
     e.add_field(name="Whop Status", value=_whop_status_display(ticket_type="cancellation", whop_brief=b), inline=True)
 
-    # Only show Remaining Days / Access Ends On when they are both present and meaningful.
-    st_key = _norm_whop_status_key(str(b.get("status") or ""))
-    cap = str(b.get("cancel_at_period_end") or "").strip().lower()
-    is_canceling = st_key == "canceling" or (st_key == "active" and cap in {"yes", "true", "1"})
     days = str(b.get("remaining_days") or "").strip()
     end = str(b.get("renewal_end") or "").strip()
-    if is_canceling and days and days != "—" and end and end != "—":
+    if days and days != "—":
         e.add_field(name="Remaining Days", value=days[:1024], inline=True)
+    if end and end != "—":
         e.add_field(name="Access Ends On", value=end[:1024], inline=True)
-    reason = str(cancellation_reason or b.get("cancellation_reason") or "").strip()
-    if reason:
-        e.add_field(name="Cancellation Reason", value=f"```\n{reason[:950]}\n```", inline=False)
+
+    spent = str(b.get("total_spent") or "").strip()
+    if spent and spent != "—":
+        e.add_field(name="Total Spent (lifetime)", value=spent[:1024], inline=True)
+
+    cap_raw = str(b.get("cancel_at_period_end") or "").strip()
+    if cap_raw and cap_raw != "—":
+        e.add_field(name="Cancel At Period End", value=cap_raw[:1024], inline=True)
+
+    # Cancellation reason values from member-status-logs can contain extra lines (membership + timestamp).
+    # Keep only the actual reason (first non-empty line) for a clean card.
+    reason_raw = str(cancellation_reason or b.get("cancellation_reason") or "").strip()
+    reason_line = ""
+    for ln in reason_raw.splitlines():
+        s = str(ln or "").strip()
+        if s:
+            reason_line = s
+            break
+    if reason_line:
+        e.add_field(name="Cancellation Reason", value=f"```\n{reason_line[:300]}\n```", inline=False)
     e.add_field(name="Whop Dashboard", value=_embed_link("Open", str(b.get("dashboard_url") or "")), inline=True)
-    if reference_jump_url:
-        e.add_field(name="Message Reference", value=_embed_link("View Full Log", reference_jump_url), inline=True)
+    e.add_field(name="Message Reference", value=_embed_link("View Full Log", reference_jump_url), inline=True)
     return e
 
 
@@ -2173,18 +2163,47 @@ def build_billing_preview_embed(
     e = discord.Embed(title="Billing", color=0xED4245)
     e.add_field(name="Member", value=str(getattr(member, "display_name", "") or str(member))[:1024], inline=True)
     e.add_field(name="Discord ID", value=_format_discord_id(int(member.id)), inline=True)
+    e.add_field(name="Membership", value=str(b.get("product") or "—")[:1024], inline=True)
+
+    st_disp = _whop_status_display(ticket_type="billing", whop_brief=b, status_override=str(status or ""))
+    e.add_field(name="Whop Status", value=str(st_disp or "—")[:1024], inline=True)
+
+    # Core billing context (same shapes as member-status-logs cards)
+    days = str(b.get("remaining_days") or "").strip()
+    if days and days != "—":
+        e.add_field(name="Remaining Days", value=days[:1024], inline=True)
+    end = str(b.get("renewal_end") or "").strip()
+    if end and end != "—":
+        e.add_field(name="Next Billing Date", value=end[:1024], inline=True)
+    spent = str(b.get("total_spent") or "").strip()
+    if spent and spent != "—":
+        e.add_field(name="Total Spent (lifetime)", value=spent[:1024], inline=True)
+    cap_raw = str(b.get("cancel_at_period_end") or "").strip()
+    if cap_raw and cap_raw != "—":
+        e.add_field(name="Cancel At Period End", value=cap_raw[:1024], inline=True)
+
+    # Optional: show a human-readable issue label (avoid confusing raw event strings).
+    ev = str(event_type or "").strip().lower()
+    issue = ""
+    if "payment.failed" in ev or "payment_failed" in ev:
+        issue = "Payment Failed"
+    elif "past_due" in ev or "invoice.past_due" in ev:
+        issue = "Past Due"
+    elif ev:
+        issue = ev.replace("_", " ").replace(".", " ").strip().title()
+    if issue:
+        e.add_field(name="Issue", value=issue[:1024], inline=True)
+
+    dash = str(b.get("dashboard_url") or "").strip()
+    e.add_field(name="Whop Dashboard", value=_embed_link("Open", dash), inline=True)
     with suppress(Exception):
-        roles_txt = _access_roles_plain(member, {int(r.id) for r in (member.roles or [])})
+        roles_txt = _access_roles_plain(
+            member,
+            {int(r.id) for r in (member.roles or []) if int(getattr(r, "id", 0) or 0) != int(member.guild.default_role.id)},
+        )
         if roles_txt and roles_txt != "—":
             e.add_field(name="Current Roles", value=str(roles_txt)[:1024], inline=False)
-    e.add_field(name="Event", value=str(event_type or "—")[:1024], inline=True)
-    e.add_field(
-        name="Whop Status",
-        value=_whop_status_display(ticket_type="billing", whop_brief=b, status_override=str(status or ""))[:1024],
-        inline=True,
-    )
-    if reference_jump_url:
-        e.add_field(name="Message Reference", value=_embed_link("View Full Log", reference_jump_url), inline=True)
+    e.add_field(name="Message Reference", value=_embed_link("View Full Log", reference_jump_url), inline=True)
     return e
 
 
@@ -2192,11 +2211,15 @@ def build_free_pass_header_embed(
     *,
     member: discord.Member,
     what_you_missed_jump_url: str,
+    reference_jump_url: str = "",
+    whop_dashboard_url: str = "",
 ) -> discord.Embed:
     e = discord.Embed(title="Free Pass", color=0x5865F2)
     e.add_field(name="Member", value=str(getattr(member, "display_name", "") or str(member))[:1024], inline=True)
     e.add_field(name="Discord ID", value=_format_discord_id(int(member.id)), inline=True)
     e.add_field(name="Whop Status", value="Not linked", inline=True)
+    e.add_field(name="Whop Dashboard", value=_embed_link("Open", str(whop_dashboard_url or "")), inline=True)
+    e.add_field(name="Message Reference", value=_embed_link("View Full Log", str(reference_jump_url or "")), inline=True)
     return e
 
 
@@ -2204,6 +2227,7 @@ def build_no_whop_link_preview_embed(
     *,
     member: discord.Member,
     whop_brief: dict | None = None,
+    reference_jump_url: str = "",
 ) -> discord.Embed:
     """Ticket header for members who have Members role but Whop Discord isn't connected (or doesn't match)."""
     b = whop_brief if isinstance(whop_brief, dict) else {}
@@ -2241,8 +2265,8 @@ def build_no_whop_link_preview_embed(
     if conn:
         e.add_field(name="Connected Discord", value=conn[:1024], inline=False)
     dash = str(b.get("dashboard_url") or "").strip()
-    if dash:
-        e.add_field(name="Whop Dashboard", value=_embed_link("Open", dash), inline=True)
+    e.add_field(name="Whop Dashboard", value=_embed_link("Open", dash), inline=True)
+    e.add_field(name="Message Reference", value=_embed_link("View Full Log", str(reference_jump_url or "")), inline=True)
     if not mid:
         e.add_field(name="Whop", value="not linked (no membership_id recorded yet)", inline=True)
     return e
@@ -2466,13 +2490,14 @@ async def open_free_pass_ticket(
     *,
     member: discord.Member,
     fingerprint: str,
+    reference_jump_url: str = "",
 ) -> discord.TextChannel | None:
     cfg = _cfg()
     if not cfg:
         return None
 
     preview_embed, source_jump = await _build_what_you_missed_preview_embed()
-    header = build_free_pass_header_embed(member=member, what_you_missed_jump_url=source_jump)
+    header = build_free_pass_header_embed(member=member, what_you_missed_jump_url=source_jump, reference_jump_url=str(reference_jump_url or ""))
     extra: list[tuple[str, discord.Embed | None]] = []
     extra.append((_guide_text(), None))
     # Put the preview LAST (cleaner; matches requested layout).
@@ -2487,6 +2512,7 @@ async def open_free_pass_ticket(
         preview_embed=header,
         extra_sends=extra,
         extra_record_fields={"what_you_missed_jump_url": str(source_jump or "")},
+        reference_jump_url=str(reference_jump_url or ""),
     )
 
 
@@ -2507,7 +2533,7 @@ async def open_no_whop_link_ticket(
     cat_id = await _get_or_create_no_whop_link_category_id(guild=guild)
     if int(cat_id or 0) <= 0:
         return None
-    embed = build_no_whop_link_preview_embed(member=member, whop_brief=whop_brief)
+    embed = build_no_whop_link_preview_embed(member=member, whop_brief=whop_brief, reference_jump_url=str(reference_jump_url or ""))
     return await _open_or_update_ticket(
         ticket_type="no_whop_link",
         owner=member,
