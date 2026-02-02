@@ -231,15 +231,15 @@
       "legacy_staff_role_ids": [876588092927115284],
       "admin_role_ids": [876598078092754985],
       "_comment_include_owner": "When true, the ticket owner can see/respond in their ticket channel.",
-      "include_ticket_owner_in_channel": true
+      "include_ticket_owner_in_channel": false
     },
     "ticket_roles": {
       "_comment": "Auto-assign roles when a ticket is OPEN; remove on close.",
       "billing_role_id": 1354146761853108225,
       "cancellation_role_id": 1467494664088064174,
-      "free_pass_no_whop_role_id": 1467500050341957725,
+      "free_pass_no_whop_role_id": 1467718805365981456,
       "_comment_no_whop_link_role_id": "Role to apply for no_whop_link tickets (Members role present but no Whop linkage recorded).",
-      "no_whop_link_role_id": 1467500050341957725
+      "no_whop_link_role_id": 1467718805365981456
     },
     "ticket_categories": {
       "billing_category_id": 1467157354977165537,
@@ -255,6 +255,8 @@
       "scan_interval_seconds": 21600,
       "_comment_members_role_id": "Discord role ID that represents current paying members (same as dm_sequence.role_cancel_a).",
       "members_role_id": 876569612085518376,
+      "_comment_log_to_member_status_logs": "When true, post a staff card to dm_sequence.member_status_logs_channel_id when a new no_whop_link ticket is opened.",
+      "log_to_member_status_logs": true,
       "_comment_whop_api": "Optional: if available, scan Whop /members to detect linked Discord IDs (best-effort; safe fallback if API lacks Discord connection fields).",
       "use_whop_api": true,
       "max_pages": 50,

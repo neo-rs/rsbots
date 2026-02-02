@@ -18,13 +18,16 @@ from rschecker_utils import fmt_date_any as _fmt_date_any
 from rschecker_utils import parse_dt_any as _parse_dt_any
 from rschecker_utils import access_roles_plain as _access_roles_plain
 from rschecker_utils import extract_discord_id_from_whop_member_record as _extract_discord_id_from_whop_member_record
+from staff_embeds import build_member_status_detailed_embed as _build_member_status_detailed_embed
 from ticket_channels import ensure_ticket_like_channel as _ensure_ticket_like_channel
 from ticket_channels import slug_channel_name as _slug_channel_name
+from whop_brief import fetch_whop_brief as _fetch_whop_brief
 
 
 BASE_DIR = Path(__file__).resolve().parent
 INDEX_PATH = BASE_DIR / "data" / "tickets_index.json"
 MIGRATIONS_STATE_PATH = BASE_DIR / "data" / "support_tickets_migrations.json"
+MEMBER_HISTORY_PATH = BASE_DIR / "member_history.json"
 
 _INDEX_LOCK: asyncio.Lock = asyncio.Lock()
 
@@ -70,11 +73,13 @@ class SupportTicketConfig:
     no_whop_link_enabled: bool
     no_whop_link_scan_interval_seconds: int
     no_whop_link_members_role_id: int
+    no_whop_link_log_to_member_status_logs: bool
     no_whop_link_use_whop_api: bool
     no_whop_link_max_pages: int
     no_whop_link_per_page: int
     no_whop_link_cooldown_seconds: int
     whop_unlinked_note: str
+    member_status_logs_channel_id: int
     resolution_followup_enabled: bool
     resolution_followup_auto_close_after_seconds: int
     resolution_followup_templates: dict[str, str]
@@ -180,6 +185,7 @@ def initialize(
     tr = st.get("ticket_roles") if isinstance(st.get("ticket_roles"), dict) else {}
     nw = st.get("no_whop_link") if isinstance(st.get("no_whop_link"), dict) else {}
     wh_api = root.get("whop_api") if isinstance(root.get("whop_api"), dict) else {}
+    dm = root.get("dm_sequence") if isinstance(root.get("dm_sequence"), dict) else {}
 
     def _int_list(obj: object) -> list[int]:
         out: list[int] = []
@@ -229,11 +235,13 @@ def initialize(
         no_whop_link_enabled=_as_bool(nw.get("enabled")),
         no_whop_link_scan_interval_seconds=max(60, _as_int(nw.get("scan_interval_seconds")) or 21600),
         no_whop_link_members_role_id=_as_int(nw.get("members_role_id")),
+        no_whop_link_log_to_member_status_logs=_as_bool(nw.get("log_to_member_status_logs")),
         no_whop_link_use_whop_api=_as_bool(nw.get("use_whop_api")),
         no_whop_link_max_pages=max(1, min(200, _as_int(nw.get("max_pages")) or 50)),
         no_whop_link_per_page=max(10, min(200, _as_int(nw.get("per_page")) or 100)),
         no_whop_link_cooldown_seconds=max(0, _as_int(nw.get("cooldown_seconds")) or 86400),
         whop_unlinked_note=str(wh_api.get("unlinked_note") or "").strip(),
+        member_status_logs_channel_id=_as_int(dm.get("member_status_logs_channel_id")),
         resolution_followup_enabled=_as_bool(rf.get("enabled")),
         resolution_followup_auto_close_after_seconds=max(0, _as_int(rf.get("auto_close_after_seconds")) or 1800),
         resolution_followup_templates={str(k).strip().lower(): str(v) for k, v in (rf_templates or {}).items() if str(k or "").strip()},
@@ -277,6 +285,8 @@ async def _run_post_ready_migrations() -> None:
         await _BOT.wait_until_ready()
     with suppress(Exception):
         await migrate_ticket_channel_staff_overwrites()
+    with suppress(Exception):
+        await migrate_ticket_channel_owner_overwrites()
 
 
 def _topic_is_support_ticket(topic: object) -> bool:
@@ -284,6 +294,105 @@ def _topic_is_support_ticket(topic: object) -> bool:
         return "rschecker_support_ticket" in str(topic or "").lower()
     except Exception:
         return False
+
+
+def _ticket_owner_id_from_topic(topic: object) -> int:
+    try:
+        m = re.search(r"(?im)^\s*user_id\s*=\s*(\d{17,19})\s*$", str(topic or ""))
+        return int(m.group(1)) if m else 0
+    except Exception:
+        return 0
+
+
+async def migrate_ticket_channel_owner_overwrites() -> None:
+    """One-time best-effort: remove ticket owner overwrite from existing tickets when include_owner is disabled."""
+    if not _ensure_cfg_loaded() or not _BOT:
+        return
+    cfg = _cfg()
+    if not cfg:
+        return
+    # Only run this migration when owner visibility is disabled.
+    if bool(cfg.include_ticket_owner_in_channel):
+        return
+    guild = _BOT.get_guild(int(cfg.guild_id))
+    if not isinstance(guild, discord.Guild):
+        return
+
+    mig_key = "owner_overwrites:disable_owner"
+    try:
+        db = _migrations_load()
+        done = str((db.get("done") or {}).get(mig_key) or "").strip()
+        if done:
+            return
+    except Exception:
+        db = {}
+
+    cat_ids = [
+        int(cfg.billing_category_id or 0),
+        int(cfg.free_pass_category_id or 0),
+        int(cfg.cancellation_category_id or 0),
+        int(cfg.no_whop_link_category_id or 0),
+    ]
+    # no_whop_link category may be configured by name (id=0); resolve it best-effort.
+    with suppress(Exception):
+        nw_id = await _get_or_create_no_whop_link_category_id(guild=guild)
+        if int(nw_id or 0) > 0:
+            cat_ids.append(int(nw_id))
+    cat_ids = [int(x) for x in cat_ids if int(x) > 0]
+
+    scanned = 0
+    removed = 0
+    header_scrubbed = 0
+    failed = 0
+
+    for cid in cat_ids:
+        cat = guild.get_channel(int(cid))
+        if not isinstance(cat, discord.CategoryChannel):
+            continue
+        for ch in list(getattr(cat, "channels", []) or []):
+            if not isinstance(ch, discord.TextChannel):
+                continue
+            if not _topic_is_support_ticket(getattr(ch, "topic", "") or ""):
+                continue
+            scanned += 1
+            try:
+                uid = _ticket_owner_id_from_topic(getattr(ch, "topic", "") or "")
+                if uid > 0:
+                    mobj = guild.get_member(int(uid))
+                    if not isinstance(mobj, discord.Member):
+                        with suppress(Exception):
+                            mobj = await guild.fetch_member(int(uid))
+                    if isinstance(mobj, discord.Member):
+                        has_ow = False
+                        with suppress(Exception):
+                            has_ow = bool(mobj in (getattr(ch, "overwrites", {}) or {}))
+                        if has_ow:
+                            await ch.set_permissions(mobj, overwrite=None, reason="RSCheckerbot: disable ticket owner visibility")
+                            removed += 1
+
+                # Scrub header message content (remove old pings) if we know the header id.
+                rec0 = await get_ticket_record_for_channel_id(int(ch.id))
+                mid0 = int((rec0 or {}).get("header_message_id") or 0) if isinstance(rec0, dict) else 0
+                if mid0 > 0:
+                    with suppress(Exception):
+                        msg = await ch.fetch_message(int(mid0))
+                        if msg and str(getattr(msg, "content", "") or "").strip():
+                            await msg.edit(content="")
+                            header_scrubbed += 1
+            except Exception:
+                failed += 1
+
+    await _log(f"🧩 support_tickets: owner_overwrites_migrate scanned={scanned} owner_overwrites_removed={removed} header_scrubbed={header_scrubbed} failed={failed}")
+    try:
+        db2 = _migrations_load()
+        done_map = db2.get("done") if isinstance(db2.get("done"), dict) else {}
+        if not isinstance(done_map, dict):
+            done_map = {}
+        done_map[mig_key] = _now_iso()
+        db2["done"] = done_map
+        _migrations_save(db2)
+    except Exception:
+        return
 
 
 async def migrate_ticket_channel_staff_overwrites() -> None:
@@ -321,6 +430,10 @@ async def migrate_ticket_channel_staff_overwrites() -> None:
         int(cfg.cancellation_category_id or 0),
         int(cfg.no_whop_link_category_id or 0),
     ]
+    with suppress(Exception):
+        nw_id = await _get_or_create_no_whop_link_category_id(guild=guild)
+        if int(nw_id or 0) > 0:
+            cat_ids.append(int(nw_id))
     cat_ids = [int(x) for x in cat_ids if int(x) > 0]
     if not cat_ids:
         return
@@ -1796,6 +1909,64 @@ class SupportTicketControlsView(discord.ui.View):
                 delete_channel=True,
             )
 
+    @discord.ui.button(
+        label="Add Member",
+        style=discord.ButtonStyle.success,
+        custom_id="rsticket:add_member",
+    )
+    async def add_member(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        if not self._allowed(interaction.user):
+            await self._deny(interaction)
+            return
+        ch = getattr(interaction, "channel", None)
+        if not isinstance(ch, discord.TextChannel):
+            with suppress(Exception):
+                await interaction.response.send_message("❌ Not a ticket text channel.", ephemeral=True)
+            return
+        # Defer so we can do network calls.
+        with suppress(Exception):
+            await interaction.response.send_message("⏳ Adding member to ticket…", ephemeral=True)
+
+        rec = await get_ticket_record_for_channel_id(int(ch.id))
+        if not isinstance(rec, dict):
+            with suppress(Exception):
+                await interaction.followup.send("❌ Ticket record not found.", ephemeral=True)
+            return
+        uid = int(rec.get("user_id") or 0)
+        if uid <= 0:
+            with suppress(Exception):
+                await interaction.followup.send("❌ Ticket has no owner user_id.", ephemeral=True)
+            return
+        guild = getattr(ch, "guild", None)
+        if not isinstance(guild, discord.Guild):
+            with suppress(Exception):
+                await interaction.followup.send("❌ Guild not available.", ephemeral=True)
+            return
+        member = guild.get_member(int(uid))
+        if not isinstance(member, discord.Member):
+            with suppress(Exception):
+                member = await guild.fetch_member(int(uid))
+        if not isinstance(member, discord.Member):
+            with suppress(Exception):
+                await interaction.followup.send("❌ Member not found in server.", ephemeral=True)
+            return
+
+        try:
+            await ch.set_permissions(
+                member,
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                reason="RSCheckerbot: staff added member to ticket",
+            )
+        except Exception as ex:
+            with suppress(Exception):
+                await interaction.followup.send(f"❌ Failed to add member: {str(ex)[:200]}", ephemeral=True)
+            return
+        with suppress(Exception):
+            await interaction.followup.send("✅ Member added to ticket.", ephemeral=True)
+
 
 def _format_discord_id(uid: int) -> str:
     return f"`{int(uid)}`" if int(uid) > 0 else "—"
@@ -1936,14 +2107,34 @@ def build_free_pass_header_embed(
     return e
 
 
-def build_no_whop_link_preview_embed(*, member: discord.Member, note: str = "") -> discord.Embed:
-    """Ticket header for members who have the Members role but no Whop linkage recorded."""
+def build_no_whop_link_preview_embed(
+    *,
+    member: discord.Member,
+    whop_brief: dict | None = None,
+    note: str = "",
+) -> discord.Embed:
+    """Ticket header for members who have Members role but Whop Discord isn't connected (or doesn't match)."""
+    b = whop_brief if isinstance(whop_brief, dict) else {}
     e = discord.Embed(title="No Whop Link", color=0xFEE75C)
     e.add_field(name="Member", value=str(getattr(member, "display_name", "") or str(member))[:1024], inline=True)
     e.add_field(name="Discord ID", value=_format_discord_id(int(member.id)), inline=True)
-    e.add_field(name="Whop", value="not linked (no membership_id recorded yet)", inline=True)
+    mid = str(b.get("membership_id") or "").strip()
+    if mid:
+        e.add_field(name="Membership ID", value=f"`{mid[:128]}`", inline=True)
+    e.add_field(name="Whop Status", value=_whop_status_display(ticket_type="no_whop_link", whop_brief=b)[:1024] or "—", inline=True)
+    prod = str(b.get("product") or "").strip()
+    if prod:
+        e.add_field(name="Membership", value=prod[:1024], inline=True)
+    spent = str(b.get("total_spent") or "").strip()
+    if spent:
+        e.add_field(name="Total Spent", value=spent[:1024], inline=True)
+    conn = str(b.get("connected_discord") or "").strip()
+    if conn:
+        e.add_field(name="Connected Discord", value=conn[:1024], inline=False)
+    dash = str(b.get("dashboard_url") or "").strip()
+    if dash:
+        e.add_field(name="Whop Dashboard", value=_embed_link("Open", dash), inline=True)
     if str(note or "").strip():
-        # Keep as plain text (no giant blocks).
         e.add_field(name="Action", value=str(note).strip()[:1024], inline=False)
     return e
 
@@ -2194,7 +2385,9 @@ async def open_no_whop_link_ticket(
     *,
     member: discord.Member,
     fingerprint: str,
+    whop_brief: dict | None = None,
     reference_jump_url: str = "",
+    note: str = "",
 ) -> discord.TextChannel | None:
     cfg = _cfg()
     if not cfg or not _BOT:
@@ -2205,7 +2398,8 @@ async def open_no_whop_link_ticket(
     cat_id = await _get_or_create_no_whop_link_category_id(guild=guild)
     if int(cat_id or 0) <= 0:
         return None
-    embed = build_no_whop_link_preview_embed(member=member, note=str(cfg.whop_unlinked_note or ""))
+    note_s = str(note or "").strip() or str(cfg.whop_unlinked_note or "").strip()
+    embed = build_no_whop_link_preview_embed(member=member, whop_brief=whop_brief, note=note_s)
     return await _open_or_update_ticket(
         ticket_type="no_whop_link",
         owner=member,
@@ -2213,6 +2407,7 @@ async def open_no_whop_link_ticket(
         category_id=int(cat_id),
         preview_embed=embed,
         reference_jump_url=reference_jump_url,
+        whop_dashboard_url=str((whop_brief or {}).get("dashboard_url") or "") if isinstance(whop_brief, dict) else "",
     )
 
 
@@ -2232,37 +2427,26 @@ def _scan_state_set(key: str, value: dict) -> None:
     _migrations_save(db)
 
 
-async def _linked_discord_ids_from_whop_api(*, max_pages: int, per_page: int) -> set[int]:
-    """Best-effort: scan Whop /members and extract linked Discord IDs.
-
-    Note: Whop Company API may not expose connected accounts; if so, this returns an empty set.
-    """
-    out: set[int] = set()
-    client = _WHOP_API_CLIENT
-    if not client or not getattr(client, "list_members", None):
-        return out
-    pages = 0
-    after: str | None = None
-    while pages < int(max_pages):
-        pages += 1
-        batch, page_info = await client.list_members(first=int(per_page), after=after)  # type: ignore[attr-defined]
-        if not isinstance(batch, list) or not batch:
-            break
-        for rec in batch:
-            if not isinstance(rec, dict):
-                continue
-            did_s = str(_extract_discord_id_from_whop_member_record(rec) or "").strip()
-            if did_s.isdigit():
-                out.add(int(did_s))
-        after = str(page_info.get("end_cursor") or "") if isinstance(page_info, dict) else ""
-        has_next = bool(page_info.get("has_next_page")) if isinstance(page_info, dict) else False
-        if not has_next or not after:
-            break
-    return out
+def _membership_id_from_member_history(discord_id: int) -> str:
+    """Best-effort: return last_membership_id/whop_key for a Discord user from member_history.json."""
+    did = int(discord_id or 0)
+    if did <= 0:
+        return ""
+    raw = _load_json(MEMBER_HISTORY_PATH)
+    if not isinstance(raw, dict):
+        return ""
+    rec = raw.get(str(did))
+    if not isinstance(rec, dict):
+        return ""
+    wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+    if not isinstance(wh, dict):
+        return ""
+    mid = str(wh.get("last_membership_id") or wh.get("last_whop_key") or "").strip()
+    return mid
 
 
 async def sweep_no_whop_link_scan() -> None:
-    """Periodic scan: open no_whop_link tickets for Members-role users with no recorded Whop linkage."""
+    """Periodic scan: open no_whop_link tickets for Members-role users whose Whop membership has no Discord connection (or mismatch)."""
     if not _ensure_cfg_loaded() or not _BOT:
         return
     cfg = _cfg()
@@ -2280,6 +2464,9 @@ async def sweep_no_whop_link_scan() -> None:
     if not isinstance(role, discord.Role):
         await _log(f"⚠️ support_tickets: no_whop_link scan skipped (members_role_id not found: {rid})")
         return
+    if not bool(cfg.no_whop_link_use_whop_api) or not _WHOP_API_CLIENT:
+        await _log("⚠️ support_tickets: no_whop_link scan skipped (whop_api_client not available)")
+        return
 
     # Throttle by persisted scan state (restart-safe).
     now = _now_utc()
@@ -2291,37 +2478,41 @@ async def sweep_no_whop_link_scan() -> None:
         return
     _scan_state_set("no_whop_link", {"last_scan_at_iso": _now_iso(), "last_summary": "running"})
 
-    linked_api: set[int] = set()
-    if bool(cfg.no_whop_link_use_whop_api):
-        with suppress(Exception):
-            linked_api = await _linked_discord_ids_from_whop_api(
-                max_pages=int(cfg.no_whop_link_max_pages),
-                per_page=int(cfg.no_whop_link_per_page),
-            )
-        if not linked_api:
-            # Informational only: we still proceed using _IS_WHOP_LINKED (member_history-based).
-            await _log("ℹ️ support_tickets: no_whop_link scan: Whop API returned 0 linked Discord IDs (using local linkage only)")
-
     members = [m for m in (guild.members or []) if isinstance(m, discord.Member) and (not getattr(m, "bot", False)) and role in (m.roles or [])]
     opened = 0
     already_open = 0
     suppressed = 0
     skipped_linked = 0
+    skipped_no_mid = 0
     failed = 0
 
     for m in members:
         uid = int(getattr(m, "id", 0) or 0)
         if uid <= 0:
             continue
-        # Linked by Whop API (if available) OR by local recorded linkage callback.
-        if uid in linked_api:
-            skipped_linked += 1
+        mid = _membership_id_from_member_history(int(uid))
+        if not str(mid or "").strip():
+            skipped_no_mid += 1
             continue
-        linked_local = False
-        if _IS_WHOP_LINKED:
-            with suppress(Exception):
-                linked_local = bool(_IS_WHOP_LINKED(int(uid)))
-        if linked_local:
+
+        # Fetch Whop brief (includes dashboard + total spend + connected discord when available).
+        try:
+            brief = await _fetch_whop_brief(_WHOP_API_CLIENT, str(mid), enable_enrichment=True)
+        except Exception:
+            brief = {}
+        if not isinstance(brief, dict) or not brief:
+            failed += 1
+            continue
+
+        connected_disp = str(brief.get("connected_discord") or "").strip()
+        did_in_whop = ""
+        with suppress(Exception):
+            m_did = re.search(r"\b(\d{17,19})\b", connected_disp)
+            if m_did:
+                did_in_whop = m_did.group(1)
+
+        # If Whop shows a Discord connection matching this member, skip.
+        if did_in_whop and did_in_whop.isdigit() and int(did_in_whop) == int(uid):
             skipped_linked += 1
             continue
 
@@ -2329,11 +2520,33 @@ async def sweep_no_whop_link_scan() -> None:
             already_open += 1
             continue
 
-        fp = f"{int(uid)}|no_whop_link"
+        note = ""
+        if did_in_whop and did_in_whop.isdigit() and int(did_in_whop) != int(uid):
+            note = f"Whop has Discord connected to a different account: `{did_in_whop}`"
+        else:
+            note = str(cfg.whop_unlinked_note or "").strip()
+
+        fp = f"{int(uid)}|no_whop_link|{str(mid).strip()}"
         try:
-            ch = await open_no_whop_link_ticket(member=m, fingerprint=fp)
+            ch = await open_no_whop_link_ticket(member=m, fingerprint=fp, whop_brief=brief, note=note)
             if isinstance(ch, discord.TextChannel):
                 opened += 1
+                # Optional: also post to member-status-logs for staff visibility (no pings).
+                if bool(cfg.no_whop_link_log_to_member_status_logs) and int(cfg.member_status_logs_channel_id or 0) > 0:
+                    out_ch = guild.get_channel(int(cfg.member_status_logs_channel_id))
+                    if isinstance(out_ch, discord.TextChannel):
+                        with suppress(Exception):
+                            access = _access_roles_plain(m, {int(r.id) for r in (m.roles or [])})
+                            emb = _build_member_status_detailed_embed(
+                                title="🧾 No Whop Link (Members role)",
+                                member=m,
+                                access_roles=access,
+                                color=0xFEE75C,
+                                discord_kv=[("event", "support_tickets.no_whop_link_scan"), ("ticket", f"<#{int(ch.id)}>")],
+                                whop_brief=brief,
+                                event_kind="active",
+                            )
+                            await out_ch.send(embed=emb, allowed_mentions=discord.AllowedMentions.none(), silent=True)
             elif ch:
                 suppressed += 1
             else:
@@ -2341,7 +2554,10 @@ async def sweep_no_whop_link_scan() -> None:
         except Exception:
             failed += 1
 
-    summary = f"members={len(members)} opened={opened} already_open={already_open} linked={skipped_linked} suppressed={suppressed} failed={failed}"
+    summary = (
+        f"members={len(members)} opened={opened} already_open={already_open} "
+        f"linked_ok={skipped_linked} no_mid={skipped_no_mid} suppressed={suppressed} failed={failed}"
+    )
     await _log(f"🧾 support_tickets: no_whop_link scan {summary}")
     _scan_state_set("no_whop_link", {"last_scan_at_iso": _now_iso(), "last_summary": summary})
 
