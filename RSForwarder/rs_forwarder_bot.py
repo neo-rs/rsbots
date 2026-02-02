@@ -3357,6 +3357,7 @@ class RSForwarderBot:
                         super().__init__(timeout=900)
                         self._bot = bot_obj
                         self._owner_id = int(owner_id or 0)
+                        self._message: Optional[discord.Message] = None
 
                         # Wizard stage: "dest" then "src"
                         self.stage: str = "dest"
@@ -3430,6 +3431,28 @@ class RSForwarderBot:
                             # After defer(), edit the message directly.
                             if interaction.message:
                                 await interaction.message.edit(embed=emb, view=self)
+                        except Exception:
+                            pass
+
+                    async def _edit_response(self, interaction: discord.Interaction) -> None:
+                        """
+                        Fast path for component interactions (avoids "This interaction failed"):
+                        use interaction.response.edit_message when possible.
+                        """
+                        emb = await self._build_embed()
+                        try:
+                            await interaction.response.edit_message(embed=emb, view=self)
+                            try:
+                                self._message = interaction.message or self._message
+                            except Exception:
+                                pass
+                            return
+                        except Exception:
+                            pass
+                        try:
+                            msg = interaction.message or self._message
+                            if msg:
+                                await msg.edit(embed=emb, view=self)
                         except Exception:
                             pass
 
@@ -3525,6 +3548,8 @@ class RSForwarderBot:
                                 self.children[-1].callback = self._dest_next  # type: ignore[attr-defined]
 
                             # Nav buttons
+                            self.add_item(discord.ui.Button(label="Manual IDs", style=discord.ButtonStyle.secondary, row=4))
+                            self.children[-1].callback = self._manual_ids  # type: ignore[attr-defined]
                             self.add_item(discord.ui.Button(label="Next", style=discord.ButtonStyle.primary, row=4))
                             self.children[-1].callback = self._go_next  # type: ignore[attr-defined]
                             self.add_item(discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger, row=4))
@@ -3590,15 +3615,148 @@ class RSForwarderBot:
 
                             self.add_item(discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary, row=4))
                             self.children[-1].callback = self._go_back  # type: ignore[attr-defined]
+                            self.add_item(discord.ui.Button(label="Manual IDs", style=discord.ButtonStyle.secondary, row=4))
+                            self.children[-1].callback = self._manual_ids  # type: ignore[attr-defined]
                             self.add_item(discord.ui.Button(label="Map → destination", style=discord.ButtonStyle.success, row=4))
                             self.children[-1].callback = self._map  # type: ignore[attr-defined]
                             self.add_item(discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger, row=4))
                             self.children[-1].callback = self._cancel  # type: ignore[attr-defined]
 
+                    async def _manual_ids(self, interaction: discord.Interaction):
+                        if not await self._guard(interaction):
+                            return
+
+                        view = self
+
+                        class _ManualIdsModal(discord.ui.Modal):
+                            def __init__(self):
+                                title = "RSForwarder: Manual IDs (Destination)" if view.stage == "dest" else "RSForwarder: Manual IDs (Source)"
+                                super().__init__(title=title)
+
+                                self.guild_id = discord.ui.TextInput(
+                                    label=("Destination guild ID" if view.stage == "dest" else "Source guild ID") + " (optional)",
+                                    placeholder="1451275225512546497",
+                                    required=False,
+                                    max_length=24,
+                                )
+                                self.category_id = discord.ui.TextInput(
+                                    label=("Destination category ID" if view.stage == "dest" else "Source category ID") + " (optional; blank = all)",
+                                    placeholder="0",
+                                    required=False,
+                                    max_length=24,
+                                )
+                                self.channel_ids = discord.ui.TextInput(
+                                    label=("Destination channel ID/mention" if view.stage == "dest" else "Source channel IDs/mentions (comma)") + " (optional)",
+                                    placeholder="#some-channel  OR  1467585427589435472",
+                                    required=False,
+                                    max_length=400,
+                                )
+                                self.add_item(self.guild_id)
+                                self.add_item(self.category_id)
+                                self.add_item(self.channel_ids)
+
+                            async def on_submit(self, interaction2: discord.Interaction):  # type: ignore[override]
+                                if not await view._guard(interaction2):
+                                    return
+                                try:
+                                    await interaction2.response.defer(ephemeral=True)
+                                except Exception:
+                                    pass
+
+                                def _as_int(s: str) -> int:
+                                    t = str(s or "").strip()
+                                    if not t:
+                                        return 0
+                                    return int(t) if t.isdigit() else 0
+
+                                gid = _as_int(str(self.guild_id.value or ""))
+                                cid = _as_int(str(self.category_id.value or ""))
+                                raw_channels = str(self.channel_ids.value or "").strip()
+
+                                # Apply guild/category
+                                try:
+                                    if view.stage == "dest":
+                                        if gid:
+                                            view.dest_guild_id = int(gid)
+                                            view.dest_channel_page = 0
+                                            view.dest_channel_id = 0
+                                        if str(self.category_id.value or "").strip() != "":
+                                            view.dest_category_id = int(cid or 0)
+                                            view.dest_channel_page = 0
+                                            view.dest_channel_id = 0
+                                    else:
+                                        if gid:
+                                            view.source_guild_id = int(gid)
+                                            view.source_channel_page = 0
+                                            view.selected_source_channel_ids = set()
+                                        if str(self.category_id.value or "").strip() != "":
+                                            view.source_category_id = int(cid or 0)
+                                            view.source_channel_page = 0
+                                            view.selected_source_channel_ids = set()
+                                except Exception:
+                                    pass
+
+                                # Apply channel(s)
+                                if raw_channels:
+                                    parts = [p.strip() for p in raw_channels.replace("\n", ",").split(",") if p.strip()]
+                                    ids: List[int] = []
+                                    for p in parts[:30]:
+                                        x = view._bot._extract_channel_id_from_ref(p) or 0
+                                        if x > 0:
+                                            ids.append(int(x))
+                                    if ids:
+                                        if view.stage == "dest":
+                                            # Take first destination channel id.
+                                            ch_obj = await view._bot._resolve_channel_by_id(int(ids[0]))
+                                            if isinstance(ch_obj, discord.TextChannel):
+                                                view.dest_channel_id = int(ch_obj.id)
+                                                try:
+                                                    view.dest_guild_id = int(getattr(getattr(ch_obj, "guild", None), "id", 0) or view.dest_guild_id)
+                                                except Exception:
+                                                    pass
+                                                try:
+                                                    view.dest_category_id = int(getattr(ch_obj, "category_id", 0) or 0)
+                                                except Exception:
+                                                    pass
+                                                view.dest_channel_page = 0
+                                        else:
+                                            ok_ids: Set[int] = set()
+                                            for x in ids:
+                                                ch_obj = await view._bot._resolve_channel_by_id(int(x))
+                                                if not isinstance(ch_obj, discord.TextChannel):
+                                                    continue
+                                                # If a source guild is set, keep only channels from that guild.
+                                                try:
+                                                    g0 = int(getattr(getattr(ch_obj, "guild", None), "id", 0) or 0)
+                                                except Exception:
+                                                    g0 = 0
+                                                if view.source_guild_id and g0 and int(g0) != int(view.source_guild_id):
+                                                    continue
+                                                ok_ids.add(int(ch_obj.id))
+                                                if not view.source_guild_id and g0:
+                                                    view.source_guild_id = int(g0)
+                                            if ok_ids:
+                                                view.selected_source_channel_ids = ok_ids
+
+                                view._rebuild()
+                                # Edit the original mapper message (use stored reference).
+                                try:
+                                    msg = view._message or interaction2.message
+                                    if msg:
+                                        emb = await view._build_embed()
+                                        await msg.edit(embed=emb, view=view)
+                                except Exception:
+                                    pass
+                                try:
+                                    await interaction2.followup.send("✅ Updated.", ephemeral=True)
+                                except Exception:
+                                    pass
+
+                        await interaction.response.send_modal(_ManualIdsModal())
+
                     async def _on_dest_guild(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
-                        await self._defer(interaction)
                         try:
                             self.dest_guild_id = int(self.dest_guild_select.values[0])
                             self.dest_category_id = 0
@@ -3607,12 +3765,11 @@ class RSForwarderBot:
                         except Exception:
                             pass
                         self._rebuild()
-                        await self._edit(interaction)
+                        await self._edit_response(interaction)
 
                     async def _on_dest_category(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
-                        await self._defer(interaction)
                         try:
                             self.dest_category_id = int(self.dest_cat_select.values[0])
                             self.dest_channel_page = 0
@@ -3620,39 +3777,35 @@ class RSForwarderBot:
                         except Exception:
                             pass
                         self._rebuild()
-                        await self._edit(interaction)
+                        await self._edit_response(interaction)
 
                     async def _on_dest_channel(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
-                        await self._defer(interaction)
                         try:
                             v = int(self.dest_channel_select.values[0])
                             self.dest_channel_id = v if v > 0 else 0
                         except Exception:
                             pass
-                        await self._edit(interaction)
+                        await self._edit_response(interaction)
 
                     async def _dest_prev(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
-                        await self._defer(interaction)
                         self.dest_channel_page = max(0, int(self.dest_channel_page) - 1)
                         self._rebuild()
-                        await self._edit(interaction)
+                        await self._edit_response(interaction)
 
                     async def _dest_next(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
-                        await self._defer(interaction)
                         self.dest_channel_page = int(self.dest_channel_page) + 1
                         self._rebuild()
-                        await self._edit(interaction)
+                        await self._edit_response(interaction)
 
                     async def _on_src_guild(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
-                        await self._defer(interaction)
                         try:
                             self.source_guild_id = int(self.src_guild_select.values[0])
                             self.source_category_id = 0
@@ -3661,12 +3814,11 @@ class RSForwarderBot:
                         except Exception:
                             pass
                         self._rebuild()
-                        await self._edit(interaction)
+                        await self._edit_response(interaction)
 
                     async def _on_src_category(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
-                        await self._defer(interaction)
                         try:
                             self.source_category_id = int(self.src_cat_select.values[0])
                             self.source_channel_page = 0
@@ -3674,33 +3826,30 @@ class RSForwarderBot:
                         except Exception:
                             pass
                         self._rebuild()
-                        await self._edit(interaction)
+                        await self._edit_response(interaction)
 
                     async def _on_src_channels(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
-                        await self._defer(interaction)
                         try:
                             self.selected_source_channel_ids = set(int(v) for v in (self.src_channel_select.values or []) if str(v).isdigit() and int(v) > 0)
                         except Exception:
                             self.selected_source_channel_ids = set()
-                        await self._edit(interaction)
+                        await self._edit_response(interaction)
 
                     async def _src_prev(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
-                        await self._defer(interaction)
                         self.source_channel_page = max(0, int(self.source_channel_page) - 1)
                         self._rebuild()
-                        await self._edit(interaction)
+                        await self._edit_response(interaction)
 
                     async def _src_next(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
-                        await self._defer(interaction)
                         self.source_channel_page = int(self.source_channel_page) + 1
                         self._rebuild()
-                        await self._edit(interaction)
+                        await self._edit_response(interaction)
 
                     async def _go_next(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
@@ -3708,18 +3857,16 @@ class RSForwarderBot:
                         if int(self.dest_channel_id or 0) <= 0:
                             await interaction.response.send_message("❌ Pick a destination channel first.", ephemeral=True)
                             return
-                        await self._defer(interaction)
                         self.stage = "src"
                         self._rebuild()
-                        await self._edit(interaction)
+                        await self._edit_response(interaction)
 
                     async def _go_back(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
-                        await self._defer(interaction)
                         self.stage = "dest"
                         self._rebuild()
-                        await self._edit(interaction)
+                        await self._edit_response(interaction)
 
                     async def _map(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
@@ -3731,7 +3878,10 @@ class RSForwarderBot:
                             await interaction.response.send_message("❌ Destination channel not set.", ephemeral=True)
                             return
 
-                        await self._defer(interaction)
+                        try:
+                            await interaction.response.defer()
+                        except Exception:
+                            pass
                         dest_obj = await self._bot._resolve_channel_by_id(int(self.dest_channel_id))
                         if not isinstance(dest_obj, discord.TextChannel):
                             await interaction.followup.send("❌ Destination channel not accessible.", ephemeral=True)
@@ -3756,22 +3906,35 @@ class RSForwarderBot:
                         self.selected_source_channel_ids = set()
                         self.source_channel_page = 0
                         self._rebuild()
-                        await self._edit(interaction)
+                        try:
+                            msg = interaction.message or self._message
+                            if msg:
+                                emb = await self._build_embed()
+                                await msg.edit(embed=emb, view=self)
+                        except Exception:
+                            pass
 
                     async def _cancel(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
                             return
-                        await self._defer(interaction)
                         self.stop()
                         try:
-                            if interaction.message:
-                                await interaction.message.edit(view=None)
+                            await interaction.response.edit_message(view=None)
                         except Exception:
-                            pass
+                            try:
+                                msg = interaction.message or self._message
+                                if msg:
+                                    await msg.edit(view=None)
+                            except Exception:
+                                pass
 
                 view = _RsAddWizardView(self)
                 emb = await view._build_embed()
-                await ctx.send(embed=emb, view=view)
+                try:
+                    sent = await ctx.send(embed=emb, view=view)
+                    view._message = sent
+                except Exception:
+                    await ctx.send(embed=emb, view=view)
                 return
 
             # Manual mode

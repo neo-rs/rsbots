@@ -16,7 +16,7 @@ RSForwarder is a standalone bot for forwarding messages from RS Server channels 
   - `role_id`: Role ID to mention (optional)
   - `text`: Text to include with role mention (optional)
 - **Usage**:
-  - `!rsadd` (wizard: destination first → source → **Map → destination**; auto-creates/uses webhook)
+  - `!rsadd` (wizard: destination first → source → **Map → destination**; includes “Manual IDs” for large servers; auto-creates/uses webhook)
   - Manual: `!rsadd #personal-deals <WEBHOOK_URL> 886824827745337374 "leads found!"`
   - Manual: `!rsadd 1446174806981480578 <WEBHOOK_URL>`
 - **Admin Only**: No (but requires channel access)
