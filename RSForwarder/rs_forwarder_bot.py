@@ -6095,9 +6095,15 @@ class RSForwarderBot:
             if "author" in branded_embed:
                 del branded_embed["author"]
             
-            # Remove title (simple embed per boss request)
-            if "title" in branded_embed:
-                del branded_embed["title"]
+            # Preserve title (this is often the product name on deal cards).
+            # Keep it within Discord limits.
+            try:
+                if isinstance(branded_embed.get("title"), str):
+                    t = (branded_embed.get("title") or "").strip()
+                    if len(t) > 256:
+                        branded_embed["title"] = t[:253] + "..."
+            except Exception:
+                pass
             
             # Set embed color to blue sidebar (branding blue)
             branded_embed["color"] = 0x0099FF  # Branding blue color
