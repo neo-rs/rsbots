@@ -1,7 +1,7 @@
 {
   "guild_id": 876528050081251379,
   "guild_ids": [876528050081251379, 1451275225512546497],
-  "admin_role_ids": [876598078092754985],
+  "admin_role_ids": [],
   "admin_user_ids": [],
   "log_channel_id": "1452590450631376906",
   "ssh_commands_channel_id": "1452892665514430545",

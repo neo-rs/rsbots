@@ -7162,6 +7162,7 @@ async def on_ready():
             log_func=log_other,
             is_whop_linked=_is_whop_linked,
             timezone_name=tz_name,
+            whop_api_client=whop_api_client,
         )
     except Exception as e:
         # Don't silently disable the whole ticket system.

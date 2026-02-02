@@ -961,6 +961,33 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
     # Stable amazon masks per destination within a message
     amazon_mask_cache: Dict[str, str] = {}
 
+    # Domains that should NOT be affiliate-wrapped (marketplaces, etc).
+    # If a URL resolves/expands to one of these, we will avoid Mavely/Amazon affiliate rewriting.
+    # Config: `affiliate_skip_domains`: ["ebay.com", "stockx.com", ...]
+    skip_domains: List[str] = []
+    try:
+        raw_sd = (cfg or {}).get("affiliate_skip_domains")
+        if isinstance(raw_sd, list):
+            skip_domains = [str(x or "").strip().lower() for x in raw_sd if str(x or "").strip()]
+    except Exception:
+        skip_domains = []
+
+    def _host_matches_skip(host: str) -> bool:
+        h = (host or "").strip().lower()
+        if h.startswith("www."):
+            h = h[4:]
+        if not h or not skip_domains:
+            return False
+        for d in skip_domains:
+            dd = (d or "").strip().lower()
+            if dd.startswith("www."):
+                dd = dd[4:]
+            if not dd:
+                continue
+            if h == dd or h.endswith("." + dd):
+                return True
+        return False
+
     expand_enabled = _bool_or_default((cfg or {}).get("affiliate_expand_redirects"), True)
     max_redirects = int(_cfg_or_env_int(cfg, "affiliate_max_redirects", "AUTO_AFFILIATE_MAX_REDIRECTS") or 8)
     timeout_s = float(_cfg_or_env_int(cfg, "affiliate_expand_timeout_s", "AUTO_AFFILIATE_EXPAND_TIMEOUT_S") or 8)
@@ -1041,6 +1068,21 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
         def _is_mavely_unsupported(err_msg: Optional[str]) -> bool:
             m = (err_msg or "").strip().lower()
             return ("merchant not supported" in m) or ("brand not found" in m)
+
+        # Skip affiliate rewriting for configured marketplace domains.
+        # Still allow expansion/unwrapping to surface the final destination when available.
+        try:
+            parsed = urlparse(target)
+            host = (parsed.netloc or "").lower()
+        except Exception:
+            host = ""
+        if host and _host_matches_skip(host):
+            if target and (target != raw):
+                mapped[u] = target
+                notes[u] = "expanded only (marketplace skipped)"
+            else:
+                notes[u] = "marketplace skipped"
+            continue
 
         # Re-wrap existing Mavely links into YOUR Mavely link (so forwarded posts always credit you).
         if is_mavely_link(raw):

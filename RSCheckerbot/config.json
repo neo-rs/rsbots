@@ -226,7 +226,9 @@
     "guild_id": 876528050081251379,
     "permissions": {
       "_comment": "Staff can run !transcript/!close and view all ticket channels. Admin roles are optional; administrators are always treated as allowed.",
-      "staff_role_ids": [876588092927115284],
+      "staff_role_ids": [1351371587617558539],
+      "_comment_legacy_staff_role_ids": "Optional: remove these legacy staff role overwrites from existing ticket channels on startup (one-time migration).",
+      "legacy_staff_role_ids": [876588092927115284],
       "admin_role_ids": [876598078092754985],
       "_comment_include_owner": "When true, the ticket owner can see/respond in their ticket channel.",
       "include_ticket_owner_in_channel": true
@@ -235,12 +237,29 @@
       "_comment": "Auto-assign roles when a ticket is OPEN; remove on close.",
       "billing_role_id": 1354146761853108225,
       "cancellation_role_id": 1467494664088064174,
-      "free_pass_no_whop_role_id": 1467500050341957725
+      "free_pass_no_whop_role_id": 1467500050341957725,
+      "_comment_no_whop_link_role_id": "Role to apply for no_whop_link tickets (Members role present but no Whop linkage recorded).",
+      "no_whop_link_role_id": 1467500050341957725
     },
     "ticket_categories": {
       "billing_category_id": 1467157354977165537,
       "free_pass_category_id": 1467157711685681214,
-      "cancellation_category_id": 1467169698608320542
+      "cancellation_category_id": 1467169698608320542,
+      "_comment_no_whop_link": "Category for 'No Whop Link' tickets. If id is 0, RSCheckerbot will find/create by name.",
+      "no_whop_link_category_id": 0,
+      "no_whop_link_category_name": "no-whop-link"
+    },
+    "no_whop_link": {
+      "_comment": "Scan current Discord Members-role users and open a ticket when Whop linkage is not recorded.",
+      "enabled": true,
+      "scan_interval_seconds": 21600,
+      "_comment_members_role_id": "Discord role ID that represents current paying members (same as dm_sequence.role_cancel_a).",
+      "members_role_id": 876569612085518376,
+      "_comment_whop_api": "Optional: if available, scan Whop /members to detect linked Discord IDs (best-effort; safe fallback if API lacks Discord connection fields).",
+      "use_whop_api": true,
+      "max_pages": 50,
+      "per_page": 100,
+      "cooldown_seconds": 86400
     },
     "transcripts": {
       "_comment": "If per-type transcript channel IDs are 0, RSCheckerbot will create/find channels under transcript_category_id by name.",
