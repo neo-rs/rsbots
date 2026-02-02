@@ -3618,7 +3618,15 @@ class RSForwarderBot:
                             opts.append(discord.SelectOption(label=f"#{str(getattr(ch, 'name', '') or ch.id)[:95]}", value=str(int(ch.id))))
                         if not opts:
                             opts = [discord.SelectOption(label="(no channels)", value="0")]
-                        sel = discord.ui.Select(placeholder="Select source channel(s)…", min_values=0, max_values=25, options=opts, row=0)
+                        # Discord requires max_values <= number of options.
+                        max_v = min(25, max(1, len(opts)))
+                        sel = discord.ui.Select(
+                            placeholder="Select source channel(s)…",
+                            min_values=0,
+                            max_values=max_v,
+                            options=opts,
+                            row=0,
+                        )
                         sel.callback = self._src_pick_channels  # type: ignore[assignment]
                         self.add_item(sel)
 
