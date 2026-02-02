@@ -20,6 +20,7 @@ import subprocess
 import shlex
 import time
 import hashlib
+import unicodedata
 from urllib.parse import urlparse
 
 from RSForwarder import affiliate_rewriter
@@ -3309,6 +3310,8 @@ class RSForwarderBot:
                         self._bot = bot_obj
                         self._owner_id = int(owner_id or 0)
                         self.dest_channel_id = int(dest_channel.id)
+                        self.dest_guild_id = int(getattr(getattr(ctx, "guild", None), "id", 0) or 0)
+                        self.dest_channel_page = 0
                         # default guild: current guild (if bot is in it)
                         self.source_guild_id = int(getattr(getattr(ctx, "guild", None), "id", 0) or 0) or 0
                         if not self.source_guild_id and bot_obj.bot.guilds:
@@ -3317,10 +3320,18 @@ class RSForwarderBot:
                         self.channel_page = 0
                         self.selected_channel_ids: Set[int] = set()
 
+                        self.dest_select = discord.ui.Select(
+                            placeholder="Select destination channel (page)…",
+                            min_values=1,
+                            max_values=1,
+                            options=[],
+                        )
                         self.guild_select = discord.ui.Select(placeholder="Select source guild…", min_values=1, max_values=1, options=[])
                         self.channel_select = discord.ui.Select(placeholder="Select source channels (page)…", min_values=0, max_values=25, options=[])
+                        self.dest_select.callback = self._on_select_destination  # type: ignore[assignment]
                         self.guild_select.callback = self._on_select_guild  # type: ignore[assignment]
                         self.channel_select.callback = self._on_select_channels  # type: ignore[assignment]
+                        self.add_item(self.dest_select)
                         self.add_item(self.guild_select)
                         self.add_item(self.channel_select)
                         self._rebuild_options()
@@ -3339,6 +3350,29 @@ class RSForwarderBot:
                             return self._bot.bot.get_guild(int(self.source_guild_id))
                         except Exception:
                             return None
+
+                    def _dest_guild(self) -> Optional[discord.Guild]:
+                        try:
+                            if self.dest_guild_id:
+                                return self._bot.bot.get_guild(int(self.dest_guild_id))
+                        except Exception:
+                            pass
+                        return None
+
+                    def _dest_channels(self) -> List[discord.TextChannel]:
+                        g = self._dest_guild()
+                        if not g:
+                            return []
+                        chans = [c for c in (getattr(g, "text_channels", []) or []) if isinstance(c, discord.TextChannel)]
+                        return sorted(chans, key=lambda c: int(getattr(c, "position", 0) or 0))
+
+                    def _current_dest_channel_page(self) -> List[discord.TextChannel]:
+                        chans = self._dest_channels()
+                        page_size = 25
+                        max_page = max(0, (len(chans) - 1) // page_size) if chans else 0
+                        self.dest_channel_page = max(0, min(int(self.dest_channel_page), int(max_page)))
+                        start = int(self.dest_channel_page) * page_size
+                        return chans[start:start + page_size]
 
                     def _categories(self) -> List[Optional[discord.CategoryChannel]]:
                         g = self._current_guild()
@@ -3376,6 +3410,26 @@ class RSForwarderBot:
                             return 0
 
                     def _rebuild_options(self) -> None:
+                        # destination channel options (in the guild where the command was run)
+                        dest_opts: List[discord.SelectOption] = []
+                        for ch in self._current_dest_channel_page():
+                            try:
+                                name = str(getattr(ch, "name", "") or f"channel-{int(ch.id)}")
+                                label = f"#{name}"
+                                if len(label) > 100:
+                                    label = label[:97] + "..."
+                                dest_opts.append(discord.SelectOption(label=label, value=str(int(ch.id))))
+                            except Exception:
+                                pass
+                        self.dest_select.options = dest_opts[:25]
+                        # If our current dest is not set/visible, snap to first option.
+                        if self.dest_select.options:
+                            try:
+                                if int(self.dest_channel_id or 0) <= 0:
+                                    self.dest_channel_id = int(self.dest_select.options[0].value)
+                            except Exception:
+                                pass
+
                         # guild options
                         guild_opts: List[discord.SelectOption] = []
                         for g in (self._bot.bot.guilds or [])[:25]:
@@ -3424,7 +3478,7 @@ class RSForwarderBot:
                         if self.selected_channel_ids:
                             shown = ", ".join([f"<#{cid}>" for cid in list(self.selected_channel_ids)[:10]])
                             emb.add_field(name="Selected", value=shown, inline=False)
-                        emb.set_footer(text="Prev/Next Category • Prev/Next Channels • Map → destination")
+                        emb.set_footer(text="Prev/Next Destination • Prev/Next Category • Prev/Next Channels • Map → destination")
                         return emb
 
                     async def _refresh(self, interaction: discord.Interaction) -> None:
@@ -3437,6 +3491,15 @@ class RSForwarderBot:
                                 await interaction.followup.send(embed=emb, view=self, ephemeral=True)
                             except Exception:
                                 pass
+
+                    async def _on_select_destination(self, interaction: discord.Interaction):
+                        if not await self._guard(interaction):
+                            return
+                        try:
+                            self.dest_channel_id = int(self.dest_select.values[0])
+                        except Exception:
+                            pass
+                        await self._refresh(interaction)
 
                     async def _on_select_guild(self, interaction: discord.Interaction):
                         if not await self._guard(interaction):
@@ -3457,6 +3520,20 @@ class RSForwarderBot:
                             self.selected_channel_ids = set(int(v) for v in (self.channel_select.values or []) if str(v).isdigit())
                         except Exception:
                             self.selected_channel_ids = set()
+                        await self._refresh(interaction)
+
+                    @discord.ui.button(label="Prev destination", style=discord.ButtonStyle.secondary, row=1)
+                    async def prev_destination(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+                        if not await self._guard(interaction):
+                            return
+                        self.dest_channel_page = max(0, int(self.dest_channel_page) - 1)
+                        await self._refresh(interaction)
+
+                    @discord.ui.button(label="Next destination", style=discord.ButtonStyle.secondary, row=1)
+                    async def next_destination(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+                        if not await self._guard(interaction):
+                            return
+                        self.dest_channel_page = int(self.dest_channel_page) + 1
                         await self._refresh(interaction)
 
                     @discord.ui.button(label="Prev category", style=discord.ButtonStyle.secondary, row=2)
@@ -3501,12 +3578,12 @@ class RSForwarderBot:
                         if not self.selected_channel_ids:
                             await interaction.response.send_message("❌ Select at least one source channel first.", ephemeral=True)
                             return
-                        dest = self._bot.bot.get_channel(int(self.dest_channel_id))
-                        if not isinstance(dest, discord.TextChannel):
+                        dest_obj = await self._bot._resolve_channel_by_id(int(self.dest_channel_id))
+                        if not isinstance(dest_obj, discord.TextChannel):
                             await interaction.response.send_message("❌ Destination channel not accessible.", ephemeral=True)
                             return
 
-                        ok_wh, msg_wh, wh_url = await self._bot._get_or_create_destination_webhook_url(dest)
+                        ok_wh, msg_wh, wh_url = await self._bot._get_or_create_destination_webhook_url(dest_obj)
                         if not ok_wh:
                             await interaction.response.send_message(f"❌ {msg_wh}", ephemeral=True)
                             return
@@ -5960,21 +6037,82 @@ class RSForwarderBot:
             where_only = bool((channel_config or {}).get("repost_affiliate_where_only"))
             where_marker = str((channel_config or {}).get("repost_affiliate_where_marker") or "`Where:`").strip()
             if where_only and content and where_marker:
+                def _lstrip_invisible_prefix(s: str) -> str:
+                    """
+                    Discord sometimes injects Unicode "format" characters (category Cf) around inline code.
+                    Those are not removed by .lstrip(), but we want marker matching to ignore them.
+                    """
+                    t = s or ""
+                    i = 0
+                    n = len(t)
+                    while i < n:
+                        ch = t[i]
+                        if ch.isspace():
+                            i += 1
+                            continue
+                        try:
+                            if unicodedata.category(ch) == "Cf":
+                                i += 1
+                                continue
+                        except Exception:
+                            pass
+                        break
+                    return t[i:]
+
+                def _codepoints_prefix(s: str, limit: int = 12) -> str:
+                    try:
+                        return " ".join([f"U+{ord(c):04X}" for c in (s or "")[: max(0, int(limit))]])
+                    except Exception:
+                        return ""
+
                 try:
                     lines = content.splitlines()
                 except Exception:
                     lines = [content]
                 out_lines: List[str] = []
+                where_matched = 0
+                where_notes: List[str] = []
                 for ln in lines:
                     # Only affiliate-rewrite URLs in the `Where:` line.
-                    if where_marker and (ln.lstrip().startswith(where_marker)):
-                        new_ln, changed, _notes = await affiliate_rewriter.rewrite_text(self.config, ln)
+                    ln_norm = _lstrip_invisible_prefix(ln)
+                    hit = bool(where_marker and ln_norm.startswith(where_marker))
+                    # Fallback: accept "Where:" without backticks too.
+                    if (not hit) and where_marker == "`Where:`":
+                        hit = ln_norm.startswith("Where:") or ln_norm.startswith("**Where:**")
+
+                    if hit:
+                        where_matched += 1
+                        new_ln, changed, notes = await affiliate_rewriter.rewrite_text(self.config, ln)
                         if changed:
                             any_changed = True
+                        if debug and isinstance(notes, dict) and notes:
+                            shown = 0
+                            for u, note in list(notes.items()):
+                                if shown >= 2:
+                                    break
+                                nu = (str(u or "").strip() or "?")[:140]
+                                nn = (str(note or "").replace("\r", " ").replace("\n", " ").strip() or "?")
+                                if len(nn) > 200:
+                                    nn = nn[:200] + "..."
+                                where_notes.append(f"{nu} ({nn})")
+                                shown += 1
                         out_lines.append(new_ln)
                     else:
                         out_lines.append(ln)
                 content = "\n".join(out_lines)
+                if debug:
+                    try:
+                        if where_matched == 0:
+                            first = lines[0] if lines else ""
+                            cp = _codepoints_prefix(str(first or ""), limit=16)
+                            print(
+                                f"{Colors.YELLOW}[Repost] where-only enabled but no lines matched marker={where_marker!r}. "
+                                f"first_line_prefix={cp}{Colors.RESET}"
+                            )
+                        elif where_notes:
+                            print(f"{Colors.CYAN}[Repost] where rewrite notes: { ' | '.join(where_notes) }{Colors.RESET}")
+                    except Exception:
+                        pass
             elif content:
                 content2, changed, _notes = await affiliate_rewriter.rewrite_text(self.config, content)
                 if changed:
