@@ -5946,16 +5946,13 @@ echo "CHANGED_END"
             ok, stdout, stderr = self._execute_ssh_command(cmd, timeout=180)
             out = (stdout or "").strip()
             err = (stderr or "").strip()
-            if not ok:
-                # IMPORTANT: include BOTH streams.
-                # Git often writes progress/info to stderr, while the actual failure may be on stdout.
-                if err and out:
-                    msg = (err + "\n" + out).strip()
-                else:
-                    msg = err or out or "unknown error"
-                return False, {"error": msg[:1200]}
 
-            stats: Dict[str, Any] = {"raw": out[-1600:]}
+            # Parse stdout even on non-zero exit codes.
+            #
+            # Why: In some environments git emits output on stderr and certain host shell wrappers
+            # can still propagate a non-zero exit status even though our script reached the explicit
+            # OK=1 / NO_CHANGES=1 paths. We prefer trusting our sentinel lines when present.
+            stats: Dict[str, Any] = {"raw": out[-1600:], "stderr": err[-1600:]}
             lines = [ln.rstrip("\r") for ln in out.splitlines()]
             in_changed = False
             changed_lines: List[str] = []
@@ -5977,6 +5974,20 @@ echo "CHANGED_END"
                     if k:
                         stats[k] = v
             stats["changed_sample"] = changed_lines[:30]
+
+            if not ok:
+                # If the script self-reported OK and did not report an ERR, treat it as success.
+                if str(stats.get("ok") or "").strip() == "1" and not str(stats.get("err") or "").strip():
+                    return True, stats
+
+                # IMPORTANT: include BOTH streams.
+                # Git often writes progress/info to stderr, while the actual failure may be on stdout.
+                if err and out:
+                    msg = (err + "\n" + out).strip()
+                else:
+                    msg = err or out or "unknown error"
+                return False, {"error": msg[:1200]}
+
             return True, stats
         except Exception as e:
             return False, {"error": f"rsadminbot stage update failed ({type(e).__name__}): {str(e)[:300]}"}
@@ -6710,11 +6721,17 @@ echo "CHANGED_END"
                     self.logger.log_ssh_command(cmd_txt, False, None, error_msg, None)
                 return False, "", error_msg
             
-            # Escape command for bash -c
-            escaped_cmd = shlex.quote(cmd_txt)
-            
-            # Build command as list (no shell parsing on Windows)
-            cmd = base + ["-t", "-o", "ConnectTimeout=10", "bash", "-lc", escaped_cmd]
+            # Build command as list (no local shell parsing on Windows).
+            #
+            # IMPORTANT:
+            # - SSH options MUST come before the `user@host` target.
+            # - Do NOT shlex.quote() the bash -lc payload here; we're not going through a shell.
+            #   If we pass a literally quoted string, bash will treat the quotes as part of the
+            #   command text and fail (e.g., trying to execute a command named "set -euo ...").
+            host_target = base[-1]
+            base_no_host = base[:-1]
+            # Avoid forcing a TTY; it can add control chars and isn't required for our non-interactive sudo usage.
+            cmd = base_no_host + ["-o", "ConnectTimeout=10", host_target, "bash", "-lc", cmd_txt]
             
             # Suppress verbose output - only log errors
             is_validation = cmd_txt.strip() == "sudo -n true"

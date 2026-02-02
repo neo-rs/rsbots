@@ -2461,6 +2461,8 @@ def _extract_reporting_from_member_status_embed(
                 whop_brief["remaining_days"] = v
             elif ln in {"whop dashboard", "dashboard"}:
                 whop_brief["dashboard_url"] = v
+            elif ln in {"connected discord", "connected_discord"}:
+                whop_brief["connected_discord"] = v
             elif ln in {"cancel at period end", "cancel_at_period_end"}:
                 whop_brief["cancel_at_period_end"] = v
             elif ln in {"access ends on", "next billing date", "renewal end", "renewal_end"}:
@@ -2555,6 +2557,21 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
     title_low = title.lower()
     ref_url = str(getattr(msg, "jump_url", "") or "").strip()
     occurred_at = getattr(msg, "created_at", None) or datetime.now(timezone.utc)
+
+    # No-Whop-Link close trigger: if member-status-logs shows Connected Discord matching this member, close ticket + remove role.
+    try:
+        cd = str((whop_brief or {}).get("connected_discord") or "").strip() if isinstance(whop_brief, dict) else ""
+    except Exception:
+        cd = ""
+    if cd:
+        m_cd = re.search(r"\b(\d{17,19})\b", cd)
+        if m_cd and m_cd.group(1).isdigit() and int(m_cd.group(1)) == int(did_i) and has_member_role(member):
+            with suppress(Exception):
+                await support_tickets.close_no_whop_link_if_linked(
+                    int(did_i),
+                    resolution_event="discord_linked",
+                    reference_jump_url=ref_url,
+                )
 
     # Close Free Pass as soon as we see an access-confirmation style card in member-status-logs.
     if (
@@ -8202,6 +8219,10 @@ async def on_message(message: discord.Message):
 async def on_message_edit(before: discord.Message, after: discord.Message):
     with suppress(Exception):
         await support_tickets.audit_message_edit(before, after)
+    # Also re-run ticket triggers when member-status-logs messages are edited/updated.
+    if MEMBER_STATUS_LOGS_CHANNEL_ID and int(getattr(getattr(after, "channel", None), "id", 0) or 0) == int(MEMBER_STATUS_LOGS_CHANNEL_ID):
+        with suppress(Exception):
+            await _maybe_open_tickets_from_member_status_logs(after)
 
 
 @bot.event

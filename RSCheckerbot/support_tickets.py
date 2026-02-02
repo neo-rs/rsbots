@@ -28,6 +28,7 @@ BASE_DIR = Path(__file__).resolve().parent
 INDEX_PATH = BASE_DIR / "data" / "tickets_index.json"
 MIGRATIONS_STATE_PATH = BASE_DIR / "data" / "support_tickets_migrations.json"
 MEMBER_HISTORY_PATH = BASE_DIR / "member_history.json"
+WHOP_IDENTITY_CACHE_PATH = BASE_DIR / "whop_identity_cache.json"
 
 _INDEX_LOCK: asyncio.Lock = asyncio.Lock()
 
@@ -733,13 +734,89 @@ def _support_ping_role_mention() -> str:
     return f"<@&{int(rid)}>" if int(rid or 0) > 0 else ""
 
 
-def _ticket_ping_content(*, owner_id: int, include_owner: bool) -> str:
-    """Ticket header ping content (member + support role)."""
-    if not bool(include_owner):
-        return ""
+def _no_whop_link_followup_text(*, member_mention: str, staff_role_id: int) -> str:
+    staff_mention = f"<@&{int(staff_role_id)}>" if int(staff_role_id or 0) > 0 else ""
+    # Keep formatting exactly as provided (Discord markdown + custom emoji IDs).
+    return (
+        "## Link Your Discord Account to Whop (Required) <a:rslknock:1247632729948946472>\n"
+        f"### Yo {member_mention} <:sniped:1350271143822753873> , this ticket is here to help you link your Discord to Whop so your access can be tracked correctly.\n"
+        "### If Discord isn’t connected, Whop can’t sync your membership.\n"
+        "> ### Step 1: Open Connected Accounts\n"
+        "> **Make sure you’re logged into Whop, then open:**\n"
+        "> <https://whop.com/@me/settings/connected-accounts/>\n"
+        "> ### Step 2: Connect Discord\n"
+        "> **On the Connected Accounts page:**\n"
+        "> * Find Discord  \n"
+        "> * Click Add Account or Connect  \n"
+        "> **A new tab will open.**\n"
+        "> ### Step 3: Authorize Whop\n"
+        "> **In the new tab:**\n"
+        "> * Log into the same Discord account you’re using now  \n"
+        "> * You’ll see a page called Whop Bot  \n"
+        "> * Scroll down and click Authorize  \n"
+        "> **You’ll be redirected back to Whop when it’s complete.**\n"
+        "> ### Mobile Users\n"
+        "> **If you’re on your phone:**\n"
+        "> * Open a mobile browser (not inside the Discord app)  \n"
+        "> * Go to the same link above  \n"
+        "> * Tap Add Account next to Discord  \n"
+        "> * Log in and authorize when prompted  \n"
+        "> ### After You’re Done\n"
+        "> **Once Discord is connected:**\n"
+        "> * Come back to this ticket  \n"
+        "> * Send a quick message saying connected  \n"
+        "## **We’ll verify it on our end **<:rslgoat1:1247633099450486844>\n\n"
+        "**Important** <:blamebots:910339769043648582> <#1212099029358608506>\n"
+        "```We’re now tracking every member directly through Whop to keep access clean and accurate.\n"
+        "By the end of this month, members who have not linked their Discord account in Whop may lose access until it’s connected.\n"
+        "If that happens or if you run into any issues, open a ticket and we’ll help you get it sorted.```\n"
+        f"-# **Our DEDICATED {staff_mention}  will be here to keep nagging you for the rest of the month and help you cook!** <a:pepevbcook:1412558017089503253>\n"
+    )
+
+
+async def _ensure_no_whop_link_followup_message(
+    *,
+    channel: discord.TextChannel,
+    owner_id: int,
+    followup_message_id: int,
+    staff_role_id: int,
+) -> int:
+    if not _ensure_cfg_loaded() or not _BOT or not isinstance(channel, discord.TextChannel):
+        return 0
     uid = int(owner_id or 0)
-    role_mention = _support_ping_role_mention()
-    return " ".join([x for x in [f"<@{uid}>" if uid else "", role_mention] if str(x or "").strip()])
+    member_mention = f"<@{uid}>" if uid > 0 else ""
+    content = _no_whop_link_followup_text(member_mention=member_mention, staff_role_id=int(staff_role_id or 0))
+
+    bot_id = int(getattr(getattr(_BOT, "user", None), "id", 0) or 0)
+    mid = int(followup_message_id or 0)
+    if mid > 0:
+        with suppress(Exception):
+            msg = await channel.fetch_message(int(mid))
+            if msg and int(getattr(getattr(msg, "author", None), "id", 0) or 0) == bot_id:
+                await msg.edit(content=content)
+                return int(getattr(msg, "id", 0) or 0)
+
+    try:
+        sent = await channel.send(
+            content=content,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            silent=True,
+        )
+        return int(getattr(sent, "id", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _ticket_ping_content(*, owner_id: int, mention_owner: bool, mention_staff: bool) -> str:
+    """Ticket header ping content (member + support role).
+
+    Note: mentions are independent from channel permissions. We can ping the member even if they are not added to
+    the channel (used for no_whop_link while testing).
+    """
+    uid = int(owner_id or 0)
+    owner_mention = f"<@{uid}>" if (uid and bool(mention_owner)) else ""
+    role_mention = _support_ping_role_mention() if bool(mention_staff) else ""
+    return " ".join([x for x in [owner_mention, role_mention] if str(x or "").strip()])
 
 
 async def _ensure_ticket_header_message(
@@ -747,6 +824,8 @@ async def _ensure_ticket_header_message(
     channel: discord.TextChannel,
     owner_id: int,
     include_owner: bool,
+    mention_owner: bool = False,
+    mention_staff: bool = False,
     preview_embed: discord.Embed,
     header_message_id: int = 0,
 ) -> int:
@@ -755,7 +834,9 @@ async def _ensure_ticket_header_message(
         return 0
 
     view = _CONTROLS_VIEW or SupportTicketControlsView()
-    ping = _ticket_ping_content(owner_id=int(owner_id), include_owner=bool(include_owner))
+    ping_owner = bool(mention_owner) or bool(include_owner)
+    ping_staff = bool(mention_staff) or bool(include_owner)
+    ping = _ticket_ping_content(owner_id=int(owner_id), mention_owner=ping_owner, mention_staff=ping_staff)
     bot_id = int(getattr(getattr(_BOT, "user", None), "id", 0) or 0)
 
     # Prefer editing the stored message id.
@@ -801,7 +882,7 @@ async def _ensure_ticket_header_message(
             content=ping,
             embed=preview_embed,
             view=view,
-            allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
+            allowed_mentions=discord.AllowedMentions(users=True, roles=bool(ping_staff), everyone=False),
         )
         return int(getattr(sent, "id", 0) or 0)
     except Exception:
@@ -1356,6 +1437,15 @@ async def _set_ticket_role_for_member(*, guild: discord.Guild, member: discord.M
     with suppress(Exception):
         has_it = any(int(getattr(r, "id", 0) or 0) == int(rid) for r in (member.roles or []))
     if add:
+        # Special case: no_whop_link should never keep the Billing role.
+        if str(ticket_type or "").strip().lower() == "no_whop_link":
+            cfg = _cfg()
+            bid = int(getattr(cfg, "billing_role_id", 0) or 0) if cfg else 0
+            if bid > 0:
+                bill_role = guild.get_role(int(bid))
+                if bill_role and any(int(getattr(r, "id", 0) or 0) == int(bid) for r in (member.roles or [])):
+                    with suppress(Exception):
+                        await member.remove_roles(bill_role, reason="RSCheckerbot: replace billing role with no-whop role")
         if has_it:
             return
         try:
@@ -1392,7 +1482,7 @@ async def post_resolution_followup_and_remove_role(
     if uid <= 0:
         return False
     ttype = str(ticket_type or "").strip().lower()
-    if ttype not in {"billing", "cancellation", "free_pass"}:
+    if ttype not in {"billing", "cancellation", "free_pass", "no_whop_link"}:
         return False
 
     # Find the open ticket channel (copy under lock).
@@ -1445,7 +1535,7 @@ async def post_resolution_followup_and_remove_role(
     with suppress(Exception):
         await _set_ticket_role_for_member(guild=guild, member=owner, ticket_type=ttype, add=False)
 
-    # Follow-up embed + buttons in-ticket (ping member + support).
+    # Follow-up embed + buttons in-ticket.
     tmpl = _resolution_followup_template(ttype)
     desc = tmpl.strip() if tmpl else "Update: this ticket appears resolved. If you still have concerns, reply here — otherwise Support can close."
     e = discord.Embed(title="Update", description=desc[:4096], color=0x57F287)
@@ -1454,15 +1544,25 @@ async def post_resolution_followup_and_remove_role(
     if reference_jump_url:
         e.add_field(name="Source", value=_embed_link("View Full Log", str(reference_jump_url)), inline=True)
     view = _CONTROLS_VIEW or SupportTicketControlsView()
-    role_mention = _support_ping_role_mention()
-    ping = " ".join([x for x in [f"<@{uid}>", role_mention] if str(x or "").strip()])
-    with suppress(Exception):
-        await ch.send(
-            content=ping,
-            embed=e,
-            view=view,
-            allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
-        )
+    if ttype == "no_whop_link":
+        # No staff ping; member may not have channel access.
+        with suppress(Exception):
+            await ch.send(
+                embed=e,
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+                silent=True,
+            )
+    else:
+        role_mention = _support_ping_role_mention()
+        ping = " ".join([x for x in [f"<@{uid}>", role_mention] if str(x or "").strip()])
+        with suppress(Exception):
+            await ch.send(
+                content=ping,
+                embed=e,
+                view=view,
+                allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
+            )
 
     # Mark "sent" after posting succeeds (best-effort).
     async with _INDEX_LOCK:
@@ -1506,7 +1606,7 @@ async def reconcile_open_ticket_roles() -> None:
                 continue
             uid = _as_int(rec.get("user_id"))
             ttype = str(rec.get("ticket_type") or "").strip().lower()
-            if uid <= 0 or ttype not in {"billing", "cancellation", "free_pass"}:
+            if uid <= 0 or ttype not in {"billing", "cancellation", "free_pass", "no_whop_link"}:
                 continue
             r_iso = str(rec.get("resolved_followup_sent_at_iso") or "").strip()
             tickets.append((uid, ttype, r_iso))
@@ -1663,6 +1763,10 @@ async def _open_or_update_ticket(
                     )
 
     # Dedupe / cooldown: single open ticket per (type,user) or fingerprint.
+    # For no_whop_link we want: ping member (but do NOT grant access) + no staff ping while testing.
+    ping_member = str(ticket_type or "").strip().lower() == "no_whop_link"
+    ping_staff = False
+
     async with _INDEX_LOCK:
         db = _index_load()
         existing = _ticket_find_open(db, ticket_type=ticket_type, user_id=int(owner.id), fingerprint=fingerprint)
@@ -1682,6 +1786,8 @@ async def _open_or_update_ticket(
                         channel=ch,
                         owner_id=int(owner.id),
                         include_owner=bool(cfg.include_ticket_owner_in_channel),
+                        mention_owner=bool(ping_member),
+                        mention_staff=bool(ping_staff),
                         preview_embed=preview_embed,
                         header_message_id=int(header_mid),
                     )
@@ -1692,6 +1798,20 @@ async def _open_or_update_ticket(
                             rec["reference_jump_url"] = str(reference_jump_url or "")
                         if whop_dashboard_url:
                             rec["whop_dashboard_url"] = str(whop_dashboard_url or "")
+                        # Ensure/update no_whop_link follow-up instructions message (dedupe-safe).
+                        if str(ticket_type or "").strip().lower() == "no_whop_link":
+                            staff_rid = 0
+                            with suppress(Exception):
+                                staff_rid = next((int(x) for x in (cfg.staff_role_ids or []) if int(x) > 0), 0)
+                            follow_mid = _as_int(rec.get("no_whop_link_followup_message_id") or 0)
+                            new_fmid = await _ensure_no_whop_link_followup_message(
+                                channel=ch,
+                                owner_id=int(owner.id),
+                                followup_message_id=int(follow_mid),
+                                staff_role_id=int(staff_rid),
+                            )
+                            if new_fmid:
+                                rec["no_whop_link_followup_message_id"] = int(new_fmid)
                         db["tickets"][_tid] = rec  # type: ignore[index]
                         _index_save(db)
                 # Log dedupe to tickets-logs instead of posting inside the ticket.
@@ -1789,6 +1909,8 @@ async def _open_or_update_ticket(
                     channel=ch,
                     owner_id=int(owner.id),
                     include_owner=bool(cfg.include_ticket_owner_in_channel),
+                    mention_owner=bool(ping_member),
+                    mention_staff=bool(ping_staff),
                     preview_embed=preview_embed,
                     header_message_id=0,
                 )
@@ -1830,6 +1952,25 @@ async def _open_or_update_ticket(
                 ks = str(k or "").strip()
                 if ks:
                     rec[ks] = v
+
+        # no_whop_link: send the big follow-up instructions message (content-only), and store its id for editing later.
+        if str(ticket_type or "").strip().lower() == "no_whop_link":
+            staff_rid = 0
+            with suppress(Exception):
+                staff_rid = next((int(x) for x in (cfg.staff_role_ids or []) if int(x) > 0), 0)
+            follow_mid = 0
+            with suppress(Exception):
+                follow_mid = int(
+                    await _ensure_no_whop_link_followup_message(
+                        channel=ch,
+                        owner_id=int(owner.id),
+                        followup_message_id=0,
+                        staff_role_id=int(staff_rid),
+                    )
+                    or 0
+                )
+            if follow_mid:
+                rec["no_whop_link_followup_message_id"] = int(follow_mid)
         db["tickets"][ticket_id] = rec  # type: ignore[index]
         _index_save(db)
         return ch
@@ -2111,7 +2252,6 @@ def build_no_whop_link_preview_embed(
     *,
     member: discord.Member,
     whop_brief: dict | None = None,
-    note: str = "",
 ) -> discord.Embed:
     """Ticket header for members who have Members role but Whop Discord isn't connected (or doesn't match)."""
     b = whop_brief if isinstance(whop_brief, dict) else {}
@@ -2121,6 +2261,23 @@ def build_no_whop_link_preview_embed(
     mid = str(b.get("membership_id") or "").strip()
     if mid:
         e.add_field(name="Membership ID", value=f"`{mid[:128]}`", inline=True)
+    # Member since (Whop side when available; fallback to Discord join date).
+    ms = str(b.get("member_since") or b.get("customer_since") or "").strip()
+    if not ms:
+        with suppress(Exception):
+            if getattr(member, "joined_at", None):
+                ms = _fmt_date_any(member.joined_at.astimezone(timezone.utc).isoformat())  # type: ignore[union-attr]
+    if ms:
+        e.add_field(name="Member Since", value=str(ms)[:1024], inline=True)
+    # Current roles (all roles, no mentions)
+    with suppress(Exception):
+        role_ids = {int(r.id) for r in (member.roles or []) if int(getattr(r, "id", 0) or 0) != int(member.guild.default_role.id)}
+        roles_txt = _access_roles_plain(member, role_ids)
+        if roles_txt and roles_txt != "—":
+            e.add_field(name="Current Roles", value=str(roles_txt)[:1024], inline=False)
+    if not str(b.get("status") or "").strip():
+        # Default for discord-only fallback cases
+        b = {**b, "status": "Not linked"}
     e.add_field(name="Whop Status", value=_whop_status_display(ticket_type="no_whop_link", whop_brief=b)[:1024] or "—", inline=True)
     prod = str(b.get("product") or "").strip()
     if prod:
@@ -2134,8 +2291,8 @@ def build_no_whop_link_preview_embed(
     dash = str(b.get("dashboard_url") or "").strip()
     if dash:
         e.add_field(name="Whop Dashboard", value=_embed_link("Open", dash), inline=True)
-    if str(note or "").strip():
-        e.add_field(name="Action", value=str(note).strip()[:1024], inline=False)
+    if not mid:
+        e.add_field(name="Whop", value="not linked (no membership_id recorded yet)", inline=True)
     return e
 
 
@@ -2398,8 +2555,7 @@ async def open_no_whop_link_ticket(
     cat_id = await _get_or_create_no_whop_link_category_id(guild=guild)
     if int(cat_id or 0) <= 0:
         return None
-    note_s = str(note or "").strip() or str(cfg.whop_unlinked_note or "").strip()
-    embed = build_no_whop_link_preview_embed(member=member, whop_brief=whop_brief, note=note_s)
+    embed = build_no_whop_link_preview_embed(member=member, whop_brief=whop_brief)
     return await _open_or_update_ticket(
         ticket_type="no_whop_link",
         owner=member,
@@ -2408,6 +2564,7 @@ async def open_no_whop_link_ticket(
         preview_embed=embed,
         reference_jump_url=reference_jump_url,
         whop_dashboard_url=str((whop_brief or {}).get("dashboard_url") or "") if isinstance(whop_brief, dict) else "",
+        extra_record_fields={"no_whop_link_note": str(note or "").strip()},
     )
 
 
@@ -2445,6 +2602,21 @@ def _membership_id_from_member_history(discord_id: int) -> str:
     return mid
 
 
+def _linked_discord_id_from_identity_cache(email: str) -> int:
+    """Best-effort: resolve linked Discord ID by email from whop_identity_cache.json (built from native whop cards)."""
+    em = str(email or "").strip().lower()
+    if not em or "@" not in em:
+        return 0
+    raw = _load_json(WHOP_IDENTITY_CACHE_PATH)
+    if not isinstance(raw, dict):
+        return 0
+    rec = raw.get(em)
+    if not isinstance(rec, dict):
+        return 0
+    did = str(rec.get("discord_id") or "").strip()
+    return int(did) if did.isdigit() else 0
+
+
 async def sweep_no_whop_link_scan() -> None:
     """Periodic scan: open no_whop_link tickets for Members-role users whose Whop membership has no Discord connection (or mismatch)."""
     if not _ensure_cfg_loaded() or not _BOT:
@@ -2464,9 +2636,7 @@ async def sweep_no_whop_link_scan() -> None:
     if not isinstance(role, discord.Role):
         await _log(f"⚠️ support_tickets: no_whop_link scan skipped (members_role_id not found: {rid})")
         return
-    if not bool(cfg.no_whop_link_use_whop_api) or not _WHOP_API_CLIENT:
-        await _log("⚠️ support_tickets: no_whop_link scan skipped (whop_api_client not available)")
-        return
+    client_ok = bool(_WHOP_API_CLIENT) and bool(cfg.no_whop_link_use_whop_api)
 
     # Throttle by persisted scan state (restart-safe).
     now = _now_utc()
@@ -2484,7 +2654,14 @@ async def sweep_no_whop_link_scan() -> None:
     suppressed = 0
     skipped_linked = 0
     skipped_no_mid = 0
+    skipped_no_client = 0
     failed = 0
+
+    # Safeguard: if we cannot resolve linkage signals reliably, abort rather than spamming tickets.
+    # We'll compute a rough coverage ratio while scanning.
+    checked = 0
+    resolved_linked = 0
+    resolved_unlinked = 0
 
     for m in members:
         uid = int(getattr(m, "id", 0) or 0)
@@ -2492,10 +2669,28 @@ async def sweep_no_whop_link_scan() -> None:
             continue
         mid = _membership_id_from_member_history(int(uid))
         if not str(mid or "").strip():
+            # Fallback: open a discord-only ticket (roles + join date).
             skipped_no_mid += 1
+            if await has_open_ticket_for_user(ticket_type="no_whop_link", user_id=int(uid)):
+                already_open += 1
+                continue
+            fp = f"{int(uid)}|no_whop_link|no_mid"
+            try:
+                ch0 = await open_no_whop_link_ticket(member=m, fingerprint=fp, whop_brief=None, note=str(cfg.whop_unlinked_note or "").strip())
+                if isinstance(ch0, discord.TextChannel):
+                    opened += 1
+                elif ch0:
+                    suppressed += 1
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
             continue
 
         # Fetch Whop brief (includes dashboard + total spend + connected discord when available).
+        if not client_ok:
+            skipped_no_client += 1
+            continue
         try:
             brief = await _fetch_whop_brief(_WHOP_API_CLIENT, str(mid), enable_enrichment=True)
         except Exception:
@@ -2503,6 +2698,7 @@ async def sweep_no_whop_link_scan() -> None:
         if not isinstance(brief, dict) or not brief:
             failed += 1
             continue
+        checked += 1
 
         connected_disp = str(brief.get("connected_discord") or "").strip()
         did_in_whop = ""
@@ -2510,11 +2706,24 @@ async def sweep_no_whop_link_scan() -> None:
             m_did = re.search(r"\b(\d{17,19})\b", connected_disp)
             if m_did:
                 did_in_whop = m_did.group(1)
+        # Fallback: identity cache by email when API doesn't expose connections.
+        if (not did_in_whop) and str(brief.get("email") or "").strip():
+            with suppress(Exception):
+                did2 = _linked_discord_id_from_identity_cache(str(brief.get("email") or ""))
+                if did2 > 0:
+                    did_in_whop = str(int(did2))
 
         # If Whop shows a Discord connection matching this member, skip.
         if did_in_whop and did_in_whop.isdigit() and int(did_in_whop) == int(uid):
             skipped_linked += 1
+            resolved_linked += 1
             continue
+        resolved_unlinked += 1
+
+        # Early abort if it looks like we can't resolve any links (prevents spam when API/cache doesn't expose connections).
+        if checked >= 25 and resolved_linked <= 0:
+            await _log("⚠️ support_tickets: no_whop_link scan aborted (0 linked resolutions after 25 checks; connection fields likely unavailable)")
+            break
 
         if await has_open_ticket_for_user(ticket_type="no_whop_link", user_id=int(uid)):
             already_open += 1
@@ -2556,7 +2765,7 @@ async def sweep_no_whop_link_scan() -> None:
 
     summary = (
         f"members={len(members)} opened={opened} already_open={already_open} "
-        f"linked_ok={skipped_linked} no_mid={skipped_no_mid} suppressed={suppressed} failed={failed}"
+        f"linked_ok={skipped_linked} no_mid={skipped_no_mid} no_client={skipped_no_client} suppressed={suppressed} failed={failed}"
     )
     await _log(f"🧾 support_tickets: no_whop_link scan {summary}")
     _scan_state_set("no_whop_link", {"last_scan_at_iso": _now_iso(), "last_summary": summary})
@@ -2890,6 +3099,49 @@ async def close_free_pass_if_whop_linked(
             resolution_event=str(resolution_event or "whop_linked"),
             reference_jump_url=str(reference_jump_url or ""),
         )
+    return
+
+
+async def close_no_whop_link_if_linked(
+    discord_id: int,
+    *,
+    resolution_event: str = "whop_linked",
+    reference_jump_url: str = "",
+) -> None:
+    """Close no_whop_link ticket when linkage is confirmed (triggered from member-status-logs)."""
+    if not _ensure_cfg_loaded():
+        return
+    uid = int(discord_id or 0)
+    if uid <= 0:
+        return
+    cfg = _cfg()
+    if not cfg or not _BOT:
+        return
+    guild = _BOT.get_guild(int(cfg.guild_id))
+    if not isinstance(guild, discord.Guild):
+        return
+
+    # Find open no_whop_link ticket channel id under lock.
+    ch_id = 0
+    async with _INDEX_LOCK:
+        db = _index_load()
+        found = _ticket_find_open(db, ticket_type="no_whop_link", user_id=uid, fingerprint="")
+        if found:
+            _tid, rec = found
+            ch_id = _as_int(rec.get("channel_id"))
+    if not ch_id:
+        return
+
+    # Close (this also removes the no-whop role). We still post a small update into transcript.
+    with suppress(Exception):
+        await post_resolution_followup_and_remove_role(
+            discord_id=int(uid),
+            ticket_type="no_whop_link",
+            resolution_event=str(resolution_event or "whop_linked"),
+            reference_jump_url=str(reference_jump_url or ""),
+        )
+    with suppress(Exception):
+        await close_ticket_by_channel_id(int(ch_id), close_reason=str(resolution_event or "whop_linked"), do_transcript=True, delete_channel=True)
     return
 
 
