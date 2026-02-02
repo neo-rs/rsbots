@@ -36,6 +36,44 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 - **Returns**: Confirmation message (auto-deletes after 5 seconds)
 - **Note**: Command message is auto-deleted
 
+#### `.checker purgenowhop`
+- **Description**: Delete ONLY open `no_whop_link` support ticket channels (safe: verified by ticket topic + ticket_type)
+- **Aliases**: `purgenowhoplink`, `purgenowhoplinks`, `wipe-nowhop`, `wipe-nowhoplink`
+- **Parameters**:
+  - `confirm`: Must be exactly `confirm` to proceed (required)
+- **Usage**: `.checker purgenowhop confirm`
+- **Admin Only**: Yes (requires administrator permissions)
+- **Returns**: Deletion summary (deleted count, skipped count, failed count)
+
+#### `.checker scannowhop`
+- **Description**: Force-run the `no_whop_link` scan immediately (bypasses interval throttling)
+- **Aliases**: `scan-nowhop`, `nowhopscan`, `scan_nowhop`
+- **Parameters**: None
+- **Usage**: `.checker scannowhop`
+- **Admin Only**: Yes (requires administrator permissions)
+- **Returns**: Scan summary string
+
+#### `.checker rebuildnowhop`
+- **Description**: Purge + re-scan `no_whop_link` tickets (safe regen)
+- **Aliases**: `rebuild-nowhop`, `rebuild-nowhoplink`, `regen-nowhop`
+- **Parameters**:
+  - `confirm`: Must be exactly `confirm` to proceed (required)
+- **Usage**: `.checker rebuildnowhop confirm`
+- **Admin Only**: Yes (requires administrator permissions)
+- **Returns**: Purge deleted count + scan summary string
+
+#### `.checker fixnowhoproles`
+- **Description**: One-time cleanup: remove Billing role from members who currently have a No-Whop role
+- **Aliases**: `fix-nowhop-roles`, `fixnowhop`
+- **Parameters**:
+  - `billing_role_id` (optional): Override the configured Billing role id
+  - `confirm`: Must be exactly `confirm` to proceed (required)
+- **Usage**:
+  - `.checker fixnowhoproles confirm`
+  - `.checker fixnowhoproles 1467500050341957725 confirm`
+- **Admin Only**: Yes (requires administrator permissions)
+- **Returns**: Removal summary (removed count, failed count)
+
 #### `.checker syncsummary`
 - **Description**: DM a boss-friendly report to the invoker. With **no dates**, it re-sends the latest **Whop Sync Summary + CSV** (from `#whop-sync-summary` mirror). With **dates**, it generates a **Whop memberships joined report** filtered by **Whop “Joined at”** (membership `created_at`, with `date_joined` fallback) and DMs an embed + CSV.
 - **Aliases**: `whopsync`, `whopsyncsummary`, `sync-report`
@@ -182,10 +220,10 @@ These commands are only available **inside an OPEN support ticket channel** and 
 
 ## Command Summary
 
-- **Total Commands**: 15
-- **Admin Commands**: 13 (the `.checker` commands require administrator permissions)
+- **Total Commands**: 19
+- **Admin Commands**: 17 (the `.checker` commands require administrator permissions)
 - **Public Commands**: 0
-- **Commands with Aliases**: 7
+- **Commands with Aliases**: 11
 - **Command Prefix**: `.checker` (dot prefix) + `!` (ticket channels only)
 
 ## Notes

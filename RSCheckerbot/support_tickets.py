@@ -638,40 +638,53 @@ async def sweep_startup_messages() -> None:
                         _index_save(db2)
             continue
 
-        # Guard: skip if any human spoke since creation.
-        spoke = await _startup_has_human_activity_since_creation(
-            ch=ch,
-            created_at=created_dt,
-            limit=int(cfg.startup_recent_history_limit),
-        )
-        if spoke:
-            async with _INDEX_LOCK:
-                db2 = _index_load()
-                found = _ticket_by_channel_id(db2, int(ch_id))
-                if found:
-                    tid2, rec2 = found
-                    if _ticket_is_open(rec2) and (not str(rec2.get("startup_sent_at_iso") or "").strip()):
-                        rec2["startup_skipped_at_iso"] = _now_iso()
-                        db2["tickets"][tid2] = rec2  # type: ignore[index]
-                        _index_save(db2)
-            continue
+        # Guard: for most tickets we skip if any human spoke since creation.
+        # For `no_whop_link`, we DO send (the guide is the point of the ticket).
+        if ttype != "no_whop_link":
+            spoke = await _startup_has_human_activity_since_creation(
+                ch=ch,
+                created_at=created_dt,
+                limit=int(cfg.startup_recent_history_limit),
+            )
+            if spoke:
+                async with _INDEX_LOCK:
+                    db2 = _index_load()
+                    found = _ticket_by_channel_id(db2, int(ch_id))
+                    if found:
+                        tid2, rec2 = found
+                        if _ticket_is_open(rec2) and (not str(rec2.get("startup_sent_at_iso") or "").strip()):
+                            rec2["startup_skipped_at_iso"] = _now_iso()
+                            db2["tickets"][tid2] = rec2  # type: ignore[index]
+                            _index_save(db2)
+                continue
 
         tmpl = _startup_template(ttype)
         if not tmpl:
             continue
         mention = f"<@{int(uid)}>" if uid else ""
-        content = tmpl.replace("{mention}", mention).strip()
+        staff_mention = _support_ping_role_mention()
+        content = (
+            tmpl.replace("{mention}", mention)
+            .replace("{staff}", staff_mention)
+            .replace("{staff_mention}", staff_mention)
+            .strip()
+        )
         if not content:
             continue
 
         ok = True
         try:
             await ch.send(
-                content=content[:1900],
-                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+                content=content[:1990],
+                allowed_mentions=discord.AllowedMentions(
+                    users=True,
+                    roles=bool(staff_mention and ("{staff" in tmpl or "<@&" in content)),
+                    everyone=False,
+                ),
             )
-        except Exception:
+        except Exception as ex:
             ok = False
+            await _log(f"❌ support_tickets: startup_message_send_failed type={ttype} ch={int(ch.id)} err={str(ex)[:180]}")
 
         if ok:
             async with _INDEX_LOCK:
@@ -760,79 +773,6 @@ def _support_ping_role_mention() -> str:
     with suppress(Exception):
         rid = next((int(x) for x in (cfg.staff_role_ids or []) if int(x) > 0), 0)
     return f"<@&{int(rid)}>" if int(rid or 0) > 0 else ""
-
-
-def _no_whop_link_followup_text(*, member_mention: str, staff_role_id: int) -> str:
-    staff_mention = f"<@&{int(staff_role_id)}>" if int(staff_role_id or 0) > 0 else ""
-    # Keep formatting exactly as provided (Discord markdown + custom emoji IDs).
-    return (
-        "## Link Your Discord Account to Whop (Required) <a:rslknock:1247632729948946472>\n"
-        f"### Yo {member_mention} <:sniped:1350271143822753873> , this ticket is here to help you link your Discord to Whop so your access can be tracked correctly.\n"
-        "### If Discord isn’t connected, Whop can’t sync your membership.\n"
-        "> ### Step 1: Open Connected Accounts\n"
-        "> **Make sure you’re logged into Whop, then open:**\n"
-        "> <https://whop.com/@me/settings/connected-accounts/>\n"
-        "> ### Step 2: Connect Discord\n"
-        "> **On the Connected Accounts page:**\n"
-        "> * Find Discord  \n"
-        "> * Click Add Account or Connect  \n"
-        "> **A new tab will open.**\n"
-        "> ### Step 3: Authorize Whop\n"
-        "> **In the new tab:**\n"
-        "> * Log into the same Discord account you’re using now  \n"
-        "> * You’ll see a page called Whop Bot  \n"
-        "> * Scroll down and click Authorize  \n"
-        "> **You’ll be redirected back to Whop when it’s complete.**\n"
-        "> ### Mobile Users\n"
-        "> **If you’re on your phone:**\n"
-        "> * Open a mobile browser (not inside the Discord app)  \n"
-        "> * Go to the same link above  \n"
-        "> * Tap Add Account next to Discord  \n"
-        "> * Log in and authorize when prompted  \n"
-        "> ### After You’re Done\n"
-        "> **Once Discord is connected:**\n"
-        "> * Come back to this ticket  \n"
-        "> * Send a quick message saying connected  \n"
-        "## **We’ll verify it on our end **<:rslgoat1:1247633099450486844>\n\n"
-        "**Important** <:blamebots:910339769043648582> <#1212099029358608506>\n"
-        "```We’re now tracking every member directly through Whop to keep access clean and accurate.\n"
-        "By the end of this month, members who have not linked their Discord account in Whop may lose access until it’s connected.\n"
-        "If that happens or if you run into any issues, open a ticket and we’ll help you get it sorted.```\n"
-        f"-# **Our DEDICATED {staff_mention}  will be here to keep nagging you for the rest of the month and help you cook!** <a:pepevbcook:1412558017089503253>\n"
-    )
-
-
-async def _ensure_no_whop_link_followup_message(
-    *,
-    channel: discord.TextChannel,
-    owner_id: int,
-    followup_message_id: int,
-    staff_role_id: int,
-) -> int:
-    if not _ensure_cfg_loaded() or not _BOT or not isinstance(channel, discord.TextChannel):
-        return 0
-    uid = int(owner_id or 0)
-    member_mention = f"<@{uid}>" if uid > 0 else ""
-    content = _no_whop_link_followup_text(member_mention=member_mention, staff_role_id=int(staff_role_id or 0))
-
-    bot_id = int(getattr(getattr(_BOT, "user", None), "id", 0) or 0)
-    mid = int(followup_message_id or 0)
-    if mid > 0:
-        with suppress(Exception):
-            msg = await channel.fetch_message(int(mid))
-            if msg and int(getattr(getattr(msg, "author", None), "id", 0) or 0) == bot_id:
-                await msg.edit(content=content)
-                return int(getattr(msg, "id", 0) or 0)
-
-    try:
-        sent = await channel.send(
-            content=content,
-            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
-            silent=True,
-        )
-        return int(getattr(sent, "id", 0) or 0)
-    except Exception:
-        return 0
 
 
 def _ticket_ping_content(*, owner_id: int, mention_owner: bool, mention_staff: bool) -> str:
@@ -1840,20 +1780,6 @@ async def _open_or_update_ticket(
                             rec["reference_jump_url"] = str(reference_jump_url or "")
                         if whop_dashboard_url:
                             rec["whop_dashboard_url"] = str(whop_dashboard_url or "")
-                        # Ensure/update no_whop_link follow-up instructions message (dedupe-safe).
-                        if str(ticket_type or "").strip().lower() == "no_whop_link":
-                            staff_rid = 0
-                            with suppress(Exception):
-                                staff_rid = next((int(x) for x in (cfg.staff_role_ids or []) if int(x) > 0), 0)
-                            follow_mid = _as_int(rec.get("no_whop_link_followup_message_id") or 0)
-                            new_fmid = await _ensure_no_whop_link_followup_message(
-                                channel=ch,
-                                owner_id=int(owner.id),
-                                followup_message_id=int(follow_mid),
-                                staff_role_id=int(staff_rid),
-                            )
-                            if new_fmid:
-                                rec["no_whop_link_followup_message_id"] = int(new_fmid)
                         db["tickets"][_tid] = rec  # type: ignore[index]
                         _index_save(db)
                 # Log dedupe to tickets-logs instead of posting inside the ticket.
@@ -1995,24 +1921,6 @@ async def _open_or_update_ticket(
                 if ks:
                     rec[ks] = v
 
-        # no_whop_link: send the big follow-up instructions message (content-only), and store its id for editing later.
-        if str(ticket_type or "").strip().lower() == "no_whop_link":
-            staff_rid = 0
-            with suppress(Exception):
-                staff_rid = next((int(x) for x in (cfg.staff_role_ids or []) if int(x) > 0), 0)
-            follow_mid = 0
-            with suppress(Exception):
-                follow_mid = int(
-                    await _ensure_no_whop_link_followup_message(
-                        channel=ch,
-                        owner_id=int(owner.id),
-                        followup_message_id=0,
-                        staff_role_id=int(staff_rid),
-                    )
-                    or 0
-                )
-            if follow_mid:
-                rec["no_whop_link_followup_message_id"] = int(follow_mid)
         db["tickets"][ticket_id] = rec  # type: ignore[index]
         _index_save(db)
         return ch
@@ -2904,6 +2812,67 @@ async def purge_no_whop_link_open_tickets(
 
     await _log(f"🧹 support_tickets: purged no_whop_link tickets deleted={deleted} skipped={skipped} failed={failed}")
     return {"deleted": int(deleted), "skipped": int(skipped), "failed": int(failed)}
+
+
+async def remove_billing_role_from_no_whop_members(*, billing_role_id: int = 0) -> dict:
+    """One-time helper: remove Billing role from members who currently have a No-Whop role.
+
+    Config-driven:
+    - Billing role defaults to `support_tickets.ticket_roles.billing_role_id` unless overridden.
+    - No-Whop roles: `no_whop_link_role_id` + `free_pass_no_whop_role_id`
+    """
+    if not _ensure_cfg_loaded() or not _BOT:
+        return {"removed": 0, "skipped": 0, "failed": 0}
+    cfg = _cfg()
+    if not cfg:
+        return {"removed": 0, "skipped": 0, "failed": 0}
+    guild = _BOT.get_guild(int(cfg.guild_id))
+    if not isinstance(guild, discord.Guild):
+        return {"removed": 0, "skipped": 0, "failed": 0}
+
+    bid = int(billing_role_id or 0) or int(cfg.billing_role_id or 0)
+    if bid <= 0:
+        await _log("⚠️ support_tickets: fix_no_whop_roles skipped (billing_role_id not configured)")
+        return {"removed": 0, "skipped": 0, "failed": 0}
+    bill_role = guild.get_role(int(bid))
+    if not isinstance(bill_role, discord.Role):
+        await _log(f"⚠️ support_tickets: fix_no_whop_roles skipped (billing role not found: {bid})")
+        return {"removed": 0, "skipped": 0, "failed": 0}
+
+    nowhop_ids = {int(cfg.no_whop_link_role_id or 0), int(cfg.free_pass_no_whop_role_id or 0)}
+    nowhop_ids = {int(x) for x in nowhop_ids if int(x) > 0}
+    if not nowhop_ids:
+        await _log("⚠️ support_tickets: fix_no_whop_roles skipped (no_whop role ids not configured)")
+        return {"removed": 0, "skipped": 0, "failed": 0}
+    nowhop_roles = [guild.get_role(int(rid)) for rid in nowhop_ids]
+    nowhop_roles = [r for r in nowhop_roles if isinstance(r, discord.Role)]
+    if not nowhop_roles:
+        await _log("⚠️ support_tickets: fix_no_whop_roles skipped (no_whop roles not found in guild)")
+        return {"removed": 0, "skipped": 0, "failed": 0}
+
+    removed = 0
+    skipped = 0
+    failed = 0
+
+    for m in (guild.members or []):
+        if not isinstance(m, discord.Member) or getattr(m, "bot", False):
+            continue
+        try:
+            rids = {int(r.id) for r in (m.roles or [])}
+        except Exception:
+            continue
+        if int(bid) not in rids:
+            continue
+        if not (rids & nowhop_ids):
+            continue
+        try:
+            await m.remove_roles(bill_role, reason="RSCheckerbot: one-time cleanup (No-Whop members should not have Billing role)")
+            removed += 1
+        except Exception:
+            failed += 1
+
+    await _log(f"🧹 support_tickets: fix_no_whop_roles removed={removed} failed={failed} billing_role_id={bid} no_whop_role_ids={sorted(list(nowhop_ids))}")
+    return {"removed": int(removed), "skipped": int(skipped), "failed": int(failed)}
 
 
 async def handle_free_pass_join_if_needed(
