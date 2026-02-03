@@ -401,12 +401,23 @@ def _build_member_lookup_result_embed(*, guild: discord.Guild, did: int) -> disc
                 break
         if lines:
             e.add_field(name="Latest Whop Logs", value="\n".join(lines)[:1024], inline=False)
-    elif not rec:
-        e.add_field(
-            name="Baseline",
-            value="No baseline record yet for this Discord ID.\nRun `whoplogs-baseline` to populate `member_history.json`.",
-            inline=False,
-        )
+    else:
+        # Be explicit: "baseline" here refers specifically to whop-logs-derived history stored under whop.native_whop_logs_latest.
+        if not rec:
+            e.add_field(
+                name="Baseline",
+                value=(
+                    "No Whop-logs baseline record found for this Discord ID **on this bot**.\n"
+                    "Run `whoplogs-baseline` (or copy the updated `member_history.json` onto the machine running RSCheckerbot)."
+                ),
+                inline=False,
+            )
+        else:
+            e.add_field(
+                name="Baseline",
+                value="Baseline record exists, but no `native_whop_logs_latest` entries were recorded yet for this Discord ID.",
+                inline=False,
+            )
 
     return e
 
