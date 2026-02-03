@@ -23,6 +23,7 @@ from staff_embeds import build_member_status_detailed_embed as _build_member_sta
 from ticket_channels import ensure_ticket_like_channel as _ensure_ticket_like_channel
 from ticket_channels import slug_channel_name as _slug_channel_name
 from whop_brief import fetch_whop_brief as _fetch_whop_brief
+from whop_brief import enrich_whop_brief_from_membership_logs as _enrich_whop_brief_from_membership_logs
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -45,6 +46,8 @@ class SupportTicketConfig:
     cancellation_category_id: int
     billing_category_id: int
     free_pass_category_id: int
+    member_welcome_category_id: int
+    member_welcome_category_name: str
     no_whop_link_category_id: int
     no_whop_link_category_name: str
     transcript_category_id: int
@@ -59,8 +62,10 @@ class SupportTicketConfig:
     delete_on_whop_linked: bool
     dedupe_enabled: bool
     cooldown_free_pass_seconds: int
+    cooldown_free_pass_welcome_seconds: int
     cooldown_billing_seconds: int
     cooldown_cancellation_seconds: int
+    cooldown_member_welcome_seconds: int
     startup_enabled: bool
     startup_delay_seconds: int
     startup_recent_history_limit: int
@@ -74,6 +79,7 @@ class SupportTicketConfig:
     cancellation_role_id: int
     free_pass_no_whop_role_id: int
     no_whop_link_role_id: int
+    no_whop_remove_role_ids_on_add: list[int]
     no_whop_link_enabled: bool
     no_whop_link_scan_interval_seconds: int
     no_whop_link_members_role_id: int
@@ -218,6 +224,8 @@ def initialize(
         cancellation_category_id=_as_int(cats.get("cancellation_category_id")),
         billing_category_id=_as_int(cats.get("billing_category_id")),
         free_pass_category_id=_as_int(cats.get("free_pass_category_id")),
+        member_welcome_category_id=_as_int(cats.get("member_welcome_category_id")),
+        member_welcome_category_name=str(cats.get("member_welcome_category_name") or "member-welcome").strip() or "member-welcome",
         no_whop_link_category_id=_as_int(cats.get("no_whop_link_category_id")),
         no_whop_link_category_name=str(cats.get("no_whop_link_category_name") or "no-whop-link").strip() or "no-whop-link",
         transcript_category_id=_as_int(tx.get("transcript_category_id")),
@@ -232,8 +240,10 @@ def initialize(
         delete_on_whop_linked=_as_bool(fp_ad.get("delete_on_whop_linked")),
         dedupe_enabled=_as_bool(dd.get("enabled")),
         cooldown_free_pass_seconds=max(0, _as_int((dd.get("free_pass") or {}).get("cooldown_seconds")) or 86400),
+        cooldown_free_pass_welcome_seconds=max(0, _as_int((dd.get("free_pass_welcome") or {}).get("cooldown_seconds")) or 86400),
         cooldown_billing_seconds=max(0, _as_int((dd.get("billing") or {}).get("cooldown_seconds")) or 21600),
         cooldown_cancellation_seconds=max(0, _as_int((dd.get("cancellation") or {}).get("cooldown_seconds")) or 86400),
+        cooldown_member_welcome_seconds=max(0, _as_int((dd.get("member_welcome") or {}).get("cooldown_seconds")) or 86400),
         startup_enabled=_as_bool(sm.get("enabled")),
         startup_delay_seconds=max(5, _as_int(sm.get("delay_seconds")) or 300),
         startup_recent_history_limit=max(10, min(200, _as_int(sm.get("recent_history_limit")) or 50)),
@@ -247,6 +257,7 @@ def initialize(
         cancellation_role_id=_as_int(tr.get("cancellation_role_id")),
         free_pass_no_whop_role_id=_as_int(tr.get("free_pass_no_whop_role_id")),
         no_whop_link_role_id=_as_int(tr.get("no_whop_link_role_id")),
+        no_whop_remove_role_ids_on_add=_int_list(tr.get("remove_role_ids_on_no_whop") or tr.get("no_whop_remove_role_ids_on_add") or []),
         no_whop_link_enabled=_as_bool(nw.get("enabled")),
         no_whop_link_scan_interval_seconds=max(60, _as_int(nw.get("scan_interval_seconds")) or 21600),
         no_whop_link_members_role_id=_as_int(nw.get("members_role_id")),
@@ -313,6 +324,76 @@ def _member_history_get(discord_id: int) -> dict:
     return rec if isinstance(rec, dict) else {}
 
 
+def _snowflake_created_at_utc(snowflake_id: int) -> datetime | None:
+    """Best-effort Discord account creation time from snowflake."""
+    try:
+        sid = int(snowflake_id or 0)
+        if sid <= 0:
+            return None
+        ms = (sid >> 22) + 1420070400000
+        return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+    except Exception:
+        return None
+
+
+def _whop_member_type(product: str, *, has_membership: bool) -> str:
+    """Human-readable member type label for lookup."""
+    if not has_membership:
+        return "Direct Invite / No Whop"
+    p = str(product or "").strip()
+    if not p:
+        return "Whop (unknown product)"
+    if "(lite" in p.lower() or "lite" in p.lower():
+        return "Reselling Secrets (Lite)"
+    return "Reselling Secrets"
+
+
+def _merged_membership_logs_fields(*, db: dict, whop_user_id: str, membership_id: str) -> dict[str, str]:
+    """Merge fields across whop_users[*].whop.membership_logs_latest (newest-first) for a membership_id."""
+    if not isinstance(db, dict):
+        return {}
+    user_id = str(whop_user_id or "").strip()
+    if not user_id:
+        return {}
+    wu = db.get("whop_users") if isinstance(db.get("whop_users"), dict) else {}
+    rec = wu.get(user_id) if isinstance(wu, dict) else None
+    if not isinstance(rec, dict):
+        return {}
+    wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+    latest = wh.get("membership_logs_latest") if isinstance(wh.get("membership_logs_latest"), dict) else {}
+    if not isinstance(latest, dict) or not latest:
+        return {}
+    mid = str(membership_id or "").strip()
+    rows: list[dict] = []
+    for v in latest.values():
+        if not isinstance(v, dict):
+            continue
+        if mid:
+            v_mid = str(v.get("membership_id") or "").strip()
+            if v_mid and v_mid != mid:
+                continue
+        rows.append(v)
+
+    def _k(v: dict) -> str:
+        return str(v.get("recorded_at") or v.get("created_at") or "")
+
+    rows.sort(key=_k, reverse=True)
+    out: dict[str, str] = {}
+    for row in rows:
+        f = row.get("fields") if isinstance(row.get("fields"), dict) else {}
+        if not isinstance(f, dict):
+            continue
+        for kk, vv in f.items():
+            k2 = str(kk or "").strip().lower()
+            if not k2 or k2 in out:
+                continue
+            s = str(vv or "").strip()
+            if not s:
+                continue
+            out[k2[:64]] = s[:1500]
+    return out
+
+
 def _native_logs_latest_rows(rec: dict) -> list[dict]:
     """Return native_whop_logs_latest entries sorted newest->oldest (best-effort)."""
     if not isinstance(rec, dict):
@@ -335,22 +416,70 @@ def _native_logs_latest_rows(rec: dict) -> list[dict]:
     return rows
 
 
+def _member_status_latest_rows(rec: dict) -> list[dict]:
+    """Return member_status_logs_latest entries sorted newest->oldest (best-effort)."""
+    if not isinstance(rec, dict):
+        return []
+    wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+    latest = wh.get("member_status_logs_latest") if isinstance(wh.get("member_status_logs_latest"), dict) else {}
+    rows: list[dict] = []
+    if isinstance(latest, dict):
+        for v in latest.values():
+            if isinstance(v, dict):
+                rows.append(v)
+
+    def _ts(row: dict) -> float:
+        dt = _parse_dt_any(row.get("created_at") or row.get("recorded_at") or "")
+        if not dt:
+            return 0.0
+        return float(dt.timestamp())
+
+    rows.sort(key=_ts, reverse=True)
+    return rows
+
+
 def _build_member_lookup_result_embed(*, guild: discord.Guild, did: int) -> discord.Embed:
     cfg = _cfg()
     did_i = int(did or 0)
     member = guild.get_member(did_i) if did_i > 0 else None
-    rec = _member_history_get(did_i)
+    # Load full db once (we also need whop_users baseline).
+    db = _load_json(MEMBER_HISTORY_PATH)
+    db = db if isinstance(db, dict) else {}
+    rec = db.get(str(did_i)) if isinstance(db.get(str(did_i)), dict) else {}
+    if not isinstance(rec, dict):
+        rec = {}
 
     e = discord.Embed(title="Member Lookup", color=0x5865F2)
+
+    # --------------------
+    # Discord member info
+    # --------------------
     if isinstance(member, discord.Member):
         e.add_field(name="Member", value=f"{member.mention}\n{str(member.display_name or member)}"[:1024], inline=True)
         e.add_field(name="Discord ID", value=_format_discord_id(int(member.id)), inline=True)
-        with suppress(Exception):
-            e.add_field(name="Current Roles", value=_roles_plain(member)[:1024], inline=False)
     else:
         e.add_field(name="Member", value="Not found in guild cache.", inline=True)
         e.add_field(name="Discord ID", value=_format_discord_id(did_i), inline=True)
 
+    created_dt = _snowflake_created_at_utc(did_i)
+    created_s = created_dt.strftime("%b %d, %Y") if created_dt else "—"
+    joined_s = "—"
+    if isinstance(member, discord.Member):
+        with suppress(Exception):
+            if getattr(member, "joined_at", None):
+                joined_s = member.joined_at.astimezone(timezone.utc).strftime("%b %d, %Y")  # type: ignore[union-attr]
+        with suppress(Exception):
+            e.add_field(name="Current Roles", value=_roles_plain(member)[:1024], inline=False)
+
+    e.add_field(
+        name="Discord Member Information",
+        value=f"- Discord Account Created: {created_s}\n- First Joined: {joined_s}"[:1024],
+        inline=False,
+    )
+
+    # --------------------
+    # Whop info (baseline-enriched)
+    # --------------------
     wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
     last_mid = str(wh.get("last_membership_id") or wh.get("last_whop_key") or "").strip()
     last_status = str(wh.get("last_status") or "").strip()
@@ -358,66 +487,125 @@ def _build_member_lookup_result_embed(*, guild: discord.Guild, did: int) -> disc
     last_dt = _parse_dt_any(last_ts)
     last_dt_s = last_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if last_dt else "—"
     last_summary = wh.get("last_summary") if isinstance(wh.get("last_summary"), dict) else {}
-
+    base_brief = dict(last_summary) if isinstance(last_summary, dict) else {}
     if last_mid:
-        e.add_field(name="Whop Key", value=f"`{last_mid}`"[:1024], inline=True)
-    if last_status:
-        e.add_field(name="Last Status", value=_whop_status_label(last_status)[:1024], inline=True)
-    e.add_field(name="Last Seen", value=last_dt_s[:1024], inline=True)
+        base_brief.setdefault("membership_id", last_mid)
+    if last_status and not str(base_brief.get("status") or "").strip():
+        base_brief["status"] = last_status
+    brief = _enrich_whop_brief_from_membership_logs(base_brief, membership_id=str(last_mid or "").strip())
+    brief = brief if isinstance(brief, dict) else base_brief
 
-    product = str(last_summary.get("product") or "").strip()
-    total_spent = str(last_summary.get("total_spent") or "").strip()
-    renewal_end = str(last_summary.get("renewal_end") or "").strip()
-    remaining_days = str(last_summary.get("remaining_days") or "").strip()
+    product = str(brief.get("product") or "").strip()
+    member_type = _whop_member_type(product, has_membership=bool(last_mid))
+    member_since = str(brief.get("customer_since") or brief.get("member_since") or "").strip()
+    if not member_since and isinstance(member, discord.Member):
+        with suppress(Exception):
+            if getattr(member, "joined_at", None):
+                member_since = member.joined_at.astimezone(timezone.utc).strftime("%b %d, %Y")  # type: ignore[union-attr]
+    core_lines = [
+        f"- Member Since: {member_since or '—'}",
+        f"- Current Member Type: {member_type}",
+        f"- Last Seen: {last_dt_s}",
+    ]
+    e.add_field(name="Core Info", value="\n".join(core_lines)[:1024], inline=False)
+
+    whop_user_id = str(brief.get("whop_user_id") or "").strip()
+    username = str(brief.get("username") or "").strip()
+    st = str(brief.get("status") or "").strip()
+    spent = str(brief.get("total_spent") or "").strip()
+    trial_days = str(brief.get("trial_days") or "").strip()
+    plan_is_renewal = str(brief.get("plan_is_renewal") or "").strip()
+    pricing = str(brief.get("pricing") or "").strip()
+    cancel_ape = str(brief.get("cancel_at_period_end") or "").strip()
+    remaining_days = str(brief.get("remaining_days") or "").strip()
+    renewal_end = str(brief.get("renewal_end") or "").strip()
+    dash = str(brief.get("dashboard_url") or "").strip()
+
+    # Access pass from whop-logs baseline (discord-keyed).
+    access_pass = ""
+    with suppress(Exception):
+        latest = wh.get("native_whop_logs_latest") if isinstance(wh.get("native_whop_logs_latest"), dict) else {}
+        if isinstance(latest, dict):
+            # pick any newest-ish record with access_pass
+            for v in sorted(list(latest.values()), key=lambda r: str((r or {}).get("recorded_at") or ""), reverse=True):
+                if not isinstance(v, dict):
+                    continue
+                ap = str(v.get("access_pass") or "").strip()
+                if ap:
+                    access_pass = ap
+                    break
+
+    # Pull checkout/manage links from membership-logs baseline (whop_users).
+    merged = _merged_membership_logs_fields(db=db, whop_user_id=whop_user_id, membership_id=last_mid)
+    checkout = str(merged.get("checkout") or "").strip()
+    manage = str(merged.get("manage") or "").strip()
+    renewal_window = str(merged.get("renewal window") or "").strip()
+
+    whop_lines: list[str] = []
+    if username:
+        whop_lines.append(f"- Username: `{username}`")
+    if whop_user_id:
+        whop_lines.append(f"- Whop User ID: `{whop_user_id}`")
+    if last_mid:
+        whop_lines.append(f"- Membership ID: `{last_mid}`")
+    if st:
+        whop_lines.append(f"- Status: {_whop_status_label(st)}")
     if product:
-        e.add_field(name="Membership", value=product[:1024], inline=True)
-    if total_spent:
-        e.add_field(name="Total Spent (lifetime)", value=total_spent[:1024], inline=True)
+        whop_lines.append(f"- Membership: {product}")
+    if spent:
+        whop_lines.append(f"- Total Spent (lifetime): {spent}")
+    if access_pass:
+        whop_lines.append(f"- Access Pass: {access_pass}")
     if remaining_days and remaining_days != "—":
-        e.add_field(name="Remaining Days", value=remaining_days[:1024], inline=True)
+        whop_lines.append(f"- Remaining Days: {remaining_days}")
     if renewal_end and renewal_end != "—":
-        e.add_field(name="Access Ends On", value=renewal_end[:1024], inline=True)
+        whop_lines.append(f"- Access Ends On: {renewal_end}")
+    if renewal_window and renewal_window != "—":
+        whop_lines.append(f"- Renewal Window: {renewal_window}")
+    if trial_days:
+        whop_lines.append(f"- Trial Days: {trial_days}")
+    if plan_is_renewal:
+        whop_lines.append(f"- Plan Is Renewal: {plan_is_renewal}")
+    if pricing:
+        whop_lines.append(f"- Pricing: {pricing}")
+    if cancel_ape:
+        whop_lines.append(f"- Cancel At Period End: {cancel_ape}")
+    if dash:
+        whop_lines.append(f"- Whop Dashboard: {_embed_link('Open', dash)}")
+    if manage:
+        whop_lines.append(f"- Manage: {_embed_link('Open', manage)}")
+    if checkout:
+        whop_lines.append(f"- Checkout: {_embed_link('Open', checkout)}")
+    if not whop_lines:
+        whop_lines = ["—"]
 
-    dash = str(last_summary.get("dashboard_url") or "").strip()
-    e.add_field(name="Whop Dashboard", value=_embed_link("Open", dash), inline=True)
+    e.add_field(name="Whop Member Information", value="\n".join(whop_lines)[:1024], inline=False)
 
-    # Native whop-logs baseline (most recent messages)
-    rows = _native_logs_latest_rows(rec)
-    max_rows = int(getattr(cfg, "member_lookup_max_native_logs", 5) or 5) if cfg else 5
-    max_rows = max(0, min(10, max_rows))
-    if max_rows and rows:
-        lines: list[str] = []
-        for row in rows[: max_rows * 2]:
-            title = str(row.get("title") or "").strip()
-            created = str(row.get("created_at") or "").strip()
-            jump = str(row.get("jump_url") or "").strip()
-            if not title:
-                continue
-            chunk = f"- {_short_iso(created)}: {title} {_embed_link('Open', jump)}"
-            if sum(len(x) + 1 for x in lines) + len(chunk) > 1000:
-                break
-            lines.append(chunk)
-            if len(lines) >= max_rows:
-                break
-        if lines:
-            e.add_field(name="Latest Whop Logs", value="\n".join(lines)[:1024], inline=False)
-    else:
-        # Be explicit: "baseline" here refers specifically to whop-logs-derived history stored under whop.native_whop_logs_latest.
-        if not rec:
-            e.add_field(
-                name="Baseline",
-                value=(
-                    "No Whop-logs baseline record found for this Discord ID **on this bot**.\n"
-                    "Run `whoplogs-baseline` (or copy the updated `member_history.json` onto the machine running RSCheckerbot)."
-                ),
-                inline=False,
-            )
-        else:
-            e.add_field(
-                name="Baseline",
-                value="Baseline record exists, but no `native_whop_logs_latest` entries were recorded yet for this Discord ID.",
-                inline=False,
-            )
+    # --------------------
+    # Payment / full logs (summary)
+    # --------------------
+    pay_lines: list[str] = []
+    if spent:
+        pay_lines.append(f"- Total Spent: {spent}")
+    if access_pass:
+        pay_lines.append(f"- Access Pass: {access_pass}")
+    if st:
+        pay_lines.append(f"- Status: {_whop_status_label(st)}")
+    if renewal_window:
+        pay_lines.append(f"- Renewal Window: {renewal_window}")
+    if trial_days:
+        pay_lines.append(f"- Trial Days: {trial_days}")
+    if plan_is_renewal:
+        pay_lines.append(f"- Plan Is Renewal: {plan_is_renewal}")
+    if pricing:
+        pay_lines.append(f"- Pricing: {pricing}")
+    if manage:
+        pay_lines.append(f"- Manage: {_embed_link('Open', manage)}")
+    if checkout:
+        pay_lines.append(f"- Checkout: {_embed_link('Open', checkout)}")
+    if not pay_lines:
+        pay_lines = ["—"]
+    e.add_field(name="Payment Full Logs", value="\n".join(pay_lines)[:1024], inline=False)
 
     return e
 
@@ -547,6 +735,7 @@ async def migrate_ticket_channel_owner_overwrites() -> None:
         int(cfg.billing_category_id or 0),
         int(cfg.free_pass_category_id or 0),
         int(cfg.cancellation_category_id or 0),
+        int(cfg.member_welcome_category_id or 0),
         int(cfg.no_whop_link_category_id or 0),
     ]
     # no_whop_link category may be configured by name (id=0); resolve it best-effort.
@@ -554,6 +743,11 @@ async def migrate_ticket_channel_owner_overwrites() -> None:
         nw_id = await _get_or_create_no_whop_link_category_id(guild=guild)
         if int(nw_id or 0) > 0:
             cat_ids.append(int(nw_id))
+    # member_welcome category may be configured by name (id=0); resolve it best-effort.
+    with suppress(Exception):
+        mw_id = await _get_or_create_member_welcome_category_id(guild=guild)
+        if int(mw_id or 0) > 0:
+            cat_ids.append(int(mw_id))
     cat_ids = [int(x) for x in cat_ids if int(x) > 0]
 
     scanned = 0
@@ -669,12 +863,17 @@ async def migrate_ticket_channel_staff_overwrites() -> None:
         int(cfg.billing_category_id or 0),
         int(cfg.free_pass_category_id or 0),
         int(cfg.cancellation_category_id or 0),
+        int(cfg.member_welcome_category_id or 0),
         int(cfg.no_whop_link_category_id or 0),
     ]
     with suppress(Exception):
         nw_id = await _get_or_create_no_whop_link_category_id(guild=guild)
         if int(nw_id or 0) > 0:
             cat_ids.append(int(nw_id))
+    with suppress(Exception):
+        mw_id = await _get_or_create_member_welcome_category_id(guild=guild)
+        if int(mw_id or 0) > 0:
+            cat_ids.append(int(mw_id))
     cat_ids = [int(x) for x in cat_ids if int(x) > 0]
     if not cat_ids:
         return
@@ -808,6 +1007,32 @@ async def _startup_has_human_activity_since_creation(
     return False
 
 
+def _chunk_message_content(content: str, *, max_len: int = 1990) -> list[str]:
+    """Split long startup content into safe chunks (prefers newline boundaries)."""
+    s = str(content or "")
+    if not s:
+        return []
+    n = max(200, int(max_len or 1990))
+    if len(s) <= n:
+        return [s]
+    out: list[str] = []
+    cur = s
+    while cur:
+        if len(cur) <= n:
+            out.append(cur)
+            break
+        cut = cur.rfind("\n\n", 0, n)
+        if cut < 0:
+            cut = cur.rfind("\n", 0, n)
+        if cut < 0:
+            cut = n
+        part = cur[:cut].rstrip()
+        if part:
+            out.append(part)
+        cur = cur[cut:].lstrip("\n")
+    return out
+
+
 async def sweep_startup_messages() -> None:
     """Pattern A: stateless sweeper loop for 5-minute startup acknowledgement."""
     if not _ensure_cfg_loaded():
@@ -896,14 +1121,13 @@ async def sweep_startup_messages() -> None:
 
         ok = True
         try:
-            await ch.send(
-                content=content[:1990],
-                allowed_mentions=discord.AllowedMentions(
-                    users=True,
-                    roles=bool(staff_mention and ("{staff" in tmpl or "<@&" in content)),
-                    everyone=False,
-                ),
+            allow = discord.AllowedMentions(
+                users=True,
+                roles=bool(staff_mention and ("{staff" in tmpl or "<@&" in content)),
+                everyone=False,
             )
+            for part in _chunk_message_content(content, max_len=1990):
+                await ch.send(content=part, allowed_mentions=allow)
         except Exception as ex:
             ok = False
             await _log(f"❌ support_tickets: startup_message_send_failed type={ttype} ch={int(ch.id)} err={str(ex)[:180]}")
@@ -941,10 +1165,14 @@ def _cooldown_seconds_for(ticket_type: str) -> int:
     t = str(ticket_type or "").strip().lower()
     if t == "free_pass":
         return int(c.cooldown_free_pass_seconds)
+    if t == "free_pass_welcome":
+        return int(c.cooldown_free_pass_welcome_seconds)
     if t == "billing":
         return int(c.cooldown_billing_seconds)
     if t == "no_whop_link":
         return int(c.no_whop_link_cooldown_seconds)
+    if t == "member_welcome":
+        return int(c.cooldown_member_welcome_seconds)
     return int(c.cooldown_cancellation_seconds)
 
 
@@ -961,6 +1189,10 @@ def _ticket_channel_name(ticket_type: str, member: discord.abc.User) -> str:
         prefix = "billing"
     elif t == "free_pass":
         prefix = "freepass"
+    elif t == "free_pass_welcome":
+        prefix = "freepass"
+    elif t == "member_welcome":
+        prefix = "welcome"
     elif t == "no_whop_link":
         prefix = "nowhop"
 
@@ -1134,6 +1366,7 @@ def _ticket_category_ids_for_audit() -> set[int]:
         int(cfg.cancellation_category_id or 0),
         int(cfg.billing_category_id or 0),
         int(cfg.free_pass_category_id or 0),
+        int(cfg.member_welcome_category_id or 0),
     }
     if bool(cfg.audit_include_transcript_category):
         ids.add(int(cfg.transcript_category_id or 0))
@@ -1647,25 +1880,39 @@ async def _set_ticket_role_for_member(*, guild: discord.Guild, member: discord.M
         has_it = any(int(getattr(r, "id", 0) or 0) == int(rid) for r in (member.roles or []))
     if add:
         # Special case: whenever we're adding the "no-whop" role (free-pass-no-whop or no-whop-link),
-        # ensure the Billing role is removed (these should be mutually exclusive).
+        # ensure any configured "remove on no-whop add" roles are removed (ex: legacy billing-fail role).
         cfg = _cfg()
-        bid = int(getattr(cfg, "billing_role_id", 0) or 0) if cfg else 0
-        if bid > 0:
-            should_remove_billing = False
-            try:
-                nr = int(getattr(cfg, "no_whop_link_role_id", 0) or 0) if cfg else 0
-                fr = int(getattr(cfg, "free_pass_no_whop_role_id", 0) or 0) if cfg else 0
-                should_remove_billing = int(role.id) in {int(nr), int(fr)} or str(ticket_type or "").strip().lower() == "no_whop_link"
-            except Exception:
-                should_remove_billing = str(ticket_type or "").strip().lower() == "no_whop_link"
-            if should_remove_billing:
-                bill_role = guild.get_role(int(bid))
-                if bill_role and any(int(getattr(r, "id", 0) or 0) == int(bid) for r in (member.roles or [])):
+        nr = int(getattr(cfg, "no_whop_link_role_id", 0) or 0) if cfg else 0
+        fr = int(getattr(cfg, "free_pass_no_whop_role_id", 0) or 0) if cfg else 0
+        is_no_whop_add = int(role.id) in {int(nr), int(fr)} or str(ticket_type or "").strip().lower() == "no_whop_link"
+        if is_no_whop_add:
+            remove_ids: set[int] = set()
+            with suppress(Exception):
+                if cfg and int(getattr(cfg, "billing_role_id", 0) or 0) > 0:
+                    remove_ids.add(int(getattr(cfg, "billing_role_id", 0) or 0))
+            with suppress(Exception):
+                for x in (getattr(cfg, "no_whop_remove_role_ids_on_add", None) or []) if cfg else []:
+                    rid2 = int(x or 0)
+                    if rid2 > 0:
+                        remove_ids.add(int(rid2))
+            # Never remove the role we are about to add.
+            remove_ids.discard(int(role.id))
+            if remove_ids:
+                try:
+                    member_role_ids = {int(getattr(r, "id", 0) or 0) for r in (member.roles or [])}
+                except Exception:
+                    member_role_ids = set()
+                for rid2 in sorted(list(remove_ids)):
+                    if rid2 not in member_role_ids:
+                        continue
+                    r2 = guild.get_role(int(rid2))
+                    if not r2:
+                        continue
                     try:
-                        await member.remove_roles(bill_role, reason="RSCheckerbot: replace billing role with no-whop role")
+                        await member.remove_roles(r2, reason="RSCheckerbot: remove legacy role when adding no-whop role")
                     except Exception as ex:
                         await _log(
-                            f"⚠️ support_tickets: failed to remove billing role_id={bid} from user_id={int(member.id)} "
+                            f"⚠️ support_tickets: failed to remove role_id={rid2} from user_id={int(member.id)} "
                             f"(hierarchy/perms?) err={str(ex)[:180]}"
                         )
         if has_it:
@@ -2500,6 +2747,51 @@ def build_free_pass_header_embed(
     return e
 
 
+def build_free_pass_welcome_header_embed(
+    *,
+    member: discord.Member,
+    whop_brief: dict | None,
+    reference_jump_url: str = "",
+) -> discord.Embed:
+    """Ticket header for Whop Free Pass (Lite) members (linked via Whop)."""
+    b = whop_brief if isinstance(whop_brief, dict) else {}
+    e = discord.Embed(title="Free Pass Welcome", color=0x57F287)
+    e.add_field(name="Member", value=str(getattr(member, "display_name", "") or str(member))[:1024], inline=True)
+    e.add_field(name="Discord ID", value=_format_discord_id(int(member.id)), inline=True)
+    prod = str(b.get("product") or "").strip() or "—"
+    e.add_field(name="Membership", value=prod[:1024], inline=True)
+    st_disp = _whop_status_display(ticket_type="free_pass_welcome", whop_brief=b, status_override=str(b.get("status") or ""))
+    e.add_field(name="Whop Status", value=str(st_disp or "—")[:1024], inline=True)
+    dash = str(b.get("dashboard_url") or "").strip()
+    e.add_field(name="Whop Dashboard", value=_embed_link("Open", dash), inline=True)
+    e.add_field(name="Message Reference", value=_embed_link("View Full Log", str(reference_jump_url or "")), inline=True)
+    return e
+
+
+def build_member_welcome_preview_embed(
+    *,
+    member: discord.Member,
+    whop_brief: dict | None,
+    reference_jump_url: str = "",
+) -> discord.Embed:
+    """Ticket header for first-time paid members (full access)."""
+    b = whop_brief if isinstance(whop_brief, dict) else {}
+    e = discord.Embed(title="Member Welcome", color=0x57F287)
+    e.add_field(name="Member", value=str(getattr(member, "display_name", "") or str(member))[:1024], inline=True)
+    e.add_field(name="Discord ID", value=_format_discord_id(int(member.id)), inline=True)
+    prod = str(b.get("product") or "").strip() or "—"
+    e.add_field(name="Membership", value=prod[:1024], inline=True)
+    st_disp = _whop_status_display(ticket_type="member_welcome", whop_brief=b, status_override=str(b.get("status") or ""))
+    e.add_field(name="Whop Status", value=str(st_disp or "—")[:1024], inline=True)
+    spent = str(b.get("total_spent") or "").strip()
+    if spent and spent != "—":
+        e.add_field(name="Total Spent (lifetime)", value=spent[:1024], inline=True)
+    dash = str(b.get("dashboard_url") or "").strip()
+    e.add_field(name="Whop Dashboard", value=_embed_link("Open", dash), inline=True)
+    e.add_field(name="Message Reference", value=_embed_link("View Full Log", str(reference_jump_url or "")), inline=True)
+    return e
+
+
 def build_no_whop_link_preview_embed(
     *,
     member: discord.Member,
@@ -2586,6 +2878,46 @@ async def _get_or_create_no_whop_link_category_id(*, guild: discord.Guild) -> in
         return int(created.id) if isinstance(created, discord.CategoryChannel) else 0
     except Exception as ex:
         await _log(f"❌ support_tickets: failed to create no-whop-link category ({str(ex)[:200]})")
+        return 0
+
+
+async def _get_or_create_member_welcome_category_id(*, guild: discord.Guild) -> int:
+    cfg = _cfg()
+    if not cfg or not isinstance(guild, discord.Guild) or not _BOT:
+        return 0
+    cid = int(cfg.member_welcome_category_id or 0)
+    if cid > 0:
+        ch = guild.get_channel(cid)
+        return int(ch.id) if isinstance(ch, discord.CategoryChannel) else 0
+
+    name = str(cfg.member_welcome_category_name or "member-welcome").strip() or "member-welcome"
+    for cat in list(getattr(guild, "categories", []) or []):
+        if isinstance(cat, discord.CategoryChannel) and str(getattr(cat, "name", "") or "").strip().lower() == name.lower():
+            return int(cat.id)
+
+    me = getattr(guild, "me", None) or guild.get_member(int(getattr(getattr(_BOT, "user", None), "id", 0) or 0))
+    if not (me and getattr(me, "guild_permissions", None) and bool(getattr(me.guild_permissions, "manage_channels", False))):
+        await _log("❌ support_tickets: cannot create member-welcome category (missing manage_channels)")
+        return 0
+
+    overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {}
+    overwrites[guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+    if isinstance(me, discord.Member):
+        overwrites[me] = discord.PermissionOverwrite(view_channel=True, manage_channels=True, manage_permissions=True, read_message_history=True)
+    for rid in list(dict.fromkeys([int(x) for x in (cfg.staff_role_ids or []) if int(x) > 0])):
+        role = guild.get_role(int(rid))
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True)
+    for rid in list(dict.fromkeys([int(x) for x in (cfg.admin_role_ids or []) if int(x) > 0])):
+        role = guild.get_role(int(rid))
+        if role and role not in overwrites:
+            overwrites[role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True)
+
+    try:
+        created = await guild.create_category(name=name, overwrites=overwrites, reason="RSCheckerbot: create member-welcome ticket category")
+        return int(created.id) if isinstance(created, discord.CategoryChannel) else 0
+    except Exception as ex:
+        await _log(f"❌ support_tickets: failed to create member-welcome category ({str(ex)[:200]})")
         return 0
 
 
@@ -2790,6 +3122,58 @@ async def open_free_pass_ticket(
         extra_sends=extra,
         extra_record_fields={"what_you_missed_jump_url": str(source_jump or "")},
         reference_jump_url=str(reference_jump_url or ""),
+    )
+
+
+async def open_free_pass_welcome_ticket(
+    *,
+    member: discord.Member,
+    whop_brief: dict | None,
+    fingerprint: str,
+    reference_jump_url: str = "",
+) -> discord.TextChannel | None:
+    """Welcome ticket for Whop Free Pass (Lite) members (should NOT apply no-whop role)."""
+    cfg = _cfg()
+    if not cfg:
+        return None
+    header = build_free_pass_welcome_header_embed(member=member, whop_brief=whop_brief, reference_jump_url=str(reference_jump_url or ""))
+    return await _open_or_update_ticket(
+        ticket_type="free_pass_welcome",
+        owner=member,
+        fingerprint=fingerprint,
+        category_id=int(cfg.free_pass_category_id),
+        preview_embed=header,
+        reference_jump_url=str(reference_jump_url or ""),
+        whop_dashboard_url=str((whop_brief or {}).get("dashboard_url") or "") if isinstance(whop_brief, dict) else "",
+    )
+
+
+async def open_member_welcome_ticket(
+    *,
+    member: discord.Member,
+    whop_brief: dict | None,
+    fingerprint: str,
+    reference_jump_url: str = "",
+) -> discord.TextChannel | None:
+    """First-time paid-member welcome ticket (separate category)."""
+    cfg = _cfg()
+    if not cfg or not _BOT:
+        return None
+    guild = _BOT.get_guild(int(cfg.guild_id))
+    if not isinstance(guild, discord.Guild):
+        return None
+    cat_id = await _get_or_create_member_welcome_category_id(guild=guild)
+    if int(cat_id or 0) <= 0:
+        return None
+    header = build_member_welcome_preview_embed(member=member, whop_brief=whop_brief, reference_jump_url=str(reference_jump_url or ""))
+    return await _open_or_update_ticket(
+        ticket_type="member_welcome",
+        owner=member,
+        fingerprint=fingerprint,
+        category_id=int(cat_id),
+        preview_embed=header,
+        reference_jump_url=str(reference_jump_url or ""),
+        whop_dashboard_url=str((whop_brief or {}).get("dashboard_url") or "") if isinstance(whop_brief, dict) else "",
     )
 
 
@@ -3497,6 +3881,45 @@ async def close_ticket_by_channel_id(
         with suppress(Exception):
             await ch.delete(reason=f"RSCheckerbot: close ticket ({close_reason})")
     return True
+
+
+async def close_open_ticket_for_user(
+    discord_id: int,
+    *,
+    ticket_type: str,
+    close_reason: str,
+    do_transcript: bool = True,
+    delete_channel: bool = True,
+) -> bool:
+    """Close the current OPEN ticket of a given type for a user (best-effort)."""
+    if not _ensure_cfg_loaded():
+        return False
+    uid = int(discord_id or 0)
+    if uid <= 0:
+        return False
+    t = str(ticket_type or "").strip().lower()
+    if not t:
+        return False
+
+    # Never hold the index lock while awaiting close_ticket_by_channel_id (it also needs the lock).
+    ch_id = 0
+    async with _INDEX_LOCK:
+        db = _index_load()
+        found = _ticket_find_open(db, ticket_type=t, user_id=uid, fingerprint="")
+        if found:
+            _tid, rec = found
+            if _ticket_is_open(rec):
+                ch_id = _as_int(rec.get("channel_id"))
+    if not ch_id:
+        return False
+    return bool(
+        await close_ticket_by_channel_id(
+            int(ch_id),
+            close_reason=str(close_reason or ""),
+            do_transcript=bool(do_transcript),
+            delete_channel=bool(delete_channel),
+        )
+    )
 
 
 async def close_free_pass_if_whop_linked(

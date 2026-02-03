@@ -1,15 +1,257 @@
 from __future__ import annotations
 
 import logging
+import json
+import re
 from contextlib import suppress
 from datetime import datetime, timezone
 from math import ceil
+from pathlib import Path
 
 from whop_api_client import WhopAPIClient
 from rschecker_utils import extract_discord_id_from_whop_member_record
 from rschecker_utils import fmt_date_any as _fmt_date_any, parse_dt_any as _parse_dt_any, usd_amount
 
 log = logging.getLogger("rs-checker")
+
+_BASE_DIR = Path(__file__).resolve().parent
+_MEMBER_HISTORY_PATH = _BASE_DIR / "member_history.json"
+_MH_CACHE: dict | None = None
+_MH_CACHE_MTIME: float = 0.0
+_MH_CACHE_AT: float = 0.0
+
+
+def _now_ts() -> float:
+    try:
+        return float(datetime.now(timezone.utc).timestamp())
+    except Exception:
+        return 0.0
+
+
+def _load_membership_baseline_cached(*, max_age_seconds: int = 30) -> dict:
+    """Load only the membership baseline slices from member_history.json (cached)."""
+    global _MH_CACHE, _MH_CACHE_MTIME, _MH_CACHE_AT
+    now = _now_ts()
+    if _MH_CACHE is not None and _MH_CACHE_AT and (now - _MH_CACHE_AT) < float(max_age_seconds):
+        return _MH_CACHE
+    mtime = 0.0
+    try:
+        mtime = float(_MEMBER_HISTORY_PATH.stat().st_mtime)
+    except Exception:
+        mtime = 0.0
+    if _MH_CACHE is not None and mtime and _MH_CACHE_MTIME and mtime == _MH_CACHE_MTIME:
+        _MH_CACHE_AT = now
+        return _MH_CACHE
+    data: dict = {}
+    try:
+        raw = json.loads(_MEMBER_HISTORY_PATH.read_text(encoding="utf-8") or "{}")
+        if isinstance(raw, dict):
+            data = raw
+    except Exception:
+        data = {}
+    # Keep only what we need (reduces memory churn).
+    out = {
+        "whop_users": data.get("whop_users") if isinstance(data.get("whop_users"), dict) else {},
+        "whop_user_index": data.get("whop_user_index") if isinstance(data.get("whop_user_index"), dict) else {},
+        "whop_membership_index": data.get("whop_membership_index") if isinstance(data.get("whop_membership_index"), dict) else {},
+    }
+    _MH_CACHE = out
+    _MH_CACHE_MTIME = mtime
+    _MH_CACHE_AT = now
+    return out
+
+
+def _extract_user_id_from_dashboard_url(raw: str) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    # Markdown link [Open](https://...)
+    m = re.search(r"\((https?://[^)]+)\)", s)
+    if m:
+        s = m.group(1).strip()
+    m2 = re.search(r"/users/(user_[A-Za-z0-9]+)/", s)
+    return m2.group(1) if m2 else ""
+
+
+def _best_membership_log_entry(wh_rec: dict, *, membership_id: str = "") -> dict:
+    """Pick the most relevant membership_logs_latest entry (preferring matching membership_id)."""
+    if not isinstance(wh_rec, dict):
+        return {}
+    wh = wh_rec.get("whop") if isinstance(wh_rec.get("whop"), dict) else {}
+    latest = wh.get("membership_logs_latest") if isinstance(wh.get("membership_logs_latest"), dict) else {}
+    if not isinstance(latest, dict) or not latest:
+        return {}
+    mid = str(membership_id or "").strip()
+    if mid:
+        best_m: dict | None = None
+        best_k_m = ""
+        for v in latest.values():
+            if not (isinstance(v, dict) and str(v.get("membership_id") or "").strip() == mid):
+                continue
+            k = str(v.get("recorded_at") or v.get("created_at") or "")
+            if (best_m is None) or (k > best_k_m):
+                best_m = v
+                best_k_m = k
+        if isinstance(best_m, dict):
+            return best_m
+    # Otherwise pick newest by recorded_at then created_at.
+    best: dict | None = None
+    best_k = ""
+    for v in latest.values():
+        if not isinstance(v, dict):
+            continue
+        k = str(v.get("recorded_at") or v.get("created_at") or "")
+        if (best is None) or (k > best_k):
+            best = v
+            best_k = k
+    return best if isinstance(best, dict) else {}
+
+
+def _merged_membership_log_fields(wh_rec: dict, *, membership_id: str = "") -> dict[str, str]:
+    """Merge fields across membership_logs_latest newest-first (PII-safe, best-effort)."""
+    if not isinstance(wh_rec, dict):
+        return {}
+    wh = wh_rec.get("whop") if isinstance(wh_rec.get("whop"), dict) else {}
+    latest = wh.get("membership_logs_latest") if isinstance(wh.get("membership_logs_latest"), dict) else {}
+    if not isinstance(latest, dict) or not latest:
+        return {}
+    mid = str(membership_id or "").strip()
+    rows: list[dict] = []
+    for v in latest.values():
+        if not isinstance(v, dict):
+            continue
+        if mid:
+            v_mid = str(v.get("membership_id") or "").strip()
+            if v_mid and v_mid != mid:
+                continue
+        rows.append(v)
+
+    def _k(v: dict) -> str:
+        return str(v.get("recorded_at") or v.get("created_at") or "")
+
+    rows.sort(key=_k, reverse=True)
+    out: dict[str, str] = {}
+    for v in rows:
+        f = v.get("fields") if isinstance(v.get("fields"), dict) else {}
+        if not isinstance(f, dict):
+            continue
+        for kk, vv in f.items():
+            k2 = str(kk or "").strip().lower()
+            if not k2:
+                continue
+            if k2 in out:
+                continue
+            s = str(vv or "").strip()
+            if not s:
+                continue
+            out[k2] = s
+    return out
+
+
+def enrich_whop_brief_from_membership_logs(brief: dict | None, *, membership_id: str = "") -> dict:
+    """Fill missing fields in a whop_brief from membership-log baseline (no extra API calls)."""
+    b = brief if isinstance(brief, dict) else {}
+    mid = str(membership_id or b.get("membership_id") or "").strip()
+    uid = str(b.get("whop_user_id") or "").strip()
+    if not uid:
+        uid = _extract_user_id_from_dashboard_url(str(b.get("dashboard_url") or ""))
+    # Pull baseline slices
+    base = _load_membership_baseline_cached()
+    wh_users = base.get("whop_users") if isinstance(base.get("whop_users"), dict) else {}
+    wh_idx = base.get("whop_user_index") if isinstance(base.get("whop_user_index"), dict) else {}
+    mem_idx = base.get("whop_membership_index") if isinstance(base.get("whop_membership_index"), dict) else {}
+
+    key = ""
+    if uid and uid in wh_users:
+        key = uid
+    if not key and mid and isinstance(mem_idx, dict) and mid in mem_idx:
+        key = str(mem_idx.get(mid) or "").strip()
+    # Fallback: find by last_membership_id (linear scan; used only if index missing)
+    if not key and mid:
+        try:
+            for k0, rec0 in wh_users.items():
+                if not isinstance(rec0, dict):
+                    continue
+                wh0 = rec0.get("whop") if isinstance(rec0.get("whop"), dict) else {}
+                if str(wh0.get("last_membership_id") or "").strip() == mid:
+                    key = str(k0)
+                    break
+        except Exception:
+            key = ""
+
+    # Fallback: if we have a username from prior brief, use username index
+    if not key:
+        uname = str(b.get("username") or b.get("user_name") or "").strip().lower()
+        uname = re.sub(r"[^a-z0-9_.-]+", "", uname)
+        if uname and uname in wh_idx:
+            key = str(wh_idx.get(uname) or "").strip()
+
+    rec = wh_users.get(key) if key and isinstance(wh_users, dict) else None
+    if not isinstance(rec, dict):
+        return b
+
+    fields = _merged_membership_log_fields(rec, membership_id=mid)
+    if not fields:
+        return b
+
+    def _get(*names: str) -> str:
+        for nm in names:
+            v = fields.get(str(nm).strip().lower())
+            if v is None:
+                continue
+            s = str(v or "").strip()
+            if s:
+                return s
+        return ""
+
+    # Always attach stable IDs when missing.
+    if not str(b.get("membership_id") or "").strip():
+        b["membership_id"] = _get("membership id") or mid
+    if not str(b.get("whop_user_id") or "").strip():
+        b["whop_user_id"] = _get("whop user id") or uid
+    if not str(b.get("username") or "").strip():
+        b["username"] = _get("username")
+
+    # Fill staff-facing fields if missing/blank.
+    if (not str(b.get("status") or "").strip()) or str(b.get("status") or "").strip() == "—":
+        b["status"] = _get("status") or b.get("status") or ""
+    if (not str(b.get("product") or "").strip()) or str(b.get("product") or "").strip() == "—":
+        b["product"] = _get("product", "membership") or b.get("product") or ""
+    if not str(b.get("total_spent") or "").strip():
+        b["total_spent"] = _get("total spent")
+    if not str(b.get("trial_days") or "").strip():
+        b["trial_days"] = _get("trial days")
+    if not str(b.get("plan_is_renewal") or "").strip():
+        b["plan_is_renewal"] = _get("plan is renewal")
+    if not str(b.get("pricing") or "").strip():
+        b["pricing"] = _get("pricing")
+    if not str(b.get("is_first_membership") or "").strip():
+        b["is_first_membership"] = _get("first membership")
+    if not str(b.get("cancel_at_period_end") or "").strip():
+        b["cancel_at_period_end"] = _get("cancel at period end")
+
+    dash = _get("dashboard")
+    if dash and not str(b.get("dashboard_url") or "").strip():
+        b["dashboard_url"] = dash
+
+    # Renewal window: "start → end"
+    win = _get("renewal window", "renewal")
+    if win and (not str(b.get("renewal_end_iso") or "").strip()):
+        parts = [p.strip() for p in win.split("→")]
+        if len(parts) == 2:
+            start_iso = parts[0].strip()
+            end_iso = parts[1].strip()
+            if start_iso:
+                b["renewal_start"] = _fmt_date_any(start_iso)
+            if end_iso:
+                b["renewal_end_iso"] = end_iso
+                b["renewal_end"] = _fmt_date_any(end_iso)
+                dt_end = _parse_dt_any(end_iso)
+                if dt_end:
+                    delta = (dt_end - datetime.now(timezone.utc)).total_seconds()
+                    b["remaining_days"] = max(0, int(ceil(delta / 86400.0)))
+
+    return b
 
 
 def _coerce_money_amount(v: object) -> float | None:
@@ -145,17 +387,19 @@ async def fetch_whop_brief(
     enable_enrichment: bool = True,
 ) -> dict:
     """Fetch a minimal Whop summary for staff (no internal IDs)."""
-    if not client or not enable_enrichment:
-        return {}
     mid = (membership_id or "").strip()
     if not mid:
         return {}
+
+    # If API is disabled/unavailable, still provide baseline-derived fields so staff/tickets aren't blank.
+    if (not client) or (not enable_enrichment):
+        return enrich_whop_brief_from_membership_logs({"membership_id": mid}, membership_id=mid)
 
     membership = None
     with suppress(Exception):
         membership = await client.get_membership_by_id(mid)
     if not isinstance(membership, dict):
-        return {}
+        return enrich_whop_brief_from_membership_logs({"membership_id": mid}, membership_id=mid)
 
     product_title = "—"
     if isinstance(membership.get("product"), dict):
@@ -186,6 +430,21 @@ async def fetch_whop_brief(
         "manage_url": "",
         "dashboard_url": "",
         "cancel_at_period_end": "yes" if membership.get("cancel_at_period_end") is True else ("no" if membership.get("cancel_at_period_end") is False else "—"),
+        "plan_is_renewal": "true"
+        if (
+            membership.get("plan_is_renewal") is True
+            or membership.get("is_renewal") is True
+            or ((membership.get("plan") or {}).get("is_renewal") is True if isinstance(membership.get("plan"), dict) else False)
+        )
+        else (
+            "false"
+            if (
+                membership.get("plan_is_renewal") is False
+                or membership.get("is_renewal") is False
+                or ((membership.get("plan") or {}).get("is_renewal") is False if isinstance(membership.get("plan"), dict) else False)
+            )
+            else "—"
+        ),
         "is_first_membership": "true" if membership.get("is_first_membership") is True else ("false" if membership.get("is_first_membership") is False else "—"),
         "last_payment_method": "—",
         "last_payment_type": "—",
@@ -289,5 +548,5 @@ async def fetch_whop_brief(
             elif du:
                 brief["connected_discord"] = du
 
-    return brief
+    return enrich_whop_brief_from_membership_logs(brief, membership_id=mid)
 

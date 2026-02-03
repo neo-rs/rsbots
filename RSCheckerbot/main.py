@@ -168,6 +168,7 @@ from staff_embeds import (
     build_member_status_detailed_embed as _build_member_status_detailed_embed,
 )
 from whop_brief import fetch_whop_brief
+from whop_brief import enrich_whop_brief_from_membership_logs as _enrich_whop_brief_from_membership_logs
 from whop_native_membership_cache import get_summary as _get_native_summary_by_mid
 from staff_channels import (
     PAYMENT_FAILURE_CHANNEL_NAME,
@@ -2439,6 +2440,19 @@ def _extract_reporting_from_member_status_embed(
     discord_id: int | None = None
     whop_brief: dict = {}
 
+    def _extract_url(raw: str) -> str:
+        s = str(raw or "").strip()
+        if not s:
+            return ""
+        # Prefer markdown links: [Open](https://...)
+        m = re.search(r"\((https?://[^)]+)\)", s)
+        if m:
+            return str(m.group(1)).strip()
+        m2 = re.search(r"(https?://\S+)", s)
+        if m2:
+            return str(m2.group(1)).strip().rstrip(").,")
+        return ""
+
     # Fields
     try:
         for f in (getattr(sent_embed, "fields", None) or []):
@@ -2451,8 +2465,16 @@ def _extract_reporting_from_member_status_embed(
                 m = re.search(r"(\d{17,19})", v)
                 if m:
                     discord_id = int(m.group(1))
-            elif ln == "total spent":
+            elif ln.startswith("total spent"):
                 whop_brief["total_spent"] = v
+            elif ln in {"membership id", "membership_id"}:
+                # Normalize membership id tokens (mem_... or R-...) even if wrapped in backticks/extra text.
+                m_mid = re.search(r"\b(mem_[A-Za-z0-9]+)\b", v)
+                if m_mid:
+                    whop_brief["membership_id"] = m_mid.group(1)
+                else:
+                    m_r = re.search(r"\b(R-[A-Za-z0-9-]{8,})\b", v)
+                    whop_brief["membership_id"] = m_r.group(1) if m_r else v
             elif ln in {"membership", "product"}:
                 whop_brief["product"] = v
             elif ln == "status":
@@ -2460,11 +2482,15 @@ def _extract_reporting_from_member_status_embed(
             elif ln in {"remaining days", "remaining_days"}:
                 whop_brief["remaining_days"] = v
             elif ln in {"whop dashboard", "dashboard"}:
-                whop_brief["dashboard_url"] = v
+                whop_brief["dashboard_url"] = _extract_url(v)
             elif ln in {"connected discord", "connected_discord"}:
                 whop_brief["connected_discord"] = v
             elif ln in {"cancel at period end", "cancel_at_period_end"}:
                 whop_brief["cancel_at_period_end"] = v
+            elif ln in {"plan is renewal", "plan_is_renewal", "plan is renewal?"}:
+                whop_brief["plan_is_renewal"] = v
+            elif ln in {"first membership", "is_first_membership", "first_membership"}:
+                whop_brief["is_first_membership"] = v
             elif ln in {"access ends on", "next billing date", "renewal end", "renewal_end"}:
                 # Best-effort: store ISO for reminders
                 whop_brief["renewal_end"] = v
@@ -2478,6 +2504,8 @@ def _extract_reporting_from_member_status_embed(
                         whop_brief["renewal_end_iso"] = dt.isoformat()
                     except Exception:
                         pass
+            elif ln in {"customer since", "customer_since", "member since", "member_since"}:
+                whop_brief["customer_since"] = v
     except Exception:
         pass
 
@@ -2509,7 +2537,100 @@ def _extract_reporting_from_member_status_embed(
         if st == "trialing":
             kind = "trialing"
 
+    # Enrich from membership-log baseline (fills blanks without extra API calls).
+    with suppress(Exception):
+        whop_brief = _enrich_whop_brief_from_membership_logs(whop_brief, membership_id=str(whop_brief.get("membership_id") or "").strip())
+
     return (ts_i, kind, discord_id, whop_brief)
+
+
+def record_member_status_baseline(
+    discord_id: int,
+    *,
+    kind: str,
+    message: discord.Message,
+    embed: discord.Embed,
+    whop_brief: dict | None,
+) -> None:
+    """Persist a compact per-user baseline for member-status-logs cards (no PII)."""
+    try:
+        did = int(discord_id)
+    except Exception:
+        return
+    if did <= 0:
+        return
+    if not isinstance(message, discord.Message) or not isinstance(embed, discord.Embed):
+        return
+    try:
+        now = _history_now_ts()
+        db = _load_member_history()
+        key = str(did)
+        rec = db.get(key, {})
+        rec = _ensure_member_history_shape(rec, now=now)
+        wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+
+        ms = wh.get("member_status_logs_latest") if isinstance(wh.get("member_status_logs_latest"), dict) else {}
+        if not isinstance(ms, dict):
+            ms = {}
+
+        k = str(kind or "").strip().lower() or "unknown"
+        title = str(getattr(embed, "title", "") or "").strip()
+        created_at_iso = ""
+        try:
+            dt0 = getattr(message, "created_at", None)
+            if dt0:
+                created_at_iso = dt0.replace(tzinfo=timezone.utc).isoformat()
+        except Exception:
+            created_at_iso = ""
+
+        safe_brief = whop_brief if isinstance(whop_brief, dict) else {}
+        # Never store PII
+        for pii_key in ("email", "user_name", "name", "username"):
+            with suppress(Exception):
+                safe_brief.pop(pii_key, None)
+
+        # Keep membership key up-to-date for later lookups/enrichment.
+        try:
+            mid0 = str((safe_brief or {}).get("membership_id") or "").strip()
+            if mid0.startswith(("mem_", "R-")):
+                wh["last_membership_id"] = mid0
+                wh["last_whop_key"] = mid0
+        except Exception:
+            pass
+        try:
+            st0 = str((safe_brief or {}).get("status") or "").strip().lower()
+            if st0:
+                wh["last_status"] = st0
+        except Exception:
+            pass
+        wh["last_event_ts"] = int(now)
+        wh["last_event_type"] = "member_status_logs"
+
+        ms[k] = {
+            "kind": k,
+            "title": title,
+            "created_at": created_at_iso,
+            "message_id": int(getattr(message, "id", 0) or 0),
+            "jump_url": str(getattr(message, "jump_url", "") or "").strip(),
+            "membership_id": str((safe_brief or {}).get("membership_id") or "").strip(),
+            "status": str((safe_brief or {}).get("status") or "").strip(),
+            "product": str((safe_brief or {}).get("product") or "").strip(),
+            "remaining_days": str((safe_brief or {}).get("remaining_days") or "").strip(),
+            "renewal_end": str((safe_brief or {}).get("renewal_end") or "").strip(),
+            "renewal_end_iso": str((safe_brief or {}).get("renewal_end_iso") or "").strip(),
+            "total_spent": str((safe_brief or {}).get("total_spent") or "").strip(),
+            "dashboard_url": str((safe_brief or {}).get("dashboard_url") or "").strip(),
+            "cancel_at_period_end": str((safe_brief or {}).get("cancel_at_period_end") or "").strip(),
+            "connected_discord": str((safe_brief or {}).get("connected_discord") or "").strip(),
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        wh["member_status_logs_latest"] = ms
+        rec["whop"] = wh
+        db[key] = rec
+        _save_member_history(db)
+    except Exception:
+        return
 
 
 async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> None:
@@ -2621,38 +2742,100 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                 )
 
     # Payment succeeded is a strong resolve signal (post follow-ups).
-    if ("payment succeeded" in title_low or "payment received" in title_low) and has_member_role(member):
-        # Resolve Free Pass too if linkage is confirmed (will no-op if not linked).
-        with suppress(Exception):
-            await support_tickets.close_free_pass_if_whop_linked(
-                int(did_i),
-                resolution_event="payment_succeeded",
-                reference_jump_url=ref_url,
-            )
-        with suppress(Exception):
-            await support_tickets.post_resolution_followup_and_remove_role(
-                discord_id=int(did_i),
-                ticket_type="billing",
-                resolution_event="payment_succeeded",
-                reference_jump_url=ref_url,
-            )
-        with suppress(Exception):
-            await support_tickets.post_resolution_followup_and_remove_role(
-                discord_id=int(did_i),
-                ticket_type="cancellation",
-                resolution_event="payment_succeeded",
-                reference_jump_url=ref_url,
-            )
+    if ("payment succeeded" in title_low or "payment received" in title_low):
+        if has_member_role(member):
+            # Resolve Free Pass too if linkage is confirmed (will no-op if not linked).
+            with suppress(Exception):
+                await support_tickets.close_free_pass_if_whop_linked(
+                    int(did_i),
+                    resolution_event="payment_succeeded",
+                    reference_jump_url=ref_url,
+                )
+            with suppress(Exception):
+                await support_tickets.post_resolution_followup_and_remove_role(
+                    discord_id=int(did_i),
+                    ticket_type="billing",
+                    resolution_event="payment_succeeded",
+                    reference_jump_url=ref_url,
+                )
+            with suppress(Exception):
+                await support_tickets.post_resolution_followup_and_remove_role(
+                    discord_id=int(did_i),
+                    ticket_type="cancellation",
+                    resolution_event="payment_succeeded",
+                    reference_jump_url=ref_url,
+                )
+
+        # Free Pass / Member Welcome automation (product + first-time vs renewal).
+        try:
+            prod = str((whop_brief or {}).get("product") or "").strip() if isinstance(whop_brief, dict) else ""
+            prod_low = prod.lower().strip()
+        except Exception:
+            prod_low = ""
+        try:
+            first_raw = str((whop_brief or {}).get("is_first_membership") or "").strip().lower() if isinstance(whop_brief, dict) else ""
+            renew_raw = str((whop_brief or {}).get("plan_is_renewal") or "").strip().lower() if isinstance(whop_brief, dict) else ""
+        except Exception:
+            first_raw, renew_raw = "", ""
+
+        is_first = (first_raw in {"true", "yes", "1"}) or (renew_raw in {"false", "no", "0"})
+        is_renewal = (first_raw in {"false", "no", "0"}) or (renew_raw in {"true", "yes", "1"})
+        if not is_first or is_renewal:
+            return
+
+        st_cfg = config.get("support_tickets", {}) if isinstance(config, dict) else {}
+        prod_cfg = st_cfg.get("membership_products", {}) if isinstance(st_cfg.get("membership_products"), dict) else {}
+        lite_titles = [str(x).strip().lower() for x in (prod_cfg.get("lite_product_titles") or []) if str(x or "").strip()]
+        full_titles = [str(x).strip().lower() for x in (prod_cfg.get("full_product_titles") or []) if str(x or "").strip()]
+        is_lite = bool(prod_low and prod_low in set(lite_titles))
+        is_full = bool(prod_low and prod_low in set(full_titles))
+
+        mid = _membership_id_from_history(int(did_i))
+        if is_lite:
+            fp = f"{mid or int(did_i)}|free_pass_welcome|{occurred_at.date().isoformat()}"
+            try:
+                await support_tickets.open_free_pass_welcome_ticket(
+                    member=member,
+                    whop_brief=whop_brief if isinstance(whop_brief, dict) else {},
+                    fingerprint=fp,
+                    reference_jump_url=ref_url,
+                )
+            except Exception as ex:
+                await log_other(f"❌ SupportTickets: exception opening free_pass_welcome for `{did_i}` err=`{str(ex)[:240]}`")
+        elif is_full and has_member_role(member):
+            # Upgrade path: if they previously had a Free Pass ticket (direct-invite / no-whop), close it and open Member Welcome.
+            try:
+                await support_tickets.close_open_ticket_for_user(
+                    int(did_i),
+                    ticket_type="free_pass",
+                    close_reason="upgraded_to_paid",
+                    do_transcript=True,
+                    delete_channel=True,
+                )
+            except Exception as ex:
+                await log_other(f"⚠️ SupportTickets: exception closing free_pass on upgrade for `{did_i}` err=`{str(ex)[:240]}`")
+            fp = f"{mid or int(did_i)}|member_welcome|{occurred_at.date().isoformat()}"
+            try:
+                await support_tickets.open_member_welcome_ticket(
+                    member=member,
+                    whop_brief=whop_brief if isinstance(whop_brief, dict) else {},
+                    fingerprint=fp,
+                    reference_jump_url=ref_url,
+                )
+            except Exception as ex:
+                await log_other(f"❌ SupportTickets: exception opening member_welcome for `{did_i}` err=`{str(ex)[:240]}`")
 
     # Open tickets based on canonical kinds/titles.
     if kind == "member_joined":
         # Free Pass: only if not linked to Whop yet (no membership_id recorded).
         if not _membership_id_from_history(int(did_i)):
             fp = f"{int(did_i)}|freepass|{_tz_now().date().isoformat()}"
-            with suppress(Exception):
+            try:
                 ch_created = await support_tickets.open_free_pass_ticket(member=member, fingerprint=fp, reference_jump_url=ref_url)
                 if not ch_created:
                     await log_other(f"❌ SupportTickets: failed to open free-pass ticket for `{did_i}` (member_joined)")
+            except Exception as ex:
+                await log_other(f"❌ SupportTickets: exception opening free-pass ticket for `{did_i}` (member_joined) err=`{str(ex)[:240]}`")
         return
 
     # Billing (payment failed / billing issue)
@@ -2660,7 +2843,7 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
         mid = _membership_id_from_history(int(did_i))
         fp = f"{mid or int(did_i)}|billing|{occurred_at.date().isoformat()}"
         st = str((whop_brief or {}).get("status") or "Past Due").strip() if isinstance(whop_brief, dict) else "Past Due"
-        with suppress(Exception):
+        try:
             ch_created = await support_tickets.open_billing_ticket(
                 member=member,
                 event_type="payment.failed",
@@ -2672,6 +2855,8 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
             )
             if not ch_created:
                 await log_other(f"❌ SupportTickets: failed to open billing ticket for `{did_i}` (kind={kind})")
+        except Exception as ex:
+            await log_other(f"❌ SupportTickets: exception opening billing ticket for `{did_i}` (kind={kind}) err=`{str(ex)[:240]}`")
         return
 
     # Cancellation
@@ -2686,7 +2871,7 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                 if "cancellation reason" in n or (n == "reason"):
                     reason = v
                     break
-        with suppress(Exception):
+        try:
             ch_created = await support_tickets.open_cancellation_ticket(
                 member=member,
                 whop_brief=whop_brief if isinstance(whop_brief, dict) else {},
@@ -2696,6 +2881,8 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
             )
             if not ch_created:
                 await log_other(f"❌ SupportTickets: failed to open cancellation ticket for `{did_i}` (kind={kind})")
+        except Exception as ex:
+            await log_other(f"❌ SupportTickets: exception opening cancellation ticket for `{did_i}` (kind={kind}) err=`{str(ex)[:240]}`")
         return
 
 
@@ -3064,6 +3251,26 @@ try:
 except Exception:
     CID_TTL_MINUTES = 10.0
 VERBOSE_ROLE_LISTS = bool(LOG_CONTROLS.get("verbose_role_lists", False))
+
+# Member history ingest (Discord channel tailer -> member_history.json)
+MEMBER_HISTORY_INGEST = config.get("member_history_ingest", {}) if isinstance(config, dict) else {}
+MEMBER_HISTORY_INGEST_ENABLED = bool(MEMBER_HISTORY_INGEST.get("enabled", False))
+try:
+    MEMBER_HISTORY_INGEST_INTERVAL_SECONDS = int(MEMBER_HISTORY_INGEST.get("interval_seconds") or 300)
+except Exception:
+    MEMBER_HISTORY_INGEST_INTERVAL_SECONDS = 300
+MEMBER_HISTORY_INGEST_INTERVAL_SECONDS = max(30, min(MEMBER_HISTORY_INGEST_INTERVAL_SECONDS, 3600))
+try:
+    MEMBER_HISTORY_INGEST_BATCH_LIMIT = int(MEMBER_HISTORY_INGEST.get("batch_limit") or 500)
+except Exception:
+    MEMBER_HISTORY_INGEST_BATCH_LIMIT = 500
+MEMBER_HISTORY_INGEST_BATCH_LIMIT = max(25, min(MEMBER_HISTORY_INGEST_BATCH_LIMIT, 2000))
+try:
+    MEMBER_HISTORY_INGEST_OVERLAP = int(MEMBER_HISTORY_INGEST.get("overlap_messages") or 5)
+except Exception:
+    MEMBER_HISTORY_INGEST_OVERLAP = 5
+MEMBER_HISTORY_INGEST_OVERLAP = max(0, min(MEMBER_HISTORY_INGEST_OVERLAP, 25))
+MEMBER_HISTORY_BLANK_OUTPUTS_ENABLED = bool(MEMBER_HISTORY_INGEST.get("blank_outputs_enabled", False))
 
 # Optional output routing (send staff logs to a different guild, e.g. Neo Test Server).
 try:
@@ -3504,6 +3711,373 @@ def _save_member_history(db: dict) -> None:
         save_json(MEMBER_HISTORY_FILE, db)
     except Exception:
         pass
+
+
+# -----------------------------
+# Member history ingest (tail channels -> member_history.json)
+# -----------------------------
+MEMBER_HISTORY_INGEST_STATE_FILE = BASE_DIR / "data" / "member_history_ingest_state.json"
+BLANK_OUTPUTS_JSONL = BASE_DIR / "data" / "blank_outputs.jsonl"
+
+
+def _ensure_data_dir() -> None:
+    with suppress(Exception):
+        (BASE_DIR / "data").mkdir(parents=True, exist_ok=True)
+
+
+def _ingest_state_load() -> dict:
+    _ensure_data_dir()
+    raw = load_json(MEMBER_HISTORY_INGEST_STATE_FILE)
+    st = raw if isinstance(raw, dict) else {}
+    if not isinstance(st.get("channels"), dict):
+        st["channels"] = {}
+    return st
+
+
+def _ingest_state_save(st: dict) -> None:
+    _ensure_data_dir()
+    save_json(MEMBER_HISTORY_INGEST_STATE_FILE, st if isinstance(st, dict) else {"channels": {}})
+
+
+def _ingest_after_id(st: dict, channel_id: int) -> int:
+    try:
+        ch = (st.get("channels") or {}).get(str(int(channel_id)))
+        if isinstance(ch, dict):
+            v = str(ch.get("after_message_id") or "").strip()
+            return int(v) if v.isdigit() else 0
+    except Exception:
+        return 0
+    return 0
+
+
+def _ingest_set_after_id(st: dict, channel_id: int, message_id: int) -> None:
+    if not isinstance(st, dict):
+        return
+    if not isinstance(st.get("channels"), dict):
+        st["channels"] = {}
+    ch = st["channels"].get(str(int(channel_id))) if isinstance(st["channels"], dict) else None  # type: ignore[index]
+    if not isinstance(ch, dict):
+        ch = {}
+    ch["after_message_id"] = str(int(message_id))
+    ch["updated_at_iso"] = datetime.now(timezone.utc).isoformat()
+    st["channels"][str(int(channel_id))] = ch  # type: ignore[index]
+
+
+def _strip_emails(text: str) -> str:
+    return re.sub(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", "[redacted-email]", str(text or ""))
+
+
+def _norm_title_key(title: str) -> str:
+    return re.sub(r"\s+", " ", str(title or "").strip().lower())[:80] or "unknown"
+
+
+def _parse_bullet_kv(desc: str) -> dict[str, str]:
+    """Parse '• Key: Value' lines (PII-safe: drops name/email)."""
+    out: dict[str, str] = {}
+    s = _strip_emails(str(desc or ""))
+    for line in (s.splitlines() or []):
+        ln = line.strip()
+        if not ln:
+            continue
+        m = re.match(r"^[•*\-]\s*([^:]{1,64})\s*:\s*(.+?)\s*$", ln)
+        if not m:
+            continue
+        k = re.sub(r"\s+", " ", str(m.group(1) or "").strip().lower())
+        v = str(m.group(2) or "").strip()
+        if not k or not v:
+            continue
+        if k in {"name", "email"} or ("email" in k) or ("phone" in k):
+            continue
+        out[k[:64]] = v[:1500]
+    # Debug IDs (stable)
+    with suppress(Exception):
+        m2 = re.search(r"(?i)\buser=(user_[A-Za-z0-9]+)\b", s)
+        if m2:
+            out.setdefault("whop user id", m2.group(1))
+        m3 = re.search(r"(?i)\bmem=(mem_[A-Za-z0-9]+)\b", s)
+        if m3:
+            out.setdefault("membership id", m3.group(1))
+        m4 = re.search(r"(?i)\bplan=(plan_[A-Za-z0-9]+)\b", s)
+        if m4:
+            out.setdefault("plan id", m4.group(1))
+    return out
+
+
+def _extract_user_id_from_text(*parts: object) -> str:
+    blob = " ".join(str(p or "") for p in parts)
+    m = re.search(r"\b(user_[A-Za-z0-9]+)\b", blob)
+    if m:
+        return m.group(1)
+    m2 = re.search(r"/users/(user_[A-Za-z0-9]+)/", blob)
+    return m2.group(1) if m2 else ""
+
+
+def _extract_membership_id_from_text(*parts: object) -> str:
+    blob = " ".join(str(p or "") for p in parts)
+    m = re.search(r"\b(mem_[A-Za-z0-9]+)\b", blob)
+    if m:
+        return m.group(1)
+    m2 = re.search(r"\b(R-[A-Za-z0-9-]{8,})\b", blob)
+    return m2.group(1) if m2 else ""
+
+
+def _extract_username_from_text(desc: str) -> str:
+    s = _strip_emails(str(desc or ""))
+    m = re.search(r"(?im)^\s*[•*\-]\s*username\s*:\s*([A-Za-z0-9][A-Za-z0-9_.-]{1,62}[A-Za-z0-9]?)\s*$", s)
+    return str(m.group(1)).strip().lower() if m else ""
+
+
+def _ensure_whop_users_shape(db: dict) -> dict:
+    if not isinstance(db, dict):
+        db = {}
+    if not isinstance(db.get("whop_users"), dict):
+        db["whop_users"] = {}
+    if not isinstance(db.get("whop_user_index"), dict):
+        db["whop_user_index"] = {}
+    if not isinstance(db.get("whop_membership_index"), dict):
+        db["whop_membership_index"] = {}
+    return db
+
+
+def _apply_whop_membership_log_to_history(
+    db: dict,
+    *,
+    channel_id: int,
+    message_id: int,
+    jump_url: str,
+    created_at_iso: str,
+    title: str,
+    desc: str,
+) -> bool:
+    """Update db['whop_users'] from a whop-membership-logs embed description (PII-safe)."""
+    db = _ensure_whop_users_shape(db)
+    fields = _parse_bullet_kv(desc)
+    user_id = str(fields.get("whop user id") or _extract_user_id_from_text(desc, jump_url)).strip()
+    mem_id = str(fields.get("membership id") or _extract_membership_id_from_text(desc, jump_url)).strip()
+    username = str(fields.get("username") or _extract_username_from_text(desc)).strip().lower()
+    if not user_id.startswith("user_"):
+        # Without a stable key, skip.
+        return False
+    wu = db.get("whop_users") if isinstance(db.get("whop_users"), dict) else {}
+    if not isinstance(wu, dict):
+        return False
+    rec = wu.get(user_id) if isinstance(wu.get(user_id), dict) else {}
+    if not isinstance(rec, dict):
+        rec = {}
+    wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+    if not isinstance(wh, dict):
+        wh = {}
+    rec["whop"] = wh
+    if username:
+        wh["username"] = username
+        idx = db.get("whop_user_index")
+        if isinstance(idx, dict):
+            idx[username] = user_id
+    if mem_id and mem_id.startswith(("mem_", "R-")):
+        wh["last_membership_id"] = mem_id
+        midx = db.get("whop_membership_index")
+        if isinstance(midx, dict):
+            midx[mem_id] = user_id
+
+    latest = wh.get("membership_logs_latest") if isinstance(wh.get("membership_logs_latest"), dict) else {}
+    if not isinstance(latest, dict):
+        latest = {}
+    tkey = _norm_title_key(title)
+    latest[tkey] = {
+        "title": str(title or "").strip()[:256],
+        "created_at": str(created_at_iso or "").strip()[:64],
+        "message_id": int(message_id or 0),
+        "jump_url": str(jump_url or "").strip()[:300],
+        "membership_id": mem_id[:128],
+        "user_id": user_id[:64],
+        "fields": fields,
+        "source_channel_id": int(channel_id or 0),
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    wh["membership_logs_latest"] = latest
+    wu[user_id] = rec
+    db["whop_users"] = wu
+    return True
+
+
+def _ensure_member_whop_shape(rec: dict) -> dict:
+    if not isinstance(rec, dict):
+        rec = {}
+    if not isinstance(rec.get("whop"), dict):
+        rec["whop"] = {}
+    return rec
+
+
+def _apply_whop_logs_to_history(
+    db: dict,
+    *,
+    channel_id: int,
+    message_id: int,
+    jump_url: str,
+    created_at_iso: str,
+    title: str,
+    embed: discord.Embed,
+) -> bool:
+    """Update db[discord_id].whop.native_whop_logs_latest from a whop-logs embed (PII-safe)."""
+    if not isinstance(db, dict) or not isinstance(embed, discord.Embed):
+        return False
+    # Extract discord id
+    did = 0
+    try:
+        for f in (getattr(embed, "fields", None) or []):
+            if str(getattr(f, "name", "") or "").strip().lower() == "discord id":
+                m = re.search(r"\b(\d{17,19})\b", str(getattr(f, "value", "") or ""))
+                if m:
+                    did = int(m.group(1))
+                    break
+    except Exception:
+        did = 0
+    if not did:
+        blob = " ".join(
+            [
+                str(getattr(embed, "title", "") or ""),
+                str(getattr(embed, "description", "") or ""),
+                " ".join([f"{getattr(f,'name','')}: {getattr(f,'value','')}" for f in (getattr(embed, "fields", None) or [])]),
+            ]
+        )
+        m2 = re.search(r"\b(\d{17,19})\b", blob)
+        did = int(m2.group(1)) if m2 else 0
+    if did <= 0:
+        return False
+    key_val = ""
+    access_pass = ""
+    mstatus = ""
+    with suppress(Exception):
+        for f in (getattr(embed, "fields", None) or []):
+            n = str(getattr(f, "name", "") or "").strip().lower()
+            v = str(getattr(f, "value", "") or "").strip()
+            if n == "key":
+                key_val = v
+            elif n in {"access pass", "access_pass"}:
+                access_pass = v
+            elif n in {"membership status", "membership_status", "status"}:
+                mstatus = v
+            elif n in {"membership id", "membership_id"} and (not key_val):
+                key_val = v
+    # Normalize membership key
+    key_tok = _extract_membership_id_from_text(key_val)
+    if not key_tok:
+        key_tok = _extract_membership_id_from_text(str(getattr(embed, "description", "") or ""))
+
+    rec = db.get(str(did)) if isinstance(db.get(str(did)), dict) else {}
+    rec = _ensure_member_whop_shape(rec if isinstance(rec, dict) else {})
+    wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+    if not isinstance(wh, dict):
+        wh = {}
+    if key_tok.startswith(("mem_", "R-")):
+        wh["last_whop_key"] = key_tok
+        wh["last_membership_id"] = key_tok
+
+    latest = wh.get("native_whop_logs_latest") if isinstance(wh.get("native_whop_logs_latest"), dict) else {}
+    if not isinstance(latest, dict):
+        latest = {}
+    tkey = _norm_title_key(title)
+    latest[tkey] = {
+        "title": str(title or "").strip()[:256],
+        "created_at": str(created_at_iso or "").strip()[:64],
+        "message_id": int(message_id or 0),
+        "jump_url": str(jump_url or "").strip()[:300],
+        "key": str(key_tok or "").strip()[:128],
+        "membership_status": str(mstatus or "").strip()[:64],
+        "access_pass": str(access_pass or "").strip()[:128],
+        "source_channel_id": int(channel_id or 0),
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    wh["native_whop_logs_latest"] = latest
+    rec["whop"] = wh
+    db[str(did)] = rec
+    return True
+
+
+@tasks.loop(seconds=300)
+async def member_history_ingest_loop() -> None:
+    """Tail whop-logs + whop-membership-logs and update member_history.json (resume-safe)."""
+    try:
+        if not bot.is_ready():
+            return
+        if not bool(MEMBER_HISTORY_INGEST_ENABLED):
+            return
+        # Require channel IDs
+        if not (str(WHOP_LOGS_CHANNEL_ID or "").strip().isdigit() or str(WHOP_WEBHOOK_CHANNEL_ID or "").strip().isdigit()):
+            return
+
+        st = _ingest_state_load()
+        db = _load_member_history()
+        if not isinstance(db, dict):
+            db = {}
+        db = _ensure_whop_users_shape(db)
+
+        async def _tail_channel(cid: int, *, mode: str) -> int:
+            if cid <= 0:
+                return 0
+            ch0 = bot.get_channel(int(cid))
+            if ch0 is None:
+                with suppress(Exception):
+                    ch0 = await bot.fetch_channel(int(cid))
+            if not isinstance(ch0, discord.TextChannel):
+                return 0
+            after_id = _ingest_after_id(st, int(cid))
+            after_obj = discord.Object(id=int(after_id)) if int(after_id) > 0 else None
+            processed = 0
+            newest_seen = after_id
+            async for m in ch0.history(limit=int(MEMBER_HISTORY_INGEST_BATCH_LIMIT), after=after_obj, oldest_first=True):
+                processed += 1
+                newest_seen = max(int(newest_seen or 0), int(getattr(m, "id", 0) or 0))
+                if not m.embeds:
+                    continue
+                e0 = m.embeds[0]
+                if not isinstance(e0, discord.Embed):
+                    continue
+                title = str(getattr(e0, "title", "") or "").strip() or "(no title)"
+                jump = str(getattr(m, "jump_url", "") or "").strip()
+                created_iso = ""
+                with suppress(Exception):
+                    if getattr(m, "created_at", None):
+                        created_iso = m.created_at.astimezone(timezone.utc).isoformat()  # type: ignore[union-attr]
+                if mode == "whop_membership_logs":
+                    desc = str(getattr(e0, "description", "") or "")
+                    _apply_whop_membership_log_to_history(
+                        db,
+                        channel_id=int(cid),
+                        message_id=int(getattr(m, "id", 0) or 0),
+                        jump_url=jump,
+                        created_at_iso=created_iso,
+                        title=title,
+                        desc=desc,
+                    )
+                else:
+                    _apply_whop_logs_to_history(
+                        db,
+                        channel_id=int(cid),
+                        message_id=int(getattr(m, "id", 0) or 0),
+                        jump_url=jump,
+                        created_at_iso=created_iso,
+                        title=title,
+                        embed=e0,
+                    )
+            if newest_seen and int(newest_seen) > int(after_id or 0):
+                _ingest_set_after_id(st, int(cid), int(newest_seen))
+            return processed
+
+        logs_cid = int(WHOP_LOGS_CHANNEL_ID or 0) if str(WHOP_LOGS_CHANNEL_ID or "").strip().isdigit() else 0
+        mem_cid = int(WHOP_WEBHOOK_CHANNEL_ID or 0) if str(WHOP_WEBHOOK_CHANNEL_ID or "").strip().isdigit() else 0
+        p1 = await _tail_channel(logs_cid, mode="whop_logs")
+        p2 = await _tail_channel(mem_cid, mode="whop_membership_logs")
+
+        if p1 or p2:
+            _save_member_history(db)
+            _ingest_state_save(st)
+            with suppress(Exception):
+                await log_other(f"🧾 member_history_ingest: whop_logs={p1} whop_membership_logs={p2}")
+    except Exception as e:
+        with suppress(Exception):
+            await log_other(f"⚠️ member_history_ingest_loop error: `{str(e)[:200]}`")
+
 
 
 STAFF_ALERTS_FILE = BASE_DIR / "staff_alerts.json"
@@ -4058,20 +4632,30 @@ def _whop_summary_for_member(discord_id: int) -> dict:
         hist = get_member_history(int(discord_id)) or {}
         wh = hist.get("whop") if isinstance(hist, dict) else None
         if isinstance(wh, dict) and isinstance(wh.get("last_summary"), dict):
-            return wh.get("last_summary") or {}
+            base = wh.get("last_summary") or {}
+            mid = _membership_id_from_history(int(discord_id))
+            with suppress(Exception):
+                base = _enrich_whop_brief_from_membership_logs(base, membership_id=str(mid or "").strip())
+            return base if isinstance(base, dict) else {}
         # If we don't have a last_summary but we do have a membership_id,
         # fetch the most recent parsed native Whop summary by membership_id.
         mid = _membership_id_from_history(int(discord_id))
         if mid:
             cached = _get_native_summary_by_mid(mid)
             if isinstance(cached, dict) and cached:
-                return cached
+                base = cached
+                with suppress(Exception):
+                    base = _enrich_whop_brief_from_membership_logs(base, membership_id=str(mid or "").strip())
+                return base if isinstance(base, dict) else {}
         # Fallback: if we only have a timeline/status (from whop_history backfill),
         # expose at least status so staff cards aren't blank.
         if isinstance(wh, dict):
             st = str(wh.get("last_status") or "").strip().lower()
             if st:
-                return {"status": st}
+                base = {"status": st}
+                with suppress(Exception):
+                    base = _enrich_whop_brief_from_membership_logs(base, membership_id=str(mid or "").strip())
+                return base
     except Exception:
         return {}
     return {}
@@ -4635,6 +5219,75 @@ async def log_member_status(msg: str, embed: discord.Embed = None, *, channel_na
             sent = await ch.send(content=(content or ""), embed=embed, allowed_mentions=allow)
         try:
             await _maybe_capture_for_reporting(embed, is_member_status=is_member_status_target)
+        except Exception:
+            pass
+        # Also persist a compact baseline into member_history.json so staff lookup has usable data
+        # even when staff cannot open #whop-logs links.
+        try:
+            if sent and is_member_status_target and in_main_guild and isinstance(embed, discord.Embed):
+                ts_i, kind, discord_id, whop_brief = _extract_reporting_from_member_status_embed(
+                    embed,
+                    fallback_ts=int((getattr(sent, "created_at", None) or datetime.now(timezone.utc)).timestamp()),
+                )
+                if discord_id:
+                    # Update the staff-safe Whop summary snapshot (no PII).
+                    try:
+                        record_member_whop_summary(
+                            int(discord_id),
+                            (whop_brief or {}),
+                            event_type=str(kind or ""),
+                            membership_id=str((whop_brief or {}).get("membership_id") or ""),
+                        )
+                    except Exception:
+                        pass
+                    # Record the latest member-status card per kind.
+                    with suppress(Exception):
+                        record_member_status_baseline(
+                            int(discord_id),
+                            kind=str(kind or ""),
+                            message=sent,
+                            embed=embed,
+                            whop_brief=(whop_brief or {}),
+                        )
+                    # Record "blank/—" Whop outputs for debugging (PII-safe).
+                    if bool(MEMBER_HISTORY_BLANK_OUTPUTS_ENABLED):
+                        try:
+                            missing: list[str] = []
+                            for f in (getattr(embed, "fields", None) or []):
+                                nm = str(getattr(f, "name", "") or "").strip()
+                                val = str(getattr(f, "value", "") or "").strip()
+                                if not nm:
+                                    continue
+                                if nm.strip().lower() in {
+                                    "membership id",
+                                    "status",
+                                    "membership",
+                                    "total spent (lifetime)",
+                                    "remaining days",
+                                    "next billing date",
+                                    "access ends on",
+                                    "renewal window",
+                                    "whop dashboard",
+                                }:
+                                    if (not val) or val == "—" or val.strip() == "—":
+                                        missing.append(nm)
+                            if missing:
+                                _ensure_data_dir()
+                                append_jsonl(
+                                    BLANK_OUTPUTS_JSONL,
+                                    {
+                                        "ts_utc": datetime.now(timezone.utc).isoformat(),
+                                        "message_id": int(getattr(sent, "id", 0) or 0),
+                                        "channel_id": int(getattr(getattr(sent, "channel", None), "id", 0) or 0),
+                                        "title": str(getattr(embed, "title", "") or "")[:256],
+                                        "kind": str(kind or "")[:64],
+                                        "discord_id": int(discord_id),
+                                        "membership_id": str((whop_brief or {}).get("membership_id") or "")[:128],
+                                        "missing_fields": missing[:32],
+                                    },
+                                )
+                        except Exception:
+                            pass
         except Exception:
             pass
         return sent
@@ -5421,6 +6074,14 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
             return
 
         title, color, embed_kind = _title_for_event(kind)
+        # Fill missing Whop fields from membership-log baseline (no extra API calls).
+        try:
+            if not isinstance(brief, dict):
+                brief = {}
+            brief.setdefault("membership_id", str(mid2 or "").strip())
+            brief = _enrich_whop_brief_from_membership_logs(brief, membership_id=str(mid2 or "").strip())
+        except Exception:
+            pass
         connected_disp = str((brief or {}).get("connected_discord") or "").strip()
         did = _extract_discord_id_from_connected(connected_disp)
 
@@ -7356,6 +8017,15 @@ async def on_ready():
         asyncio.create_task(support_tickets.ensure_member_lookup_panel())
         log.info("[SupportTickets] Member lookup panel scheduled")
 
+    # Member history ingest: tail whop-logs + whop-membership-logs into member_history.json (resume-safe).
+    if bool(MEMBER_HISTORY_INGEST_ENABLED):
+        with suppress(Exception):
+            member_history_ingest_loop.change_interval(seconds=int(MEMBER_HISTORY_INGEST_INTERVAL_SECONDS))
+        with suppress(Exception):
+            if not member_history_ingest_loop.is_running():
+                member_history_ingest_loop.start()
+                log.info(f"[MemberHistory] Ingest loop started (every {int(MEMBER_HISTORY_INGEST_INTERVAL_SECONDS)}s)")
+
     if post_startup_report:
         startup_notes.append("Scheduler started and state restored.")
     
@@ -8197,11 +8867,16 @@ async def on_message(message: discord.Message):
     # Ticket triggers from member-status-logs channel (regardless of author),
     # but only if the embed footer identifies RSCheckerbot.
     if MEMBER_STATUS_LOGS_CHANNEL_ID and int(getattr(getattr(message, "channel", None), "id", 0) or 0) == int(MEMBER_STATUS_LOGS_CHANNEL_ID):
-        with suppress(Exception):
+        try:
             await _maybe_open_tickets_from_member_status_logs(message)
+        except Exception as ex:
+            with suppress(Exception):
+                await log_other(f"❌ SupportTickets: trigger error in member-status-logs msg_id={int(getattr(message,'id',0) or 0)} err=`{str(ex)[:240]}`")
         # Ticket audit logs (member-status-logs messages too).
-        with suppress(Exception):
+        try:
             await support_tickets.audit_message_create(message)
+        except Exception:
+            pass
         return
 
     # Support tickets: track last_activity for non-bot messages (always, even when webhooks are enabled).
@@ -8237,8 +8912,11 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
         await support_tickets.audit_message_edit(before, after)
     # Also re-run ticket triggers when member-status-logs messages are edited/updated.
     if MEMBER_STATUS_LOGS_CHANNEL_ID and int(getattr(getattr(after, "channel", None), "id", 0) or 0) == int(MEMBER_STATUS_LOGS_CHANNEL_ID):
-        with suppress(Exception):
+        try:
             await _maybe_open_tickets_from_member_status_logs(after)
+        except Exception as ex:
+            with suppress(Exception):
+                await log_other(f"❌ SupportTickets: trigger error in member-status-logs edit msg_id={int(getattr(after,'id',0) or 0)} err=`{str(ex)[:240]}`")
 
 
 @bot.event

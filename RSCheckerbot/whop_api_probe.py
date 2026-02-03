@@ -8,12 +8,13 @@ Small standalone script to confirm what Whop API returns, using your existing
 
 from __future__ import annotations
 
+import ast
 import argparse
 import asyncio
 import json
 import re
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -33,6 +34,8 @@ from rschecker_utils import access_roles_plain, coerce_role_ids, fmt_date_any, u
 from staff_embeds import build_case_minimal_embed, build_member_status_detailed_embed
 from whop_webhook_handler import _extract_email_from_embed as _extract_email_from_native_embed
 from whop_webhook_handler import _extract_discord_id_from_embed as _extract_discord_id_from_native_embed
+from whop_webhook_handler import _extract_native_kv_from_embed as _extract_native_kv_from_native_embed
+from whop_webhook_handler import _build_whop_summary_from_native_kv as _build_whop_summary_from_native_kv
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -40,6 +43,1189 @@ _PROBE_STAFFCARDS_DEDUPE_FILE = BASE_DIR / ".probe_staffcards_sent.json"
 _MEMBER_HISTORY_FILE = BASE_DIR / "member_history.json"
 _WHOP_IDENTITY_CACHE_FILE = BASE_DIR / "whop_identity_cache.json"
 _PROBE_WHOPLOGS_STATE_FILE = BASE_DIR / ".probe_whoplogs_baseline_state.json"
+_PROBE_MEMBERSTATUS_STATE_FILE = BASE_DIR / ".probe_memberstatus_cards_state.json"
+
+
+def _backup_path(prefix: str, *, suffix: str = ".json") -> Path:
+    """Return a timestamped path under RSCheckerbot/backups/."""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    out_dir = BASE_DIR / "backups"
+    with suppress(Exception):
+        out_dir.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(prefix or "scan")).strip("_")
+    return out_dir / f"{safe}_{ts}{suffix}"
+
+
+def _latest_backup(prefix: str) -> Path | None:
+    """Return most recently modified backup file matching prefix."""
+    out_dir = BASE_DIR / "backups"
+    if not out_dir.exists():
+        return None
+    best: Path | None = None
+    best_m = 0.0
+    for p in out_dir.glob(f"{prefix}_*.json"):
+        try:
+            m = float(p.stat().st_mtime)
+        except Exception:
+            m = 0.0
+        if (best is None) or (m > best_m):
+            best = p
+            best_m = m
+    return best
+
+
+def _safe_int(v: object, default: int = 0) -> int:
+    try:
+        s = str(v or "").strip()
+        return int(s) if s.isdigit() else int(v)  # type: ignore[arg-type]
+    except Exception:
+        return int(default)
+
+
+def _pretty_kv(d: dict, *, keys: list[str]) -> str:
+    out: list[str] = []
+    for k in keys:
+        v = d.get(k) if isinstance(d, dict) else None
+        if v is None or v == "" or v == {} or v == []:
+            continue
+        out.append(f"- {k}: {v}")
+    return "\n".join(out) if out else "(none)"
+
+
+def _load_report_json(path: Path) -> dict:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8") or "{}")
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _report_titles_sorted(report: dict) -> list[dict[str, Any]]:
+    titles = ((report.get("observed") or {}).get("titles") or {}) if isinstance(report, dict) else {}
+    titles = titles if isinstance(titles, dict) else {}
+    merged = report.get("merge") if isinstance(report.get("merge"), dict) else {}
+    merged = merged if isinstance(merged, dict) else {}
+    rows: list[dict[str, Any]] = []
+    for title, rec in titles.items():
+        if not isinstance(rec, dict):
+            continue
+        m = merged.get(title) if isinstance(merged.get(title), dict) else {}
+        rows.append(
+            {
+                "title": str(title),
+                "count": int(rec.get("count", 0) or 0),
+                "has_discord_id_field": bool(rec.get("has_discord_id_field")),
+                "has_email_field": bool(rec.get("has_email_field")),
+                "producer_title_match": bool((m or {}).get("producer_title_match")),
+                "dominant_kind": str((m or {}).get("dominant_kind") or ""),
+            }
+        )
+    rows.sort(key=lambda r: (int(r.get("count", 0) or 0), str(r.get("title") or "")), reverse=True)
+    return rows
+
+
+def _rebuild_merge_from_observed(report: dict) -> dict:
+    """Recompute code_scan + merge for an existing report (no Discord scan)."""
+    observed = report.get("observed") if isinstance(report.get("observed"), dict) else {}
+    titles = observed.get("titles") if isinstance(observed.get("titles"), dict) else {}
+    code = _scan_rscheckerbot_member_status_code()
+    producer_title_keys = set(code.get("producer_titles") or [])
+    callsites_by_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for cs in (code.get("embed_callsites") or []):
+        if isinstance(cs, dict) and str(cs.get("title_key") or "").strip():
+            callsites_by_key[str(cs.get("title_key"))].append(cs)
+    title_for_event_by_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for it in (code.get("title_for_event_titles") or []):
+        if isinstance(it, dict) and str(it.get("title_key") or "").strip():
+            title_for_event_by_key[str(it.get("title_key"))].append(it)
+
+    open_kinds = {"payment_failed", "deactivated", "cancellation_scheduled", "member_joined"}
+    close_title_fragments = {
+        "membership activated",
+        "payment activated",
+        "payment renewed",
+        "payment resumed",
+        "access restored",
+    }
+    close_kinds = {"membership_activated_pending", "trialing", "member_role_added"}
+
+    merged: dict[str, Any] = {}
+    for title, rec in titles.items():
+        if not isinstance(rec, dict):
+            continue
+        key = _title_key(str(title))
+        inferred_kind = _infer_member_status_kind(str(title))
+        kinds_d = rec.get("kinds") if isinstance(rec.get("kinds"), dict) else {}
+        dominant_kind = inferred_kind
+        try:
+            if kinds_d:
+                dominant_kind = max(kinds_d.items(), key=lambda kv: int(kv[1] or 0))[0]
+        except Exception:
+            dominant_kind = inferred_kind
+
+        title_low = str(title).lower()
+        used_by_ticket_open = dominant_kind in open_kinds
+        used_by_ticket_close = (dominant_kind in close_kinds) or any(frag in title_low for frag in close_title_fragments)
+
+        fl = rec.get("field_labels") if isinstance(rec.get("field_labels"), dict) else {}
+        top_field_labels: list[dict[str, Any]] = []
+        try:
+            items = sorted(fl.items(), key=lambda kv: int(kv[1] or 0), reverse=True)
+            for n, c in items[:12]:
+                top_field_labels.append({"label": str(n), "count": int(c or 0)})
+        except Exception:
+            top_field_labels = []
+
+        merged[str(title)] = {
+            "title_key": key,
+            "count": int(rec.get("count", 0) or 0),
+            "dominant_kind": dominant_kind,
+            "producer_title_match": bool(key and key in producer_title_keys),
+            "producer_callsites": (callsites_by_key.get(key) or [])[:6],
+            "producer_title_for_event": (title_for_event_by_key.get(key) or [])[:6],
+            "used_by_ticket_open": bool(used_by_ticket_open),
+            "used_by_ticket_close": bool(used_by_ticket_close),
+            "has_discord_id_field": bool(rec.get("has_discord_id_field")),
+            "has_membership_id_field": bool(rec.get("has_membership_id_field")),
+            "has_email_field": bool(rec.get("has_email_field")),
+            "top_field_labels": top_field_labels,
+        }
+
+    report["code_scan"] = code
+    report["merge"] = merged
+    unknown_titles = [t for t, info in merged.items() if not bool((info or {}).get("producer_title_match"))]
+    unknown_titles.sort(key=lambda t: int((merged.get(t) or {}).get("count", 0) or 0), reverse=True)
+    if not isinstance(report.get("observed"), dict):
+        report["observed"] = {}
+    report["observed"]["unknown_titles"] = unknown_titles[:200]
+    return report
+
+
+def _view_member_history_for_discord_id(did: int) -> str:
+    db = _load_json_file(_MEMBER_HISTORY_FILE)
+    rec = db.get(str(int(did))) if isinstance(db, dict) else None
+    if not isinstance(rec, dict):
+        return "No record in member_history.json for this Discord ID."
+    wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+    out: list[str] = []
+    out.append("== member_history.json ==")
+    out.append(f"discord_id: {did}")
+    if isinstance(wh, dict):
+        out.append("")
+        out.append("== whop ==")
+        out.append(_pretty_kv(wh, keys=["last_membership_id", "last_whop_key", "last_status", "last_event_type", "last_event_ts"]))
+        ls = wh.get("last_summary") if isinstance(wh.get("last_summary"), dict) else {}
+        if isinstance(ls, dict) and ls:
+            # Keep it compact; summary is already PII-scrubbed by main bot.
+            out.append("")
+            out.append("== whop.last_summary (keys) ==")
+            out.append(", ".join(sorted(ls.keys())[:50]))
+        ms = wh.get("member_status_logs_latest") if isinstance(wh.get("member_status_logs_latest"), dict) else {}
+        if isinstance(ms, dict) and ms:
+            out.append("")
+            out.append("== whop.member_status_logs_latest ==")
+            # Show per kind: title + created_at
+            for k, v in sorted(ms.items(), key=lambda kv: str(kv[0])):
+                if not isinstance(v, dict):
+                    continue
+                out.append(f"- {k}: {v.get('title','')}  ({_short_iso(v.get('created_at') or v.get('recorded_at') or '')})")
+        nw = wh.get("native_whop_logs_latest") if isinstance(wh.get("native_whop_logs_latest"), dict) else {}
+        if isinstance(nw, dict) and nw:
+            out.append("")
+            out.append("== whop.native_whop_logs_latest (titles) ==")
+            keys = sorted(list(nw.keys()))[:25]
+            out.append(", ".join(keys) + (" ..." if len(nw) > len(keys) else ""))
+    return "\n".join(out)
+
+
+def _memberstatus_template_labels(*, kind: str) -> dict[str, list[str]]:
+    """Human-friendly list of possible labels for member-status cards (template-level)."""
+    k = str(kind or "").strip().lower()
+
+    # These are the stable “sections” used by staff_embeds.build_member_status_detailed_embed().
+    # Not all labels appear on every card (many are conditional).
+    base = [
+        "Member",
+        "Discord ID",
+        "Current Roles",
+    ]
+
+    member_activity = [
+        "Discord Account Created",
+        "First Joined",
+        "Join Count",
+        "Returning Member",
+        "Left At",
+        "Ever Had Member Role",
+        "First Access",
+        "Last Access",
+        "Roles Added",
+        "Roles Removed",
+        "Reason",
+        "Invite Code",
+        "Tracked Invite",
+        "Source",
+        "Access Roles At Leave",
+        "Whop Link",
+    ]
+
+    # Whop core fields shown on non-lifecycle cards (forced on many cases)
+    whop_core = [
+        "Membership ID",
+        "Status",
+        "Membership",
+        "Total Spent",
+        "Remaining Days",
+        "Next Billing Date",
+        "Access Ends On",
+        "Whop Dashboard",
+        "Renewal Window",
+        "Connected Discord",
+        "Cancellation reason",
+        "Cancel At Period End",
+    ]
+
+    whop_extra = [
+        "Trial Days",
+        "Plan Is Renewal",
+        "Promo",
+        "Pricing",
+        "MRR",
+        "Customer since",
+        "Last Successful Payment",
+        "Last Payment Method",
+        "Last Payment Type",
+        "Payment Issue",
+    ]
+
+    # Lifecycle cards often show only “Whop not linked …” instead of the full core set.
+    lifecycle_hint = ["Whop"]
+
+    # Best-effort: suggest which labels are most likely for the kind.
+    if k in {"member_joined", "member_left"}:
+        return {
+            "Base": base,
+            "MemberActivity": member_activity,
+            "LifecycleWhopHint": lifecycle_hint,
+        }
+    if k in {"payment_failed", "cancellation_scheduled", "deactivated", "payment_succeeded", "membership_activated", "membership_activated_pending"}:
+        return {
+            "Base": base,
+            "MemberActivity": member_activity,
+            "WhopCore": whop_core,
+            "WhopExtra": whop_extra,
+        }
+    return {
+        "Base": base,
+        "MemberActivity": member_activity,
+        "WhopCore": whop_core,
+        "WhopExtra": whop_extra,
+    }
+
+def _ticket_impact_for_memberstatus(*, kind: str, title: str = "") -> dict[str, Any]:
+    """Best-effort mapping of a member-status card to ticket actions (based on main.py logic)."""
+    k = str(kind or "").strip().lower()
+    t = str(title or "").strip().lower()
+    out: dict[str, Any] = {"opens": [], "closes": [], "follows_up": [], "notes": []}
+
+    # Open tickets
+    if k == "member_joined":
+        out["opens"].append("free_pass (only if no membership_id recorded yet)")
+    if k == "payment_failed" or ("billing issue" in t) or ("past due" in t) or ("payment failed" in t):
+        out["opens"].append("billing")
+    if k in {"cancellation_scheduled", "deactivated"} or ("cancellation" in t) or ("deactivated" in t):
+        out["opens"].append("cancellation")
+
+    # Close / resolve signals
+    if (
+        k in {"membership_activated_pending", "member_role_added", "trialing"}
+        or ("membership activated" in t)
+        or ("payment activated" in t)
+        or ("payment renewed" in t)
+        or ("payment resumed" in t)
+        or ("access restored" in t)
+    ):
+        out["closes"].append("free_pass (if Members role present)")
+        out["follows_up"].append("billing (post resolution follow-up + remove role)")
+        out["follows_up"].append("cancellation (post resolution follow-up + remove role)")
+
+    if ("payment succeeded" in t) or ("payment received" in t):
+        out["closes"].append("free_pass (if Members role present)")
+        out["follows_up"].append("billing (post resolution follow-up + remove role)")
+        out["follows_up"].append("cancellation (post resolution follow-up + remove role)")
+
+    # No-Whop link tickets can be closed by any card that includes Connected Discord matching the member;
+    # title is not the gate (field is).
+    out["notes"].append("no_whop_link: can close when card has Connected Discord matching member (field-driven, not title-driven)")
+    return out
+
+
+def _code_defined_memberstatus_cards() -> list[dict[str, Any]]:
+    """Return a de-duped list of member-status card titles defined by code."""
+    code = _scan_rscheckerbot_member_status_code()
+    cards: dict[str, dict[str, Any]] = {}
+
+    def _add(*, title: str, kind: str, sources: list[dict[str, Any]], variants: list[str] | None = None) -> None:
+        t = str(title or "").strip()
+        if not t:
+            return
+        key = _title_key(t)
+        if not key:
+            return
+        rec = cards.get(key) if isinstance(cards.get(key), dict) else None
+        if rec is None:
+            rec = {
+                "title": t,
+                "title_key": key,
+                "kind": str(kind or "").strip().lower() or _infer_member_status_kind(t),
+                "sources": [],
+                "variants": [],
+            }
+            cards[key] = rec
+        # Merge sources
+        if sources:
+            s0 = rec.get("sources") if isinstance(rec.get("sources"), list) else []
+            for s in sources:
+                if isinstance(s, dict):
+                    s0.append(s)
+            rec["sources"] = s0
+        # Merge variants
+        if variants:
+            v0 = rec.get("variants") if isinstance(rec.get("variants"), list) else []
+            for v in variants:
+                vv = str(v or "").strip()
+                if vv and vv not in v0:
+                    v0.append(vv)
+            rec["variants"] = v0
+
+    # From _title_for_event() (main producer catalog)
+    for it in (code.get("title_for_event_titles") or []):
+        if not isinstance(it, dict):
+            continue
+        title = str(it.get("title") or "").strip()
+        embed_kind = str(it.get("embed_kind") or "").strip()
+        src = {"file": str(it.get("file") or "main.py"), "line": int(it.get("line", 0) or 0), "source": str(it.get("source") or "_title_for_event")}
+        # Variants when Discord member cannot be resolved (these show up in channel history)
+        variants = [
+            f"{title} (Discord not linked)",
+            f"{title} (Discord linked, not in server)",
+        ]
+        _add(title=title, kind=embed_kind, sources=[src], variants=variants)
+
+    # From literal embed builder callsites (handlers)
+    for cs in (code.get("embed_callsites") or []):
+        if not isinstance(cs, dict):
+            continue
+        title = str(cs.get("title") or "").strip()
+        kind = str(cs.get("event_hint") or "").strip().lower()
+        src = {"file": str(cs.get("file") or ""), "line": int(cs.get("line", 0) or 0), "context": str(cs.get("context") or ""), "source": "embed_callsite"}
+        _add(title=title, kind=kind, sources=[src], variants=None)
+
+    # De-dupe sources per card
+    out: list[dict[str, Any]] = []
+    for k, rec in cards.items():
+        if not isinstance(rec, dict):
+            continue
+        # Normalize kind (event_hint may be webhook event string; fallback to inferred)
+        kk = str(rec.get("kind") or "").strip().lower()
+        if kk and "." in kk:
+            kk = _infer_member_status_kind(str(rec.get("title") or ""))
+        rec["kind"] = kk or _infer_member_status_kind(str(rec.get("title") or ""))
+        # De-dupe sources
+        srcs = rec.get("sources") if isinstance(rec.get("sources"), list) else []
+        seen = set()
+        uniq = []
+        for s in srcs:
+            if not isinstance(s, dict):
+                continue
+            sig = (str(s.get("file") or ""), int(s.get("line") or 0), str(s.get("source") or ""), str(s.get("context") or ""))
+            if sig in seen:
+                continue
+            seen.add(sig)
+            uniq.append(s)
+        rec["sources"] = uniq
+        rec["labels"] = _memberstatus_template_labels(kind=str(rec.get("kind") or ""))
+        rec["ticket_impact"] = _ticket_impact_for_memberstatus(kind=str(rec.get("kind") or ""), title=str(rec.get("title") or ""))
+        out.append(rec)
+
+    out.sort(key=lambda r: str(r.get("title") or ""))
+    return out
+
+
+def _probe_memberstatus_codeview(args: argparse.Namespace) -> int:
+    """Interactive viewer for code-defined member-status card titles and their labels."""
+    cards = _code_defined_memberstatus_cards()
+    if not cards:
+        print("No code-defined member-status cards found.")
+        return 2
+
+    filtered = cards
+
+    def _print_list(pool: list[dict[str, Any]]) -> None:
+        print("")
+        print(f"Code Cards ({len(pool)}):")
+        for i, c in enumerate(pool, 1):
+            title = str(c.get("title") or "")
+            kind = str(c.get("kind") or "")[:22]
+            srcs = c.get("sources") if isinstance(c.get("sources"), list) else []
+            ti = c.get("ticket_impact") if isinstance(c.get("ticket_impact"), dict) else {}
+            opens = ti.get("opens") if isinstance(ti.get("opens"), list) else []
+            closes = ti.get("closes") if isinstance(ti.get("closes"), list) else []
+            tag = ""
+            if opens:
+                tag = "OPEN"
+            if closes:
+                tag = (tag + "+CLOSE") if tag else "CLOSE"
+            print(f"{i:>3}. {kind:<22} [{tag or '----'}] {title}   (sources={len(srcs)})")
+        print("")
+
+    def _show(idx: int, pool: list[dict[str, Any]]) -> None:
+        if idx < 1 or idx > len(pool):
+            print("Invalid index.")
+            return
+        c = pool[idx - 1]
+        title = str(c.get("title") or "")
+        kind = str(c.get("kind") or "")
+        print("")
+        print("=" * 80)
+        print(f"CODE CARD: {title}")
+        print("=" * 80)
+        print(f"kind: {kind}")
+
+        ti = c.get("ticket_impact") if isinstance(c.get("ticket_impact"), dict) else {}
+        opens = ti.get("opens") if isinstance(ti.get("opens"), list) else []
+        closes = ti.get("closes") if isinstance(ti.get("closes"), list) else []
+        follows = ti.get("follows_up") if isinstance(ti.get("follows_up"), list) else []
+        notes = ti.get("notes") if isinstance(ti.get("notes"), list) else []
+        if opens or closes or follows:
+            print("\nTicket impact (from main.py trigger logic):")
+            if opens:
+                print("  Opens:")
+                for x in opens:
+                    print(f"    - {x}")
+            if closes:
+                print("  Closes:")
+                for x in closes:
+                    print(f"    - {x}")
+            if follows:
+                print("  Follow-ups:")
+                for x in follows:
+                    print(f"    - {x}")
+        if notes:
+            print("\nNotes:")
+            for n in notes[:4]:
+                print(f"  - {n}")
+
+        vars0 = c.get("variants") if isinstance(c.get("variants"), list) else []
+        if vars0:
+            print("\nVariants (may appear in channel history):")
+            for v in vars0[:8]:
+                print(f"  - {v}")
+
+        print("\nLabels (template-level):")
+        labels = c.get("labels") if isinstance(c.get("labels"), dict) else {}
+        for sec, items in (labels or {}).items():
+            if not isinstance(items, list):
+                continue
+            print(f"  {sec}:")
+            for it in items:
+                print(f"    - {it}")
+
+        print("\nSources (where this title is produced):")
+        srcs = c.get("sources") if isinstance(c.get("sources"), list) else []
+        if not srcs:
+            print("  (none)")
+        for s in srcs[:12]:
+            if not isinstance(s, dict):
+                continue
+            file = str(s.get("file") or "")
+            line = int(s.get("line", 0) or 0)
+            src = str(s.get("source") or "")
+            ctx = str(s.get("context") or "")
+            extra = f"  {ctx}" if ctx else ""
+            print(f"  - {file}:{line}  ({src}){extra}")
+        print("")
+
+    print("=== Member Status CODE Cards Viewer ===")
+    print("This lists every member-status card title defined by RSCheckerbot code (not Discord history).")
+    print("")
+    print("Commands:")
+    print("  L        = list code cards")
+    print("  <n>      = open card #n")
+    print("  S <n>    = open card #n")
+    print("  F <text> = filter by title substring")
+    print("  A        = reset filter")
+    print("  Q        = quit")
+    print("")
+
+    while True:
+        try:
+            raw = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("")
+            break
+        if not raw:
+            continue
+        if raw.isdigit():
+            _show(int(raw), filtered)
+            continue
+        cmd = raw.split(" ", 1)
+        c = cmd[0].strip().lower()
+        arg = cmd[1].strip() if len(cmd) > 1 else ""
+        if c == "q":
+            break
+        if c == "l":
+            _print_list(filtered)
+            continue
+        if c == "a":
+            filtered = cards
+            _print_list(filtered)
+            continue
+        if c == "f":
+            q = arg.lower().strip()
+            if not q:
+                filtered = cards
+                _print_list(filtered)
+                continue
+            filtered = [x for x in cards if q in str(x.get("title") or "").lower()]
+            if not filtered:
+                print("No matches. Try: A")
+                continue
+            _print_list(filtered)
+            continue
+        if c == "s":
+            if not arg or (not arg.strip().isdigit()):
+                print("Usage: S <n>")
+                continue
+            _show(int(arg.strip()), filtered)
+            continue
+        print("Unknown command. Use: L, <n>, S <n>, F <text>, A, Q")
+
+    return 0
+
+
+def _probe_memberstatus_view(args: argparse.Namespace) -> int:
+    """Interactive viewer for memberstatus-cards reports + member_history.json."""
+    rep_path_raw = str(getattr(args, "report", "") or "").strip()
+    rep_path = Path(rep_path_raw) if rep_path_raw else (_latest_backup("memberstatus_cards_scan") or None)
+    if rep_path is None or (not rep_path.exists()):
+        print("No report found. Run `memberstatus-cards` first (it writes to RSCheckerbot/backups/).")
+        return 2
+
+    report = _load_report_json(rep_path)
+    if not report:
+        print(f"Failed to load report: {rep_path}")
+        return 2
+
+    if bool(getattr(args, "refresh_code", False)):
+        report = _rebuild_merge_from_observed(report)
+        outp = _backup_path("memberstatus_cards_refreshed")
+        try:
+            outp.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+            print(f"✅ Refreshed code mapping saved to: {outp}")
+        except Exception as e:
+            print(f"⚠️ Failed to write refreshed report: {e}")
+        return 0
+
+    print("=== Member Status Report Viewer ===")
+    print(f"report: {rep_path}")
+    meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+    print(f"scanned_at: {meta.get('scanned_at')}")
+    print(f"scanned_messages: {meta.get('scanned_messages')}  embeds: {meta.get('messages_with_embeds')}  unique_titles: {meta.get('unique_titles')}")
+    print("")
+    print("Commands:")
+    print("  L              = list titles")
+    print("  <n>            = open title #n (same as: S n)")
+    print("  S <n>          = show title details by index (from list)")
+    print("  F <text>       = filter titles (substring). Example: F payment")
+    print("  A              = show ALL titles (reset filter)")
+    print("  G              = group titles by trigger/use (ticket open/close, whop-only, unknown)")
+    print("  M <discord_id> = show member_history.json snapshot for a Discord ID")
+    print("  R              = refresh code mapping (no Discord scan) -> writes new report file")
+    print("  H              = help")
+    print("  Q              = quit")
+    print("")
+
+    rows = _report_titles_sorted(report)
+    filtered = rows
+
+    def _print_list(pool: list[dict[str, Any]]) -> None:
+        print("")
+        print(f"Titles ({len(pool)}):")
+        for i, r in enumerate(pool, 1):
+            title = str(r.get("title") or "")
+            count = int(r.get("count", 0) or 0)
+            did_ok = "DID" if bool(r.get("has_discord_id_field")) else "---"
+            em_ok = "EML" if bool(r.get("has_email_field")) else "---"
+            prod = "OK" if bool(r.get("producer_title_match")) else "??"
+            kind = str(r.get("dominant_kind") or "")[:18]
+            print(f"{i:>3}. [{prod}] [{did_ok}/{em_ok}] {count:>5}  {kind:<18}  {title}")
+        print("")
+
+    def _help() -> None:
+        print("")
+        print("Help:")
+        print("  - Start with: L")
+        print("  - Then type a number like: 1   (opens details for title #1)")
+        print("  - Filter by text like: F cancel")
+        print("  - Reset filter: A")
+        print("  - Group by trigger: G")
+        print("  - Check member data: M <discord_id>")
+        print("")
+
+    def _group_view() -> None:
+        merged = report.get("merge") if isinstance(report.get("merge"), dict) else {}
+        merged = merged if isinstance(merged, dict) else {}
+
+        def _get_flags(title: str) -> tuple[bool, bool, bool, bool]:
+            mrec = merged.get(title) if isinstance(merged.get(title), dict) else {}
+            open0 = bool(mrec.get("used_by_ticket_open"))
+            close0 = bool(mrec.get("used_by_ticket_close"))
+            did0 = bool(mrec.get("has_discord_id_field"))
+            eml0 = bool(mrec.get("has_email_field"))
+            return (open0, close0, did0, eml0)
+
+        groups: dict[str, list[dict[str, Any]]] = {
+            "TicketOpenTriggers": [],
+            "TicketCloseSignals": [],
+            "WhopOnly_Unlinked": [],
+            "UnknownOrLegacy": [],
+        }
+
+        for r in rows:
+            title = str(r.get("title") or "")
+            open0, close0, did0, eml0 = _get_flags(title)
+            if open0:
+                groups["TicketOpenTriggers"].append(r)
+                continue
+            if close0:
+                groups["TicketCloseSignals"].append(r)
+                continue
+            if (not did0) and eml0:
+                groups["WhopOnly_Unlinked"].append(r)
+                continue
+            if not bool(r.get("producer_title_match")):
+                groups["UnknownOrLegacy"].append(r)
+                continue
+
+        print("")
+        print("=" * 80)
+        print("GROUP VIEW (organized by what triggers/uses these cards)")
+        print("=" * 80)
+        for name in ("TicketOpenTriggers", "TicketCloseSignals", "WhopOnly_Unlinked", "UnknownOrLegacy"):
+            pool = groups.get(name) or []
+            pool.sort(key=lambda r: int(r.get("count", 0) or 0), reverse=True)
+            print("")
+            print(f"{name} ({len(pool)}):")
+            for r in pool[:25]:
+                title = str(r.get("title") or "")
+                count = int(r.get("count", 0) or 0)
+                kind = str(r.get("dominant_kind") or "")[:18]
+                did_ok = "DID" if bool(r.get("has_discord_id_field")) else "---"
+                em_ok = "EML" if bool(r.get("has_email_field")) else "---"
+                prod = "OK" if bool(r.get("producer_title_match")) else "??"
+                print(f"  - [{prod}] [{did_ok}/{em_ok}] {count:>5}  {kind:<18}  {title}")
+            if len(pool) > 25:
+                print(f"  ... +{len(pool) - 25} more")
+        print("")
+
+    def _show_details(idx: int, pool: list[dict[str, Any]]) -> None:
+        if idx < 1 or idx > len(pool):
+            print("Invalid index.")
+            return
+        title = str(pool[idx - 1].get("title") or "")
+        obs_titles = ((report.get("observed") or {}).get("titles") or {}) if isinstance(report, dict) else {}
+        obs_titles = obs_titles if isinstance(obs_titles, dict) else {}
+        rec = obs_titles.get(title) if isinstance(obs_titles.get(title), dict) else {}
+        m = report.get("merge") if isinstance(report.get("merge"), dict) else {}
+        mrec = m.get(title) if isinstance(m.get(title), dict) else {}
+
+        print("")
+        print("=" * 80)
+        print(f"TITLE: {title}")
+        print("=" * 80)
+        print(f"count: {rec.get('count')}")
+        print(f"dominant_kind: {mrec.get('dominant_kind')}")
+        print(f"producer_title_match: {mrec.get('producer_title_match')}")
+        print(f"ticket_open: {mrec.get('used_by_ticket_open')}  ticket_close: {mrec.get('used_by_ticket_close')}")
+
+        print("\nField labels (top):")
+        fl = rec.get("field_labels") if isinstance(rec.get("field_labels"), dict) else {}
+        items = sorted(fl.items(), key=lambda kv: int(kv[1] or 0), reverse=True)[:30]
+        for n, c in items:
+            print(f"  - {n}: {c}")
+
+        print("\nProducer callsites:")
+        pcs = mrec.get("producer_callsites") if isinstance(mrec.get("producer_callsites"), list) else []
+        if not pcs:
+            print("  (none found in code scan)")
+        else:
+            for cs in pcs[:10]:
+                if not isinstance(cs, dict):
+                    continue
+                print(f"  - {cs.get('file')}:{cs.get('line')}  {cs.get('context')}  title={cs.get('title')}")
+
+        pte = mrec.get("producer_title_for_event") if isinstance(mrec.get("producer_title_for_event"), list) else []
+        if pte:
+            print("\nProduced by _title_for_event():")
+            for cs in pte[:10]:
+                if not isinstance(cs, dict):
+                    continue
+                print(f"  - main.py:{cs.get('line')}  embed_kind={cs.get('embed_kind')}  title={cs.get('title')}")
+
+        print("\nSamples (jump links):")
+        samples = rec.get("samples") if isinstance(rec.get("samples"), list) else []
+        for s in samples[:3]:
+            if not isinstance(s, dict):
+                continue
+            print(f"  - {_short_iso(s.get('created_at') or '')}  {s.get('jump_url')}")
+        print("")
+
+    while True:
+        try:
+            raw = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("")
+            break
+        if not raw:
+            continue
+        # Convenience: typing a number opens that row.
+        if raw.strip().isdigit():
+            _show_details(int(raw.strip()), filtered)
+            continue
+        cmd = raw.strip().split(" ", 1)
+        c = cmd[0].strip().lower()
+        arg = cmd[1].strip() if len(cmd) > 1 else ""
+        if c == "q":
+            break
+        if c == "h":
+            _help()
+            continue
+        if c == "l":
+            _print_list(filtered)
+            continue
+        if c == "a":
+            filtered = rows
+            _print_list(filtered)
+            continue
+        if c == "g":
+            _group_view()
+            continue
+        if c == "f":
+            q = arg.lower().strip()
+            # If user accidentally typed a number (common mistake), treat it as select.
+            if q.isdigit():
+                _show_details(int(q), filtered)
+                continue
+            if not q:
+                filtered = rows
+                _print_list(filtered)
+                continue
+            proposed = [r for r in rows if q in str(r.get("title") or "").lower()]
+            if not proposed:
+                print("No matches for that filter. Try: A (show all) or F <different text>.")
+                continue
+            filtered = proposed
+            _print_list(filtered[:80])
+            continue
+        if c == "s":
+            if not arg:
+                print("Usage: S <n>   (or just type the number)")
+                continue
+            idx = _safe_int(arg, 0)
+            _show_details(idx, filtered)
+            continue
+        if c == "m":
+            # Allow raw mention / text; extract first snowflake.
+            m0 = re.search(r"(\d{17,19})", str(arg or ""))
+            did = int(m0.group(1)) if m0 else _safe_int(arg, 0)
+            if did <= 0:
+                print("Usage: M <discord_id>")
+                continue
+            print(_view_member_history_for_discord_id(int(did)))
+            print("")
+            continue
+        if c == "r":
+            report = _rebuild_merge_from_observed(report)
+            outp = _backup_path("memberstatus_cards_refreshed")
+            try:
+                outp.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+                print(f"✅ Refreshed code mapping saved to: {outp}")
+            except Exception as e:
+                print(f"⚠️ Failed to write refreshed report: {e}")
+            # Reload rows from refreshed report
+            rows = _report_titles_sorted(report)
+            filtered = rows
+            continue
+
+        print("Unknown command. Use: L, <n>, S <n>, F <text>, A, G, M <discord_id>, R, H, Q")
+
+    return 0
+
+def _short_iso(ts: object) -> str:
+    s = str(ts or "").strip()
+    if not s:
+        return ""
+    if "T" in s:
+        s = s.replace("T", " ")
+    if s.endswith("+00:00"):
+        s = s[:-6] + "Z"
+    return s[:19] + ("Z" if s.endswith("Z") else "")
+
+
+def _title_key(s: str) -> str:
+    """Normalize for comparing titles across historical drift."""
+    t = str(s or "").strip()
+    if not t:
+        return ""
+    # Drop common probe prefixes
+    if t.lower().startswith("[api probe]"):
+        t = t[len("[api probe]") :].strip()
+    # Drop common suffixes like "(Discord not linked)" / "(Discord linked, not in server)"
+    t = re.sub(r"\s*\((discord.*?|unverified.*?)\)\s*$", "", t, flags=re.IGNORECASE).strip()
+    t = re.sub(r"\s+", " ", t).strip().lower()
+    return t
+
+
+def _infer_member_status_kind(title: str) -> str:
+    """Best-effort kind inference from an observed member-status title."""
+    t = str(title or "").strip().lower()
+    if not t:
+        return "unknown"
+    if "payment created" in t:
+        return "payment_created"
+    if "payment pending" in t:
+        return "payment_pending"
+    if "setup intent" in t:
+        return "setup_intent"
+    if "entry " in t or t.startswith("📩 entry") or "waitlist" in t:
+        return "entry"
+    if "invoice " in t:
+        return "invoice"
+    if "refund" in t:
+        return "refund"
+    if "dispute" in t:
+        return "dispute"
+    if "payment failed" in t or "billing issue" in t or "access risk" in t:
+        return "payment_failed"
+    if "payment succeeded" in t or "payment renewed" in t or "payment activated" in t or "access restored" in t:
+        return "payment_succeeded"
+    if "cancellation removed" in t:
+        return "cancellation_removed"
+    if "cancellation scheduled" in t or "set to cancel" in t or "canceling" in t:
+        return "cancellation_scheduled"
+    if "member joined" in t:
+        return "member_joined"
+    if "member left" in t:
+        return "member_left"
+    if "activated (pending)" in t or "activation (pending)" in t:
+        return "membership_activated_pending"
+    if "membership activated" in t:
+        return "membership_activated"
+    if "deactivated" in t or "access ended" in t:
+        return "deactivated"
+    return "unknown"
+
+
+def _extract_discord_id_from_member_status_embed(e: discord.Embed) -> int:
+    """Extract Discord ID from a member-status embed (no message object needed)."""
+    if not isinstance(e, discord.Embed):
+        return 0
+    # Prefer field label
+    with suppress(Exception):
+        for f in (getattr(e, "fields", None) or []):
+            n = str(getattr(f, "name", "") or "").strip().lower()
+            if n == "discord id":
+                v = str(getattr(f, "value", "") or "")
+                m = re.search(r"\b(\d{17,19})\b", v)
+                if m:
+                    return int(m.group(1))
+    # Fallback: any snowflake-like id in description
+    desc = str(getattr(e, "description", "") or "")
+    m2 = re.search(r"\b(\d{17,19})\b", desc)
+    return int(m2.group(1)) if m2 else 0
+
+
+def _extract_membership_id_from_member_status_embed(e: discord.Embed) -> str:
+    if not isinstance(e, discord.Embed):
+        return ""
+    blob = " ".join(
+        [str(getattr(e, "title", "") or ""), str(getattr(e, "description", "") or "")]
+        + [f"{getattr(f,'name','')}: {getattr(f,'value','')}" for f in (getattr(e, "fields", None) or [])]
+    )
+    m = re.search(r"\b(mem_[A-Za-z0-9]+)\b", blob)
+    if m:
+        return m.group(1)
+    m2 = re.search(r"\b(R-[A-Za-z0-9-]{8,}W)\b", blob)
+    if m2:
+        return m2.group(1)
+    m3 = re.search(r"\b(R-[A-Za-z0-9-]{8,})\b", blob)
+    return m3.group(1) if m3 else ""
+
+
+def _update_member_history_from_member_status_hit(
+    *,
+    discord_id: int,
+    kind: str,
+    title: str,
+    created_at_iso: str,
+    message_id: int,
+    jump_url: str,
+    membership_id: str,
+    source_channel_id: int,
+    field_labels: list[str],
+) -> bool:
+    """Write a minimal, non-bloated per-kind record into member_history.json (no PII)."""
+    did = int(discord_id or 0)
+    if did <= 0:
+        return False
+    db = _load_json_file(_MEMBER_HISTORY_FILE)
+    if not isinstance(db, dict):
+        db = {}
+    rec = db.get(str(did), {})
+    rec = _ensure_member_history_whop_shape(rec if isinstance(rec, dict) else {})
+    wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+    if not isinstance(wh, dict):
+        wh = {}
+
+    mid = str(membership_id or "").strip()
+    if mid.startswith(("mem_", "R-")):
+        wh["last_whop_key"] = mid
+        wh["last_membership_id"] = mid
+
+    latest = wh.get("member_status_logs_latest") if isinstance(wh.get("member_status_logs_latest"), dict) else {}
+    if not isinstance(latest, dict):
+        latest = {}
+    k = str(kind or "").strip().lower() or "unknown"
+    latest[k] = {
+        "kind": k,
+        "title": str(title or "").strip()[:256],
+        "created_at": str(created_at_iso or "").strip()[:64],
+        "message_id": int(message_id or 0),
+        "jump_url": str(jump_url or "").strip()[:300],
+        "membership_id": mid[:128],
+        "source_channel_id": int(source_channel_id or 0),
+        "field_labels": [str(x or "").strip()[:64] for x in (field_labels or []) if str(x or "").strip()][:40],
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        if len(latest) > 40:
+            items = list(latest.items())
+            items.sort(key=lambda kv: str((kv[1] or {}).get("recorded_at") or ""), reverse=True)
+            latest = dict(items[:40])
+    except Exception:
+        pass
+    wh["member_status_logs_latest"] = latest
+    rec["whop"] = wh
+    db[str(did)] = rec
+    try:
+        save_json(Path(_MEMBER_HISTORY_FILE), db)
+    except Exception:
+        _save_json_file(Path(_MEMBER_HISTORY_FILE), db)
+    return True
+
+
+def _scan_rscheckerbot_member_status_code() -> dict:
+    """Static scan: titles/producers/consumers for member-status cards in RSCheckerbot."""
+    root = BASE_DIR
+    py_files = sorted([p for p in root.glob("*.py") if p.is_file()])
+
+    embed_callsites: list[dict[str, Any]] = []
+    producer_titles: set[str] = set()
+    title_for_event_map: list[dict[str, Any]] = []
+    consumer_sites: list[dict[str, Any]] = []
+
+    # 1) Find calls to build_member_status_detailed_embed(title="...") (including common aliases)
+    class _Visitor(ast.NodeVisitor):
+        def __init__(self, file_path: Path):
+            self.file_path = file_path
+            self.stack: list[str] = []
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> Any:
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> Any:
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_Call(self, node: ast.Call) -> Any:
+            fn = node.func
+            called = ""
+            if isinstance(fn, ast.Name):
+                called = fn.id
+            elif isinstance(fn, ast.Attribute):
+                called = fn.attr
+            if called in {"build_member_status_detailed_embed", "_build_member_status_detailed_embed"}:
+                title_val = None
+                event_hint = ""
+                for kw in (node.keywords or []):
+                    if kw.arg == "title" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                        title_val = kw.value.value
+                    if kw.arg == "discord_kv":
+                        # Try to extract ("event", "x.y") constant when present.
+                        try:
+                            if isinstance(kw.value, (ast.List, ast.Tuple)):
+                                for el in kw.value.elts:
+                                    if isinstance(el, ast.Tuple) and len(el.elts) >= 2:
+                                        k0, v0 = el.elts[0], el.elts[1]
+                                        if (
+                                            isinstance(k0, ast.Constant)
+                                            and k0.value == "event"
+                                            and isinstance(v0, ast.Constant)
+                                            and isinstance(v0.value, str)
+                                        ):
+                                            event_hint = v0.value
+                                            break
+                        except Exception:
+                            pass
+                if isinstance(title_val, str) and title_val.strip():
+                    producer_titles.add(_title_key(title_val))
+                    embed_callsites.append(
+                        {
+                            "file": str(self.file_path.name),
+                            "line": int(getattr(node, "lineno", 0) or 0),
+                            "context": "::".join(self.stack) if self.stack else "module",
+                            "title": title_val,
+                            "title_key": _title_key(title_val),
+                            "event_hint": event_hint,
+                        }
+                    )
+            self.generic_visit(node)
+
+    for p in py_files:
+        try:
+            src = p.read_text(encoding="utf-8", errors="ignore")
+            tree = ast.parse(src, filename=str(p))
+        except Exception:
+            continue
+        _Visitor(p).visit(tree)
+
+    # 2) Extract all return titles from main.py::_title_for_event (AST-based; robust to formatting)
+    main_py = root / "main.py"
+    if main_py.exists():
+        src = main_py.read_text(encoding="utf-8", errors="ignore")
+        try:
+            tree = ast.parse(src, filename=str(main_py))
+        except Exception:
+            tree = None
+
+        def _is_title_tuple(ret: ast.Return) -> tuple[str, str] | None:
+            """Return (title, embed_kind) if this is a 3-tuple return with literal title/kind."""
+            v = ret.value
+            if not isinstance(v, ast.Tuple) or len(v.elts) < 3:
+                return None
+            a0, _a1, a2 = v.elts[0], v.elts[1], v.elts[2]
+            if not (isinstance(a0, ast.Constant) and isinstance(a0.value, str)):
+                return None
+            if not (isinstance(a2, ast.Constant) and isinstance(a2.value, str)):
+                return None
+            return (str(a0.value), str(a2.value))
+
+        if tree is not None:
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef) and node.name == "_title_for_event":
+                    for subnode in ast.walk(node):
+                        if isinstance(subnode, ast.Return):
+                            out = _is_title_tuple(subnode)
+                            if not out:
+                                continue
+                            title, embed_kind = out
+                            title_for_event_map.append(
+                                {
+                                    "file": "main.py",
+                                    "line": int(getattr(subnode, "lineno", 0) or 0),
+                                    "title": title,
+                                    "title_key": _title_key(title),
+                                    "embed_kind": embed_kind,
+                                    "source": "_title_for_event",
+                                }
+                            )
+                            producer_titles.add(_title_key(title))
+                    break
+
+        # Consumers (anchor line numbers)
+        for name in (
+            "_extract_reporting_from_member_status_embed",
+            "_maybe_open_tickets_from_member_status_logs",
+            "log_member_status",
+        ):
+            mm = re.search(rf"^(async\s+def|def)\s+{re.escape(name)}\s*\(", src, re.MULTILINE)
+            if mm:
+                # compute line number by counting newlines before match
+                line_no = src[: mm.start()].count("\n") + 1
+                consumer_sites.append(
+                    {
+                        "file": "main.py",
+                        "line": int(line_no),
+                        "context": name,
+                        "type": "consumer_anchor",
+                    }
+                )
+
+        # Consumer string references
+        for pat, label in (
+            ("member-status-logs", "channel_name_literal"),
+            ("Member Status Tracking", "footer_literal"),
+            ("Payment Failed", "title_fragment"),
+            ("Membership Deactivated", "title_fragment"),
+            ("Payment Succeeded", "title_fragment"),
+        ):
+            for m2 in re.finditer(re.escape(pat), src):
+                line_no = src[: m2.start()].count("\n") + 1
+                consumer_sites.append(
+                    {
+                        "file": "main.py",
+                        "line": int(line_no),
+                        "context": "literal",
+                        "type": label,
+                        "value": pat,
+                    }
+                )
+
+    # 3) Extra producer titles in whop_webhook_handler.py (if any are literals outside builder)
+    wh = root / "whop_webhook_handler.py"
+    if wh.exists():
+        src = wh.read_text(encoding="utf-8", errors="ignore")
+        for name in ("handle_payment_failed", "handle_membership_deactivated", "handle_membership_activated", "handle_payment_activation", "handle_payment_renewal"):
+            mm = re.search(rf"^(async\s+def)\s+{re.escape(name)}\s*\(", src, re.MULTILINE)
+            if mm:
+                line_no = src[: mm.start()].count("\n") + 1
+                consumer_sites.append(
+                    {
+                        "file": "whop_webhook_handler.py",
+                        "line": int(line_no),
+                        "context": name,
+                        "type": "producer_handler",
+                    }
+                )
+
+    # De-dupe title_for_event_map
+    seen = set()
+    uniq = []
+    for it in title_for_event_map:
+        k = it.get("title_key")
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(it)
+    title_for_event_map = uniq
+
+    return {
+        "files_scanned": len(py_files),
+        "producer_titles_count": len(producer_titles),
+        "producer_titles": sorted([t for t in producer_titles if t]),
+        "embed_callsites": sorted(embed_callsites, key=lambda x: (x.get("file", ""), int(x.get("line", 0) or 0))),
+        "title_for_event_titles": title_for_event_map,
+        "consumer_sites": sorted(consumer_sites, key=lambda x: (x.get("file", ""), int(x.get("line", 0) or 0))),
+    }
 
 
 def _load_json_file(p: Path) -> dict:
@@ -143,12 +1329,15 @@ def _update_member_history_from_whop_log_hit(
     membership_status: str,
     access_pass: str,
     source_channel_id: int,
+    db: dict | None = None,
+    save: bool = True,
 ) -> bool:
     """Write a minimal, non-bloated per-title record into member_history.json (no PII)."""
     did = int(discord_id or 0)
     if did <= 0:
         return False
-    db = _load_json_file(_MEMBER_HISTORY_FILE)
+    if db is None:
+        db = _load_json_file(_MEMBER_HISTORY_FILE)
     if not isinstance(db, dict):
         db = {}
     rec = db.get(str(did), {})
@@ -192,10 +1381,250 @@ def _update_member_history_from_whop_log_hit(
     wh["native_whop_logs_latest"] = latest
     rec["whop"] = wh
     db[str(did)] = rec
+    if save:
+        try:
+            save_json(Path(_MEMBER_HISTORY_FILE), db)
+        except Exception:
+            _save_json_file(Path(_MEMBER_HISTORY_FILE), db)
+    return True
+
+
+def _norm_title_key(title: str) -> str:
+    return re.sub(r"\s+", " ", str(title or "").strip().lower())[:80] or "unknown"
+
+
+def _norm_whop_username(s: str) -> str:
+    """Normalize a Whop-style handle (no spaces, safe chars only)."""
+    raw = str(s or "").strip()
+    if raw.startswith("@"):
+        raw = raw[1:].strip()
+    raw = raw.strip().lower()
+    raw = raw.strip("`*_")
+    # Enforce handle-like format (prevents storing PII-ish full names).
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{1,62}[a-z0-9]?", raw or ""):
+        return ""
+    if "." in raw and raw.endswith("."):
+        raw = raw[:-1]
+    return raw
+
+
+def _strip_emails(text: str) -> str:
+    """Remove emails from text (PII-safe baseline)."""
+    s = str(text or "")
+    s = re.sub(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", "[redacted-email]", s)
+    return s
+
+
+def _extract_whop_user_id_from_text(*parts: object) -> str:
+    blob = " ".join(str(p or "") for p in parts)
+    m = re.search(r"\b(user_[A-Za-z0-9]+)\b", blob)
+    if m:
+        return m.group(1)
+    # Common dashboard URL path
+    m2 = re.search(r"/users/(user_[A-Za-z0-9]+)/?", blob)
+    return m2.group(1) if m2 else ""
+
+
+def _extract_membership_id_from_text(*parts: object) -> str:
+    blob = " ".join(str(p or "") for p in parts)
+    m = re.search(r"\b(mem_[A-Za-z0-9]+)\b", blob)
+    if m:
+        return m.group(1)
+    m2 = re.search(r"\b(R-[A-Za-z0-9-]{8,})\b", blob)
+    return m2.group(1) if m2 else ""
+
+
+def _extract_whop_username_from_embed(e: discord.Embed) -> str:
+    """Best-effort extract Whop handle like @username from an embed."""
+    if not isinstance(e, discord.Embed):
+        return ""
+    parts: list[str] = []
+    with suppress(Exception):
+        parts.append(str(getattr(getattr(e, "author", None), "name", "") or ""))
+    with suppress(Exception):
+        parts.append(str(getattr(e, "title", "") or ""))
+    with suppress(Exception):
+        parts.append(str(getattr(e, "description", "") or ""))
+    with suppress(Exception):
+        for f in (getattr(e, "fields", None) or []):
+            parts.append(str(getattr(f, "name", "") or ""))
+            parts.append(str(getattr(f, "value", "") or ""))
+    blob = " ".join(p for p in parts if p)
+    # Critical: do not let emails like foo@gmail.com produce fake "username" keys like "gmail.com".
+    blob = _strip_emails(blob)
+    m = re.search(r"@([A-Za-z0-9][A-Za-z0-9_.-]{1,62}[A-Za-z0-9]?)", blob)
+    if m:
+        return _norm_whop_username(m.group(1))
+    # Common in whop-membership-logs: description line like "• Username: foo_bar"
+    with suppress(Exception):
+        desc = _strip_emails(str(getattr(e, "description", "") or ""))
+        m2 = re.search(r"(?im)^\s*[•*\-]\s*username\s*:\s*([A-Za-z0-9][A-Za-z0-9_.-]{1,62}[A-Za-z0-9]?)\s*$", desc)
+        if m2:
+            u2 = _norm_whop_username(m2.group(1))
+            if u2:
+                return u2
+    # Some cards may have a dedicated "Username" field without @
+    with suppress(Exception):
+        for f in (getattr(e, "fields", None) or []):
+            n = str(getattr(f, "name", "") or "").strip().lower()
+            if n in {"username", "user", "whop username", "whop user"}:
+                v = str(getattr(f, "value", "") or "").strip()
+                # Take first token
+                tok = re.split(r"[\s\r\n]+", v)[0].strip()
+                u = _norm_whop_username(tok)
+                if u:
+                    return u
+    return ""
+
+
+def _extract_kv_from_description(desc: str) -> dict[str, str]:
+    """Parse '• Key: Value' lines from embed description (PII-safe: drops name/email)."""
+    out: dict[str, str] = {}
+    s = _strip_emails(str(desc or ""))
+    if not s.strip():
+        return out
+    for line in (s.splitlines() or []):
+        ln = line.strip()
+        if not ln:
+            continue
+        # Bullet lines
+        m = re.match(r"^[•*\-]\s*([^:]{1,64})\s*:\s*(.+?)\s*$", ln)
+        if not m:
+            continue
+        k = re.sub(r"\s+", " ", str(m.group(1) or "").strip().lower())
+        v = str(m.group(2) or "").strip()
+        if not k or not v:
+            continue
+        if "email" in k or k == "name":
+            continue
+        if "phone" in k:
+            continue
+        out[k[:64]] = v[:1500]
+    # Debug line often contains stable IDs
+    with suppress(Exception):
+        m2 = re.search(r"(?i)\buser=(user_[A-Za-z0-9]+)\b", s)
+        if m2:
+            out.setdefault("whop user id", m2.group(1))
+        m3 = re.search(r"(?i)\bmem=(mem_[A-Za-z0-9]+)\b", s)
+        if m3:
+            out.setdefault("membership id", m3.group(1))
+        m4 = re.search(r"(?i)\bplan=(plan_[A-Za-z0-9]+)\b", s)
+        if m4:
+            out.setdefault("plan id", m4.group(1))
+    return out
+
+
+def _extract_embed_fields_map(e: discord.Embed) -> dict[str, str]:
+    """Return normalized field_name -> value (emails stripped)."""
+    out: dict[str, str] = {}
+    if not isinstance(e, discord.Embed):
+        return out
+    with suppress(Exception):
+        for f in (getattr(e, "fields", None) or []):
+            n = str(getattr(f, "name", "") or "").strip()
+            v = str(getattr(f, "value", "") or "").strip()
+            if not n or not v:
+                continue
+            n_low = re.sub(r"\s+", " ", n.strip().lower())
+            # Drop obvious PII fields.
+            if "email" in n_low or "phone" in n_low:
+                continue
+            out[n_low[:64]] = _strip_emails(v)[:1500]
+    if not out:
+        with suppress(Exception):
+            out = _extract_kv_from_description(str(getattr(e, "description", "") or ""))
+    return out
+
+
+def _ensure_whop_users_shape(db: dict) -> dict:
+    if not isinstance(db, dict):
+        db = {}
+    wu = db.get("whop_users")
+    if not isinstance(wu, dict):
+        db["whop_users"] = {}
+    idx = db.get("whop_user_index")
+    if not isinstance(idx, dict):
+        db["whop_user_index"] = {}
+    return db
+
+
+def _update_member_history_from_whop_membership_log_hit(
+    *,
+    whop_user_key: str,
+    whop_username: str = "",
+    title: str,
+    created_at_iso: str,
+    message_id: int,
+    jump_url: str,
+    fields_map: dict[str, str],
+    whop_user_id: str,
+    membership_id: str,
+    source_channel_id: int,
+    db: dict | None = None,
+    save: bool = True,
+) -> bool:
+    """Write a minimal per-title record into member_history.json under whop_users (no PII)."""
+    key = str(whop_user_key or "").strip().lower()
+    if not key:
+        return False
+    if db is None:
+        db = _load_json_file(_MEMBER_HISTORY_FILE)
+    db = _ensure_whop_users_shape(db)
+    wu = db.get("whop_users")
+    if not isinstance(wu, dict):
+        wu = {}
+        db["whop_users"] = wu
+    rec = wu.get(key) if isinstance(wu.get(key), dict) else {}
+    if not isinstance(rec, dict):
+        rec = {}
+    wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+    if not isinstance(wh, dict):
+        wh = {}
+    rec["whop"] = wh
+
+    # Optional: store username + allow lookup by username without duplicating records.
+    u = _norm_whop_username(str(whop_username or "").strip())
+    if u:
+        wh["username"] = u
+        idx = db.get("whop_user_index")
+        if isinstance(idx, dict):
+            idx[u] = key
+
+    if str(whop_user_id or "").strip().startswith("user_"):
+        wh["user_id"] = str(whop_user_id).strip()[:64]
+    if str(membership_id or "").strip().startswith(("mem_", "R-")):
+        wh["last_membership_id"] = str(membership_id).strip()[:128]
+
+    latest = wh.get("membership_logs_latest") if isinstance(wh.get("membership_logs_latest"), dict) else {}
+    if not isinstance(latest, dict):
+        latest = {}
+    tkey = _norm_title_key(title)
+    latest[tkey] = {
+        "title": str(title or "").strip()[:256],
+        "created_at": str(created_at_iso or "").strip()[:64],
+        "message_id": int(message_id or 0),
+        "jump_url": str(jump_url or "").strip()[:300],
+        "membership_id": str(membership_id or "").strip()[:128],
+        "user_id": str(whop_user_id or "").strip()[:64],
+        "fields": fields_map if isinstance(fields_map, dict) else {},
+        "source_channel_id": int(source_channel_id or 0),
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
     try:
-        save_json(Path(_MEMBER_HISTORY_FILE), db)
+        if len(latest) > 25:
+            items = list(latest.items())
+            items.sort(key=lambda kv: str((kv[1] or {}).get("recorded_at") or ""), reverse=True)
+            latest = dict(items[:25])
     except Exception:
-        _save_json_file(Path(_MEMBER_HISTORY_FILE), db)
+        pass
+    wh["membership_logs_latest"] = latest
+    wu[str(key)] = rec
+    db["whop_users"] = wu
+    if save:
+        try:
+            save_json(Path(_MEMBER_HISTORY_FILE), db)
+        except Exception:
+            _save_json_file(Path(_MEMBER_HISTORY_FILE), db)
     return True
 
 
@@ -245,6 +1674,12 @@ async def _probe_whoplogs_baseline(args: argparse.Namespace) -> int:
     interactive = bool(getattr(args, "interactive", False))
     checkpoint_every = int(getattr(args, "checkpoint_every", 0) or 0)
     checkpoint_every = max(0, min(checkpoint_every, 50000))
+
+    key_by = str(getattr(args, "key_by", "") or "discord_id").strip().lower()
+    if key_by not in {"discord_id", "whop_username", "whop_user_id", "membership_id", "auto"}:
+        key_by = "discord_id"
+    out_path_raw = str(getattr(args, "out", "") or "").strip()
+    out_path = Path(out_path_raw) if out_path_raw else None
 
     state_path = Path(str(getattr(args, "state_file", "") or "").strip() or str(_PROBE_WHOPLOGS_STATE_FILE))
     state = _load_probe_state(state_path)
@@ -303,6 +1738,7 @@ async def _probe_whoplogs_baseline(args: argparse.Namespace) -> int:
         print(f"channel_id: {channel_id}")
         print(f"limit: {limit}")
         print(f"record_member_history: {bool(do_record)}")
+        print(f"key_by: {key_by}")
         print(f"state_file: {str(state_path)}")
         if progress_every:
             print(f"progress_every: {progress_every}  (live bar)")
@@ -350,13 +1786,27 @@ async def _probe_whoplogs_baseline(args: argparse.Namespace) -> int:
         scanned = 0
         extracted = 0
         updated = 0
-        unique_dids: set[int] = set()
+        unique_keys: set[str] = set()
         newest_iso = ""
         oldest_iso = ""
         oldest_msg_id = 0
+        mh_db: dict | None = None
+        mh_dirty = 0
+        if do_record:
+            mh_db = _load_json_file(_MEMBER_HISTORY_FILE)
+            if not isinstance(mh_db, dict):
+                mh_db = {}
+            # Ensure optional top-level shapes exist early.
+            mh_db = _ensure_whop_users_shape(mh_db)
+
+        # Inventory (helps map message cards to label templates).
+        title_counts: Counter[str] = Counter()
+        field_labels_by_title: dict[str, Counter[str]] = defaultdict(Counter)
+        samples_by_title: dict[str, list[dict[str, str]]] = defaultdict(list)
 
         async def _scan_batch(before: discord.Object | None) -> tuple[int, int, int, str, str, int]:
             """Return (scanned, extracted, updated, newest_iso, oldest_iso, oldest_msg_id)."""
+            nonlocal mh_db, mh_dirty
             _scanned = 0
             _extracted = 0
             _updated = 0
@@ -380,7 +1830,7 @@ async def _probe_whoplogs_baseline(args: argparse.Namespace) -> int:
                         _progress_line(
                             scanned=_scanned,
                             extracted=extracted + _extracted,
-                            unique_ids=len(unique_dids),
+                            unique_ids=len(unique_keys),
                             newest=_newest or newest_iso,
                             oldest=_oldest or oldest_iso,
                         )
@@ -392,22 +1842,88 @@ async def _probe_whoplogs_baseline(args: argparse.Namespace) -> int:
                     state["last_scan_in_progress_at"] = datetime.now(timezone.utc).isoformat()
                     state["last_scan_in_progress_oldest_utc"] = str(_oldest or "")
                     _save_probe_state(state_path, state)
+                    # Also flush member_history periodically if we're recording (keeps long scans safe).
+                    if do_record and mh_db is not None and mh_dirty:
+                        try:
+                            save_json(Path(_MEMBER_HISTORY_FILE), mh_db)
+                            mh_dirty = 0
+                        except Exception:
+                            with suppress(Exception):
+                                _save_json_file(Path(_MEMBER_HISTORY_FILE), mh_db)
+                                mh_dirty = 0
 
                 e0 = msg.embeds[0] if msg.embeds else None
                 if not isinstance(e0, discord.Embed):
                     continue
 
-                did_txt = str(_extract_discord_id_from_native_embed(e0) or "").strip()
-                if not did_txt.isdigit():
-                    continue
-                did = int(did_txt)
-                if did <= 0:
-                    continue
-                _extracted += 1
-                unique_dids.add(did)
-
                 title = str(getattr(e0, "title", "") or "").strip() or "(no title)"
                 jump = str(getattr(msg, "jump_url", "") or "").strip()
+
+                title_counts[title] += 1
+                with suppress(Exception):
+                    for f in (getattr(e0, "fields", None) or []):
+                        lbl = str(getattr(f, "name", "") or "").strip()
+                        if lbl:
+                            field_labels_by_title[title][lbl] += 1
+                # Capture a few redacted samples per title for schema mapping.
+                try:
+                    if len(samples_by_title[title]) < 3:
+                        desc = str(getattr(e0, "description", "") or "").strip()
+                        desc = _strip_emails(desc).strip()
+                        if len(desc) > 1200:
+                            desc = desc[:1200] + "…"
+                        auth = str(getattr(getattr(e0, "author", None), "name", "") or "").strip()
+                        samples_by_title[title].append(
+                            {
+                                "message_id": str(int(getattr(msg, "id", 0) or 0)),
+                                "jump_url": str(getattr(msg, "jump_url", "") or "").strip()[:300],
+                                "author": _strip_emails(auth)[:200],
+                                "description": desc,
+                            }
+                        )
+                except Exception:
+                    pass
+
+                # Key extraction
+                did = 0
+                did_txt = str(_extract_discord_id_from_native_embed(e0) or "").strip()
+                if did_txt.isdigit():
+                    did = int(did_txt)
+
+                wh_user = _extract_whop_username_from_embed(e0)
+                wh_user_id = _extract_whop_user_id_from_text(jump, title, str(getattr(e0, "description", "") or ""))
+                mem_id = _extract_membership_id_from_text(jump, title, str(getattr(e0, "description", "") or ""))
+
+                key = ""
+                key_kind = key_by
+                if key_by == "discord_id":
+                    key = str(did) if did > 0 else ""
+                elif key_by == "whop_username":
+                    key = str(wh_user or "")
+                elif key_by == "whop_user_id":
+                    key = str(wh_user_id or "")
+                elif key_by == "membership_id":
+                    key = str(mem_id or "")
+                elif key_by == "auto":
+                    if did > 0:
+                        key_kind = "discord_id"
+                        key = str(did)
+                    elif wh_user_id:
+                        key_kind = "whop_user_id"
+                        key = str(wh_user_id)
+                    elif mem_id:
+                        key_kind = "membership_id"
+                        key = str(mem_id)
+                    elif wh_user:
+                        key_kind = "whop_username"
+                        key = str(wh_user)
+
+                key = str(key or "").strip()
+                if not key:
+                    continue
+
+                _extracted += 1
+                unique_keys.add(f"{key_kind}:{key}")
 
                 key_val = ""
                 access_pass = ""
@@ -424,19 +1940,42 @@ async def _probe_whoplogs_baseline(args: argparse.Namespace) -> int:
                             mstatus = v
 
                 if do_record:
-                    ok = _update_member_history_from_whop_log_hit(
-                        discord_id=int(did),
-                        title=title,
-                        created_at_iso=str(getattr(msg, "created_at", None) or "").strip(),
-                        message_id=int(getattr(msg, "id", 0) or 0),
-                        jump_url=jump,
-                        whop_key=key_val,
-                        membership_status=mstatus,
-                        access_pass=access_pass,
-                        source_channel_id=int(channel_id),
-                    )
+                    ok = False
+                    created_iso = str(getattr(msg, "created_at", None) or "").strip()
+                    mid_msg = int(getattr(msg, "id", 0) or 0)
+                    if key_kind == "discord_id" and key.isdigit() and int(key) > 0:
+                        ok = _update_member_history_from_whop_log_hit(
+                            discord_id=int(key),
+                            title=title,
+                            created_at_iso=created_iso,
+                            message_id=mid_msg,
+                            jump_url=jump,
+                            whop_key=key_val,
+                            membership_status=mstatus,
+                            access_pass=access_pass,
+                            source_channel_id=int(channel_id),
+                            db=mh_db,
+                            save=False,
+                        )
+                    else:
+                        fmap = _extract_embed_fields_map(e0)
+                        ok = _update_member_history_from_whop_membership_log_hit(
+                            whop_user_key=str(key),
+                            whop_username=str(wh_user or ""),
+                            title=title,
+                            created_at_iso=created_iso,
+                            message_id=mid_msg,
+                            jump_url=jump,
+                            fields_map=fmap,
+                            whop_user_id=str(wh_user_id or ""),
+                            membership_id=str(mem_id or ""),
+                            source_channel_id=int(channel_id),
+                            db=mh_db,
+                            save=False,
+                        )
                     if ok:
                         _updated += 1
+                        mh_dirty += 1
 
             return (_scanned, _extracted, _updated, _newest, _oldest, _oldest_id)
 
@@ -504,13 +2043,52 @@ async def _probe_whoplogs_baseline(args: argparse.Namespace) -> int:
             sys.stdout.flush()
 
         print(f"messages_scanned: {scanned}")
-        print(f"embeds_with_discord_id: {extracted}")
-        print(f"unique_discord_ids: {len(unique_dids)}")
+        print(f"embeds_with_key: {extracted}")
+        if key_by == "discord_id":
+            # Back-compat label (older runs used this wording).
+            print(f"embeds_with_discord_id: {extracted}")
+        print(f"unique_keys: {len(unique_keys)}")
         if newest_iso and oldest_iso:
             print(f"scan_window_newest_utc: {newest_iso}")
             print(f"scan_window_oldest_utc: {oldest_iso}")
         if do_record:
             print(f"member_history_updates: {updated}")
+            # Final flush of member_history.json
+            if mh_db is not None and mh_dirty:
+                with suppress(Exception):
+                    save_json(Path(_MEMBER_HISTORY_FILE), mh_db)
+                    mh_dirty = 0
+
+        # Optional inventory report
+        if out_path:
+            try:
+                report = {
+                    "meta": {
+                        "channel_id": int(channel_id),
+                        "limit": int(limit),
+                        "key_by": str(key_by),
+                        "messages_scanned": int(scanned),
+                        "extracted": int(extracted),
+                        "unique_keys": int(len(unique_keys)),
+                        "scan_window_newest_utc": str(newest_iso or ""),
+                        "scan_window_oldest_utc": str(oldest_iso or ""),
+                        "record_member_history": bool(do_record),
+                        "generated_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    "titles": {
+                        t: {
+                            "count": int(c),
+                            "field_labels": dict(field_labels_by_title.get(t, Counter())),
+                            "samples": samples_by_title.get(t, [])[:3],
+                        }
+                        for t, c in title_counts.most_common()
+                    },
+                }
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+                print(f"saved_report: {str(out_path)}")
+            except Exception as ex:
+                print(f"failed_to_write_report: {str(out_path)} err={str(ex)[:200]}")
 
         # Save resume cursor (oldest message id we reached in this batch).
         if oldest_msg_id > 0:
@@ -518,12 +2096,14 @@ async def _probe_whoplogs_baseline(args: argparse.Namespace) -> int:
             state["last_scan_completed_at"] = datetime.now(timezone.utc).isoformat()
             state["last_scan_summary"] = {
                 "messages_scanned": scanned,
-                "unique_discord_ids": len(unique_dids),
-                "embeds_with_discord_id": extracted,
+                "unique_keys": len(unique_keys),
+                "embeds_with_key": extracted,
+                "embeds_with_discord_id": extracted if key_by == "discord_id" else 0,
                 "scan_window_newest_utc": newest_iso,
                 "scan_window_oldest_utc": oldest_iso,
                 "channel_id": int(channel_id),
                 "record_member_history": bool(do_record),
+                "key_by": str(key_by),
                 "run_until_done": bool(run_until_done),
                 "batches": int(batches),
             }
@@ -904,6 +2484,458 @@ async def _whop_brief_api_only(client: WhopAPIClient, membership_id: str) -> dic
         "last_payment_method": last_payment_method,
         "last_payment_type": last_payment_type,
     }
+
+
+async def _probe_memberstatus_cards(args: argparse.Namespace) -> int:
+    """Scan member-status-logs and inventory card titles/fields + code producers/consumers.
+
+    This is a read-only scanner by default. If --record-member-history is enabled,
+    it can also write compact per-user snapshots into member_history.json behind
+    --confirm confirm (no PII stored).
+    """
+    cfg = load_config()
+    token = str(cfg.get("bot_token") or "").strip()
+    if not token:
+        print("Missing bot_token in config.secrets.json")
+        return 2
+
+    # Channel id: explicit flag or config default
+    channel_id = 0
+    try:
+        channel_id = int(str(getattr(args, "channel_id", "") or "").strip() or 0)
+    except Exception:
+        channel_id = 0
+    if not channel_id:
+        dm = cfg.get("dm_sequence") if isinstance(cfg, dict) else {}
+        dm = dm if isinstance(dm, dict) else {}
+        try:
+            channel_id = int(str(dm.get("member_status_logs_channel_id") or 0).strip() or 0)
+        except Exception:
+            channel_id = 0
+    if not channel_id:
+        print("Missing --channel-id and no dm_sequence.member_status_logs_channel_id configured.")
+        return 2
+
+    limit = int(getattr(args, "limit", 5000) or 5000)
+    limit = max(50, min(limit, 20000))
+    run_until_done = bool(getattr(args, "run_until_done", False))
+    batch_delay_s = float(getattr(args, "batch_delay_seconds", 1.0) or 1.0)
+    batch_delay_s = max(0.0, min(batch_delay_s, 10.0))
+    max_batches = int(getattr(args, "max_batches", 0) or 0)
+    max_batches = max(0, min(max_batches, 1000000))
+    interactive = bool(getattr(args, "interactive", False))
+    checkpoint_every = int(getattr(args, "checkpoint_every", 0) or 0)
+    checkpoint_every = max(0, min(checkpoint_every, 50000))
+
+    state_path = Path(str(getattr(args, "state_file", "") or "").strip() or str(_PROBE_MEMBERSTATUS_STATE_FILE))
+    state = _load_probe_state(state_path)
+
+    before_id_raw = str(getattr(args, "before_message_id", "") or "").strip()
+    resume = bool(getattr(args, "resume", False))
+    if (not before_id_raw) and resume:
+        before_id_raw = str(state.get("before_message_id") or "").strip()
+    before_obj = discord.Object(id=int(before_id_raw)) if before_id_raw.isdigit() else None
+
+    do_record = bool(getattr(args, "record_member_history", False))
+    confirm = str(getattr(args, "confirm", "") or "").strip().lower()
+    if do_record and confirm != "confirm":
+        print("Confirmation required to write member_history.json. Use: --record-member-history --confirm confirm")
+        return 2
+
+    out_raw = str(getattr(args, "out", "") or "").strip()
+    out_path = Path(out_raw) if out_raw else _backup_path("memberstatus_cards_scan")
+
+    intents = discord.Intents.none()
+    intents.guilds = True
+    intents.messages = True
+    intents.message_content = False
+    bot = discord.Client(intents=intents)
+
+    @bot.event
+    async def on_ready():
+        nonlocal state
+        progress_every = int(getattr(args, "progress_every", 200) or 200)
+        progress_every = max(0, min(progress_every, 5000))
+        bar_w = int(getattr(args, "bar_width", 24) or 24)
+        bar_w = max(10, min(bar_w, 60))
+
+        def _progress_line(*, scanned: int, embeds: int, titles: int, newest: str, oldest: str) -> str:
+            pct = int((float(scanned) / float(limit)) * 100.0) if limit > 0 else 0
+            pct = max(0, min(pct, 100))
+            filled = int((pct / 100.0) * bar_w)
+            bar = "[" + ("=" * filled) + ("-" * (bar_w - filled)) + "]"
+            return (
+                f"\r{bar} {pct:3d}% scanned={scanned}/{limit} embeds={embeds} titles={titles} "
+                f"newest={_short_iso(newest) if newest else '-'} oldest={_short_iso(oldest) if oldest else '-'}"
+            )
+
+        print("=== Member Status Cards Scan ===")
+        print(f"channel_id: {channel_id}")
+        print(f"limit: {limit}")
+        print(f"record_member_history: {bool(do_record)}")
+        print(f"state_file: {str(state_path)}")
+        print(f"out: {str(out_path)}")
+        if progress_every:
+            print(f"progress_every: {progress_every}  (live bar)")
+        try:
+            ms = (int(channel_id) >> 22) + 1420070400000
+            created_dt = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+            print(f"channel_created_utc: {created_dt.isoformat()}")
+        except Exception:
+            pass
+        if before_obj:
+            print(f"before_message_id: {int(before_obj.id)}")
+        elif resume:
+            print("resume: requested, but no saved cursor found (starting from newest).")
+        elif interactive:
+            saved = str(state.get("before_message_id") or "").strip()
+            if saved.isdigit():
+                try:
+                    ans = await asyncio.to_thread(input, f"Resume from last saved cursor ({saved})? [Y/n] ")
+                except Exception:
+                    ans = "y"
+                if str(ans or "").strip().lower() not in {"n", "no"}:
+                    state["_resume_override_before_id"] = str(saved)
+                    print(f"resume_selected_before_message_id: {saved}")
+        if run_until_done:
+            print(f"run_until_done: True (batch_delay_seconds={batch_delay_s} max_batches={max_batches or '∞'})")
+        if interactive:
+            print("interactive: True (will prompt between batches)")
+        if checkpoint_every:
+            print(f"checkpoint_every: {checkpoint_every} (write resume cursor periodically)")
+
+        ch = bot.get_channel(channel_id)
+        if ch is None:
+            with suppress(Exception):
+                ch = await bot.fetch_channel(channel_id)
+        if not isinstance(ch, discord.TextChannel):
+            print("channel not found or not text.")
+            with suppress(Exception):
+                await bot.close()
+            return
+
+        scanned_total = 0
+        embeds_total = 0
+        newest_iso = ""
+        oldest_iso = ""
+        oldest_msg_id = 0
+
+        # Observed stats keyed by raw title
+        by_title: dict[str, dict[str, Any]] = {}
+        unique_titles: set[str] = set()
+        unique_dids: set[int] = set()
+
+        def _title_bucket(title: str) -> dict[str, Any]:
+            if title not in by_title:
+                by_title[title] = {
+                    "count": 0,
+                    "kinds": {},
+                    "footers": {},
+                    "field_labels": {},
+                    "samples": [],
+                    "has_email_field": False,
+                    "has_discord_id_field": False,
+                    "has_membership_id_field": False,
+                }
+            return by_title[title]
+
+        async def _scan_batch(before: discord.Object | None) -> tuple[int, int, str, str, int]:
+            """Return (scanned, embeds, newest_iso, oldest_iso, oldest_msg_id)."""
+            _scanned = 0
+            _embeds = 0
+            _newest = ""
+            _oldest = ""
+            _oldest_id = 0
+
+            async for msg in ch.history(limit=limit, before=before):
+                _scanned += 1
+                _oldest_id = int(getattr(msg, "id", 0) or 0) or _oldest_id
+                try:
+                    ts = (getattr(msg, "created_at", None) or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+                    if not _newest:
+                        _newest = ts
+                    _oldest = ts
+                except Exception:
+                    pass
+
+                if progress_every and (_scanned == 1 or (_scanned % progress_every) == 0 or _scanned == limit):
+                    sys.stdout.write(
+                        _progress_line(
+                            scanned=_scanned,
+                            embeds=embeds_total + _embeds,
+                            titles=len(unique_titles),
+                            newest=_newest or newest_iso,
+                            oldest=_oldest or oldest_iso,
+                        )
+                    )
+                    sys.stdout.flush()
+                if checkpoint_every and _oldest_id and (_scanned % checkpoint_every) == 0:
+                    state["before_message_id"] = str(_oldest_id)
+                    state["last_scan_in_progress_at"] = datetime.now(timezone.utc).isoformat()
+                    state["last_scan_in_progress_oldest_utc"] = str(_oldest or "")
+                    _save_probe_state(state_path, state)
+
+                e0 = msg.embeds[0] if msg.embeds else None
+                if not isinstance(e0, discord.Embed):
+                    continue
+                _embeds += 1
+
+                title = str(getattr(e0, "title", "") or "").strip() or "(no title)"
+                unique_titles.add(title)
+                bucket = _title_bucket(title)
+                bucket["count"] = int(bucket.get("count", 0) or 0) + 1
+
+                kind = _infer_member_status_kind(title)
+                kinds = bucket.get("kinds") if isinstance(bucket.get("kinds"), dict) else {}
+                kinds[kind] = int(kinds.get(kind, 0) or 0) + 1
+                bucket["kinds"] = kinds
+
+                footer_text = ""
+                with suppress(Exception):
+                    footer_text = str(getattr(getattr(e0, "footer", None), "text", "") or "").strip()
+                footers = bucket.get("footers") if isinstance(bucket.get("footers"), dict) else {}
+                footers[footer_text or "(no footer)"] = int(footers.get(footer_text or "(no footer)", 0) or 0) + 1
+                bucket["footers"] = footers
+
+                labels: list[str] = []
+                has_email = False
+                has_did = False
+                has_mid_field = False
+                with suppress(Exception):
+                    for f in (getattr(e0, "fields", None) or []):
+                        n = str(getattr(f, "name", "") or "").strip()
+                        if not n:
+                            continue
+                        labels.append(n)
+                        ln = n.lower()
+                        if ln == "email":
+                            has_email = True
+                        if ln == "discord id":
+                            has_did = True
+                        if ln in {"membership id", "membership_id"}:
+                            has_mid_field = True
+                bucket["has_email_field"] = bool(bucket.get("has_email_field")) or has_email
+                bucket["has_discord_id_field"] = bool(bucket.get("has_discord_id_field")) or has_did
+                bucket["has_membership_id_field"] = bool(bucket.get("has_membership_id_field")) or has_mid_field
+
+                fl = bucket.get("field_labels") if isinstance(bucket.get("field_labels"), dict) else {}
+                for n in labels:
+                    fl[n] = int(fl.get(n, 0) or 0) + 1
+                bucket["field_labels"] = fl
+
+                did = _extract_discord_id_from_member_status_embed(e0)
+                if did > 0:
+                    unique_dids.add(int(did))
+                mid = _extract_membership_id_from_member_status_embed(e0)
+
+                if do_record and did > 0:
+                    with suppress(Exception):
+                        _update_member_history_from_member_status_hit(
+                            discord_id=int(did),
+                            kind=kind,
+                            title=title,
+                            created_at_iso=str(getattr(msg, "created_at", None) or "").strip(),
+                            message_id=int(getattr(msg, "id", 0) or 0),
+                            jump_url=str(getattr(msg, "jump_url", "") or "").strip(),
+                            membership_id=mid,
+                            source_channel_id=int(channel_id),
+                            field_labels=labels,
+                        )
+
+                # Keep only a few samples per title (labels only; no PII values)
+                samples = bucket.get("samples") if isinstance(bucket.get("samples"), list) else []
+                if len(samples) < 3:
+                    samples.append(
+                        {
+                            "message_id": int(getattr(msg, "id", 0) or 0),
+                            "jump_url": str(getattr(msg, "jump_url", "") or "").strip(),
+                            "created_at": str(getattr(msg, "created_at", None) or "").strip(),
+                            "kind": kind,
+                            "footer": footer_text,
+                            "field_labels": labels[:30],
+                            "has_email_field": has_email,
+                            "discord_id_present": bool(did > 0),
+                            "membership_id_present": bool(bool(mid)),
+                        }
+                    )
+                bucket["samples"] = samples
+
+            return (_scanned, _embeds, _newest, _oldest, _oldest_id)
+
+        # If interactive resume selected, use it.
+        before_cur = None
+        try:
+            v = str(state.get("_resume_override_before_id") or "").strip()
+            if v.isdigit():
+                before_cur = discord.Object(id=int(v))
+        except Exception:
+            before_cur = None
+        if before_cur is None:
+            before_cur = before_obj
+
+        batches = 0
+        while True:
+            batches += 1
+            if max_batches and batches > max_batches:
+                break
+            b_scanned, b_embeds, b_newest, b_oldest, b_oldest_id = await _scan_batch(before_cur)
+            scanned_total += int(b_scanned)
+            embeds_total += int(b_embeds)
+            if b_newest and not newest_iso:
+                newest_iso = b_newest
+            if b_oldest:
+                oldest_iso = b_oldest
+            if b_oldest_id:
+                oldest_msg_id = int(b_oldest_id)
+
+            # Save cursor after each batch
+            if oldest_msg_id:
+                state["before_message_id"] = str(oldest_msg_id)
+                state["last_scan_completed_at"] = datetime.now(timezone.utc).isoformat()
+                state["last_scan_oldest_utc"] = str(oldest_iso or "")
+                _save_probe_state(state_path, state)
+
+            if progress_every:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+
+            # Stop conditions
+            if b_scanned <= 0 or b_oldest_id <= 0:
+                break
+            if not run_until_done:
+                break
+
+            if interactive:
+                try:
+                    ans = await asyncio.to_thread(input, "Continue to next batch (older history)? [Y/n] ")
+                except Exception:
+                    ans = "y"
+                if str(ans or "").strip().lower() in {"n", "no"}:
+                    break
+            if batch_delay_s:
+                await asyncio.sleep(float(batch_delay_s))
+
+            before_cur = discord.Object(id=int(oldest_msg_id))
+
+        # Build code scan + merge mapping
+        code = _scan_rscheckerbot_member_status_code()
+        producer_title_keys = set(code.get("producer_titles") or [])
+        callsites_by_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for cs in (code.get("embed_callsites") or []):
+            if isinstance(cs, dict) and str(cs.get("title_key") or "").strip():
+                callsites_by_key[str(cs.get("title_key"))].append(cs)
+        title_for_event_by_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for it in (code.get("title_for_event_titles") or []):
+            if isinstance(it, dict) and str(it.get("title_key") or "").strip():
+                title_for_event_by_key[str(it.get("title_key"))].append(it)
+
+        merged: dict[str, Any] = {}
+        # Ticket relevance (as of current main.py logic)
+        open_kinds = {"payment_failed", "deactivated", "cancellation_scheduled", "member_joined"}
+        close_title_fragments = {
+            "membership activated",
+            "payment activated",
+            "payment renewed",
+            "payment resumed",
+            "access restored",
+        }
+        close_kinds = {"membership_activated_pending", "trialing", "member_role_added"}
+
+        for title, rec in sorted(by_title.items(), key=lambda kv: int((kv[1] or {}).get("count", 0) or 0), reverse=True):
+            key = _title_key(title)
+            inferred_kind = _infer_member_status_kind(title)
+            kinds_d = rec.get("kinds") if isinstance(rec.get("kinds"), dict) else {}
+            dominant_kind = inferred_kind
+            try:
+                if kinds_d:
+                    dominant_kind = max(kinds_d.items(), key=lambda kv: int(kv[1] or 0))[0]
+            except Exception:
+                dominant_kind = inferred_kind
+
+            title_low = str(title).lower()
+            used_by_ticket_open = dominant_kind in open_kinds
+            used_by_ticket_close = (dominant_kind in close_kinds) or any(frag in title_low for frag in close_title_fragments)
+
+            fl = rec.get("field_labels") if isinstance(rec.get("field_labels"), dict) else {}
+            top_field_labels: list[dict[str, Any]] = []
+            try:
+                items = sorted(fl.items(), key=lambda kv: int(kv[1] or 0), reverse=True)
+                for n, c in items[:12]:
+                    top_field_labels.append({"label": str(n), "count": int(c or 0)})
+            except Exception:
+                top_field_labels = []
+
+            merged[title] = {
+                "title_key": key,
+                "count": int(rec.get("count", 0) or 0),
+                "dominant_kind": dominant_kind,
+                "producer_title_match": bool(key and key in producer_title_keys),
+                "producer_callsites": (callsites_by_key.get(key) or [])[:6],
+                "producer_title_for_event": (title_for_event_by_key.get(key) or [])[:3],
+                "used_by_ticket_open": bool(used_by_ticket_open),
+                "used_by_ticket_close": bool(used_by_ticket_close),
+                "has_discord_id_field": bool(rec.get("has_discord_id_field")),
+                "has_membership_id_field": bool(rec.get("has_membership_id_field")),
+                "has_email_field": bool(rec.get("has_email_field")),
+                "top_field_labels": top_field_labels,
+            }
+
+        unknown_titles = [t for t, info in merged.items() if not bool(info.get("producer_title_match"))]
+        unknown_titles.sort(key=lambda t: int((merged.get(t) or {}).get("count", 0) or 0), reverse=True)
+
+        report = {
+            "meta": {
+                "scanned_at": datetime.now(timezone.utc).isoformat(),
+                "channel_id": int(channel_id),
+                "limit": int(limit),
+                "run_until_done": bool(run_until_done),
+                "batches": int(batches),
+                "scanned_messages": int(scanned_total),
+                "messages_with_embeds": int(embeds_total),
+                "unique_titles": int(len(unique_titles)),
+                "unique_discord_ids": int(len(unique_dids)),
+                "newest_utc": str(newest_iso or ""),
+                "oldest_utc": str(oldest_iso or ""),
+                "oldest_message_id": int(oldest_msg_id or 0),
+                "state_file": str(state_path),
+                "resume_cursor_before_message_id": str(state.get("before_message_id") or ""),
+                "record_member_history": bool(do_record),
+            },
+            "observed": {
+                "titles": by_title,
+                "unknown_titles": unknown_titles[:50],
+            },
+            "code_scan": code,
+            "merge": merged,
+        }
+
+        # Console summary (systemrepair-style)
+        print("\n" + "=" * 80)
+        print("SUMMARY")
+        print("=" * 80)
+        print(f"  scanned_messages: {scanned_total}")
+        print(f"  embeds_seen:      {embeds_total}")
+        print(f"  unique_titles:    {len(unique_titles)}")
+        print(f"  unique_discord:   {len(unique_dids)}")
+        print(f"  unknown_titles:   {len(unknown_titles)} (top 10 below)")
+        for t in unknown_titles[:10]:
+            print(f"   - {t}  (count={int((by_title.get(t) or {}).get('count', 0) or 0)})")
+
+        # Save report
+        with suppress(Exception):
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+            print(f"\n✅ Results saved to: {out_path}")
+        except Exception as e:
+            print(f"\n⚠️ Failed to write report: {e}")
+
+        with suppress(Exception):
+            await bot.close()
+
+    async with bot:
+        await bot.start(token)
+    return 0
 
 
 @dataclass
@@ -2907,12 +4939,44 @@ def main() -> int:
     pnow.add_argument("--whop-logs-before-message-id", default="", help="Scan whop-logs messages before this message id (snowflake) to reach older history.")
     pnow.add_argument("--record-member-history", action="store_true", default=False, help="Record latest per-title whop-logs hits into member_history.json (no PII).")
 
+    pmc = sub.add_parser(
+        "memberstatus-cards",
+        help="Scan member-status-logs and inventory message card titles/fields + producer/consumer code paths.",
+    )
+    pmc.add_argument("--channel-id", default="", help="Discord member-status-logs channel id (defaults to dm_sequence.member_status_logs_channel_id).")
+    pmc.add_argument("--limit", type=int, default=5000, help="How many messages to scan this run (50-20000).")
+    pmc.add_argument("--before-message-id", default="", help="Scan messages before this message id (to go further back).")
+    pmc.add_argument("--resume", action="store_true", default=False, help="Resume using saved cursor from state file.")
+    pmc.add_argument("--state-file", default="", help="State file path (default: RSCheckerbot/.probe_memberstatus_cards_state.json).")
+    pmc.add_argument("--out", default="", help="Optional output JSON file path (default: RSCheckerbot/backups/memberstatus_cards_scan_*.json).")
+    pmc.add_argument("--record-member-history", action="store_true", default=False, help="Write compact per-user snapshots into member_history.json (no PII).")
+    pmc.add_argument("--confirm", default="", help="Must be exactly 'confirm' when using --record-member-history.")
+    pmc.add_argument("--progress-every", type=int, default=200, help="Update the live progress bar every N messages (0 disables).")
+    pmc.add_argument("--bar-width", type=int, default=24, help="Width of the live progress bar (10-60).")
+    pmc.add_argument("--run-until-done", action="store_true", default=False, help="Keep scanning older history in chunks until the channel history is exhausted.")
+    pmc.add_argument("--batch-delay-seconds", type=float, default=1.0, help="Delay between chunks when --run-until-done is enabled (0-10).")
+    pmc.add_argument("--max-batches", type=int, default=0, help="Optional safety cap on number of chunks (0 = unlimited).")
+    pmc.add_argument("--interactive", action="store_true", default=False, help="Prompt to resume and/or continue between chunks (safe for flaky connections).")
+    pmc.add_argument("--checkpoint-every", type=int, default=0, help="Write resume cursor every N messages within a chunk (0 disables).")
+
+    pmv = sub.add_parser("memberstatus-view", help="Interactive viewer for memberstatus-cards reports + member_history.json (no token required).")
+    pmv.add_argument("--report", default="", help="Path to a memberstatus_cards_scan_*.json report (defaults to latest under RSCheckerbot/backups/).")
+    pmv.add_argument("--refresh-code", action="store_true", default=False, help="Recompute producer/consumer mapping and write a refreshed report file (no Discord scan).")
+
+    pcv = sub.add_parser("memberstatus-codeview", help="Interactive viewer for code-defined member-status card titles + labels (no token required).")
+
     pbl = sub.add_parser("whoplogs-baseline", help="Scan a whop-logs channel and record a per-user baseline into member_history.json.")
     pbl.add_argument("--channel-id", required=True, help="Discord whop-logs channel id to scan.")
     pbl.add_argument("--limit", type=int, default=5000, help="How many messages to scan this run (50-20000).")
     pbl.add_argument("--before-message-id", default="", help="Scan messages before this message id (to go further back).")
     pbl.add_argument("--resume", action="store_true", default=False, help="Resume using saved cursor from state file.")
     pbl.add_argument("--state-file", default="", help="State file path (default: RSCheckerbot/.probe_whoplogs_baseline_state.json).")
+    pbl.add_argument(
+        "--key-by",
+        default="discord_id",
+        help="How to key records: discord_id (default), whop_username, whop_user_id, membership_id, auto (best-effort).",
+    )
+    pbl.add_argument("--out", default="", help="Optional JSON report path (titles + field label inventory).")
     pbl.add_argument("--record-member-history", action="store_true", default=False, help="Actually write updates into member_history.json (no PII).")
     pbl.add_argument("--confirm", default="", help="Must be exactly 'confirm' when using --record-member-history.")
     pbl.add_argument("--progress-every", type=int, default=200, help="Update the live progress bar every N messages (0 disables).")
@@ -2948,6 +5012,12 @@ def main() -> int:
         return asyncio.run(_probe_staffcards(args))
     if args.mode == "nowhop-debug":
         return asyncio.run(_probe_nowhop_debug(args))
+    if args.mode == "memberstatus-cards":
+        return asyncio.run(_probe_memberstatus_cards(args))
+    if args.mode == "memberstatus-view":
+        return _probe_memberstatus_view(args)
+    if args.mode == "memberstatus-codeview":
+        return _probe_memberstatus_codeview(args)
     if args.mode == "whoplogs-baseline":
         return asyncio.run(_probe_whoplogs_baseline(args))
     return 2

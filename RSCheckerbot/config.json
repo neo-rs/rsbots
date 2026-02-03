@@ -239,15 +239,25 @@
       "cancellation_role_id": 1467494664088064174,
       "free_pass_no_whop_role_id": 1467718805365981456,
       "_comment_no_whop_link_role_id": "Role to apply for no_whop_link tickets (Members role present but no Whop linkage recorded).",
-      "no_whop_link_role_id": 1467718805365981456
+      "no_whop_link_role_id": 1467718805365981456,
+      "_comment_remove_role_ids_on_no_whop": "Optional: when adding the no-whop role, also remove these role IDs (legacy roles from older versions).",
+      "remove_role_ids_on_no_whop": [1467500050341957725]
     },
     "ticket_categories": {
       "billing_category_id": 1467157354977165537,
       "free_pass_category_id": 1467157711685681214,
       "cancellation_category_id": 1467169698608320542,
+      "_comment_member_welcome": "Category for 'Member Welcome' tickets (first-time paid members). If id is 0, RSCheckerbot will find/create by name.",
+      "member_welcome_category_id": 0,
+      "member_welcome_category_name": "member-welcome",
       "_comment_no_whop_link": "Category for 'No Whop Link' tickets. If id is 0, RSCheckerbot will find/create by name.",
       "no_whop_link_category_id": 0,
       "no_whop_link_category_name": "no-whop-link"
+    },
+    "membership_products": {
+      "_comment": "Product-title routing for ticket automation from member-status-logs cards. Match is case-insensitive exact string by default.",
+      "lite_product_titles": ["Reselling Secrets (Lite)"],
+      "full_product_titles": ["Reselling Secrets"]
     },
     "no_whop_link": {
       "_comment": "Scan current Discord Members-role users and open a ticket when Whop linkage is not recorded.",
@@ -287,8 +297,10 @@
       "templates": {
         "default": "Yo {member}, share what you need help with and {staff} will take it from there.",
         "free_pass": "Hey {member}, if you’re ready to get started, let us know.\nThe {staff} team will help you all the way until you have full access.",
+        "free_pass_welcome": "Hey {member}, welcome in.\nThe {staff} team will help you get situated.",
         "billing": "Hey {member}, it looks like there may be an issue with your subscription.\nLet us know what’s going on and {staff} will assist you.",
         "cancellation": "Hey {member}, if you don’t mind, please share a bit about why you decided to cancel.\nOur {staff} team will take a look and see what we can work out.",
+        "member_welcome": "Hey {member}, welcome in.\nIf you have any questions or need help getting set up, {staff} is here.",
         "no_whop_link": "Hey {member}, please link your Discord to Whop to avoid losing access.\n{staff} is here if you have any questions or need help."
       }
     },
@@ -296,6 +308,8 @@
       "_comment": "5-minute startup acknowledgement (Pattern A sweeper). Disabled by default.",
       "enabled": true,
       "delay_seconds": 300,
+      "_comment_check_interval_seconds": "How often the maintenance loop checks for tickets needing a startup message.",
+      "check_interval_seconds": 60,
       "recent_history_limit": 50,
       "templates": {
         "cancellation": "Yo {mention}! Just checking in. We’ve got your cancellation ticket and are taking a look. If you don’t mind sharing what made you decide to cancel, feel free to let us know here.",
@@ -332,8 +346,10 @@
     "dedupe": {
       "enabled": true,
       "free_pass": { "cooldown_seconds": 86400 },
+      "free_pass_welcome": { "cooldown_seconds": 86400 },
       "billing": { "cooldown_seconds": 21600 },
-      "cancellation": { "cooldown_seconds": 86400 }
+      "cancellation": { "cooldown_seconds": 86400 },
+      "member_welcome": { "cooldown_seconds": 86400 }
     },
     "sources": {
       "_comment": "Optional: jump links to the original RSCheckerbot full-log messages (keeps ticket embeds minimal).",
@@ -349,6 +365,16 @@
       "panel_title": "Client Success Tool",
       "panel_description": "Use the buttons below to look up a member’s Discord + Whop baseline history."
     }
+  }
+  ,
+  "member_history_ingest": {
+    "_comment": "Optional: auto-ingest Discord whop-logs + whop-membership-logs into member_history.json (resume-safe).",
+    "enabled": true,
+    "interval_seconds": 300,
+    "batch_limit": 500,
+    "overlap_messages": 5,
+    "_comment_blank_outputs": "When enabled, record any member-status-logs staff cards with blank/— Whop fields into RSCheckerbot/data/blank_outputs.jsonl.",
+    "blank_outputs_enabled": true
   }
 }
 

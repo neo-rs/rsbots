@@ -243,3 +243,48 @@ These commands are only available **inside an OPEN support ticket channel** and 
 - Membership lookups use `member_history.json` (`whop.last_membership_id`) when available
 - Legacy case channels are identified by topic containing `rschecker_payment_case` or name starting with `pay-`
 - Cleanup removes old data from registry and invites based on configured retention periods
+
+## Local Maintenance Tools (CLI)
+
+These are **local scripts** you run on the machine that has `RSCheckerbot/config.json` + `RSCheckerbot/config.secrets.json` (bot token). They are not Discord commands.
+
+### `whop_api_probe.py memberstatus-cards`
+
+- **Purpose**: Scan `#member-status-logs` history and generate an inventory of **every message card title** + **field label set**, then map each card back to the **producer/consumer code paths** that generate/use it (tickets/roles/reporting).
+
+  This is specifically designed to handle historical drift from past formatting changes.
+
+- **Default behavior**: Read-only. Writes a JSON report under `RSCheckerbot/backups/` and saves a resume cursor under `RSCheckerbot/.probe_memberstatus_cards_state.json`.
+
+- **Dry run (recommended first)**:
+
+```bash
+py -3 RSCheckerbot/whop_api_probe.py memberstatus-cards --channel-id 1452835008170426368 --limit 5000 --resume --progress-every 200 --checkpoint-every 2000 --run-until-done
+```
+
+- **Interactive (safer for flaky connections)**:
+
+```bash
+py -3 RSCheckerbot/whop_api_probe.py memberstatus-cards --channel-id 1452835008170426368 --limit 5000 --interactive --checkpoint-every 2000 --run-until-done
+```
+
+- **Record into `member_history.json` (compact baseline, no PII)**:
+
+  This writes per-user snapshots under `member_history.json -> whop.member_status_logs_latest`. It is **confirm-gated**.
+
+```bash
+py -3 RSCheckerbot/whop_api_probe.py memberstatus-cards --channel-id 1452835008170426368 --limit 5000 --resume --run-until-done --record-member-history --confirm confirm
+```
+
+- **Outputs**:
+
+  - **Report JSON**: `RSCheckerbot/backups/memberstatus_cards_scan_*.json`
+  - **Resume cursor**: `RSCheckerbot/.probe_memberstatus_cards_state.json`
+
+- **How to interpret the report (high-signal fields)**:
+
+  - `observed.titles`: exact observed Discord embed titles with counts, footers, and field label stats
+  - `merge`: per-title “known vs unknown” + ticket relevance + producer callsites
+  - `merge.<title>.producer_callsites`: where in code a literal `title="..."` is used
+  - `merge.<title>.producer_title_for_event`: titles emitted by `main.py::_title_for_event()`
+  - `observed.unknown_titles`: likely legacy titles or drifted variants that no longer match current producers
