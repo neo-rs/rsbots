@@ -3850,6 +3850,8 @@ class MemberLookupResultView(discord.ui.View):
     def __init__(self, *, did: int):
         super().__init__(timeout=600)
         self.did = int(did or 0)
+        self._render_lock = asyncio.Lock()
+        self._render_cache: dict[str, list[discord.Embed]] = {}
 
     def _allowed(self, user: discord.abc.User | discord.Member) -> bool:
         try:
@@ -3879,14 +3881,30 @@ class MemberLookupResultView(discord.ui.View):
             with suppress(Exception):
                 await interaction.response.send_message("❌ Guild not found.", ephemeral=True)
             return
-        embs = await _build_member_lookup_category_embeds(guild=guild, did=int(self.did), category=str(category or ""))
+
+        # ACK ASAP to avoid "Unknown interaction" when rate-limited / slow.
+        # After deferring, we must use edit_original_response() instead of response.edit_message().
+        with suppress(Exception):
+            if not interaction.response.is_done():
+                await interaction.response.defer()
+
+        cat = str(category or "").strip().lower()
+        async with self._render_lock:
+            embs = self._render_cache.get(cat)
+            if embs is None:
+                embs = await _build_member_lookup_category_embeds(guild=guild, did=int(self.did), category=cat)
+                self._render_cache[cat] = embs
+
         # Update the same ephemeral message so staff can switch between views.
         try:
-            await interaction.response.edit_message(embeds=embs[:10], view=self)
+            await interaction.edit_original_response(embeds=embs[:10], view=self)
         except TypeError:
-            # Older discord.py: may not support embeds= on edit_message reliably.
+            # Older discord.py: may not support embeds= on edit reliably.
             with suppress(Exception):
-                await interaction.response.edit_message(embed=(embs[0] if embs else None), view=self)
+                await interaction.edit_original_response(embed=(embs[0] if embs else None), view=self)
+        except discord.NotFound:
+            # Interaction/message expired or deleted; nothing we can do.
+            return
 
     @discord.ui.button(label="Payment", style=discord.ButtonStyle.primary)
     async def payment(self, interaction: discord.Interaction, _button: discord.ui.Button):
