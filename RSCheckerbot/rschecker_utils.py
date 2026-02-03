@@ -98,7 +98,7 @@ def extract_discord_id_from_whop_member_record(rec: dict) -> str:
         if isinstance(obj, dict):
             # Special-case: connection objects often look like {"provider":"discord", ... "user_id":"123..."}
             try:
-                prov = str(obj.get("provider") or obj.get("service") or "").strip().lower()
+                prov = str(obj.get("provider") or obj.get("service") or obj.get("type") or obj.get("platform") or "").strip().lower()
                 if prov == "discord":
                     for k in (
                         # Most common

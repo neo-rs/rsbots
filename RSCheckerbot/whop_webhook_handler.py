@@ -670,6 +670,10 @@ async def _resolve_discord_id_from_whop_logs(
         return ""
     ch = guild.get_channel(int(WHOP_LOGS_CHANNEL_ID))
     if not isinstance(ch, discord.TextChannel):
+        # Cache may not contain the channel yet (fresh boot). Try fetching once.
+        with suppress(Exception):
+            ch = await guild.fetch_channel(int(WHOP_LOGS_CHANNEL_ID))
+    if not isinstance(ch, discord.TextChannel):
         return ""
     email_n = _norm_email(email) if email else ""
     mid = str(membership_id_hint or "").strip()

@@ -2672,13 +2672,51 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
     )
     if not footer_ok and not has_discord_id_field and not did:
         return
-    if not did:
-        return
-    did_i = int(did)
-
     guild = bot.get_guild(GUILD_ID)
     if not guild:
         return
+
+    # Fallback: some staff cards (e.g. "(Discord not linked)") omit Discord ID, but we can still
+    # resolve it from native `#whop-logs` (email/key match) and proceed with ticketing.
+    if not did:
+        email_hint = ""
+        with suppress(Exception):
+            for f in (getattr(e0, "fields", None) or []):
+                if str(getattr(f, "name", "") or "").strip().lower() == "email":
+                    email_hint = str(getattr(f, "value", "") or "").strip()
+                    break
+        if email_hint:
+            try:
+                lim = int(WHOP_API_CONFIG.get("logs_lookup_limit", 50))
+            except Exception:
+                lim = 50
+            with suppress(Exception):
+                did2 = await _resolve_discord_id_from_whop_logs(
+                    guild,
+                    email=email_hint,
+                    membership_id_hint=str((whop_brief or {}).get("membership_id") or "").strip(),
+                    whop_key=str((whop_brief or {}).get("membership_id") or "").strip(),
+                    limit=int(max(10, min(250, lim))),
+                )
+                if str(did2 or "").strip().isdigit():
+                    did = int(str(did2).strip())
+                    if isinstance(whop_brief, dict) and did:
+                        whop_brief["connected_discord"] = str(did)
+                    # Persist for restarts (so we don't need to scan history again).
+                    with suppress(Exception):
+                        db_ic2 = load_json(WHOP_IDENTITY_CACHE_FILE)
+                        if not isinstance(db_ic2, dict):
+                            db_ic2 = {}
+                        db_ic2[str(email_hint).strip().lower()] = {
+                            "discord_id": str(did),
+                            "discord_username": "",
+                            "last_seen": datetime.now(timezone.utc).isoformat(),
+                        }
+                        save_json(WHOP_IDENTITY_CACHE_FILE, db_ic2)
+
+    if not did:
+        return
+    did_i = int(did)
     member = guild.get_member(int(did_i))
     if not isinstance(member, discord.Member):
         with suppress(Exception):
@@ -6109,6 +6147,59 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
         connected_disp = str((brief or {}).get("connected_discord") or "").strip()
         did = _extract_discord_id_from_connected(connected_disp)
 
+        # Whop API does not always include Discord linkage in the membership payload.
+        # Before we emit "(Discord not linked)", try to resolve Discord ID from the native `#whop-logs`
+        # cards (email/key match). This avoids false "not linked" staff cards and fixes downstream ticketing.
+        if not did:
+            try:
+                email_hint = str((brief or {}).get("email") or "").strip()
+            except Exception:
+                email_hint = ""
+            if email_hint:
+                # First try the persisted identity cache (no Discord history scan).
+                with suppress(Exception):
+                    db_ic = load_json(WHOP_IDENTITY_CACHE_FILE)
+                    if isinstance(db_ic, dict):
+                        rec0 = db_ic.get(str(email_hint).strip().lower() or "")
+                        if isinstance(rec0, dict):
+                            v0 = str(rec0.get("discord_id") or "").strip()
+                            if v0.isdigit():
+                                did = int(v0)
+                                if did > 0:
+                                    connected_disp = str(did)
+                                    if isinstance(brief, dict):
+                                        brief["connected_discord"] = connected_disp
+                if not did:
+                    try:
+                        lim = int(WHOP_API_CONFIG.get("logs_lookup_limit", 50))
+                    except Exception:
+                        lim = 50
+                    with suppress(Exception):
+                        did2 = await _resolve_discord_id_from_whop_logs(
+                            guild,
+                            email=email_hint,
+                            membership_id_hint=str(mid2 or "").strip(),
+                            whop_key=str((brief or {}).get("membership_id") or "").strip(),
+                            limit=int(max(10, min(250, lim))),
+                        )
+                        did = int(did2) if str(did2 or "").strip().isdigit() else 0
+                        if did > 0:
+                            # Treat as linked for downstream logic/cards.
+                            connected_disp = str(did)
+                            if isinstance(brief, dict):
+                                brief["connected_discord"] = connected_disp
+                            # Persist for restarts (so we don't need to scan history again).
+                            with suppress(Exception):
+                                db_ic2 = load_json(WHOP_IDENTITY_CACHE_FILE)
+                                if not isinstance(db_ic2, dict):
+                                    db_ic2 = {}
+                                db_ic2[str(email_hint).strip().lower()] = {
+                                    "discord_id": str(did),
+                                    "discord_username": "",
+                                    "last_seen": datetime.now(timezone.utc).isoformat(),
+                                }
+                                save_json(WHOP_IDENTITY_CACHE_FILE, db_ic2)
+
         member_obj: discord.Member | None = None
         if did:
             member_obj = guild.get_member(int(did))
@@ -7880,14 +7971,29 @@ async def on_ready():
         _MH_LINK_CACHE["mtime"] = float(mtime)
         return _MH_LINK_CACHE["db"] if isinstance(_MH_LINK_CACHE.get("db"), dict) else {}
 
+    # Linked detection mode:
+    # - strict: require explicit "Connected Discord" proof (original behavior)
+    # - loose: treat "has Whop membership activity" as linked (requested; can be inaccurate by design)
+    try:
+        _linked_mode = str(
+            (((config or {}).get("support_tickets") or {}).get("no_whop_link") or {}).get("linked_detection_mode")
+            or ((config or {}).get("whop_api") or {}).get("linked_detection_mode")
+            or "strict"
+        ).strip().lower()
+    except Exception:
+        _linked_mode = "strict"
+    _linked_mode = _linked_mode if _linked_mode in {"strict", "loose"} else "strict"
+
     def _is_whop_linked(did: int) -> bool:
-        """Return True only when Whop shows this Discord ID as connected.
+        """Return True when this Discord ID is considered Whop-linked.
 
         This is used for:
         - closing `no_whop_link` tickets once the member connects Discord in Whop
         - removing stale "No Whop" roles after linkage is confirmed
 
-        IMPORTANT: Do NOT treat "has a membership_id" as linked. We require a Connected Discord match.
+        Modes:
+        - strict: require a Connected Discord match
+        - loose: treat any Whop membership activity as linked (inaccurate by design)
         """
         try:
             did_i = int(did or 0)
@@ -7962,6 +8068,38 @@ async def on_ready():
                 return True
         except Exception:
             pass
+
+        # Loose mode: any Whop activity for this Discord ID counts as "linked".
+        if _linked_mode == "loose":
+            try:
+                # Any known membership key/id is enough.
+                if mid and str(mid).strip().startswith(("mem_", "R-")):
+                    return True
+                if str(wh.get("last_membership_id") or "").strip().startswith(("mem_", "R-")):
+                    return True
+                if str(wh.get("last_whop_key") or "").strip().startswith(("mem_", "R-")):
+                    return True
+                # Any native whop-logs history captured for this Discord ID.
+                nwl = wh.get("native_whop_logs_latest") if isinstance(wh.get("native_whop_logs_latest"), dict) else {}
+                if isinstance(nwl, dict) and len(nwl) > 0:
+                    return True
+                # Any member-status log baseline row that has real Whop fields (even if Connected Discord is blank).
+                ms = wh.get("member_status_logs_latest") if isinstance(wh.get("member_status_logs_latest"), dict) else {}
+                if isinstance(ms, dict):
+                    for row in ms.values():
+                        if not isinstance(row, dict):
+                            continue
+                        if str(row.get("membership_id") or "").strip() or str(row.get("product") or "").strip() or str(row.get("status") or "").strip():
+                            return True
+                # Any summary snapshot (status/product/membership id).
+                if isinstance(ls, dict) and (
+                    str(ls.get("membership_id") or "").strip()
+                    or str(ls.get("product") or "").strip()
+                    or str(ls.get("status") or "").strip()
+                ):
+                    return True
+            except Exception:
+                pass
 
         return False
 

@@ -888,6 +888,320 @@ def _build_member_lookup_result_embeds(*, guild: discord.Guild, did: int) -> lis
     return [emb_overview, emb_discord, emb_whop, emb_hist, emb_events]
 
 
+def _truthy(v: object) -> bool:
+    if isinstance(v, bool):
+        return v
+    s = str(v or "").strip().lower()
+    return s in {"1", "true", "yes", "y", "on"}
+
+
+def _lookup_snowflake_created_at_utc(did: int) -> str:
+    dt = _snowflake_created_at_utc(int(did or 0))
+    return dt.astimezone(timezone.utc).strftime("%b %d, %Y") if dt else "—"
+
+
+def _lookup_member_activity_kv(*, rec: dict, member: discord.Member) -> list[tuple[str, object]]:
+    """MemberActivity block for lookup cards (best-effort; hide blanks)."""
+    acc = rec.get("access") if isinstance(rec.get("access"), dict) else {}
+    disc = rec.get("discord") if isinstance(rec.get("discord"), dict) else {}
+    out: list[tuple[str, object]] = []
+    out.append(("account_created", _lookup_snowflake_created_at_utc(int(member.id))))
+    with suppress(Exception):
+        if getattr(member, "joined_at", None):
+            out.append(("first_joined", member.joined_at.astimezone(timezone.utc).strftime("%b %d, %Y")))  # type: ignore[union-attr]
+    # Stored counts
+    jc = int(rec.get("join_count") or 0) if isinstance(rec, dict) else 0
+    if jc > 0:
+        out.append(("join_count", jc))
+        out.append(("returning_member", "true" if jc > 1 else "false"))
+    # Leave
+    out.append(("left_at", _fmt_unix_ts(rec.get("last_leave_ts"))))
+    # Access / Members timeline
+    out.append(("ever_had_member_role", "true" if bool(acc.get("ever_had_member_role")) else "false"))
+    out.append(("first_access", _fmt_unix_ts(acc.get("first_access_ts"))))
+    out.append(("last_access", _fmt_unix_ts(acc.get("last_access_ts"))))
+    # Invite fields (if present in history)
+    for k in ("invite_code", "tracked_invite", "source"):
+        v = disc.get(k) if isinstance(disc, dict) else ""
+        if str(v or "").strip():
+            out.append((k, str(v).strip()))
+    # Whop link status (display only; not used for logic)
+    linked = False
+    try:
+        fn = _IS_WHOP_LINKED
+        if fn:
+            linked = bool(fn(int(member.id)))
+    except Exception:
+        linked = False
+    out.append(("whop_link", "linked" if linked else "not linked"))
+    return out
+
+
+def _lookup_best_membership_id(*, rec: dict) -> str:
+    """Pick best membership token we know (prefer mem_ over R-)."""
+    if not isinstance(rec, dict):
+        return ""
+    wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+    cands: list[str] = []
+    with suppress(Exception):
+        cands.append(str(wh.get("last_membership_id") or "").strip())
+        cands.append(str(wh.get("last_whop_key") or "").strip())
+    with suppress(Exception):
+        for row in _member_status_latest_rows(rec)[:15]:
+            if isinstance(row, dict):
+                cands.append(str(row.get("membership_id") or "").strip())
+    with suppress(Exception):
+        for row in _native_logs_latest_rows(rec)[:25]:
+            if isinstance(row, dict):
+                cands.append(str(row.get("key") or "").strip())
+    cands = [x for x in cands if x and x != "—"]
+    for x in cands:
+        if str(x).startswith("mem_"):
+            return str(x)
+    for x in cands:
+        if str(x).startswith("R-"):
+            return str(x)
+    return str(cands[0]) if cands else ""
+
+
+def _lookup_best_whop_brief(*, db: dict, rec: dict) -> dict:
+    """Best-effort Whop brief for lookup cards (baseline-enriched)."""
+    wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+    base_summary = wh.get("last_summary") if isinstance(wh.get("last_summary"), dict) else {}
+    brief0 = dict(base_summary) if isinstance(base_summary, dict) else {}
+    mid = _lookup_best_membership_id(rec=rec)
+    if mid:
+        brief0.setdefault("membership_id", mid)
+    # Enrich from whop-membership-logs baseline when possible (no extra API calls).
+    with suppress(Exception):
+        brief0 = _enrich_whop_brief_from_membership_logs(brief0, membership_id=str(mid or "").strip())
+    return brief0 if isinstance(brief0, dict) else {}
+
+
+def _lookup_pick_source_row(*, db: dict, rec: dict, category: str) -> tuple[str, dict]:
+    """Return (source_kind, row_dict) for the most relevant last card."""
+    cat = str(category or "").strip().lower()
+    ms_rows = _member_status_latest_rows(rec)
+    ms_kinds: set[str] = set()
+    ms_keywords: tuple[str, ...] = ()
+    ml_keywords: tuple[str, ...] = ()
+    wl_keywords: tuple[str, ...] = ()
+    if cat == "payment":
+        ms_kinds = {"payment_failed", "payment_succeeded", "payment_pending", "invoice_paid", "invoice_past_due", "setup_intent_requires_action"}
+        ms_keywords = ("payment", "invoice")
+        ml_keywords = ("payment", "invoice", "setup intent")
+        wl_keywords = ("payment", "purchased", "membership update")
+    elif cat == "membership":
+        ms_kinds = {"membership_activated_pending", "membership_activated", "member_joined", "trialing", "deactivated", "member_role_added"}
+        ms_keywords = ("membership", "activated", "joined", "deactivated")
+        ml_keywords = ("membership", "activated", "pending", "deactivated")
+        wl_keywords = ("membership", "purchased", "membership update")
+    elif cat == "cancellation":
+        ms_kinds = {"cancellation_scheduled", "cancellation_removed", "deactivated"}
+        ms_keywords = ("cancellation", "cancel", "deactivated")
+        ml_keywords = ("cancel", "cancellation")
+        wl_keywords = ("cancel", "cancellation")
+    elif cat == "dispute":
+        ms_kinds = {"dispute_created", "dispute_updated", "refund_created", "refund_updated"}
+        ms_keywords = ("dispute", "refund", "chargeback")
+        ml_keywords = ("dispute", "refund", "chargeback")
+        wl_keywords = ("dispute", "refund", "chargeback")
+
+    # 1) member-status-logs baseline (best when available)
+    for row in (ms_rows or [])[:25]:
+        if not isinstance(row, dict):
+            continue
+        k = str(row.get("kind") or "").strip().lower()
+        t = str(row.get("title") or "").strip().lower()
+        if (k and k in ms_kinds) or (ms_keywords and any(x in t for x in ms_keywords)):
+            return ("member_status_logs", row)
+
+    # 2) whop-membership-logs baseline (needs whop_user_id)
+    brief = _lookup_best_whop_brief(db=db, rec=rec)
+    mid = str(brief.get("membership_id") or "").strip()
+    whop_uid = _whop_user_id_for_lookup(db=db, brief=brief, membership_id=mid)
+    if whop_uid:
+        rows = _membership_logs_rows(db=db, whop_user_id=whop_uid)
+        for r0 in (rows or [])[:30]:
+            title = str(r0.get("title") or "").strip().lower()
+            if ml_keywords and any(x in title for x in ml_keywords):
+                return ("whop_membership_logs", r0)
+
+    # 3) native whop-logs baseline
+    wl = _native_logs_latest_rows(rec)
+    for r1 in (wl or [])[:30]:
+        title = str(r1.get("title") or "").strip().lower()
+        if wl_keywords and any(x in title for x in wl_keywords):
+            return ("whop_logs", r1)
+
+    return ("synthetic", {})
+
+
+def _lookup_title_color_for(*, category: str, brief: dict) -> tuple[str, int, str]:
+    """Return (title, color, event_kind) for the lookup card."""
+    cat = str(category or "").strip().lower()
+    st = str((brief or {}).get("status") or "").strip().lower()
+    cap = str((brief or {}).get("cancel_at_period_end") or "").strip().lower()
+    if cat == "payment":
+        if st in {"past_due", "unpaid"}:
+            return ("❌ Payment Failed — Action Needed", 0xED4245, "payment_failed")
+        return ("✅ Payment Activated", 0x57F287, "active")
+    if cat == "membership":
+        if st in {"deactivated", "canceled", "cancelled", "expired"}:
+            return ("🟧 Membership Deactivated", 0xF59E0B, "deactivated")
+        if st in {"trialing", "pending"}:
+            return ("⏳ Membership Activated (Pending)", 0xFEE75C, "membership_activated_pending")
+        return ("✅ Membership Activated", 0x57F287, "active")
+    if cat == "cancellation":
+        if cap in {"yes", "true", "1"}:
+            return ("⚠️ Cancellation Scheduled", 0xFEE75C, "cancellation_scheduled")
+        if st in {"canceled", "cancelled", "deactivated"}:
+            return ("🟧 Membership Deactivated", 0xF59E0B, "deactivated")
+        return ("✅ Cancellation Removed", 0x57F287, "active")
+    if cat == "dispute":
+        return ("⚠️ Dispute", 0xED4245, "dispute")
+    return ("Member Lookup", 0x5865F2, "active")
+
+
+def _lookup_brief_from_source_row(*, source_kind: str, row: dict, base_brief: dict) -> tuple[dict, str]:
+    """Overlay the chosen source row onto base_brief. Return (brief, source_line)."""
+    brief = dict(base_brief) if isinstance(base_brief, dict) else {}
+    sk = str(source_kind or "").strip()
+    r = row if isinstance(row, dict) else {}
+    created = _short_iso(str(r.get("created_at") or r.get("recorded_at") or ""))
+    jump = str(r.get("jump_url") or "").strip()
+    source_line = f"{sk} • {created}"
+    if jump:
+        source_line += f" • {_embed_link('Open', jump)}"
+
+    if sk == "member_status_logs":
+        for k in (
+            "membership_id",
+            "status",
+            "product",
+            "remaining_days",
+            "renewal_end",
+            "renewal_end_iso",
+            "total_spent",
+            "dashboard_url",
+            "cancel_at_period_end",
+            "connected_discord",
+        ):
+            v = str(r.get(k) or "").strip()
+            if v:
+                brief[k] = v
+    elif sk == "whop_logs":
+        # native whop-logs baseline row
+        k0 = str(r.get("key") or "").strip()
+        if k0:
+            brief["membership_id"] = k0
+        st0 = str(r.get("membership_status") or "").strip()
+        if st0:
+            brief["status"] = st0
+        ap = str(r.get("access_pass") or "").strip()
+        if ap and (not str(brief.get("product") or "").strip()):
+            brief["product"] = ap
+    elif sk == "whop_membership_logs":
+        # baseline fields already merged in whop_brief; add anything obviously present
+        fields = r.get("fields") if isinstance(r.get("fields"), dict) else {}
+        if isinstance(fields, dict):
+            mid = str(r.get("membership_id") or fields.get("membership id") or "").strip()
+            if mid:
+                brief["membership_id"] = mid
+            if str(fields.get("status") or "").strip():
+                brief["status"] = str(fields.get("status") or "").strip()
+            # Prefer product/membership label when present
+            prod = str(fields.get("product") or fields.get("membership") or "").strip()
+            if prod:
+                brief["product"] = prod
+            spent = str(fields.get("total spent") or fields.get("total spent (lifetime)") or "").strip()
+            if spent and (not str(brief.get("total_spent") or "").strip()):
+                brief["total_spent"] = spent
+            dash = str(fields.get("dashboard") or "").strip()
+            if dash and (not str(brief.get("dashboard_url") or "").strip()):
+                brief["dashboard_url"] = dash
+            rw = str(fields.get("renewal window") or "").strip()
+            if rw and (not str(brief.get("renewal_window") or "").strip()):
+                brief["renewal_window"] = rw
+            cd = str(fields.get("connected discord") or fields.get("connected_discord") or "").strip()
+            if cd and (not str(brief.get("connected_discord") or "").strip()):
+                brief["connected_discord"] = cd
+
+    return (brief, source_line)
+
+
+def _build_member_lookup_category_embeds(*, guild: discord.Guild, did: int, category: str) -> list[discord.Embed]:
+    """Build a single 'last card' style embed for the chosen category, with baseline fallback."""
+    did_i = int(did or 0)
+    member = guild.get_member(did_i) if did_i > 0 else None
+    if not isinstance(member, discord.Member):
+        return [_embed_desc_lines("Member Lookup", [f"❌ Member `{did_i}` not found in this server."])]
+
+    db = _member_history_db_cached()
+    rec = db.get(str(did_i)) if isinstance(db, dict) else {}
+    rec = rec if isinstance(rec, dict) else {}
+
+    base_brief = _lookup_best_whop_brief(db=db, rec=rec) if rec else {}
+    source_kind, row = _lookup_pick_source_row(db=db, rec=rec, category=category) if rec else ("synthetic", {})
+    brief2, source_line = _lookup_brief_from_source_row(source_kind=source_kind, row=row, base_brief=base_brief)
+    # Final enrichment pass (fills blanks from whop-membership-logs baseline when possible).
+    with suppress(Exception):
+        brief2 = _enrich_whop_brief_from_membership_logs(brief2, membership_id=str(brief2.get("membership_id") or "").strip())
+
+    title, color, event_kind = _lookup_title_color_for(category=category, brief=brief2)
+    # If we have a real source card title, prefer it (keeps parity with member-status-logs).
+    with suppress(Exception):
+        if isinstance(row, dict) and str(row.get("title") or "").strip():
+            title = str(row.get("title") or "").strip()[:240]
+            event_kind = str(row.get("kind") or event_kind).strip().lower() or event_kind
+
+    # Base + MemberActivity (Discord-side)
+    access_roles = _roles_plain(member) or "—"
+    member_kv = _lookup_member_activity_kv(rec=rec, member=member)
+
+    emb = _build_member_status_detailed_embed(
+        title=title,
+        member=member,
+        access_roles=access_roles,
+        color=int(color),
+        member_kv=member_kv,
+        discord_kv=[],
+        whop_brief=(brief2 if isinstance(brief2, dict) else {}),
+        event_kind=event_kind,
+        force_whop_core_fields=True,
+    )
+    # Add a compact source line so staff can click through when available.
+    with suppress(Exception):
+        emb.add_field(name="Source", value=str(source_line or "synthetic")[:1024], inline=False)
+    return [emb]
+
+
+def _build_member_lookup_picker_embed(*, guild: discord.Guild, did: int) -> discord.Embed:
+    did_i = int(did or 0)
+    member = guild.get_member(did_i) if did_i > 0 else None
+    if not isinstance(member, discord.Member):
+        return discord.Embed(title="Member Lookup", description=f"❌ Member `{did_i}` not found in this server.", color=0x5865F2)
+    lines: list[str] = [
+        f"**Member**: {member.mention}",
+        f"**Discord ID**: `{did_i}`",
+        f"**Current Roles**: {_roles_plain(member) or '—'}",
+        "",
+        "**Pick what you want to view:**",
+        "- Payment",
+        "- Membership",
+        "- Cancellation",
+        "- Dispute",
+    ]
+    open_lines = _open_tickets_lines_for_user(user_id=did_i)
+    if open_lines:
+        lines.append("")
+        lines.append("**Open Tickets:**")
+        lines.extend(open_lines)
+    e = _embed_desc_lines("Member Lookup — Select View", lines)
+    e.color = 0x2B2D31
+    return e
+
+
 def _native_logs_latest_rows(rec: dict) -> list[dict]:
     """Return native_whop_logs_latest entries sorted newest->oldest (best-effort)."""
     if not isinstance(rec, dict):
@@ -1183,13 +1497,14 @@ async def migrate_ticket_channel_owner_overwrites() -> None:
         int(cfg.free_pass_category_id or 0),
         int(cfg.cancellation_category_id or 0),
         int(cfg.member_welcome_category_id or 0),
-        int(cfg.no_whop_link_category_id or 0),
+        int(cfg.no_whop_link_category_id or 0) if bool(getattr(cfg, "no_whop_link_enabled", False)) else 0,
     ]
-    # no_whop_link category may be configured by name (id=0); resolve it best-effort.
-    with suppress(Exception):
-        nw_id = await _get_or_create_no_whop_link_category_id(guild=guild)
-        if int(nw_id or 0) > 0:
-            cat_ids.append(int(nw_id))
+    # no_whop_link category may be configured by name (id=0); resolve it ONLY when enabled.
+    if bool(getattr(cfg, "no_whop_link_enabled", False)):
+        with suppress(Exception):
+            nw_id = await _get_or_create_no_whop_link_category_id(guild=guild)
+            if int(nw_id or 0) > 0:
+                cat_ids.append(int(nw_id))
     # member_welcome category may be configured by name (id=0); resolve it best-effort.
     with suppress(Exception):
         mw_id = await _get_or_create_member_welcome_category_id(guild=guild)
@@ -1311,12 +1626,13 @@ async def migrate_ticket_channel_staff_overwrites() -> None:
         int(cfg.free_pass_category_id or 0),
         int(cfg.cancellation_category_id or 0),
         int(cfg.member_welcome_category_id or 0),
-        int(cfg.no_whop_link_category_id or 0),
+        int(cfg.no_whop_link_category_id or 0) if bool(getattr(cfg, "no_whop_link_enabled", False)) else 0,
     ]
-    with suppress(Exception):
-        nw_id = await _get_or_create_no_whop_link_category_id(guild=guild)
-        if int(nw_id or 0) > 0:
-            cat_ids.append(int(nw_id))
+    if bool(getattr(cfg, "no_whop_link_enabled", False)):
+        with suppress(Exception):
+            nw_id = await _get_or_create_no_whop_link_category_id(guild=guild)
+            if int(nw_id or 0) > 0:
+                cat_ids.append(int(nw_id))
     with suppress(Exception):
         mw_id = await _get_or_create_member_welcome_category_id(guild=guild)
         if int(mw_id or 0) > 0:
@@ -2973,30 +3289,76 @@ class _MemberLookupModal(discord.ui.Modal, title="Lookup Member"):
                 await interaction.response.send_message("❌ Please paste a valid Discord ID (17-19 digits).", ephemeral=True)
             return
         did = int(m.group(1))
-        embeds = _build_member_lookup_result_embeds(guild=guild, did=did)
-        if not embeds:
-            embeds = [_build_member_lookup_result_embed(guild=guild, did=did)]
-
-        # Prefer sending all embeds in one ephemeral response; fall back to followups if needed.
-        sent_ok = False
-        try:
+        picker = _build_member_lookup_picker_embed(guild=guild, did=did)
+        view = MemberLookupResultView(did=did)
+        with suppress(Exception):
             await interaction.response.send_message(
-                embeds=embeds[:10],
+                embed=picker,
+                view=view,
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
-            sent_ok = True
-        except TypeError:
-            sent_ok = False
+
+
+class MemberLookupResultView(discord.ui.View):
+    """Ephemeral per-lookup view: staff chooses which last-card to render."""
+
+    def __init__(self, *, did: int):
+        super().__init__(timeout=600)
+        self.did = int(did or 0)
+
+    def _allowed(self, user: discord.abc.User | discord.Member) -> bool:
+        try:
+            return bool(isinstance(user, discord.Member) and _is_staff_member(user))
         except Exception:
-            sent_ok = False
-        if not sent_ok:
-            # Fallback: send first embed, then followups (still ephemeral).
+            return False
+
+    async def _deny(self, interaction: discord.Interaction) -> None:
+        with suppress(Exception):
+            await interaction.response.send_message("❌ Not allowed (staff only).", ephemeral=True)
+
+    async def _render(self, interaction: discord.Interaction, *, category: str) -> None:
+        if not _ensure_cfg_loaded() or not _BOT:
             with suppress(Exception):
-                await interaction.response.send_message(embed=embeds[0], ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-            for e in embeds[1:5]:
-                with suppress(Exception):
-                    await interaction.followup.send(embed=e, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+                await interaction.response.send_message("❌ Bot not ready.", ephemeral=True)
+            return
+        if not self._allowed(interaction.user):
+            await self._deny(interaction)
+            return
+        cfg = _cfg()
+        if not cfg:
+            with suppress(Exception):
+                await interaction.response.send_message("❌ Config not loaded.", ephemeral=True)
+            return
+        guild = _BOT.get_guild(int(cfg.guild_id))
+        if not isinstance(guild, discord.Guild):
+            with suppress(Exception):
+                await interaction.response.send_message("❌ Guild not found.", ephemeral=True)
+            return
+        embs = _build_member_lookup_category_embeds(guild=guild, did=int(self.did), category=str(category or ""))
+        # Update the same ephemeral message so staff can switch between views.
+        try:
+            await interaction.response.edit_message(embeds=embs[:10], view=self)
+        except TypeError:
+            # Older discord.py: may not support embeds= on edit_message reliably.
+            with suppress(Exception):
+                await interaction.response.edit_message(embed=(embs[0] if embs else None), view=self)
+
+    @discord.ui.button(label="Payment", style=discord.ButtonStyle.primary)
+    async def payment(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self._render(interaction, category="payment")
+
+    @discord.ui.button(label="Membership", style=discord.ButtonStyle.secondary)
+    async def membership(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self._render(interaction, category="membership")
+
+    @discord.ui.button(label="Cancellation", style=discord.ButtonStyle.secondary)
+    async def cancellation(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self._render(interaction, category="cancellation")
+
+    @discord.ui.button(label="Dispute", style=discord.ButtonStyle.danger)
+    async def dispute(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self._render(interaction, category="dispute")
 
 
 class MemberLookupPanelView(discord.ui.View):

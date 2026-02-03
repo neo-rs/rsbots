@@ -174,7 +174,7 @@
     "sync_interval_hours": 6,
     "startup_sync_delay_seconds": 180,
     "enable_verification": true,
-    "enable_sync": true,
+    "enable_sync": false,
     "_comment_cards_api": "If false, webhook-driven staff cards will NOT call Whop API (they will rely on whop-logs + whop-membership-logs). Scans/sync still use API.",
     "cards_use_api": true,
     "_comment_movement_log": "Whop movement/webhook receipt logs. Sent to a dedicated channel in Neo for easy tracking.",
@@ -262,6 +262,8 @@
     "no_whop_link": {
       "_comment": "Scan current Discord Members-role users and open a ticket when Whop linkage is not recorded.",
       "enabled": false,
+      "_comment_linked_detection_mode": "strict = require 'Connected Discord' proof. loose = treat any Whop membership activity as linked (inaccurate by design; clears No-Whop for members who never connected Discord).",
+      "linked_detection_mode": "loose",
       "scan_interval_seconds": 21600,
       "_comment_members_role_id": "Discord role ID that represents current paying members (same as dm_sequence.role_cancel_a).",
       "members_role_id": 876569612085518376,

@@ -3755,6 +3755,7 @@ async def _probe_nowhop_debug(args: argparse.Namespace) -> int:
     scan_discord_logs = bool(getattr(args, "scan_discord_logs", False))
     scan_whop_logs = bool(getattr(args, "scan_whop_logs", False))
     record_member_history = bool(getattr(args, "record_member_history", False))
+    dump_member_discord_paths = bool(getattr(args, "dump_member_discord_paths", False))
     max_pages = int(getattr(args, "members_max_pages", 10) or 10)
     per_page = int(getattr(args, "members_per_page", 100) or 100)
     max_pages = max(1, min(max_pages, 200))
@@ -4211,6 +4212,458 @@ async def _probe_nowhop_debug(args: argparse.Namespace) -> int:
         else:
             print("decision: NOT LINKED (no connected_discord in API) -> OPEN no_whop_link.")
 
+        if dump_member_discord_paths:
+            # Dump discord-related key paths from the Whop member record (PII-safe).
+            try:
+                mem_obj = await client.get_membership_by_id(str(mid))
+            except Exception:
+                mem_obj = {}
+            mber_id = ""
+            try:
+                mm = mem_obj.get("member") if isinstance(mem_obj, dict) else None
+                if isinstance(mm, dict):
+                    mber_id = str(mm.get("id") or "").strip()
+                elif isinstance(mm, str):
+                    mber_id = mm.strip()
+            except Exception:
+                mber_id = ""
+            if (not mber_id) and isinstance(mem_obj, dict):
+                mu = str(mem_obj.get("manage_url") or mem_obj.get("manageUrl") or "").strip()
+                m = re.search(r"\b(mber_[A-Za-z0-9]+)\b", mu)
+                mber_id = m.group(1) if m else ""
+            print(f"api.member_id: {mber_id or '—'}")
+            if mber_id:
+                try:
+                    mrec = await client.get_member_by_id(str(mber_id))
+                except Exception:
+                    mrec = {}
+                extracted = extract_discord_id_from_whop_member_record(mrec) if isinstance(mrec, dict) else ""
+                print(f"api.member.extract_discord_id_from_whop_member_record: {extracted or '—'}")
+                paths: list[tuple[str, str]] = []
+
+                def _redact(s: str) -> str:
+                    return re.sub(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", "[redacted-email]", s)
+
+                def walk(obj: object, path: str = "", depth: int = 0) -> None:
+                    if depth > 6:
+                        return
+                    if isinstance(obj, dict):
+                        # Also include dicts that look like connections with provider/type == discord
+                        try:
+                            prov = str(obj.get("provider") or obj.get("service") or obj.get("type") or obj.get("platform") or "").strip().lower()
+                        except Exception:
+                            prov = ""
+                        if prov == "discord":
+                            paths.append((path or "<root>", f"provider=discord keys={','.join(list(obj.keys())[:20])}"))
+                        for k, v in obj.items():
+                            k_low = str(k or "").lower()
+                            p = f"{path}.{k}" if path else str(k)
+                            if "discord" in k_low:
+                                sv = _redact(str(v))[:200]
+                                paths.append((p, sv))
+                            walk(v, p, depth + 1)
+                    elif isinstance(obj, list):
+                        for i, it in enumerate(obj[:25]):
+                            walk(it, f"{path}[{i}]", depth + 1)
+
+                walk(mrec, "", 0)
+                print(f"api.member.discord_paths_found: {len(paths)}")
+                for pth, val in paths[:40]:
+                    print(f"- {pth}: {val}")
+
+    return 0
+
+
+def _matches_connected_discord(connected: object, did: int) -> bool:
+    try:
+        m = re.search(r"\b(\d{17,19})\b", str(connected or ""))
+        return bool(m and m.group(1).isdigit() and int(m.group(1)) == int(did))
+    except Exception:
+        return False
+
+
+def _is_whop_linked_from_member_history(*, db: dict, discord_id: int, membership_id: str = "") -> bool:
+    """Best-effort: treat as linked only when we can prove Connected Discord == discord_id."""
+    did = int(discord_id or 0)
+    if did <= 0 or not isinstance(db, dict):
+        return False
+    rec = db.get(str(did))
+    if not isinstance(rec, dict):
+        rec = {}
+    wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+    if not isinstance(wh, dict):
+        wh = {}
+
+    # 1) member-status-logs baseline (most definitive in your pipeline)
+    ms = wh.get("member_status_logs_latest") if isinstance(wh.get("member_status_logs_latest"), dict) else {}
+    if isinstance(ms, dict):
+        for row in ms.values():
+            if isinstance(row, dict) and _matches_connected_discord(row.get("connected_discord"), did):
+                return True
+
+    # 2) last_summary snapshot (sometimes includes it)
+    ls = wh.get("last_summary") if isinstance(wh.get("last_summary"), dict) else {}
+    if isinstance(ls, dict) and _matches_connected_discord(ls.get("connected_discord"), did):
+        return True
+
+    # 3) membership-logs baseline (whop_users) via membership_index
+    mid = str(membership_id or "").strip()
+    if not mid:
+        mid = str(wh.get("last_membership_id") or wh.get("last_whop_key") or "").strip()
+    if mid:
+        midx = db.get("whop_membership_index") if isinstance(db.get("whop_membership_index"), dict) else {}
+        ukey = str(midx.get(mid) or "").strip() if isinstance(midx, dict) else ""
+        if ukey:
+            wu = db.get("whop_users") if isinstance(db.get("whop_users"), dict) else {}
+            urec = wu.get(ukey) if isinstance(wu, dict) else None
+            uwh = urec.get("whop") if isinstance(urec, dict) and isinstance(urec.get("whop"), dict) else {}
+            latest = uwh.get("membership_logs_latest") if isinstance(uwh.get("membership_logs_latest"), dict) else {}
+            if isinstance(latest, dict):
+                for row in latest.values():
+                    if not isinstance(row, dict):
+                        continue
+                    fields = row.get("fields") if isinstance(row.get("fields"), dict) else {}
+                    if not isinstance(fields, dict):
+                        continue
+                    cd2 = fields.get("connected discord") or fields.get("connected_discord") or ""
+                    if _matches_connected_discord(cd2, did):
+                        return True
+
+    return False
+
+
+def _extract_discord_id_from_channel_topic(topic: object) -> int:
+    try:
+        m = re.search(r"(?im)^\s*user_id\s*=\s*(\d{17,19})\s*$", str(topic or ""))
+        if m and m.group(1).isdigit():
+            return int(m.group(1))
+    except Exception:
+        return 0
+    return 0
+
+
+def _extract_discord_id_from_embed(e: discord.Embed) -> int:
+    if not isinstance(e, discord.Embed):
+        return 0
+    try:
+        for f in (getattr(e, "fields", None) or []):
+            n = str(getattr(f, "name", "") or "").strip().lower()
+            v = str(getattr(f, "value", "") or "").strip()
+            if n == "discord id":
+                m = re.search(r"\b(\d{17,19})\b", v)
+                if m and m.group(1).isdigit():
+                    return int(m.group(1))
+    except Exception:
+        return 0
+    return 0
+
+
+def _extract_membership_id_from_embed(e: discord.Embed) -> str:
+    if not isinstance(e, discord.Embed):
+        return ""
+    try:
+        for f in (getattr(e, "fields", None) or []):
+            n = str(getattr(f, "name", "") or "").strip().lower()
+            v = str(getattr(f, "value", "") or "").strip()
+            if n in {"membership id", "membership_id", "whop key", "key"}:
+                mid = _extract_membership_id_from_text(v)
+                if mid:
+                    return mid
+    except Exception:
+        return ""
+    with suppress(Exception):
+        return _extract_membership_id_from_text(str(getattr(e, "title", "") or ""), str(getattr(e, "description", "") or ""))
+    return ""
+
+
+async def _probe_nowhop_purge(args: argparse.Namespace) -> int:
+    """Purge nowhop category: remove No-Whop role for linked users, delete all channels, delete category."""
+    cfg = load_config()
+    token = str(cfg.get("bot_token") or "").strip()
+    if not token:
+        print("Missing bot_token in config.secrets.json")
+        return 2
+
+    try:
+        st = cfg.get("support_tickets") if isinstance(cfg, dict) else {}
+        st = st if isinstance(st, dict) else {}
+        default_gid = int(st.get("guild_id") or cfg.get("guild_id") or 0)
+    except Exception:
+        default_gid = 0
+
+    try:
+        guild_id = int(str(getattr(args, "guild_id", "") or default_gid or 0).strip())
+    except Exception:
+        guild_id = 0
+    try:
+        category_id = int(str(getattr(args, "category_id", "") or "").strip())
+    except Exception:
+        category_id = 0
+
+    # No-Whop role id (default from config support_tickets.ticket_roles.no_whop_link_role_id)
+    role_id = 0
+    try:
+        tr = (st.get("ticket_roles") if isinstance(st, dict) else {}) if isinstance(st, dict) else {}
+        tr = tr if isinstance(tr, dict) else {}
+        role_id = int(tr.get("no_whop_link_role_id") or 0)
+    except Exception:
+        role_id = 0
+    try:
+        override = str(getattr(args, "no_whop_role_id", "") or "").strip()
+        if override.isdigit():
+            role_id = int(override)
+    except Exception:
+        pass
+
+    apply = bool(getattr(args, "apply", False))
+    confirm = str(getattr(args, "confirm", "") or "").strip()
+    skip_role_remove = bool(getattr(args, "skip_role_remove", False))
+    skip_delete_channels = bool(getattr(args, "skip_delete_channels", False))
+    skip_delete_category = bool(getattr(args, "skip_delete_category", False))
+    scan_members = bool(getattr(args, "scan_members", False))
+    try:
+        members_max_pages = int(getattr(args, "members_max_pages", 50) or 50)
+    except Exception:
+        members_max_pages = 50
+    try:
+        members_per_page = int(getattr(args, "members_per_page", 100) or 100)
+    except Exception:
+        members_per_page = 100
+    members_max_pages = max(1, min(members_max_pages, 200))
+    members_per_page = max(10, min(members_per_page, 200))
+    try:
+        sleep_ms = int(getattr(args, "sleep_ms", 850) or 850)
+    except Exception:
+        sleep_ms = 850
+    sleep_ms = max(0, min(sleep_ms, 5000))
+
+    if not guild_id or not category_id:
+        print(f"Missing required ids (guild_id={guild_id} category_id={category_id}).")
+        return 2
+    if apply and confirm != "confirm":
+        print("Refusing to apply destructive changes without --confirm confirm")
+        return 2
+
+    # Load member_history baseline once.
+    mh = _load_json_file(_MEMBER_HISTORY_FILE)
+    if not isinstance(mh, dict):
+        mh = {}
+
+    print("=== nowhop purge ===")
+    print(f"guild_id: {guild_id}")
+    print(f"category_id: {category_id}")
+    print(f"no_whop_role_id: {role_id}")
+    print(f"apply: {apply} (confirm={confirm!r})")
+    print(f"skip_role_remove: {skip_role_remove}  skip_delete_channels: {skip_delete_channels}  skip_delete_category: {skip_delete_category}")
+    print(f"scan_members: {scan_members} (max_pages={members_max_pages} per_page={members_per_page})")
+    print(f"sleep_ms: {sleep_ms}")
+    print(f"member_history_file: {str(_MEMBER_HISTORY_FILE)} (exists={_MEMBER_HISTORY_FILE.exists()})")
+
+    intents = discord.Intents.none()
+    intents.guilds = True
+    intents.messages = True
+    intents.message_content = False
+    bot = discord.Client(intents=intents)
+
+    @bot.event
+    async def on_ready():
+        print(f"logged in as: {bot.user}")
+        g = bot.get_guild(int(guild_id))
+        if g is None:
+            with suppress(Exception):
+                g = await bot.fetch_guild(int(guild_id))
+        if g is None:
+            print("guild not found / not accessible")
+            with suppress(Exception):
+                await bot.close()
+            return
+
+        role = None
+        if int(role_id) > 0:
+            with suppress(Exception):
+                role = g.get_role(int(role_id))
+
+        cat = bot.get_channel(int(category_id))
+        if cat is None:
+            with suppress(Exception):
+                cat = await bot.fetch_channel(int(category_id))
+        if not isinstance(cat, discord.CategoryChannel):
+            print(f"category not found or not a category: {type(cat)}")
+            with suppress(Exception):
+                await bot.close()
+            return
+
+        chans = [c for c in list(getattr(cat, "channels", []) or []) if isinstance(c, discord.TextChannel)]
+        print(f"channels_in_category: {len(chans)}")
+
+        scanned = 0
+        did_found = 0
+        linked_true = 0
+        linked_false = 0
+        role_removed = 0
+        role_remove_failed = 0
+        channels_deleted = 0
+        channels_delete_failed = 0
+        no_did = 0
+
+        # First pass: extract (channel -> discord_id, membership_id) without deleting anything.
+        items: list[dict] = []
+        for ch in chans:
+            scanned += 1
+            ch_name = str(getattr(ch, "name", "") or "")
+            ch_id = int(getattr(ch, "id", 0) or 0)
+            print(f"\n[{scanned}/{len(chans)}] channel: {ch_name} ({ch_id})")
+
+            did = _extract_discord_id_from_channel_topic(getattr(ch, "topic", "") or "")
+            mid = ""
+            if not mid:
+                mid = _extract_membership_id_from_text(str(getattr(ch, "topic", "") or ""), ch_name)
+            if not did:
+                try:
+                    async for msg in ch.history(limit=25, oldest_first=True):
+                        for e0 in (getattr(msg, "embeds", None) or []):
+                            if not isinstance(e0, discord.Embed):
+                                continue
+                            if not did:
+                                did = _extract_discord_id_from_embed(e0)
+                            if not mid:
+                                mid = _extract_membership_id_from_embed(e0)
+                            if did and mid:
+                                break
+                        if did and mid:
+                            break
+                except Exception as ex:
+                    print(f"  warn: failed to scan channel header embeds: {str(ex)[:200]}")
+
+            if did:
+                did_found += 1
+                print(f"  discord_id: {did}")
+            else:
+                no_did += 1
+                print("  discord_id: (not found)")
+
+            if mid:
+                print(f"  membership_id: {mid}")
+
+            items.append({"channel": ch, "discord_id": int(did or 0), "membership_id": str(mid or "").strip()})
+
+        # Optional: definitive linkage scan via Whop API /members (targets-only).
+        linked_by_members_api: set[int] = set()
+        if scan_members:
+            client, wh = _init_client_from_local_config()
+            if not client:
+                print("\n[scan_members] Missing `whop_api.api_key` or `whop_api.company_id` in config.secrets.json. Skipping.")
+            else:
+                targets = sorted({int(it.get("discord_id") or 0) for it in items if int(it.get("discord_id") or 0) > 0})
+                print(f"\n[scan_members] targets: {len(targets)} discord_id(s)")
+                after: str | None = None
+                pages = 0
+                scanned_members = 0
+                found = 0
+                target_set = set(targets)
+                while pages < members_max_pages and found < len(targets):
+                    batch, page_info = await client.list_members(
+                        first=members_per_page,
+                        after=after,
+                        params={"order": "joined_at", "direction": "desc"},
+                    )
+                    pages += 1
+                    if not batch:
+                        break
+                    for rec in batch:
+                        if not isinstance(rec, dict):
+                            continue
+                        scanned_members += 1
+                        raw = extract_discord_id_from_whop_member_record(rec)
+                        if str(raw or "").strip().isdigit():
+                            d0 = int(str(raw).strip())
+                            if d0 in target_set and d0 not in linked_by_members_api:
+                                linked_by_members_api.add(d0)
+                                found += 1
+                    after = str(page_info.get("end_cursor") or "") if isinstance(page_info, dict) else ""
+                    has_next = bool(page_info.get("has_next_page")) if isinstance(page_info, dict) else False
+                    if (not has_next) or (not after):
+                        break
+                print(f"[scan_members] pages_scanned: {pages} members_scanned: {scanned_members} linked_targets_found: {len(linked_by_members_api)}/{len(targets)}")
+
+        # Second pass: decide linked + apply actions.
+        print("\n=== decisions ===")
+        idx2 = 0
+        for it in items:
+            idx2 += 1
+            ch = it.get("channel")
+            did = int(it.get("discord_id") or 0)
+            mid = str(it.get("membership_id") or "").strip()
+            ch_name = str(getattr(ch, "name", "") or "") if isinstance(ch, discord.TextChannel) else "?"
+            ch_id = int(getattr(ch, "id", 0) or 0) if isinstance(ch, discord.TextChannel) else 0
+
+            print(f"\n[{idx2}/{len(items)}] channel: {ch_name} ({ch_id})")
+            print(f"  discord_id: {did or '—'}")
+            if mid:
+                print(f"  membership_id: {mid}")
+
+            linked_baseline = _is_whop_linked_from_member_history(db=mh, discord_id=int(did), membership_id=str(mid or ""))
+            linked_api = bool(did and did in linked_by_members_api)
+            linked = bool(linked_api or linked_baseline)
+            if did:
+                print(f"  linked: {linked} (api={linked_api} baseline={linked_baseline})")
+                if linked:
+                    linked_true += 1
+                else:
+                    linked_false += 1
+
+            if apply and (not skip_role_remove) and did and linked and isinstance(role, discord.Role):
+                try:
+                    mobj = g.get_member(int(did))
+                    if not isinstance(mobj, discord.Member):
+                        mobj = await g.fetch_member(int(did))
+                    if isinstance(mobj, discord.Member):
+                        if role in (mobj.roles or []):
+                            await mobj.remove_roles(role, reason="nowhop purge: linked in Whop; remove No Whop role")
+                            role_removed += 1
+                            print("  role_removed: yes")
+                        else:
+                            print("  role_removed: no (role not present)")
+                    else:
+                        print("  role_removed: no (member not found)")
+                except Exception as ex:
+                    role_remove_failed += 1
+                    print(f"  role_removed: FAILED ({str(ex)[:200]})")
+
+            if apply and (not skip_delete_channels):
+                try:
+                    if isinstance(ch, discord.TextChannel):
+                        await ch.delete(reason="nowhop purge: delete deprecated no-whop ticket channel")
+                    channels_deleted += 1
+                    print("  channel_deleted: yes")
+                except Exception as ex:
+                    channels_delete_failed += 1
+                    print(f"  channel_deleted: FAILED ({str(ex)[:200]})")
+                if sleep_ms:
+                    await asyncio.sleep(float(sleep_ms) / 1000.0)
+
+        cat_deleted = False
+        if apply and (not skip_delete_category):
+            try:
+                await cat.delete(reason="nowhop purge: delete deprecated no-whop ticket category")
+                cat_deleted = True
+                print("\ncategory_deleted: yes")
+            except Exception as ex:
+                print(f"\ncategory_deleted: FAILED ({str(ex)[:200]})")
+
+        print("\n=== summary ===")
+        print(f"channels_scanned: {scanned}")
+        print(f"discord_ids_found: {did_found} (missing={no_did})")
+        print(f"linked_true: {linked_true} linked_false: {linked_false}")
+        print(f"role_removed: {role_removed} role_remove_failed: {role_remove_failed}")
+        print(f"channels_deleted: {channels_deleted} channels_delete_failed: {channels_delete_failed}")
+        print(f"category_deleted: {cat_deleted}")
+
+        with suppress(Exception):
+            await bot.close()
+
+    async with bot:
+        await bot.start(token)
     return 0
 
 
@@ -4938,6 +5391,34 @@ def main() -> int:
     pnow.add_argument("--whop-logs-history-limit", type=int, default=2000, help="How many recent messages to scan in whop-logs (50-20000).")
     pnow.add_argument("--whop-logs-before-message-id", default="", help="Scan whop-logs messages before this message id (snowflake) to reach older history.")
     pnow.add_argument("--record-member-history", action="store_true", default=False, help="Record latest per-title whop-logs hits into member_history.json (no PII).")
+    pnow.add_argument(
+        "--dump-member-discord-paths",
+        action="store_true",
+        default=False,
+        help="When Whop API is available, dump discord-related key paths from the Whop member record (PII-safe).",
+    )
+
+    pnp = sub.add_parser(
+        "nowhop-purge",
+        help="Purge a nowhop category: remove No-Whop role for linked users, delete all channels, delete category.",
+    )
+    pnp.add_argument("--category-id", required=True, help="Discord category channel ID containing nowhop ticket channels.")
+    pnp.add_argument("--guild-id", default="", help="Discord guild ID (defaults to support_tickets.guild_id).")
+    pnp.add_argument(
+        "--no-whop-role-id",
+        dest="no_whop_role_id",
+        default="",
+        help="No-Whop role ID to remove when linked (defaults to support_tickets.ticket_roles.no_whop_link_role_id).",
+    )
+    pnp.add_argument("--apply", action="store_true", default=False, help="Actually remove roles / delete channels / delete category (destructive).")
+    pnp.add_argument("--confirm", default="", help="Must be exactly 'confirm' when using --apply.")
+    pnp.add_argument("--skip-role-remove", action="store_true", default=False, help="Do not remove No-Whop role (even when linked).")
+    pnp.add_argument("--skip-delete-channels", action="store_true", default=False, help="Do not delete nowhop channels.")
+    pnp.add_argument("--skip-delete-category", action="store_true", default=False, help="Do not delete the category.")
+    pnp.add_argument("--sleep-ms", type=int, default=850, help="Delay between deletions (helps avoid rate limits).")
+    pnp.add_argument("--scan-members", action="store_true", default=False, help="Also scan Whop API /members to confirm which Discord IDs are connected (more accurate).")
+    pnp.add_argument("--members-max-pages", type=int, default=50, help="Max pages to scan from /members when --scan-members is set.")
+    pnp.add_argument("--members-per-page", type=int, default=100, help="Page size for /members when --scan-members is set (10-200).")
 
     pmc = sub.add_parser(
         "memberstatus-cards",
@@ -5012,6 +5493,8 @@ def main() -> int:
         return asyncio.run(_probe_staffcards(args))
     if args.mode == "nowhop-debug":
         return asyncio.run(_probe_nowhop_debug(args))
+    if args.mode == "nowhop-purge":
+        return asyncio.run(_probe_nowhop_purge(args))
     if args.mode == "memberstatus-cards":
         return asyncio.run(_probe_memberstatus_cards(args))
     if args.mode == "memberstatus-view":
