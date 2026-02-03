@@ -5,6 +5,14 @@ RSCheckerbot manages member verification, payment tracking, and DM sequences for
 
 ## Command Categories
 
+### Slash Commands (Staff/Admin)
+
+#### `/channel_limits`
+- **Description**: Show current server channel counts vs Discord limits (and category count vs limit)
+- **Staff/Admin Only**: Yes (Discord Administrator OR roles from `config.json -> support_tickets.permissions.staff_role_ids` / `admin_role_ids`)
+- **Usage**: `/channel_limits`
+- **Returns**: Ephemeral summary line (no public spam)
+
 ### Content Management Commands
 
 #### `.checker editmessages`

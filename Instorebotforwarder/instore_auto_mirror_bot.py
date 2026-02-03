@@ -552,6 +552,13 @@ class InstorebotForwarder:
         s = " ".join((price or "").split()).strip()
         if not s:
             return ""
+        # Support code-prefixed formats like "USD1,472.34" / "PHP1,472.34"
+        m0 = re.search(r"^([A-Z]{3})\s?(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)$", s, re.IGNORECASE)
+        if m0:
+            code = (m0.group(1) or "").upper().strip()
+            num = (m0.group(2) or "").replace(",", "").strip()
+            sym0 = {"USD": "$", "CAD": "$", "AUD": "$", "GBP": "£", "EUR": "€"}.get(code)
+            return f"{sym0}{num}" if sym0 else f"{code}{num}"
         m = re.search(r"([$£€])\s?(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", s)
         if m:
             return f"{m.group(1)}{m.group(2)}"
@@ -562,6 +569,48 @@ class InstorebotForwarder:
             sym = {"USD": "$", "CAD": "$", "AUD": "$", "GBP": "£", "EUR": "€"}.get(code)
             return f"{sym}{num}" if sym else f"{num} {code}".strip()
         return s
+
+    def _sanitize_amazon_price_for_marketplace(self, price: str, *, url: str) -> str:
+        """
+        Guardrail: for amazon.com pages, reject non-USD currency strings (e.g. PHP/₱).
+        We prefer returning "" (missing) over posting the wrong currency.
+        """
+        p = " ".join((price or "").split()).strip()
+        if not p:
+            return ""
+        try:
+            host = (urlparse(url).netloc or "").lower()
+        except Exception:
+            host = ""
+
+        # Only enforce strict USD for amazon.com.
+        if not host.endswith("amazon.com"):
+            return p
+
+        # Accept $-prefixed or explicit USD formats.
+        if "$" in p:
+            return p
+        if re.search(r"\bUSD\b", p, re.IGNORECASE):
+            return p
+
+        # Reject common foreign currency markers (e.g. PHP1,472.34 or ₱1,472.34).
+        if "₱" in p:
+            return ""
+
+        # If it looks like a currency code price, reject (better N/A than wrong currency).
+        # Handles "PHP1,472.34" (prefix) and "1472.34 PHP" (suffix).
+        m_pref = re.match(r"^([A-Z]{3})", p, re.IGNORECASE)
+        if m_pref:
+            code = (m_pref.group(1) or "").upper().strip()
+            if code and code != "USD":
+                return ""
+        m_suf = re.search(r"\b([A-Z]{3})\b", p, re.IGNORECASE)
+        if m_suf:
+            code = (m_suf.group(1) or "").upper().strip()
+            if code and code != "USD":
+                return ""
+
+        return p
 
     def _price_to_float(self, price: str) -> Tuple[Optional[float], str]:
         """
@@ -591,19 +640,6 @@ class InstorebotForwarder:
         if not t:
             return ""
 
-        # Prefer common strike-through/list-price DOM fragments.
-        for pat in (
-            r'\bList Price\b[^$£€]{0,80}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)',
-            r'\bWas\b[^$£€]{0,80}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)',
-            r'\bMSRP\b[^$£€]{0,80}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)',
-            r'\bTypical price\b[^$£€]{0,80}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)',
-        ):
-            m = re.search(pat, t, re.IGNORECASE | re.DOTALL)
-            if m:
-                cand = self._normalize_price_str(m.group(1) or "")
-                if cand:
-                    return cand
-
         # Only do the "highest currency" fallback when we *also* know a current price.
         # Otherwise we risk picking per-unit prices like "$0.21/oz" as a fake "Before".
         cur_norm = self._normalize_price_str(current_price)
@@ -618,11 +654,13 @@ class InstorebotForwarder:
         if cur_val is None:
             return ""
 
-        # Reduce false positives by focusing on the main price area when possible.
+        # Prefer common strike-through/list-price DOM fragments, but only if they are > current.
+        # This avoids false "before" values like AppleCare add-ons that can be lower than the item price.
+        # Also focus within the main price area when possible.
         focus = t
         try:
             low_all = t.lower()
-            mpos = re.search(r"(corepricedisplay_desktop_feature_div|corepricedisplay_mobile_feature_div|apexpricetopay|pricetopay|buybox)", low_all)
+            mpos = re.search(r"(corepricedisplay_desktop_feature_div|corepricedisplay_mobile_feature_div|apexpricetopay|pricetopay|buybox|apex_desktop|apex_mobile)", low_all)
             if mpos:
                 start = max(0, mpos.start() - 2000)
                 end = min(len(t), mpos.start() + 9000)
@@ -630,6 +668,28 @@ class InstorebotForwarder:
         except Exception:
             focus = t
 
+        for pat in (
+            r'\bList Price\b[^$£€]{0,80}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)',
+            r'\bWas\b[^$£€]{0,80}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)',
+            r'\bMSRP\b[^$£€]{0,80}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)',
+            r'\bTypical price\b[^$£€]{0,80}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)',
+        ):
+            m = re.search(pat, focus, re.IGNORECASE | re.DOTALL)
+            if not m:
+                continue
+            cand = self._normalize_price_str(m.group(1) or "")
+            if not cand:
+                continue
+            try:
+                cand_val, _cand_sym = self._price_to_float(cand)
+            except Exception:
+                cand_val = None
+            if cand_val is None:
+                continue
+            if cand_val > cur_val:
+                return cand
+
+        # Reduce false positives by focusing on the main price area when possible.
         vals: List[Tuple[float, str]] = []
         for m in re.finditer(r"(?<!\w)([$£€])\s?(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)(?!\w)", focus):
             sym = (m.group(1) or "").strip()
@@ -1721,9 +1781,18 @@ class InstorebotForwarder:
             title = self._extract_amazon_title_from_html(html_txt)
             image_url = self._extract_amazon_image_from_html(html_txt)
             price = self._normalize_price_str(price_txt) or self._extract_amazon_current_price_from_html(html_txt)
+            try:
+                price = self._sanitize_amazon_price_for_marketplace(price, url=u)
+            except Exception:
+                pass
             before_price = self._extract_amazon_before_price_from_html(html_txt, current_price=price)
+            try:
+                before_price = self._sanitize_amazon_price_for_marketplace(before_price, url=u)
+            except Exception:
+                pass
             discount_notes = self._extract_amazon_discount_notes_from_html(html_txt)
             dept = self._extract_amazon_department_from_html(html_txt)
+            availability = self._extract_amazon_availability_from_html(html_txt)
 
             out = {
                 "title": title.strip(),
@@ -1732,6 +1801,7 @@ class InstorebotForwarder:
                 "before_price": before_price.strip(),
                 "discount_notes": "; ".join([n for n in (discount_notes or []) if n]).strip(),
                 "department": (dept or "").strip(),
+                "availability": (availability or "").strip(),
             }
             if not (out.get("title") or out.get("image_url") or out.get("price")):
                 return None, "no useful fields found"
@@ -1952,6 +2022,40 @@ class InstorebotForwarder:
 
         return ""
 
+    def _extract_amazon_availability_from_html(self, html_txt: str) -> str:
+        """
+        Best-effort availability signal from an Amazon product page.
+
+        Returns:
+        - "out_of_stock" when we see strong OOS/unavailable wording
+        - "" when unknown/in-stock (we don't try to guarantee "in stock")
+        """
+        t = html_txt or ""
+        if not t:
+            return ""
+        low = t.lower()
+
+        strong = (
+            "currently unavailable",
+            "temporarily out of stock",
+            "we don't know when or if this item will be back in stock",
+            "out of stock",
+        )
+        if any(s in low for s in strong):
+            return "out_of_stock"
+
+        # Common availability container (sometimes contains "In Stock." / "Out of Stock.")
+        try:
+            m = re.search(r'id=["\']availability["\'][\s\S]{0,1200}</', t, re.IGNORECASE)
+            snippet = (m.group(0) or "").lower() if m else ""
+        except Exception:
+            snippet = ""
+        if snippet:
+            if ("currently unavailable" in snippet) or ("temporarily out of stock" in snippet) or ("out of stock" in snippet):
+                return "out_of_stock"
+
+        return ""
+
     def _extract_jsonld_product(self, html: str) -> Dict[str, Any]:
         """
         Parse a Product JSON-LD block if present. Best-effort only.
@@ -2166,6 +2270,13 @@ class InstorebotForwarder:
         # Best-effort before/list price (strike-through, list price labels, etc).
         before_price = self._extract_amazon_before_price_from_html(html_txt, current_price=price)
 
+        # Currency guardrails (amazon.com should be USD; reject foreign currencies).
+        try:
+            price = self._sanitize_amazon_price_for_marketplace(price, url=u)
+            before_price = self._sanitize_amazon_price_for_marketplace(before_price, url=u)
+        except Exception:
+            pass
+
         # Best-effort discount signals (coupon/sub&save/deal badge).
         try:
             discount_notes = self._extract_amazon_discount_notes_from_html(html_txt)
@@ -2177,6 +2288,12 @@ class InstorebotForwarder:
             department = self._extract_amazon_department_from_html(html_txt)
         except Exception:
             department = ""
+
+        # Best-effort availability (out of stock / currently unavailable).
+        try:
+            availability = self._extract_amazon_availability_from_html(html_txt)
+        except Exception:
+            availability = ""
 
         # If we still have no image, try adsystem image by ASIN (works even when the HTML is sparse).
         if (not image_url) and asin_guess:
@@ -2194,14 +2311,28 @@ class InstorebotForwarder:
             "before_price": " ".join((before_price or "").split()).strip(),
             "discount_notes": "; ".join([n for n in (discount_notes or []) if n]).strip(),
             "department": (department or "").strip(),
+            "availability": (availability or "").strip(),
         }
         # Ensure at least one field is useful
         if not (out.get("title") or out.get("image_url") or out.get("price")):
             return None, "no useful fields found"
 
+        # Sanity: if our extracted "before_price" is lower than the current price,
+        # it's almost certainly a coupon/savings amount or unrelated number.
+        # Clear it so Playwright merge (below) can replace it, or it becomes N/A later.
+        try:
+            cur_v, _cur_s = self._price_to_float(out.get("price", ""))
+            bef_v, _bef_s = self._price_to_float(out.get("before_price", ""))
+            if (cur_v is not None) and (bef_v is not None) and (bef_v > 0) and (cur_v > 0) and (bef_v < cur_v):
+                out["before_price"] = ""
+        except Exception:
+            pass
+
         # If the requests-based fetch didn't expose the current price (common on some product layouts),
         # try a Playwright scrape and merge any missing fields.
-        if self._playwright_enabled() and (not out.get("price") or not out.get("image_url")):
+        pw: Optional[Dict[str, str]] = None
+        pw_err: Optional[str] = None
+        if self._playwright_enabled() and (not out.get("price") or not out.get("image_url") or not out.get("before_price")):
             try:
                 pw, pw_err = await self._scrape_amazon_page_playwright(u)
             except Exception as e:
@@ -2210,6 +2341,33 @@ class InstorebotForwarder:
                 for k in ("title", "image_url", "price", "before_price", "discount_notes", "department"):
                     if (not str(out.get(k) or "").strip()) and str(pw.get(k) or "").strip():
                         out[k] = str(pw.get(k) or "").strip()
+
+        # Re-run the sanity check AFTER Playwright merge too (Playwright can fill current price, which
+        # can reveal a previously-extracted bogus "before" number like an add-on price/coupon).
+        try:
+            cur_v2, _cur_s2 = self._price_to_float(out.get("price", ""))
+            bef_v2, _bef_s2 = self._price_to_float(out.get("before_price", ""))
+            if (cur_v2 is not None) and (bef_v2 is not None) and (bef_v2 > 0) and (cur_v2 > 0) and (bef_v2 < cur_v2):
+                out["before_price"] = ""
+        except Exception:
+            pass
+
+        # If we cleared before_price and Playwright had a candidate, try to use it.
+        if (not str(out.get("before_price") or "").strip()) and pw and (not pw_err):
+            try:
+                cand_b = str(pw.get("before_price") or "").strip()
+            except Exception:
+                cand_b = ""
+            if cand_b:
+                out["before_price"] = cand_b
+                # ... and validate it one more time.
+                try:
+                    cur_v3, _cur_s3 = self._price_to_float(out.get("price", ""))
+                    bef_v3, _bef_s3 = self._price_to_float(out.get("before_price", ""))
+                    if (cur_v3 is not None) and (bef_v3 is not None) and (bef_v3 > 0) and (cur_v3 > 0) and (bef_v3 < cur_v3):
+                        out["before_price"] = ""
+                except Exception:
+                    pass
         if asin_guess:
             self._scrape_cache_put(asin_guess, out)
         return out, None
@@ -2225,6 +2383,13 @@ class InstorebotForwarder:
         s = (text or "")
         if not s:
             return ""
+
+        # Prefer explicitly labeled "Current Price: $X" when present.
+        m_lab = re.search(r"\bcurrent\s*price\b[^$£€]{0,20}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", s, re.IGNORECASE)
+        if m_lab:
+            cand = self._normalize_price_str(m_lab.group(1) or "")
+            if cand:
+                return cand
 
         # Capture all symbol-prefixed prices and pick the minimum numeric value.
         matches = list(re.finditer(r"(?<!\w)([$£€])\s?(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)(?!\w)", s))
@@ -2273,6 +2438,13 @@ class InstorebotForwarder:
         if not s:
             return ""
         cur = (current_price or "").strip()
+
+        # Prefer explicitly labeled "Before: $X" when present.
+        m_b = re.search(r"\bbefore\b[^$£€]{0,20}([$£€]\s?\d{1,4}(?:,\d{3})*(?:\.\d{2})?)", s, re.IGNORECASE)
+        if m_b:
+            candb = self._normalize_price_str(m_b.group(1) or "")
+            if candb and candb != cur:
+                return candb
 
         # Prefer explicit orig/retail/list patterns.
         patterns = [
@@ -2933,6 +3105,18 @@ class InstorebotForwarder:
         else:
             _log_flow("SCRAPE_SKIP", asin=(asin or ""), reason=("disabled" if not self._scrape_enabled() else "no_url"))
 
+        # Skip out-of-stock / unavailable items.
+        try:
+            avail = str((scraped or {}).get("availability") or "").strip().lower()
+        except Exception:
+            avail = ""
+        if avail in {"oos", "out_of_stock", "unavailable"}:
+            _log_flow("SKIP_OOS", asin=(asin or ""), url=final_url)
+            if dedupe_reserved and asin:
+                self._dedupe_release(asin)
+                dedupe_reserved = False
+            return None, {"urls": urls, "amazon": {"asin": asin, "final_url": final_url, "url_used": det.url_used}, "skip_reason": "oos"}
+
         # Final fields:
         # - Title: prefer Amazon product name when available, else message reconstruction.
         # - Price/Before: prefer message-derived values; if missing, fill from scrape when available.
@@ -2961,10 +3145,8 @@ class InstorebotForwarder:
 
         # Ensure the card always has both lines.
         if not price:
-            price = "N/A"
             price_src = "missing"
         if not before_price:
-            before_price = "N/A"
             before_src = "missing"
         # Category: detect from message text, and also from scraped title when available
         # (so grocery routing can work even if the source post is short).
@@ -2989,7 +3171,6 @@ class InstorebotForwarder:
         except Exception:
             img_src = "none"
         _log_flow("IMAGE", source=img_src, has=("1" if bool(image_url) else "0"))
-        _log_flow("PRICES", current_src=price_src, before_src=before_src, has_current=("1" if price and price != "N/A" else "0"), has_before=("1" if before_price and before_price != "N/A" else "0"))
 
         # Percent off (only when both prices are known and Before > Current).
         discount_pct_str = ""
@@ -2999,6 +3180,29 @@ class InstorebotForwarder:
         except Exception:
             cur_val, cur_sym = None, ""
             bef_val, bef_sym = None, ""
+
+        # Sanity: "Before" should never be lower than "Current".
+        # If it is, try to swap in a better scraped before_price; otherwise SKIP (not a deal).
+        if (cur_val is not None) and (bef_val is not None) and (bef_val > 0) and (cur_val > 0) and (bef_val < cur_val):
+            sb_raw = str((scraped or {}).get("before_price") or "").strip()
+            sb = self._normalize_price_str(sb_raw) if sb_raw else ""
+            try:
+                sb_val, sb_sym = self._price_to_float(sb)
+            except Exception:
+                sb_val, sb_sym = None, ""
+            if sb and (sb_val is not None) and (sb_val > cur_val) and ((not cur_sym) or (not sb_sym) or (cur_sym == sb_sym)):
+                before_price = sb
+                before_src = "scrape"
+                bef_val, bef_sym = sb_val, sb_sym
+                _log_flow("BEFORE_FIXUP", action="swap_to_scrape", before=str(before_price), current=str(price))
+            else:
+                _log_flow("SKIP_NOT_DEAL", reason="current_gt_before", before=str(before_price), current=str(price))
+                if dedupe_reserved and asin:
+                    self._dedupe_release(asin)
+                    dedupe_reserved = False
+                return None, {"urls": urls, "amazon": {"asin": asin, "final_url": final_url, "url_used": det.url_used}, "skip_reason": "current_gt_before"}
+
+        _log_flow("PRICES", current_src=price_src, before_src=before_src, has_current=("1" if bool(price) else "0"), has_before=("1" if bool(before_price) else "0"))
         if (cur_val is not None) and (bef_val is not None) and bef_val > 0 and cur_val < bef_val:
             # Only show when symbols match (or one is missing).
             if (not cur_sym) or (not bef_sym) or (cur_sym == bef_sym):
@@ -3126,8 +3330,8 @@ class InstorebotForwarder:
 
         # Build the "card body" to match your desired format (no footer/timestamp, one key link).
         card_lines: List[str] = []
-        card_lines.append(f"Current Price: **{price}**")
-        card_lines.append(f"Before: **{before_price}**")
+        card_lines.append(f"Current Price: **{price}**" if price else "Current Price:")
+        card_lines.append(f"Before: **{before_price}**" if before_price else "Before:")
         if discount_pct_str:
             card_lines.append(f"Discount: **{discount_pct_str}**")
         if discount_lines:

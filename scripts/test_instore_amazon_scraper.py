@@ -74,6 +74,7 @@ def _print_result(url: str, data: Optional[Dict[str, str]], err: Optional[str]) 
     out = {
         "title": data.get("title", ""),
         "department": data.get("department", ""),
+        "availability": data.get("availability", ""),
         "price": data.get("price", ""),
         "before_price": data.get("before_price", ""),
         "discount_notes": data.get("discount_notes", ""),

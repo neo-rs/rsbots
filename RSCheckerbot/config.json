@@ -369,6 +369,17 @@
     }
   }
   ,
+  "channel_limits": {
+    "_comment": "Staff/admin-only slash command + monitoring. Posts channel counts to log_channel_id on create/delete and warns near Discord limits.",
+    "enabled": true,
+    "log_channel_id": 1468301512244723784,
+    "guild_channel_limit": 500,
+    "category_limit": 50,
+    "warn_threshold_remaining": 10,
+    "warn_threshold_percent": 0.95,
+    "warn_cooldown_seconds": 1800
+  }
+  ,
   "member_history_ingest": {
     "_comment": "Optional: auto-ingest Discord whop-logs + whop-membership-logs into member_history.json (resume-safe).",
     "enabled": true,

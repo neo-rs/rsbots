@@ -145,6 +145,7 @@ from mirror_world_config import load_config_with_secrets
 from mirror_world_config import is_placeholder_secret, mask_secret
 
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 from aiohttp import web
 import aiohttp
@@ -3291,6 +3292,39 @@ except Exception:
     CID_TTL_MINUTES = 10.0
 VERBOSE_ROLE_LISTS = bool(LOG_CONTROLS.get("verbose_role_lists", False))
 
+# Channel limits monitor (posts counts/warnings on channel create/delete + staff slash command).
+CHANNEL_LIMITS_CONFIG = config.get("channel_limits", {}) if isinstance(config, dict) else {}
+CHANNEL_LIMITS_ENABLED = bool(CHANNEL_LIMITS_CONFIG.get("enabled", True))
+try:
+    CHANNEL_LIMITS_LOG_CHANNEL_ID = int(CHANNEL_LIMITS_CONFIG.get("log_channel_id") or 0)
+except Exception:
+    CHANNEL_LIMITS_LOG_CHANNEL_ID = 0
+try:
+    CHANNEL_LIMITS_GUILD_CHANNEL_LIMIT = int(CHANNEL_LIMITS_CONFIG.get("guild_channel_limit") or 500)
+except Exception:
+    CHANNEL_LIMITS_GUILD_CHANNEL_LIMIT = 500
+CHANNEL_LIMITS_GUILD_CHANNEL_LIMIT = max(1, min(int(CHANNEL_LIMITS_GUILD_CHANNEL_LIMIT or 500), 2000))
+try:
+    CHANNEL_LIMITS_CATEGORY_LIMIT = int(CHANNEL_LIMITS_CONFIG.get("category_limit") or 50)
+except Exception:
+    CHANNEL_LIMITS_CATEGORY_LIMIT = 50
+CHANNEL_LIMITS_CATEGORY_LIMIT = max(1, min(int(CHANNEL_LIMITS_CATEGORY_LIMIT or 50), 200))
+try:
+    CHANNEL_LIMITS_WARN_THRESHOLD_REMAINING = int(CHANNEL_LIMITS_CONFIG.get("warn_threshold_remaining") or 10)
+except Exception:
+    CHANNEL_LIMITS_WARN_THRESHOLD_REMAINING = 10
+CHANNEL_LIMITS_WARN_THRESHOLD_REMAINING = max(0, min(int(CHANNEL_LIMITS_WARN_THRESHOLD_REMAINING or 10), 200))
+try:
+    CHANNEL_LIMITS_WARN_THRESHOLD_PERCENT = float(CHANNEL_LIMITS_CONFIG.get("warn_threshold_percent") or 0.95)
+except Exception:
+    CHANNEL_LIMITS_WARN_THRESHOLD_PERCENT = 0.95
+CHANNEL_LIMITS_WARN_THRESHOLD_PERCENT = max(0.0, min(float(CHANNEL_LIMITS_WARN_THRESHOLD_PERCENT or 0.95), 1.0))
+try:
+    CHANNEL_LIMITS_WARN_COOLDOWN_SECONDS = int(CHANNEL_LIMITS_CONFIG.get("warn_cooldown_seconds") or 1800)
+except Exception:
+    CHANNEL_LIMITS_WARN_COOLDOWN_SECONDS = 1800
+CHANNEL_LIMITS_WARN_COOLDOWN_SECONDS = max(0, min(int(CHANNEL_LIMITS_WARN_COOLDOWN_SECONDS or 1800), 86400))
+
 # Member history ingest (Discord channel tailer -> member_history.json)
 MEMBER_HISTORY_INGEST = config.get("member_history_ingest", {}) if isinstance(config, dict) else {}
 MEMBER_HISTORY_INGEST_ENABLED = bool(MEMBER_HISTORY_INGEST.get("enabled", False))
@@ -3508,6 +3542,281 @@ class RSCheckerBot:
             log.error(f"Failed to save messages: {e}")
 
 bot_instance = RSCheckerBot()
+
+# -----------------------------
+# Channel limits monitor (staff/admin only)
+# -----------------------------
+def _channel_limits_role_id_set(raw: object) -> set[int]:
+    out: set[int] = set()
+    for x in (raw or []):
+        try:
+            xi = int(str(x).strip())
+        except Exception:
+            continue
+        if xi > 0:
+            out.add(int(xi))
+    return out
+
+
+def _channel_limits_staff_admin_role_ids() -> tuple[set[int], set[int]]:
+    root = config if isinstance(config, dict) else {}
+    st = root.get("support_tickets") if isinstance(root.get("support_tickets"), dict) else {}
+    perms = st.get("permissions") if isinstance(st.get("permissions"), dict) else {}
+    staff_ids = _channel_limits_role_id_set(perms.get("staff_role_ids"))
+    admin_ids = _channel_limits_role_id_set(perms.get("admin_role_ids"))
+    return staff_ids, admin_ids
+
+
+_CHANNEL_LIMITS_STAFF_ROLE_IDS, _CHANNEL_LIMITS_ADMIN_ROLE_IDS = _channel_limits_staff_admin_role_ids()
+_CHANNEL_LIMITS_LAST_WARN_AT_MONO: float = 0.0
+_CHANNEL_LIMITS_LAST_WARN_KEY: str = ""
+
+
+def _channel_limits_is_authorized(member: discord.Member) -> bool:
+    if not isinstance(member, discord.Member):
+        return False
+    with suppress(Exception):
+        perms = getattr(member, "guild_permissions", None)
+        if perms and bool(getattr(perms, "administrator", False)):
+            return True
+    try:
+        rids = {int(getattr(r, "id", 0) or 0) for r in (member.roles or [])}
+    except Exception:
+        rids = set()
+    if any(int(x) in rids for x in (_CHANNEL_LIMITS_ADMIN_ROLE_IDS or set())):
+        return True
+    if any(int(x) in rids for x in (_CHANNEL_LIMITS_STAFF_ROLE_IDS or set())):
+        return True
+    return False
+
+
+def _channel_limits_counts(guild: discord.Guild) -> dict[str, object]:
+    chs = list(getattr(guild, "channels", None) or [])
+    cats = list(getattr(guild, "categories", None) or [])
+    texts = list(getattr(guild, "text_channels", None) or [])
+    voices = list(getattr(guild, "voice_channels", None) or [])
+    stages = list(getattr(guild, "stage_channels", None) or [])
+    forums: list[object] = []
+    with suppress(Exception):
+        forums = list(getattr(guild, "forums", None) or [])
+    if not forums:
+        fc = getattr(discord, "ForumChannel", None)
+        if fc:
+            with suppress(Exception):
+                forums = [c for c in chs if isinstance(c, fc)]
+
+    total = int(len(chs))
+    cat_count = int(len(cats))
+    non_cat = max(0, total - cat_count)
+    return {
+        "total": total,
+        "non_category": non_cat,
+        "categories": cat_count,
+        "text": int(len(texts)),
+        "voice": int(len(voices)),
+        "stage": int(len(stages)),
+        "forum": int(len(forums)),
+        "limit_total": int(CHANNEL_LIMITS_GUILD_CHANNEL_LIMIT or 500),
+        "limit_categories": int(CHANNEL_LIMITS_CATEGORY_LIMIT or 50),
+    }
+
+
+def _channel_limits_fmt_line(counts: dict[str, object]) -> str:
+    try:
+        total = int(counts.get("total") or 0)
+        non_cat = int(counts.get("non_category") or 0)
+        cats = int(counts.get("categories") or 0)
+        lt = max(1, int(counts.get("limit_total") or 500))
+        lc = max(1, int(counts.get("limit_categories") or 50))
+        text = int(counts.get("text") or 0)
+        voice = int(counts.get("voice") or 0)
+        stage = int(counts.get("stage") or 0)
+        forum = int(counts.get("forum") or 0)
+    except Exception:
+        total, non_cat, cats, lt, lc, text, voice, stage, forum = 0, 0, 0, 500, 50, 0, 0, 0, 0
+
+    pct_total = (total / max(1, lt)) * 100.0
+    pct_cats = (cats / max(1, lc)) * 100.0
+    return (
+        f"Channels **{total}/{lt}** ({pct_total:.1f}%) • "
+        f"Non-category **{non_cat}** • "
+        f"Categories **{cats}/{lc}** ({pct_cats:.1f}%) • "
+        f"Text **{text}** • Voice **{voice}** • Stage **{stage}** • Forum **{forum}**"
+    )
+
+
+def _channel_limits_warn_key_and_reasons(counts: dict[str, object]) -> tuple[str, list[str]]:
+    try:
+        total = int(counts.get("total") or 0)
+        cats = int(counts.get("categories") or 0)
+        lt = max(1, int(counts.get("limit_total") or 500))
+        lc = max(1, int(counts.get("limit_categories") or 50))
+    except Exception:
+        total, cats, lt, lc = 0, 0, 500, 50
+
+    remaining_total = lt - total
+    remaining_cats = lc - cats
+
+    reasons: list[str] = []
+    try:
+        pct_t = (total / max(1, lt))
+        pct_c = (cats / max(1, lc))
+    except Exception:
+        pct_t, pct_c = 0.0, 0.0
+
+    if remaining_total <= int(CHANNEL_LIMITS_WARN_THRESHOLD_REMAINING or 0) or pct_t >= float(CHANNEL_LIMITS_WARN_THRESHOLD_PERCENT or 1.0):
+        reasons.append(f"total_channels={total}/{lt} remaining={remaining_total}")
+    if remaining_cats <= int(CHANNEL_LIMITS_WARN_THRESHOLD_REMAINING or 0) or pct_c >= float(CHANNEL_LIMITS_WARN_THRESHOLD_PERCENT or 1.0):
+        reasons.append(f"categories={cats}/{lc} remaining={remaining_cats}")
+
+    key = "|".join(reasons)
+    return key, reasons
+
+
+def _channel_limits_make_embed(*, title: str, description: str = "", color: int = 0x5865F2) -> discord.Embed:
+    e = discord.Embed(
+        title=str(title or "Channel Limits")[:256],
+        description=(str(description or "").strip()[:4096] if str(description or "").strip() else None),
+        color=int(color or 0x5865F2),
+        timestamp=datetime.now(timezone.utc),
+    )
+    e.set_footer(text="RSCheckerbot • Channel limits")
+    return e
+
+
+async def _channel_limits_get_log_channel() -> object | None:
+    cid = int(CHANNEL_LIMITS_LOG_CHANNEL_ID or 0)
+    if cid <= 0:
+        return None
+    ch = bot.get_channel(cid)
+    if ch is not None and hasattr(ch, "send"):
+        return ch
+    with suppress(Exception):
+        fetched = await bot.fetch_channel(cid)
+        if fetched is not None and hasattr(fetched, "send"):
+            return fetched
+    return None
+
+
+async def _channel_limits_post(*, embed: discord.Embed) -> None:
+    if not CHANNEL_LIMITS_ENABLED:
+        return
+    if not isinstance(embed, discord.Embed):
+        return
+    ch = await _channel_limits_get_log_channel()
+    if not ch:
+        return
+    with suppress(Exception):
+        await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+
+async def _channel_limits_post_counts_for_channel_event(*, action: str, channel: discord.abc.GuildChannel) -> None:
+    if not CHANNEL_LIMITS_ENABLED:
+        return
+    g = getattr(channel, "guild", None)
+    if not isinstance(g, discord.Guild):
+        return
+    try:
+        if int(GUILD_ID or 0) and int(g.id) != int(GUILD_ID or 0):
+            return
+    except Exception:
+        pass
+
+    counts = _channel_limits_counts(g)
+    ch_name = str(getattr(channel, "name", "") or "").strip() or "unknown"
+    ch_id = int(getattr(channel, "id", 0) or 0)
+    ch_type = str(getattr(getattr(channel, "type", None), "name", "") or getattr(channel, "type", "") or "").strip()
+    act = str(action or "").strip().lower()
+    if act == "created":
+        title = "➕ Channel created"
+        color = 0x57F287
+    elif act == "deleted":
+        title = "➖ Channel deleted"
+        color = 0xED4245
+    else:
+        title = f"📌 Channel {action}".strip()
+        color = 0x5865F2
+
+    e = _channel_limits_make_embed(title=title, color=color)
+    ch_label = f"<#{ch_id}>" if ch_id else f"`{ch_name}`"
+    e.add_field(name="Channel", value=f"{ch_label}\nName: `{ch_name}`\nType: `{ch_type or 'unknown'}`", inline=False)
+    e.add_field(name="Counts", value=_channel_limits_fmt_line(counts)[:1024], inline=False)
+    await _channel_limits_post(embed=e)
+
+    # Warning (cooldown + dedupe key)
+    global _CHANNEL_LIMITS_LAST_WARN_AT_MONO, _CHANNEL_LIMITS_LAST_WARN_KEY
+    warn_key, reasons = _channel_limits_warn_key_and_reasons(counts)
+    if not reasons:
+        return
+
+    now_m = time.monotonic()
+    cd = int(CHANNEL_LIMITS_WARN_COOLDOWN_SECONDS or 0)
+    if cd > 0 and (now_m - float(_CHANNEL_LIMITS_LAST_WARN_AT_MONO or 0.0)) < float(cd):
+        return
+
+    _CHANNEL_LIMITS_LAST_WARN_AT_MONO = float(now_m)
+    _CHANNEL_LIMITS_LAST_WARN_KEY = str(warn_key or "")
+    reason_text = ", ".join(reasons)[:1200]
+    e2 = _channel_limits_make_embed(
+        title="⚠️ Approaching Discord channel limits",
+        description=(f"Trigger: `{reason_text}`" if reason_text else ""),
+        color=0xFEE75C,
+    )
+    e2.add_field(name="Counts", value=_channel_limits_fmt_line(counts)[:1024], inline=False)
+    await _channel_limits_post(embed=e2)
+
+
+def _channel_limits_appcmd_check(interaction: discord.Interaction) -> bool:
+    if not interaction or not getattr(interaction, "guild", None):
+        return False
+    user = getattr(interaction, "user", None)
+    return bool(isinstance(user, discord.Member) and _channel_limits_is_authorized(user))
+
+
+@bot.tree.command(name="channel_limits", description="Show server channel usage vs Discord limits (staff/admin only).")
+@app_commands.check(_channel_limits_appcmd_check)
+async def channel_limits_slash(interaction: discord.Interaction):
+    g = interaction.guild
+    if not isinstance(g, discord.Guild):
+        with suppress(Exception):
+            await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+    counts = _channel_limits_counts(g)
+    e = _channel_limits_make_embed(title="Channel Limits", color=0x5865F2)
+    e.add_field(name="Counts", value=_channel_limits_fmt_line(counts)[:1024], inline=False)
+    with suppress(Exception):
+        if not interaction.response.is_done():
+            await interaction.response.send_message(embed=e, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+        else:
+            await interaction.followup.send(embed=e, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@channel_limits_slash.error
+async def channel_limits_slash_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        with suppress(Exception):
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ Staff/admin only.", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ Staff/admin only.", ephemeral=True)
+        return
+
+
+@bot.event
+async def setup_hook():
+    # Publish slash commands quickly to the configured main guild (no-op if missing).
+    try:
+        gid = int(GUILD_ID or 0)
+    except Exception:
+        gid = 0
+    if gid <= 0:
+        return
+    gobj = discord.Object(id=gid)
+    with suppress(Exception):
+        bot.tree.copy_global_to(guild=gobj)
+    with suppress(Exception):
+        synced = await bot.tree.sync(guild=gobj)
+        log.info("[Slash] synced %s command(s) to guild_id=%s", int(len(synced or [])), gid)
 
 # -----------------------------
 # Invite Tracking JSON
@@ -9207,12 +9516,16 @@ async def on_raw_message_delete(payload):
 async def on_guild_channel_create(channel: discord.abc.GuildChannel):
     with suppress(Exception):
         await support_tickets.audit_channel_create(channel)
+    with suppress(Exception):
+        await _channel_limits_post_counts_for_channel_event(action="created", channel=channel)
 
 
 @bot.event
 async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
     with suppress(Exception):
         await support_tickets.audit_channel_delete(channel)
+    with suppress(Exception):
+        await _channel_limits_post_counts_for_channel_event(action="deleted", channel=channel)
 
 
 @bot.event
