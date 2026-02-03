@@ -656,6 +656,7 @@ def _extract_key_from_embed(embed: discord.Embed) -> str:
 async def _resolve_discord_id_from_whop_logs(
     guild: discord.Guild | None,
     *,
+    client: discord.Client | None = None,
     email: str,
     membership_id_hint: str,
     whop_key: str,
@@ -664,15 +665,24 @@ async def _resolve_discord_id_from_whop_logs(
     """Search whop-logs channel for a matching email/key and return Discord ID."""
     # Rate-limit protection: do not repeatedly scan channel history for the same key.
     global _WHOP_LOGS_LOOKUP_CACHE, _WHOP_LOGS_LOOKUP_LAST
-    if not guild:
-        return ""
     if not WHOP_LOGS_CHANNEL_ID:
         return ""
-    ch = guild.get_channel(int(WHOP_LOGS_CHANNEL_ID))
-    if not isinstance(ch, discord.TextChannel):
-        # Cache may not contain the channel yet (fresh boot). Try fetching once.
+    # Prefer global channel resolution via client (works even if caller passes the wrong guild).
+    ch = None
+    if client is not None:
         with suppress(Exception):
-            ch = await guild.fetch_channel(int(WHOP_LOGS_CHANNEL_ID))
+            ch = client.get_channel(int(WHOP_LOGS_CHANNEL_ID))
+        if not isinstance(ch, discord.TextChannel):
+            with suppress(Exception):
+                ch = await client.fetch_channel(int(WHOP_LOGS_CHANNEL_ID))  # type: ignore[attr-defined]
+    if not isinstance(ch, discord.TextChannel):
+        if not guild:
+            return ""
+        ch = guild.get_channel(int(WHOP_LOGS_CHANNEL_ID))
+        if not isinstance(ch, discord.TextChannel):
+            # Cache may not contain the channel yet (fresh boot). Try fetching once.
+            with suppress(Exception):
+                ch = await guild.fetch_channel(int(WHOP_LOGS_CHANNEL_ID))
     if not isinstance(ch, discord.TextChannel):
         return ""
     email_n = _norm_email(email) if email else ""
@@ -759,6 +769,7 @@ async def _resolve_discord_id_from_whop_logs(
 async def resolve_discord_id_from_whop_logs(
     guild: discord.Guild | None,
     *,
+    client: discord.Client | None = None,
     email: str,
     membership_id_hint: str = "",
     whop_key: str = "",
@@ -767,6 +778,7 @@ async def resolve_discord_id_from_whop_logs(
     """Resolve Discord ID by searching `whop-logs` for the matching email/key."""
     return await _resolve_discord_id_from_whop_logs(
         guild,
+        client=client,
         email=email,
         membership_id_hint=membership_id_hint,
         whop_key=whop_key,

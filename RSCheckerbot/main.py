@@ -2693,6 +2693,7 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
             with suppress(Exception):
                 did2 = await _resolve_discord_id_from_whop_logs(
                     guild,
+                    client=bot,
                     email=email_hint,
                     membership_id_hint=str((whop_brief or {}).get("membership_id") or "").strip(),
                     whop_key=str((whop_brief or {}).get("membership_id") or "").strip(),
@@ -4501,6 +4502,7 @@ async def _fetch_whop_brief_by_membership_id(membership_id: str) -> dict:
                     g = bot.get_guild(int(GUILD_ID)) if int(GUILD_ID or 0) else None
                 resolved = await _resolve_discord_id_from_whop_logs(
                     g,
+                    client=bot,
                     email=email_hint,
                     membership_id_hint=mid,
                     whop_key="",
@@ -6177,6 +6179,7 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                     with suppress(Exception):
                         did2 = await _resolve_discord_id_from_whop_logs(
                             guild,
+                            client=bot,
                             email=email_hint,
                             membership_id_hint=str(mid2 or "").strip(),
                             whop_key=str((brief or {}).get("membership_id") or "").strip(),

@@ -4765,6 +4765,478 @@ async def _probe_resolve_discord(args: argparse.Namespace) -> int:
     return 0
 
 
+def _extract_email_from_member_status_embed(e: discord.Embed) -> str:
+    """Extract Email from RSCheckerbot '(Discord not linked)' staff embeds (not persisted)."""
+    if not isinstance(e, discord.Embed):
+        return ""
+    with suppress(Exception):
+        for f in (getattr(e, "fields", None) or []):
+            if str(getattr(f, "name", "") or "").strip().lower() == "email":
+                v = str(getattr(f, "value", "") or "").strip()
+                # Some embeds wrap emails across lines (e.g. "gmail.\ncom"). Extract via regex.
+                m = re.search(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", v, flags=re.I)
+                if m:
+                    return str(m.group(1)).strip().lower()
+                # Fallback: remove whitespace/newlines and try again.
+                vv = re.sub(r"\s+", "", v)
+                m2 = re.search(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", vv, flags=re.I)
+                if m2:
+                    return str(m2.group(1)).strip().lower()
+    return ""
+
+
+def _extract_basic_whop_brief_from_unlinked_embed(e: discord.Embed) -> dict[str, str]:
+    """Extract best-effort Whop fields from the existing unlinked embed."""
+    out: dict[str, str] = {}
+    if not isinstance(e, discord.Embed):
+        return out
+    with suppress(Exception):
+        for f in (getattr(e, "fields", None) or []):
+            n = str(getattr(f, "name", "") or "").strip().lower()
+            v = str(getattr(f, "value", "") or "").strip()
+            if not n or not v:
+                continue
+            if n in {"membership", "product"}:
+                out["product"] = v
+            elif n == "status":
+                out["status"] = v
+            elif n.startswith("total spent"):
+                out["total_spent"] = v
+            elif n in {"whop dashboard", "dashboard"}:
+                # Keep raw URL if present; else leave as-is.
+                m = re.search(r"(https?://\\S+)", v)
+                out["dashboard_url"] = m.group(1).rstrip(").,") if m else v
+            elif n == "renewal window":
+                out["renewal_window"] = v
+    return out
+
+
+async def _probe_memberstatus_fix_unlinked(args: argparse.Namespace) -> int:
+    """Fix historical '(Discord not linked)' RSCheckerbot cards when whop-logs shows a Discord ID.
+
+    - Scans member-status-logs for RSCheckerbot • Whop API embeds with '(Discord not linked)' suffix
+    - Resolves the real Discord ID from #whop-logs by email
+    - Rebuilds a proper member-status detailed embed (filled labels) and edits the message (default)
+      OR deletes the message if --delete is set.
+    """
+    cfg = load_config()
+    token = str(cfg.get("bot_token") or "").strip()
+    if not token:
+        print("Missing bot_token in config.secrets.json")
+        return 2
+
+    confirm = str(getattr(args, "confirm", "") or "").strip().lower()
+    apply = bool(getattr(args, "apply", False))
+    delete = bool(getattr(args, "delete", False))
+    if apply and confirm != "confirm":
+        print("Confirmation required. Use: --apply --confirm confirm")
+        return 2
+
+    try:
+        guild_id = int(str(getattr(args, "guild_id", "") or cfg.get("guild_id") or 0).strip())
+    except Exception:
+        guild_id = 0
+    if not guild_id:
+        print("Missing guild_id.")
+        return 2
+
+    # Channels
+    dm = cfg.get("dm_sequence") if isinstance(cfg, dict) else {}
+    dm = dm if isinstance(dm, dict) else {}
+    inv = cfg.get("invite_tracking") if isinstance(cfg, dict) else {}
+    inv = inv if isinstance(inv, dict) else {}
+    try:
+        ms_cid = int(str(getattr(args, "channel_id", "") or dm.get("member_status_logs_channel_id") or 0).strip())
+    except Exception:
+        ms_cid = 0
+    if not ms_cid:
+        print("Missing member-status-logs channel id (--channel-id or dm_sequence.member_status_logs_channel_id).")
+        return 2
+    try:
+        whop_logs_cid = int(str(getattr(args, "whop_logs_channel_id", "") or inv.get("whop_logs_channel_id") or 0).strip())
+    except Exception:
+        whop_logs_cid = 0
+    if not whop_logs_cid:
+        print("Missing whop-logs channel id (--whop-logs-channel-id or invite_tracking.whop_logs_channel_id).")
+        return 2
+    try:
+        mem_logs_cid = int(str(getattr(args, "whop_membership_logs_channel_id", "") or inv.get("whop_webhook_channel_id") or 0).strip())
+    except Exception:
+        mem_logs_cid = 0
+    if not mem_logs_cid:
+        print("Missing whop-membership-logs channel id (--whop-membership-logs-channel-id or invite_tracking.whop_webhook_channel_id).")
+        return 2
+
+    limit = int(getattr(args, "limit", 500) or 500)
+    limit = max(50, min(limit, 20000))
+    whoplogs_limit = int(getattr(args, "whoplogs_limit", 300) or 300)
+    whoplogs_limit = max(25, min(whoplogs_limit, 500))
+    memlogs_limit = int(getattr(args, "memlogs_limit", 450) or 450)
+    memlogs_limit = max(50, min(memlogs_limit, 1000))
+    before_id_raw = str(getattr(args, "before_message_id", "") or "").strip()
+    before_obj = discord.Object(id=int(before_id_raw)) if before_id_raw.isdigit() else None
+    sleep_ms = int(getattr(args, "sleep_ms", 900) or 900)
+    sleep_ms = max(0, min(sleep_ms, 5000))
+    progress_every = int(getattr(args, "progress_every", 10) or 10)
+    progress_every = max(0, min(progress_every, 5000))
+    verbose = bool(getattr(args, "verbose", False))
+
+    print("=== memberstatus-fix-unlinked ===")
+    print(f"guild_id: {guild_id}")
+    print(f"member_status_logs_channel_id: {ms_cid}")
+    print(f"whop_logs_channel_id: {whop_logs_cid}")
+    print(f"whop_membership_logs_channel_id: {mem_logs_cid}")
+    print(f"limit: {limit} whoplogs_limit: {whoplogs_limit} memlogs_limit: {memlogs_limit}")
+    if before_obj:
+        print(f"before_message_id: {int(before_obj.id)}")
+    print(f"apply: {apply} delete: {delete}")
+    if progress_every:
+        print(f"progress_every: {progress_every}")
+
+    intents = discord.Intents.none()
+    intents.guilds = True
+    intents.members = True
+    intents.messages = True
+    intents.message_content = False
+    bot = discord.Client(intents=intents)
+
+    @bot.event
+    async def on_ready():
+        import traceback
+
+        def _ascii(s: object) -> str:
+            try:
+                return str(s).encode("ascii", "backslashreplace").decode("ascii")
+            except Exception:
+                return "<?>"
+
+        print("connected: scanning...")
+        scanned = candidates = resolved = edited = deleted = skipped = failed = 0
+        edited_msgs: list[dict[str, object]] = []
+        try:
+            import time as _time
+
+            started_at = float(_time.time())
+            last_progress_at = float(started_at)
+
+            g = bot.get_guild(guild_id)
+            if g is None:
+                with suppress(Exception):
+                    g = await bot.fetch_guild(guild_id)
+            if g is None:
+                print("guild not found")
+                return
+
+            ms_ch = bot.get_channel(ms_cid)
+            if ms_ch is None:
+                with suppress(Exception):
+                    ms_ch = await bot.fetch_channel(ms_cid)
+            wh_ch = bot.get_channel(whop_logs_cid)
+            if wh_ch is None:
+                with suppress(Exception):
+                    wh_ch = await bot.fetch_channel(whop_logs_cid)
+            mem_ch = bot.get_channel(mem_logs_cid)
+            if mem_ch is None:
+                with suppress(Exception):
+                    mem_ch = await bot.fetch_channel(mem_logs_cid)
+
+            if not isinstance(ms_ch, discord.TextChannel):
+                print("member-status-logs channel not found or not text.")
+                return
+            if not isinstance(wh_ch, discord.TextChannel):
+                print("whop-logs channel not found or not text.")
+                return
+            if not isinstance(mem_ch, discord.TextChannel):
+                print("whop-membership-logs channel not found or not text.")
+                return
+
+            # Cache email -> did
+            email_to_did: dict[str, int] = {}
+            # Cache email -> parsed membership-log brief fields (so we don't rescan for the same email)
+            email_to_mem_brief: dict[str, dict[str, object] | None] = {}
+
+            def _resolve_did_cached(email: str) -> int:
+                em = str(email or "").strip().lower()
+                if not em:
+                    return 0
+                if em in email_to_did:
+                    return int(email_to_did.get(em) or 0)
+                return 0
+
+            async def _resolve_did_by_email(email: str) -> int:
+                em = str(email or "").strip().lower()
+                if not em:
+                    return 0
+                cached = _resolve_did_cached(em)
+                if cached:
+                    return cached
+                did0 = 0
+                async for msg in wh_ch.history(limit=whoplogs_limit):
+                    e0 = msg.embeds[0] if msg.embeds else None
+                    if not isinstance(e0, discord.Embed):
+                        continue
+                    em2 = str(_extract_email_from_native_embed(e0) or "").strip().lower()
+                    if not em2 or em2 != em:
+                        continue
+                    did_s = str(_extract_discord_id_from_native_embed(e0) or "").strip()
+                    if did_s.isdigit():
+                        did0 = int(did_s)
+                        break
+                email_to_did[em] = int(did0 or 0)
+                return int(did0 or 0)
+
+            async def _find_latest_membership_embed_by_email(email: str) -> discord.Embed | None:
+                em = str(email or "").strip().lower()
+                if not em:
+                    return None
+                # Fast path: if we already cached a membership brief for this email, skip scanning.
+                if em in email_to_mem_brief:
+                    return None
+                async for msg in mem_ch.history(limit=memlogs_limit):
+                    e0 = msg.embeds[0] if msg.embeds else None
+                    if not isinstance(e0, discord.Embed):
+                        continue
+                    blob = (str(getattr(e0, "title", "") or "") + "\n" + str(getattr(e0, "description", "") or "")).lower()
+                    if em in blob:
+                        return e0
+                return None
+
+            def _md_link(url: str, *, label: str = "Open") -> str:
+                u = str(url or "").strip()
+                if not u:
+                    return ""
+                if u.startswith("[") and "](" in u and u.endswith(")"):
+                    return u
+                m = re.search(r"(https?://\\S+)", u)
+                u2 = (m.group(1) if m else u).rstrip(").,")
+                if not u2.startswith(("http://", "https://")):
+                    return ""
+                return f"[{label}]({u2})"
+
+            allowed_kinds = {
+                "payment_created",
+                "payment_pending",
+                "setup_intent",
+                "invoice",
+                "payment_failed",
+                "payment_succeeded",
+                "cancellation_scheduled",
+                "cancellation_removed",
+                "membership_activated_pending",
+                "membership_activated",
+                "deactivated",
+                "refund",
+                "dispute",
+            }
+
+            oldest_id = 0
+            async for msg in ms_ch.history(limit=limit, before=before_obj):
+                scanned += 1
+                oldest_id = int(getattr(msg, "id", 0) or 0) or oldest_id
+                if progress_every and (scanned == 1 or (scanned % progress_every) == 0):
+                    now = float(_time.time())
+                    if (now - last_progress_at) >= 1.0:
+                        last_progress_at = now
+                        elapsed = int(now - started_at)
+                        print(
+                            f"progress: scanned={scanned} cand={candidates} resolved={resolved} "
+                            f"edited={edited} deleted={deleted} skipped={skipped} failed={failed} "
+                            f"elapsed={elapsed}s last_msg={int(getattr(msg,'id',0) or 0)}"
+                        )
+                e0 = msg.embeds[0] if msg.embeds else None
+                if not isinstance(e0, discord.Embed):
+                    continue
+                title0 = str(getattr(e0, "title", "") or "").strip()
+                if "(discord not linked)" not in title0.lower():
+                    continue
+                footer0 = str(getattr(getattr(e0, "footer", None), "text", "") or "").lower()
+                if "rscheckerbot" not in footer0:
+                    continue
+                clean_title = re.sub(r"\s*\(discord not linked\)\s*$", "", title0, flags=re.IGNORECASE).strip()
+                kind = _infer_member_status_kind(clean_title)
+                if kind not in allowed_kinds:
+                    skipped += 1
+                    continue
+                candidates += 1
+                email = _extract_email_from_member_status_embed(e0)
+                if not email:
+                    skipped += 1
+                    continue
+                did = await _resolve_did_by_email(email)
+                if did <= 0:
+                    skipped += 1
+                    continue
+                resolved += 1
+
+                # If deleting, only delete when we can resolve DID (safe).
+                if apply and delete:
+                    try:
+                        await msg.delete(reason="memberstatus-fix-unlinked: deleting wrong '(Discord not linked)' card (DID resolved)")
+                        deleted += 1
+                        edited_msgs.append(
+                            {
+                                "action": "deleted",
+                                "message_id": int(msg.id),
+                                "jump_url": str(getattr(msg, "jump_url", "") or "").strip(),
+                                "email": str(email or "").strip().lower(),
+                                "discord_id": int(did),
+                                "kind": str(kind),
+                                "old_title": title0,
+                                "new_title": clean_title,
+                            }
+                        )
+                        if sleep_ms:
+                            await asyncio.sleep(float(sleep_ms) / 1000.0)
+                    except Exception as ex:
+                        failed += 1
+                        print(f"delete_failed: msg={int(msg.id)} err={str(ex)[:120]}")
+                    continue
+
+                member = g.get_member(int(did))
+                if member is None:
+                    with suppress(Exception):
+                        member = await g.fetch_member(int(did))
+                if not isinstance(member, discord.Member):
+                    skipped += 1
+                    continue
+
+                # Build best-effort brief from existing embed + latest membership log card (by email).
+                brief: dict[str, object] = {}
+                brief.update(_extract_basic_whop_brief_from_unlinked_embed(e0))
+                brief["connected_discord"] = str(did)
+                em_l = str(email or "").strip().lower()
+                if em_l in email_to_mem_brief and isinstance(email_to_mem_brief.get(em_l), dict):
+                    brief.update(email_to_mem_brief.get(em_l) or {})
+                else:
+                    mem_e = await _find_latest_membership_embed_by_email(email)
+                    if isinstance(mem_e, discord.Embed):
+                        kv = _extract_kv_from_description(str(getattr(mem_e, "description", "") or ""))
+                        mem_brief: dict[str, object] = {}
+                        mid = str(kv.get("membership id") or "").strip()
+                        if mid:
+                            mem_brief["membership_id"] = mid
+                        st = str(kv.get("status") or "").strip()
+                        if st:
+                            mem_brief["status"] = st
+                        prod = str(kv.get("product") or kv.get("membership") or "").strip()
+                        if prod:
+                            mem_brief["product"] = prod
+                        spent = str(kv.get("total spent") or kv.get("total spent (lifetime)") or "").strip()
+                        if spent:
+                            mem_brief["total_spent"] = spent
+                        rw = str(kv.get("renewal window") or "").strip()
+                        if rw:
+                            mem_brief["renewal_window"] = rw
+                        td = str(kv.get("trial days") or "").strip()
+                        if td:
+                            mem_brief["trial_days"] = td
+                        pir = str(kv.get("plan is renewal") or "").strip()
+                        if pir:
+                            mem_brief["plan_is_renewal"] = pir
+                        pricing = str(kv.get("pricing") or "").strip()
+                        if pricing:
+                            mem_brief["pricing"] = pricing
+                        cd2 = str(kv.get("connected discord") or kv.get("connected_discord") or "").strip()
+                        if cd2:
+                            mem_brief["connected_discord"] = cd2
+                        dash = str(kv.get("dashboard") or "").strip()
+                        if dash:
+                            mem_brief["dashboard_url"] = _md_link(dash, label="Open") or dash
+                        manage = str(kv.get("manage") or "").strip()
+                        if manage:
+                            mem_brief["manage_url"] = _md_link(manage, label="Open") or manage
+                        checkout = str(kv.get("checkout") or kv.get("purchase link") or "").strip()
+                        if checkout:
+                            mem_brief["checkout_url"] = _md_link(checkout, label="Open") or checkout
+                        email_to_mem_brief[em_l] = mem_brief
+                        brief.update(mem_brief)
+                    else:
+                        email_to_mem_brief[em_l] = None
+
+                # Color mapping consistent with support cards.
+                color = 0x5865F2
+                if kind in {"payment_failed", "dispute"}:
+                    color = 0xED4245
+                elif kind in {"cancellation_scheduled"}:
+                    color = 0xFEE75C
+                elif kind in {"deactivated"}:
+                    color = 0xF59E0B
+                elif kind in {"payment_succeeded", "membership_activated"}:
+                    color = 0x57F287
+
+                relevant_roles = coerce_role_ids(cfg.get("dm_sequence", {}).get("role_trigger"), cfg.get("dm_sequence", {}).get("welcome_role_id"))
+                access = access_roles_plain(member, relevant_roles)
+                embed_new = build_member_status_detailed_embed(
+                    title=clean_title,
+                    member=member,
+                    access_roles=access,
+                    color=int(color),
+                    discord_kv=None,
+                    member_kv=[("reason", "fixed from whop-logs (email->discord_id)")],
+                    whop_brief=brief,
+                    event_kind=str(kind or "active"),
+                    force_whop_core_fields=True,
+                )
+
+                if apply:
+                    try:
+                        await msg.edit(embed=embed_new, allowed_mentions=discord.AllowedMentions.none())
+                        edited += 1
+                        edited_msgs.append(
+                            {
+                                "action": "edited",
+                                "message_id": int(msg.id),
+                                "jump_url": str(getattr(msg, "jump_url", "") or "").strip(),
+                                "email": str(email or "").strip().lower(),
+                                "discord_id": int(did),
+                                "kind": str(kind),
+                                "old_title": title0,
+                                "new_title": clean_title,
+                            }
+                        )
+                        if verbose:
+                            print(f"edited: msg={int(msg.id)} did={int(did)} kind={kind}")
+                        if sleep_ms:
+                            await asyncio.sleep(float(sleep_ms) / 1000.0)
+                    except Exception as ex:
+                        failed += 1
+                        print(f"edit_failed: msg={int(msg.id)} err={str(ex)[:120]}")
+                else:
+                    # Avoid Windows console UnicodeEncodeError for emoji titles.
+                    print(
+                        "dry_run: would_edit "
+                        + f"msg={int(msg.id)} kind={str(kind)} "
+                        + f"title={_ascii(title0)} -> {_ascii(clean_title)} "
+                        + f"did={int(did)} email={_ascii(email)}"
+                    )
+
+            print("=== memberstatus-fix-unlinked summary ===")
+            print(f"scanned: {scanned}")
+            print(f"candidates_unlinked: {candidates}")
+            print(f"resolved_did: {resolved}")
+            print(f"edited: {edited} deleted: {deleted} skipped: {skipped} failed: {failed}")
+            if oldest_id:
+                print(f"oldest_scanned_message_id: {oldest_id}")
+            if edited_msgs:
+                print("edited_messages (up to 25):")
+                for r in edited_msgs[:25]:
+                    print(
+                        f"- {str(r.get('action'))} msg={int(r.get('message_id') or 0)} "
+                        f"did={int(r.get('discord_id') or 0)} kind={str(r.get('kind') or '')} "
+                        f"jump={str(r.get('jump_url') or '')}"
+                    )
+        except Exception as ex:
+            print(f"ERROR: {type(ex).__name__}: {str(ex)[:200]}")
+            print(traceback.format_exc()[:4000])
+        finally:
+            with suppress(Exception):
+                await bot.close()
+
+    async with bot:
+        await bot.start(token)
+    return 0
+
+
 def _looks_like_dispute(payment: dict) -> bool:
     if not isinstance(payment, dict):
         return False
@@ -5335,6 +5807,29 @@ def main() -> int:
     pres.add_argument("--guild-id", default="", help="Override guild id (defaults to config guild_id).")
     pres.add_argument("--channel-id", default="", help="Override whop-logs channel id (defaults to invite_tracking.whop_logs_channel_id).")
 
+    pfix = sub.add_parser(
+        "memberstatus-fix-unlinked",
+        help="Scan member-status-logs for '(Discord not linked)' RSCheckerbot cards and fix/delete them using whop-logs evidence.",
+    )
+    pfix.add_argument("--guild-id", default="", help="Discord guild ID (defaults to config guild_id).")
+    pfix.add_argument("--channel-id", default="", help="member-status-logs channel id (defaults to dm_sequence.member_status_logs_channel_id).")
+    pfix.add_argument("--whop-logs-channel-id", default="", help="whop-logs channel id (defaults to invite_tracking.whop_logs_channel_id).")
+    pfix.add_argument(
+        "--whop-membership-logs-channel-id",
+        default="",
+        help="whop-membership-logs channel id (defaults to invite_tracking.whop_webhook_channel_id).",
+    )
+    pfix.add_argument("--limit", type=int, default=500, help="How many member-status-logs messages to scan (50-20000).")
+    pfix.add_argument("--before-message-id", default="", help="Scan member-status-logs messages before this message id (snowflake) to go further back.")
+    pfix.add_argument("--whoplogs-limit", type=int, default=300, help="How many whop-logs messages to scan per email match (25-500).")
+    pfix.add_argument("--memlogs-limit", type=int, default=450, help="How many whop-membership-logs messages to scan per email match (50-1000).")
+    pfix.add_argument("--apply", action="store_true", default=False, help="Actually edit/delete messages (otherwise dry-run).")
+    pfix.add_argument("--delete", action="store_true", default=False, help="Delete bad cards instead of editing them.")
+    pfix.add_argument("--confirm", default="", help="Must be exactly 'confirm' when using --apply.")
+    pfix.add_argument("--sleep-ms", type=int, default=900, help="Delay between edits/deletes when --apply is set (ms, 0-5000).")
+    pfix.add_argument("--progress-every", type=int, default=10, help="Print a progress line every N scanned messages (0 disables).")
+    pfix.add_argument("--verbose", action="store_true", default=False, help="Print one line for each successful edit/delete.")
+
     pa = sub.add_parser("alerts", help="Scan /payments and print dispute/resolution-like signals.")
     pa.add_argument("--max-pages", type=int, default=5)
     pa.add_argument("--first", type=int, default=100)
@@ -5479,6 +5974,8 @@ def main() -> int:
         return asyncio.run(_probe_raw(args))
     if args.mode == "resolve-discord":
         return asyncio.run(_probe_resolve_discord(args))
+    if args.mode == "memberstatus-fix-unlinked":
+        return asyncio.run(_probe_memberstatus_fix_unlinked(args))
     if args.mode == "alerts":
         return asyncio.run(_probe_alerts(args))
     if args.mode == "compare-csv":
