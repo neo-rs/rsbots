@@ -261,7 +261,7 @@
     },
     "no_whop_link": {
       "_comment": "Scan current Discord Members-role users and open a ticket when Whop linkage is not recorded.",
-      "enabled": true,
+      "enabled": false,
       "scan_interval_seconds": 21600,
       "_comment_members_role_id": "Discord role ID that represents current paying members (same as dm_sequence.role_cancel_a).",
       "members_role_id": 876569612085518376,

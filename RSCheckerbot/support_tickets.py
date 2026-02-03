@@ -34,6 +34,9 @@ WHOP_IDENTITY_CACHE_PATH = BASE_DIR / "whop_identity_cache.json"
 MEMBER_LOOKUP_PANEL_STATE_PATH = BASE_DIR / "data" / "support_member_lookup_panel.json"
 
 _INDEX_LOCK: asyncio.Lock = asyncio.Lock()
+_MH_DB_CACHE: dict | None = None
+_MH_DB_CACHE_AT: float = 0.0
+_MH_DB_CACHE_MTIME: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -317,11 +320,30 @@ def _member_history_get(discord_id: int) -> dict:
     did = int(discord_id or 0)
     if did <= 0:
         return {}
-    raw = _load_json(MEMBER_HISTORY_PATH)
-    if not isinstance(raw, dict):
-        return {}
-    rec = raw.get(str(did))
+    db = _member_history_db_cached()
+    rec = db.get(str(did)) if isinstance(db, dict) else None
     return rec if isinstance(rec, dict) else {}
+
+
+def _member_history_db_cached(*, ttl_seconds: int = 15) -> dict:
+    """Load member_history.json once per short window (it can be large)."""
+    global _MH_DB_CACHE, _MH_DB_CACHE_AT, _MH_DB_CACHE_MTIME
+    try:
+        ttl = max(1, min(int(ttl_seconds or 15), 120))
+    except Exception:
+        ttl = 15
+    now = datetime.now(timezone.utc).timestamp()
+    try:
+        mtime = float(MEMBER_HISTORY_PATH.stat().st_mtime) if MEMBER_HISTORY_PATH.exists() else 0.0
+    except Exception:
+        mtime = 0.0
+    if _MH_DB_CACHE is not None and (now - float(_MH_DB_CACHE_AT)) <= float(ttl) and float(mtime) == float(_MH_DB_CACHE_MTIME):
+        return _MH_DB_CACHE if isinstance(_MH_DB_CACHE, dict) else {}
+    raw = _load_json(MEMBER_HISTORY_PATH)
+    _MH_DB_CACHE = raw if isinstance(raw, dict) else {}
+    _MH_DB_CACHE_AT = float(now)
+    _MH_DB_CACHE_MTIME = float(mtime)
+    return _MH_DB_CACHE if isinstance(_MH_DB_CACHE, dict) else {}
 
 
 def _snowflake_created_at_utc(snowflake_id: int) -> datetime | None:
@@ -394,6 +416,478 @@ def _merged_membership_logs_fields(*, db: dict, whop_user_id: str, membership_id
     return out
 
 
+def _membership_logs_rows(*, db: dict, whop_user_id: str) -> list[dict]:
+    """Return membership log rows sorted newest->oldest for a whop_user."""
+    user_id = str(whop_user_id or "").strip()
+    if not user_id or not isinstance(db, dict):
+        return []
+    wu = db.get("whop_users") if isinstance(db.get("whop_users"), dict) else {}
+    rec = wu.get(user_id) if isinstance(wu, dict) else None
+    if not isinstance(rec, dict):
+        return []
+    wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+    latest = wh.get("membership_logs_latest") if isinstance(wh.get("membership_logs_latest"), dict) else {}
+    if not isinstance(latest, dict) or not latest:
+        return []
+    rows: list[dict] = [v for v in latest.values() if isinstance(v, dict)]
+
+    def _ts(row: dict) -> float:
+        dt = _parse_dt_any(row.get("recorded_at") or row.get("created_at") or "")
+        return float(dt.timestamp()) if dt else 0.0
+
+    rows.sort(key=_ts, reverse=True)
+    return rows
+
+
+def _fmt_ts_any(v: object) -> str:
+    dt = _parse_dt_any(v)
+    if not dt:
+        return "—"
+    return dt.astimezone(timezone.utc).strftime("%b %d, %Y")
+
+
+def _fmt_unix_ts(v: object) -> str:
+    try:
+        ts = int(v) if v is not None else 0
+    except Exception:
+        ts = 0
+    if ts <= 0:
+        return "—"
+    try:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%b %d, %Y")
+    except Exception:
+        return "—"
+
+
+def _embed_desc_lines(title: str, lines: list[str], *, max_chars: int = 3500) -> discord.Embed:
+    e = discord.Embed(title=title, color=0x5865F2)
+    out: list[str] = []
+    n = 0
+    for ln in (lines or []):
+        s = str(ln or "").rstrip()
+        if not s:
+            continue
+        if n + len(s) + 1 > int(max_chars):
+            break
+        out.append(s)
+        n += len(s) + 1
+    e.description = ("\n".join(out) if out else "—")
+    return e
+
+
+def _open_tickets_lines_for_user(*, user_id: int) -> list[str]:
+    """Human-readable open tickets list for member lookup."""
+    uid = int(user_id or 0)
+    if uid <= 0:
+        return []
+    lines: list[str] = []
+    try:
+        db = _index_load()
+        for _tid, rec in _ticket_iter(db):
+            if not _ticket_is_open(rec):
+                continue
+            if _as_int(rec.get("user_id")) != uid:
+                continue
+            ttype = str(rec.get("ticket_type") or "").strip().lower() or "unknown"
+            ch_id = _as_int(rec.get("channel_id"))
+            created = str(rec.get("created_at_iso") or "").strip()
+            last_act = str(rec.get("last_activity_at_iso") or "").strip()
+            age = _short_iso(created) if created else "—"
+            last_s = _short_iso(last_act) if last_act else "—"
+            lines.append(f"- **{ttype}**: <#{int(ch_id)}> (created {age}, last activity {last_s})"[:1200])
+    except Exception:
+        return []
+    return lines[:10]
+
+
+def _whop_user_id_for_lookup(*, db: dict, brief: dict, membership_id: str) -> str:
+    if not isinstance(db, dict):
+        return ""
+    b = brief if isinstance(brief, dict) else {}
+    u = str(b.get("whop_user_id") or "").strip()
+    if u.startswith("user_"):
+        return u
+    mid = str(membership_id or "").strip()
+    idx = db.get("whop_membership_index") if isinstance(db.get("whop_membership_index"), dict) else {}
+    if mid and isinstance(idx, dict):
+        u2 = str(idx.get(mid) or "").strip()
+        if u2.startswith("user_"):
+            return u2
+    un = str(b.get("username") or "").strip().lower()
+    uidx = db.get("whop_user_index") if isinstance(db.get("whop_user_index"), dict) else {}
+    if un and isinstance(uidx, dict):
+        u3 = str(uidx.get(un) or "").strip()
+        if u3.startswith("user_"):
+            return u3
+    return ""
+
+
+def _derive_last_seen_utc(rec: dict) -> str:
+    """Pick best last-seen value from whop timeline + baselines."""
+    if not isinstance(rec, dict):
+        return "—"
+    wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+    # Prefer explicit timeline last_seen_ts
+    ts = wh.get("last_seen_ts")
+    if ts:
+        s = _fmt_unix_ts(ts)
+        if s != "—":
+            return s
+    # Fallback: last_event_ts
+    ts2 = wh.get("last_event_ts")
+    if ts2:
+        s = _fmt_ts_any(ts2)
+        if s != "—":
+            return s
+    # Fallback: newest member_status/native log row created_at
+    best: datetime | None = None
+    for rows in (_member_status_latest_rows(rec), _native_logs_latest_rows(rec)):
+        for row in (rows or [])[:3]:
+            dt = _parse_dt_any(row.get("created_at") or row.get("recorded_at") or "")
+            if dt and (best is None or dt > best):
+                best = dt
+    return best.astimezone(timezone.utc).strftime("%b %d, %Y") if best else "—"
+
+
+def _build_member_lookup_result_embeds(*, guild: discord.Guild, did: int) -> list[discord.Embed]:
+    """Detailed, support-friendly multi-embed lookup output."""
+    did_i = int(did or 0)
+    member = guild.get_member(did_i) if did_i > 0 else None
+    db = _member_history_db_cached()
+    rec = db.get(str(did_i)) if isinstance(db, dict) else {}
+    rec = rec if isinstance(rec, dict) else {}
+    wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+
+    # Basic identity
+    display = str(getattr(member, "display_name", "") or getattr(member, "name", "") or "—") if isinstance(member, discord.Member) else "—"
+    mention = member.mention if isinstance(member, discord.Member) else f"`{did_i}`"
+
+    def _matches_did(s: object) -> bool:
+        try:
+            m = re.search(r"\b(\d{17,19})\b", str(s or ""))
+            return bool(m and m.group(1).isdigit() and int(m.group(1)) == int(did_i))
+        except Exception:
+            return False
+
+    # Derive linkage signal (Connected Discord)
+    connected_discord = ""
+    with suppress(Exception):
+        ms_map = wh.get("member_status_logs_latest") if isinstance(wh.get("member_status_logs_latest"), dict) else {}
+        if isinstance(ms_map, dict):
+            for row in ms_map.values():
+                if not isinstance(row, dict):
+                    continue
+                cd0 = str(row.get("connected_discord") or "").strip()
+                if cd0 and cd0 != "—":
+                    connected_discord = cd0
+                    break
+
+    # Overview embed
+    ov_lines: list[str] = [
+        f"**Member**: {mention}",
+        f"**Display Name**: {display}",
+        f"**Discord ID**: `{did_i}`",
+    ]
+    if isinstance(member, discord.Member):
+        created_dt = _snowflake_created_at_utc(did_i)
+        ov_lines.append(f"**Discord Account Created**: {created_dt.strftime('%b %d, %Y') if created_dt else '—'}")
+        with suppress(Exception):
+            if getattr(member, "joined_at", None):
+                ov_lines.append(f"**First Joined**: {member.joined_at.astimezone(timezone.utc).strftime('%b %d, %Y')}")  # type: ignore[union-attr]
+
+    open_lines = _open_tickets_lines_for_user(user_id=did_i)
+    if open_lines:
+        ov_lines.append("")
+        ov_lines.append("**Open Tickets**:")
+        ov_lines.extend(open_lines)
+
+    # Quick Whop linkage status (used for nowhop cleanup)
+    ov_lines.append("")
+    ov_lines.append("**Whop Link Status**:")
+    if connected_discord:
+        ov_lines.append(f"- Connected Discord: `{connected_discord}`")
+        ov_lines.append(f"- Linked: `{'yes' if _matches_did(connected_discord) else 'no'}`")
+    else:
+        ov_lines.append("- Connected Discord: —")
+        ov_lines.append("- Linked: `no`")
+
+    emb_overview = _embed_desc_lines("Member Lookup (1/5) — Overview", ov_lines)
+
+    # Discord details embed
+    disc_lines: list[str] = []
+    if isinstance(member, discord.Member):
+        disc_lines.append(f"**Current Roles**: {_roles_plain(member) or '—'}")
+    # Stored history
+    acc = rec.get("access") if isinstance(rec.get("access"), dict) else {}
+    disc = rec.get("discord") if isinstance(rec.get("discord"), dict) else {}
+    disc_lines.append("")
+    disc_lines.append("**Access Timeline (from member_history.json)**:")
+    disc_lines.append(f"- Ever Had Access Role: `{bool(acc.get('ever_had_access_role'))}`")
+    disc_lines.append(f"- First Access: {_fmt_unix_ts(acc.get('first_access_ts'))}")
+    disc_lines.append(f"- Last Access: {_fmt_unix_ts(acc.get('last_access_ts'))}")
+    disc_lines.append(f"- Ever Had Member Role: `{bool(acc.get('ever_had_member_role'))}`")
+    disc_lines.append(f"- First Member Role: {_fmt_unix_ts(acc.get('first_member_role_ts'))}")
+    disc_lines.append(f"- Last Member Role: {_fmt_unix_ts(acc.get('last_member_role_ts'))}")
+    disc_lines.append("")
+    disc_lines.append("**Join/Leave (legacy fields)**:")
+    disc_lines.append(f"- Join Count: `{int(rec.get('join_count') or 0)}`")
+    disc_lines.append(f"- First Join: {_fmt_unix_ts(rec.get('first_join_ts'))}")
+    disc_lines.append(f"- Last Join: {_fmt_unix_ts(rec.get('last_join_ts'))}")
+    disc_lines.append(f"- Last Leave: {_fmt_unix_ts(rec.get('last_leave_ts'))}")
+    if isinstance(disc.get("last_role_names"), list) and disc.get("last_role_names"):
+        rn = ", ".join([str(x) for x in (disc.get("last_role_names") or []) if str(x).strip()][:40])
+        if rn:
+            disc_lines.append("")
+            disc_lines.append("**Last Snapshot Roles (stored)**:")
+            disc_lines.append(f"- {rn[:1800]}")
+    emb_discord = _embed_desc_lines("Member Lookup (2/5) — Discord", disc_lines)
+
+    # Whop summary embed (baseline-enriched)
+    # Pick the best membership key we know about (prefer mem_ over R-).
+    cands: list[str] = []
+    with suppress(Exception):
+        cands.append(str(wh.get("last_membership_id") or "").strip())
+        cands.append(str(wh.get("last_whop_key") or "").strip())
+    with suppress(Exception):
+        for row in _member_status_latest_rows(rec)[:15]:
+            if isinstance(row, dict):
+                cands.append(str(row.get("membership_id") or "").strip())
+    with suppress(Exception):
+        for row in _native_logs_latest_rows(rec)[:25]:
+            if isinstance(row, dict):
+                cands.append(str(row.get("key") or "").strip())
+    cands = [x for x in cands if x and x != "—"]
+    last_mid = ""
+    for x in cands:
+        if str(x).startswith("mem_"):
+            last_mid = str(x)
+            break
+    if not last_mid:
+        for x in cands:
+            if str(x).startswith("R-"):
+                last_mid = str(x)
+                break
+    if not last_mid and cands:
+        last_mid = str(cands[0])
+    last_status = str(wh.get("last_status") or "").strip()
+    base_summary = wh.get("last_summary") if isinstance(wh.get("last_summary"), dict) else {}
+    base_brief = dict(base_summary) if isinstance(base_summary, dict) else {}
+    if last_mid:
+        base_brief.setdefault("membership_id", last_mid)
+    if last_status and not str(base_brief.get("status") or "").strip():
+        base_brief["status"] = last_status
+    brief = _enrich_whop_brief_from_membership_logs(base_brief, membership_id=str(last_mid or "").strip())
+    brief = brief if isinstance(brief, dict) else base_brief
+
+    # Derived info
+    product = str(brief.get("product") or "").strip()
+    access_pass = ""
+    with suppress(Exception):
+        latest = wh.get("native_whop_logs_latest") if isinstance(wh.get("native_whop_logs_latest"), dict) else {}
+        if isinstance(latest, dict):
+            for v in sorted(list(latest.values()), key=lambda r: str((r or {}).get("recorded_at") or ""), reverse=True):
+                if not isinstance(v, dict):
+                    continue
+                ap = str(v.get("access_pass") or "").strip()
+                if ap:
+                    access_pass = ap
+                    break
+    # If product is blank, try to fill from member-status baseline.
+    if not product:
+        with suppress(Exception):
+            for row in _member_status_latest_rows(rec)[:10]:
+                if not isinstance(row, dict):
+                    continue
+                p2 = str(row.get("product") or "").strip()
+                if p2 and p2 != "—":
+                    product = p2
+                    break
+
+    member_type = _whop_member_type(product, has_membership=bool(last_mid))
+    if (member_type == "Whop (unknown product)") and access_pass:
+        if "free pass" in access_pass.lower():
+            member_type = f"Free Pass ({access_pass})"
+        elif access_pass:
+            member_type = access_pass
+
+    member_since = str(brief.get("customer_since") or brief.get("member_since") or "").strip()
+    if not member_since and isinstance(member, discord.Member):
+        with suppress(Exception):
+            if getattr(member, "joined_at", None):
+                member_since = member.joined_at.astimezone(timezone.utc).strftime("%b %d, %Y")  # type: ignore[union-attr]
+
+    last_seen = _derive_last_seen_utc(rec)
+    wh_lines: list[str] = [
+        f"**Current Member Type**: {member_type}",
+        f"**Member Since**: {member_since or '—'}",
+        f"**Last Seen**: {last_seen}",
+        "",
+        f"**Membership ID**: `{last_mid}`" if last_mid else "**Membership ID**: —",
+    ]
+    whop_user_id = _whop_user_id_for_lookup(db=db, brief=brief, membership_id=last_mid)
+    if whop_user_id:
+        wh_lines.append(f"**Whop User ID**: `{whop_user_id}`")
+    if str(brief.get("status") or "").strip():
+        wh_lines.append(f"**Status**: {_whop_status_label(str(brief.get('status') or ''))}")
+    if product:
+        wh_lines.append(f"**Membership / Product**: {product}")
+    if access_pass:
+        wh_lines.append(f"**Access Pass**: {access_pass}")
+    if str(brief.get("total_spent") or "").strip():
+        wh_lines.append(f"**Total Spent (lifetime)**: {str(brief.get('total_spent') or '').strip()}")
+    if str(brief.get("remaining_days") or "").strip() and str(brief.get("remaining_days") or "").strip() != "—":
+        wh_lines.append(f"**Remaining Days**: {str(brief.get('remaining_days') or '').strip()}")
+    if str(brief.get("renewal_end") or "").strip() and str(brief.get("renewal_end") or "").strip() != "—":
+        wh_lines.append(f"**Access Ends On**: {str(brief.get('renewal_end') or '').strip()}")
+    if str(brief.get("next_billing_date") or "").strip() and str(brief.get("next_billing_date") or "").strip() != "—":
+        wh_lines.append(f"**Next Billing Date**: {str(brief.get('next_billing_date') or '').strip()}")
+    if str(brief.get("cancel_at_period_end") or "").strip():
+        wh_lines.append(f"**Cancel At Period End**: {str(brief.get('cancel_at_period_end') or '').strip()}")
+    dash = str(brief.get("dashboard_url") or "").strip()
+    if dash:
+        wh_lines.append(f"**Whop Dashboard**: {_embed_link('Open', dash)}")
+
+    # Whop timeline fields (from whop_history backfill)
+    wh_lines.append("")
+    wh_lines.append("**Whop Timeline (from whop_history backfill, if available)**:")
+    wh_lines.append(f"- First Seen: {_fmt_unix_ts(wh.get('first_seen_ts'))}")
+    wh_lines.append(f"- Last Seen: {_fmt_unix_ts(wh.get('last_seen_ts'))}")
+    wh_lines.append(f"- Last Active: {_fmt_unix_ts(wh.get('last_active_ts'))}")
+    wh_lines.append(f"- Last Canceled: {_fmt_unix_ts(wh.get('last_canceled_ts'))}")
+
+    # Pull key fields from membership-log baseline to fill gaps for support.
+    merged_fields: dict[str, str] = {}
+    with suppress(Exception):
+        if whop_user_id:
+            merged_fields = _merged_membership_logs_fields(db=db, whop_user_id=whop_user_id, membership_id=last_mid)
+    if merged_fields:
+        wh_lines.append("")
+        wh_lines.append("**Whop Membership Log Fields (baseline)**:")
+        for k in (
+            "connected discord",
+            "status",
+            "membership",
+            "product",
+            "plan",
+            "total spent",
+            "total spent (lifetime)",
+            "next billing date",
+            "renewal window",
+            "pricing",
+            "manage",
+            "checkout",
+        ):
+            v = str(merged_fields.get(k) or "").strip()
+            if not v:
+                continue
+            label = k.title()
+            if k in {"manage", "checkout"}:
+                wh_lines.append(f"- {label}: {_embed_link('Open', v)}")
+            else:
+                wh_lines.append(f"- {label}: {v}")
+
+    # Explicit linkage line on the Whop page too.
+    if not any("Connected Discord" in x for x in wh_lines):
+        wh_lines.insert(0, f"**Connected Discord**: `{connected_discord}`" if connected_discord else "**Connected Discord**: —")
+
+    emb_whop = _embed_desc_lines("Member Lookup (3/5) — Whop", wh_lines)
+
+    # History embed (member-status + whop logs + membership logs)
+    hist_lines: list[str] = []
+    ms_rows = _member_status_latest_rows(rec)
+    if ms_rows:
+        hist_lines.append("**Member Status Cards (latest per kind)**:")
+        for row in ms_rows[:10]:
+            title = str(row.get("title") or row.get("kind") or "").strip() or "—"
+            created = _short_iso(str(row.get("created_at") or ""))
+            st = str(row.get("status") or "").strip()
+            prod = str(row.get("product") or "").strip()
+            cd = str(row.get("connected_discord") or "").strip()
+            parts = [created, title]
+            if st:
+                parts.append(f"status={st}")
+            if prod:
+                parts.append(f"product={prod}")
+            if cd and cd != "—":
+                parts.append(f"connected_discord={cd}")
+            hist_lines.append("- " + " • ".join([p for p in parts if p])[:1800])
+        hist_lines.append("")
+
+    wl_rows = _native_logs_latest_rows(rec)
+    if wl_rows:
+        hist_lines.append("**Whop Logs (latest titles)**:")
+        for row in wl_rows[:10]:
+            title = str(row.get("title") or "").strip() or "—"
+            created = _short_iso(str(row.get("created_at") or ""))
+            ap = str(row.get("access_pass") or "").strip()
+            k = str(row.get("key") or "").strip()
+            bits = [created, title]
+            if ap:
+                bits.append(f"access_pass={ap}")
+            if k:
+                bits.append(f"key={k}")
+            hist_lines.append("- " + " • ".join(bits)[:1800])
+        hist_lines.append("")
+
+    if whop_user_id:
+        rows = _membership_logs_rows(db=db, whop_user_id=whop_user_id)
+        if rows:
+            hist_lines.append("**Whop Membership Logs (latest cards)**:")
+            for r0 in rows[:10]:
+                title = str(r0.get("title") or "").strip() or "—"
+                created = _short_iso(str(r0.get("created_at") or r0.get("recorded_at") or ""))
+                fields = r0.get("fields") if isinstance(r0.get("fields"), dict) else {}
+                st2 = str(fields.get("status") or fields.get("membership status") or "").strip()
+                mb = str(fields.get("membership") or fields.get("product") or "").strip()
+                spent = str(fields.get("total spent") or fields.get("total spent (lifetime)") or "").strip()
+                nb = str(fields.get("next billing date") or "").strip()
+                rw = str(fields.get("renewal window") or "").strip()
+                seg = [created, title]
+                if st2:
+                    seg.append(f"status={st2}")
+                if mb:
+                    seg.append(f"membership={mb}")
+                if spent:
+                    seg.append(f"spent={spent}")
+                if nb:
+                    seg.append(f"next={nb}")
+                if rw:
+                    seg.append(f"renewal={rw}")
+                hist_lines.append("- " + " • ".join(seg)[:1800])
+
+    emb_hist = _embed_desc_lines("Member Lookup (4/5) — History", (hist_lines if hist_lines else ["—"]))
+
+    # Events embed (Discord-side audit trail from member_history)
+    ev_lines: list[str] = []
+    events = rec.get("events") if isinstance(rec.get("events"), list) else []
+    if events:
+        ev_lines.append("**Recent Discord Events (member_history)**:")
+
+        def _role_name(rid: int) -> str:
+            rr = guild.get_role(int(rid)) if guild else None
+            return str(getattr(rr, "name", "") or f"role:{int(rid)}")
+
+        for ev in list(events)[-25:][::-1]:
+            if not isinstance(ev, dict):
+                continue
+            ts = _fmt_unix_ts(ev.get("ts"))
+            kind = str(ev.get("kind") or "").strip() or "event"
+            note = str(ev.get("note") or "").strip()
+            added = [int(x) for x in (ev.get("roles_added") or []) if str(x).strip().isdigit()]
+            removed = [int(x) for x in (ev.get("roles_removed") or []) if str(x).strip().isdigit()]
+            parts = [f"{ts} • {kind}"]
+            if note:
+                parts.append(f"note={note}")
+            if added:
+                parts.append("added=" + ", ".join(_role_name(x) for x in added[:8]))
+            if removed:
+                parts.append("removed=" + ", ".join(_role_name(x) for x in removed[:8]))
+            ev_lines.append("- " + " • ".join(parts)[:1800])
+    emb_events = _embed_desc_lines("Member Lookup (5/5) — Events", (ev_lines if ev_lines else ["—"]))
+
+    return [emb_overview, emb_discord, emb_whop, emb_hist, emb_events]
+
+
 def _native_logs_latest_rows(rec: dict) -> list[dict]:
     """Return native_whop_logs_latest entries sorted newest->oldest (best-effort)."""
     if not isinstance(rec, dict):
@@ -439,175 +933,9 @@ def _member_status_latest_rows(rec: dict) -> list[dict]:
 
 
 def _build_member_lookup_result_embed(*, guild: discord.Guild, did: int) -> discord.Embed:
-    cfg = _cfg()
-    did_i = int(did or 0)
-    member = guild.get_member(did_i) if did_i > 0 else None
-    # Load full db once (we also need whop_users baseline).
-    db = _load_json(MEMBER_HISTORY_PATH)
-    db = db if isinstance(db, dict) else {}
-    rec = db.get(str(did_i)) if isinstance(db.get(str(did_i)), dict) else {}
-    if not isinstance(rec, dict):
-        rec = {}
-
-    e = discord.Embed(title="Member Lookup", color=0x5865F2)
-
-    # --------------------
-    # Discord member info
-    # --------------------
-    if isinstance(member, discord.Member):
-        e.add_field(name="Member", value=f"{member.mention}\n{str(member.display_name or member)}"[:1024], inline=True)
-        e.add_field(name="Discord ID", value=_format_discord_id(int(member.id)), inline=True)
-    else:
-        e.add_field(name="Member", value="Not found in guild cache.", inline=True)
-        e.add_field(name="Discord ID", value=_format_discord_id(did_i), inline=True)
-
-    created_dt = _snowflake_created_at_utc(did_i)
-    created_s = created_dt.strftime("%b %d, %Y") if created_dt else "—"
-    joined_s = "—"
-    if isinstance(member, discord.Member):
-        with suppress(Exception):
-            if getattr(member, "joined_at", None):
-                joined_s = member.joined_at.astimezone(timezone.utc).strftime("%b %d, %Y")  # type: ignore[union-attr]
-        with suppress(Exception):
-            e.add_field(name="Current Roles", value=_roles_plain(member)[:1024], inline=False)
-
-    e.add_field(
-        name="Discord Member Information",
-        value=f"- Discord Account Created: {created_s}\n- First Joined: {joined_s}"[:1024],
-        inline=False,
-    )
-
-    # --------------------
-    # Whop info (baseline-enriched)
-    # --------------------
-    wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
-    last_mid = str(wh.get("last_membership_id") or wh.get("last_whop_key") or "").strip()
-    last_status = str(wh.get("last_status") or "").strip()
-    last_ts = wh.get("last_event_ts")
-    last_dt = _parse_dt_any(last_ts)
-    last_dt_s = last_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if last_dt else "—"
-    last_summary = wh.get("last_summary") if isinstance(wh.get("last_summary"), dict) else {}
-    base_brief = dict(last_summary) if isinstance(last_summary, dict) else {}
-    if last_mid:
-        base_brief.setdefault("membership_id", last_mid)
-    if last_status and not str(base_brief.get("status") or "").strip():
-        base_brief["status"] = last_status
-    brief = _enrich_whop_brief_from_membership_logs(base_brief, membership_id=str(last_mid or "").strip())
-    brief = brief if isinstance(brief, dict) else base_brief
-
-    product = str(brief.get("product") or "").strip()
-    member_type = _whop_member_type(product, has_membership=bool(last_mid))
-    member_since = str(brief.get("customer_since") or brief.get("member_since") or "").strip()
-    if not member_since and isinstance(member, discord.Member):
-        with suppress(Exception):
-            if getattr(member, "joined_at", None):
-                member_since = member.joined_at.astimezone(timezone.utc).strftime("%b %d, %Y")  # type: ignore[union-attr]
-    core_lines = [
-        f"- Member Since: {member_since or '—'}",
-        f"- Current Member Type: {member_type}",
-        f"- Last Seen: {last_dt_s}",
-    ]
-    e.add_field(name="Core Info", value="\n".join(core_lines)[:1024], inline=False)
-
-    whop_user_id = str(brief.get("whop_user_id") or "").strip()
-    username = str(brief.get("username") or "").strip()
-    st = str(brief.get("status") or "").strip()
-    spent = str(brief.get("total_spent") or "").strip()
-    trial_days = str(brief.get("trial_days") or "").strip()
-    plan_is_renewal = str(brief.get("plan_is_renewal") or "").strip()
-    pricing = str(brief.get("pricing") or "").strip()
-    cancel_ape = str(brief.get("cancel_at_period_end") or "").strip()
-    remaining_days = str(brief.get("remaining_days") or "").strip()
-    renewal_end = str(brief.get("renewal_end") or "").strip()
-    dash = str(brief.get("dashboard_url") or "").strip()
-
-    # Access pass from whop-logs baseline (discord-keyed).
-    access_pass = ""
-    with suppress(Exception):
-        latest = wh.get("native_whop_logs_latest") if isinstance(wh.get("native_whop_logs_latest"), dict) else {}
-        if isinstance(latest, dict):
-            # pick any newest-ish record with access_pass
-            for v in sorted(list(latest.values()), key=lambda r: str((r or {}).get("recorded_at") or ""), reverse=True):
-                if not isinstance(v, dict):
-                    continue
-                ap = str(v.get("access_pass") or "").strip()
-                if ap:
-                    access_pass = ap
-                    break
-
-    # Pull checkout/manage links from membership-logs baseline (whop_users).
-    merged = _merged_membership_logs_fields(db=db, whop_user_id=whop_user_id, membership_id=last_mid)
-    checkout = str(merged.get("checkout") or "").strip()
-    manage = str(merged.get("manage") or "").strip()
-    renewal_window = str(merged.get("renewal window") or "").strip()
-
-    whop_lines: list[str] = []
-    if username:
-        whop_lines.append(f"- Username: `{username}`")
-    if whop_user_id:
-        whop_lines.append(f"- Whop User ID: `{whop_user_id}`")
-    if last_mid:
-        whop_lines.append(f"- Membership ID: `{last_mid}`")
-    if st:
-        whop_lines.append(f"- Status: {_whop_status_label(st)}")
-    if product:
-        whop_lines.append(f"- Membership: {product}")
-    if spent:
-        whop_lines.append(f"- Total Spent (lifetime): {spent}")
-    if access_pass:
-        whop_lines.append(f"- Access Pass: {access_pass}")
-    if remaining_days and remaining_days != "—":
-        whop_lines.append(f"- Remaining Days: {remaining_days}")
-    if renewal_end and renewal_end != "—":
-        whop_lines.append(f"- Access Ends On: {renewal_end}")
-    if renewal_window and renewal_window != "—":
-        whop_lines.append(f"- Renewal Window: {renewal_window}")
-    if trial_days:
-        whop_lines.append(f"- Trial Days: {trial_days}")
-    if plan_is_renewal:
-        whop_lines.append(f"- Plan Is Renewal: {plan_is_renewal}")
-    if pricing:
-        whop_lines.append(f"- Pricing: {pricing}")
-    if cancel_ape:
-        whop_lines.append(f"- Cancel At Period End: {cancel_ape}")
-    if dash:
-        whop_lines.append(f"- Whop Dashboard: {_embed_link('Open', dash)}")
-    if manage:
-        whop_lines.append(f"- Manage: {_embed_link('Open', manage)}")
-    if checkout:
-        whop_lines.append(f"- Checkout: {_embed_link('Open', checkout)}")
-    if not whop_lines:
-        whop_lines = ["—"]
-
-    e.add_field(name="Whop Member Information", value="\n".join(whop_lines)[:1024], inline=False)
-
-    # --------------------
-    # Payment / full logs (summary)
-    # --------------------
-    pay_lines: list[str] = []
-    if spent:
-        pay_lines.append(f"- Total Spent: {spent}")
-    if access_pass:
-        pay_lines.append(f"- Access Pass: {access_pass}")
-    if st:
-        pay_lines.append(f"- Status: {_whop_status_label(st)}")
-    if renewal_window:
-        pay_lines.append(f"- Renewal Window: {renewal_window}")
-    if trial_days:
-        pay_lines.append(f"- Trial Days: {trial_days}")
-    if plan_is_renewal:
-        pay_lines.append(f"- Plan Is Renewal: {plan_is_renewal}")
-    if pricing:
-        pay_lines.append(f"- Pricing: {pricing}")
-    if manage:
-        pay_lines.append(f"- Manage: {_embed_link('Open', manage)}")
-    if checkout:
-        pay_lines.append(f"- Checkout: {_embed_link('Open', checkout)}")
-    if not pay_lines:
-        pay_lines = ["—"]
-    e.add_field(name="Payment Full Logs", value="\n".join(pay_lines)[:1024], inline=False)
-
-    return e
+    # Back-compat wrapper (some callers expect a single embed).
+    embs = _build_member_lookup_result_embeds(guild=guild, did=int(did or 0))
+    return embs[0] if embs else discord.Embed(title="Member Lookup", description="—", color=0x5865F2)
 
 
 async def ensure_member_lookup_panel() -> None:
@@ -2526,9 +2854,30 @@ class _MemberLookupModal(discord.ui.Modal, title="Lookup Member"):
                 await interaction.response.send_message("❌ Please paste a valid Discord ID (17-19 digits).", ephemeral=True)
             return
         did = int(m.group(1))
-        emb = _build_member_lookup_result_embed(guild=guild, did=did)
-        with suppress(Exception):
-            await interaction.response.send_message(embed=emb, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+        embeds = _build_member_lookup_result_embeds(guild=guild, did=did)
+        if not embeds:
+            embeds = [_build_member_lookup_result_embed(guild=guild, did=did)]
+
+        # Prefer sending all embeds in one ephemeral response; fall back to followups if needed.
+        sent_ok = False
+        try:
+            await interaction.response.send_message(
+                embeds=embeds[:10],
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            sent_ok = True
+        except TypeError:
+            sent_ok = False
+        except Exception:
+            sent_ok = False
+        if not sent_ok:
+            # Fallback: send first embed, then followups (still ephemeral).
+            with suppress(Exception):
+                await interaction.response.send_message(embed=embeds[0], ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+            for e in embeds[1:5]:
+                with suppress(Exception):
+                    await interaction.followup.send(embed=e, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 class MemberLookupPanelView(discord.ui.View):
@@ -4011,6 +4360,94 @@ async def close_no_whop_link_if_linked(
     return
 
 
+async def sweep_no_whop_link_cleanup(*, force: bool = False) -> str:
+    """Cleanup no_whop_link: close tickets + remove No Whop role once Whop is linked."""
+    if not _ensure_cfg_loaded() or not _BOT:
+        return "skipped:not_ready"
+    cfg = _cfg()
+    if not cfg:
+        return "skipped:no_cfg"
+    if not _IS_WHOP_LINKED:
+        return "skipped:no_is_whop_linked"
+
+    guild = _BOT.get_guild(int(cfg.guild_id))
+    if not isinstance(guild, discord.Guild):
+        return "skipped:no_guild"
+
+    # Throttle: run at most once per 10 minutes unless forced.
+    state = _scan_state_get()
+    rec = state.get("no_whop_link_cleanup") if isinstance(state.get("no_whop_link_cleanup"), dict) else {}
+    last_iso = str((rec or {}).get("last_run_at_iso") or "").strip()
+    last_dt = _parse_iso(last_iso) if last_iso else None
+    now = _now_utc()
+    if (not bool(force)) and last_dt and (now - last_dt) < timedelta(seconds=600):
+        return "skipped:throttle"
+    _scan_state_set("no_whop_link_cleanup", {"last_run_at_iso": _now_iso(), "last_summary": "running"})
+
+    # 1) Close OPEN no_whop_link tickets whose owner is now linked.
+    to_close: list[tuple[int, int]] = []  # (channel_id, user_id)
+    async with _INDEX_LOCK:
+        db = _index_load()
+        for _tid, r in _ticket_iter(db):
+            if not _ticket_is_open(r):
+                continue
+            if str(r.get("ticket_type") or "").strip().lower() != "no_whop_link":
+                continue
+            ch_id = _as_int(r.get("channel_id"))
+            uid = _as_int(r.get("user_id"))
+            if ch_id and uid:
+                to_close.append((ch_id, uid))
+
+    closed = 0
+    skipped = 0
+    failed = 0
+    for ch_id, uid in to_close:
+        linked = False
+        with suppress(Exception):
+            linked = bool(_IS_WHOP_LINKED(int(uid)))
+        if not linked:
+            skipped += 1
+            continue
+        try:
+            ok = await close_ticket_by_channel_id(
+                int(ch_id),
+                close_reason="whop_linked",
+                do_transcript=True,
+                delete_channel=True,
+            )
+            if ok:
+                closed += 1
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+
+    # 2) Remove stale No Whop role from members who are now linked (even if no ticket exists).
+    role_removed = 0
+    role_skipped = 0
+    rid = int(cfg.no_whop_link_role_id or 0)
+    role = guild.get_role(int(rid)) if rid else None
+    if isinstance(role, discord.Role):
+        for m in list(getattr(role, "members", []) or []):
+            if not isinstance(m, discord.Member):
+                continue
+            linked = False
+            with suppress(Exception):
+                linked = bool(_IS_WHOP_LINKED(int(m.id)))
+            if not linked:
+                role_skipped += 1
+                continue
+            with suppress(Exception):
+                await m.remove_roles(role, reason="RSCheckerbot: Whop linked; remove No Whop role")
+                role_removed += 1
+
+    summary = f"closed={closed} skipped={skipped} failed={failed} role_removed={role_removed} role_skipped={role_skipped}"
+    _scan_state_set("no_whop_link_cleanup", {"last_run_at_iso": _now_iso(), "last_summary": summary})
+    with suppress(Exception):
+        await _log(f"🧹 support_tickets: no_whop_link cleanup {summary}")
+    return summary
+
+
 async def sweep_free_pass_tickets() -> None:
     """Periodic sweeper: inactivity and whop-linked closure for Free Pass tickets."""
     if not _ensure_cfg_loaded():
@@ -4021,6 +4458,9 @@ async def sweep_free_pass_tickets() -> None:
     # Always run no-whop-link scan (config-gated; restart-safe).
     with suppress(Exception):
         await sweep_no_whop_link_scan()
+    # Always run no-whop-link cleanup (restart-safe): close resolved tickets + remove stale roles.
+    with suppress(Exception):
+        await sweep_no_whop_link_cleanup()
     # Always run resolved-ticket sweeper (config-gated; restart-safe).
     with suppress(Exception):
         await sweep_resolved_tickets()

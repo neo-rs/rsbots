@@ -4666,9 +4666,33 @@ def _membership_id_from_history(discord_id: int) -> str:
         hist = get_member_history(int(discord_id)) or {}
         wh = hist.get("whop") if isinstance(hist, dict) else None
         if isinstance(wh, dict):
-            mid = str(wh.get("last_membership_id") or wh.get("last_whop_key") or "").strip()
-            if mid.startswith(("mem_", "R-")):
-                return mid
+            cands: list[str] = []
+            cands.append(str(wh.get("last_membership_id") or "").strip())
+            cands.append(str(wh.get("last_whop_key") or "").strip())
+
+            # Also scan baselines stored under this user.
+            ms = wh.get("member_status_logs_latest") if isinstance(wh.get("member_status_logs_latest"), dict) else {}
+            if isinstance(ms, dict):
+                for row in ms.values():
+                    if isinstance(row, dict):
+                        cands.append(str(row.get("membership_id") or "").strip())
+            nw = wh.get("native_whop_logs_latest") if isinstance(wh.get("native_whop_logs_latest"), dict) else {}
+            if isinstance(nw, dict):
+                for row in nw.values():
+                    if isinstance(row, dict):
+                        cands.append(str(row.get("key") or "").strip())
+
+            cands = [x for x in cands if x and x != "—"]
+            for x in cands:
+                if str(x).startswith("mem_"):
+                    return str(x)
+            for x in cands:
+                if str(x).startswith("R-"):
+                    return str(x)
+            if cands:
+                x0 = str(cands[0])
+                if x0.startswith(("mem_", "R-")):
+                    return x0
     except Exception:
         return ""
     return ""
@@ -7829,21 +7853,117 @@ async def on_ready():
     except Exception:
         tz_name = "UTC"
 
-    def _is_whop_linked(did: int) -> bool:
+    _MH_LINK_CACHE: dict[str, object] = {"db": None, "at": 0.0, "mtime": 0.0}
+
+    def _mh_db_cached(*, ttl_seconds: int = 15) -> dict:
+        """Load member_history.json once per short window (it can be large)."""
         try:
-            # Only treat as "linked" when:
-            # - we have a membership_id recorded for this discord_id, AND
-            # - the member currently has the Members role in this guild (ROLE_CANCEL_A).
-            did_i = int(did)
-            if not _membership_id_from_history(did_i):
-                return False
-            g = bot.get_guild(GUILD_ID)
-            if not g:
-                return False
-            m = g.get_member(int(did_i))
-            return bool(isinstance(m, discord.Member) and has_member_role(m))
+            ttl = max(1, min(int(ttl_seconds or 15), 120))
+        except Exception:
+            ttl = 15
+        now = time.time()
+        try:
+            mtime = float(MEMBER_HISTORY_FILE.stat().st_mtime) if MEMBER_HISTORY_FILE.exists() else 0.0
+        except Exception:
+            mtime = 0.0
+        try:
+            db0 = _MH_LINK_CACHE.get("db")
+            at0 = float(_MH_LINK_CACHE.get("at") or 0.0)
+            mt0 = float(_MH_LINK_CACHE.get("mtime") or 0.0)
+        except Exception:
+            db0, at0, mt0 = None, 0.0, 0.0
+        if isinstance(db0, dict) and (now - at0) <= float(ttl) and float(mtime) == float(mt0):
+            return db0
+        db_new = _load_member_history()
+        _MH_LINK_CACHE["db"] = db_new if isinstance(db_new, dict) else {}
+        _MH_LINK_CACHE["at"] = float(now)
+        _MH_LINK_CACHE["mtime"] = float(mtime)
+        return _MH_LINK_CACHE["db"] if isinstance(_MH_LINK_CACHE.get("db"), dict) else {}
+
+    def _is_whop_linked(did: int) -> bool:
+        """Return True only when Whop shows this Discord ID as connected.
+
+        This is used for:
+        - closing `no_whop_link` tickets once the member connects Discord in Whop
+        - removing stale "No Whop" roles after linkage is confirmed
+
+        IMPORTANT: Do NOT treat "has a membership_id" as linked. We require a Connected Discord match.
+        """
+        try:
+            did_i = int(did or 0)
         except Exception:
             return False
+        if did_i <= 0:
+            return False
+
+        def _matches_connected_discord(val: object) -> bool:
+            try:
+                m = re.search(r"\b(\d{17,19})\b", str(val or ""))
+                return bool(m and m.group(1).isdigit() and int(m.group(1)) == int(did_i))
+            except Exception:
+                return False
+
+        db_hist = _mh_db_cached(ttl_seconds=15)
+        hist = db_hist.get(str(did_i)) if isinstance(db_hist, dict) else {}
+        hist = hist if isinstance(hist, dict) else {}
+        wh = hist.get("whop") if isinstance(hist.get("whop"), dict) else {}
+
+        # 1) Strongest signal: member-status-logs baseline "Connected Discord".
+        try:
+            ms = wh.get("member_status_logs_latest") if isinstance(wh.get("member_status_logs_latest"), dict) else {}
+            if isinstance(ms, dict):
+                for row in ms.values():
+                    if isinstance(row, dict) and _matches_connected_discord(row.get("connected_discord")):
+                        return True
+        except Exception:
+            pass
+
+        # 2) Next: last_summary snapshot, if it contains connected_discord.
+        try:
+            ls = wh.get("last_summary") if isinstance(wh.get("last_summary"), dict) else {}
+            if isinstance(ls, dict) and _matches_connected_discord(ls.get("connected_discord")):
+                return True
+        except Exception:
+            ls = {}
+
+        # 3) Membership-log baseline: sometimes "Connected Discord" only exists there.
+        try:
+            mid = _membership_id_from_history(int(did_i))
+        except Exception:
+            mid = ""
+        if mid:
+            try:
+                midx = db_hist.get("whop_membership_index") if isinstance(db_hist.get("whop_membership_index"), dict) else {}
+                whop_uid = str(midx.get(str(mid).strip()) or "").strip() if isinstance(midx, dict) else ""
+                wu = db_hist.get("whop_users") if isinstance(db_hist.get("whop_users"), dict) else {}
+                urec = wu.get(whop_uid) if isinstance(wu, dict) else None
+                wwh = urec.get("whop") if isinstance(urec, dict) and isinstance(urec.get("whop"), dict) else {}
+                latest = wwh.get("membership_logs_latest") if isinstance(wwh.get("membership_logs_latest"), dict) else {}
+                if isinstance(latest, dict):
+                    for row in latest.values():
+                        if not isinstance(row, dict):
+                            continue
+                        fields = row.get("fields") if isinstance(row.get("fields"), dict) else {}
+                        if not isinstance(fields, dict):
+                            continue
+                        cd2 = fields.get("connected discord") or fields.get("connected_discord") or ""
+                        if _matches_connected_discord(cd2):
+                            return True
+            except Exception:
+                pass
+
+        # 4) Enrichment fallback: sometimes API summary exists without member-status cards.
+        try:
+            base = dict(ls) if isinstance(ls, dict) else {}
+            if mid and not str(base.get("membership_id") or "").strip():
+                base["membership_id"] = str(mid).strip()
+            enriched = _enrich_whop_brief_from_membership_logs(base, membership_id=str(mid or "").strip())
+            if isinstance(enriched, dict) and _matches_connected_discord(enriched.get("connected_discord")):
+                return True
+        except Exception:
+            pass
+
+        return False
 
     try:
         support_tickets.initialize(
@@ -7858,6 +7978,11 @@ async def on_ready():
         # Don't silently disable the whole ticket system.
         with suppress(Exception):
             await log_other(f"❌ support_tickets.initialize failed: `{str(e)[:400]}`")
+
+    # Run nowhop cleanup immediately on startup (restart-safe).
+    # This closes resolved `no_whop_link` tickets + removes stale No-Whop roles once linkage is confirmed.
+    with suppress(Exception):
+        asyncio.create_task(support_tickets.sweep_no_whop_link_cleanup(force=True))
     
     # Backfill Whop timeline from whop_history.json (before initializing whop handler)
     _backfill_whop_timeline_from_whop_history()
