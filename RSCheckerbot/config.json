@@ -346,7 +346,7 @@
       "enabled": true,
       "channel_id": 1468062046166978701,
       "max_native_logs": 5,
-      "panel_title": "Ticket Tool",
+      "panel_title": "Client Success Tool",
       "panel_description": "Use the buttons below to look up a member’s Discord + Whop baseline history."
     }
   }
