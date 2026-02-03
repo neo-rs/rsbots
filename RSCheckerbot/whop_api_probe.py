@@ -4785,6 +4785,18 @@ def _extract_email_from_member_status_embed(e: discord.Embed) -> str:
     return ""
 
 
+def _extract_name_from_member_status_embed(e: discord.Embed) -> str:
+    """Extract Member (Whop) name from RSCheckerbot Whop-API embeds."""
+    if not isinstance(e, discord.Embed):
+        return ""
+    with suppress(Exception):
+        for f in (getattr(e, "fields", None) or []):
+            if str(getattr(f, "name", "") or "").strip().lower() in {"member (whop)", "member"}:
+                v = str(getattr(f, "value", "") or "").strip()
+                return re.sub(r"\s+", " ", v).strip()
+    return ""
+
+
 def _extract_basic_whop_brief_from_unlinked_embed(e: discord.Embed) -> dict[str, str]:
     """Extract best-effort Whop fields from the existing unlinked embed."""
     out: dict[str, str] = {}
@@ -4954,6 +4966,8 @@ async def _probe_memberstatus_fix_unlinked(args: argparse.Namespace) -> int:
             email_to_did: dict[str, int] = {}
             # Cache email -> parsed membership-log brief fields (so we don't rescan for the same email)
             email_to_mem_brief: dict[str, dict[str, object] | None] = {}
+            # Cache whop-name -> did (best-effort fallback when email is missing/wrapped beyond parsing)
+            name_to_did: dict[str, int] = {}
 
             def _resolve_did_cached(email: str) -> int:
                 em = str(email or "").strip().lower()
@@ -4983,6 +4997,43 @@ async def _probe_memberstatus_fix_unlinked(args: argparse.Namespace) -> int:
                         did0 = int(did_s)
                         break
                 email_to_did[em] = int(did0 or 0)
+                return int(did0 or 0)
+
+            async def _resolve_did_by_name(name: str) -> int:
+                nm = re.sub(r"\s+", " ", str(name or "").strip())
+                if not nm:
+                    return 0
+                key_nm = nm.lower()
+                if key_nm in name_to_did:
+                    return int(name_to_did.get(key_nm) or 0)
+                did0 = 0
+                matches = 0
+                # Only accept if we find exactly one match in the window (avoid wrong links).
+                async for msg in wh_ch.history(limit=whoplogs_limit):
+                    e0 = msg.embeds[0] if msg.embeds else None
+                    if not isinstance(e0, discord.Embed):
+                        continue
+                    # Match Name field (native whop-logs card)
+                    name2 = ""
+                    with suppress(Exception):
+                        for f in (getattr(e0, "fields", None) or []):
+                            if str(getattr(f, "name", "") or "").strip().lower() == "name":
+                                name2 = re.sub(r"\s+", " ", str(getattr(f, "value", "") or "").strip())
+                                break
+                    if not name2:
+                        continue
+                    if name2.strip().lower() != key_nm:
+                        continue
+                    did_s = str(_extract_discord_id_from_native_embed(e0) or "").strip()
+                    if not did_s.isdigit():
+                        continue
+                    matches += 1
+                    did0 = int(did_s)
+                    if matches >= 2:
+                        # Ambiguous; refuse.
+                        did0 = 0
+                        break
+                name_to_did[key_nm] = int(did0 or 0)
                 return int(did0 or 0)
 
             async def _find_latest_membership_embed_by_email(email: str) -> discord.Embed | None:
@@ -5059,10 +5110,12 @@ async def _probe_memberstatus_fix_unlinked(args: argparse.Namespace) -> int:
                     continue
                 candidates += 1
                 email = _extract_email_from_member_status_embed(e0)
-                if not email:
-                    skipped += 1
-                    continue
-                did = await _resolve_did_by_email(email)
+                name_wh = _extract_name_from_member_status_embed(e0)
+                did = 0
+                if email:
+                    did = await _resolve_did_by_email(email)
+                if did <= 0 and name_wh:
+                    did = await _resolve_did_by_name(name_wh)
                 if did <= 0:
                     skipped += 1
                     continue
@@ -5096,9 +5149,6 @@ async def _probe_memberstatus_fix_unlinked(args: argparse.Namespace) -> int:
                 if member is None:
                     with suppress(Exception):
                         member = await g.fetch_member(int(did))
-                if not isinstance(member, discord.Member):
-                    skipped += 1
-                    continue
 
                 # Build best-effort brief from existing embed + latest membership log card (by email).
                 brief: dict[str, object] = {}
@@ -5153,7 +5203,9 @@ async def _probe_memberstatus_fix_unlinked(args: argparse.Namespace) -> int:
                     else:
                         email_to_mem_brief[em_l] = None
 
-                # Color mapping consistent with support cards.
+                # Rebuild embed:
+                # - If member is in-server, build the full Member Status Tracking embed.
+                # - Otherwise, still fix the card (show the resolved Discord ID) using a compact embed.
                 color = 0x5865F2
                 if kind in {"payment_failed", "dispute"}:
                     color = 0xED4245
@@ -5164,19 +5216,36 @@ async def _probe_memberstatus_fix_unlinked(args: argparse.Namespace) -> int:
                 elif kind in {"payment_succeeded", "membership_activated"}:
                     color = 0x57F287
 
-                relevant_roles = coerce_role_ids(cfg.get("dm_sequence", {}).get("role_trigger"), cfg.get("dm_sequence", {}).get("welcome_role_id"))
-                access = access_roles_plain(member, relevant_roles)
-                embed_new = build_member_status_detailed_embed(
-                    title=clean_title,
-                    member=member,
-                    access_roles=access,
-                    color=int(color),
-                    discord_kv=None,
-                    member_kv=[("reason", "fixed from whop-logs (email->discord_id)")],
-                    whop_brief=brief,
-                    event_kind=str(kind or "active"),
-                    force_whop_core_fields=True,
-                )
+                if isinstance(member, discord.Member):
+                    relevant_roles = coerce_role_ids(cfg.get("dm_sequence", {}).get("role_trigger"), cfg.get("dm_sequence", {}).get("welcome_role_id"))
+                    access = access_roles_plain(member, relevant_roles)
+                    embed_new = build_member_status_detailed_embed(
+                        title=clean_title,
+                        member=member,
+                        access_roles=access,
+                        color=int(color),
+                        discord_kv=None,
+                        member_kv=[("reason", "fixed from whop-logs (email/name->discord_id)")],
+                        whop_brief=brief,
+                        event_kind=str(kind or "active"),
+                        force_whop_core_fields=True,
+                    )
+                else:
+                    # Compact safe embed (no guild member object available)
+                    embed_new = discord.Embed(title=clean_title, color=int(color))
+                    # Preserve the same core layout as the original Whop API embed but with correct Discord.
+                    embed_new.add_field(name="Member (Whop)", value=str(name_wh or "—")[:1024], inline=True)
+                    embed_new.add_field(name="Email", value=str(email or "—")[:1024], inline=True)
+                    embed_new.add_field(name="Discord", value=f"<@{int(did)}>"[:1024], inline=True)
+                    if str(brief.get("product") or "").strip():
+                        embed_new.add_field(name="Membership", value=str(brief.get("product") or "")[:1024], inline=True)
+                    if str(brief.get("status") or "").strip():
+                        embed_new.add_field(name="Status", value=str(brief.get("status") or "")[:1024], inline=True)
+                    if str(brief.get("total_spent") or "").strip():
+                        embed_new.add_field(name="Total Spent (lifetime)", value=str(brief.get("total_spent") or "")[:1024], inline=True)
+                    if str(brief.get("dashboard_url") or "").strip():
+                        embed_new.add_field(name="Whop Dashboard", value=str(brief.get("dashboard_url") or "")[:1024], inline=False)
+                    embed_new.set_footer(text="RSCheckerbot • Member Status Tracking")
 
                 if apply:
                     try:
@@ -5195,7 +5264,7 @@ async def _probe_memberstatus_fix_unlinked(args: argparse.Namespace) -> int:
                             }
                         )
                         if verbose:
-                            print(f"edited: msg={int(msg.id)} did={int(did)} kind={kind}")
+                            print(f"edited: msg={int(msg.id)} did={int(did)} kind={kind} jump={str(getattr(msg,'jump_url','') or '')}")
                         if sleep_ms:
                             await asyncio.sleep(float(sleep_ms) / 1000.0)
                     except Exception as ex:

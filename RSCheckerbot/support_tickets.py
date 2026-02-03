@@ -1168,6 +1168,134 @@ def _lookup_cache_set(did: int, data: dict) -> None:
     _LOOKUP_LIVE_CACHE_AT[did_i] = datetime.now(timezone.utc).timestamp()
 
 
+def _infer_memberstatus_kind_from_title(title: str) -> str:
+    """Best-effort kind inference from a member-status-logs embed title."""
+    t = str(title or "").strip().lower()
+    if not t:
+        return "unknown"
+    if "payment created" in t:
+        return "payment_created"
+    if "payment pending" in t:
+        return "payment_pending"
+    if "setup intent" in t:
+        return "setup_intent"
+    if "invoice " in t:
+        return "invoice"
+    if "refund" in t:
+        return "refund"
+    if "dispute" in t:
+        return "dispute"
+    if "payment failed" in t or "billing issue" in t or "access risk" in t:
+        return "payment_failed"
+    if "payment succeeded" in t or "payment renewed" in t or "payment activated" in t or "access restored" in t:
+        return "payment_succeeded"
+    if "cancellation removed" in t:
+        return "cancellation_removed"
+    if "cancellation scheduled" in t or "set to cancel" in t or "canceling" in t:
+        return "cancellation_scheduled"
+    if "member joined" in t:
+        return "member_joined"
+    if "member left" in t:
+        return "member_left"
+    if "activated (pending)" in t or "activation (pending)" in t:
+        return "membership_activated_pending"
+    if "membership activated" in t:
+        return "membership_activated"
+    if "deactivated" in t or "access ended" in t:
+        return "deactivated"
+    return "unknown"
+
+
+def _brief_from_member_status_embed(e: discord.Embed) -> dict:
+    """Extract a whop_brief-ish dict from a RSCheckerbot member-status-logs embed."""
+    if not isinstance(e, discord.Embed):
+        return {}
+    out: dict[str, object] = {}
+    with suppress(Exception):
+        for f in (getattr(e, "fields", None) or []):
+            n = str(getattr(f, "name", "") or "").strip().lower()
+            v = str(getattr(f, "value", "") or "").strip()
+            if not n or not v:
+                continue
+            if n in {"membership id", "membership_id"}:
+                out["membership_id"] = v.strip("`")
+            elif n in {"membership", "product"}:
+                out["product"] = v
+            elif n == "status":
+                out["status"] = v
+            elif n.startswith("total spent"):
+                out["total_spent"] = v
+            elif n in {"whop dashboard", "dashboard"}:
+                out["dashboard_url"] = _embed_link("Open", v)
+            elif n in {"renewal window", "renewal_window"}:
+                out["renewal_window"] = v
+            elif n in {"remaining days", "remaining_days"}:
+                out["remaining_days"] = v
+            elif n in {"next billing date", "access ends on", "renewal end", "renewal_end"}:
+                out["renewal_end"] = v
+            elif n in {"connected discord", "connected_discord"}:
+                out["connected_discord"] = v
+            elif n in {"cancel at period end", "cancel_at_period_end"}:
+                out["cancel_at_period_end"] = v
+            elif n in {"customer since", "member since", "customer_since", "member_since"}:
+                out["customer_since"] = v
+    return out
+
+
+async def _scan_member_status_logs_for_did(*, guild: discord.Guild, did: int, limit: int) -> list[dict]:
+    """Scan member-status-logs channel for embeds matching this Discord ID (newest-first)."""
+    cfg = _cfg()
+    if not cfg or not _BOT:
+        return []
+    cid = int(cfg.member_status_logs_channel_id or 0)
+    if cid <= 0:
+        return []
+    try:
+        lim = max(50, min(int(limit or 500), 2000))
+    except Exception:
+        lim = 500
+    ch0 = _BOT.get_channel(int(cid))
+    if ch0 is None:
+        with suppress(Exception):
+            ch0 = await _BOT.fetch_channel(int(cid))
+    if not isinstance(ch0, discord.TextChannel):
+        return []
+    rows: list[dict] = []
+    did_s = str(int(did))
+
+    def _embed_has_did(e: discord.Embed) -> bool:
+        with suppress(Exception):
+            for f in (getattr(e, "fields", None) or []):
+                if str(getattr(f, "name", "") or "").strip().lower() == "discord id":
+                    return did_s in str(getattr(f, "value", "") or "")
+        return False
+
+    async for m in ch0.history(limit=lim):
+        if not m.embeds:
+            continue
+        e0 = m.embeds[0]
+        if not isinstance(e0, discord.Embed):
+            continue
+        if not _embed_has_did(e0):
+            continue
+        title = str(getattr(e0, "title", "") or "").strip()
+        kind = _infer_memberstatus_kind_from_title(title)
+        brief = _brief_from_member_status_embed(e0)
+        rows.append(
+            {
+                "kind": kind,
+                "title": title,
+                "created_at": (m.created_at.astimezone(timezone.utc).isoformat() if getattr(m, "created_at", None) else ""),
+                "jump_url": str(getattr(m, "jump_url", "") or "").strip(),
+                "brief": brief,
+                "source": "member_status_logs",
+            }
+        )
+        if len(rows) >= 25:
+            break
+    return rows
+
+
 def _parse_whop_bullets(text: str) -> dict[str, str]:
     """Parse bullet lines like '• Key: Value' into a dict (lookup-only)."""
     out: dict[str, str] = {}
@@ -1324,8 +1452,6 @@ async def _build_member_lookup_category_embeds(*, guild: discord.Guild, did: int
     """Build a single 'last card' style embed for the chosen category, with baseline fallback."""
     did_i = int(did or 0)
     member = guild.get_member(did_i) if did_i > 0 else None
-    if not isinstance(member, discord.Member):
-        return [_embed_desc_lines("Member Lookup", [f"❌ Member `{did_i}` not found in this server."])]
 
     db = _member_history_db_cached()
     rec = db.get(str(did_i)) if isinstance(db, dict) else {}
@@ -1341,10 +1467,25 @@ async def _build_member_lookup_category_embeds(*, guild: discord.Guild, did: int
                 return True
         return False
 
-    # If baseline is missing, do a small live scan of whop-logs + whop-membership-logs so buttons
-    # don't all show the same blank synthetic card.
+    # Always prefer the latest matching member-status-logs card (it represents the real staff card).
+    # Cache it so switching buttons is instant.
     live = _lookup_cache_get(did_i, ttl_seconds=120) or {}
-    if (not live) and (not _has_any_whop_value(base_brief)):
+    if not isinstance(live, dict):
+        live = {}
+    if "member_status" not in live:
+        cfg = _cfg()
+        # Reuse max_native_logs as a cap for live scans (keeps this configurable).
+        scan_lim = 200 * int((cfg.member_lookup_max_native_logs or 5) if cfg else 5)
+        with suppress(Exception):
+            ms_rows = await _scan_member_status_logs_for_did(guild=guild, did=did_i, limit=scan_lim)
+            live["member_status"] = ms_rows
+            _lookup_cache_set(did_i, live)
+
+    # If baseline is missing (or member isn't in server), also live scan whop-logs + whop-membership-logs
+    # so we can fill fields when member-status cards are sparse.
+    if (not live.get("whop_logs") and not live.get("membership_logs")) and (
+        (not _has_any_whop_value(base_brief)) or (not isinstance(member, discord.Member))
+    ):
         cfg = _cfg()
         logs_cid = int(cfg.whop_logs_channel_id or 0) if cfg else 0
         mem_cid = int(cfg.whop_membership_logs_channel_id or 0) if cfg else 0
@@ -1365,7 +1506,7 @@ async def _build_member_lookup_category_embeds(*, guild: discord.Guild, did: int
         whop_logs_hits: list[dict] = []
         mem_logs_hits: list[dict] = []
         email_hint = ""
-        name_hint = str(getattr(member, "display_name", "") or getattr(member, "name", "") or "").strip()
+        name_hint = str(getattr(member, "display_name", "") or getattr(member, "name", "") or "").strip() if isinstance(member, discord.Member) else ""
         # 1) Find the latest whop-logs card for this Discord ID (gives us email for matching).
         if isinstance(logs_ch, discord.TextChannel):
             try:
@@ -1443,6 +1584,7 @@ async def _build_member_lookup_category_embeds(*, guild: discord.Guild, did: int
     def _pick_live_row(cat: str) -> tuple[str, dict]:
         """Pick the most relevant live row for this category."""
         c = str(cat or "").strip().lower()
+        ms_rows = [r for r in (live.get("member_status") or []) if isinstance(r, dict)]
         mem_rows = [r for r in (live.get("membership_logs") or []) if isinstance(r, dict)]
         wl_rows = [r for r in (live.get("whop_logs") or []) if isinstance(r, dict)]
         # Prefer membership logs, then whop logs.
@@ -1456,6 +1598,21 @@ async def _build_member_lookup_category_embeds(*, guild: discord.Guild, did: int
             keys = ("dispute", "refund", "chargeback")
         else:
             keys = ()
+
+        # Prefer real staff cards first (member-status-logs).
+        if ms_rows:
+            want: set[str] = set()
+            if c == "payment":
+                want = {"payment_failed", "payment_succeeded", "payment_created", "payment_pending", "invoice", "setup_intent"}
+            elif c == "membership":
+                want = {"membership_activated_pending", "membership_activated", "member_joined", "trialing", "deactivated"}
+            elif c == "cancellation":
+                want = {"cancellation_scheduled", "cancellation_removed", "deactivated"}
+            elif c == "dispute":
+                want = {"dispute", "refund"}
+            for r in ms_rows:
+                if str(r.get("kind") or "").strip().lower() in want:
+                    return ("member_status_logs", r)
 
         for r in mem_rows:
             t = str(r.get("title") or "").strip().lower()
@@ -1472,10 +1629,11 @@ async def _build_member_lookup_category_embeds(*, guild: discord.Guild, did: int
         return ("whop_membership_logs", mem_rows[0]) if mem_rows else (("whop_logs", wl_rows[0]) if wl_rows else ("synthetic", {}))
 
     # Choose a source row.
-    if rec:
+    # Pick the most relevant source for this category.
+    # Prefer live member-status rows, then member_history-derived rows, then other live logs.
+    source_kind, row = _pick_live_row(str(category or ""))
+    if source_kind == "synthetic" and rec:
         source_kind, row = _lookup_pick_source_row(db=db, rec=rec, category=category)
-    else:
-        source_kind, row = _pick_live_row(str(category or ""))
 
     # Merge base brief with source row's parsed brief (live rows include brief already).
     brief2 = dict(base_brief) if isinstance(base_brief, dict) else {}
@@ -1496,27 +1654,62 @@ async def _build_member_lookup_category_embeds(*, guild: discord.Guild, did: int
         brief2 = _enrich_whop_brief_from_membership_logs(brief2, membership_id=str(brief2.get("membership_id") or "").strip())
 
     title, color, event_kind = _lookup_title_color_for(category=category, brief=brief2)
-    # Keep per-button titles stable (do not override with source card title).
+    # If we found a real member-status card, use its title (this is what staff expects).
     src_title = ""
     with suppress(Exception):
         if isinstance(row, dict):
             src_title = str(row.get("title") or "").strip()
+            if source_kind == "member_status_logs" and src_title:
+                title = src_title[:240]
 
-    # Base + MemberActivity (Discord-side)
-    access_roles = _roles_plain(member) or "—"
-    member_kv = _lookup_member_activity_kv(rec=rec, member=member)
+    # Build embed:
+    # - if member exists in guild: full Member Status Tracking layout
+    # - otherwise: compact lookup embed using whop-logs/membership-logs data
+    if isinstance(member, discord.Member):
+        access_roles = _roles_plain(member) or "—"
+        member_kv = _lookup_member_activity_kv(rec=rec, member=member)
+        emb = _build_member_status_detailed_embed(
+            title=title,
+            member=member,
+            access_roles=access_roles,
+            color=int(color),
+            member_kv=member_kv,
+            discord_kv=[],
+            whop_brief=(brief2 if isinstance(brief2, dict) else {}),
+            event_kind=event_kind,
+            force_whop_core_fields=True,
+        )
+    else:
+        emb = discord.Embed(title=title, color=int(color), timestamp=_now_utc())
+        # Basic identity (no Member object available)
+        wh_name = str((brief2 or {}).get("user_name") or (live.get("name") if isinstance(live, dict) else "") or "—").strip()  # type: ignore[union-attr]
+        email0 = str((brief2 or {}).get("email") or (live.get("email") if isinstance(live, dict) else "") or "—").strip()  # type: ignore[union-attr]
+        emb.add_field(name="Member (Whop)", value=wh_name[:1024] if wh_name else "—", inline=True)
+        emb.add_field(name="Discord ID", value=f"`{did_i}`", inline=True)
+        emb.add_field(name="In Server", value="no", inline=True)
+        if email0 and email0 != "—":
+            emb.add_field(name="Email", value=email0[:1024], inline=True)
+        # Whop core
+        mid0 = str((brief2 or {}).get("membership_id") or "").strip()
+        if mid0:
+            emb.add_field(name="Membership ID", value=f"`{mid0[:128]}`", inline=True)
+        st0 = str((brief2 or {}).get("status") or "").strip()
+        if st0:
+            emb.add_field(name="Status", value=st0[:1024], inline=True)
+        prod0 = str((brief2 or {}).get("product") or "").strip()
+        if prod0:
+            emb.add_field(name="Membership", value=prod0[:1024], inline=True)
+        spent0 = str((brief2 or {}).get("total_spent") or "").strip()
+        if spent0:
+            emb.add_field(name="Total Spent (lifetime)", value=spent0[:1024], inline=True)
+        renew0 = str((brief2 or {}).get("renewal_window") or "").strip()
+        if renew0:
+            emb.add_field(name="Renewal Window", value=renew0[:1024], inline=False)
+        dash0 = str((brief2 or {}).get("dashboard_url") or "").strip()
+        if dash0:
+            emb.add_field(name="Whop Dashboard", value=str(dash0)[:1024], inline=False)
+        emb.set_footer(text="RSCheckerbot • Member Lookup")
 
-    emb = _build_member_status_detailed_embed(
-        title=title,
-        member=member,
-        access_roles=access_roles,
-        color=int(color),
-        member_kv=member_kv,
-        discord_kv=[],
-        whop_brief=(brief2 if isinstance(brief2, dict) else {}),
-        event_kind=event_kind,
-        force_whop_core_fields=True,
-    )
     # Add a compact source line so staff can click through when available.
     with suppress(Exception):
         emb.add_field(name="Source", value=str(source_line or "synthetic")[:1024], inline=False)
@@ -1529,12 +1722,13 @@ async def _build_member_lookup_category_embeds(*, guild: discord.Guild, did: int
 def _build_member_lookup_picker_embed(*, guild: discord.Guild, did: int) -> discord.Embed:
     did_i = int(did or 0)
     member = guild.get_member(did_i) if did_i > 0 else None
-    if not isinstance(member, discord.Member):
-        return discord.Embed(title="Member Lookup", description=f"❌ Member `{did_i}` not found in this server.", color=0x5865F2)
+    mention = member.mention if isinstance(member, discord.Member) else f"<@{did_i}>"
+    roles_txt = _roles_plain(member) if isinstance(member, discord.Member) else ""
     lines: list[str] = [
-        f"**Member**: {member.mention}",
+        f"**Member**: {mention}",
         f"**Discord ID**: `{did_i}`",
-        f"**Current Roles**: {_roles_plain(member) or '—'}",
+        f"**Current Roles**: {roles_txt or '—'}",
+        f"**In Server**: `{'yes' if isinstance(member, discord.Member) else 'no'}`",
         "",
         "**Pick what you want to view:**",
         "- Payment",
