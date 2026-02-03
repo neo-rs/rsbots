@@ -1016,6 +1016,125 @@ async def _run_post_ready_migrations() -> None:
         await migrate_ticket_channel_staff_overwrites()
     with suppress(Exception):
         await migrate_ticket_channel_owner_overwrites()
+    with suppress(Exception):
+        await migrate_strip_total_spent_from_ticket_headers()
+
+
+async def migrate_strip_total_spent_from_ticket_headers() -> None:
+    """One-time migration: remove Total Spent fields from existing ticket header embeds (edit in place)."""
+    if not _ensure_cfg_loaded() or not _BOT:
+        return
+    cfg = _cfg()
+    if not cfg:
+        return
+    guild = _BOT.get_guild(int(cfg.guild_id))
+    if not isinstance(guild, discord.Guild):
+        return
+
+    mig_key = "ticket_header:strip_total_spent_v1"
+    try:
+        dbm = _migrations_load()
+        done = str((dbm.get("done") or {}).get(mig_key) or "").strip() if isinstance(dbm, dict) else ""
+        if done:
+            return
+    except Exception:
+        dbm = {}
+
+    # Gather open tickets with header_message_id (avoid scanning channel histories).
+    targets: list[tuple[str, int, int]] = []  # (ticket_type, channel_id, header_message_id)
+    async with _INDEX_LOCK:
+        idx = _index_load()
+        for _tid, rec in _ticket_iter(idx):
+            if not _ticket_is_open(rec):
+                continue
+            ttype = str(rec.get("ticket_type") or "").strip().lower()
+            if ttype not in {"cancellation", "billing", "member_welcome", "no_whop_link"}:
+                continue
+            ch_id = _as_int(rec.get("channel_id"))
+            mid = _as_int(rec.get("header_message_id"))
+            if ch_id > 0 and mid > 0:
+                targets.append((ttype, int(ch_id), int(mid)))
+
+    bot_id = int(getattr(getattr(_BOT, "user", None), "id", 0) or 0)
+    view = _CONTROLS_VIEW or SupportTicketControlsView()
+    scanned = 0
+    edited = 0
+    skipped = 0
+    failed = 0
+
+    def _strip(e: discord.Embed) -> tuple[discord.Embed, bool]:
+        # Use dict roundtrip to preserve everything (author/footer/thumbnail/etc).
+        try:
+            d = e.to_dict()
+        except Exception:
+            return (e, False)
+        fields = d.get("fields") if isinstance(d, dict) else None
+        if not isinstance(fields, list) or not fields:
+            return (e, False)
+        kept: list[dict] = []
+        removed_any = False
+        for f in fields:
+            if not isinstance(f, dict):
+                continue
+            nm = str(f.get("name") or "").strip()
+            if nm.strip().lower().startswith("total spent"):
+                removed_any = True
+                continue
+            kept.append(f)
+        if not removed_any:
+            return (e, False)
+        d["fields"] = kept
+        try:
+            return (discord.Embed.from_dict(d), True)
+        except Exception:
+            return (e, False)
+
+    for _ttype, ch_id, mid in targets:
+        scanned += 1
+        try:
+            ch = guild.get_channel(int(ch_id))
+            if not isinstance(ch, discord.TextChannel):
+                skipped += 1
+                continue
+            msg = await ch.fetch_message(int(mid))
+            if int(getattr(getattr(msg, "author", None), "id", 0) or 0) != bot_id:
+                skipped += 1
+                continue
+            if not getattr(msg, "embeds", None):
+                skipped += 1
+                continue
+            e0 = msg.embeds[0]
+            if not isinstance(e0, discord.Embed):
+                skipped += 1
+                continue
+            e2, changed = _strip(e0)
+            if not changed:
+                skipped += 1
+                continue
+            with suppress(Exception):
+                await msg.edit(embed=e2, view=view, allowed_mentions=discord.AllowedMentions.none())
+            edited += 1
+        except Exception:
+            failed += 1
+
+    # Mark migration done
+    try:
+        out = dbm if isinstance(dbm, dict) else {}
+        if not isinstance(out.get("done"), dict):
+            out["done"] = {}
+        out["done"][mig_key] = _now_iso()
+        out.setdefault("stats", {})[mig_key] = {
+            "scanned": scanned,
+            "edited": edited,
+            "skipped": skipped,
+            "failed": failed,
+        }
+        _migrations_save(out)
+    except Exception:
+        pass
+
+    with suppress(Exception):
+        await _log(f"🧾 support_tickets: migration strip_total_spent scanned={scanned} edited={edited} skipped={skipped} failed={failed}")
 
 
 def _topic_is_support_ticket(topic: object) -> bool:
@@ -3000,10 +3119,6 @@ def build_cancellation_preview_embed(
     if end and end != "—":
         e.add_field(name="Access Ends On", value=end[:1024], inline=True)
 
-    spent = str(b.get("total_spent") or "").strip()
-    if spent and spent != "—":
-        e.add_field(name="Total Spent (lifetime)", value=spent[:1024], inline=True)
-
     cap_raw = str(b.get("cancel_at_period_end") or "").strip()
     if cap_raw and cap_raw != "—":
         e.add_field(name="Cancel At Period End", value=cap_raw[:1024], inline=True)
@@ -3048,9 +3163,6 @@ def build_billing_preview_embed(
     end = str(b.get("renewal_end") or "").strip()
     if end and end != "—":
         e.add_field(name="Next Billing Date", value=end[:1024], inline=True)
-    spent = str(b.get("total_spent") or "").strip()
-    if spent and spent != "—":
-        e.add_field(name="Total Spent (lifetime)", value=spent[:1024], inline=True)
     cap_raw = str(b.get("cancel_at_period_end") or "").strip()
     if cap_raw and cap_raw != "—":
         e.add_field(name="Cancel At Period End", value=cap_raw[:1024], inline=True)
@@ -3132,9 +3244,6 @@ def build_member_welcome_preview_embed(
     e.add_field(name="Membership", value=prod[:1024], inline=True)
     st_disp = _whop_status_display(ticket_type="member_welcome", whop_brief=b, status_override=str(b.get("status") or ""))
     e.add_field(name="Whop Status", value=str(st_disp or "—")[:1024], inline=True)
-    spent = str(b.get("total_spent") or "").strip()
-    if spent and spent != "—":
-        e.add_field(name="Total Spent (lifetime)", value=spent[:1024], inline=True)
     dash = str(b.get("dashboard_url") or "").strip()
     e.add_field(name="Whop Dashboard", value=_embed_link("Open", dash), inline=True)
     e.add_field(name="Message Reference", value=_embed_link("View Full Log", str(reference_jump_url or "")), inline=True)
@@ -3176,9 +3285,6 @@ def build_no_whop_link_preview_embed(
     prod = str(b.get("product") or "").strip()
     if prod:
         e.add_field(name="Membership", value=prod[:1024], inline=True)
-    spent = str(b.get("total_spent") or "").strip()
-    if spent:
-        e.add_field(name="Total Spent", value=spent[:1024], inline=True)
     conn = str(b.get("connected_discord") or "").strip()
     if conn:
         e.add_field(name="Connected Discord", value=conn[:1024], inline=False)
