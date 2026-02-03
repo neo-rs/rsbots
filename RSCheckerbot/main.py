@@ -7351,6 +7351,10 @@ async def on_ready():
     with suppress(Exception):
         asyncio.create_task(support_tickets.reconcile_open_ticket_roles())
         log.info("[SupportTickets] Role reconcile scheduled")
+    # Support tickets: ensure staff member lookup panel exists (optional; config-driven).
+    with suppress(Exception):
+        asyncio.create_task(support_tickets.ensure_member_lookup_panel())
+        log.info("[SupportTickets] Member lookup panel scheduled")
 
     if post_startup_report:
         startup_notes.append("Scheduler started and state restored.")

@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import json
 import re
+import sys
 from collections import Counter
 from contextlib import suppress
 from dataclasses import dataclass
@@ -28,7 +29,7 @@ except Exception:  # pragma: no cover
 
 from whop_api_client import WhopAPIClient
 from rschecker_utils import extract_discord_id_from_whop_member_record
-from rschecker_utils import access_roles_plain, coerce_role_ids, fmt_date_any, usd_amount
+from rschecker_utils import access_roles_plain, coerce_role_ids, fmt_date_any, usd_amount, save_json
 from staff_embeds import build_case_minimal_embed, build_member_status_detailed_embed
 from whop_webhook_handler import _extract_email_from_embed as _extract_email_from_native_embed
 from whop_webhook_handler import _extract_discord_id_from_embed as _extract_discord_id_from_native_embed
@@ -36,6 +37,9 @@ from whop_webhook_handler import _extract_discord_id_from_embed as _extract_disc
 
 BASE_DIR = Path(__file__).resolve().parent
 _PROBE_STAFFCARDS_DEDUPE_FILE = BASE_DIR / ".probe_staffcards_sent.json"
+_MEMBER_HISTORY_FILE = BASE_DIR / "member_history.json"
+_WHOP_IDENTITY_CACHE_FILE = BASE_DIR / "whop_identity_cache.json"
+_PROBE_WHOPLOGS_STATE_FILE = BASE_DIR / ".probe_whoplogs_baseline_state.json"
 
 
 def _load_json_file(p: Path) -> dict:
@@ -71,6 +75,468 @@ def load_config() -> dict:
     cfg = _load_json_file(BASE_DIR / "config.json")
     secrets = _load_json_file(BASE_DIR / "config.secrets.json")
     return _deep_merge(cfg, secrets)
+
+
+def _mid_from_member_history(did: int) -> str:
+    raw = _load_json_file(_MEMBER_HISTORY_FILE)
+    if not isinstance(raw, dict):
+        return ""
+    rec = raw.get(str(int(did))) if did else None
+    if not isinstance(rec, dict):
+        return ""
+    wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+    if not isinstance(wh, dict):
+        return ""
+    return str(wh.get("last_membership_id") or wh.get("last_whop_key") or "").strip()
+
+
+def _linked_discord_id_from_identity_cache(email: str) -> int:
+    """Best-effort: email -> discord_id cache built from native Whop cards."""
+    em = str(email or "").strip().lower()
+    if not em or "@" not in em:
+        return 0
+    raw = _load_json_file(_WHOP_IDENTITY_CACHE_FILE)
+    if not isinstance(raw, dict):
+        return 0
+    rec = raw.get(em)
+    if not isinstance(rec, dict):
+        return 0
+    did = str(rec.get("discord_id") or "").strip()
+    return int(did) if did.isdigit() else 0
+
+
+def _email_from_identity_cache_by_discord_id(discord_id: int) -> str:
+    """Best-effort reverse lookup: discord_id -> email from whop_identity_cache.json."""
+    did = int(discord_id or 0)
+    if did <= 0:
+        return ""
+    raw = _load_json_file(_WHOP_IDENTITY_CACHE_FILE)
+    if not isinstance(raw, dict):
+        return ""
+    for em, rec in raw.items():
+        if not isinstance(rec, dict):
+            continue
+        v = str(rec.get("discord_id") or "").strip()
+        if v.isdigit() and int(v) == did and ("@" in str(em or "")):
+            return str(em).strip().lower()
+    return ""
+
+
+def _ensure_member_history_whop_shape(rec: dict) -> dict:
+    if not isinstance(rec, dict):
+        rec = {}
+    wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+    if not isinstance(wh, dict):
+        wh = {}
+    rec["whop"] = wh
+    return rec
+
+
+def _update_member_history_from_whop_log_hit(
+    *,
+    discord_id: int,
+    title: str,
+    created_at_iso: str,
+    message_id: int,
+    jump_url: str,
+    whop_key: str,
+    membership_status: str,
+    access_pass: str,
+    source_channel_id: int,
+) -> bool:
+    """Write a minimal, non-bloated per-title record into member_history.json (no PII)."""
+    did = int(discord_id or 0)
+    if did <= 0:
+        return False
+    db = _load_json_file(_MEMBER_HISTORY_FILE)
+    if not isinstance(db, dict):
+        db = {}
+    rec = db.get(str(did), {})
+    rec = _ensure_member_history_whop_shape(rec if isinstance(rec, dict) else {})
+    wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+    if not isinstance(wh, dict):
+        wh = {}
+
+    # Keep membership identifiers up-to-date (both mem_... and R-... can be used as membership keys in this project).
+    key0 = str(whop_key or "").strip()
+    if key0.startswith(("mem_", "R-")):
+        wh["last_whop_key"] = key0
+        wh["last_membership_id"] = key0
+
+    # Per-title latest record (no arrays; no bloat).
+    tkey = re.sub(r"\s+", " ", str(title or "").strip().lower())[:80] or "unknown"
+    latest = wh.get("native_whop_logs_latest") if isinstance(wh.get("native_whop_logs_latest"), dict) else {}
+    if not isinstance(latest, dict):
+        latest = {}
+    latest[tkey] = {
+        "title": str(title or "").strip()[:256],
+        "created_at": str(created_at_iso or "").strip()[:64],
+        "message_id": int(message_id or 0),
+        "jump_url": str(jump_url or "").strip()[:300],
+        "key": str(whop_key or "").strip()[:128],
+        "membership_status": str(membership_status or "").strip()[:64],
+        "access_pass": str(access_pass or "").strip()[:128],
+        "source_channel_id": int(source_channel_id or 0),
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # Cap titles per user to avoid bloat.
+    try:
+        if len(latest) > 25:
+            # Keep most recent 25 by recorded_at.
+            items = list(latest.items())
+            items.sort(key=lambda kv: str((kv[1] or {}).get("recorded_at") or ""), reverse=True)
+            latest = dict(items[:25])
+    except Exception:
+        pass
+
+    wh["native_whop_logs_latest"] = latest
+    rec["whop"] = wh
+    db[str(did)] = rec
+    try:
+        save_json(Path(_MEMBER_HISTORY_FILE), db)
+    except Exception:
+        _save_json_file(Path(_MEMBER_HISTORY_FILE), db)
+    return True
+
+
+def _load_probe_state(p: Path) -> dict:
+    raw = _load_json_file(p)
+    return raw if isinstance(raw, dict) else {}
+
+
+def _save_probe_state(p: Path, data: dict) -> None:
+    try:
+        if not isinstance(data, dict):
+            data = {}
+        save_json(p, data)
+    except Exception:
+        _save_json_file(p, data if isinstance(data, dict) else {})
+
+
+async def _probe_whoplogs_baseline(args: argparse.Namespace) -> int:
+    """Scan a whop-logs channel and write a baseline into member_history.json (no PII).
+
+    This is designed to be run repeatedly in batches:
+    - First run scans newest -> older messages.
+    - It records a resume cursor (oldest scanned message id) into a state file.
+    - Subsequent runs can pass --resume to continue scanning older history.
+    """
+    cfg = load_config()
+    token = str(cfg.get("bot_token") or "").strip()
+    if not token:
+        print("Missing bot_token in config.secrets.json")
+        return 2
+
+    try:
+        channel_id = int(str(getattr(args, "channel_id", "") or "").strip())
+    except Exception:
+        channel_id = 0
+    if not channel_id:
+        print("Missing --channel-id.")
+        return 2
+
+    limit = int(getattr(args, "limit", 5000) or 5000)
+    limit = max(50, min(limit, 20000))
+    run_until_done = bool(getattr(args, "run_until_done", False))
+    batch_delay_s = float(getattr(args, "batch_delay_seconds", 1.0) or 1.0)
+    batch_delay_s = max(0.0, min(batch_delay_s, 10.0))
+    max_batches = int(getattr(args, "max_batches", 0) or 0)
+    max_batches = max(0, min(max_batches, 1000000))
+    interactive = bool(getattr(args, "interactive", False))
+    checkpoint_every = int(getattr(args, "checkpoint_every", 0) or 0)
+    checkpoint_every = max(0, min(checkpoint_every, 50000))
+
+    state_path = Path(str(getattr(args, "state_file", "") or "").strip() or str(_PROBE_WHOPLOGS_STATE_FILE))
+    state = _load_probe_state(state_path)
+
+    before_id_raw = str(getattr(args, "before_message_id", "") or "").strip()
+    resume = bool(getattr(args, "resume", False))
+    if (not before_id_raw) and resume:
+        before_id_raw = str(state.get("before_message_id") or "").strip()
+
+    before_obj = discord.Object(id=int(before_id_raw)) if before_id_raw.isdigit() else None
+
+    do_record = bool(getattr(args, "record_member_history", False))
+    confirm = str(getattr(args, "confirm", "") or "").strip().lower()
+    if do_record and confirm != "confirm":
+        print("Confirmation required to write member_history.json. Use: --record-member-history --confirm confirm")
+        return 2
+
+    intents = discord.Intents.none()
+    intents.guilds = True
+    intents.messages = True
+    intents.message_content = False
+    bot = discord.Client(intents=intents)
+
+    @bot.event
+    async def on_ready():
+        nonlocal state
+        progress_every = int(getattr(args, "progress_every", 200) or 200)
+        progress_every = max(0, min(progress_every, 5000))
+        bar_w = int(getattr(args, "bar_width", 24) or 24)
+        bar_w = max(10, min(bar_w, 60))
+
+        def _short_iso(ts: str) -> str:
+            s = str(ts or "").strip()
+            # Keep it compact: YYYY-MM-DD HH:MM:SS (UTC)
+            if "T" in s:
+                s = s.replace("T", " ")
+            if s.endswith("+00:00"):
+                s = s[:-6] + "Z"
+            return s[:19] + ("Z" if s.endswith("Z") else "")
+
+        def _progress_line(*, scanned: int, extracted: int, unique_ids: int, newest: str, oldest: str) -> str:
+            if limit <= 0:
+                pct = 0
+            else:
+                pct = int((float(scanned) / float(limit)) * 100.0)
+                pct = max(0, min(pct, 100))
+            filled = int((pct / 100.0) * bar_w)
+            bar = "[" + ("=" * filled) + ("-" * (bar_w - filled)) + "]"
+            return (
+                f"\r{bar} {pct:3d}% "
+                f"scanned={scanned}/{limit} embeds={extracted} unique={unique_ids} "
+                f"newest={_short_iso(newest) if newest else '-'} oldest={_short_iso(oldest) if oldest else '-'}"
+            )
+
+        print("=== Whop Logs Baseline Scan ===")
+        print(f"channel_id: {channel_id}")
+        print(f"limit: {limit}")
+        print(f"record_member_history: {bool(do_record)}")
+        print(f"state_file: {str(state_path)}")
+        if progress_every:
+            print(f"progress_every: {progress_every}  (live bar)")
+        # Channel creation timestamp from snowflake (UTC)
+        try:
+            ms = (int(channel_id) >> 22) + 1420070400000
+            created_dt = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+            print(f"channel_created_utc: {created_dt.isoformat()}")
+        except Exception:
+            pass
+        if before_obj:
+            print(f"before_message_id: {int(before_obj.id)}")
+        elif resume:
+            print("resume: requested, but no saved cursor found (starting from newest).")
+        elif interactive:
+            # If we have a saved cursor, offer to resume.
+            saved = str(state.get("before_message_id") or "").strip()
+            if saved.isdigit():
+                try:
+                    ans = await asyncio.to_thread(input, f"Resume from last saved cursor ({saved})? [Y/n] ")
+                except Exception:
+                    ans = "y"
+                if str(ans or "").strip().lower() not in {"n", "no"}:
+                    nonlocal_before = discord.Object(id=int(saved))
+                    # Rebind outer before_obj via closure mutation is awkward; store in state and read below.
+                    state["_resume_override_before_id"] = str(saved)
+                    print(f"resume_selected_before_message_id: {saved}")
+        if run_until_done:
+            print(f"run_until_done: True (batch_delay_seconds={batch_delay_s} max_batches={max_batches or '∞'})")
+        if interactive:
+            print("interactive: True (will prompt between batches)")
+        if checkpoint_every:
+            print(f"checkpoint_every: {checkpoint_every} (write resume cursor periodically)")
+
+        ch = bot.get_channel(channel_id)
+        if ch is None:
+            with suppress(Exception):
+                ch = await bot.fetch_channel(channel_id)
+        if not isinstance(ch, discord.TextChannel):
+            print("channel not found or not text.")
+            with suppress(Exception):
+                await bot.close()
+            return
+
+        scanned = 0
+        extracted = 0
+        updated = 0
+        unique_dids: set[int] = set()
+        newest_iso = ""
+        oldest_iso = ""
+        oldest_msg_id = 0
+
+        async def _scan_batch(before: discord.Object | None) -> tuple[int, int, int, str, str, int]:
+            """Return (scanned, extracted, updated, newest_iso, oldest_iso, oldest_msg_id)."""
+            _scanned = 0
+            _extracted = 0
+            _updated = 0
+            _newest = ""
+            _oldest = ""
+            _oldest_id = 0
+
+            async for msg in ch.history(limit=limit, before=before):
+                _scanned += 1
+                _oldest_id = int(getattr(msg, "id", 0) or 0) or _oldest_id
+                try:
+                    ts = (getattr(msg, "created_at", None) or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+                    if not _newest:
+                        _newest = ts
+                    _oldest = ts
+                except Exception:
+                    pass
+
+                if progress_every and (_scanned == 1 or (_scanned % progress_every) == 0 or _scanned == limit):
+                    sys.stdout.write(
+                        _progress_line(
+                            scanned=_scanned,
+                            extracted=extracted + _extracted,
+                            unique_ids=len(unique_dids),
+                            newest=_newest or newest_iso,
+                            oldest=_oldest or oldest_iso,
+                        )
+                    )
+                    sys.stdout.flush()
+                if checkpoint_every and _oldest_id and (_scanned % checkpoint_every) == 0:
+                    # Save an in-progress checkpoint so a crash/timeout can resume.
+                    state["before_message_id"] = str(_oldest_id)
+                    state["last_scan_in_progress_at"] = datetime.now(timezone.utc).isoformat()
+                    state["last_scan_in_progress_oldest_utc"] = str(_oldest or "")
+                    _save_probe_state(state_path, state)
+
+                e0 = msg.embeds[0] if msg.embeds else None
+                if not isinstance(e0, discord.Embed):
+                    continue
+
+                did_txt = str(_extract_discord_id_from_native_embed(e0) or "").strip()
+                if not did_txt.isdigit():
+                    continue
+                did = int(did_txt)
+                if did <= 0:
+                    continue
+                _extracted += 1
+                unique_dids.add(did)
+
+                title = str(getattr(e0, "title", "") or "").strip() or "(no title)"
+                jump = str(getattr(msg, "jump_url", "") or "").strip()
+
+                key_val = ""
+                access_pass = ""
+                mstatus = ""
+                with suppress(Exception):
+                    for f in (getattr(e0, "fields", None) or []):
+                        n = str(getattr(f, "name", "") or "").strip().lower()
+                        v = str(getattr(f, "value", "") or "").strip()
+                        if n == "key":
+                            key_val = v
+                        elif n in {"access pass", "access_pass"}:
+                            access_pass = v
+                        elif n in {"membership status", "membership_status", "status"}:
+                            mstatus = v
+
+                if do_record:
+                    ok = _update_member_history_from_whop_log_hit(
+                        discord_id=int(did),
+                        title=title,
+                        created_at_iso=str(getattr(msg, "created_at", None) or "").strip(),
+                        message_id=int(getattr(msg, "id", 0) or 0),
+                        jump_url=jump,
+                        whop_key=key_val,
+                        membership_status=mstatus,
+                        access_pass=access_pass,
+                        source_channel_id=int(channel_id),
+                    )
+                    if ok:
+                        _updated += 1
+
+            return (_scanned, _extracted, _updated, _newest, _oldest, _oldest_id)
+
+        # If interactive resume selected, use it.
+        before_cur = None
+        try:
+            v = str(state.get("_resume_override_before_id") or "").strip()
+            if v.isdigit():
+                before_cur = discord.Object(id=int(v))
+        except Exception:
+            before_cur = None
+        if before_cur is None:
+            before_cur = before_obj
+        batches = 0
+        while True:
+            batches += 1
+            if max_batches and batches > max_batches:
+                break
+            try:
+                b_scanned, b_extracted, b_updated, b_newest, b_oldest, b_oldest_id = await _scan_batch(before_cur)
+            except Exception as ex:
+                # Save cursor if we have one, then stop.
+                if oldest_msg_id:
+                    state["before_message_id"] = str(oldest_msg_id)
+                    state["last_scan_error_at"] = datetime.now(timezone.utc).isoformat()
+                    state["last_scan_error"] = str(ex)[:300]
+                    _save_probe_state(state_path, state)
+                print(f"\nERROR: scan failed (batch={batches}) err={str(ex)[:200]}")
+                break
+            scanned += int(b_scanned)
+            extracted += int(b_extracted)
+            updated += int(b_updated)
+            if b_newest and not newest_iso:
+                newest_iso = b_newest
+            if b_oldest:
+                oldest_iso = b_oldest
+            if b_oldest_id:
+                oldest_msg_id = b_oldest_id
+
+            # Stop if this batch hit the end of available history.
+            if b_scanned < limit:
+                break
+            if not run_until_done:
+                break
+            # Continue scanning older messages.
+            if oldest_msg_id <= 0:
+                break
+            if interactive:
+                try:
+                    ans = await asyncio.to_thread(
+                        input,
+                        f"\nContinue scanning older than {oldest_msg_id} (oldest_utc={_short_iso(oldest_iso) if oldest_iso else '-'})? [Y/n] ",
+                    )
+                except Exception:
+                    ans = "y"
+                if str(ans or "").strip().lower() in {"n", "no"}:
+                    break
+            before_cur = discord.Object(id=int(oldest_msg_id))
+            if batch_delay_s:
+                await asyncio.sleep(batch_delay_s)
+
+        if progress_every:
+            # Finish the live line cleanly
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+        print(f"messages_scanned: {scanned}")
+        print(f"embeds_with_discord_id: {extracted}")
+        print(f"unique_discord_ids: {len(unique_dids)}")
+        if newest_iso and oldest_iso:
+            print(f"scan_window_newest_utc: {newest_iso}")
+            print(f"scan_window_oldest_utc: {oldest_iso}")
+        if do_record:
+            print(f"member_history_updates: {updated}")
+
+        # Save resume cursor (oldest message id we reached in this batch).
+        if oldest_msg_id > 0:
+            state["before_message_id"] = str(oldest_msg_id)
+            state["last_scan_completed_at"] = datetime.now(timezone.utc).isoformat()
+            state["last_scan_summary"] = {
+                "messages_scanned": scanned,
+                "unique_discord_ids": len(unique_dids),
+                "embeds_with_discord_id": extracted,
+                "scan_window_newest_utc": newest_iso,
+                "scan_window_oldest_utc": oldest_iso,
+                "channel_id": int(channel_id),
+                "record_member_history": bool(do_record),
+                "run_until_done": bool(run_until_done),
+                "batches": int(batches),
+            }
+            state.pop("_resume_override_before_id", None)
+            _save_probe_state(state_path, state)
+            print(f"saved_resume_before_message_id: {oldest_msg_id}")
+
+        with suppress(Exception):
+            await bot.close()
+
+    async with bot:
+        await bot.start(token)
+    return 0
 
 
 def _parse_user_day(s: str) -> Optional[date]:
@@ -1234,6 +1700,488 @@ async def _probe_raw(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _probe_nowhop_debug(args: argparse.Namespace) -> int:
+    """Debug how 'no whop link' is determined for specific Discord IDs.
+
+    This mirrors RSCheckerbot/support_tickets.py scan decision points:
+    - If no membership_id is recorded locally for the Discord ID -> ticket uses Discord-only fallback.
+    - If membership_id exists -> fetch API-only brief and show connected-discord extraction.
+    """
+    dids = []
+    for x in (getattr(args, "discord_id", []) or []):
+        s = str(x or "").strip()
+        if s.isdigit():
+            dids.append(int(s))
+    dids = sorted(set([d for d in dids if d > 0]))
+    if not dids:
+        print("Missing --discord-id (repeatable).")
+        return 2
+
+    client, wh = _init_client_from_local_config()
+    api_ready = bool(client and isinstance(wh, dict))
+    scan_members = bool(getattr(args, "scan_members", False))
+    scan_discord_logs = bool(getattr(args, "scan_discord_logs", False))
+    scan_whop_logs = bool(getattr(args, "scan_whop_logs", False))
+    record_member_history = bool(getattr(args, "record_member_history", False))
+    max_pages = int(getattr(args, "members_max_pages", 10) or 10)
+    per_page = int(getattr(args, "members_per_page", 100) or 100)
+    max_pages = max(1, min(max_pages, 200))
+    per_page = max(10, min(per_page, 200))
+
+    print("=== no_whop_link debug (local) ===")
+    print(f"discord_ids: {', '.join(str(d) for d in dids)}")
+    print(f"member_history_file: {str(_MEMBER_HISTORY_FILE)} (exists={_MEMBER_HISTORY_FILE.exists()})")
+    print(f"identity_cache_file: {str(_WHOP_IDENTITY_CACHE_FILE)} (exists={_WHOP_IDENTITY_CACHE_FILE.exists()})")
+    print(f"whop_api_ready: {api_ready}")
+    if not api_ready:
+        print("NOTE: Whop API not available locally (missing whop_api.api_key or whop_api.company_id).")
+        print("      We can still explain why tickets are discord-only fallback when membership_id is missing.")
+
+    found_in_members: dict[int, dict] = {}
+    scan_stats = {"pages": 0, "scanned": 0, "discord_ids_found": 0}
+
+    if scan_members and api_ready and client:
+        print("\n=== scan: Whop /members (looking for connected Discord IDs) ===")
+        after: str | None = None
+        pages = 0
+        scanned = 0
+        did_found = 0
+        while pages < max_pages and len(found_in_members) < len(dids):
+            batch, page_info = await client.list_members(first=per_page, after=after, params={"order": "joined_at", "direction": "desc"})
+            pages += 1
+            if not batch:
+                break
+            for rec in batch:
+                if not isinstance(rec, dict):
+                    continue
+                scanned += 1
+                raw = extract_discord_id_from_whop_member_record(rec)
+                if str(raw or "").strip().isdigit():
+                    did_found += 1
+                    d0 = int(str(raw).strip())
+                    if d0 in dids and d0 not in found_in_members:
+                        found_in_members[d0] = rec
+                if len(found_in_members) >= len(dids):
+                    break
+            after = str(page_info.get("end_cursor") or "") if isinstance(page_info, dict) else ""
+            has_next = bool(page_info.get("has_next_page")) if isinstance(page_info, dict) else False
+            if (not has_next) or (not after):
+                break
+        scan_stats = {"pages": pages, "scanned": scanned, "discord_ids_found": did_found}
+        print(f"pages_scanned: {pages} (max_pages={max_pages})")
+        print(f"members_scanned: {scanned}")
+        print(f"members_with_discord_connection_field: {did_found}")
+        print(f"targets_found: {len(found_in_members)}/{len(dids)}")
+
+    # Discord-side truth: member-status-logs embeds include a "Connected Discord" field when Whop is linked.
+    latest_log: dict[int, dict] = {}
+    if scan_discord_logs:
+        cfg = load_config()
+        token = str(cfg.get("bot_token") or "").strip()
+        if not token:
+            print("\n=== scan: Discord member-status-logs ===")
+            print("Missing bot_token in config.secrets.json (cannot scan Discord logs).")
+        else:
+            st = cfg.get("support_tickets") if isinstance(cfg, dict) else {}
+            dm = cfg.get("dm_sequence") if isinstance(cfg, dict) else {}
+            st = st if isinstance(st, dict) else {}
+            dm = dm if isinstance(dm, dict) else {}
+            try:
+                guild_id = int(str(getattr(args, "guild_id", "") or st.get("guild_id") or cfg.get("guild_id") or 0).strip())
+            except Exception:
+                guild_id = 0
+            try:
+                ch_id = int(str(getattr(args, "channel_id", "") or dm.get("member_status_logs_channel_id") or 0).strip())
+            except Exception:
+                ch_id = 0
+            hist_lim = int(getattr(args, "history_limit", 800) or 800)
+            hist_lim = max(50, min(hist_lim, 5000))
+            if not guild_id or not ch_id:
+                print("\n=== scan: Discord member-status-logs ===")
+                print(f"Missing guild_id or channel_id (guild_id={guild_id} channel_id={ch_id}).")
+            else:
+                intents = discord.Intents.none()
+                intents.guilds = True
+                intents.messages = True
+                intents.message_content = False
+                bot = discord.Client(intents=intents)
+
+                @bot.event
+                async def on_ready():
+                    print("\n=== scan: Discord member-status-logs ===")
+                    print(f"guild_id: {guild_id}")
+                    print(f"channel_id: {ch_id}")
+                    print(f"history_limit: {hist_lim}")
+                    ch = bot.get_channel(ch_id)
+                    if ch is None:
+                        with suppress(Exception):
+                            ch = await bot.fetch_channel(ch_id)
+                    if not isinstance(ch, discord.TextChannel):
+                        print("channel not found or not text.")
+                        with suppress(Exception):
+                            await bot.close()
+                        return
+
+                    scanned = 0
+                    matches = 0
+                    async for msg in ch.history(limit=hist_lim):
+                        scanned += 1
+                        e0 = msg.embeds[0] if msg.embeds else None
+                        if not isinstance(e0, discord.Embed):
+                            continue
+                        # Extract Discord ID and Connected Discord from fields (best-effort).
+                        did0 = 0
+                        connected = ""
+                        membership_id = ""
+                        for f in (getattr(e0, "fields", None) or []):
+                            n = str(getattr(f, "name", "") or "").strip().lower()
+                            v = str(getattr(f, "value", "") or "").strip()
+                            if n == "discord id":
+                                m = re.search(r"\b(\d{17,19})\b", v)
+                                if m:
+                                    did0 = int(m.group(1))
+                            elif n in {"connected discord", "connected_discord"}:
+                                connected = v
+                            elif n in {"membership id", "membership_id"}:
+                                membership_id = v
+                        if did0 and did0 in dids:
+                            latest_log[did0] = {
+                                "message_id": int(getattr(msg, "id", 0) or 0),
+                                "jump_url": str(getattr(msg, "jump_url", "") or ""),
+                                "title": str(getattr(e0, "title", "") or ""),
+                                "connected_discord": connected,
+                                "membership_id": membership_id,
+                            }
+                            matches += 1
+                            if len(latest_log) >= len(dids):
+                                # We are scanning newest-first; once we have all, stop.
+                                break
+                    print(f"messages_scanned: {scanned}")
+                    print(f"matched_targets: {len(latest_log)}/{len(dids)} (hits={matches})")
+                    with suppress(Exception):
+                        await bot.close()
+
+                async with bot:
+                    await bot.start(token)
+
+    # Discord-side truth: whop-logs native cards may include contact labels / connected discord info.
+    latest_whop_logs: dict[int, dict] = {}
+    if scan_whop_logs:
+        cfg = load_config()
+        token = str(cfg.get("bot_token") or "").strip()
+        if not token:
+            print("\n=== scan: Discord whop-logs ===")
+            print("Missing bot_token in config.secrets.json (cannot scan whop-logs).")
+        else:
+            try:
+                whop_logs_ch_id = int(str(getattr(args, "whop_logs_channel_id", "") or 0).strip())
+            except Exception:
+                whop_logs_ch_id = 0
+            hist_lim = int(getattr(args, "whop_logs_history_limit", 2000) or 2000)
+            hist_lim = max(50, min(hist_lim, 20000))
+            before_id_raw = str(getattr(args, "whop_logs_before_message_id", "") or "").strip()
+            before_obj = discord.Object(id=int(before_id_raw)) if before_id_raw.isdigit() else None
+            if not whop_logs_ch_id:
+                print("\n=== scan: Discord whop-logs ===")
+                print("Missing --whop-logs-channel-id.")
+            else:
+                intents = discord.Intents.none()
+                intents.guilds = True
+                intents.messages = True
+                intents.message_content = False
+                bot = discord.Client(intents=intents)
+
+                def _blob_from_embed(e: discord.Embed) -> str:
+                    parts = [str(getattr(e, "title", "") or ""), str(getattr(e, "description", "") or "")]
+                    with suppress(Exception):
+                        ft = str(getattr(getattr(e, "footer", None), "text", "") or "")
+                        if ft:
+                            parts.append(ft)
+                    with suppress(Exception):
+                        for f in (getattr(e, "fields", None) or []):
+                            parts.append(str(getattr(f, "name", "") or ""))
+                            parts.append(str(getattr(f, "value", "") or ""))
+                    return " ".join([p for p in parts if str(p or "").strip()])
+
+                @bot.event
+                async def on_ready():
+                    print("\n=== scan: Discord whop-logs ===")
+                    print(f"channel_id: {whop_logs_ch_id}")
+                    print(f"history_limit: {hist_lim}")
+                    if before_obj:
+                        print(f"before_message_id: {int(before_obj.id)}")
+                    ch = bot.get_channel(whop_logs_ch_id)
+                    if ch is None:
+                        with suppress(Exception):
+                            ch = await bot.fetch_channel(whop_logs_ch_id)
+                    if not isinstance(ch, discord.TextChannel):
+                        print("channel not found or not text.")
+                        with suppress(Exception):
+                            await bot.close()
+                        return
+
+                    scanned = 0
+                    hits = 0
+                    via_email_hits = 0
+                    did_fields_hits = 0
+                    regex_hits = 0
+                    newest_iso = ""
+                    oldest_iso = ""
+
+                    did_strs = {str(d) for d in dids}
+
+                    async for msg in ch.history(limit=hist_lim, before=before_obj):
+                        scanned += 1
+                        try:
+                            ts = (getattr(msg, "created_at", None) or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+                            if not newest_iso:
+                                newest_iso = ts
+                            oldest_iso = ts
+                        except Exception:
+                            pass
+                        e0 = msg.embeds[0] if msg.embeds else None
+                        if not isinstance(e0, discord.Embed):
+                            continue
+                        blob = _blob_from_embed(e0)
+                        # Native helper extractors (email + discord id, when present)
+                        email = str(_extract_email_from_native_embed(e0) or "").strip().lower()
+                        did_txt = str(_extract_discord_id_from_native_embed(e0) or "").strip()
+                        did0 = int(did_txt) if did_txt.isdigit() else 0
+
+                        # Extra fields we want to record (non-PII): Key, Access Pass, Membership Status.
+                        key_val = ""
+                        access_pass = ""
+                        mstatus = ""
+                        with suppress(Exception):
+                            for f in (getattr(e0, "fields", None) or []):
+                                n = str(getattr(f, "name", "") or "").strip().lower()
+                                v = str(getattr(f, "value", "") or "").strip()
+                                if n == "key":
+                                    key_val = v
+                                elif n in {"access pass", "access_pass"}:
+                                    access_pass = v
+                                elif n in {"membership status", "membership_status", "status"}:
+                                    mstatus = v
+
+                        matched = False
+                        matched_did = 0
+                        match_kind = ""
+
+                        if did0 and did0 in dids:
+                            matched = True
+                            matched_did = int(did0)
+                            match_kind = "native_discord_id"
+                            did_fields_hits += 1
+                        else:
+                            # Fallback: look for exact target IDs in the embed text.
+                            for s in did_strs:
+                                if s and s in blob:
+                                    matched = True
+                                    matched_did = int(s)
+                                    match_kind = "regex_in_embed"
+                                    regex_hits += 1
+                                    break
+                        if (not matched) and email:
+                            cached_did = _linked_discord_id_from_identity_cache(email)
+                            if cached_did in dids:
+                                matched = True
+                                matched_did = int(cached_did)
+                                match_kind = "identity_cache_email"
+                                via_email_hits += 1
+
+                        if not matched or matched_did <= 0:
+                            continue
+
+                        # Record newest match for this discord id (we're scanning newest-first).
+                        if matched_did not in latest_whop_logs:
+                            latest_whop_logs[matched_did] = {
+                                "message_id": int(getattr(msg, "id", 0) or 0),
+                                "jump_url": str(getattr(msg, "jump_url", "") or ""),
+                                "title": str(getattr(e0, "title", "") or ""),
+                                "created_at": str(getattr(msg, "created_at", None) or "").strip(),
+                                "email": email,
+                                "extracted_discord_id": str(did_txt or ""),
+                                "match_kind": match_kind,
+                                "key": key_val,
+                                "access_pass": access_pass,
+                                "membership_status": mstatus,
+                            }
+                            hits += 1
+                            if len(latest_whop_logs) >= len(dids):
+                                break
+
+                    print(f"messages_scanned: {scanned}")
+                    if newest_iso and oldest_iso:
+                        print(f"scan_window_newest_utc: {newest_iso}")
+                        print(f"scan_window_oldest_utc: {oldest_iso}")
+                    print(f"matched_targets: {len(latest_whop_logs)}/{len(dids)} (hits={hits})")
+                    print(f"match_breakdown: native_discord_id={did_fields_hits} regex_in_embed={regex_hits} identity_cache_email={via_email_hits}")
+                    with suppress(Exception):
+                        await bot.close()
+
+                async with bot:
+                    await bot.start(token)
+
+    for did in dids:
+        mid = _mid_from_member_history(int(did))
+        print("\n---")
+        print(f"discord_id: {did}")
+        cache_email = _email_from_identity_cache_by_discord_id(int(did))
+        print(f"identity_cache.email_for_discord_id: {cache_email or '-'}")
+        if scan_discord_logs:
+            info = latest_log.get(int(did)) if isinstance(latest_log, dict) else None
+            if isinstance(info, dict) and info:
+                cd = str(info.get("connected_discord") or "").strip()
+                print("discord_logs.match: YES")
+                print(f"discord_logs.title: {str(info.get('title') or '')}")
+                print(f"discord_logs.jump: {str(info.get('jump_url') or '')}")
+                print(f"discord_logs.connected_discord: {cd or '-'}")
+                print(f"discord_logs.membership_id: {str(info.get('membership_id') or '-')}")
+                m = re.search(r"\b(\d{17,19})\b", cd)
+                cd_id = int(m.group(1)) if m else 0
+                if cd_id == int(did):
+                    print("discord_logs.decision: CONNECTED (Connected Discord matches this discord_id)")
+                elif cd_id > 0:
+                    print(f"discord_logs.decision: MISMATCH (Connected Discord={cd_id} != discord_id={did})")
+                elif cd:
+                    print("discord_logs.decision: UNPARSEABLE (Connected Discord present but not an ID)")
+                else:
+                    print("discord_logs.decision: NOT LINKED (no Connected Discord field/value)")
+            else:
+                print("discord_logs.match: NO (no recent member-status embed found for this discord_id in scan window)")
+        if scan_whop_logs:
+            info = latest_whop_logs.get(int(did)) if isinstance(latest_whop_logs, dict) else None
+            if isinstance(info, dict) and info:
+                print("whop_logs.match: YES")
+                print(f"whop_logs.match_kind: {str(info.get('match_kind') or '')}")
+                print(f"whop_logs.title: {str(info.get('title') or '')}")
+                print(f"whop_logs.jump: {str(info.get('jump_url') or '')}")
+                print(f"whop_logs.email: {str(info.get('email') or '-')}")
+                edid = str(info.get("extracted_discord_id") or "").strip()
+                if edid:
+                    print(f"whop_logs.extracted_discord_id: {edid}")
+                if str(info.get("key") or "").strip():
+                    print(f"whop_logs.key: {str(info.get('key') or '')}")
+                if str(info.get("membership_status") or "").strip():
+                    print(f"whop_logs.membership_status: {str(info.get('membership_status') or '')}")
+                if str(info.get("access_pass") or "").strip():
+                    print(f"whop_logs.access_pass: {str(info.get('access_pass') or '')}")
+                if record_member_history:
+                    ok = _update_member_history_from_whop_log_hit(
+                        discord_id=int(did),
+                        title=str(info.get("title") or ""),
+                        created_at_iso=str(info.get("created_at") or "").strip(),
+                        message_id=int(info.get("message_id") or 0),
+                        jump_url=str(info.get("jump_url") or ""),
+                        whop_key=str(info.get("key") or ""),
+                        membership_status=str(info.get("membership_status") or ""),
+                        access_pass=str(info.get("access_pass") or ""),
+                        source_channel_id=int(getattr(args, "whop_logs_channel_id", 0) or 0),
+                    )
+                    print(f"member_history.recorded_from_whop_logs: {'YES' if ok else 'NO'}")
+            else:
+                print("whop_logs.match: NO (no matching whop-logs embed found in scan window)")
+        if scan_members and api_ready:
+            recm = found_in_members.get(int(did))
+            if isinstance(recm, dict) and recm:
+                print("whop_members_scan.match: YES (Discord is connected in Whop member record)")
+                print(f"whop_member_id: {str(recm.get('id') or recm.get('member_id') or '')}")
+                print(f"whop_status: {str(recm.get('status') or '')}")
+                print(f"whop_most_recent_action: {str(recm.get('most_recent_action') or '')}")
+            else:
+                # Only claim "not connected" if the API actually exposes any discord IDs at all in this scan.
+                if int(scan_stats.get("discord_ids_found") or 0) > 0:
+                    print("whop_members_scan.match: NO (not seen in scanned members with Discord connections)")
+                else:
+                    print("whop_members_scan.match: INCONCLUSIVE (API scan did not expose any Discord connection fields)")
+        print(f"member_history.last_membership_id: {mid or '—'}")
+        print(f"member_history.last_membership_id.len: {len(mid)}")
+        print(f"member_history.last_membership_id.repr: {repr(mid)}")
+        if not mid:
+            print("decision: OPEN no_whop_link (discord-only fallback) because no membership_id recorded yet.")
+            # Optional: if we can resolve email via identity cache, attempt to locate the Whop user and derive membership_id.
+            if cache_email and api_ready and client:
+                # Scan /members for this email to get Whop user_id, then fetch memberships.
+                print("attempt: resolve membership via identity_cache email -> /members -> /memberships")
+                user_id = ""
+                member_id = ""
+                after: str | None = None
+                pages = 0
+                scanned = 0
+                while pages < max_pages:
+                    batch, page_info = await client.list_members(first=per_page, after=after, params={"order": "joined_at", "direction": "desc"})
+                    pages += 1
+                    if not batch:
+                        break
+                    for rec in batch:
+                        if not isinstance(rec, dict):
+                            continue
+                        scanned += 1
+                        u = rec.get("user") if isinstance(rec.get("user"), dict) else {}
+                        em = str(u.get("email") or "").strip().lower() if isinstance(u, dict) else ""
+                        if em and em == cache_email:
+                            user_id = str(u.get("id") or u.get("user_id") or "").strip()
+                            member_id = str(rec.get("id") or rec.get("member_id") or "").strip()
+                            break
+                    after = str(page_info.get("end_cursor") or "") if isinstance(page_info, dict) else ""
+                    has_next = bool(page_info.get("has_next_page")) if isinstance(page_info, dict) else False
+                    if user_id or (not has_next) or (not after):
+                        break
+                print(f"scan_email.pages_scanned: {pages}")
+                print(f"scan_email.members_scanned: {scanned}")
+                print(f"scan_email.whop_user_id: {user_id or '—'}")
+                print(f"scan_email.whop_member_id: {member_id or '—'}")
+                if user_id:
+                    ms = []
+                    with suppress(Exception):
+                        ms = await client.get_user_memberships(user_id)
+                    ms = ms if isinstance(ms, list) else []
+                    mids = [str(m.get("id") or m.get("membership_id") or "").strip() for m in ms if isinstance(m, dict)]
+                    mids = [m for m in mids if m]
+                    print(f"user_memberships.count: {len(ms)}")
+                    print(f"user_memberships.membership_ids.sample: {mids[:5]}")
+                    if mids:
+                        # Fetch the newest-looking membership and check connected Discord via member record.
+                        m0 = str(mids[0])
+                        brief = {}
+                        with suppress(Exception):
+                            brief = await _whop_brief_api_only(client, m0)
+                        conn = str((brief or {}).get("connected_discord") or "").strip() if isinstance(brief, dict) else ""
+                        print(f"api.membership_id_used: {m0}")
+                        print(f"api.connected_discord: {conn or '—'}")
+            continue
+        if not api_ready or not client:
+            print("decision: membership_id exists, but cannot probe Whop API locally (missing credentials).")
+            continue
+        brief = {}
+        with suppress(Exception):
+            brief = await _whop_brief_api_only(client, str(mid))
+        if not isinstance(brief, dict) or not brief:
+            print("api: failed to fetch membership (brief empty)")
+            print("decision: cannot confirm linkage via API (would skip/avoid low-quality ticket in production scan).")
+            continue
+        conn = str(brief.get("connected_discord") or "").strip()
+        email = str(brief.get("email") or "").strip()
+        cached_did = _linked_discord_id_from_identity_cache(email) if email else 0
+        print(f"api.status: {str(brief.get('status') or '')}")
+        print(f"api.product: {str(brief.get('product') or '')}")
+        print(f"api.connected_discord: {conn or '—'}")
+        if email:
+            print(f"api.email: {email}")
+            print(f"identity_cache.discord_id_for_email: {cached_did or '—'}")
+        # Determine "linked" vs "not linked"
+        m = re.search(r"\b(\d{17,19})\b", conn)
+        conn_id = int(m.group(1)) if m else 0
+        if conn_id == int(did):
+            print("decision: LINKED (connected_discord matches this discord_id) -> no ticket.")
+        elif conn_id > 0 and conn_id != int(did):
+            print(f"decision: MISMATCH (connected_discord={conn_id} != discord_id={did}) -> OPEN no_whop_link.")
+        else:
+            print("decision: NOT LINKED (no connected_discord in API) -> OPEN no_whop_link.")
+
+    return 0
+
+
 async def _probe_resolve_discord(args: argparse.Namespace) -> int:
     """Resolve Discord ID by scanning native whop-logs cards for an email."""
     cfg = load_config()
@@ -1944,6 +2892,37 @@ def main() -> int:
     psc.add_argument("--delay-ms", type=int, default=800, help="Delay between posts (ms) so you can watch 1-by-1.")
     psc.add_argument("--force", action="store_true", default=False, help="Disable dedupe and repost even if already posted before.")
 
+    pnow = sub.add_parser("nowhop-debug", help="Debug no_whop_link decision for specific Discord IDs (local + optional API).")
+    pnow.add_argument("--discord-id", action="append", default=[], help="Discord user id (repeatable).")
+    pnow.add_argument("--scan-members", action="store_true", default=False, help="Scan Whop /members pages and try to match connected Discord IDs.")
+    pnow.add_argument("--members-max-pages", type=int, default=10, help="Max pages to scan from /members (each page is members-per-page).")
+    pnow.add_argument("--members-per-page", type=int, default=100, help="Page size for /members (10-200).")
+    pnow.add_argument("--scan-discord-logs", action="store_true", default=False, help="Scan Discord member-status-logs for Connected Discord field (definitive).")
+    pnow.add_argument("--guild-id", default="", help="Discord guild id for scan-discord-logs (defaults to support_tickets.guild_id).")
+    pnow.add_argument("--channel-id", default="", help="Discord channel id for scan-discord-logs (defaults to dm_sequence.member_status_logs_channel_id).")
+    pnow.add_argument("--history-limit", type=int, default=800, help="How many recent messages to scan in member-status-logs (50-5000).")
+    pnow.add_argument("--scan-whop-logs", action="store_true", default=False, help="Scan Discord whop-logs channel for Discord linkage (native cards).")
+    pnow.add_argument("--whop-logs-channel-id", dest="whop_logs_channel_id", default="", help="Discord channel id for whop-logs scan.")
+    pnow.add_argument("--whop-logs-history-limit", type=int, default=2000, help="How many recent messages to scan in whop-logs (50-20000).")
+    pnow.add_argument("--whop-logs-before-message-id", default="", help="Scan whop-logs messages before this message id (snowflake) to reach older history.")
+    pnow.add_argument("--record-member-history", action="store_true", default=False, help="Record latest per-title whop-logs hits into member_history.json (no PII).")
+
+    pbl = sub.add_parser("whoplogs-baseline", help="Scan a whop-logs channel and record a per-user baseline into member_history.json.")
+    pbl.add_argument("--channel-id", required=True, help="Discord whop-logs channel id to scan.")
+    pbl.add_argument("--limit", type=int, default=5000, help="How many messages to scan this run (50-20000).")
+    pbl.add_argument("--before-message-id", default="", help="Scan messages before this message id (to go further back).")
+    pbl.add_argument("--resume", action="store_true", default=False, help="Resume using saved cursor from state file.")
+    pbl.add_argument("--state-file", default="", help="State file path (default: RSCheckerbot/.probe_whoplogs_baseline_state.json).")
+    pbl.add_argument("--record-member-history", action="store_true", default=False, help="Actually write updates into member_history.json (no PII).")
+    pbl.add_argument("--confirm", default="", help="Must be exactly 'confirm' when using --record-member-history.")
+    pbl.add_argument("--progress-every", type=int, default=200, help="Update the live progress bar every N messages (0 disables).")
+    pbl.add_argument("--bar-width", type=int, default=24, help="Width of the live progress bar (10-60).")
+    pbl.add_argument("--run-until-done", action="store_true", default=False, help="Keep scanning older history in chunks until the channel history is exhausted.")
+    pbl.add_argument("--batch-delay-seconds", type=float, default=1.0, help="Delay between chunks when --run-until-done is enabled (0-10).")
+    pbl.add_argument("--max-batches", type=int, default=0, help="Optional safety cap on number of chunks (0 = unlimited).")
+    pbl.add_argument("--interactive", action="store_true", default=False, help="Prompt to resume and/or continue between chunks (safe for flaky connections).")
+    pbl.add_argument("--checkpoint-every", type=int, default=0, help="Write resume cursor every N messages within a chunk (0 disables).")
+
     args = p.parse_args()
     if args.mode == "joined":
         if not args.end:
@@ -1967,6 +2946,10 @@ def main() -> int:
         return asyncio.run(_probe_joined_summary(args))
     if args.mode == "staffcards":
         return asyncio.run(_probe_staffcards(args))
+    if args.mode == "nowhop-debug":
+        return asyncio.run(_probe_nowhop_debug(args))
+    if args.mode == "whoplogs-baseline":
+        return asyncio.run(_probe_whoplogs_baseline(args))
     return 2
 
 

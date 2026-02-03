@@ -17,6 +17,7 @@ from rschecker_utils import save_json as _save_json
 from rschecker_utils import fmt_date_any as _fmt_date_any
 from rschecker_utils import parse_dt_any as _parse_dt_any
 from rschecker_utils import access_roles_plain as _access_roles_plain
+from rschecker_utils import roles_plain as _roles_plain
 from rschecker_utils import extract_discord_id_from_whop_member_record as _extract_discord_id_from_whop_member_record
 from staff_embeds import build_member_status_detailed_embed as _build_member_status_detailed_embed
 from ticket_channels import ensure_ticket_like_channel as _ensure_ticket_like_channel
@@ -29,6 +30,7 @@ INDEX_PATH = BASE_DIR / "data" / "tickets_index.json"
 MIGRATIONS_STATE_PATH = BASE_DIR / "data" / "support_tickets_migrations.json"
 MEMBER_HISTORY_PATH = BASE_DIR / "member_history.json"
 WHOP_IDENTITY_CACHE_PATH = BASE_DIR / "whop_identity_cache.json"
+MEMBER_LOOKUP_PANEL_STATE_PATH = BASE_DIR / "data" / "support_member_lookup_panel.json"
 
 _INDEX_LOCK: asyncio.Lock = asyncio.Lock()
 
@@ -86,6 +88,11 @@ class SupportTicketConfig:
     resolution_followup_enabled: bool
     resolution_followup_auto_close_after_seconds: int
     resolution_followup_templates: dict[str, str]
+    member_lookup_enabled: bool
+    member_lookup_channel_id: int
+    member_lookup_max_native_logs: int
+    member_lookup_panel_title: str
+    member_lookup_panel_description: str
 
 
 _BOT: commands.Bot | None = None
@@ -94,6 +101,7 @@ _LOG_FUNC = None  # async callable(str) -> None
 _IS_WHOP_LINKED = None  # callable(discord_id:int) -> bool
 _TZ_NAME = "UTC"
 _CONTROLS_VIEW: "SupportTicketControlsView | None" = None
+_MEMBER_LOOKUP_VIEW: "MemberLookupPanelView | None" = None
 _WHOP_API_CLIENT = None  # optional WhopAPIClient injected by main.py
 
 
@@ -189,6 +197,7 @@ def initialize(
     al = st.get("audit_logs") if isinstance(st.get("audit_logs"), dict) else {}
     tr = st.get("ticket_roles") if isinstance(st.get("ticket_roles"), dict) else {}
     nw = st.get("no_whop_link") if isinstance(st.get("no_whop_link"), dict) else {}
+    ml = st.get("member_lookup") if isinstance(st.get("member_lookup"), dict) else {}
     wh_api = root.get("whop_api") if isinstance(root.get("whop_api"), dict) else {}
     dm = root.get("dm_sequence") if isinstance(root.get("dm_sequence"), dict) else {}
 
@@ -252,6 +261,14 @@ def initialize(
         resolution_followup_enabled=_as_bool(rf.get("enabled")),
         resolution_followup_auto_close_after_seconds=max(0, _as_int(rf.get("auto_close_after_seconds")) or 1800),
         resolution_followup_templates={str(k).strip().lower(): str(v) for k, v in (rf_templates or {}).items() if str(k or "").strip()},
+        member_lookup_enabled=_as_bool(ml.get("enabled", False)),
+        member_lookup_channel_id=_as_int(ml.get("channel_id")),
+        member_lookup_max_native_logs=max(0, min(10, _as_int(ml.get("max_native_logs")) or 5)),
+        member_lookup_panel_title=str(ml.get("panel_title") or "Ticket Tool").strip() or "Ticket Tool",
+        member_lookup_panel_description=str(
+            ml.get("panel_description") or "Use the buttons below to look up a member’s Discord + Whop baseline history."
+        ).strip()
+        or "Use the buttons below to look up a member’s Discord + Whop baseline history.",
     )
 
     # Register persistent view so buttons survive restarts.
@@ -260,6 +277,184 @@ def initialize(
         with suppress(Exception):
             _CONTROLS_VIEW = SupportTicketControlsView()
             _BOT.add_view(_CONTROLS_VIEW)
+    global _MEMBER_LOOKUP_VIEW
+    if _BOT and _MEMBER_LOOKUP_VIEW is None:
+        with suppress(Exception):
+            _MEMBER_LOOKUP_VIEW = MemberLookupPanelView()
+            _BOT.add_view(_MEMBER_LOOKUP_VIEW)
+
+
+def _member_lookup_state_load() -> dict:
+    raw = _load_json(MEMBER_LOOKUP_PANEL_STATE_PATH)
+    return raw if isinstance(raw, dict) else {}
+
+
+def _member_lookup_state_save(state: dict) -> None:
+    if not isinstance(state, dict):
+        state = {}
+    _save_json(MEMBER_LOOKUP_PANEL_STATE_PATH, state)
+
+
+def _short_iso(ts: str) -> str:
+    dt = _parse_dt_any(ts)
+    if not dt:
+        return "—"
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _member_history_get(discord_id: int) -> dict:
+    did = int(discord_id or 0)
+    if did <= 0:
+        return {}
+    raw = _load_json(MEMBER_HISTORY_PATH)
+    if not isinstance(raw, dict):
+        return {}
+    rec = raw.get(str(did))
+    return rec if isinstance(rec, dict) else {}
+
+
+def _native_logs_latest_rows(rec: dict) -> list[dict]:
+    """Return native_whop_logs_latest entries sorted newest->oldest (best-effort)."""
+    if not isinstance(rec, dict):
+        return []
+    wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+    latest = wh.get("native_whop_logs_latest") if isinstance(wh.get("native_whop_logs_latest"), dict) else {}
+    rows: list[dict] = []
+    if isinstance(latest, dict):
+        for v in latest.values():
+            if isinstance(v, dict):
+                rows.append(v)
+
+    def _ts(row: dict) -> float:
+        dt = _parse_dt_any(row.get("created_at") or row.get("recorded_at") or "")
+        if not dt:
+            return 0.0
+        return float(dt.timestamp())
+
+    rows.sort(key=_ts, reverse=True)
+    return rows
+
+
+def _build_member_lookup_result_embed(*, guild: discord.Guild, did: int) -> discord.Embed:
+    cfg = _cfg()
+    did_i = int(did or 0)
+    member = guild.get_member(did_i) if did_i > 0 else None
+    rec = _member_history_get(did_i)
+
+    e = discord.Embed(title="Member Lookup", color=0x5865F2)
+    if isinstance(member, discord.Member):
+        e.add_field(name="Member", value=f"{member.mention}\n{str(member.display_name or member)}"[:1024], inline=True)
+        e.add_field(name="Discord ID", value=_format_discord_id(int(member.id)), inline=True)
+        with suppress(Exception):
+            e.add_field(name="Current Roles", value=_roles_plain(member)[:1024], inline=False)
+    else:
+        e.add_field(name="Member", value="Not found in guild cache.", inline=True)
+        e.add_field(name="Discord ID", value=_format_discord_id(did_i), inline=True)
+
+    wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+    last_mid = str(wh.get("last_membership_id") or wh.get("last_whop_key") or "").strip()
+    last_status = str(wh.get("last_status") or "").strip()
+    last_ts = wh.get("last_event_ts")
+    last_dt = _parse_dt_any(last_ts)
+    last_dt_s = last_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if last_dt else "—"
+    last_summary = wh.get("last_summary") if isinstance(wh.get("last_summary"), dict) else {}
+
+    if last_mid:
+        e.add_field(name="Whop Key", value=f"`{last_mid}`"[:1024], inline=True)
+    if last_status:
+        e.add_field(name="Last Status", value=_whop_status_label(last_status)[:1024], inline=True)
+    e.add_field(name="Last Seen", value=last_dt_s[:1024], inline=True)
+
+    product = str(last_summary.get("product") or "").strip()
+    total_spent = str(last_summary.get("total_spent") or "").strip()
+    renewal_end = str(last_summary.get("renewal_end") or "").strip()
+    remaining_days = str(last_summary.get("remaining_days") or "").strip()
+    if product:
+        e.add_field(name="Membership", value=product[:1024], inline=True)
+    if total_spent:
+        e.add_field(name="Total Spent (lifetime)", value=total_spent[:1024], inline=True)
+    if remaining_days and remaining_days != "—":
+        e.add_field(name="Remaining Days", value=remaining_days[:1024], inline=True)
+    if renewal_end and renewal_end != "—":
+        e.add_field(name="Access Ends On", value=renewal_end[:1024], inline=True)
+
+    dash = str(last_summary.get("dashboard_url") or "").strip()
+    e.add_field(name="Whop Dashboard", value=_embed_link("Open", dash), inline=True)
+
+    # Native whop-logs baseline (most recent messages)
+    rows = _native_logs_latest_rows(rec)
+    max_rows = int(getattr(cfg, "member_lookup_max_native_logs", 5) or 5) if cfg else 5
+    max_rows = max(0, min(10, max_rows))
+    if max_rows and rows:
+        lines: list[str] = []
+        for row in rows[: max_rows * 2]:
+            title = str(row.get("title") or "").strip()
+            created = str(row.get("created_at") or "").strip()
+            jump = str(row.get("jump_url") or "").strip()
+            if not title:
+                continue
+            chunk = f"- {_short_iso(created)}: {title} {_embed_link('Open', jump)}"
+            if sum(len(x) + 1 for x in lines) + len(chunk) > 1000:
+                break
+            lines.append(chunk)
+            if len(lines) >= max_rows:
+                break
+        if lines:
+            e.add_field(name="Latest Whop Logs", value="\n".join(lines)[:1024], inline=False)
+    elif not rec:
+        e.add_field(
+            name="Baseline",
+            value="No baseline record yet for this Discord ID.\nRun `whoplogs-baseline` to populate `member_history.json`.",
+            inline=False,
+        )
+
+    return e
+
+
+async def ensure_member_lookup_panel() -> None:
+    """Ensure the staff lookup panel exists in the configured channel (no channel spam)."""
+    if not _ensure_cfg_loaded() or not _BOT:
+        return
+    cfg = _cfg()
+    if not cfg or (not bool(cfg.member_lookup_enabled)):
+        return
+    ch_id = int(cfg.member_lookup_channel_id or 0)
+    if ch_id <= 0:
+        return
+    guild = _BOT.get_guild(int(cfg.guild_id))
+    if not isinstance(guild, discord.Guild):
+        return
+    ch = guild.get_channel(int(ch_id))
+    if not isinstance(ch, discord.TextChannel):
+        return
+
+    state = _member_lookup_state_load()
+    mid = _as_int(state.get("message_id"))
+    view = _MEMBER_LOOKUP_VIEW or MemberLookupPanelView()
+    emb = discord.Embed(title=str(cfg.member_lookup_panel_title or "Ticket Tool"), color=0x2B2D31)
+    emb.description = str(cfg.member_lookup_panel_description or "").strip()[:4000]
+
+    sent = None
+    if mid > 0:
+        try:
+            msg = await ch.fetch_message(int(mid))
+            await msg.edit(embed=emb, view=view)
+            sent = msg
+        except Exception:
+            sent = None
+    if not sent:
+        try:
+            sent = await ch.send(embed=emb, view=view, allowed_mentions=discord.AllowedMentions.none(), silent=True)
+        except Exception:
+            sent = None
+    if sent:
+        _member_lookup_state_save(
+            {
+                "channel_id": int(ch.id),
+                "message_id": int(sent.id),
+                "updated_at_iso": _now_iso(),
+            }
+        )
 
     # Best-effort: ensure ticket index file is writable (avoid silent failures later).
     try:
@@ -2036,6 +2231,77 @@ class SupportTicketControlsView(discord.ui.View):
                 do_transcript=True,
                 delete_channel=True,
             )
+
+
+class _MemberLookupModal(discord.ui.Modal, title="Lookup Member"):
+    query = discord.ui.TextInput(
+        label="Discord ID or @mention",
+        placeholder="e.g. 1195796809705066627 or <@1195796809705066627>",
+        required=True,
+        max_length=64,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not _ensure_cfg_loaded() or not _BOT:
+            with suppress(Exception):
+                await interaction.response.send_message("❌ Bot not ready.", ephemeral=True)
+            return
+        if not isinstance(interaction.user, discord.Member) or not _is_staff_member(interaction.user):
+            with suppress(Exception):
+                await interaction.response.send_message("❌ Not allowed (staff only).", ephemeral=True)
+            return
+        cfg = _cfg()
+        if not cfg:
+            with suppress(Exception):
+                await interaction.response.send_message("❌ Config not loaded.", ephemeral=True)
+            return
+        guild = _BOT.get_guild(int(cfg.guild_id))
+        if not isinstance(guild, discord.Guild):
+            with suppress(Exception):
+                await interaction.response.send_message("❌ Guild not found.", ephemeral=True)
+            return
+
+        raw = str(self.query.value or "").strip()
+        m = re.search(r"\b(\d{17,19})\b", raw)
+        if not m:
+            with suppress(Exception):
+                await interaction.response.send_message("❌ Please paste a valid Discord ID (17-19 digits).", ephemeral=True)
+            return
+        did = int(m.group(1))
+        emb = _build_member_lookup_result_embed(guild=guild, did=did)
+        with suppress(Exception):
+            await interaction.response.send_message(embed=emb, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+class MemberLookupPanelView(discord.ui.View):
+    """Persistent staff panel for member lookups (ephemeral results)."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    def _allowed(self, user: discord.abc.User | discord.Member) -> bool:
+        try:
+            if isinstance(user, discord.Member):
+                return _is_staff_member(user)
+        except Exception:
+            return False
+        return False
+
+    async def _deny(self, interaction: discord.Interaction) -> None:
+        with suppress(Exception):
+            await interaction.response.send_message("❌ Not allowed (staff only).", ephemeral=True)
+
+    @discord.ui.button(
+        label="Lookup Member",
+        style=discord.ButtonStyle.primary,
+        custom_id="rsmember:lookup",
+    )
+    async def lookup(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        if not self._allowed(interaction.user):
+            await self._deny(interaction)
+            return
+        with suppress(Exception):
+            await interaction.response.send_modal(_MemberLookupModal())
 
 
 def _format_discord_id(uid: int) -> str:
