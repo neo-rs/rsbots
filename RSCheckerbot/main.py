@@ -3622,8 +3622,8 @@ def _channel_limits_fmt_line(counts: dict[str, object]) -> str:
 
 
 def _channel_limits_fmt_big_line(counts: dict[str, object]) -> str:
-    # Discord markdown heading to make the count visually larger.
-    return f"## {_channel_limits_fmt_line(counts)}"
+    # Embeds don't support markdown headings; use bold for emphasis.
+    return f"**{_channel_limits_fmt_line(counts)}**"
 
 
 def _channel_limits_make_embed(*, title: str, description: str = "", color: int = 0x5865F2) -> discord.Embed:
@@ -3732,23 +3732,16 @@ async def _channel_limits_post_counts_for_channel_event(*, action: str, channel:
 
     # Total channel limit warning at configured threshold (default 450/500).
     warn_total_at = int(CHANNEL_LIMITS_TOTAL_WARN_AT or 0)
-    if warn_total_at > 0 and total >= warn_total_at and (last_total < warn_total_at):
-        desc_lines = []
-        if admin_ping:
-            desc_lines.append(admin_ping)
-        desc_lines.append("Channel Count")
-        desc_lines.append(f"Approaching limit: **{total}/{total_limit}**")
+    # Never warn from an unknown baseline (ex: right after restart).
+    if warn_total_at > 0 and last_total >= 0 and total >= warn_total_at and (last_total < warn_total_at):
+        desc_lines = ["Channel Count", f"Approaching limit: **{total}/{total_limit}**"]
         e_total = _channel_limits_make_embed(
             title="⚠️ Approaching Discord channel limits",
             description="\n".join(desc_lines),
             color=0xFEE75C,
         )
         e_total.add_field(name="Channel Count", value=_channel_limits_fmt_big_line(counts)[:1024], inline=False)
-        await _channel_limits_post(
-            embed=e_total,
-            content=None,
-            allowed_mentions=(admin_mentions if admin_ping else discord.AllowedMentions.none()),
-        )
+        await _channel_limits_post(embed=e_total, content=(admin_ping or None), allowed_mentions=(admin_mentions if admin_ping else discord.AllowedMentions.none()))
 
     # Ticket category warnings at configured threshold (default 40/50).
     warn_cat_at = int(CHANNEL_LIMITS_TICKET_CATEGORY_WARN_AT or 0)
@@ -3761,24 +3754,17 @@ async def _channel_limits_post_counts_for_channel_event(*, action: str, channel:
     for key in ("cancellation", "freepass", "billing"):
         cur = int(tcounts.get(key) or 0)
         prev = _last_ticket(key)
-        if warn_cat_at > 0 and cur >= warn_cat_at and (prev < warn_cat_at):
+        # Never warn from an unknown baseline (ex: right after restart).
+        if warn_cat_at > 0 and prev >= 0 and cur >= warn_cat_at and (prev < warn_cat_at):
             lbl = label_map.get(key) or str(key).title()
-            desc_lines = []
-            if admin_ping:
-                desc_lines.append(admin_ping)
-            desc_lines.append(lbl)
-            desc_lines.append(f"Approaching limit: **{cur}/{cat_limit}**")
+            desc_lines = [lbl, f"Approaching limit: **{cur}/{cat_limit}**"]
             e_cat = _channel_limits_make_embed(
                 title="⚠️ Approaching Discord channel limits",
                 description="\n".join(desc_lines),
                 color=0xFEE75C,
             )
             e_cat.add_field(name="Channel Count", value=_channel_limits_fmt_big_line(counts)[:1024], inline=False)
-            await _channel_limits_post(
-                embed=e_cat,
-                content=None,
-                allowed_mentions=(admin_mentions if admin_ping else discord.AllowedMentions.none()),
-            )
+            await _channel_limits_post(embed=e_cat, content=(admin_ping or None), allowed_mentions=(admin_mentions if admin_ping else discord.AllowedMentions.none()))
 
     _CHANNEL_LIMITS_LAST_TOTAL = int(total)
     if not isinstance(_CHANNEL_LIMITS_LAST_TICKET_COUNTS, dict):
@@ -8270,6 +8256,7 @@ async def sync_whop_memberships_error(error):
 @bot.event
 async def on_ready():
     global queue_state, registry, invite_usage_cache, whop_api_client
+    global _CHANNEL_LIMITS_LAST_TOTAL, _CHANNEL_LIMITS_LAST_TICKET_COUNTS
     startup_notes: list[str] = []
     startup_kv: list[tuple[str, object]] = []
     post_startup_report = _should_post_boot()
@@ -8282,6 +8269,16 @@ async def on_ready():
     
     queue_state = load_json(QUEUE_FILE)
     registry = load_json(REGISTRY_FILE)
+
+    # Channel limits: set a baseline so we don't fire warnings immediately after restart
+    # just because counts are already above the threshold.
+    with suppress(Exception):
+        g0 = bot.get_guild(int(GUILD_ID or 0)) if int(GUILD_ID or 0) else None
+        if isinstance(g0, discord.Guild):
+            c0 = _channel_limits_counts(g0)
+            _CHANNEL_LIMITS_LAST_TOTAL = int(c0.get("total") or 0)
+            tc0 = _channel_limits_ticket_category_counts(g0)
+            _CHANNEL_LIMITS_LAST_TICKET_COUNTS = {str(k): int(v or 0) for k, v in (tc0 or {}).items()}
 
     # Support tickets (Neo): initialize after config load so ticket commands + sweeper can run.
     try:
