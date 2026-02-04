@@ -4786,8 +4786,13 @@ echo "TARGET=$TARGET"
                 pass
             return
 
-        # Sync app commands only to allowed guild(s) (owner-only policy).
-        guild_ids: List[int] = list(self._get_allowed_slash_guild_ids())
+        # RSNotes should only be available in the neo-test-server.
+        # (Reselling Secrets should only have /delete /transfer /archive.)
+        try:
+            test_gid = int(self.config.get("test_server_guild_id") or 0)
+        except Exception:
+            test_gid = 0
+        guild_ids: List[int] = [test_gid] if test_gid else []
 
         # Debug: do we actually have the command in the tree?
         try:
@@ -4864,22 +4869,69 @@ echo "TARGET=$TARGET"
             except Exception:
                 pass
 
-        guild_ids = list(self._get_allowed_slash_guild_ids())
-        if not guild_ids:
+        # Split registration by guild:
+        # - Reselling Secrets: only /delete /transfer /archive
+        # - neo-test-server: everything else
+        try:
+            test_gid = int(self.config.get("test_server_guild_id") or 0)
+        except Exception:
+            test_gid = 0
+        try:
+            rs_gid = int(self.config.get("rs_server_guild_id") or 0)
+        except Exception:
+            rs_gid = 0
+
+        if not test_gid and not rs_gid:
             try:
-                print(f"{Colors.YELLOW}[Slash] No allowed guild ids configured; skipping slash sync{Colors.RESET}")
+                print(f"{Colors.YELLOW}[Slash] No configured guild ids; skipping slash sync{Colors.RESET}")
             except Exception:
                 pass
             return
 
-        for gid in guild_ids:
+        rs_only = {"delete", "transfer", "archive"}
+
+        async def _sync_guild(*, gid: int, keep: Optional[set[str]] = None, remove: Optional[set[str]] = None) -> None:
+            if not gid:
+                return
+            gobj = discord.Object(id=int(gid))
             try:
-                # Make commands appear quickly by syncing as guild-scoped.
+                # Clear existing guild commands in our local tree snapshot.
                 try:
-                    self.bot.tree.copy_global_to(guild=discord.Object(id=gid))
+                    self.bot.tree.clear_commands(guild=gobj)
                 except Exception:
                     pass
-                synced = await self.bot.tree.sync(guild=discord.Object(id=gid))
+
+                # Copy all globals into this guild (fast guild-scoped propagation).
+                try:
+                    self.bot.tree.copy_global_to(guild=gobj)
+                except Exception:
+                    pass
+
+                # Optionally remove specific commands.
+                if remove:
+                    for name in sorted({str(x) for x in remove if x}):
+                        try:
+                            self.bot.tree.remove_command(name, guild=gobj)
+                        except Exception:
+                            pass
+
+                # Optionally keep only an allowlist.
+                if keep is not None:
+                    try:
+                        current = list(self.bot.tree.get_commands(guild=gobj) or [])
+                    except Exception:
+                        current = []
+                    for cmd in current:
+                        nm = str(getattr(cmd, "name", "") or "").strip()
+                        if not nm:
+                            continue
+                        if nm not in keep:
+                            try:
+                                self.bot.tree.remove_command(nm, guild=gobj)
+                            except Exception:
+                                pass
+
+                synced = await self.bot.tree.sync(guild=gobj)
                 try:
                     names = sorted({str(getattr(x, "name", "") or "") for x in (synced or []) if getattr(x, "name", None)})
                     print(f"{Colors.GREEN}[Slash] Sync OK: guild={gid} commands={len(names)}{Colors.RESET}")
@@ -4890,6 +4942,12 @@ echo "TARGET=$TARGET"
                     print(f"{Colors.YELLOW}[Slash] Sync failed: guild={gid} err={type(e).__name__}: {str(e)[:200]}{Colors.RESET}")
                 except Exception:
                     pass
+
+        # neo-test-server: everything except rs-only commands
+        await _sync_guild(gid=test_gid, remove=rs_only)
+
+        # Reselling Secrets: only rs-only commands
+        await _sync_guild(gid=rs_gid, keep=rs_only)
     
     async def _initialize_monitor_channels(self) -> None:
         """Initialize monitor category and per-bot channels in test server."""
