@@ -3305,25 +3305,37 @@ except Exception:
     CHANNEL_LIMITS_GUILD_CHANNEL_LIMIT = 500
 CHANNEL_LIMITS_GUILD_CHANNEL_LIMIT = max(1, min(int(CHANNEL_LIMITS_GUILD_CHANNEL_LIMIT or 500), 2000))
 try:
-    CHANNEL_LIMITS_CATEGORY_LIMIT = int(CHANNEL_LIMITS_CONFIG.get("category_limit") or 50)
+    CHANNEL_LIMITS_TOTAL_WARN_AT = int(CHANNEL_LIMITS_CONFIG.get("total_warn_at") or 450)
 except Exception:
-    CHANNEL_LIMITS_CATEGORY_LIMIT = 50
-CHANNEL_LIMITS_CATEGORY_LIMIT = max(1, min(int(CHANNEL_LIMITS_CATEGORY_LIMIT or 50), 200))
+    CHANNEL_LIMITS_TOTAL_WARN_AT = 450
+CHANNEL_LIMITS_TOTAL_WARN_AT = max(0, min(int(CHANNEL_LIMITS_TOTAL_WARN_AT or 450), int(CHANNEL_LIMITS_GUILD_CHANNEL_LIMIT or 500)))
 try:
-    CHANNEL_LIMITS_WARN_THRESHOLD_REMAINING = int(CHANNEL_LIMITS_CONFIG.get("warn_threshold_remaining") or 10)
+    CHANNEL_LIMITS_TICKET_CATEGORY_LIMIT = int(CHANNEL_LIMITS_CONFIG.get("ticket_category_limit") or 50)
 except Exception:
-    CHANNEL_LIMITS_WARN_THRESHOLD_REMAINING = 10
-CHANNEL_LIMITS_WARN_THRESHOLD_REMAINING = max(0, min(int(CHANNEL_LIMITS_WARN_THRESHOLD_REMAINING or 10), 200))
+    CHANNEL_LIMITS_TICKET_CATEGORY_LIMIT = 50
+CHANNEL_LIMITS_TICKET_CATEGORY_LIMIT = max(1, min(int(CHANNEL_LIMITS_TICKET_CATEGORY_LIMIT or 50), 200))
 try:
-    CHANNEL_LIMITS_WARN_THRESHOLD_PERCENT = float(CHANNEL_LIMITS_CONFIG.get("warn_threshold_percent") or 0.95)
+    CHANNEL_LIMITS_TICKET_CATEGORY_WARN_AT = int(CHANNEL_LIMITS_CONFIG.get("ticket_category_warn_at") or 40)
 except Exception:
-    CHANNEL_LIMITS_WARN_THRESHOLD_PERCENT = 0.95
-CHANNEL_LIMITS_WARN_THRESHOLD_PERCENT = max(0.0, min(float(CHANNEL_LIMITS_WARN_THRESHOLD_PERCENT or 0.95), 1.0))
+    CHANNEL_LIMITS_TICKET_CATEGORY_WARN_AT = 40
+CHANNEL_LIMITS_TICKET_CATEGORY_WARN_AT = max(0, min(int(CHANNEL_LIMITS_TICKET_CATEGORY_WARN_AT or 40), int(CHANNEL_LIMITS_TICKET_CATEGORY_LIMIT or 50)))
 try:
-    CHANNEL_LIMITS_WARN_COOLDOWN_SECONDS = int(CHANNEL_LIMITS_CONFIG.get("warn_cooldown_seconds") or 1800)
+    CHANNEL_LIMITS_ADMIN_PING_ROLE_ID = int(CHANNEL_LIMITS_CONFIG.get("admin_ping_role_id") or 0)
 except Exception:
-    CHANNEL_LIMITS_WARN_COOLDOWN_SECONDS = 1800
-CHANNEL_LIMITS_WARN_COOLDOWN_SECONDS = max(0, min(int(CHANNEL_LIMITS_WARN_COOLDOWN_SECONDS or 1800), 86400))
+    CHANNEL_LIMITS_ADMIN_PING_ROLE_ID = 0
+
+CHANNEL_LIMITS_TICKET_CATEGORY_IDS = CHANNEL_LIMITS_CONFIG.get("ticket_category_ids") if isinstance(CHANNEL_LIMITS_CONFIG, dict) else None
+CHANNEL_LIMITS_TICKET_CATEGORY_IDS = CHANNEL_LIMITS_TICKET_CATEGORY_IDS if isinstance(CHANNEL_LIMITS_TICKET_CATEGORY_IDS, dict) else {}
+
+def _cl_int(v: object) -> int:
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return 0
+
+_TICKET_CATEGORY_ID_CANCELLATION = _cl_int(CHANNEL_LIMITS_TICKET_CATEGORY_IDS.get("cancellation"))
+_TICKET_CATEGORY_ID_FREEPASS = _cl_int(CHANNEL_LIMITS_TICKET_CATEGORY_IDS.get("freepass"))
+_TICKET_CATEGORY_ID_BILLING = _cl_int(CHANNEL_LIMITS_TICKET_CATEGORY_IDS.get("billing"))
 
 # Member history ingest (Discord channel tailer -> member_history.json)
 MEMBER_HISTORY_INGEST = config.get("member_history_ingest", {}) if isinstance(config, dict) else {}
@@ -3568,8 +3580,8 @@ def _channel_limits_staff_admin_role_ids() -> tuple[set[int], set[int]]:
 
 
 _CHANNEL_LIMITS_STAFF_ROLE_IDS, _CHANNEL_LIMITS_ADMIN_ROLE_IDS = _channel_limits_staff_admin_role_ids()
-_CHANNEL_LIMITS_LAST_WARN_AT_MONO: float = 0.0
-_CHANNEL_LIMITS_LAST_WARN_KEY: str = ""
+_CHANNEL_LIMITS_LAST_TOTAL: int = -1
+_CHANNEL_LIMITS_LAST_TICKET_COUNTS: dict[str, int] = {}
 
 
 def _channel_limits_is_authorized(member: discord.Member) -> bool:
@@ -3592,85 +3604,26 @@ def _channel_limits_is_authorized(member: discord.Member) -> bool:
 
 def _channel_limits_counts(guild: discord.Guild) -> dict[str, object]:
     chs = list(getattr(guild, "channels", None) or [])
-    cats = list(getattr(guild, "categories", None) or [])
-    texts = list(getattr(guild, "text_channels", None) or [])
-    voices = list(getattr(guild, "voice_channels", None) or [])
-    stages = list(getattr(guild, "stage_channels", None) or [])
-    forums: list[object] = []
-    with suppress(Exception):
-        forums = list(getattr(guild, "forums", None) or [])
-    if not forums:
-        fc = getattr(discord, "ForumChannel", None)
-        if fc:
-            with suppress(Exception):
-                forums = [c for c in chs if isinstance(c, fc)]
-
     total = int(len(chs))
-    cat_count = int(len(cats))
-    non_cat = max(0, total - cat_count)
     return {
         "total": total,
-        "non_category": non_cat,
-        "categories": cat_count,
-        "text": int(len(texts)),
-        "voice": int(len(voices)),
-        "stage": int(len(stages)),
-        "forum": int(len(forums)),
         "limit_total": int(CHANNEL_LIMITS_GUILD_CHANNEL_LIMIT or 500),
-        "limit_categories": int(CHANNEL_LIMITS_CATEGORY_LIMIT or 50),
     }
 
 
 def _channel_limits_fmt_line(counts: dict[str, object]) -> str:
     try:
         total = int(counts.get("total") or 0)
-        non_cat = int(counts.get("non_category") or 0)
-        cats = int(counts.get("categories") or 0)
         lt = max(1, int(counts.get("limit_total") or 500))
-        lc = max(1, int(counts.get("limit_categories") or 50))
-        text = int(counts.get("text") or 0)
-        voice = int(counts.get("voice") or 0)
-        stage = int(counts.get("stage") or 0)
-        forum = int(counts.get("forum") or 0)
     except Exception:
-        total, non_cat, cats, lt, lc, text, voice, stage, forum = 0, 0, 0, 500, 50, 0, 0, 0, 0
+        total, lt = 0, 500
 
-    pct_total = (total / max(1, lt)) * 100.0
-    pct_cats = (cats / max(1, lc)) * 100.0
-    return (
-        f"Channels **{total}/{lt}** ({pct_total:.1f}%) • "
-        f"Non-category **{non_cat}** • "
-        f"Categories **{cats}/{lc}** ({pct_cats:.1f}%) • "
-        f"Text **{text}** • Voice **{voice}** • Stage **{stage}** • Forum **{forum}**"
-    )
+    return f"Channels {total}/{lt}"
 
 
-def _channel_limits_warn_key_and_reasons(counts: dict[str, object]) -> tuple[str, list[str]]:
-    try:
-        total = int(counts.get("total") or 0)
-        cats = int(counts.get("categories") or 0)
-        lt = max(1, int(counts.get("limit_total") or 500))
-        lc = max(1, int(counts.get("limit_categories") or 50))
-    except Exception:
-        total, cats, lt, lc = 0, 0, 500, 50
-
-    remaining_total = lt - total
-    remaining_cats = lc - cats
-
-    reasons: list[str] = []
-    try:
-        pct_t = (total / max(1, lt))
-        pct_c = (cats / max(1, lc))
-    except Exception:
-        pct_t, pct_c = 0.0, 0.0
-
-    if remaining_total <= int(CHANNEL_LIMITS_WARN_THRESHOLD_REMAINING or 0) or pct_t >= float(CHANNEL_LIMITS_WARN_THRESHOLD_PERCENT or 1.0):
-        reasons.append(f"total_channels={total}/{lt} remaining={remaining_total}")
-    if remaining_cats <= int(CHANNEL_LIMITS_WARN_THRESHOLD_REMAINING or 0) or pct_c >= float(CHANNEL_LIMITS_WARN_THRESHOLD_PERCENT or 1.0):
-        reasons.append(f"categories={cats}/{lc} remaining={remaining_cats}")
-
-    key = "|".join(reasons)
-    return key, reasons
+def _channel_limits_fmt_big_line(counts: dict[str, object]) -> str:
+    # Discord markdown heading to make the count visually larger.
+    return f"## {_channel_limits_fmt_line(counts)}"
 
 
 def _channel_limits_make_embed(*, title: str, description: str = "", color: int = 0x5865F2) -> discord.Embed:
@@ -3682,6 +3635,28 @@ def _channel_limits_make_embed(*, title: str, description: str = "", color: int 
     )
     e.set_footer(text="RSCheckerbot • Channel limits")
     return e
+
+
+def _channel_limits_ticket_category_counts(guild: discord.Guild) -> dict[str, int]:
+    """Return channel counts inside each configured support ticket category."""
+    out: dict[str, int] = {}
+    if not isinstance(guild, discord.Guild):
+        return out
+
+    def _count_for_category_id(cid: int) -> int:
+        if int(cid or 0) <= 0:
+            return 0
+        cat = guild.get_channel(int(cid))
+        if not isinstance(cat, discord.CategoryChannel):
+            return 0
+        with suppress(Exception):
+            return int(len(list(getattr(cat, "channels", None) or [])))
+        return 0
+
+    out["cancellation"] = _count_for_category_id(int(_TICKET_CATEGORY_ID_CANCELLATION or 0))
+    out["freepass"] = _count_for_category_id(int(_TICKET_CATEGORY_ID_FREEPASS or 0))
+    out["billing"] = _count_for_category_id(int(_TICKET_CATEGORY_ID_BILLING or 0))
+    return out
 
 
 async def _channel_limits_get_log_channel() -> object | None:
@@ -3698,7 +3673,7 @@ async def _channel_limits_get_log_channel() -> object | None:
     return None
 
 
-async def _channel_limits_post(*, embed: discord.Embed) -> None:
+async def _channel_limits_post(*, embed: discord.Embed, content: str | None = None, allowed_mentions: discord.AllowedMentions | None = None) -> None:
     if not CHANNEL_LIMITS_ENABLED:
         return
     if not isinstance(embed, discord.Embed):
@@ -3707,7 +3682,11 @@ async def _channel_limits_post(*, embed: discord.Embed) -> None:
     if not ch:
         return
     with suppress(Exception):
-        await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        await ch.send(
+            content=(str(content)[:800] if str(content or "").strip() else None),
+            embed=embed,
+            allowed_mentions=(allowed_mentions if isinstance(allowed_mentions, discord.AllowedMentions) else discord.AllowedMentions.none()),
+        )
 
 
 async def _channel_limits_post_counts_for_channel_event(*, action: str, channel: discord.abc.GuildChannel) -> None:
@@ -3723,47 +3702,72 @@ async def _channel_limits_post_counts_for_channel_event(*, action: str, channel:
         pass
 
     counts = _channel_limits_counts(g)
-    ch_name = str(getattr(channel, "name", "") or "").strip() or "unknown"
-    ch_id = int(getattr(channel, "id", 0) or 0)
-    ch_type = str(getattr(getattr(channel, "type", None), "name", "") or getattr(channel, "type", "") or "").strip()
-    act = str(action or "").strip().lower()
-    if act == "created":
-        title = "➕ Channel created"
-        color = 0x57F287
-    elif act == "deleted":
-        title = "➖ Channel deleted"
-        color = 0xED4245
-    else:
-        title = f"📌 Channel {action}".strip()
-        color = 0x5865F2
-
-    e = _channel_limits_make_embed(title=title, color=color)
-    ch_label = f"<#{ch_id}>" if ch_id else f"`{ch_name}`"
-    e.add_field(name="Channel", value=f"{ch_label}\nName: `{ch_name}`\nType: `{ch_type or 'unknown'}`", inline=False)
-    e.add_field(name="Counts", value=_channel_limits_fmt_line(counts)[:1024], inline=False)
+    # Every create/delete: post only the channel count card (no extra breakdown).
+    e = _channel_limits_make_embed(title="Channel Count", description=_channel_limits_fmt_big_line(counts), color=0x5865F2)
     await _channel_limits_post(embed=e)
 
-    # Warning (cooldown + dedupe key)
-    global _CHANNEL_LIMITS_LAST_WARN_AT_MONO, _CHANNEL_LIMITS_LAST_WARN_KEY
-    warn_key, reasons = _channel_limits_warn_key_and_reasons(counts)
-    if not reasons:
-        return
+    # Warnings: ping Admin role when thresholds are reached (ticket categories + 450/500 total).
+    global _CHANNEL_LIMITS_LAST_TOTAL, _CHANNEL_LIMITS_LAST_TICKET_COUNTS
+    try:
+        total = int(counts.get("total") or 0)
+        total_limit = int(counts.get("limit_total") or CHANNEL_LIMITS_GUILD_CHANNEL_LIMIT or 500)
+    except Exception:
+        total, total_limit = 0, int(CHANNEL_LIMITS_GUILD_CHANNEL_LIMIT or 500)
 
-    now_m = time.monotonic()
-    cd = int(CHANNEL_LIMITS_WARN_COOLDOWN_SECONDS or 0)
-    if cd > 0 and (now_m - float(_CHANNEL_LIMITS_LAST_WARN_AT_MONO or 0.0)) < float(cd):
-        return
+    # Compute ticket category counts (channels inside each category).
+    tcounts = _channel_limits_ticket_category_counts(g)
+    last_total = int(_CHANNEL_LIMITS_LAST_TOTAL or -1)
 
-    _CHANNEL_LIMITS_LAST_WARN_AT_MONO = float(now_m)
-    _CHANNEL_LIMITS_LAST_WARN_KEY = str(warn_key or "")
-    reason_text = ", ".join(reasons)[:1200]
-    e2 = _channel_limits_make_embed(
-        title="⚠️ Approaching Discord channel limits",
-        description=(f"Trigger: `{reason_text}`" if reason_text else ""),
-        color=0xFEE75C,
-    )
-    e2.add_field(name="Counts", value=_channel_limits_fmt_line(counts)[:1024], inline=False)
-    await _channel_limits_post(embed=e2)
+    def _last_ticket(k: str) -> int:
+        try:
+            return int((_CHANNEL_LIMITS_LAST_TICKET_COUNTS or {}).get(str(k), -1))
+        except Exception:
+            return -1
+
+    admin_role_id = int(CHANNEL_LIMITS_ADMIN_PING_ROLE_ID or 0)
+    admin_ping = f"<@&{admin_role_id}>" if admin_role_id > 0 else ""
+    admin_mentions = discord.AllowedMentions(roles=True, users=False, everyone=False, replied_user=False)
+
+    # Total channel limit warning at configured threshold (default 450/500).
+    warn_total_at = int(CHANNEL_LIMITS_TOTAL_WARN_AT or 0)
+    if warn_total_at > 0 and total >= warn_total_at and (last_total < warn_total_at):
+        e_total = _channel_limits_make_embed(
+            title="⚠️ Approaching Discord channel limits",
+            description=f"Channel Count\nApproaching limit: **{total}/{total_limit}**",
+            color=0xFEE75C,
+        )
+        e_total.add_field(name="Channel Count", value=_channel_limits_fmt_big_line(counts)[:1024], inline=False)
+        warn_content = f"{admin_ping}\n⚠️ Approaching Discord channel limits" if admin_ping else None
+        await _channel_limits_post(embed=e_total, content=warn_content, allowed_mentions=(admin_mentions if admin_ping else discord.AllowedMentions.none()))
+
+    # Ticket category warnings at configured threshold (default 40/50).
+    warn_cat_at = int(CHANNEL_LIMITS_TICKET_CATEGORY_WARN_AT or 0)
+    cat_limit = int(CHANNEL_LIMITS_TICKET_CATEGORY_LIMIT or 50)
+    label_map = {
+        "cancellation": "Cancellation Ticket",
+        "freepass": "Free Pass Welcome Ticket",
+        "billing": "Billing Ticket",
+    }
+    for key in ("cancellation", "freepass", "billing"):
+        cur = int(tcounts.get(key) or 0)
+        prev = _last_ticket(key)
+        if warn_cat_at > 0 and cur >= warn_cat_at and (prev < warn_cat_at):
+            lbl = label_map.get(key) or str(key).title()
+            e_cat = _channel_limits_make_embed(
+                title="⚠️ Approaching Discord channel limits",
+                description=f"{lbl}\nApproaching limit: **{cur}/{cat_limit}**",
+                color=0xFEE75C,
+            )
+            e_cat.add_field(name="Channel Count", value=_channel_limits_fmt_big_line(counts)[:1024], inline=False)
+            warn_content = f"{admin_ping}\n⚠️ Approaching Discord channel limits" if admin_ping else None
+            await _channel_limits_post(embed=e_cat, content=warn_content, allowed_mentions=(admin_mentions if admin_ping else discord.AllowedMentions.none()))
+
+    _CHANNEL_LIMITS_LAST_TOTAL = int(total)
+    if not isinstance(_CHANNEL_LIMITS_LAST_TICKET_COUNTS, dict):
+        _CHANNEL_LIMITS_LAST_TICKET_COUNTS = {}
+    for k, v in (tcounts or {}).items():
+        with suppress(Exception):
+            _CHANNEL_LIMITS_LAST_TICKET_COUNTS[str(k)] = int(v or 0)
 
 
 def _channel_limits_appcmd_check(interaction: discord.Interaction) -> bool:
@@ -3782,8 +3786,19 @@ async def channel_limits_slash(interaction: discord.Interaction):
             await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
         return
     counts = _channel_limits_counts(g)
-    e = _channel_limits_make_embed(title="Channel Limits", color=0x5865F2)
-    e.add_field(name="Counts", value=_channel_limits_fmt_line(counts)[:1024], inline=False)
+    tcounts = _channel_limits_ticket_category_counts(g)
+    e = _channel_limits_make_embed(title="Channel Limits", description=_channel_limits_fmt_big_line(counts), color=0x5865F2)
+    e.add_field(name="Channel Count", value=_channel_limits_fmt_big_line(counts)[:1024], inline=False)
+    cat_limit = int(CHANNEL_LIMITS_TICKET_CATEGORY_LIMIT or 50)
+    e.add_field(
+        name="Support Ticket Categories",
+        value=(
+            f"Cancellation: **{int(tcounts.get('cancellation') or 0)}/{cat_limit}**\n"
+            f"Free Pass: **{int(tcounts.get('freepass') or 0)}/{cat_limit}**\n"
+            f"Billing: **{int(tcounts.get('billing') or 0)}/{cat_limit}**"
+        )[:1024],
+        inline=False,
+    )
     with suppress(Exception):
         if not interaction.response.is_done():
             await interaction.response.send_message(embed=e, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())

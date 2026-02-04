@@ -370,14 +370,19 @@
   }
   ,
   "channel_limits": {
-    "_comment": "Staff/admin-only slash command + monitoring. Posts channel counts to log_channel_id on create/delete and warns near Discord limits.",
+    "_comment": "Staff/admin-only slash command + monitoring. Posts a Channel Count embed to log_channel_id on channel create/delete. Pings admin_ping_role_id when ticket categories reach ticket_category_warn_at/ticket_category_limit and when total channels reach total_warn_at/guild_channel_limit.",
     "enabled": true,
     "log_channel_id": 1468301512244723784,
     "guild_channel_limit": 500,
-    "category_limit": 50,
-    "warn_threshold_remaining": 10,
-    "warn_threshold_percent": 0.95,
-    "warn_cooldown_seconds": 1800
+    "total_warn_at": 450,
+    "admin_ping_role_id": 876598078092754985,
+    "ticket_category_limit": 50,
+    "ticket_category_warn_at": 40,
+    "ticket_category_ids": {
+      "cancellation": 1467169698608320542,
+      "freepass": 1467157711685681214,
+      "billing": 1467157354977165537
+    }
   }
   ,
   "member_history_ingest": {
