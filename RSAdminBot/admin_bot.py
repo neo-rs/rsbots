@@ -7014,7 +7014,18 @@ echo "CHANGED_END"
         if owner_id and user_id == owner_id:
             return True, ""
 
-        # Allow configured admins (role/user allowlist). Do NOT auto-allow "Administrator" permission here.
+        # Allow configured admins (user allowlist) WITHOUT requiring a Member object.
+        #
+        # Why: some interaction payloads (especially component interactions) may not include a cached Member.
+        # `admin_user_ids` should still work even if member/roles are unavailable.
+        try:
+            admin_user_ids = self.config.get("admin_user_ids", []) if isinstance(self.config, dict) else []
+            if str(user_id) in [str(uid) for uid in (admin_user_ids or [])]:
+                return True, ""
+        except Exception:
+            pass
+
+        # Allow configured admins (role allowlist). Do NOT auto-allow "Administrator" permission here.
         member: Optional[discord.Member] = None
         try:
             if isinstance(interaction.user, discord.Member):
