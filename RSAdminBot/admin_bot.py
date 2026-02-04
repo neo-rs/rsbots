@@ -5891,12 +5891,30 @@ git diff --name-only "$OLD" "$NEW" -- "RSAdminBot" 2>/dev/null > "$TMP_CHANGED" 
 CHANGED_COUNT="$(sed '/^$/d' "$TMP_CHANGED" | wc -l | tr -d ' ')"
 if [ "$CHANGED_COUNT" = "" ]; then CHANGED_COUNT="0"; fi
 
-if [ "$OLD" != "" ] && [ "$NEW" != "" ] && [ "$OLD" = "$NEW" ] && [ "$CHANGED_COUNT" = "0" ]; then
+# Drift check (live tree vs git checkout) so config-only changes still apply.
+# This prevents the "NO_CHANGES but live config is stale" failure mode.
+DRIFT_COUNT=0
+while IFS= read -r p; do
+  p="$(printf "%s" "$p" | tr -d "\r")"
+  if [ -z "$p" ]; then continue; fi
+  if [ -f "$CODE_ROOT/$p" ] && [ -f "$LIVE_ROOT/$p" ]; then
+    A="$(sha256sum "$CODE_ROOT/$p" 2>/dev/null | awk '{print $1}' || true)"
+    B="$(sha256sum "$LIVE_ROOT/$p" 2>/dev/null | awk '{print $1}' || true)"
+    if [ "$A" != "$B" ]; then
+      DRIFT_COUNT=$((DRIFT_COUNT+1))
+    fi
+  elif [ -f "$CODE_ROOT/$p" ] && [ ! -f "$LIVE_ROOT/$p" ]; then
+    DRIFT_COUNT=$((DRIFT_COUNT+1))
+  fi
+done < "$TMP_SYNC"
+
+if [ "$OLD" != "" ] && [ "$NEW" != "" ] && [ "$OLD" = "$NEW" ] && [ "$CHANGED_COUNT" = "0" ] && [ "$DRIFT_COUNT" = "0" ]; then
   echo "OK=1"
   echo "OLD=$OLD"
   echo "NEW=$NEW"
   echo "SYNC_COUNT=$SYNC_COUNT"
   echo "CHANGED_COUNT=0"
+  echo "DRIFT_COUNT=0"
   echo "NO_CHANGES=1"
   echo "STAGING_DIR="
   echo "BACKUP="
@@ -5923,6 +5941,7 @@ echo "OLD=$OLD"
 echo "NEW=$NEW"
 echo "SYNC_COUNT=$SYNC_COUNT"
 echo "CHANGED_COUNT=$CHANGED_COUNT"
+echo "DRIFT_COUNT=$DRIFT_COUNT"
 echo "NO_CHANGES=0"
 echo "STAGING_DIR=$STAGING_DIR"
 echo "BACKUP=$BACKUP_TAR"
