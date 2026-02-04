@@ -819,7 +819,7 @@ class ChannelTransferView(ui.View):
             self.category_select = None
     
     async def on_channel_select(self, interaction: discord.Interaction):
-        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        ok, err = await self.admin_bot._slash_owner_guard(interaction)
         if not ok:
             await self.admin_bot._interaction_reply(interaction, content=err, ephemeral=True)
             return
@@ -844,7 +844,7 @@ class ChannelTransferView(ui.View):
             await interaction.response.send_message(f"❌ Error: {str(e)[:200]}", ephemeral=True)
     
     async def on_category_select(self, interaction: discord.Interaction):
-        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        ok, err = await self.admin_bot._slash_owner_guard(interaction)
         if not ok:
             await self.admin_bot._interaction_reply(interaction, content=err, ephemeral=True)
             return
@@ -999,7 +999,7 @@ class BotSelectView(ui.View):
     
     async def on_select(self, interaction: discord.Interaction):
         """Handle bot selection"""
-        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        ok, err = await self.admin_bot._slash_owner_guard(interaction)
         if not ok:
             await self.admin_bot._interaction_reply(interaction, content=err, ephemeral=True)
             return
@@ -1801,7 +1801,7 @@ class BotSelectView(ui.View):
     
     async def _handle_info(self, interaction, bot_name, bot_info):
         """Handle bot info (dropdown)."""
-        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        ok, err = await self.admin_bot._slash_owner_guard(interaction)
         if not ok:
             await interaction.followup.send(err, ephemeral=True)
             return
@@ -1850,7 +1850,7 @@ class BotSelectView(ui.View):
     
     async def _handle_config(self, interaction, bot_name, bot_info):
         """Handle bot config"""
-        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        ok, err = await self.admin_bot._slash_owner_guard(interaction)
         if not ok:
             await interaction.followup.send(err, ephemeral=True)
             return
@@ -1859,7 +1859,7 @@ class BotSelectView(ui.View):
 
     async def _handle_secrets(self, interaction, bot_name, bot_info):
         """Handle bot secrets status (masked) + update flow."""
-        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        ok, err = await self.admin_bot._slash_owner_guard(interaction)
         if not ok:
             await interaction.followup.send(err, ephemeral=True)
             return
@@ -1919,7 +1919,7 @@ class BotSelectView(ui.View):
 
     async def _handle_fileview(self, interaction, bot_name, bot_info):
         """Show a quick file listing (sizes + mtimes) for a bot folder."""
-        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        ok, err = await self.admin_bot._slash_owner_guard(interaction)
         if not ok:
             await interaction.followup.send(err, ephemeral=True)
             return
@@ -2017,7 +2017,7 @@ class BotSelectView(ui.View):
 
     async def _handle_details(self, interaction, bot_name, bot_info):
         """Show systemd details via botctl.sh (dropdown action)."""
-        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        ok, err = await self.admin_bot._slash_owner_guard(interaction)
         if not ok:
             await interaction.followup.send(err, ephemeral=True)
             return
@@ -2028,7 +2028,7 @@ class BotSelectView(ui.View):
 
     async def _handle_logs(self, interaction, bot_name, bot_info):
         """Show journalctl logs via botctl.sh (dropdown action)."""
-        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        ok, err = await self.admin_bot._slash_owner_guard(interaction)
         if not ok:
             await interaction.followup.send(err, ephemeral=True)
             return
@@ -2063,7 +2063,7 @@ class BotConfigEditModal(ui.Modal):
         self.add_item(self.json_value)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        ok, err = await self.admin_bot._slash_owner_guard(interaction)
         if not ok:
             await self.admin_bot._interaction_reply(interaction, content=err, ephemeral=True)
             return
@@ -2104,7 +2104,7 @@ class BotConfigActionsView(ui.View):
         self.bot_key = str(bot_key or "").strip().lower()
 
     async def _deny_if_needed(self, interaction: discord.Interaction) -> bool:
-        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        ok, err = await self.admin_bot._slash_owner_guard(interaction)
         if not ok:
             await self.admin_bot._interaction_reply(interaction, content=err, ephemeral=True)
             return True
@@ -2156,7 +2156,7 @@ class BotSecretsEditModal(ui.Modal):
         self.add_item(self.json_value)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        ok, err = await self.admin_bot._slash_owner_guard(interaction)
         if not ok:
             await self.admin_bot._interaction_reply(interaction, content=err, ephemeral=True)
             return
@@ -2198,7 +2198,7 @@ class BotSecretsActionsView(ui.View):
         self.bot_key = str(bot_key or "").strip().lower()
 
     async def _deny_if_needed(self, interaction: discord.Interaction) -> bool:
-        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        ok, err = await self.admin_bot._slash_owner_guard(interaction)
         if not ok:
             await self.admin_bot._interaction_reply(interaction, content=err, ephemeral=True)
             return True
@@ -2223,7 +2223,7 @@ class StartBotView(ui.View):
     @ui.button(label="🟢 Start Bot", style=discord.ButtonStyle.success)
     async def start_bot(self, interaction: discord.Interaction, button: ui.Button):
         """Start the bot when button is clicked"""
-        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        ok, err = await self.admin_bot._slash_owner_guard(interaction)
         if not ok:
             await self.admin_bot._interaction_reply(interaction, content=err, ephemeral=True)
             return
@@ -2323,13 +2323,13 @@ class StartBotView(ui.View):
 
 
 class RSAdminSlashCog(commands.Cog):
-    """Slash-only command surface for RSAdminBot (ephemeral, test-server, owner-only)."""
+    """Slash-only command surface for RSAdminBot (ephemeral, allowed guilds, owner/admin-only)."""
 
     def __init__(self, admin_bot_instance: "RSAdminBot"):
         self.admin_bot = admin_bot_instance
 
     async def _guard(self, interaction: discord.Interaction) -> bool:
-        ok, err = self.admin_bot._slash_owner_guard(interaction)
+        ok, err = await self.admin_bot._slash_owner_guard(interaction)
         if not ok:
             await self.admin_bot._interaction_reply(interaction, content=err, ephemeral=True)
             return False
@@ -2414,7 +2414,7 @@ class RSAdminSlashCog(commands.Cog):
                 self._started = False
 
             async def _deny_if_needed(self, i: discord.Interaction) -> bool:
-                ok, err = admin_bot._slash_owner_guard(i)
+                ok, err = await admin_bot._slash_owner_guard(i)
                 if not ok:
                     await admin_bot._interaction_reply(i, content=err, ephemeral=True)
                     return True
@@ -2453,7 +2453,7 @@ class RSAdminSlashCog(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(name="delete", description="Delete a channel (owner-only).")
+    @app_commands.command(name="delete", description="Delete a channel (owner/admin-only).")
     async def delete(self, interaction: discord.Interaction) -> None:
         if not await self._guard(interaction):
             return
@@ -2480,7 +2480,7 @@ class RSAdminSlashCog(commands.Cog):
                 return self.parent._channel_options(guild, current_channel_id=current_channel_id)  # type: ignore[attr-defined]
 
             async def on_channel_selected(self, i: discord.Interaction):
-                ok, err = admin_bot._slash_owner_guard(i)
+                ok, err = await admin_bot._slash_owner_guard(i)
                 if not ok:
                     await admin_bot._interaction_reply(i, content=err, ephemeral=True)
                     return
@@ -2493,7 +2493,7 @@ class RSAdminSlashCog(commands.Cog):
 
             @ui.button(label="Delete now", style=discord.ButtonStyle.danger)
             async def confirm_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
-                ok, err = admin_bot._slash_owner_guard(i)
+                ok, err = await admin_bot._slash_owner_guard(i)
                 if not ok:
                     await admin_bot._interaction_reply(i, content=err, ephemeral=True)
                     return
@@ -2520,7 +2520,7 @@ class RSAdminSlashCog(commands.Cog):
 
             @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
             async def cancel_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
-                ok, err = admin_bot._slash_owner_guard(i)
+                ok, err = await admin_bot._slash_owner_guard(i)
                 if not ok:
                     await admin_bot._interaction_reply(i, content=err, ephemeral=True)
                     return
@@ -2540,7 +2540,7 @@ class RSAdminSlashCog(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(name="transfer", description="Move a channel to a category (owner-only).")
+    @app_commands.command(name="transfer", description="Move a channel to a category (owner/admin-only).")
     async def transfer(self, interaction: discord.Interaction) -> None:
         if not await self._guard(interaction):
             return
@@ -2578,7 +2578,7 @@ class RSAdminSlashCog(commands.Cog):
                 self.confirm_btn.disabled = not (self.channel_id and self.category_id)  # type: ignore[attr-defined]
 
             async def on_channel_selected(self, i: discord.Interaction):
-                ok, err = admin_bot._slash_owner_guard(i)
+                ok, err = await admin_bot._slash_owner_guard(i)
                 if not ok:
                     await admin_bot._interaction_reply(i, content=err, ephemeral=True)
                     return
@@ -2590,7 +2590,7 @@ class RSAdminSlashCog(commands.Cog):
                 await i.response.edit_message(view=self)
 
             async def on_category_selected(self, i: discord.Interaction):
-                ok, err = admin_bot._slash_owner_guard(i)
+                ok, err = await admin_bot._slash_owner_guard(i)
                 if not ok:
                     await admin_bot._interaction_reply(i, content=err, ephemeral=True)
                     return
@@ -2603,7 +2603,7 @@ class RSAdminSlashCog(commands.Cog):
 
             @ui.button(label="Confirm transfer", style=discord.ButtonStyle.primary)
             async def confirm_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
-                ok, err = admin_bot._slash_owner_guard(i)
+                ok, err = await admin_bot._slash_owner_guard(i)
                 if not ok:
                     await admin_bot._interaction_reply(i, content=err, ephemeral=True)
                     return
@@ -2635,7 +2635,7 @@ class RSAdminSlashCog(commands.Cog):
 
             @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
             async def cancel_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
-                ok, err = admin_bot._slash_owner_guard(i)
+                ok, err = await admin_bot._slash_owner_guard(i)
                 if not ok:
                     await admin_bot._interaction_reply(i, content=err, ephemeral=True)
                     return
@@ -2653,7 +2653,7 @@ class RSAdminSlashCog(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(name="archive", description="Mirror-archive a channel into an archive category (owner-only).")
+    @app_commands.command(name="archive", description="Mirror-archive a channel into an archive category (owner/admin-only).")
     async def archive(self, interaction: discord.Interaction) -> None:
         if not await self._guard(interaction):
             return
@@ -2694,7 +2694,7 @@ class RSAdminSlashCog(commands.Cog):
                 self.start_btn.disabled = not bool(self.category_id and self.mode)  # type: ignore[attr-defined]
 
             async def on_category_selected(self, i: discord.Interaction):
-                ok, err = admin_bot._slash_owner_guard(i)
+                ok, err = await admin_bot._slash_owner_guard(i)
                 if not ok:
                     await admin_bot._interaction_reply(i, content=err, ephemeral=True)
                     return
@@ -2719,7 +2719,7 @@ class RSAdminSlashCog(commands.Cog):
 
             @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
             async def cancel_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
-                ok, err = admin_bot._slash_owner_guard(i)
+                ok, err = await admin_bot._slash_owner_guard(i)
                 if not ok:
                     await admin_bot._interaction_reply(i, content=err, ephemeral=True)
                     return
@@ -2730,7 +2730,7 @@ class RSAdminSlashCog(commands.Cog):
 
             @ui.button(label="Start archive", style=discord.ButtonStyle.success)
             async def start_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
-                ok, err = admin_bot._slash_owner_guard(i)
+                ok, err = await admin_bot._slash_owner_guard(i)
                 if not ok:
                     await admin_bot._interaction_reply(i, content=err, ephemeral=True)
                     return
@@ -3428,7 +3428,7 @@ class RSAdminSlashCog(commands.Cog):
                 self._started = False
 
             async def _deny_if_needed(self, i: discord.Interaction) -> bool:
-                ok, err = admin_bot._slash_owner_guard(i)
+                ok, err = await admin_bot._slash_owner_guard(i)
                 if not ok:
                     await admin_bot._interaction_reply(i, content=err, ephemeral=True)
                     return True
@@ -6991,8 +6991,12 @@ echo "CHANGED_END"
                 ids.append(gid)
         return ids
 
-    def _slash_owner_guard(self, interaction: discord.Interaction) -> tuple[bool, str]:
-        """Guard for all RSAdminBot slash commands: allowed guild(s) + owner/admin only."""
+    async def _slash_owner_guard(self, interaction: discord.Interaction) -> tuple[bool, str]:
+        """Guard for all RSAdminBot slash commands: allowed guild(s) + owner/admin only.
+
+        Important: Component interactions (buttons/selects) sometimes arrive without a cached
+        `discord.Member` instance. In that case we fetch the member so role-based admin checks work.
+        """
         if not interaction or not getattr(interaction, "user", None):
             return False, "❌ Missing interaction user."
         if not getattr(interaction, "guild", None):
@@ -7017,6 +7021,11 @@ echo "CHANGED_END"
                 member = interaction.user
             else:
                 member = interaction.guild.get_member(user_id)
+                if member is None:
+                    try:
+                        member = await interaction.guild.fetch_member(user_id)
+                    except Exception:
+                        member = None
         except Exception:
             member = None
 
@@ -7024,12 +7033,6 @@ echo "CHANGED_END"
             return True, ""
 
         return False, "❌ Owner/Admin-only command."
-
-        # If we couldn't determine an owner id, fail closed.
-        if not owner_id:
-            return False, "❌ Server owner is unknown; refusing to run."
-
-        return True, ""
 
     async def _interaction_reply(
         self,

@@ -3704,8 +3704,25 @@ async def _channel_limits_post_counts_for_channel_event(*, action: str, channel:
         pass
 
     counts = _channel_limits_counts(g)
-    # Every create/delete: post only the channel count card (no extra breakdown).
-    e = _channel_limits_make_embed(title="Channel Count", description=_channel_limits_fmt_big_line(counts), color=0x5865F2)
+    # Every create/delete: post the event card (channel details + simple count; no breakdown).
+    ch_name = str(getattr(channel, "name", "") or "").strip() or "unknown"
+    ch_id = int(getattr(channel, "id", 0) or 0)
+    ch_type = str(getattr(getattr(channel, "type", None), "name", "") or getattr(channel, "type", "") or "").strip() or "unknown"
+    act = str(action or "").strip().lower()
+    if act == "created":
+        title = "➕ Channel created"
+        color = 0x57F287
+    elif act == "deleted":
+        title = "➖ Channel deleted"
+        color = 0xED4245
+    else:
+        title = f"📌 Channel {action}".strip()
+        color = 0x5865F2
+
+    ch_label = f"<#{ch_id}>" if ch_id else f"`{ch_name}`"
+    e = _channel_limits_make_embed(title=title, color=color)
+    e.add_field(name="Channel", value=f"{ch_label}\nName: `{ch_name}`\nType: `{ch_type}`", inline=False)
+    e.add_field(name="Counts", value=_channel_limits_fmt_big_line(counts)[:1024], inline=False)
     await _channel_limits_post(embed=e)
 
     # Warnings: ping Admin role when thresholds are reached (ticket categories + 450/500 total).
