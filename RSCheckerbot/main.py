@@ -3649,8 +3649,10 @@ def _channel_limits_ticket_category_counts(guild: discord.Guild) -> dict[str, in
         cat = guild.get_channel(int(cid))
         if not isinstance(cat, discord.CategoryChannel):
             return 0
+        # Only count text channels (ticket channels are text). This avoids counting any unexpected types.
         with suppress(Exception):
-            return int(len(list(getattr(cat, "channels", None) or [])))
+            chans = list(getattr(cat, "channels", None) or [])
+            return int(sum(1 for ch in chans if isinstance(ch, discord.TextChannel)))
         return 0
 
     out["cancellation"] = _count_for_category_id(int(_TICKET_CATEGORY_ID_CANCELLATION or 0))
@@ -3731,14 +3733,22 @@ async def _channel_limits_post_counts_for_channel_event(*, action: str, channel:
     # Total channel limit warning at configured threshold (default 450/500).
     warn_total_at = int(CHANNEL_LIMITS_TOTAL_WARN_AT or 0)
     if warn_total_at > 0 and total >= warn_total_at and (last_total < warn_total_at):
+        desc_lines = []
+        if admin_ping:
+            desc_lines.append(admin_ping)
+        desc_lines.append("Channel Count")
+        desc_lines.append(f"Approaching limit: **{total}/{total_limit}**")
         e_total = _channel_limits_make_embed(
             title="⚠️ Approaching Discord channel limits",
-            description=f"Channel Count\nApproaching limit: **{total}/{total_limit}**",
+            description="\n".join(desc_lines),
             color=0xFEE75C,
         )
         e_total.add_field(name="Channel Count", value=_channel_limits_fmt_big_line(counts)[:1024], inline=False)
-        warn_content = f"{admin_ping}\n⚠️ Approaching Discord channel limits" if admin_ping else None
-        await _channel_limits_post(embed=e_total, content=warn_content, allowed_mentions=(admin_mentions if admin_ping else discord.AllowedMentions.none()))
+        await _channel_limits_post(
+            embed=e_total,
+            content=None,
+            allowed_mentions=(admin_mentions if admin_ping else discord.AllowedMentions.none()),
+        )
 
     # Ticket category warnings at configured threshold (default 40/50).
     warn_cat_at = int(CHANNEL_LIMITS_TICKET_CATEGORY_WARN_AT or 0)
@@ -3753,14 +3763,22 @@ async def _channel_limits_post_counts_for_channel_event(*, action: str, channel:
         prev = _last_ticket(key)
         if warn_cat_at > 0 and cur >= warn_cat_at and (prev < warn_cat_at):
             lbl = label_map.get(key) or str(key).title()
+            desc_lines = []
+            if admin_ping:
+                desc_lines.append(admin_ping)
+            desc_lines.append(lbl)
+            desc_lines.append(f"Approaching limit: **{cur}/{cat_limit}**")
             e_cat = _channel_limits_make_embed(
                 title="⚠️ Approaching Discord channel limits",
-                description=f"{lbl}\nApproaching limit: **{cur}/{cat_limit}**",
+                description="\n".join(desc_lines),
                 color=0xFEE75C,
             )
             e_cat.add_field(name="Channel Count", value=_channel_limits_fmt_big_line(counts)[:1024], inline=False)
-            warn_content = f"{admin_ping}\n⚠️ Approaching Discord channel limits" if admin_ping else None
-            await _channel_limits_post(embed=e_cat, content=warn_content, allowed_mentions=(admin_mentions if admin_ping else discord.AllowedMentions.none()))
+            await _channel_limits_post(
+                embed=e_cat,
+                content=None,
+                allowed_mentions=(admin_mentions if admin_ping else discord.AllowedMentions.none()),
+            )
 
     _CHANNEL_LIMITS_LAST_TOTAL = int(total)
     if not isinstance(_CHANNEL_LIMITS_LAST_TICKET_COUNTS, dict):
