@@ -3708,20 +3708,34 @@ async def _channel_limits_post_counts_for_channel_event(*, action: str, channel:
     ch_name = str(getattr(channel, "name", "") or "").strip() or "unknown"
     ch_id = int(getattr(channel, "id", 0) or 0)
     ch_type = str(getattr(getattr(channel, "type", None), "name", "") or getattr(channel, "type", "") or "").strip() or "unknown"
+    # Determine a friendlier object kind for title/field labels.
+    is_category = isinstance(channel, discord.CategoryChannel) or (str(ch_type).lower() == "category")
+    if is_category:
+        kind_label = "Category"
+    else:
+        # Keep it simple and consistent with your examples.
+        kind_label = "Channel"
     act = str(action or "").strip().lower()
     if act == "created":
-        title = "➕ Channel created"
+        title = f"➕ {kind_label} created"
         color = 0x57F287
     elif act == "deleted":
-        title = "➖ Channel deleted"
+        title = f"➖ {kind_label} deleted"
         color = 0xED4245
     else:
-        title = f"📌 Channel {action}".strip()
+        title = f"📌 {kind_label} {action}".strip()
         color = 0x5865F2
 
-    ch_label = f"<#{ch_id}>" if ch_id else f"`{ch_name}`"
+    # Categories can't be mentioned like <#id>. For deleted objects, the mention is also not useful,
+    # but we keep it for non-category channels so it's clickable when applicable.
+    if (not is_category) and ch_id:
+        ch_label = f"<#{ch_id}>"
+    else:
+        ch_label = f"`{ch_name}`"
     e = _channel_limits_make_embed(title=title, color=color)
-    e.add_field(name="Channel", value=f"{ch_label}\nName: `{ch_name}`\nType: `{ch_type}`", inline=False)
+    field_label = "Category" if is_category else "Channel"
+    id_line = f"ID: `{ch_id}`" if ch_id else "ID: `unknown`"
+    e.add_field(name=field_label, value=f"{ch_label}\nName: `{ch_name}`\nType: `{ch_type}`\n{id_line}", inline=False)
     e.add_field(name="Counts", value=_channel_limits_fmt_big_line(counts)[:1024], inline=False)
     await _channel_limits_post(embed=e)
 
