@@ -187,10 +187,26 @@ class _RsFsManualResolveView(discord.ui.View):
         err = str(it.get("error") or "").strip()
         rurl = str(it.get("resolved_url") or "").strip()
         rtitle = str(it.get("resolved_title") or "").strip()
+        
+        # Get release ID for this item
+        rid = 0
+        try:
+            if store and sku:
+                key = self._bot._rs_fs_override_key(store, sku)
+                rid = int(self._rid_by_key.get(key, 0) or 0)
+        except Exception:
+            rid = 0
+        
         fields: List[Tuple[str, str, bool]] = [
             ("Item", f"`{self._idx + 1}` / `{len(self._items)}`", True),
             ("Store / SKU", f"`{store}` / `{sku}`", False),
         ]
+        
+        # Add release ID and remove command if available
+        if rid > 0:
+            fields.append(("Release ID", f"`{rid}`", True))
+            fields.append(("Remove Command", f"```\n/removereleaseid release_id: {rid}\n```", False))
+        
         if title:
             fields.append(("Current title", title[:900], False))
         if url:
@@ -281,9 +297,7 @@ class _RsFsManualResolveView(discord.ui.View):
             # If title was not provided, use existing title if available
             t = str(it.get("title") or "").strip()
         
-        # If title is needed but still empty, use URL as fallback (for display)
-        if needs_title and not t:
-            t = u if u else ""
+        # Never use URL as title fallback - keep title empty if not found
 
         # Compute affiliate URL (plain) and upsert into sheet immediately.
         aff = u
@@ -2557,8 +2571,7 @@ class RSForwarderBot:
                                 break
                         if not url:
                             url = (urls[0] if urls else "").strip()
-                        if not title:
-                            title = url or ""
+                        # Never use URL as title fallback - keep title empty if not found
                         return title, url
 
                     # Pass 1: ID-like fields (SKU/PID/TCIN/ASIN/UPC/etc)
@@ -2646,8 +2659,7 @@ class RSForwarderBot:
                         url = str(getattr(e, "url", "") or "").strip()
                         if not url:
                             url = self._first_url_in_text(blob)
-                        if not title:
-                            title = url or ""
+                        # Never use URL as title fallback - keep title empty if not found
                         if debug_enabled:
                             try:
                                 g_id = int(getattr(getattr(ch, "guild", None), "id", 0) or 0)
