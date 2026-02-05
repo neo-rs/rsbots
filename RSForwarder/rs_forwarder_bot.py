@@ -121,11 +121,15 @@ class _RsFsManualResolveModal(discord.ui.Modal):
 
 
 class _RsFsManualResolveView(discord.ui.View):
-    def __init__(self, bot_obj: "RSForwarderBot", ctx, entries: List[rs_fs_sheet_sync.RsFsPreviewEntry]):
+    def __init__(self, bot_obj: "RSForwarderBot", ctx, entries: List[rs_fs_sheet_sync.RsFsPreviewEntry], *, merged_text: str = "", rid_by_key: Dict[str, int] = None, all_entries: List[rs_fs_sheet_sync.RsFsPreviewEntry] = None):
         super().__init__(timeout=900)
         self._bot = bot_obj
         self._owner_id = int(getattr(getattr(ctx, "author", None), "id", 0) or 0)
         self._channel = getattr(ctx, "channel", None)
+        self._ctx = ctx  # Store ctx for sending messages after Finish
+        self._merged_text = merged_text  # Store merged_text for Remove Helper generation
+        self._rid_by_key = rid_by_key or {}  # Store rid_by_key for Remove Helper generation
+        self._all_entries = all_entries or entries  # Store all entries for Remove Helper generation
         self._items: List[Dict[str, str]] = []
         for e in entries or []:
             self._items.append(
@@ -201,12 +205,23 @@ class _RsFsManualResolveView(discord.ui.View):
         # Update button labels before rendering
         self._update_button_labels()
         
+        # Enable/disable Previous and Next buttons based on position
+        for child in self.children:
+            try:
+                label = str(getattr(child, "label", "") or "")
+                if label == "Previous":
+                    child.disabled = (self._idx <= 0)  # type: ignore[attr-defined]
+                elif label == "Next":
+                    child.disabled = (self._idx >= len(self._items) - 1)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        
         return _rsfs_embed(
             "RS-FS Manual Resolve",
             status="Action required",
             color=discord.Color.orange(),
             fields=fields,
-            footer="RS-FS • Click button to provide missing info • Next = view next item",
+            footer="RS-FS • Click button to provide missing info • Previous/Next = navigate items",
         )
 
     async def _guard(self, interaction: discord.Interaction) -> bool:
@@ -346,7 +361,29 @@ class _RsFsManualResolveView(discord.ui.View):
             except Exception:
                 pass
 
-    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        if not await self._guard(interaction):
+            return
+        self._idx = max(0, self._idx - 1)
+        # Enable/disable buttons based on position
+        for child in self.children:
+            try:
+                label = str(getattr(child, "label", "") or "")
+                if label == "Next":
+                    # Enable Next if not at the end
+                    child.disabled = (self._idx >= len(self._items) - 1)  # type: ignore[attr-defined]
+                elif label == "Previous":
+                    # Disable Previous if at the start
+                    child.disabled = (self._idx <= 0)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        try:
+            await interaction.response.edit_message(embed=self._render_embed(), view=self)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, row=1)
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
         if not await self._guard(interaction):
             return
@@ -364,7 +401,7 @@ class _RsFsManualResolveView(discord.ui.View):
         except Exception:
             pass
 
-    @discord.ui.button(label="Finish", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Finish", style=discord.ButtonStyle.danger, row=1)
     async def finish(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
         if not await self._guard(interaction):
             return
@@ -375,6 +412,17 @@ class _RsFsManualResolveView(discord.ui.View):
                 pass
         try:
             await interaction.response.edit_message(embed=self._render_embed(), view=self)
+        except Exception:
+            pass
+        
+        # After Finish, trigger Remove Helper list generation
+        try:
+            await self._bot._generate_remove_helper_list(
+                self._ctx,
+                self._all_entries,
+                self._merged_text,
+                self._rid_by_key,
+            )
         except Exception:
             pass
 
@@ -1394,6 +1442,153 @@ class RSForwarderBot:
             return (uid in self._mavely_admin_user_ids()) or (uid in self._mavely_alert_user_ids())
         except Exception:
             return False
+
+    async def _generate_remove_helper_list(
+        self,
+        ctx,
+        entries: List[rs_fs_sheet_sync.RsFsPreviewEntry],
+        merged_text: str,
+        rid_by_key: Dict[str, int],
+    ) -> None:
+        """
+        Generate and send Remove Helper list embeds (one per store + unparseable).
+        Called after manual resolve Finish button or if no manual resolution needed.
+        """
+        try:
+            by_store: Dict[str, List[rs_fs_sheet_sync.RsFsPreviewEntry]] = {}
+            for e in entries or []:
+                st = str(getattr(e, "store", "") or "").strip() or "Unknown"
+                by_store.setdefault(st, []).append(e)
+
+            # Collect "unparseable" records as: release IDs present in the merged list that
+            # did NOT parse into a (store, sku) item for the public sheet.
+            parsed_ids: Set[int] = set()
+            try:
+                parsed_ids = {int(v) for v in (rid_by_key or {}).values() if int(v or 0) > 0}
+            except Exception:
+                parsed_ids = set()
+            recs0 = zephyr_release_feed_parser.parse_release_feed_records(merged_text) or []
+            unparseable_recs = [
+                r
+                for r in recs0
+                if int(getattr(r, "release_id", 0) or 0) > 0 and int(getattr(r, "release_id", 0) or 0) not in parsed_ids
+            ]
+            # Deduplicate by release_id (keep first).
+            seen_rid: Set[int] = set()
+            unparseable_recs2 = []
+            for r in unparseable_recs:
+                ridv = int(getattr(r, "release_id", 0) or 0)
+                if ridv in seen_rid:
+                    continue
+                seen_rid.add(ridv)
+                unparseable_recs2.append(r)
+            unparseable_recs = unparseable_recs2
+
+            # Build SKU -> Store map from Current List sheet for unparseable items
+            sku_to_store: Dict[str, str] = {}
+            try:
+                current_list_rows = await self._rs_fs_sheet.fetch_current_list_rows()
+                for row in current_list_rows:
+                    if len(row) >= 3:
+                        store = str(row[1] or "").strip()  # Column B: Store
+                        sku = str(row[2] or "").strip()  # Column C: SKU/Label
+                        if store and sku:
+                            sku_to_store[sku.lower()] = store
+            except Exception:
+                pass
+
+            # Sort stores for stability.
+            for st in sorted(by_store.keys(), key=lambda s: s.lower()):
+                es = by_store.get(st) or []
+
+                def _rid_for(e2) -> int:
+                    try:
+                        return int(rid_by_key.get(self._rs_fs_override_key(getattr(e2, "store", ""), getattr(e2, "sku", ""))) or 0)
+                    except Exception:
+                        return 0
+
+                es = sorted(es, key=lambda e2: (_rid_for(e2) or 10**9, str(getattr(e2, "sku", "") or "")))
+
+                # Build formatted lines with command directly under each product
+                formatted_lines: List[str] = []
+                for e2 in es:
+                    sku2 = str(getattr(e2, "sku", "") or "").strip()
+                    title2 = str(getattr(e2, "title", "") or "").strip()
+                    rid2 = _rid_for(e2)
+                    if len(title2) > 60:
+                        title2 = title2[:57] + "..."
+                    info = f"`{rid2}` `{sku2}`" + (f" — {title2}" if title2 else "")
+                    if rid2:
+                        # Format: product info line followed immediately by remove command in code block
+                        formatted_lines.append(f"{info}\n```\n/removereleaseid release_id: {rid2}\n```")
+                    else:
+                        formatted_lines.append(info)
+
+                # Split across multiple embeds if needed.
+                part = 1
+                cur_lines: List[str] = []
+
+                def _render_desc(lines: List[str]) -> str:
+                    return "\n\n".join(lines).strip()
+
+                for line in formatted_lines:
+                    next_lines = cur_lines + [line]
+                    desc_try = _render_desc(next_lines)
+                    if len(desc_try) > 3800 and cur_lines:
+                        emb2 = discord.Embed(
+                            title=f"RS-FS Remove Helper — {st}" + (f" (part {part})" if part > 1 else ""),
+                            color=discord.Color.dark_teal(),
+                        )
+                        emb2.description = _render_desc(cur_lines)
+                        emb2.set_footer(text="Use the code block copy button")
+                        await ctx.send(embed=emb2, allowed_mentions=discord.AllowedMentions.none())
+                        part += 1
+                        cur_lines = [line]
+                    else:
+                        cur_lines.append(line)
+
+                if cur_lines:
+                    emb2 = discord.Embed(
+                        title=f"RS-FS Remove Helper — {st}" + (f" (part {part})" if part > 1 else ""),
+                        color=discord.Color.dark_teal(),
+                    )
+                    emb2.description = _render_desc(cur_lines)
+                    emb2.set_footer(text="Use the code block copy button")
+                    await ctx.send(embed=emb2, allowed_mentions=discord.AllowedMentions.none())
+
+            if unparseable_recs:
+                up_lines: List[str] = []
+                for r in unparseable_recs[:25]:
+                    rid2 = int(getattr(r, "release_id", 0) or 0)
+                    sk2 = str(getattr(r, "sku", "") or "").strip()
+                    st2 = str(getattr(r, "store", "") or "").strip()
+                    is_sku2 = bool(getattr(r, "is_sku_candidate", True))
+                    
+                    # Look up store from Current List sheet if available
+                    if not st2 and sk2:
+                        st2 = sku_to_store.get(sk2.lower(), "")
+                    
+                    kind = "non-SKU" if not is_sku2 else ("unknown-store" if not st2 else "unknown")
+                    # Format: product info line followed immediately by remove command in code block
+                    store_display = st2 if st2 else "unknown"
+                    info_line = f"`{rid2}` `{store_display}` {sk2}"
+                    if rid2:
+                        up_lines.append(f"{info_line}\n```\n/removereleaseid release_id: {rid2}\n```")
+                    else:
+                        up_lines.append(info_line)
+                emb_u = discord.Embed(
+                    title="RS-FS Remove Helper — Unparseable (could not parse store/SKU)",
+                    color=discord.Color.orange(),
+                )
+                desc = "\n\n".join(up_lines).strip()
+                emb_u.description = desc
+                emb_u.set_footer(text="These release IDs could not be mapped to a store/SKU automatically • Use code block copy")
+                await ctx.send(embed=emb_u, allowed_mentions=discord.AllowedMentions.none())
+        except Exception as e:
+            try:
+                print(f"[RS-FS] Remove Helper generation error: {e}")
+            except Exception:
+                pass
 
     async def _dm_user(self, user_id: int, content: Optional[str] = None, *, embed: Optional[discord.Embed] = None, view: Optional[discord.ui.View] = None) -> bool:
         """
@@ -5153,6 +5348,9 @@ class RSForwarderBot:
                             "source": src0,
                         }
                     
+                    # Initialize changes_list before try block so it's accessible in summary
+                    changes_list: List[Tuple[str, str, str, str]] = []  # (sku, store, title, url) for added/updated items
+                    
                     # After resolution, sync ALL items from Current List to Live List to keep them matched
                     # Re-read Current List to get all items (including ones that already had titles/URLs)
                     # and merge with newly resolved data
@@ -5179,13 +5377,46 @@ class RSForwarderBot:
                                 aff = str(row[8] or "").strip() if len(row) > 8 else ""
                             all_rows.append([store, sku, title, aff, url])
                         
+                        # Track changes: get current Live List state before sync
+                        try:
+                            live_before = await self._rs_fs_sheet.fetch_live_list_rows()
+                            live_before_map: Dict[str, Tuple[str, str]] = {}  # sku_lower -> (title, url)
+                            for row in live_before:
+                                if len(row) >= 3:
+                                    sku = str(row[1] or "").strip()
+                                    title = str(row[2] or "").strip() if len(row) > 2 else ""
+                                    url = str(row[3] or "").strip() if len(row) > 3 else ""
+                                    if sku:
+                                        live_before_map[sku.lower()] = (title, url)
+                        except Exception:
+                            live_before_map = {}
+                        
                         # Sync all Current List items to Live List
                         if all_rows:
                             ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(all_rows)
+                            
+                            # Track what was added/updated
+                            for store, sku, title, aff, url in all_rows:
+                                sku_lower = sku.lower()
+                                prev_title, prev_url = live_before_map.get(sku_lower, ("", ""))
+                                # Track if title or URL was added/updated
+                                if (title and title != prev_title) or (url and url != prev_url):
+                                    changes_list.append((sku, store, title, url))
+                        else:
+                            ok, msg, added, updated, deleted = False, "no rows to sync", 0, 0, 0
                     except Exception as e:
                         # Fallback to just syncing resolved items if full sync fails
                         rows = [[e.store, e.sku, e.title, e.affiliate_url, e.monitor_url] for e in entries]
                         ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(rows)
+                        # Track changes from resolved entries
+                        changes_list = []
+                        for e in entries:
+                            st = str(getattr(e, "store", "") or "").strip()
+                            sk = str(getattr(e, "sku", "") or "").strip()
+                            t = str(getattr(e, "title", "") or "").strip()
+                            u = str(getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
+                            if st and sk and (t or u):
+                                changes_list.append((sk, st, t, u))
 
                     # Write back to History cache + update Current List with resolved columns.
                     try:
@@ -5252,6 +5483,25 @@ class RSForwarderBot:
                                 changes_text = "No changes"
                             summ.add_field(name="Sheet changes", value=changes_text, inline=True)
                             
+                            # Show detailed list of changes (title/url → SKU)
+                            if changes_list:
+                                changes_detail = []
+                                for sku, store, title, url in changes_list[:20]:  # Limit to first 20
+                                    title_display = title[:50] + "..." if len(title) > 50 else title
+                                    url_display = url[:60] + "..." if len(url) > 60 else url
+                                    if title and url:
+                                        changes_detail.append(f"`{store} {sku}`\n  Title: {title_display}\n  Store URL: {url_display}")
+                                    elif title:
+                                        changes_detail.append(f"`{store} {sku}`\n  Title: {title_display}")
+                                    elif url:
+                                        changes_detail.append(f"`{store} {sku}`\n  Store URL: {url_display}")
+                                    else:
+                                        changes_detail.append(f"`{store} {sku}`")
+                                changes_detail_text = "\n\n".join(changes_detail)
+                                if len(changes_list) > 20:
+                                    changes_detail_text += f"\n\n... and {len(changes_list) - 20} more"
+                                summ.add_field(name="Changes (Title/URL → SKU)", value=changes_detail_text or "—", inline=False)
+                            
                             # Resolution methods
                             resolution_text = f"manual `{n_manual}`\nmonitor `{n_monitor}`\nwebsite `{n_web}`"
                             summ.add_field(name="Resolution", value=resolution_text, inline=True)
@@ -5281,121 +5531,8 @@ class RSForwarderBot:
                                 allowed_mentions=discord.AllowedMentions.none(),
                             )
 
-                        # Management output: one embed per store with release_id + sku (+ short title) and
-                        # a copy-ready /removereleaseid command.
-                        try:
-                            by_store: Dict[str, List[rs_fs_sheet_sync.RsFsPreviewEntry]] = {}
-                            for e in entries or []:
-                                st = str(getattr(e, "store", "") or "").strip() or "Unknown"
-                                by_store.setdefault(st, []).append(e)
-
-                            # Collect "unparseable" records as: release IDs present in the merged list that
-                            # did NOT parse into a (store, sku) item for the public sheet.
-                            parsed_ids: Set[int] = set()
-                            try:
-                                parsed_ids = {int(v) for v in (rid_by_key or {}).values() if int(v or 0) > 0}
-                            except Exception:
-                                parsed_ids = set()
-                            recs0 = zephyr_release_feed_parser.parse_release_feed_records(merged_text) or []
-                            unparseable_recs = [
-                                r
-                                for r in recs0
-                                if int(getattr(r, "release_id", 0) or 0) > 0 and int(getattr(r, "release_id", 0) or 0) not in parsed_ids
-                            ]
-                            # Deduplicate by release_id (keep first).
-                            seen_rid: Set[int] = set()
-                            unparseable_recs2 = []
-                            for r in unparseable_recs:
-                                ridv = int(getattr(r, "release_id", 0) or 0)
-                                if ridv in seen_rid:
-                                    continue
-                                seen_rid.add(ridv)
-                                unparseable_recs2.append(r)
-                            unparseable_recs = unparseable_recs2
-
-                            # Sort stores for stability.
-                            for st in sorted(by_store.keys(), key=lambda s: s.lower()):
-                                es = by_store.get(st) or []
-
-                                def _rid_for(e2) -> int:
-                                    try:
-                                        return int(rid_by_key.get(self._rs_fs_override_key(getattr(e2, "store", ""), getattr(e2, "sku", ""))) or 0)
-                                    except Exception:
-                                        return 0
-
-                                es = sorted(es, key=lambda e2: (_rid_for(e2) or 10**9, str(getattr(e2, "sku", "") or "")))
-
-                                # Build formatted lines with command directly under each product
-                                formatted_lines: List[str] = []
-                                for e2 in es:
-                                    sku2 = str(getattr(e2, "sku", "") or "").strip()
-                                    title2 = str(getattr(e2, "title", "") or "").strip()
-                                    rid2 = _rid_for(e2)
-                                    if len(title2) > 60:
-                                        title2 = title2[:57] + "..."
-                                    info = f"`{rid2}` `{sku2}`" + (f" — {title2}" if title2 else "")
-                                    if rid2:
-                                        # Format: product info line followed immediately by remove command
-                                        formatted_lines.append(f"{info}\n```\n/removereleaseid release_id: {rid2}\n```")
-                                    else:
-                                        formatted_lines.append(info)
-
-                                # Split across multiple embeds if needed.
-                                part = 1
-                                cur_lines: List[str] = []
-
-                                def _render_desc(lines: List[str]) -> str:
-                                    return "\n\n".join(lines).strip()
-
-                                for line in formatted_lines:
-                                    next_lines = cur_lines + [line]
-                                    desc_try = _render_desc(next_lines)
-                                    if len(desc_try) > 3800 and cur_lines:
-                                        emb2 = discord.Embed(
-                                            title=f"RS-FS Remove Helper — {st}" + (f" (part {part})" if part > 1 else ""),
-                                            color=discord.Color.dark_teal(),
-                                        )
-                                        emb2.description = _render_desc(cur_lines)
-                                        emb2.set_footer(text="Use the code block copy button")
-                                        await ctx.send(embed=emb2, allowed_mentions=discord.AllowedMentions.none())
-                                        part += 1
-                                        cur_lines = [line]
-                                    else:
-                                        cur_lines.append(line)
-
-                                if cur_lines:
-                                    emb2 = discord.Embed(
-                                        title=f"RS-FS Remove Helper — {st}" + (f" (part {part})" if part > 1 else ""),
-                                        color=discord.Color.dark_teal(),
-                                    )
-                                    emb2.description = _render_desc(cur_lines)
-                                    emb2.set_footer(text="Use the code block copy button")
-                                    await ctx.send(embed=emb2, allowed_mentions=discord.AllowedMentions.none())
-
-                            if unparseable_recs:
-                                up_lines: List[str] = []
-                                for r in unparseable_recs[:25]:
-                                    rid2 = int(getattr(r, "release_id", 0) or 0)
-                                    sk2 = str(getattr(r, "sku", "") or "").strip()
-                                    st2 = str(getattr(r, "store", "") or "").strip()
-                                    is_sku2 = bool(getattr(r, "is_sku_candidate", True))
-                                    kind = "non-SKU" if not is_sku2 else ("unknown-store" if not st2 else "unknown")
-                                    # Format: product info line followed immediately by remove command
-                                    info_line = f"`{rid2}` `{kind}` {sk2}"
-                                    if rid2:
-                                        up_lines.append(f"{info_line}\n```\n/removereleaseid release_id: {rid2}\n```")
-                                    else:
-                                        up_lines.append(info_line)
-                                emb_u = discord.Embed(
-                                    title="RS-FS Remove Helper — Unparseable (could not parse store/SKU)",
-                                    color=discord.Color.orange(),
-                                )
-                                desc = "\n\n".join(up_lines).strip()
-                                emb_u.description = desc
-                                emb_u.set_footer(text="These release IDs could not be mapped to a store/SKU automatically • Use code block copy")
-                                await ctx.send(embed=emb_u, allowed_mentions=discord.AllowedMentions.none())
-                        except Exception:
-                            pass
+                        # Remove Helper list generation moved to after Finish button click
+                        # (see _generate_remove_helper_list method)
 
                         # Offer manual resolution for any items missing titles or URLs (regardless of source)
                         needs_manual = [
@@ -5409,14 +5546,22 @@ class RSForwarderBot:
                             )
                         ]
                         if needs_manual:
-                            view = _RsFsManualResolveView(self, ctx, needs_manual)  # type: ignore[name-defined]
+                            view = _RsFsManualResolveView(
+                                self, 
+                                ctx, 
+                                needs_manual,
+                                merged_text=merged_text,
+                                rid_by_key=rid_by_key,
+                                all_entries=entries,
+                            )  # type: ignore[name-defined]
                             await ctx.send(
                                 embed=view._render_embed(),
                                 view=view,
                                 allowed_mentions=discord.AllowedMentions.none(),
                             )
                         else:
-                            await ctx.send("✅ RS-FS LIVE sync finished. Check the sheet.", allowed_mentions=discord.AllowedMentions.none())
+                            # If no manual resolution needed, generate Remove Helper list immediately
+                            await self._generate_remove_helper_list(ctx, entries, merged_text, rid_by_key)
                     else:
                         await ctx.send(f"❌ RS-FS live run failed: {msg}", allowed_mentions=discord.AllowedMentions.none())
                 finally:
