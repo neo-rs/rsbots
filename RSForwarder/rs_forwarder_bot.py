@@ -4459,24 +4459,39 @@ class RSForwarderBot:
                         await self._rsfs_write_current_list(merged_text, reason="rsfsrun-start")
                     except Exception:
                         pass
-                    # Parse ALL records (like Current List), then filter to store+sku for Live List sync
-                    all_recs = zephyr_release_feed_parser.parse_release_feed_records(merged_text) or []
-                    # Filter to items with store+sku for Live List sync (but keep all for Current List)
-                    items = [r for r in all_recs if r.store and r.is_sku_candidate]
-                    if not items:
-                        await ctx.send("❌ Parsed 0 items with store+sku from the merged Zephyr text.")
+                    # Read items directly from Current List tab (not from /listreleases text)
+                    # This ensures we process ALL items in Current List, not just what's in latest /listreleases
+                    current_list_rows = await self._rs_fs_sheet.fetch_current_list_rows()
+                    if not current_list_rows:
+                        await ctx.send("❌ Could not fetch rows from Current List tab.")
                         return
-
-                    # Limit to the requested max (preserve order).
-                    items = list(items)[:lim]
-                    pairs = [(it.store, it.sku) for it in items]
-                    # Release id lookup for reporting (/removereleaseid helper).
+                    
+                    # Extract store+sku pairs from Current List rows
+                    # Current List columns: Release ID, Store, SKU/Label, Monitor Tag, Category, Channel ID, Resolved Title, Resolved URL, Affiliate URL, Status, Remove Command, Last Seen
+                    pairs: List[Tuple[str, str]] = []
                     rid_by_key: Dict[str, int] = {}
-                    for it in items:
-                        try:
-                            rid_by_key[self._rs_fs_override_key(it.store, it.sku)] = int(getattr(it, "release_id", 0) or 0)
-                        except Exception:
+                    for row in current_list_rows:
+                        if len(row) < 3:
                             continue
+                        rid_str = str(row[0] or "").strip()
+                        store = str(row[1] or "").strip()
+                        sku = str(row[2] or "").strip()
+                        # Only include rows with both store and sku (for Live List sync)
+                        if store and sku:
+                            pairs.append((store, sku))
+                            try:
+                                rid = int(rid_str) if rid_str else 0
+                                if rid > 0:
+                                    rid_by_key[self._rs_fs_override_key(store, sku)] = rid
+                            except Exception:
+                                pass
+                    
+                    if not pairs:
+                        await ctx.send("❌ Found 0 items with store+sku in Current List tab.")
+                        return
+                    
+                    # Limit to the requested max (preserve order).
+                    pairs = pairs[:lim]
                     total = len(pairs)
 
                     if progress_msg:
@@ -4745,12 +4760,8 @@ class RSForwarderBot:
                         sk = str(getattr(e, "sku", "") or "").strip()
                         if st and sk:
                             entries_by_key[self._rsfs_key_store_sku(st, sk)] = e
-                    # Add placeholders for any items that weren't resolved
-                    for it in items:
-                        st = str(getattr(it, "store", "") or "").strip()
-                        sk = str(getattr(it, "sku", "") or "").strip()
-                        if not (st and sk):
-                            continue
+                    # Add placeholders for any items from Current List that weren't resolved
+                    for st, sk in pairs:
                         key = self._rsfs_key_store_sku(st, sk)
                         if key not in entries_by_key:
                             # Add placeholder entry for unresolved item
