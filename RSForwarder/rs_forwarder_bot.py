@@ -465,12 +465,12 @@ class _RsFsInteractionCtx:
 
 
 class _RsFsCheckButtonView(discord.ui.View):
-    """Simple view with just a "Run Full Send Check" button for /listrelease triggers."""
+    """Simple view with "Run Full Send Check" and "View Current List" buttons for /listrelease triggers."""
     def __init__(self, bot_obj: "RSForwarderBot"):
         super().__init__(timeout=3600)  # 1 hour timeout
         self._bot = bot_obj
     
-    @discord.ui.button(label="Run Full Send Check", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Run Full Send Check", style=discord.ButtonStyle.primary, row=0)
     async def run_check(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
         try:
             await interaction.response.defer(ephemeral=True)
@@ -496,6 +496,148 @@ class _RsFsCheckButtonView(discord.ui.View):
         except Exception as e:
             try:
                 await interaction.followup.send(f"❌ Failed to load RS-FS Check: {str(e)[:200]}", ephemeral=True)
+            except Exception:
+                pass
+    
+    @discord.ui.button(label="View Current List", style=discord.ButtonStyle.secondary, row=0)
+    async def view_current_list(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+        
+        try:
+            if not getattr(self._bot, "_rs_fs_sheet", None) or not self._bot._rs_fs_sheet.enabled():
+                await interaction.followup.send("❌ Sheet sync is not enabled.", ephemeral=True)
+                return
+            
+            current_list_rows = await self._bot._rs_fs_sheet.fetch_current_list_rows()
+            if not current_list_rows:
+                await interaction.followup.send("❌ Could not fetch Current List.", ephemeral=True)
+                return
+            
+            # Build list of SKUs with product info, organized by store
+            # Filter by "Full Send" column contains "full-send"
+            items_by_store: Dict[str, List[str]] = {}  # store -> list of item strings
+            total_count = 0
+            max_items = 100  # Increased limit since we're organizing
+            
+            for row in current_list_rows:
+                if total_count >= max_items:
+                    break
+                if len(row) < 3:
+                    continue
+                # Skip header row
+                if str(row[0] or "").strip().lower() == "release id":
+                    continue
+                # Filter: Only show rows where "Full Send" column contains "full-send" (case-insensitive)
+                full_send = str(row[12] or "").strip() if len(row) > 12 else ""
+                full_send_lower = full_send.lower()
+                if "full-send" not in full_send_lower and "💶┃full-send-🤖" not in full_send:
+                    continue
+                rid = str(row[0] or "").strip()
+                store = str(row[1] or "").strip()
+                sku = str(row[2] or "").strip()
+                title = str(row[6] or "").strip() if len(row) > 6 else ""
+                url = str(row[7] or "").strip() if len(row) > 7 else ""
+                
+                if not (store and sku):
+                    continue
+                
+                # Filter out URLs being used as titles
+                if title and self._bot._rsfs_title_is_bad(title, url=url):
+                    title = ""
+                
+                item_parts = [f"`{store} {sku}`"]
+                if rid:
+                    item_parts.append(f"Release ID: `{rid}`")
+                if title:
+                    item_parts.append(f"Title: {title[:60]}")
+                if url:
+                    item_parts.append(f"URL: {url[:60]}")
+                
+                # Add remove command in code block
+                if rid:
+                    item_parts.append(f"```\n/removereleaseid release_id: {rid}\n```")
+                
+                item_text = " • ".join(item_parts)
+                if store not in items_by_store:
+                    items_by_store[store] = []
+                items_by_store[store].append(item_text)
+                total_count += 1
+            
+            if not items_by_store:
+                await interaction.followup.send("❌ No Full Send items found in Current List.", ephemeral=True)
+                return
+            
+            # Build organized text by store
+            organized_sections: List[str] = []
+            for store in sorted(items_by_store.keys()):  # Sort stores alphabetically
+                store_items = items_by_store[store]
+                store_header = f"**{store}**"
+                organized_sections.append(store_header)
+                organized_sections.extend(store_items)
+                organized_sections.append("")  # Empty line between stores
+            
+            items_text = "\n\n".join(organized_sections)
+            
+            # Split into multiple embeds if needed
+            if len(items_text) > 4000:
+                # Split into chunks, trying to keep stores together
+                chunk_size = 3500
+                chunks = []
+                current_chunk = []
+                current_length = 0
+                
+                for line in organized_sections:
+                    is_store_header = line.startswith("**") and line.endswith("**")
+                    line_len = len(line) + 2  # +2 for "\n\n"
+                    
+                    # If starting a new store and current chunk is getting large, finalize it
+                    if is_store_header and current_length > chunk_size * 0.7 and current_chunk:
+                        chunks.append("\n\n".join(current_chunk))
+                        current_chunk = []
+                        current_length = 0
+                    
+                    # If adding this line would exceed limit, finalize current chunk
+                    if current_length + line_len > chunk_size and current_chunk:
+                        chunks.append("\n\n".join(current_chunk))
+                        current_chunk = []
+                        current_length = 0
+                        # If this is a store header, add it to the new chunk
+                        if is_store_header:
+                            current_chunk.append(line)
+                            current_length = line_len
+                    else:
+                        current_chunk.append(line)
+                        current_length += line_len
+                
+                if current_chunk:
+                    chunks.append("\n\n".join(current_chunk))
+                
+                for i, chunk_text in enumerate(chunks):
+                    emb = discord.Embed(
+                        title="RS-FS Current List" if i == 0 else f"RS-FS Current List (continued {i + 1})",
+                        description=chunk_text,
+                        color=discord.Color.blue(),
+                    )
+                    if i == 0:
+                        emb.set_footer(text=f"Showing {total_count} items organized by store")
+                    await interaction.followup.send(embed=emb, ephemeral=True)
+            else:
+                emb = discord.Embed(
+                    title="RS-FS Current List",
+                    description=items_text,
+                    color=discord.Color.blue(),
+                )
+                if total_count >= max_items:
+                    emb.set_footer(text=f"Showing first {max_items} of {len(current_list_rows)} items")
+                else:
+                    emb.set_footer(text=f"Total: {total_count} items organized by store")
+                await interaction.followup.send(embed=emb, ephemeral=True)
+        except Exception as e:
+            try:
+                await interaction.followup.send(f"❌ Failed to load Current List: {str(e)[:200]}", ephemeral=True)
             except Exception:
                 pass
 
@@ -3507,6 +3649,9 @@ class RSForwarderBot:
             
             # Also remove from Live List by syncing Current List (which no longer has these rows)
             # This ensures Live List stays in sync
+            live_sync_added = 0
+            live_sync_updated = 0
+            live_sync_deleted = 0
             try:
                 all_current_rows = await self._rs_fs_sheet.fetch_current_list_rows()
                 all_rows: List[List[str]] = []
@@ -3532,6 +3677,9 @@ class RSForwarderBot:
                 
                 if all_rows:
                     ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(all_rows)
+                    live_sync_added = added
+                    live_sync_updated = updated
+                    live_sync_deleted = deleted
                     try:
                         print(f"{Colors.GREEN}[RS-FS Removal]{Colors.RESET} Removed release ID {release_id}: deleted {deleted_count} row(s) from Current List, synced Live List (added={added}, updated={updated}, deleted={deleted})")
                     except Exception:
@@ -3539,6 +3687,29 @@ class RSForwarderBot:
             except Exception as e:
                 try:
                     print(f"{Colors.YELLOW}[RS-FS Removal]{Colors.RESET} Removed {deleted_count} row(s) from Current List, but Live List sync failed: {e}")
+                except Exception:
+                    pass
+            
+            # Send confirmation message to the channel
+            try:
+                channel = getattr(message, "channel", None)
+                if channel and hasattr(channel, "send"):
+                    # Build confirmation embed
+                    emb = discord.Embed(
+                        title="✅ RS-FS Sheet Updated",
+                        description=f"Release ID `{release_id}` has been removed from the sheet.",
+                        color=discord.Color.green(),
+                    )
+                    emb.add_field(
+                        name="Sheet Changes",
+                        value=f"Current List: `{deleted_count}` row(s) deleted\nLive List: `{live_sync_deleted}` row(s) removed",
+                        inline=False,
+                    )
+                    emb.set_footer(text="Sheet sync completed automatically")
+                    await channel.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
+            except Exception as e:
+                try:
+                    print(f"{Colors.YELLOW}[RS-FS Removal]{Colors.RESET} Failed to send confirmation message: {e}")
                 except Exception:
                     pass
                 
