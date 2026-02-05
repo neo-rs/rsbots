@@ -4734,6 +4734,34 @@ class RSForwarderBot:
                             pass
 
                     entries = list(raw_entries or [])
+                    # Ensure all items from the original parse are included in sync, even if unresolved
+                    # This prevents sync_rows_mirror from deleting rows that should exist
+                    entries_by_key: Dict[str, rs_fs_sheet_sync.RsFsPreviewEntry] = {}
+                    for e in entries:
+                        st = str(getattr(e, "store", "") or "").strip()
+                        sk = str(getattr(e, "sku", "") or "").strip()
+                        if st and sk:
+                            entries_by_key[self._rsfs_key_store_sku(st, sk)] = e
+                    # Add placeholders for any items that weren't resolved
+                    for it in items:
+                        st = str(getattr(it, "store", "") or "").strip()
+                        sk = str(getattr(it, "sku", "") or "").strip()
+                        if not (st and sk):
+                            continue
+                        key = self._rsfs_key_store_sku(st, sk)
+                        if key not in entries_by_key:
+                            # Add placeholder entry for unresolved item
+                            entries_by_key[key] = rs_fs_sheet_sync.RsFsPreviewEntry(
+                                store=st,
+                                sku=sk,
+                                url="",
+                                title="",
+                                error="",
+                                source="unresolved",
+                                monitor_url="",
+                                affiliate_url="",
+                            )
+                    entries = list(entries_by_key.values())
                     try:
                         rewrite_enabled = bool(self.config.get("affiliate_rewrite_enabled", True))
                     except Exception:
@@ -4918,10 +4946,11 @@ class RSForwarderBot:
 
                                 def _render_desc(info_lines: List[str], cmd_lines: List[str]) -> str:
                                     info_block = "\n".join(info_lines).strip()
-                                    cmd_block = "\n".join(cmd_lines).strip()
-                                    if not cmd_block:
+                                    if not cmd_lines:
                                         return info_block
-                                    return (info_block + "\n\nCommands (copy):\n```\n" + cmd_block + "\n```").strip()
+                                    # Each command gets its own code block wrapper for individual copying
+                                    cmd_blocks = "\n".join([f"```\n{cmd}\n```" for cmd in cmd_lines])
+                                    return (info_block + "\n\nCommands (copy):\n" + cmd_blocks).strip()
 
                                 for info_ln, cmd_ln in pairs2:
                                     next_info = cur_info + [info_ln]
@@ -4969,7 +4998,9 @@ class RSForwarderBot:
                                 )
                                 desc = "\n".join(up_info).strip()
                                 if up_cmds:
-                                    desc = (desc + "\n\nCommands (copy):\n```\n" + "\n".join(up_cmds) + "\n```").strip()
+                                    # Each command gets its own code block wrapper for individual copying
+                                    cmd_blocks_up = "\n".join([f"```\n{cmd}\n```" for cmd in up_cmds])
+                                    desc = (desc + "\n\nCommands (copy):\n" + cmd_blocks_up).strip()
                                 emb_u.description = desc
                                 emb_u.set_footer(text="These release IDs could not be mapped to a store/SKU automatically • Use code block copy")
                                 await ctx.send(embed=emb_u, allowed_mentions=discord.AllowedMentions.none())
