@@ -958,7 +958,9 @@ class RSForwarderBot:
         if why_lines:
             why_val = "\n".join(why_lines).strip()
             if cmd_lines:
-                why_val = (why_val + "\n\nCommands (copy):\n```\n" + "\n".join(cmd_lines) + "\n```").strip()
+                # Each command gets its own code block wrapper for individual copying
+                cmd_blocks = "\n".join([f"```\n{cmd}\n```" for cmd in cmd_lines])
+                why_val = (why_val + "\n\nCommands (copy):\n" + cmd_blocks).strip()
             emb.add_field(
                 name="Why some items aren’t in the public sheet",
                 value=why_val,
@@ -973,7 +975,9 @@ class RSForwarderBot:
             cmd_lines2 = [f"/removereleaseid release_id: {int(sku_to_rid.get(k) or 0)}" for k in missing[:12] if int(sku_to_rid.get(k) or 0) > 0]
             val2 = f"`{len(missing)}`\n" + "\n".join(sample)
             if cmd_lines2:
-                val2 = (val2 + "\n\nCommands (copy):\n```\n" + "\n".join(cmd_lines2) + "\n```").strip()
+                # Each command gets its own code block wrapper for individual copying
+                cmd_blocks2 = "\n".join([f"```\n{cmd}\n```" for cmd in cmd_lines2])
+                val2 = (val2 + "\n\nCommands (copy):\n" + cmd_blocks2).strip()
             emb.add_field(
                 name="Missing from sheet (parseable SKUs)",
                 value=val2,
