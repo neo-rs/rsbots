@@ -465,6 +465,7 @@ class RsFsSheetSync:
             "Status",
             "Remove Command",
             "Last Seen (UTC)",
+            "Full Send",
         ]
         tab_title = self._current_tab_title()
         sheet_id, tab, err = await self._ensure_sheet_tab(tab_title)
@@ -477,7 +478,7 @@ class RsFsSheetSync:
             return False, self.last_service_error() or "missing google service / deps", 0
 
         values = [headers] + [[str(c or "") for c in r] for r in (rows or [])]
-        rng = f"'{tab}'!A1:L{max(1, len(values))}"
+        rng = f"'{tab}'!A1:M{max(1, len(values))}"
 
         async with self._api_lock:
             def _do_clear() -> None:

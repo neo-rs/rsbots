@@ -82,8 +82,22 @@ def find_artifacts(remote_folder: Path) -> List[str]:
 
 
 def main() -> None:
-    compare("RSOnboarding", REPO_ROOT / "RSOnboarding", REPO_ROOT / "Oraclserver-files" / "RSOnboarding")
-    compare("RSuccessBot", REPO_ROOT / "RSuccessBot", REPO_ROOT / "Oraclserver-files" / "RSuccessBot")
+    # Find latest snapshot directory
+    snapshot_dir = REPO_ROOT / "Oraclserver-files"
+    if snapshot_dir.exists():
+        snapshots = sorted([d for d in snapshot_dir.iterdir() if d.is_dir() and d.name.startswith("server_full_snapshot_")], 
+                          key=lambda x: x.name, reverse=True)
+        if snapshots:
+            latest_snapshot = snapshots[0]
+            print(f"Using snapshot: {latest_snapshot.name}\n")
+            compare("RSOnboarding", REPO_ROOT / "RSOnboarding", latest_snapshot / "RSOnboarding")
+            compare("RSuccessBot", REPO_ROOT / "RSuccessBot", latest_snapshot / "RSuccessBot")
+        else:
+            # Fallback to old structure
+            compare("RSOnboarding", REPO_ROOT / "RSOnboarding", REPO_ROOT / "Oraclserver-files" / "RSOnboarding")
+            compare("RSuccessBot", REPO_ROOT / "RSuccessBot", REPO_ROOT / "Oraclserver-files" / "RSuccessBot")
+    else:
+        print("Oraclserver-files directory not found")
 
     artifacts = []
     for folder in ("RSAdminBot", "RSOnboarding", "RSuccessBot"):

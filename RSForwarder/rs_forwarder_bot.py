@@ -541,13 +541,25 @@ class _RsFsViewCurrentListView(discord.ui.View):
                 return
             
             # Build list of SKUs with product info
+            # Filter by "Full Send" column (column M, index 12) = "Yes"
             items: List[str] = []
-            for row in current_list_rows[:50]:  # Limit to first 50
+            count = 0
+            for row in current_list_rows:
+                if count >= 50:  # Limit to first 50
+                    break
                 if len(row) < 3:
+                    continue
+                # Skip header row
+                if str(row[0] or "").strip().lower() == "release id":
+                    continue
+                # Filter: Only show rows where "Full Send" column = "Yes"
+                full_send = str(row[12] or "").strip() if len(row) > 12 else ""
+                if full_send.lower() != "yes":
                     continue
                 rid = str(row[0] or "").strip()
                 store = str(row[1] or "").strip()
                 sku = str(row[2] or "").strip()
+                count += 1
                 title = str(row[6] or "").strip() if len(row) > 6 else ""
                 url = str(row[7] or "").strip() if len(row) > 7 else ""
                 
@@ -1000,28 +1012,8 @@ class RSForwarderBot:
         except Exception:
             pass
         
-        # Filter: Only process records with Full Send monitor tag
-        # Note: 💶┃full-send-🤖 appears inline in the text, not in brackets, so check raw_text
-        required_monitor_tag = "💶┃full-send-🤖"
-        filtered_recs = []
-        for r in recs:
-            raw_text = str(getattr(r, "raw_text", "") or "").strip()
-            # Include if raw text contains the Full Send tag
-            if required_monitor_tag in raw_text:
-                filtered_recs.append(r)
-        recs = filtered_recs
-        
-        # Debug: log filtering results
-        try:
-            print(f"{Colors.CYAN}[RS-FS Current]{Colors.RESET} After filter: {len(recs)} records (required tag: {required_monitor_tag!r})")
-            if len(recs) == 0 and len(zephyr_release_feed_parser.parse_release_feed_records(txt) or []) > 0:
-                # Show why records were filtered out
-                all_recs = zephyr_release_feed_parser.parse_release_feed_records(txt) or []
-                for r in all_recs[:3]:
-                    rt = str(getattr(r, "raw_text", "") or "")[:150]
-                    print(f"{Colors.YELLOW}[RS-FS Current]{Colors.RESET} Filtered out: raw_text={rt!r}")
-        except Exception:
-            pass
+        # NO FILTERING HERE - write ALL records to the sheet
+        # Filtering will be done based on the "Full Send" column in the sheet
         
         rows: List[List[str]] = []
         last_seen = rs_fs_sheet_sync.RsFsSheetSync._utc_now_iso()  # type: ignore[attr-defined]
@@ -1091,6 +1083,13 @@ class RSForwarderBot:
             if src:
                 status = (status + f",src={src}").strip(",")
 
+            # Check if this record has the Full Send monitor tag
+            # Note: 💶┃full-send-🤖 appears inline in the text, not in brackets, so check raw_text
+            raw_text = str(getattr(r, "raw_text", "") or "").strip()
+            required_monitor_tag = "💶┃full-send-🤖"
+            has_full_send_tag = required_monitor_tag in raw_text
+            full_send_value = "Yes" if has_full_send_tag else "No"
+            
             rows.append(
                 [
                     str(rid or ""),
@@ -1105,6 +1104,7 @@ class RSForwarderBot:
                     status,
                     remove_cmd,
                     last_seen,
+                    full_send_value,
                 ]
             )
 
@@ -1216,12 +1216,20 @@ class RSForwarderBot:
                 history_raw_count = len(history_raw_skus)
                 
                 # Raw count: Current List column C (SKU/Label) - count all non-empty values
-                # Current List columns: Release ID (0), Store (1), SKU/Label (2), Monitor Tag (3), Category (4), Channel ID (5), Resolved Title (6), Resolved URL (7), Affiliate URL (8), Status (9), Remove Command (10), Last Seen (11)
+                # Filter by "Full Send" column (column M, index 12) = "Yes"
+                # Current List columns: Release ID (0), Store (1), SKU/Label (2), Monitor Tag (3), Category (4), Channel ID (5), Resolved Title (6), Resolved URL (7), Affiliate URL (8), Status (9), Remove Command (10), Last Seen (11), Full Send (12)
                 current_list_rows = await self._rs_fs_sheet.fetch_current_list_rows()
                 current_list_raw_skus: Set[str] = set()
                 current_list_data: Dict[str, Dict[str, str]] = {}  # sku_lower -> {store, title, url}
                 for row in current_list_rows:
                     if len(row) < 3:
+                        continue
+                    # Skip header row
+                    if str(row[0] or "").strip().lower() == "release id":
+                        continue
+                    # Filter: Only count rows where "Full Send" column = "Yes"
+                    full_send = str(row[12] or "").strip() if len(row) > 12 else ""
+                    if full_send.lower() != "yes":
                         continue
                     sku = str(row[2] or "").strip()  # Column C: SKU/Label
                     if sku:
@@ -1300,18 +1308,8 @@ class RSForwarderBot:
             return emb
 
         # Analyze the merged run using the robust record parser (handles chunk splits + non-SKU entries).
+        # Note: We don't filter here anymore - filtering is done by the "Full Send" column in the sheet
         recs = zephyr_release_feed_parser.parse_release_feed_records(merged_text) or []
-        
-        # Filter: Only analyze records with Full Send monitor tag
-        # Note: 💶┃full-send-🤖 appears inline in the text, not in brackets, so check raw_text
-        required_monitor_tag = "💶┃full-send-🤖"
-        filtered_recs = []
-        for r in recs:
-            raw_text = str(getattr(r, "raw_text", "") or "").strip()
-            # Include if raw text contains the Full Send tag
-            if required_monitor_tag in raw_text:
-                filtered_recs.append(r)
-        recs = filtered_recs
         
         all_ids = sorted({int(getattr(r, "release_id", 0) or 0) for r in recs if int(getattr(r, "release_id", 0) or 0) > 0})
         total_items = len(all_ids)
@@ -1666,22 +1664,32 @@ class RSForwarderBot:
             except Exception:
                 parsed_ids = set()
             # Also check Current List sheet for all release IDs that have store/SKU
+            # Filter by "Full Send" column (column M, index 12) = "Yes"
             try:
                 current_list_rows = await self._rs_fs_sheet.fetch_current_list_rows()
                 for row in current_list_rows:
-                    if len(row) >= 3:
-                        rid_str = str(row[0] or "").strip()
-                        store = str(row[1] or "").strip()
-                        sku = str(row[2] or "").strip()
-                        if store and sku:  # Has store and SKU, so it's parseable
-                            try:
-                                rid = int(rid_str)
-                                if rid > 0:
-                                    parsed_ids.add(rid)
-                            except (ValueError, TypeError):
-                                pass
+                    if len(row) < 3:
+                        continue
+                    # Skip header row
+                    if str(row[0] or "").strip().lower() == "release id":
+                        continue
+                    # Filter: Only process rows where "Full Send" column = "Yes"
+                    full_send = str(row[12] or "").strip() if len(row) > 12 else ""
+                    if full_send.lower() != "yes":
+                        continue
+                    rid_str = str(row[0] or "").strip()
+                    store = str(row[1] or "").strip()
+                    sku = str(row[2] or "").strip()
+                    if store and sku:  # Has store and SKU, so it's parseable
+                        try:
+                            rid = int(rid_str)
+                            if rid > 0:
+                                parsed_ids.add(rid)
+                        except (ValueError, TypeError):
+                            pass
             except Exception:
                 pass
+            # Parse all records (no filtering here - filtering is done by sheet column)
             recs0 = zephyr_release_feed_parser.parse_release_feed_records(merged_text) or []
             
             # Filter: Only process records with Full Send monitor tag
@@ -1712,15 +1720,24 @@ class RSForwarderBot:
             unparseable_recs = unparseable_recs2
 
             # Build SKU -> Store map from Current List sheet for unparseable items
+            # Filter by "Full Send" column (column M, index 12) = "Yes"
             sku_to_store: Dict[str, str] = {}
             try:
                 current_list_rows = await self._rs_fs_sheet.fetch_current_list_rows()
                 for row in current_list_rows:
-                    if len(row) >= 3:
-                        store = str(row[1] or "").strip()  # Column B: Store
-                        sku = str(row[2] or "").strip()  # Column C: SKU/Label
-                        if store and sku:
-                            sku_to_store[sku.lower()] = store
+                    if len(row) < 3:
+                        continue
+                    # Skip header row
+                    if str(row[0] or "").strip().lower() == "release id":
+                        continue
+                    # Filter: Only process rows where "Full Send" column = "Yes"
+                    full_send = str(row[12] or "").strip() if len(row) > 12 else ""
+                    if full_send.lower() != "yes":
+                        continue
+                    store = str(row[1] or "").strip()  # Column B: Store
+                    sku = str(row[2] or "").strip()  # Column C: SKU/Label
+                    if store and sku:
+                        sku_to_store[sku.lower()] = store
             except Exception as e:
                 try:
                     print(f"[RS-FS] Warning: Failed to build SKU->Store map for unparseable items: {e}")
@@ -3030,6 +3047,13 @@ class RSForwarderBot:
                 all_rows: List[List[str]] = []
                 for row in all_current_rows:
                     if len(row) < 3:
+                        continue
+                    # Skip header row
+                    if str(row[0] or "").strip().lower() == "release id":
+                        continue
+                    # Filter: Only process rows where "Full Send" column = "Yes"
+                    full_send = str(row[12] or "").strip() if len(row) > 12 else ""
+                    if full_send.lower() != "yes":
                         continue
                     store = str(row[1] or "").strip()
                     sku = str(row[2] or "").strip()
@@ -5258,11 +5282,19 @@ class RSForwarderBot:
                     # Extract store+sku pairs from Current List that:
                     # 1. Exist in both Current List and History (matched)
                     # 2. Are missing title or URL (or both) - need resolution
-                    # Current List columns: Release ID, Store, SKU/Label, Monitor Tag, Category, Channel ID, Resolved Title, Resolved URL, Affiliate URL, Status, Remove Command, Last Seen
+                    # Current List columns: Release ID (0), Store (1), SKU/Label (2), Monitor Tag (3), Category (4), Channel ID (5), Resolved Title (6), Resolved URL (7), Affiliate URL (8), Status (9), Remove Command (10), Last Seen (11), Full Send (12)
+                    # Filter by "Full Send" column = "Yes"
                     pairs: List[Tuple[str, str]] = []
                     rid_by_key: Dict[str, int] = {}
                     for row in current_list_rows:
                         if len(row) < 3:
+                            continue
+                        # Skip header row
+                        if str(row[0] or "").strip().lower() == "release id":
+                            continue
+                        # Filter: Only process rows where "Full Send" column = "Yes"
+                        full_send = str(row[12] or "").strip() if len(row) > 12 else ""
+                        if full_send.lower() != "yes":
                             continue
                         rid_str = str(row[0] or "").strip()
                         store = str(row[1] or "").strip()
@@ -5716,6 +5748,13 @@ class RSForwarderBot:
                         all_rows: List[List[str]] = []
                         for row in all_current_rows:
                             if len(row) < 3:
+                                continue
+                            # Skip header row
+                            if str(row[0] or "").strip().lower() == "release id":
+                                continue
+                            # Filter: Only process rows where "Full Send" column = "Yes"
+                            full_send = str(row[12] or "").strip() if len(row) > 12 else ""
+                            if full_send.lower() != "yes":
                                 continue
                             store = str(row[1] or "").strip()
                             sku = str(row[2] or "").strip()
