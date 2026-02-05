@@ -552,10 +552,10 @@ class _RsFsViewCurrentListView(discord.ui.View):
                 # Skip header row
                 if str(row[0] or "").strip().lower() == "release id":
                     continue
-                # Filter: Only show rows where "Full Send" column contains the tag
+                # Filter: Only show rows where "Full Send" column contains "full-send" (case-insensitive)
                 full_send = str(row[12] or "").strip() if len(row) > 12 else ""
-                required_monitor_tag = "💶┃full-send-🤖"
-                if required_monitor_tag not in full_send:
+                full_send_lower = full_send.lower()
+                if "full-send" not in full_send_lower and "💶┃full-send-🤖" not in full_send:
                     continue
                 rid = str(row[0] or "").strip()
                 store = str(row[1] or "").strip()
@@ -1008,12 +1008,12 @@ class RSForwarderBot:
         try:
             print(f"{Colors.CYAN}[RS-FS Current]{Colors.RESET} Parsed {len(recs)} records from text (len={len(txt)})")
             if recs:
-                # Check first few records for Full Send tag
-                required_monitor_tag = "💶┃full-send-🤖"
+                # Check first few records for Full Send tag (text-based, case-insensitive)
                 found_count = 0
                 for i, r in enumerate(recs[:5]):
                     raw_text = str(getattr(r, "raw_text", "") or "").strip()
-                    has_tag = required_monitor_tag in raw_text
+                    raw_text_lower = raw_text.lower()
+                    has_tag = "full-send" in raw_text_lower or "full send" in raw_text_lower or "💶┃full-send-🤖" in raw_text
                     if has_tag:
                         found_count += 1
                     if i < 3:  # Show first 3
@@ -1094,12 +1094,13 @@ class RSForwarderBot:
                 status = (status + f",src={src}").strip(",")
 
             # Extract Full Send monitor tag from raw_text if present
-            # Note: 💶┃full-send-🤖 appears inline in the text, not in brackets
+            # Check for "full-send" text (case-insensitive) - simpler than emoji matching
             raw_text = str(getattr(r, "raw_text", "") or "").strip()
-            required_monitor_tag = "💶┃full-send-🤖"
+            raw_text_lower = raw_text.lower()
             full_send_value = ""
-            if required_monitor_tag in raw_text:
-                full_send_value = required_monitor_tag
+            # Check for various forms: "full-send", "full send", or the emoji version
+            if "full-send" in raw_text_lower or "full send" in raw_text_lower or "💶┃full-send-🤖" in raw_text:
+                full_send_value = "full-send"
             
             # Debug: log first few records to see what's in raw_text
             if len(rows) < 3:
@@ -1169,9 +1170,9 @@ class RSForwarderBot:
             return "", 0, False
         merged = "\n".join(reversed(parts))
         
-        # Debug: check if merged text contains Full Send monitor tag
-        required_monitor_tag = "💶┃full-send-🤖"
-        has_tag = required_monitor_tag in merged
+        # Debug: check if merged text contains Full Send monitor tag (text-based, case-insensitive)
+        merged_lower = merged.lower()
+        has_tag = "full-send" in merged_lower or "full send" in merged_lower or "💶┃full-send-🤖" in merged
         try:
             print(f"{Colors.CYAN}[RS-FS Sheet]{Colors.RESET} Collected merged text (chunks={len(parts)}, len={len(merged)}, has_full_send_tag={has_tag})")
             if not has_tag and len(merged) > 0:
@@ -1242,7 +1243,6 @@ class RSForwarderBot:
                 current_list_all_data: Dict[str, Dict[str, str]] = {}  # sku_lower -> {store, title, url, is_full_send}
                 current_list_full_send_skus: Set[str] = set()
                 current_list_others_skus: Set[str] = set()
-                required_monitor_tag = "💶┃full-send-🤖"
                 
                 for row in current_list_rows:
                     if len(row) < 3:
@@ -1260,7 +1260,9 @@ class RSForwarderBot:
                     title = str(row[6] or "").strip() if len(row) > 6 else ""
                     url = str(row[7] or "").strip() if len(row) > 7 else ""
                     full_send = str(row[12] or "").strip() if len(row) > 12 else ""
-                    is_full_send = required_monitor_tag in full_send
+                    # Check for "full-send" text (case-insensitive) or emoji version
+                    full_send_lower = full_send.lower()
+                    is_full_send = "full-send" in full_send_lower or "💶┃full-send-🤖" in full_send
                     
                     current_list_all_data[sku_lower] = {
                         "store": store,
@@ -1710,10 +1712,10 @@ class RSForwarderBot:
                     # Skip header row
                     if str(row[0] or "").strip().lower() == "release id":
                         continue
-                    # Filter: Only process rows where "Full Send" column contains the tag
+                    # Filter: Only process rows where "Full Send" column contains "full-send" (case-insensitive)
                     full_send = str(row[12] or "").strip() if len(row) > 12 else ""
-                    required_monitor_tag = "💶┃full-send-🤖"
-                    if required_monitor_tag not in full_send:
+                    full_send_lower = full_send.lower()
+                    if "full-send" not in full_send_lower and "💶┃full-send-🤖" not in full_send:
                         continue
                     rid_str = str(row[0] or "").strip()
                     store = str(row[1] or "").strip()
@@ -1730,14 +1732,13 @@ class RSForwarderBot:
             # Parse all records (no filtering here - filtering is done by sheet column)
             recs0 = zephyr_release_feed_parser.parse_release_feed_records(merged_text) or []
             
-            # Filter: Only process records with Full Send monitor tag
-            # Note: 💶┃full-send-🤖 appears inline in the text, not in brackets, so check raw_text
-            required_monitor_tag = "💶┃full-send-🤖"
+            # Filter: Only process records with Full Send monitor tag (text-based, case-insensitive)
             filtered_recs0 = []
             for r in recs0:
                 raw_text = str(getattr(r, "raw_text", "") or "").strip()
-                # Include if raw text contains the Full Send tag
-                if required_monitor_tag in raw_text:
+                raw_text_lower = raw_text.lower()
+                # Include if raw text contains "full-send" or "full send" or emoji version
+                if "full-send" in raw_text_lower or "full send" in raw_text_lower or "💶┃full-send-🤖" in raw_text:
                     filtered_recs0.append(r)
             recs0 = filtered_recs0
             
@@ -1768,10 +1769,10 @@ class RSForwarderBot:
                     # Skip header row
                     if str(row[0] or "").strip().lower() == "release id":
                         continue
-                    # Filter: Only process rows where "Full Send" column contains the tag
+                    # Filter: Only process rows where "Full Send" column contains "full-send" (case-insensitive)
                     full_send = str(row[12] or "").strip() if len(row) > 12 else ""
-                    required_monitor_tag = "💶┃full-send-🤖"
-                    if required_monitor_tag not in full_send:
+                    full_send_lower = full_send.lower()
+                    if "full-send" not in full_send_lower and "💶┃full-send-🤖" not in full_send:
                         continue
                     store = str(row[1] or "").strip()  # Column B: Store
                     sku = str(row[2] or "").strip()  # Column C: SKU/Label
@@ -3090,10 +3091,10 @@ class RSForwarderBot:
                     # Skip header row
                     if str(row[0] or "").strip().lower() == "release id":
                         continue
-                    # Filter: Only process rows where "Full Send" column contains the tag
+                    # Filter: Only process rows where "Full Send" column contains "full-send" (case-insensitive)
                     full_send = str(row[12] or "").strip() if len(row) > 12 else ""
-                    required_monitor_tag = "💶┃full-send-🤖"
-                    if required_monitor_tag not in full_send:
+                    full_send_lower = full_send.lower()
+                    if "full-send" not in full_send_lower and "💶┃full-send-🤖" not in full_send:
                         continue
                     store = str(row[1] or "").strip()
                     sku = str(row[2] or "").strip()
@@ -3306,14 +3307,13 @@ class RSForwarderBot:
             # Dry-run path below uses SKU-only pairs for preview output.
             items = zephyr_release_feed_parser.parse_release_feed_items(text_for_parse)
             
-            # Filter: Only process items with Full Send monitor tag
-            # Note: 💶┃full-send-🤖 appears inline in the text, not in brackets, so check raw_text
-            required_monitor_tag = "💶┃full-send-🤖"
+            # Filter: Only process items with Full Send monitor tag (text-based, case-insensitive)
             filtered_items = []
             for it in (items or []):
                 raw_text = str(getattr(it, "raw_text", "") or "").strip()
-                # Include if raw text contains the Full Send tag
-                if required_monitor_tag in raw_text:
+                raw_text_lower = raw_text.lower()
+                # Include if raw text contains "full-send" or "full send" or emoji version
+                if "full-send" in raw_text_lower or "full send" in raw_text_lower or "💶┃full-send-🤖" in raw_text:
                     filtered_items.append(it)
             items = filtered_items
             
