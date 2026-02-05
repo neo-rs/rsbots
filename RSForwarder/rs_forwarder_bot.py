@@ -5409,19 +5409,15 @@ class RSForwarderBot:
                             except Exception:
                                 pass
                     
-                    if not pairs:
-                        await ctx.send("✅ All matched items already have titles and URLs. Nothing to resolve.")
-                        return
-                    
                     # Limit to the requested max (preserve order).
-                    pairs = pairs[:lim]
+                    pairs = pairs[:lim] if pairs else []
                     total = len(pairs)
-
+                    
                     # Create progress message AFTER we know the actual count
                     progress_msg = None
                     try:
                         progress_msg = await ctx.send(
-                            embed=_progress_embed("collect", 0, total),
+                            embed=_progress_embed("collect", 0, max(total, 1)),
                             allowed_mentions=discord.AllowedMentions.none(),
                         )
                     except Exception:
@@ -5429,7 +5425,7 @@ class RSForwarderBot:
 
                     if progress_msg:
                         try:
-                            await progress_msg.edit(embed=_progress_embed("resolve (monitor first)", 0, total))
+                            await progress_msg.edit(embed=_progress_embed("resolve (monitor first)", 0, max(total, 1)))
                         except Exception:
                             pass
 
@@ -5498,7 +5494,11 @@ class RSForwarderBot:
                             remaining_pairs.append((st, sk))
 
                     pairs = remaining_pairs
+                    # Total includes items that need resolution (pairs) plus already resolved (history/manual)
                     total = len(remaining_pairs) + len(manual_hits) + len(history_hits)
+                    # If no pairs but we have resolved items, still set total to at least 1 to show progress
+                    if total == 0:
+                        total = 1
                     if progress_msg:
                         try:
                             await progress_msg.edit(
@@ -5508,6 +5508,8 @@ class RSForwarderBot:
                                     total,
                                     monitor_hits=len(manual_hits) + len(history_hits),
                                     remaining=len(remaining_pairs),
+                                    monitor_hit_skus=monitor_hit_skus if 'monitor_hit_skus' in locals() else [],
+                                    error_skus=error_skus if 'error_skus' in locals() else [],
                                 )
                             )
                         except Exception:
@@ -5722,6 +5724,21 @@ class RSForwarderBot:
                         web_entries = []
 
                     raw_entries = list(monitor_hits) + list(web_entries)
+                    
+                    # Track successful web entries in monitor_hit_skus
+                    for e in web_entries:
+                        if isinstance(e, rs_fs_sheet_sync.RsFsPreviewEntry):
+                            st = str(getattr(e, "store", "") or "").strip()
+                            sk = str(getattr(e, "sku", "") or "").strip()
+                            if st and sk:
+                                sku_display = f"{st} {sk}"
+                                title = str(getattr(e, "title", "") or "").strip()
+                                url = str(getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
+                                # Only add if it has title or URL (successful resolution)
+                                if title or url:
+                                    # Avoid duplicates by SKU
+                                    if not any(s == sku_display for s, _, _ in monitor_hit_skus):
+                                        monitor_hit_skus.append((sku_display, title, url))
 
                     # Stage 3: affiliate links (plain URL for sheet)
                     if progress_msg:
@@ -5815,7 +5832,17 @@ class RSForwarderBot:
                     # Stage 4: mirror sync (single call)
                     if progress_msg:
                         try:
-                            await progress_msg.edit(embed=_progress_embed("sheet sync", total, total, monitor_hits=len(monitor_hits), remaining=0))
+                            await progress_msg.edit(
+                                embed=_progress_embed(
+                                    "sheet sync",
+                                    total,
+                                    total,
+                                    monitor_hits=len(monitor_hits),
+                                    remaining=0,
+                                    monitor_hit_skus=monitor_hit_skus,
+                                    error_skus=error_skus,
+                                )
+                            )
                         except Exception:
                             pass
 
@@ -5854,9 +5881,10 @@ class RSForwarderBot:
                             # Skip header row
                             if str(row[0] or "").strip().lower() == "release id":
                                 continue
-                            # Filter: Only process rows where "Full Send" column = "Yes"
+                            # Filter: Only process rows where "Full Send" column contains "full-send"
                             full_send = str(row[12] or "").strip() if len(row) > 12 else ""
-                            if full_send.lower() != "yes":
+                            full_send_lower = full_send.lower()
+                            if "full-send" not in full_send_lower and "💶┃full-send-🤖" not in full_send:
                                 continue
                             store = str(row[1] or "").strip()
                             sku = str(row[2] or "").strip()
@@ -5889,7 +5917,7 @@ class RSForwarderBot:
                         except Exception:
                             live_before_map = {}
                         
-                        # Sync all Current List items to Live List
+                        # Sync all Current List items (Full Send only) to Live List
                         if all_rows:
                             ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(all_rows)
                             
@@ -5901,7 +5929,9 @@ class RSForwarderBot:
                                 if (title and title != prev_title) or (url and url != prev_url):
                                     changes_list.append((sku, store, title, url))
                         else:
-                            ok, msg, added, updated, deleted = False, "no rows to sync", 0, 0, 0
+                            # If no rows to sync, check if it's because no Full Send items exist
+                            # or if all items already have titles/URLs
+                            ok, msg, added, updated, deleted = True, "no Full Send items to sync", 0, 0, 0
                     except Exception as e:
                         # Fallback to just syncing resolved items if full sync fails
                         rows = [[e.store, e.sku, e.title, e.affiliate_url, e.monitor_url] for e in entries]
