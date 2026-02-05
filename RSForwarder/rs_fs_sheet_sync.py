@@ -516,7 +516,7 @@ class RsFsSheetSync:
         if not service:
             return []
 
-        rng = f"'{tab}'!A:L"
+        rng = f"'{tab}'!A:M"
 
         async with self._api_lock:
             def _do_get() -> Dict[str, Any]:
@@ -537,9 +537,9 @@ class RsFsSheetSync:
             for i, row in enumerate(values):
                 if i == 0:
                     continue
-                # Convert to list of strings, pad to 12 columns if needed
+                # Convert to list of strings, pad to 13 columns if needed (A-M, including Full Send column)
                 row_str = [str(c or "").strip() for c in row]
-                while len(row_str) < 12:
+                while len(row_str) < 13:
                     row_str.append("")
                 # Skip completely empty rows (no Release ID, Store, or SKU)
                 if not (row_str[0] or row_str[1] or row_str[2]):

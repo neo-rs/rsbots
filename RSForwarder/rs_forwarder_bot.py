@@ -1259,10 +1259,18 @@ class RSForwarderBot:
                     store = str(row[1] or "").strip()
                     title = str(row[6] or "").strip() if len(row) > 6 else ""
                     url = str(row[7] or "").strip() if len(row) > 7 else ""
+                    # Column M (index 12) is "Full Send"
                     full_send = str(row[12] or "").strip() if len(row) > 12 else ""
                     # Check for "full-send" text (case-insensitive) or emoji version
                     full_send_lower = full_send.lower()
-                    is_full_send = "full-send" in full_send_lower or "💶┃full-send-🤖" in full_send
+                    is_full_send = bool(full_send and ("full-send" in full_send_lower or "💶┃full-send-🤖" in full_send))
+                    
+                    # Debug: log first few rows to see what's being read
+                    if len(current_list_raw_skus) < 5:
+                        try:
+                            print(f"{Colors.CYAN}[RS-FS Check]{Colors.RESET} Row {len(current_list_raw_skus)+1}: SKU={sku}, full_send_col={full_send!r}, is_full_send={is_full_send}, row_len={len(row)}")
+                        except Exception:
+                            pass
                     
                     current_list_all_data[sku_lower] = {
                         "store": store,
