@@ -540,6 +540,9 @@ class RsFsSheetSync:
                 row_str = [str(c or "").strip() for c in row]
                 while len(row_str) < 12:
                     row_str.append("")
+                # Skip completely empty rows (no Release ID, Store, or SKU)
+                if not (row_str[0] or row_str[1] or row_str[2]):
+                    continue
                 rows.append(row_str)
         return rows
 
@@ -581,6 +584,9 @@ class RsFsSheetSync:
                 row_str = [str(c or "").strip() for c in row]
                 while len(row_str) < 8:
                     row_str.append("")
+                # Skip completely empty rows (no Store or SKU)
+                if not (row_str[0] or row_str[1]):
+                    continue
                 rows.append(row_str)
         return rows
 
