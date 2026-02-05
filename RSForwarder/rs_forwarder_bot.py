@@ -383,6 +383,7 @@ class _RsFsInteractionCtx:
     """
     Minimal ctx-like wrapper so we can re-use existing command callbacks from button clicks.
     Uses interaction.followup for all sends (caller should defer first).
+    All messages are ephemeral (only visible to the user).
     """
 
     def __init__(self, interaction: discord.Interaction):
@@ -392,7 +393,45 @@ class _RsFsInteractionCtx:
         self.channel = getattr(interaction, "channel", None)
 
     async def send(self, content: Optional[str] = None, **kwargs):
+        # Always use ephemeral for interaction-based commands (button clicks)
+        kwargs.setdefault("ephemeral", True)
         return await self._interaction.followup.send(content=content, **kwargs)
+
+
+class _RsFsCheckButtonView(discord.ui.View):
+    """Simple view with just a "Run Full Send Check" button for /listrelease triggers."""
+    def __init__(self, bot_obj: "RSForwarderBot"):
+        super().__init__(timeout=3600)  # 1 hour timeout
+        self._bot = bot_obj
+    
+    @discord.ui.button(label="Run Full Send Check", style=discord.ButtonStyle.primary)
+    async def run_check(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+        try:
+            emb = await self._bot._build_rsfs_check_embed()
+            try:
+                run_lim = int((self._bot.config or {}).get("rs_fs_sheet_max_per_run") or 250)
+            except Exception:
+                run_lim = 250
+            run_lim = max(10, min(run_lim, 500))
+            try:
+                owner_id = int(getattr(getattr(interaction, "user", None), "id", 0) or 0)
+            except Exception:
+                owner_id = 0
+            # Send ephemerally using followup (already deferred)
+            await interaction.followup.send(
+                embed=emb,
+                view=_RsFsCheckView(self._bot, owner_id=owner_id, run_limit=run_lim),
+                ephemeral=True,
+            )
+        except Exception as e:
+            try:
+                await interaction.followup.send(f"❌ Failed to load RS-FS Check: {str(e)[:200]}", ephemeral=True)
+            except Exception:
+                pass
 
 
 class _RsFsCheckView(discord.ui.View):
@@ -1356,7 +1395,11 @@ class RSForwarderBot:
         except Exception:
             return False
 
-    async def _dm_user(self, user_id: int, content: str) -> bool:
+    async def _dm_user(self, user_id: int, content: Optional[str] = None, *, embed: Optional[discord.Embed] = None, view: Optional[discord.ui.View] = None) -> bool:
+        """
+        Send a DM to a user. Supports text content, embed, and view (buttons).
+        Returns True if sent successfully, False otherwise.
+        """
         try:
             uid = int(user_id)
             if uid <= 0:
@@ -1366,7 +1409,14 @@ class RSForwarderBot:
                 user = await self.bot.fetch_user(uid)
             if user is None:
                 return False
-            await user.send(content)
+            kwargs = {}
+            if content:
+                kwargs["content"] = content
+            if embed:
+                kwargs["embed"] = embed
+            if view:
+                kwargs["view"] = view
+            await user.send(**kwargs)
             return True
         except Exception:
             return False
@@ -2593,30 +2643,35 @@ class RSForwarderBot:
                         except Exception:
                             pass
                         return
-                    emb = await self._build_rsfs_check_embed()
-                    try:
-                        run_lim = int((self.config or {}).get("rs_fs_sheet_max_per_run") or 250)
-                    except Exception:
-                        run_lim = 250
-                    run_lim = max(10, min(run_lim, 500))
+                    # Send a button that triggers RS-FS Check ephemerally when clicked
+                    out_id_raw = str((self.config or {}).get("rs_fs_sheet_status_channel_id") or "").strip()
+                    out_id = int(out_id_raw) if out_id_raw else int(target_ch)
+                    out_ch2 = await self._resolve_channel_by_id(int(out_id))
+                    if not (out_ch2 and hasattr(out_ch2, "send")):
+                        try:
+                            print(
+                                f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Auto check: cannot resolve sendable channel id={out_id}"
+                            )
+                        except Exception:
+                            pass
+                        return
                     try:
                         print(
-                            f"{Colors.CYAN}[RS-FS Sheet]{Colors.RESET} Auto check: attempting send to channel_id={out_id} (debounce={self._rsfs_auto_check_debounce_s():.0f}s)"
+                            f"{Colors.CYAN}[RS-FS Sheet]{Colors.RESET} Auto check: sending button to channel_id={out_id} (debounce={self._rsfs_auto_check_debounce_s():.0f}s)"
                         )
                     except Exception:
                         pass
                     try:
                         await out_ch2.send(
-                            embed=emb,
-                            view=_RsFsCheckView(self, owner_id=0, run_limit=run_lim),
+                            content="📊 **RS-FS Check Available**\nClick the button below to view the Full Send Check (only you will see it).",
+                            view=_RsFsCheckButtonView(self),
                             allowed_mentions=discord.AllowedMentions.none(),
                         )
                         try:
-                            print(f"{Colors.CYAN}[RS-FS Sheet]{Colors.RESET} Auto check: sent embed+buttons")
+                            print(f"{Colors.CYAN}[RS-FS Sheet]{Colors.RESET} Auto check: sent button to channel")
                         except Exception:
                             pass
                     except Exception as e:
-                        # Fallback: still send buttons even if embed permissions are missing.
                         msg0 = (str(e) or "send failed").replace("\n", " ").strip()
                         if len(msg0) > 220:
                             msg0 = msg0[:220] + "..."
@@ -2624,18 +2679,6 @@ class RSForwarderBot:
                             print(f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Auto check: send failed: {msg0}")
                         except Exception:
                             pass
-                        try:
-                            await out_ch2.send(
-                                content="RS-FS Check: (embed failed) use the buttons below or run `!rsfscheck`.",
-                                view=_RsFsCheckView(self, owner_id=0, run_limit=run_lim),
-                                allowed_mentions=discord.AllowedMentions.none(),
-                            )
-                            try:
-                                print(f"{Colors.CYAN}[RS-FS Sheet]{Colors.RESET} Auto check: sent fallback text+buttons")
-                            except Exception:
-                                pass
-                        except Exception:
-                            return
                 except Exception:
                     return
 
