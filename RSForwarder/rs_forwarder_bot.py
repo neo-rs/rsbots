@@ -991,14 +991,12 @@ class RSForwarderBot:
 
         recs = zephyr_release_feed_parser.parse_release_feed_records(txt) or []
         
-        # Filter: Only process records with Full Send monitor tag and correct channel ID
+        # Filter: Only process records with Full Send monitor tag
         required_monitor_tag = "💶┃full-send-🤖"
-        required_channel_id = "1429649205714227260"
         filtered_recs = []
         for r in recs:
             monitor_tag = str(getattr(r, "monitor_tag", "") or "").strip()
-            ch_id = str(getattr(r, "channel_id", "") or "").strip()
-            # Include if monitor tag contains the required tag (channel ID already filtered at message level)
+            # Include if monitor tag contains the required tag
             if required_monitor_tag in monitor_tag:
                 filtered_recs.append(r)
         recs = filtered_recs
@@ -1109,15 +1107,7 @@ class RSForwarderBot:
         parts: List[str] = []
         found_header = False
         try:
-            # Only collect messages from the specific Full Send channel with the monitor tag
-            required_channel_id = 1429649205714227260
-            required_monitor_tag = "💶┃full-send-🤖"
-            
             async for m in ch.history(limit=int(history_limit or 350)):
-                # Filter by channel ID
-                if int(getattr(m.channel, "id", 0) or 0) != int(required_channel_id):
-                    continue
-                    
                 if not (getattr(m, "embeds", None) or []) and not (getattr(m, "content", None) or ""):
                     continue
                 t = self._collect_embed_text(m)
@@ -1125,11 +1115,6 @@ class RSForwarderBot:
                     continue
                 if not zephyr_release_feed_parser.looks_like_release_feed_embed_text(t):
                     continue
-                
-                # Filter by monitor tag - must contain the Full Send monitor tag
-                if required_monitor_tag not in t:
-                    continue
-                    
                 parts.append(t)
                 if "release feed" in t.lower():
                     found_header = True
@@ -3062,16 +3047,20 @@ class RSForwarderBot:
             target_ch = self._zephyr_release_feed_channel_id()
             if not target_ch:
                 return
-            # Only process messages from the specific Full Send channel
-            required_channel_id = 1429649205714227260
-            if int(getattr(message.channel, "id", 0) or 0) != int(required_channel_id):
+            if int(getattr(message.channel, "id", 0) or 0) != int(target_ch):
                 return
-
+            
             # If a manual rsfsrun is in progress, do not process live Zephyr messages here.
             # Manual runs build a single merged list and sync once (prevents add/remove thrash).
             if bool(getattr(self, "_rs_fs_manual_run_in_progress", False)):
                 return
 
+            mid = int(getattr(message, "id", 0) or 0)
+            if mid and mid in (self._rs_fs_seen_message_ids or set()):
+                return
+
+            text = self._collect_embed_text(message)
+            
             # Debug: confirm we are seeing messages in the target channel.
             try:
                 embeds_n = len(message.embeds or [])
@@ -3081,12 +3070,6 @@ class RSForwarderBot:
                 print(f"{Colors.CYAN}[RS-FS Sheet]{Colors.RESET} Seen msg in zephyr channel id={target_ch} msg_id={getattr(message,'id',None)} author={aname}({aid}) embeds={embeds_n}")
             except Exception:
                 pass
-
-            mid = int(getattr(message, "id", 0) or 0)
-            if mid and mid in (self._rs_fs_seen_message_ids or set()):
-                return
-
-            text = self._collect_embed_text(message)
             try:
                 short = (text or "").replace("\n", " ").strip()
                 if len(short) > 220:
@@ -3260,9 +3243,12 @@ class RSForwarderBot:
                     try:
                         try:
                             out_ch_raw = str((self.config or {}).get("rs_fs_sheet_test_output_channel_id") or "").strip()
-                            out_ch_id2 = int(out_ch_raw) if out_ch_raw else int(target_ch)
+                            # Use config channel ID for test output (fallback to Full Send channel)
+                            test_ch_id = self._zephyr_release_feed_channel_id() or 1429649205714227260
+                            out_ch_id2 = int(out_ch_raw) if out_ch_raw else int(test_ch_id)
                         except Exception:
-                            out_ch_id2 = int(target_ch)
+                            test_ch_id = self._zephyr_release_feed_channel_id() or 1429649205714227260
+                            out_ch_id2 = int(test_ch_id)
                         out_ch = await self._resolve_channel_by_id(int(out_ch_id2 or 0))
                         if out_ch and hasattr(out_ch, "send"):
                             await out_ch.send(
@@ -3288,9 +3274,12 @@ class RSForwarderBot:
 
             try:
                 out_ch_raw = str((self.config or {}).get("rs_fs_sheet_test_output_channel_id") or "").strip()
-                out_ch_id = int(out_ch_raw) if out_ch_raw else int(target_ch)
+                # Use config channel ID for test output (fallback to Full Send channel)
+                test_ch_id = self._zephyr_release_feed_channel_id() or 1429649205714227260
+                out_ch_id = int(out_ch_raw) if out_ch_raw else int(test_ch_id)
             except Exception:
-                out_ch_id = int(target_ch)
+                test_ch_id = self._zephyr_release_feed_channel_id() or 1429649205714227260
+                out_ch_id = int(test_ch_id)
 
             out_ch = None
             progress_msg = None
