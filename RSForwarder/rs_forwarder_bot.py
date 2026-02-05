@@ -672,7 +672,12 @@ class RSForwarderBot:
         history = {}
         try:
             history = await self._rs_fs_sheet.fetch_history_cache(force=False)
-        except Exception:
+        except Exception as e:
+            # Best-effort: continue with empty history if cache fetch fails
+            try:
+                print(f"[RS-FS] Warning: History cache fetch failed: {e}")
+            except Exception:
+                pass
             history = {}
         overrides = {}
         try:
@@ -830,56 +835,81 @@ class RSForwarderBot:
         except Exception as e:
             ok, msg, tab, n = False, f"failed: {str(e)[:200]}", None, 0
 
-        # Fetch counts from all three tabs
-        live_list_count = 0
-        history_count = 0
-        current_list_count = 0
+        # Fetch raw counts from all three tabs (no filtering - just count non-empty SKUs)
+        live_list_raw_count = 0
+        history_raw_count = 0
+        current_list_raw_count = 0
+        matched_skus_count = 0
         matched_complete_count = 0
         new_items_count = 0
         
         try:
             if ok and getattr(self, "_rs_fs_sheet", None):
-                # Count Live List SKUs (only count rows with both Store and SKU)
+                # Raw count: Live List column B (SKU-UPC) - count all non-empty values
                 live_list_rows = await self._rs_fs_sheet.fetch_live_list_rows()
-                live_list_skus: Set[str] = set()
+                live_list_raw_skus: Set[str] = set()
                 for row in live_list_rows:
                     if len(row) >= 2:
-                        store = str(row[0] or "").strip()
-                        sku = str(row[1] or "").strip()
-                        # Only count if both store and sku exist (consistent with Current List)
-                        if store and sku:
-                            live_list_skus.add(sku.lower())
-                live_list_count = len(live_list_skus)
+                        sku = str(row[1] or "").strip()  # Column B: SKU-UPC
+                        if sku and sku.lower() != "sku-upc":  # Skip header
+                            live_list_raw_skus.add(sku.lower())
+                live_list_raw_count = len(live_list_raw_skus)
                 
-                # Count History SKUs
-                history_cache = await self._rs_fs_sheet.fetch_history_cache(force=False)
-                history_count = len(history_cache)
+                # Raw count: History column B (SKU) - count all non-empty values
+                history_rows = await self._rs_fs_sheet.fetch_history_rows()
+                history_raw_skus: Set[str] = set()
+                for row in history_rows:
+                    if len(row) >= 2:
+                        sku = str(row[1] or "").strip()  # Column B: SKU
+                        if sku and sku.lower() != "sku":  # Skip header
+                            history_raw_skus.add(sku.lower())
+                history_raw_count = len(history_raw_skus)
                 
-                # Count Current List SKUs and check completeness
+                # Raw count: Current List column C (SKU/Label) - count all non-empty values
                 # Current List columns: Release ID (0), Store (1), SKU/Label (2), Monitor Tag (3), Category (4), Channel ID (5), Resolved Title (6), Resolved URL (7), Affiliate URL (8), Status (9), Remove Command (10), Last Seen (11)
                 current_list_rows = await self._rs_fs_sheet.fetch_current_list_rows()
-                current_list_skus: Set[str] = set()
-                complete_skus: Set[str] = set()  # SKUs with both title and URL
+                current_list_raw_skus: Set[str] = set()
+                current_list_data: Dict[str, Dict[str, str]] = {}  # sku_lower -> {store, title, url}
                 for row in current_list_rows:
                     if len(row) < 3:
                         continue
-                    # Skip rows that are completely empty (no Release ID, Store, or SKU)
-                    rid = str(row[0] or "").strip()
-                    store = str(row[1] or "").strip()
-                    sku = str(row[2] or "").strip()
-                    # Only count rows with both store and sku (consistent with Live List counting)
-                    if store and sku:
+                    sku = str(row[2] or "").strip()  # Column C: SKU/Label
+                    if sku:
                         sku_lower = sku.lower()
-                        current_list_skus.add(sku_lower)
+                        current_list_raw_skus.add(sku_lower)
+                        store = str(row[1] or "").strip()
                         title = str(row[6] or "").strip() if len(row) > 6 else ""
                         url = str(row[7] or "").strip() if len(row) > 7 else ""
-                        if title and url:
-                            complete_skus.add(sku_lower)
-                current_list_count = len(current_list_skus)
+                        current_list_data[sku_lower] = {
+                            "store": store,
+                            "sku": sku,
+                            "title": title,
+                            "url": url,
+                        }
+                current_list_raw_count = len(current_list_raw_skus)
+                
+                # Cross-match: Find SKUs that exist in both Current List and History
+                matched_skus: Set[str] = current_list_raw_skus.intersection(history_raw_skus)
+                matched_skus_count = len(matched_skus)
+                
+                # From matched SKUs, find those with both title and URL (complete)
+                complete_skus: Set[str] = set()
+                for sku_lower in matched_skus:
+                    data = current_list_data.get(sku_lower, {})
+                    title = str(data.get("title", "") or "").strip()
+                    url = str(data.get("url", "") or "").strip()
+                    if title and url:
+                        complete_skus.add(sku_lower)
                 matched_complete_count = len(complete_skus)
-                new_items_count = current_list_count - matched_complete_count
-        except Exception:
-            pass
+                
+                # New items = matched SKUs that are missing title or URL (or both)
+                new_items_count = matched_skus_count - matched_complete_count
+        except Exception as e:
+            # Best-effort counting: log error but continue with zero counts
+            try:
+                print(f"[RS-FS Check] Error counting SKUs: {e}")
+            except Exception:
+                pass
 
         emb = _rsfs_embed(
             "RS-FS Check",
@@ -887,11 +917,12 @@ class RSForwarderBot:
             color=(discord.Color.green() if ok else discord.Color.red()),
             fields=[
                 ("Spreadsheet", f"`{sid}`" if sid else "—", False),
-                ("Full Send Live List", f"SKU `{live_list_count}`", True),
-                ("Full-Send-History", f"SKU `{history_count}`", True),
-                ("Full-Send-Current-List", f"SKU `{current_list_count}`", True),
-                ("Matched SKU Complete (Title+Store Link)", f"`{matched_complete_count}`", True),
-                ("New", f"`{new_items_count}`", True),
+                ("Full Send Live List", f"SKU `{live_list_raw_count}` (raw)", True),
+                ("Full-Send-History", f"SKU `{history_raw_count}` (raw)", True),
+                ("Full-Send-Current-List", f"SKU `{current_list_raw_count}` (raw)", True),
+                ("Matched SKU (Current ∩ History)", f"`{matched_skus_count}`", True),
+                ("Matched SKU Complete (Title+URL)", f"`{matched_complete_count}`", True),
+                ("New (need resolution)", f"`{new_items_count}`", True),
             ],
             footer="RS-FS • Buttons below run actions",
         )
@@ -4520,7 +4551,18 @@ class RSForwarderBot:
                         await ctx.send("❌ Could not fetch rows from Current List tab.")
                         return
                     
-                    # Extract store+sku pairs from Current List rows that need resolution
+                    # Get History SKUs for cross-matching (raw - all non-empty SKUs in column B)
+                    history_rows = await self._rs_fs_sheet.fetch_history_rows()
+                    history_skus: Set[str] = set()
+                    for row in history_rows:
+                        if len(row) >= 2:
+                            sku = str(row[1] or "").strip()  # Column B: SKU
+                            if sku and sku.lower() != "sku":  # Skip header
+                                history_skus.add(sku.lower())
+                    
+                    # Extract store+sku pairs from Current List that:
+                    # 1. Exist in both Current List and History (matched)
+                    # 2. Are missing title or URL (or both) - need resolution
                     # Current List columns: Release ID, Store, SKU/Label, Monitor Tag, Category, Channel ID, Resolved Title, Resolved URL, Affiliate URL, Status, Remove Command, Last Seen
                     pairs: List[Tuple[str, str]] = []
                     rid_by_key: Dict[str, int] = {}
@@ -4530,10 +4572,16 @@ class RSForwarderBot:
                         rid_str = str(row[0] or "").strip()
                         store = str(row[1] or "").strip()
                         sku = str(row[2] or "").strip()
+                        if not (store and sku):
+                            continue
+                        sku_lower = sku.lower()
+                        # Only process SKUs that exist in both Current List and History (matched)
+                        if sku_lower not in history_skus:
+                            continue
                         title = str(row[6] or "").strip() if len(row) > 6 else ""
                         url = str(row[7] or "").strip() if len(row) > 7 else ""
-                        # Only include rows with store+sku that are missing title or URL (need resolution)
-                        if store and sku and (not title or not url):
+                        # Only include matched SKUs that are missing title or URL (need resolution)
+                        if not title or not url:
                             pairs.append((store, sku))
                             try:
                                 rid = int(rid_str) if rid_str else 0
@@ -4543,7 +4591,7 @@ class RSForwarderBot:
                                 pass
                     
                     if not pairs:
-                        await ctx.send("✅ All items in Current List already have titles and URLs. Nothing to resolve.")
+                        await ctx.send("✅ All matched items already have titles and URLs. Nothing to resolve.")
                         return
                     
                     # Limit to the requested max (preserve order).
@@ -4561,7 +4609,12 @@ class RSForwarderBot:
                     remaining_pairs_0: List[Tuple[str, str]] = []
                     try:
                         hist = await self._rs_fs_sheet.fetch_history_cache(force=False)
-                    except Exception:
+                    except Exception as e:
+                        # Best-effort: continue with empty history if cache fetch fails
+                        try:
+                            print(f"[RS-FS Run] Warning: History cache fetch failed: {e}")
+                        except Exception:
+                            pass
                         hist = {}
                     for st, sk in (pairs or []):
                         key = self._rsfs_key_store_sku(st, sk)

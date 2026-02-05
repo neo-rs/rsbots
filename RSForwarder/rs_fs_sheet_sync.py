@@ -590,6 +590,48 @@ class RsFsSheetSync:
                 rows.append(row_str)
         return rows
 
+    async def fetch_history_rows(self) -> List[List[str]]:
+        """
+        Fetch all rows from the History tab (excluding header).
+        Returns list of rows, each row is a list of column values.
+        History columns: Store, SKU, Title, URL, Affiliate URL, First Seen, Last Seen, Last Release ID, Source
+        """
+        tab_title = self._history_tab_title()
+        _sheet_id, tab, err = await self._ensure_sheet_tab(tab_title)
+        if err or not tab:
+            return []
+        service = self._get_service()
+        if not service:
+            return []
+
+        rng = f"'{tab}'!A:I"
+
+        async with self._api_lock:
+            def _do_get() -> Dict[str, Any]:
+                return service.spreadsheets().values().get(
+                    spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                    range=rng,
+                ).execute()
+
+            try:
+                resp = await asyncio.to_thread(_do_get)
+            except Exception:
+                return []
+
+        values = resp.get("values") if isinstance(resp, dict) else None
+        rows: List[List[str]] = []
+        if isinstance(values, list):
+            # Skip header row (row 1)
+            for i, row in enumerate(values):
+                if i == 0:
+                    continue
+                # Convert to list of strings, pad to 9 columns if needed
+                row_str = [str(c or "").strip() for c in row]
+                while len(row_str) < 9:
+                    row_str.append("")
+                rows.append(row_str)
+        return rows
+
     async def fetch_history_cache(self, *, force: bool = False) -> Dict[str, Dict[str, str]]:
         """
         Return mapping key -> record where key is `store_lower|sku_lower`.
