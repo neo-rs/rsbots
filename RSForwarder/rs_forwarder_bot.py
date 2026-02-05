@@ -3601,14 +3601,28 @@ class RSForwarderBot:
             if not getattr(self, "_rs_fs_sheet", None) or not self._rs_fs_sheet.enabled():
                 return
             
-            # Check if message is from Zephyr Companion Bot
+            # Check if message is from Zephyr Companion Bot or Zephyr Monitors
             author = getattr(message, "author", None)
             author_name = str(getattr(author, "name", "") or "").strip().lower()
-            if "zephyr" not in author_name or "companion" not in author_name:
+            author_id = int(getattr(author, "id", 0) or 0)
+            # Accept messages from Zephyr Companion Bot (name contains both "zephyr" and "companion")
+            # OR from Zephyr Monitors bot (ID 595079249468063744 or name contains "zephyr" and "monitors")
+            is_zephyr_companion = "zephyr" in author_name and "companion" in author_name
+            is_zephyr_monitors = (author_id == 595079249468063744) or ("zephyr" in author_name and "monitors" in author_name)
+            if not (is_zephyr_companion or is_zephyr_monitors):
                 return
             
             # Check if message contains removal confirmation
             text = self._collect_embed_text(message)
+            # Also check message.content directly in case embed extraction fails
+            if not text:
+                try:
+                    content = str(getattr(message, "content", "") or "").strip()
+                    if content:
+                        text = content
+                except Exception:
+                    pass
+            
             text_lower = (text or "").lower()
             if "release feed has been removed" not in text_lower and "removed:" not in text_lower:
                 return
