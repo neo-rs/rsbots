@@ -78,28 +78,46 @@ def _rsfs_embed(
 
 
 class _RsFsManualResolveModal(discord.ui.Modal):
-    def __init__(self, view: "_RsFsManualResolveView", *, store: str = "", sku: str = ""):
+    def __init__(self, view: "_RsFsManualResolveView", *, store: str = "", sku: str = "", needs_title: bool = False, needs_url: bool = False):
         st = (store or "").strip()
         sk = (sku or "").strip()
-        t = "RS-FS: Provide store link"
+        t = "RS-FS: Provide info"
         if st and sk:
-            t = f"RS-FS: {st} {sk}"
+            if needs_title and needs_url:
+                t = f"RS-FS: {st} {sk} (Title + Link)"
+            elif needs_title:
+                t = f"RS-FS: {st} {sk} (Title)"
+            elif needs_url:
+                t = f"RS-FS: {st} {sk} (Link)"
         # Discord modal title is limited; keep it safe.
         t = (t[:42] + "...") if len(t) > 45 else t
         super().__init__(title=t)
         self._view = view
-        self.url = discord.ui.TextInput(label="Store URL", placeholder="https://www.walmart.com/ip/...", required=True)
-        self.title_in = discord.ui.TextInput(
-            label="Product title (optional)",
-            placeholder="Leave blank to keep current title",
-            required=False,
-            max_length=200,
-        )
-        self.add_item(self.url)
-        self.add_item(self.title_in)
+        self.needs_title = needs_title
+        self.needs_url = needs_url
+        
+        # Only add fields for what's missing
+        if needs_url:
+            self.url = discord.ui.TextInput(label="Store URL", placeholder="https://www.walmart.com/ip/...", required=True)
+            self.add_item(self.url)
+        else:
+            self.url = None
+            
+        if needs_title:
+            self.title_in = discord.ui.TextInput(
+                label="Product title",
+                placeholder="Enter product title",
+                required=True,
+                max_length=200,
+            )
+            self.add_item(self.title_in)
+        else:
+            self.title_in = None
 
     async def on_submit(self, interaction: discord.Interaction):  # type: ignore[override]
-        await self._view._handle_modal_submit(interaction, str(self.url.value or ""), str(self.title_in.value or ""))
+        url_val = str(self.url.value or "").strip() if self.url else ""
+        title_val = str(self.title_in.value or "").strip() if self.title_in else ""
+        await self._view._handle_modal_submit(interaction, url_val, title_val)
 
 
 class _RsFsManualResolveView(discord.ui.View):
@@ -128,6 +146,34 @@ class _RsFsManualResolveView(discord.ui.View):
             return self._items[self._idx]
         return None
 
+    def _whats_missing(self) -> Tuple[bool, bool]:
+        """Returns (needs_title, needs_url) for current item"""
+        it = self._current() or {}
+        title = str(it.get("title") or "").strip()
+        url = str(it.get("url") or "").strip()
+        # Check resolved values too
+        rtitle = str(it.get("resolved_title") or "").strip()
+        rurl = str(it.get("resolved_url") or "").strip()
+        has_title = bool(title or rtitle)
+        has_url = bool(url or rurl)
+        return (not has_title, not has_url)
+    
+    def _update_button_labels(self) -> None:
+        """Update button labels based on what's missing"""
+        needs_title, needs_url = self._whats_missing()
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                label = str(getattr(child, "label", "") or "")
+                if label == "Provide link":
+                    if needs_title and needs_url:
+                        child.label = "Provide Info"
+                    elif needs_title:
+                        child.label = "Provide Title"
+                    elif needs_url:
+                        child.label = "Provide Link"
+                    else:
+                        child.label = "Update Info"  # Both present, allow updates
+    
     def _render_embed(self) -> discord.Embed:
         it = self._current() or {}
         store = str(it.get("store") or "").strip()
@@ -151,12 +197,16 @@ class _RsFsManualResolveView(discord.ui.View):
             fields.append(("Resolved URL", rurl[:900], False))
         if rtitle:
             fields.append(("Resolved title", rtitle[:900], False))
+        
+        # Update button labels before rendering
+        self._update_button_labels()
+        
         return _rsfs_embed(
             "RS-FS Manual Resolve",
             status="Action required",
             color=discord.Color.orange(),
             fields=fields,
-            footer="RS-FS • Provide link saves + updates sheet • Next = view next item",
+            footer="RS-FS • Click button to provide missing info • Next = view next item",
         )
 
     async def _guard(self, interaction: discord.Interaction) -> bool:
@@ -183,15 +233,42 @@ class _RsFsManualResolveView(discord.ui.View):
                 pass
             return
 
+        needs_title, needs_url = self._whats_missing()
+        
+        # Validate URL if it was provided or if URL is needed
         u = (url or "").strip()
-        if not (u.startswith("http://") or u.startswith("https://")):
+        if u and not (u.startswith("http://") or u.startswith("https://")):
             try:
                 await interaction.response.send_message("❌ URL must start with http:// or https://", ephemeral=True)
             except Exception:
                 pass
             return
-
-        t = (title or "").strip() or (it.get("title") or "").strip() or u
+        
+        # If URL is needed but not provided, use existing URL or error
+        if needs_url and not u:
+            existing_url = str(it.get("url") or "").strip()
+            if existing_url:
+                u = existing_url
+            else:
+                try:
+                    await interaction.response.send_message("❌ URL is required but was not provided.", ephemeral=True)
+                except Exception:
+                    pass
+                return
+        
+        # If URL not needed and not provided, use existing URL
+        if not needs_url and not u:
+            u = str(it.get("url") or "").strip()
+        
+        # Handle title
+        t = (title or "").strip()
+        if not t:
+            # If title was not provided, use existing title if available
+            t = str(it.get("title") or "").strip()
+        
+        # If title is needed but still empty, use URL as fallback (for display)
+        if needs_title and not t:
+            t = u if u else ""
 
         # Compute affiliate URL (plain) and upsert into sheet immediately.
         aff = u
@@ -230,7 +307,8 @@ class _RsFsManualResolveView(discord.ui.View):
         if self._idx >= len(self._items):
             for child in self.children:
                 try:
-                    if getattr(child, "label", "") in {"Provide link", "Next"}:
+                    label = str(getattr(child, "label", "") or "")
+                    if label in {"Provide link", "Provide Title", "Provide Link", "Provide Info", "Update Info", "Next"}:
                         child.disabled = True  # type: ignore[attr-defined]
                 except Exception:
                     pass
@@ -252,11 +330,14 @@ class _RsFsManualResolveView(discord.ui.View):
             return
         try:
             it = self._current() or {}
+            needs_title, needs_url = self._whats_missing()
             await interaction.response.send_modal(
                 _RsFsManualResolveModal(
                     self,
                     store=str(it.get("store") or ""),
                     sku=str(it.get("sku") or ""),
+                    needs_title=needs_title,
+                    needs_url=needs_url,
                 )
             )
         except Exception:
@@ -273,7 +354,8 @@ class _RsFsManualResolveView(discord.ui.View):
         if self._idx >= len(self._items):
             for child in self.children:
                 try:
-                    if getattr(child, "label", "") in {"Provide link", "Next"}:
+                    label = str(getattr(child, "label", "") or "")
+                    if label in {"Provide link", "Provide Title", "Provide Link", "Provide Info", "Update Info", "Next"}:
                         child.disabled = True  # type: ignore[attr-defined]
                 except Exception:
                     pass
@@ -4513,7 +4595,7 @@ class RSForwarderBot:
                 try:
                     await ctx.send(f"✅ Running RS-FS LIVE mirror sync from <#{ch_id}> (max={lim})…")
 
-                    def _progress_embed(stage: str, done: int, total: int, *, monitor_hits: int = 0, remaining: int = 0, web_errors: int = 0) -> discord.Embed:
+                    def _progress_embed(stage: str, done: int, total: int, *, monitor_hits: int = 0, remaining: int = 0, web_errors: int = 0, monitor_hit_skus: List[str] = None, error_skus: List[Tuple[str, str]] = None) -> discord.Embed:
                         emb = discord.Embed(title="RS-FS Live Sync", color=discord.Color.dark_teal())
                         emb.add_field(name="Stage", value=stage or "…", inline=False)
                         emb.add_field(name="Progress", value=self._format_progress_bar(done, total), inline=False)
@@ -4521,6 +4603,23 @@ class RSForwarderBot:
                         emb.add_field(name="Remaining", value=str(int(remaining)), inline=True)
                         if web_errors:
                             emb.add_field(name="Website errors", value=str(int(web_errors)), inline=True)
+                        
+                        # Show monitor hit SKUs (limit to avoid embed size issues)
+                        if monitor_hit_skus:
+                            hit_list = monitor_hit_skus[:10]  # Show first 10
+                            hit_text = "\n".join([f"`{sku}`" for sku in hit_list])
+                            if len(monitor_hit_skus) > 10:
+                                hit_text += f"\n... and {len(monitor_hit_skus) - 10} more"
+                            emb.add_field(name="Monitor hit SKUs", value=hit_text or "—", inline=False)
+                        
+                        # Show error SKUs with their problems
+                        if error_skus:
+                            error_list = error_skus[:10]  # Show first 10
+                            error_text = "\n".join([f"`{sku}` — {problem[:100]}" for sku, problem in error_list])
+                            if len(error_skus) > 10:
+                                error_text += f"\n... and {len(error_skus) - 10} more"
+                            emb.add_field(name="Problem SKUs", value=error_text or "—", inline=False)
+                        
                         emb.set_footer(text="This message updates live.")
                         return emb
 
@@ -4694,6 +4793,19 @@ class RSForwarderBot:
                     # Stage 1: monitor lookup (history+manual overrides count as hits)
                     monitor_hits: List[rs_fs_sheet_sync.RsFsPreviewEntry] = list(history_hits) + list(manual_hits)
                     remaining: List[Tuple[str, str]] = []
+                    monitor_hit_skus: List[str] = []  # Track SKUs that were monitor hits
+                    error_skus: List[Tuple[str, str]] = []  # Track SKUs with errors: (sku, error_message)
+                    # Initialize monitor hit SKUs from history and manual hits
+                    for h in history_hits + manual_hits:
+                        st = str(getattr(h, "store", "") or "").strip()
+                        sk = str(getattr(h, "sku", "") or "").strip()
+                        if st and sk:
+                            sku_display = f"{st} {sk}"
+                            if sku_display not in monitor_hit_skus:
+                                monitor_hit_skus.append(sku_display)
+                            err_msg = str(getattr(h, "error", "") or "").strip()
+                            if err_msg:
+                                error_skus.append((sku_display, err_msg))
                     g_obj = getattr(ch, "guild", None)
                     done = 0
                     errors = 0
@@ -4804,6 +4916,14 @@ class RSForwarderBot:
 
                         if found:
                             monitor_hits.append(found)
+                            # Track successful monitor hits
+                            sku_display = f"{st} {sk}"
+                            if sku_display not in monitor_hit_skus:
+                                monitor_hit_skus.append(sku_display)
+                            # Track if there's an error even though it was found
+                            err_msg = str(getattr(found, "error", "") or "").strip()
+                            if err_msg:
+                                error_skus.append((sku_display, err_msg))
                         else:
                             remaining.append((st, sk))
 
@@ -4817,6 +4937,8 @@ class RSForwarderBot:
                                         total,
                                         monitor_hits=len(monitor_hits),
                                         remaining=len(remaining),
+                                        monitor_hit_skus=monitor_hit_skus,
+                                        error_skus=error_skus,
                                     )
                                 )
                             except Exception:
@@ -4828,6 +4950,16 @@ class RSForwarderBot:
                     async def _on_web_progress(web_done: int, web_total: int, web_errors: int, entry) -> None:
                         if not progress_msg:
                             return
+                        # Track website errors with SKU details
+                        if entry and isinstance(entry, rs_fs_sheet_sync.RsFsPreviewEntry):
+                            err_msg = str(getattr(entry, "error", "") or "").strip()
+                            if err_msg:
+                                st = str(getattr(entry, "store", "") or "").strip()
+                                sk = str(getattr(entry, "sku", "") or "").strip()
+                                sku_display = f"{st} {sk}"
+                                # Avoid duplicates
+                                if not any(sku == sku_display for sku, _ in error_skus):
+                                    error_skus.append((sku_display, err_msg))
                         try:
                             await progress_msg.edit(
                                 embed=_progress_embed(
@@ -4837,6 +4969,8 @@ class RSForwarderBot:
                                     monitor_hits=offset_done,
                                     remaining=max(0, offset_done + web_total - (offset_done + web_done)),
                                     web_errors=web_errors,
+                                    monitor_hit_skus=monitor_hit_skus,
+                                    error_skus=error_skus,
                                 )
                             )
                         except Exception:
