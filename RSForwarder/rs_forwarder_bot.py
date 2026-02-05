@@ -552,9 +552,10 @@ class _RsFsViewCurrentListView(discord.ui.View):
                 # Skip header row
                 if str(row[0] or "").strip().lower() == "release id":
                     continue
-                # Filter: Only show rows where "Full Send" column = "Yes"
+                # Filter: Only show rows where "Full Send" column contains the tag
                 full_send = str(row[12] or "").strip() if len(row) > 12 else ""
-                if full_send.lower() != "yes":
+                required_monitor_tag = "💶┃full-send-🤖"
+                if required_monitor_tag not in full_send:
                     continue
                 rid = str(row[0] or "").strip()
                 store = str(row[1] or "").strip()
@@ -1007,8 +1008,17 @@ class RSForwarderBot:
         try:
             print(f"{Colors.CYAN}[RS-FS Current]{Colors.RESET} Parsed {len(recs)} records from text (len={len(txt)})")
             if recs:
-                sample_raw = str(getattr(recs[0], "raw_text", "") or "")[:200]
-                print(f"{Colors.CYAN}[RS-FS Current]{Colors.RESET} Sample raw_text: {sample_raw!r}")
+                # Check first few records for Full Send tag
+                required_monitor_tag = "💶┃full-send-🤖"
+                found_count = 0
+                for i, r in enumerate(recs[:5]):
+                    raw_text = str(getattr(r, "raw_text", "") or "").strip()
+                    has_tag = required_monitor_tag in raw_text
+                    if has_tag:
+                        found_count += 1
+                    if i < 3:  # Show first 3
+                        print(f"{Colors.CYAN}[RS-FS Current]{Colors.RESET} RID={getattr(r, 'release_id', 0)}, has_tag={has_tag}, raw_text={raw_text[:150]!r}")
+                print(f"{Colors.CYAN}[RS-FS Current]{Colors.RESET} Found Full Send tag in {found_count}/{min(5, len(recs))} sample records")
         except Exception:
             pass
         
@@ -1083,12 +1093,20 @@ class RSForwarderBot:
             if src:
                 status = (status + f",src={src}").strip(",")
 
-            # Check if this record has the Full Send monitor tag
-            # Note: 💶┃full-send-🤖 appears inline in the text, not in brackets, so check raw_text
+            # Extract Full Send monitor tag from raw_text if present
+            # Note: 💶┃full-send-🤖 appears inline in the text, not in brackets
             raw_text = str(getattr(r, "raw_text", "") or "").strip()
             required_monitor_tag = "💶┃full-send-🤖"
-            has_full_send_tag = required_monitor_tag in raw_text
-            full_send_value = "Yes" if has_full_send_tag else "No"
+            full_send_value = ""
+            if required_monitor_tag in raw_text:
+                full_send_value = required_monitor_tag
+            
+            # Debug: log first few records to see what's in raw_text
+            if len(rows) < 3:
+                try:
+                    print(f"{Colors.CYAN}[RS-FS Current]{Colors.RESET} RID={rid}, raw_text={raw_text[:150]!r}, full_send_value={full_send_value!r}")
+                except Exception:
+                    pass
             
             rows.append(
                 [
@@ -1189,6 +1207,8 @@ class RSForwarderBot:
         live_list_raw_count = 0
         history_raw_count = 0
         current_list_raw_count = 0
+        full_send_count = 0
+        others_count = 0
         matched_skus_count = 0
         matched_complete_count = 0
         new_items_count = 0
@@ -1215,52 +1235,67 @@ class RSForwarderBot:
                             history_raw_skus.add(sku.lower())
                 history_raw_count = len(history_raw_skus)
                 
-                # Raw count: Current List column C (SKU/Label) - count all non-empty values
-                # Filter by "Full Send" column (column M, index 12) = "Yes"
+                # Raw count: Current List column C (SKU/Label) - count ALL non-empty values (no filter)
                 # Current List columns: Release ID (0), Store (1), SKU/Label (2), Monitor Tag (3), Category (4), Channel ID (5), Resolved Title (6), Resolved URL (7), Affiliate URL (8), Status (9), Remove Command (10), Last Seen (11), Full Send (12)
                 current_list_rows = await self._rs_fs_sheet.fetch_current_list_rows()
                 current_list_raw_skus: Set[str] = set()
-                current_list_data: Dict[str, Dict[str, str]] = {}  # sku_lower -> {store, title, url}
+                current_list_all_data: Dict[str, Dict[str, str]] = {}  # sku_lower -> {store, title, url, is_full_send}
+                current_list_full_send_skus: Set[str] = set()
+                current_list_others_skus: Set[str] = set()
+                required_monitor_tag = "💶┃full-send-🤖"
+                
                 for row in current_list_rows:
                     if len(row) < 3:
                         continue
                     # Skip header row
                     if str(row[0] or "").strip().lower() == "release id":
                         continue
-                    # Filter: Only count rows where "Full Send" column = "Yes"
-                    full_send = str(row[12] or "").strip() if len(row) > 12 else ""
-                    if full_send.lower() != "yes":
-                        continue
                     sku = str(row[2] or "").strip()  # Column C: SKU/Label
-                    if sku:
-                        sku_lower = sku.lower()
-                        current_list_raw_skus.add(sku_lower)
-                        store = str(row[1] or "").strip()
-                        title = str(row[6] or "").strip() if len(row) > 6 else ""
-                        url = str(row[7] or "").strip() if len(row) > 7 else ""
-                        current_list_data[sku_lower] = {
-                            "store": store,
-                            "sku": sku,
-                            "title": title,
-                            "url": url,
-                        }
-                current_list_raw_count = len(current_list_raw_skus)
+                    if not sku:
+                        continue
+                    sku_lower = sku.lower()
+                    current_list_raw_skus.add(sku_lower)
+                    
+                    store = str(row[1] or "").strip()
+                    title = str(row[6] or "").strip() if len(row) > 6 else ""
+                    url = str(row[7] or "").strip() if len(row) > 7 else ""
+                    full_send = str(row[12] or "").strip() if len(row) > 12 else ""
+                    is_full_send = required_monitor_tag in full_send
+                    
+                    current_list_all_data[sku_lower] = {
+                        "store": store,
+                        "sku": sku,
+                        "title": title,
+                        "url": url,
+                        "is_full_send": is_full_send,
+                    }
+                    
+                    # Categorize by Full Send filter
+                    if is_full_send:
+                        current_list_full_send_skus.add(sku_lower)
+                    else:
+                        current_list_others_skus.add(sku_lower)
                 
-                # Cross-match: Find SKUs that exist in both Current List and History
-                matched_skus: Set[str] = current_list_raw_skus.intersection(history_raw_skus)
+                current_list_raw_count = len(current_list_raw_skus)
+                full_send_count = len(current_list_full_send_skus)
+                others_count = len(current_list_others_skus)
+                
+                # Cross-match: Find SKUs that exist in both Current List (Full Send only) and History
+                # Only use Full Send items for matched/complete/new calculations
+                matched_skus: Set[str] = current_list_full_send_skus.intersection(history_raw_skus)
                 matched_skus_count = len(matched_skus)
                 
-                # From matched SKUs, find those with both title and URL (complete)
+                # From matched SKUs (Full Send only), find those with both title and URL (complete)
                 complete_skus: Set[str] = set()
                 for sku_lower in matched_skus:
-                    data = current_list_data.get(sku_lower, {})
+                    data = current_list_all_data.get(sku_lower, {})
                     title = str(data.get("title", "") or "").strip()
                     url = str(data.get("url", "") or "").strip()
                     if title and url:
                         complete_skus.add(sku_lower)
                 matched_complete_count = len(complete_skus)
                 
-                # New items = matched SKUs that are missing title or URL (or both)
+                # New items = matched SKUs (Full Send only) that are missing title or URL (or both)
                 new_items_count = matched_skus_count - matched_complete_count
         except Exception as e:
             # Best-effort counting: log error but continue with zero counts
@@ -1278,6 +1313,8 @@ class RSForwarderBot:
                 ("Full Send Live List", f"SKU `{live_list_raw_count}` (raw)", True),
                 ("Full-Send-History", f"SKU `{history_raw_count}` (raw)", True),
                 ("Full-Send-Current-List", f"SKU `{current_list_raw_count}` (raw)", True),
+                ("Full Send channel", f"`{full_send_count}`", True),
+                ("Others", f"`{others_count}`", True),
                 ("Matched SKU (Current ∩ History)", f"`{matched_skus_count}`", True),
                 ("Matched SKU Complete (Title+URL)", f"`{matched_complete_count}`", True),
                 ("New (need resolution)", f"`{new_items_count}`", True),
@@ -1673,9 +1710,10 @@ class RSForwarderBot:
                     # Skip header row
                     if str(row[0] or "").strip().lower() == "release id":
                         continue
-                    # Filter: Only process rows where "Full Send" column = "Yes"
+                    # Filter: Only process rows where "Full Send" column contains the tag
                     full_send = str(row[12] or "").strip() if len(row) > 12 else ""
-                    if full_send.lower() != "yes":
+                    required_monitor_tag = "💶┃full-send-🤖"
+                    if required_monitor_tag not in full_send:
                         continue
                     rid_str = str(row[0] or "").strip()
                     store = str(row[1] or "").strip()
@@ -1730,9 +1768,10 @@ class RSForwarderBot:
                     # Skip header row
                     if str(row[0] or "").strip().lower() == "release id":
                         continue
-                    # Filter: Only process rows where "Full Send" column = "Yes"
+                    # Filter: Only process rows where "Full Send" column contains the tag
                     full_send = str(row[12] or "").strip() if len(row) > 12 else ""
-                    if full_send.lower() != "yes":
+                    required_monitor_tag = "💶┃full-send-🤖"
+                    if required_monitor_tag not in full_send:
                         continue
                     store = str(row[1] or "").strip()  # Column B: Store
                     sku = str(row[2] or "").strip()  # Column C: SKU/Label
@@ -3051,9 +3090,10 @@ class RSForwarderBot:
                     # Skip header row
                     if str(row[0] or "").strip().lower() == "release id":
                         continue
-                    # Filter: Only process rows where "Full Send" column = "Yes"
+                    # Filter: Only process rows where "Full Send" column contains the tag
                     full_send = str(row[12] or "").strip() if len(row) > 12 else ""
-                    if full_send.lower() != "yes":
+                    required_monitor_tag = "💶┃full-send-🤖"
+                    if required_monitor_tag not in full_send:
                         continue
                     store = str(row[1] or "").strip()
                     sku = str(row[2] or "").strip()
