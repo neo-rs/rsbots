@@ -33,6 +33,9 @@ Instorebotforwarder scans configured source channels for Amazon links (including
 - **Admin Only**: Yes (administrator in a server)
 - **Returns**: Ephemeral embed preview + debug header
 
+## eBay sold comps
+When `ebay_scrape_enabled` is true, the bot fetches eBay sold listings (New, Pre-owned, Refurbished) from the product title and shows price ranges and upside in the embed. eBay often returns a bot challenge for plain HTTP; the bot uses **Playwright** (same as Amazon) to load the page when needed. Ensure Chromium is installed: `python -m playwright install chromium`. Config: `ebay_min_sold_price` (default 5.0) filters out very low prices when computing the range.
+
 ## Command Summary
 - **Total Commands**: 4
 - **Admin Commands**: 3 (`/embedbuild list`, `/embedbuild edit`, `/embedbuild preview`)

@@ -300,6 +300,8 @@ class InstorebotForwarder:
 
         self._amazon_scrape_cache: Dict[str, Dict[str, str]] = {}
         self._amazon_scrape_cache_ts: Dict[str, float] = {}
+        self._ebay_sold_cache: Dict[str, Dict[str, Dict[str, str]]] = {}
+        self._ebay_sold_cache_ts: Dict[str, float] = {}
 
         # Simple forward buffers (config-gated; does not affect existing Amazon mappings)
         self._simple_forward_lock = asyncio.Lock()
@@ -630,6 +632,319 @@ class InstorebotForwarder:
         except Exception:
             return None, ""
         return val, sym
+
+    # -----------------------
+    # eBay sold comps (same idea as sheet: keyword -> sold search URL; scrape sold prices by condition)
+    # -----------------------
+    def _ebay_keyword_from_title(self, title: str) -> str:
+        """
+        Sanitize product title for eBay _nkw (same logic as Google Sheet formula):
+        Keep only word chars, spaces, :|+- ; trim. Returns space-separated (encoding done in URL builder).
+        """
+        s = (title or "").strip()
+        if not s:
+            return ""
+        # [^\w\s:|+-] -> remove chars that are not word, space, : | + -
+        s = re.sub(r"[^\w\s:|+-]", "", s, flags=re.IGNORECASE)
+        s = " ".join(s.split()).strip()
+        return s
+
+    def _ebay_sold_search_url(self, keyword: str, *, condition_id: Optional[int] = None) -> str:
+        """
+        Build eBay sold listings search URL (same pattern as bookmarklet: _nkw=encodeURIComponent(q)&LH_Sold=1&LH_Complete=1).
+        Proper encoding avoids broken links / redirects to ebay.com/n/all-categories when _nkw is malformed.
+        condition_id: 1000=New, 2000=Refurbished, 3000=Used/Pre-owned; None = no filter.
+        """
+        from urllib.parse import quote_plus
+
+        q = (keyword or "").strip()
+        if not q:
+            return ""
+        # Match bookmarklet: encode query so URL is valid in Discord markdown and eBay doesn't redirect
+        encoded_nkw = quote_plus(q)
+        base = f"https://www.ebay.com/sch/i.html?_nkw={encoded_nkw}&LH_Sold=1&LH_Complete=1&LH_PrefLoc=1&_sop=15&_dmd=2"
+        if condition_id is not None:
+            base += f"&LH_ItemCondition={condition_id}"
+        return base
+
+    def _parse_ebay_raw_price(self, raw: str) -> Optional[float]:
+        """Parse price from eBay price string (e.g. 'US $15.99', 'to $20.00'). Same logic as Ebay-Scraper __ParseRawPrice."""
+        if not raw or not raw.strip():
+            return None
+        s = raw.replace(",", ".").strip()
+        m = re.search(r"(\d+(?:\.\d+)?)", s)
+        if not m:
+            return None
+        try:
+            v = float(m.group(1))
+            return v if 0.01 <= v <= 1_000_000 else None
+        except Exception:
+            return None
+
+    def _extract_ebay_sold_prices_from_html(self, html_txt: str) -> List[float]:
+        """Extract USD sold prices from eBay search results. Uses BeautifulSoup when available (Ebay-Scraper style) + regex fallbacks."""
+        prices: List[float] = []
+        seen: set[str] = set()
+
+        def add(v: float) -> None:
+            if v is None:
+                return
+            if 0.01 <= v <= 1_000_000:
+                key = f"{v:.2f}"
+                if key not in seen:
+                    seen.add(key)
+                    prices.append(v)
+
+        # 0) BeautifulSoup (when available): same as Ebay-Scraper - find .s-item__price and parse text
+        try:
+            from bs4 import BeautifulSoup  # noqa: F401
+            soup = BeautifulSoup(html_txt, "html.parser")
+            for tag in soup.select(".s-item__price"):
+                text = (tag.get_text() or "").strip()
+                if text:
+                    v = self._parse_ebay_raw_price(text)
+                    add(v)
+            if prices:
+                return prices
+        except Exception:
+            pass
+
+        # 1) Regex: s-item__price elements (class may be s-item__price or s-item__price--sold)
+        for m in re.finditer(
+            r'class="[^"]*s-item__price[^"]*"[^>]*>([^<]+)<',
+            html_txt,
+            re.IGNORECASE,
+        ):
+            text = (m.group(1) or "").strip()
+            if not text:
+                continue
+            v = self._parse_ebay_raw_price(text)
+            add(v)
+
+        # 2) Same with single-quoted class and possible extra tags
+        for m in re.finditer(
+            r"class='[^']*s-item__price[^']*'[^>]*>([^<]+)<",
+            html_txt,
+            re.IGNORECASE,
+        ):
+            v = self._parse_ebay_raw_price((m.group(1) or "").strip())
+            add(v)
+
+        # 3) Visible prices in HTML: $X.XX, US $X.XX
+        for m in re.finditer(
+            r"(?:US\s*)?\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)", html_txt, re.IGNORECASE
+        ):
+            raw = (m.group(1) or "").replace(",", "").strip()
+            try:
+                add(float(raw))
+            except Exception:
+                continue
+
+        # 4) JSON/model: "currentPrice":{"value":19.99} (eBay app/srp state)
+        for m in re.finditer(
+            r'"(?:currentPrice|convertedPrice|itemPrice|soldPrice|price)"\s*:\s*\{\s*"value"\s*:\s*"?(\d+(?:\.\d{2})?)"?',
+            html_txt,
+            re.IGNORECASE,
+        ):
+            try:
+                add(float((m.group(1) or "").strip()))
+            except Exception:
+                continue
+
+        return prices
+
+    def _ebay_scrape_enabled(self) -> bool:
+        v = (self.config or {}).get("ebay_scrape_enabled", None)
+        if isinstance(v, bool):
+            return v
+        s = str(v or "").strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        return False
+
+    def _ebay_scrape_timeout_s(self) -> float:
+        try:
+            v = float((self.config or {}).get("ebay_scrape_timeout_s") or 12.0)
+        except Exception:
+            v = 12.0
+        return max(3.0, min(v, 30.0))
+
+    def _ebay_scrape_cache_ttl_s(self) -> float:
+        try:
+            v = float((self.config or {}).get("ebay_scrape_cache_ttl_s") or 3600.0)
+        except Exception:
+            v = 3600.0
+        return max(300.0, min(v, 7 * 24 * 3600.0))
+
+    def _ebay_scrape_cache_get(self, keyword: str) -> Optional[Dict[str, Dict[str, str]]]:
+        k = (keyword or "").strip().lower()[:200]
+        if not k:
+            return None
+        try:
+            ts = float(self._ebay_sold_cache_ts.get(k, 0.0) or 0.0)
+        except Exception:
+            ts = 0.0
+        if (time.time() - ts) > self._ebay_scrape_cache_ttl_s():
+            self._ebay_sold_cache_ts.pop(k, None)
+            self._ebay_sold_cache.pop(k, None)
+            return None
+        return self._ebay_sold_cache.get(k)
+
+    def _ebay_scrape_cache_put(self, keyword: str, data: Dict[str, Dict[str, str]]) -> None:
+        k = (keyword or "").strip().lower()[:200]
+        if not k:
+            return
+        self._ebay_sold_cache[k] = {kk: dict(vv) for kk, vv in (data or {}).items()}
+        self._ebay_sold_cache_ts[k] = time.time()
+
+    def _is_ebay_challenge_page(self, html_txt: str) -> bool:
+        """eBay returns a bot challenge ('Pardon Our Interruption') instead of search results for plain HTTP."""
+        if not html_txt or len(html_txt) < 200:
+            return True
+        low = html_txt.lower()
+        return (
+            "pardon our interruption" in low
+            or "checking your browser" in low
+            or "challengeget" in low
+        )
+
+    async def _fetch_ebay_sold_page(self, url: str) -> Tuple[Optional[str], Optional[str]]:
+        """Fetch one eBay sold search page; return (html, error). Tries Playwright if response is a challenge page."""
+        try:
+            import aiohttp
+        except Exception:
+            return None, "aiohttp not available"
+        timeout_s = self._ebay_scrape_timeout_s()
+        headers = {
+            "User-Agent": self._scrape_user_agent(),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
+                async with session.get(url, headers=headers, allow_redirects=True) as resp:
+                    if resp.status >= 400:
+                        return None, f"HTTP {resp.status}"
+                    html_txt = await resp.text()
+                    if self._is_ebay_challenge_page(html_txt):
+                        _log_flow("EBAY_CHALLENGE", method="aiohttp", url=url[:60])
+                        pw_html, pw_err = await self._fetch_ebay_sold_page_playwright(url)
+                        if pw_html and not pw_err:
+                            _log_flow("EBAY_PW_OK", url=url[:60])
+                            return pw_html, None
+                        _log_flow("EBAY_PW_FAIL", err=(pw_err or "no_content")[:80])
+                        return html_txt, None  # return challenge HTML so caller sees no prices
+                    return html_txt, None
+        except asyncio.TimeoutError:
+            return None, "timeout"
+        except Exception as e:
+            return None, str(e)[:200]
+
+    def _fetch_ebay_sold_page_playwright_sync(self, url: str) -> Tuple[Optional[str], Optional[str]]:
+        """Sync Playwright load (run in thread). Wait for challenge to pass and results to appear."""
+        from playwright.sync_api import sync_playwright
+        timeout_ms = 45000  # 45s for goto + challenge
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=self._playwright_headless(),
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+            try:
+                context = browser.new_context(
+                    viewport={"width": 1280, "height": 720},
+                    user_agent=self._scrape_user_agent(),
+                    locale="en-US",
+                )
+                page = context.new_page()
+                page.goto(url, wait_until="commit", timeout=timeout_ms)
+                # Let challenge run: wait for navigation to complete
+                try:
+                    page.wait_for_load_state("networkidle", timeout=20000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(8000)  # challenge often needs 5–10s
+                # Wait for results if not yet present
+                try:
+                    page.wait_for_selector(".s-item__price, .srp-river-results, [data-view=srv]", timeout=15000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(2000)
+                return page.content(), None
+            finally:
+                browser.close()
+
+    async def _fetch_ebay_sold_page_playwright(self, url: str) -> Tuple[Optional[str], Optional[str]]:
+        """Load eBay sold search in a real browser to bypass challenge; return (html, error)."""
+        if not self._playwright_enabled():
+            return None, "playwright disabled"
+        try:
+            import playwright  # type: ignore  # noqa: F401
+        except Exception:
+            return None, "playwright not installed"
+        try:
+            html_txt, _ = await asyncio.to_thread(self._fetch_ebay_sold_page_playwright_sync, url)
+            if not html_txt:
+                return None, "no content"
+            if self._is_ebay_challenge_page(html_txt):
+                return None, "still challenge after playwright"
+            return html_txt, None
+        except Exception as e:
+            return None, str(e)[:200]
+
+    async def _scrape_ebay_sold_ranges(self, keyword: str) -> Tuple[Optional[Dict[str, Dict[str, str]]], Optional[str]]:
+        """
+        For a search keyword, fetch eBay sold listings for New (1000), Pre-owned (3000), Refurbished (2000),
+        parse sold prices, return low/high per condition. Result e.g. {"new": {"low": "$10", "high": "$50"}, ...}.
+        """
+        q = self._ebay_keyword_from_title(keyword)
+        if not q:
+            _log_flow("EBAY_KEYWORD", keyword="", reason="empty")
+            return None, "empty keyword"
+        _log_flow("EBAY_KEYWORD", keyword=q[:60])
+        cached = self._ebay_scrape_cache_get(q)
+        if cached:
+            _log_flow("EBAY_CACHE_HIT", keyword=q[:40])
+            return cached, None
+
+        # 1000=New, 2000=Refurbished, 3000=Used/Pre-owned
+        condition_ids: List[Tuple[str, int]] = [
+            ("new", 1000),
+            ("pre_owned", 3000),
+            ("refurbished", 2000),
+        ]
+        result: Dict[str, Dict[str, str]] = {}
+        for cond_key, cond_id in condition_ids:
+            url = self._ebay_sold_search_url(q, condition_id=cond_id)
+            _log_flow("EBAY_FETCH_START", cond=cond_key, url=url[:70])
+            html, err = await self._fetch_ebay_sold_page(url)
+            if err or not html:
+                _log_flow("EBAY_FETCH", cond=cond_key, err=(err or "no_html")[:80], html_len=0)
+                result[cond_key] = {"low": "N/A", "high": "N/A", "url": url}
+                continue
+            _log_flow("EBAY_FETCH", cond=cond_key, err="ok", html_len=len(html or ""))
+            prices = self._extract_ebay_sold_prices_from_html(html)
+            if not prices:
+                _log_flow("EBAY_PRICES", cond=cond_key, raw_count=0, low="N/A", high="N/A")
+                result[cond_key] = {"low": "N/A", "high": "N/A", "url": url}
+                continue
+            # Ignore very low prices (parts, accessories) when computing range
+            min_sold_price = float((self.config or {}).get("ebay_min_sold_price") or 5.0)
+            prices_filtered = [p for p in prices if p >= min_sold_price]
+            if not prices_filtered:
+                prices_filtered = prices
+            low_val, high_val = min(prices_filtered), max(prices_filtered)
+            result[cond_key] = {
+                "low": f"${low_val:,.2f}" if low_val != high_val else f"${low_val:,.2f}",
+                "high": f"${high_val:,.2f}" if low_val != high_val else f"${high_val:,.2f}",
+                "url": url,
+            }
+            _log_flow("EBAY_PRICES", cond=cond_key, raw_count=len(prices), filtered=len(prices_filtered), low=result[cond_key]["low"], high=result[cond_key]["high"])
+        self._ebay_scrape_cache_put(q, result)
+        return result, None
 
     def _extract_amazon_before_price_from_html(self, html_txt: str, *, current_price: str = "") -> str:
         """
@@ -3328,6 +3643,63 @@ class InstorebotForwarder:
         deal_type = (guessed.get("deal_type") or "").strip() or "Amazon Lead"
         source_credit = (guessed.get("source_credit") or "").strip()
 
+        # eBay sold comps (run before card body so we can inject eBay block and compute upside).
+        ebay_comps_url = ""
+        ebay_sold_new = "N/A"
+        ebay_sold_pre_owned = "N/A"
+        ebay_sold_refurbished = "N/A"
+        ebay_sold_err = ""
+        ebay_sold_new_near = "N/A"
+        ebay_upside_str = ""
+        ebay_refurb_preowned_line = ""
+        if self._ebay_scrape_enabled() and title:
+            _log_flow("EBAY_START", title=(title or "")[:50])
+            try:
+                ebay_ranges, ebay_err = await self._scrape_ebay_sold_ranges(title)
+                if ebay_err:
+                    ebay_sold_err = ebay_err
+                    _log_flow("EBAY_SCRAPE_FAIL", err=ebay_err[:120])
+                elif ebay_ranges:
+                    q = self._ebay_keyword_from_title(title)
+                    ebay_comps_url = self._ebay_sold_search_url(q) if q else ""
+                    for cond_key, display in [("new", "ebay_sold_new"), ("pre_owned", "ebay_sold_pre_owned"), ("refurbished", "ebay_sold_refurbished")]:
+                        r = (ebay_ranges or {}).get(cond_key) or {}
+                        lo, hi = r.get("low", "N/A"), r.get("high", "N/A")
+                        if lo and hi and lo != "N/A" and hi != "N/A":
+                            val = f"{lo} – {hi}" if lo != hi else lo
+                        else:
+                            val = "N/A"
+                        if display == "ebay_sold_new":
+                            ebay_sold_new = val
+                            ebay_sold_new_near = lo
+                        elif display == "ebay_sold_pre_owned":
+                            ebay_sold_pre_owned = val
+                        else:
+                            ebay_sold_refurbished = val
+                    _log_flow("EBAY_SCRAPE_OK", new=ebay_sold_new[:40], pre_owned=ebay_sold_pre_owned[:40], refurb=ebay_sold_refurbished[:40])
+                    # Upside: eBay New low minus current price (only when both parse as USD).
+                    try:
+                        new_low_val, _ = self._price_to_float(ebay_sold_new_near)
+                        cur_val, _ = self._price_to_float(price)
+                        if new_low_val is not None and cur_val is not None and new_low_val > cur_val:
+                            upside = round(new_low_val - cur_val, 2)
+                            ebay_upside_str = f"Roughly ${upside:,.0f} in upside per unit"
+                    except Exception:
+                        pass
+                    # Optional: Refurbished/Pre-owned line only if at least one has data.
+                    if ebay_sold_pre_owned != "N/A" or ebay_sold_refurbished != "N/A":
+                        parts = []
+                        if ebay_sold_pre_owned != "N/A":
+                            parts.append(f"Pre-owned {ebay_sold_pre_owned}")
+                        if ebay_sold_refurbished != "N/A":
+                            parts.append(f"Refurbished {ebay_sold_refurbished}")
+                        ebay_refurb_preowned_line = "Refurbished/Pre-owned: " + "; ".join(parts)
+            except Exception as e:
+                ebay_sold_err = str(e)[:200]
+                _log_flow("EBAY_SCRAPE_EXC", err=ebay_sold_err[:120])
+        elif self._ebay_scrape_enabled() and not title:
+            _log_flow("EBAY_SKIP", reason="no_title")
+
         # Build the "card body" to match your desired format (no footer/timestamp, one key link).
         card_lines: List[str] = []
         card_lines.append(f"Current Price: **{price}**" if price else "Current Price:")
@@ -3346,6 +3718,15 @@ class InstorebotForwarder:
         if key_link:
             card_lines.append("")
             card_lines.append(key_link)
+        # eBay Comps block: link + recent sales near (New) + upside + optional Refurb/Pre-owned.
+        if ebay_comps_url:
+            card_lines.append("")
+            card_lines.append(f"**eBay Comps:** [view sold listings]({ebay_comps_url})")
+            card_lines.append(f"Recent eBay sales near {ebay_sold_new_near} (sold range for New)")
+            if ebay_upside_str:
+                card_lines.append(ebay_upside_str)
+            if ebay_refurb_preowned_line:
+                card_lines.append(ebay_refurb_preowned_line)
         card_body = "\n".join(card_lines).strip()
 
         # Routing: allow per-source overrides, otherwise personal vs grocery based on detected category.
@@ -3399,6 +3780,14 @@ class InstorebotForwarder:
             "card_body": card_body,
             "openai_steps_mode": openai_steps_mode,
             "openai_info_mode": openai_info_mode,
+            "ebay_comps_url": ebay_comps_url,
+            "ebay_sold_new": ebay_sold_new,
+            "ebay_sold_pre_owned": ebay_sold_pre_owned,
+            "ebay_sold_refurbished": ebay_sold_refurbished,
+            "ebay_sold_err": ebay_sold_err,
+            "ebay_sold_new_near": ebay_sold_new_near,
+            "ebay_upside_str": ebay_upside_str,
+            "ebay_refurb_preowned_line": ebay_refurb_preowned_line,
         }
 
         embed = _embed_from_template(tpl or {}, ctx) if tpl else None

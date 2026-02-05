@@ -3646,6 +3646,32 @@ class RSAdminBot:
             )
             await ctx.send(embed=embed, view=_DeleteChannelView())
 
+        def _resolve_category(guild: discord.Guild, raw: str) -> Tuple[Optional[discord.CategoryChannel], List[discord.CategoryChannel]]:
+            """Resolve category by ID or name. Returns (single match or None, list of name matches)."""
+            raw = raw.strip()
+            if not raw:
+                return None, []
+            if raw.isdigit():
+                ch = guild.get_channel(int(raw))
+                if isinstance(ch, discord.CategoryChannel):
+                    return ch, []
+            all_cats = [c for c in guild.categories if isinstance(c, discord.CategoryChannel)]
+            filtered = [c for c in all_cats if raw.lower() in c.name.lower()]
+            filtered = sorted(filtered, key=lambda x: x.position)
+            if len(filtered) == 1:
+                return filtered[0], []
+            if len(filtered) > 1:
+                return None, filtered[:25]
+            return None, []
+
+        async def _transfer_cleanup(*to_delete: Optional[discord.Message]) -> None:
+            for m in to_delete:
+                if m is not None:
+                    try:
+                        await m.delete()
+                    except Exception:
+                        pass
+
         @self.bot.command(name="transfer")
         async def _cmd_transfer(ctx: commands.Context, *args: str) -> None:
             if not await _guard(ctx):
@@ -3655,320 +3681,103 @@ class RSAdminBot:
             if not isinstance(getattr(ctx, "channel", None), discord.TextChannel):
                 await _deny(ctx, "❌ Run this in a server text channel.")
                 return
-            
-            # Legacy support: if args provided, try to parse them
-            if args:
-                conv_ch = commands.TextChannelConverter()
-                conv_cat = commands.CategoryChannelConverter()
-                channel: discord.TextChannel = ctx.channel  # type: ignore[assignment]
-                cat: Optional[discord.CategoryChannel] = None
 
-                raw = list(args)
-                if len(raw) >= 2:
-                    try:
-                        channel = await conv_ch.convert(ctx, raw[0])
-                        raw = raw[1:]
-                    except Exception:
-                        channel = ctx.channel  # type: ignore[assignment]
+            channel: discord.TextChannel = ctx.channel  # type: ignore[assignment]
+            me = ctx.guild.me
+            if not me or not channel.permissions_for(me).manage_channels:
+                await _deny(ctx, "❌ Missing permission: Manage Channels.")
+                return
 
-                target = " ".join(raw).strip()
+            to_delete: List[Optional[discord.Message]] = [ctx.message]
+            category_input = " ".join(args).strip() if args else None
+
+            if not category_input:
+                prompt_msg = await ctx.send(
+                    "**Transfer this channel to category.**\n"
+                    "Reply with a **category ID** or **category name** (matches as you type):"
+                )
+                to_delete.append(prompt_msg)
+
+                def check(m: discord.Message) -> bool:
+                    return m.channel.id == ctx.channel.id and m.author.id == ctx.author.id and not m.author.bot
+
                 try:
-                    cat = await conv_cat.convert(ctx, target)
-                except Exception:
-                    cat = None
-                if cat is None:
+                    reply_msg = await self.bot.wait_for("message", timeout=60.0, check=check)
+                except asyncio.TimeoutError:
                     try:
-                        if target.isdigit():
-                            c = ctx.guild.get_channel(int(target))
-                            if isinstance(c, discord.CategoryChannel):
-                                cat = c
-                    except Exception:
-                        cat = None
-                if cat is not None:
-                    me = ctx.guild.me
-                    if not me or not channel.permissions_for(me).manage_channels:
-                        await _deny(ctx, "❌ Missing permission: Manage Channels.")
-                        return
-
-                    async def _do(interaction: discord.Interaction) -> None:
-                        try:
-                            await interaction.followup.send(f"📦 Moving {channel.mention} → **{cat.name}**…", ephemeral=False)
-                        except Exception:
-                            pass
-                        try:
-                            await channel.edit(category=cat, sync_permissions=True, reason=f"Transferred by {ctx.author} via RSAdminBot")
-                        except Exception as e:
-                            try:
-                                await interaction.followup.send(f"❌ Transfer failed: {str(e)[:200]}", ephemeral=False)
-                            except Exception:
-                                pass
-
-                    embed = discord.Embed(
-                        title="Confirm transfer",
-                        description=f"Move {channel.mention} into category **{cat.name}**?",
-                        color=discord.Color.orange(),
-                    )
-                    await ctx.send(embed=embed, view=_ConfirmView(author_id=int(ctx.author.id), on_confirm=_do))
-                    return
-            
-            # Interactive UI with text input search
-            class _ChannelSearchModal(ui.Modal, title="Search Channel"):
-                search_input = ui.TextInput(label="Channel Name", placeholder="Type channel name to search...", required=True, max_length=100)
-                
-                def __init__(self, view_instance):
-                    super().__init__()
-                    self.view_instance = view_instance
-                
-                async def on_submit(self, interaction: discord.Interaction):
-                    search_term = self.search_input.value.lower().strip()
-                    if not search_term:
-                        await interaction.response.send_message("❌ Please enter a search term.", ephemeral=True)
-                        return
-                    
-                    # Filter channels by search term
-                    all_channels = [ch for ch in ctx.guild.channels if isinstance(ch, discord.TextChannel)]
-                    filtered = [ch for ch in all_channels if search_term in ch.name.lower()]
-                    filtered = sorted(filtered, key=lambda x: x.position)[:25]
-                    
-                    if not filtered:
-                        await interaction.response.send_message(f"❌ No channels found matching '{search_term}'.", ephemeral=True)
-                        return
-                    
-                    # Show filtered results in select menu
-                    opts: List[discord.SelectOption] = []
-                    for ch in filtered:
-                        opts.append(discord.SelectOption(
-                            label=f"#{ch.name}"[:100],
-                            value=str(ch.id),
-                            description=f"Channel: {ch.name}"
-                        ))
-                    
-                    # Create a new view with filtered channel select
-                    class _FilteredChannelView(ui.View):
-                        def __init__(self, parent_view):
-                            super().__init__(timeout=300)
-                            self.parent_view = parent_view
-                            self.channel_select = ui.Select(
-                                placeholder=f"CHANNELS MATCHING #{search_term.upper()} ({len(filtered)})",
-                                options=opts,
-                                min_values=1,
-                                max_values=1
-                            )
-                            self.channel_select.callback = self.on_channel_selected
-                            self.add_item(self.channel_select)
-                        
-                        async def interaction_check(self, i: discord.Interaction) -> bool:
-                            try:
-                                return int(getattr(getattr(i, "user", None), "id", 0) or 0) == int(ctx.author.id)
-                            except Exception:
-                                return False
-                        
-                        async def on_channel_selected(self, i: discord.Interaction):
-                            try:
-                                channel_id = int(self.channel_select.values[0])
-                                self.parent_view.selected_channel_id = channel_id
-                                await i.response.send_message(f"✅ Channel selected: `{ctx.guild.get_channel(channel_id).name}`. Now search for a category.", ephemeral=True)
-                                # Update main view
-                                await self.parent_view._update_message()
-                            except Exception as e:
-                                await i.response.send_message(f"❌ Error: {str(e)[:200]}", ephemeral=True)
-                    
-                    filtered_view = _FilteredChannelView(self.view_instance)
-                    await interaction.response.send_message(
-                        f"**CHANNELS MATCHING #{search_term.upper()}**\nSelect a channel from the list below:",
-                        view=filtered_view,
-                        ephemeral=True
-                    )
-            
-            class _CategorySearchModal(ui.Modal, title="Search Category"):
-                search_input = ui.TextInput(label="Category Name", placeholder="Type category name to search...", required=True, max_length=100)
-                
-                def __init__(self, view_instance):
-                    super().__init__()
-                    self.view_instance = view_instance
-                
-                async def on_submit(self, interaction: discord.Interaction):
-                    search_term = self.search_input.value.lower().strip()
-                    if not search_term:
-                        await interaction.response.send_message("❌ Please enter a search term.", ephemeral=True)
-                        return
-                    
-                    # Filter categories by search term
-                    all_cats = [c for c in ctx.guild.categories if isinstance(c, discord.CategoryChannel)]
-                    filtered = [c for c in all_cats if search_term in c.name.lower()]
-                    filtered = sorted(filtered, key=lambda x: x.position)[:25]
-                    
-                    if not filtered:
-                        await interaction.response.send_message(f"❌ No categories found matching '{search_term}'.", ephemeral=True)
-                        return
-                    
-                    # Show filtered results in select menu
-                    opts: List[discord.SelectOption] = []
-                    for cat in filtered:
-                        opts.append(discord.SelectOption(
-                            label=cat.name[:100] or "category",
-                            value=str(cat.id),
-                            description=f"Category: {cat.name}"
-                        ))
-                    
-                    # Create a new view with filtered category select
-                    class _FilteredCategoryView(ui.View):
-                        def __init__(self, parent_view):
-                            super().__init__(timeout=300)
-                            self.parent_view = parent_view
-                            self.category_select = ui.Select(
-                                placeholder=f"CATEGORIES MATCHING {search_term.upper()} ({len(filtered)})",
-                                options=opts,
-                                min_values=1,
-                                max_values=1
-                            )
-                            self.category_select.callback = self.on_category_selected
-                            self.add_item(self.category_select)
-                        
-                        async def interaction_check(self, i: discord.Interaction) -> bool:
-                            try:
-                                return int(getattr(getattr(i, "user", None), "id", 0) or 0) == int(ctx.author.id)
-                            except Exception:
-                                return False
-                        
-                        async def on_category_selected(self, i: discord.Interaction):
-                            try:
-                                category_id = int(self.category_select.values[0])
-                                self.parent_view.selected_category_id = category_id
-                                
-                                # Check if both are selected, if so perform transfer
-                                if self.parent_view.selected_channel_id and self.parent_view.selected_category_id:
-                                    await i.response.defer()
-                                    await self.parent_view._perform_transfer(i)
-                                else:
-                                    await i.response.send_message(f"✅ Category selected: `{ctx.guild.get_channel(category_id).name}`. Now search for a channel.", ephemeral=True)
-                                    await self.parent_view._update_message()
-                            except Exception as e:
-                                await i.response.send_message(f"❌ Error: {str(e)[:200]}", ephemeral=True)
-                    
-                    filtered_view = _FilteredCategoryView(self.view_instance)
-                    await interaction.response.send_message(
-                        f"**CATEGORIES MATCHING {search_term.upper()}**\nSelect a category from the list below:",
-                        view=filtered_view,
-                        ephemeral=True
-                    )
-            
-            class _TransferView(ui.View):
-                def __init__(self):
-                    super().__init__(timeout=300)
-                    self.selected_channel_id: Optional[int] = None
-                    self.selected_category_id: Optional[int] = None
-                    self.message: Optional[discord.Message] = None
-                
-                async def interaction_check(self, interaction: discord.Interaction) -> bool:
-                    try:
-                        return int(getattr(getattr(interaction, "user", None), "id", 0) or 0) == int(ctx.author.id)
-                    except Exception:
-                        return False
-                
-                async def _update_message(self):
-                    """Update the main message with current selections"""
-                    if not self.message:
-                        return
-                    
-                    channel_name = "None"
-                    category_name = "None"
-                    
-                    if self.selected_channel_id:
-                        ch = ctx.guild.get_channel(self.selected_channel_id)
-                        if ch:
-                            channel_name = f"#{ch.name}"
-                    
-                    if self.selected_category_id:
-                        cat = ctx.guild.get_channel(self.selected_category_id)
-                        if cat:
-                            category_name = cat.name
-                    
-                    embed = discord.Embed(
-                        title="📦 Transfer Channel",
-                        description=(
-                            "Use the buttons below to search and select:\n\n"
-                            f"**Channel:** {channel_name}\n"
-                            f"**Category:** {category_name}\n\n"
-                            "Type in the search modals to filter channels/categories as you type."
-                        ),
-                        color=discord.Color.orange(),
-                    )
-                    
-                    try:
-                        await self.message.edit(embed=embed, view=self)
+                        await prompt_msg.edit(content="⏱️ Timed out. Run `!transfer` again.")
                     except Exception:
                         pass
-                
-                @ui.button(label="🔍 Search Channel", style=discord.ButtonStyle.primary)
-                async def search_channel_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
-                    await i.response.send_modal(_ChannelSearchModal(self))
-                
-                @ui.button(label="🔍 Search Category", style=discord.ButtonStyle.primary)
-                async def search_category_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
-                    await i.response.send_modal(_CategorySearchModal(self))
-                
-                @ui.button(label="Confirm Transfer", style=discord.ButtonStyle.success)
-                async def confirm_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
-                    if not self.selected_channel_id or not self.selected_category_id:
-                        await i.response.send_message("❌ Please select both a channel and category first.", ephemeral=True)
-                        return
-                    await i.response.defer()
-                    await self._perform_transfer(i)
-                
-                @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-                async def cancel_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
-                    for child in self.children:
-                        if isinstance(child, ui.Button):
-                            child.disabled = True
-                    await i.response.edit_message(content="Cancelled.", view=self)
-                
-                async def _perform_transfer(self, interaction: discord.Interaction):
+                    return
+                to_delete.append(reply_msg)
+                category_input = reply_msg.content.strip()
+
+            cat_single, cat_list = _resolve_category(ctx.guild, category_input)
+
+            if cat_single is not None:
+                try:
+                    await channel.edit(category=cat_single, sync_permissions=True, reason=f"Transferred by {ctx.author} via RSAdminBot")
+                    result_msg = await ctx.send(f"✅ Moved {channel.mention} → **{cat_single.name}**")
+                    to_delete.append(result_msg)
+                except discord.Forbidden:
+                    await ctx.send("❌ I don't have permission to edit this channel.")
+                except Exception as e:
+                    await ctx.send(f"❌ Transfer failed: {str(e)[:200]}")
+                await _transfer_cleanup(*to_delete)
+                return
+
+            if cat_list:
+                author_id = ctx.author.id
+
+                class _CategorySelectView(ui.View):
+                    def __init__(self, categories: List[discord.CategoryChannel]):
+                        super().__init__(timeout=60)
+                        opts = [discord.SelectOption(label=c.name[:100], value=str(c.id), description=f"ID: {c.id}") for c in categories]
+                        sel = ui.Select(placeholder="Select category…", options=opts, min_values=1, max_values=1)
+                        sel.callback = self.on_select
+                        self.add_item(sel)
+                        self.categories = categories
+                        self.chosen: Optional[discord.CategoryChannel] = None
+
+                    async def interaction_check(self, i: discord.Interaction) -> bool:
+                        return i.user.id == author_id
+
+                    async def on_select(self, i: discord.Interaction):
+                        cid = int(self.children[0].values[0])  # type: ignore[attr-defined]
+                        self.chosen = ctx.guild.get_channel(cid) if isinstance(ctx.guild.get_channel(cid), discord.CategoryChannel) else None
+                        self.stop()
+                        await i.response.defer()
+
+                select_view = _CategorySelectView(cat_list)
+                list_msg = await ctx.send(
+                    f"**Categories matching \"{category_input}\"** — pick one:",
+                    view=select_view
+                )
+                to_delete.append(list_msg)
+
+                try:
+                    await asyncio.wait_for(select_view.wait(), timeout=60.0)
+                except asyncio.TimeoutError:
                     try:
-                        channel = ctx.guild.get_channel(self.selected_channel_id)
-                        category = ctx.guild.get_channel(self.selected_category_id)
-                        
-                        if not channel or not isinstance(channel, discord.TextChannel):
-                            await interaction.followup.send("❌ Channel not found", ephemeral=False)
-                            return
-                        
-                        if not category or not isinstance(category, discord.CategoryChannel):
-                            await interaction.followup.send("❌ Category not found", ephemeral=False)
-                            return
-                        
-                        me = ctx.guild.me
-                        if not me or not channel.permissions_for(me).manage_channels:
-                            await interaction.followup.send("❌ Missing permission: Manage Channels.", ephemeral=False)
-                            return
-                        
-                        for child in self.children:
-                            if isinstance(child, ui.Button):
-                                child.disabled = True
-                        try:
-                            await interaction.edit_original_response(content="📦 Transferring channel…", view=self)
-                        except Exception:
-                            pass
-                        
-                        await channel.edit(category=category, sync_permissions=True, reason=f"Transferred by {ctx.author} via RSAdminBot")
-                        await interaction.followup.send(f"✅ Moved {channel.mention} → **{category.name}**", ephemeral=False)
-                    except discord.Forbidden:
-                        await interaction.followup.send("❌ I don't have permission to edit this channel", ephemeral=False)
+                        await list_msg.edit(content="⏱️ Timed out.", view=None)
+                    except Exception:
+                        pass
+                    await _transfer_cleanup(*to_delete)
+                    return
+
+                if select_view.chosen:
+                    try:
+                        await channel.edit(category=select_view.chosen, sync_permissions=True, reason=f"Transferred by {ctx.author} via RSAdminBot")
+                        result_msg = await ctx.send(f"✅ Moved {channel.mention} → **{select_view.chosen.name}**")
+                        to_delete.append(result_msg)
                     except Exception as e:
-                        await interaction.followup.send(f"❌ Transfer failed: {str(e)[:200]}", ephemeral=False)
-            
-            view = _TransferView()
-            embed = discord.Embed(
-                title="📦 Transfer Channel",
-                description=(
-                    "Use the buttons below to search and select:\n\n"
-                    "**Channel:** None\n"
-                    "**Category:** None\n\n"
-                    "Type in the search modals to filter channels/categories as you type."
-                ),
-                color=discord.Color.orange(),
-            )
-            msg = await ctx.send(embed=embed, view=view)
-            view.message = msg
+                        await ctx.send(f"❌ Transfer failed: {str(e)[:200]}")
+                await _transfer_cleanup(*to_delete)
+                return
+
+            err_msg = await ctx.send(f"❌ No category found for \"{category_input}\". Use a category ID or part of a category name.")
+            to_delete.append(err_msg)
+            await _transfer_cleanup(*to_delete)
 
         @self.bot.command(name="archive")
         async def _cmd_archive(ctx: commands.Context) -> None:
