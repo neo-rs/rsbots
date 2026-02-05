@@ -543,6 +543,47 @@ class RsFsSheetSync:
                 rows.append(row_str)
         return rows
 
+    async def fetch_live_list_rows(self) -> List[List[str]]:
+        """
+        Fetch all rows from the Live List tab (excluding header).
+        Returns list of rows, each row is a list of column values.
+        Live List columns: Store, SKU-UPC, Product Title, STORE LINK, Comps, Category, affiliated link, monitor url link
+        """
+        tab = await self._resolve_tab_name()
+        if not tab:
+            return []
+        service = self._get_service()
+        if not service:
+            return []
+
+        rng = f"'{tab}'!A:H"
+
+        async with self._api_lock:
+            def _do_get() -> Dict[str, Any]:
+                return service.spreadsheets().values().get(
+                    spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                    range=rng,
+                ).execute()
+
+            try:
+                resp = await asyncio.to_thread(_do_get)
+            except Exception:
+                return []
+
+        values = resp.get("values") if isinstance(resp, dict) else None
+        rows: List[List[str]] = []
+        if isinstance(values, list):
+            # Skip header row (row 1)
+            for i, row in enumerate(values):
+                if i == 0:
+                    continue
+                # Convert to list of strings, pad to 8 columns if needed
+                row_str = [str(c or "").strip() for c in row]
+                while len(row_str) < 8:
+                    row_str.append("")
+                rows.append(row_str)
+        return rows
+
     async def fetch_history_cache(self, *, force: bool = False) -> Dict[str, Dict[str, str]]:
         """
         Return mapping key -> record where key is `store_lower|sku_lower`.

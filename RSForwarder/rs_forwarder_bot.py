@@ -830,14 +830,61 @@ class RSForwarderBot:
         except Exception as e:
             ok, msg, tab, n = False, f"failed: {str(e)[:200]}", None, 0
 
+        # Fetch counts from all three tabs
+        live_list_count = 0
+        history_count = 0
+        current_list_count = 0
+        matched_complete_count = 0
+        new_items_count = 0
+        
+        try:
+            if ok and getattr(self, "_rs_fs_sheet", None):
+                # Count Live List SKUs
+                live_list_rows = await self._rs_fs_sheet.fetch_live_list_rows()
+                live_list_skus: Set[str] = set()
+                for row in live_list_rows:
+                    if len(row) >= 2:
+                        sku = str(row[1] or "").strip().lower()
+                        if sku:
+                            live_list_skus.add(sku)
+                live_list_count = len(live_list_skus)
+                
+                # Count History SKUs
+                history_cache = await self._rs_fs_sheet.fetch_history_cache(force=False)
+                history_count = len(history_cache)
+                
+                # Count Current List SKUs and check completeness
+                current_list_rows = await self._rs_fs_sheet.fetch_current_list_rows()
+                current_list_skus: Set[str] = set()
+                complete_skus: Set[str] = set()  # SKUs with both title and URL
+                for row in current_list_rows:
+                    if len(row) >= 3:
+                        store = str(row[1] or "").strip()
+                        sku = str(row[2] or "").strip()
+                        title = str(row[6] or "").strip() if len(row) > 6 else ""
+                        url = str(row[7] or "").strip() if len(row) > 7 else ""
+                        if store and sku:
+                            sku_lower = sku.lower()
+                            current_list_skus.add(sku_lower)
+                            if title and url:
+                                complete_skus.add(sku_lower)
+                current_list_count = len(current_list_skus)
+                matched_complete_count = len(complete_skus)
+                new_items_count = current_list_count - matched_complete_count
+        except Exception:
+            pass
+
         emb = _rsfs_embed(
             "RS-FS Check",
             status=("✅ OK" if ok else f"❌ NOT ready: {msg}"),
             color=(discord.Color.green() if ok else discord.Color.red()),
             fields=[
                 ("Spreadsheet", f"`{sid}`" if sid else "—", False),
-                ("Tab", f"`{tab}` (gid={gid})" if (tab and gid) else (f"gid={gid}" if gid else "—"), False),
-                ("Existing SKUs (sheet)", str(int(n or 0)), True),
+                ("Full Send Live List", f"SKU `{live_list_count}`", True),
+                ("Full-Send-History", f"SKU `{history_count}`", True),
+                ("Full-Send-Current-List", f"SKU `{current_list_count}`", True),
+                ("Matched SKU Complete (Title+Store Link)", f"`{matched_complete_count}`", True),
+                ("New", f"`{new_items_count}`", True),
             ],
             footer="RS-FS • Buttons below run actions",
         )
@@ -4466,7 +4513,7 @@ class RSForwarderBot:
                         await ctx.send("❌ Could not fetch rows from Current List tab.")
                         return
                     
-                    # Extract store+sku pairs from Current List rows
+                    # Extract store+sku pairs from Current List rows that need resolution
                     # Current List columns: Release ID, Store, SKU/Label, Monitor Tag, Category, Channel ID, Resolved Title, Resolved URL, Affiliate URL, Status, Remove Command, Last Seen
                     pairs: List[Tuple[str, str]] = []
                     rid_by_key: Dict[str, int] = {}
@@ -4476,8 +4523,10 @@ class RSForwarderBot:
                         rid_str = str(row[0] or "").strip()
                         store = str(row[1] or "").strip()
                         sku = str(row[2] or "").strip()
-                        # Only include rows with both store and sku (for Live List sync)
-                        if store and sku:
+                        title = str(row[6] or "").strip() if len(row) > 6 else ""
+                        url = str(row[7] or "").strip() if len(row) > 7 else ""
+                        # Only include rows with store+sku that are missing title or URL (need resolution)
+                        if store and sku and (not title or not url):
                             pairs.append((store, sku))
                             try:
                                 rid = int(rid_str) if rid_str else 0
@@ -4487,7 +4536,7 @@ class RSForwarderBot:
                                 pass
                     
                     if not pairs:
-                        await ctx.send("❌ Found 0 items with store+sku in Current List tab.")
+                        await ctx.send("✅ All items in Current List already have titles and URLs. Nothing to resolve.")
                         return
                     
                     # Limit to the requested max (preserve order).
@@ -4829,15 +4878,66 @@ class RSForwarderBot:
                         except Exception:
                             pass
 
-                    rows = [[e.store, e.sku, e.title, e.affiliate_url, e.monitor_url] for e in entries]
-                    ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(rows)
+                    # Sync resolved items to Live List
+                    # Build resolved entries map for updating Current List
+                    resolved_by_key: Dict[str, Dict[str, str]] = {}
+                    for e in entries:
+                        st0 = str(getattr(e, "store", "") or "").strip()
+                        sk0 = str(getattr(e, "sku", "") or "").strip()
+                        if not (st0 and sk0):
+                            continue
+                        k0 = self._rsfs_key_store_sku(st0, sk0)
+                        u0 = str(getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
+                        t0 = str(getattr(e, "title", "") or "").strip()
+                        a0 = str(getattr(e, "affiliate_url", "") or "").strip()
+                        src0 = str(getattr(e, "source", "") or "").strip()
+                        resolved_by_key[k0] = {
+                            "title": t0,
+                            "url": u0,
+                            "affiliate_url": a0,
+                            "source": src0,
+                        }
+                    
+                    # After resolution, sync ALL items from Current List to Live List to keep them matched
+                    # Re-read Current List to get all items (including ones that already had titles/URLs)
+                    # and merge with newly resolved data
+                    try:
+                        all_current_rows = await self._rs_fs_sheet.fetch_current_list_rows()
+                        all_rows: List[List[str]] = []
+                        for row in all_current_rows:
+                            if len(row) < 3:
+                                continue
+                            store = str(row[1] or "").strip()
+                            sku = str(row[2] or "").strip()
+                            if not (store and sku):
+                                continue
+                            key = self._rsfs_key_store_sku(store, sku)
+                            # Use resolved data if available, otherwise use existing Current List data
+                            if key in resolved_by_key:
+                                res = resolved_by_key[key]
+                                title = res.get("title", "")
+                                aff = res.get("affiliate_url", "")
+                                url = res.get("url", "")
+                            else:
+                                title = str(row[6] or "").strip() if len(row) > 6 else ""
+                                url = str(row[7] or "").strip() if len(row) > 7 else ""
+                                aff = str(row[8] or "").strip() if len(row) > 8 else ""
+                            all_rows.append([store, sku, title, aff, url])
+                        
+                        # Sync all Current List items to Live List
+                        if all_rows:
+                            ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(all_rows)
+                    except Exception as e:
+                        # Fallback to just syncing resolved items if full sync fails
+                        rows = [[e.store, e.sku, e.title, e.affiliate_url, e.monitor_url] for e in entries]
+                        ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(rows)
 
                     # Write back to History cache + update Current List with resolved columns.
                     try:
                         now_iso = rs_fs_sheet_sync.RsFsSheetSync._utc_now_iso()  # type: ignore[attr-defined]
                     except Exception:
                         now_iso = ""
-                    resolved_by_key: Dict[str, Dict[str, str]] = {}
+                    # Build history rows and update resolved_by_key with release IDs
                     history_rows: List[List[str]] = []
                     for e in (entries or []):
                         st0 = str(getattr(e, "store", "") or "").strip()
@@ -4853,13 +4953,9 @@ class RSForwarderBot:
                             rid0 = int(rid_by_key.get(self._rs_fs_override_key(st0, sk0)) or 0)
                         except Exception:
                             rid0 = 0
-                        resolved_by_key[k0] = {
-                            "title": t0,
-                            "url": u0,
-                            "affiliate_url": a0,
-                            "source": src0,
-                            "last_release_id": str(rid0 or ""),
-                        }
+                        # Update resolved_by_key with release ID (it was already created earlier)
+                        if k0 in resolved_by_key:
+                            resolved_by_key[k0]["last_release_id"] = str(rid0 or "")
                         history_rows.append([st0, sk0, t0, u0, a0, "", now_iso, str(rid0 or ""), src0])
 
                     if history_rows:
