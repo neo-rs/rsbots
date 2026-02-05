@@ -992,12 +992,13 @@ class RSForwarderBot:
         recs = zephyr_release_feed_parser.parse_release_feed_records(txt) or []
         
         # Filter: Only process records with Full Send monitor tag
+        # Note: 💶┃full-send-🤖 appears inline in the text, not in brackets, so check raw_text
         required_monitor_tag = "💶┃full-send-🤖"
         filtered_recs = []
         for r in recs:
-            monitor_tag = str(getattr(r, "monitor_tag", "") or "").strip()
-            # Include if monitor tag contains the required tag
-            if required_monitor_tag in monitor_tag:
+            raw_text = str(getattr(r, "raw_text", "") or "").strip()
+            # Include if raw text contains the Full Send tag
+            if required_monitor_tag in raw_text:
                 filtered_recs.append(r)
         recs = filtered_recs
         
@@ -1267,13 +1268,14 @@ class RSForwarderBot:
         # Analyze the merged run using the robust record parser (handles chunk splits + non-SKU entries).
         recs = zephyr_release_feed_parser.parse_release_feed_records(merged_text) or []
         
-        # Filter: Only analyze records with Full Send monitor tag (channel already filtered at collection)
+        # Filter: Only analyze records with Full Send monitor tag
+        # Note: 💶┃full-send-🤖 appears inline in the text, not in brackets, so check raw_text
         required_monitor_tag = "💶┃full-send-🤖"
         filtered_recs = []
         for r in recs:
-            monitor_tag = str(getattr(r, "monitor_tag", "") or "").strip()
-            # Include if monitor tag contains the required tag
-            if required_monitor_tag in monitor_tag:
+            raw_text = str(getattr(r, "raw_text", "") or "").strip()
+            # Include if raw text contains the Full Send tag
+            if required_monitor_tag in raw_text:
                 filtered_recs.append(r)
         recs = filtered_recs
         
@@ -1648,13 +1650,14 @@ class RSForwarderBot:
                 pass
             recs0 = zephyr_release_feed_parser.parse_release_feed_records(merged_text) or []
             
-            # Filter: Only process records with Full Send monitor tag (channel already filtered at collection)
+            # Filter: Only process records with Full Send monitor tag
+            # Note: 💶┃full-send-🤖 appears inline in the text, not in brackets, so check raw_text
             required_monitor_tag = "💶┃full-send-🤖"
             filtered_recs0 = []
             for r in recs0:
-                monitor_tag = str(getattr(r, "monitor_tag", "") or "").strip()
-                # Include if monitor tag contains the required tag
-                if required_monitor_tag in monitor_tag:
+                raw_text = str(getattr(r, "raw_text", "") or "").strip()
+                # Include if raw text contains the Full Send tag
+                if required_monitor_tag in raw_text:
                     filtered_recs0.append(r)
             recs0 = filtered_recs0
             
@@ -3205,13 +3208,14 @@ class RSForwarderBot:
             # Dry-run path below uses SKU-only pairs for preview output.
             items = zephyr_release_feed_parser.parse_release_feed_items(text_for_parse)
             
-            # Filter: Only process items with Full Send monitor tag (channel already filtered at message level)
+            # Filter: Only process items with Full Send monitor tag
+            # Note: 💶┃full-send-🤖 appears inline in the text, not in brackets, so check raw_text
             required_monitor_tag = "💶┃full-send-🤖"
             filtered_items = []
             for it in (items or []):
-                monitor_tag = str(getattr(it, "monitor_tag", "") or "").strip()
-                # Include if monitor tag contains the required tag
-                if required_monitor_tag in monitor_tag:
+                raw_text = str(getattr(it, "raw_text", "") or "").strip()
+                # Include if raw text contains the Full Send tag
+                if required_monitor_tag in raw_text:
                     filtered_items.append(it)
             items = filtered_items
             
