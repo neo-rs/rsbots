@@ -991,6 +991,15 @@ class RSForwarderBot:
 
         recs = zephyr_release_feed_parser.parse_release_feed_records(txt) or []
         
+        # Debug: log parsing results
+        try:
+            print(f"{Colors.CYAN}[RS-FS Current]{Colors.RESET} Parsed {len(recs)} records from text (len={len(txt)})")
+            if recs:
+                sample_raw = str(getattr(recs[0], "raw_text", "") or "")[:200]
+                print(f"{Colors.CYAN}[RS-FS Current]{Colors.RESET} Sample raw_text: {sample_raw!r}")
+        except Exception:
+            pass
+        
         # Filter: Only process records with Full Send monitor tag
         # Note: 💶┃full-send-🤖 appears inline in the text, not in brackets, so check raw_text
         required_monitor_tag = "💶┃full-send-🤖"
@@ -1001,6 +1010,18 @@ class RSForwarderBot:
             if required_monitor_tag in raw_text:
                 filtered_recs.append(r)
         recs = filtered_recs
+        
+        # Debug: log filtering results
+        try:
+            print(f"{Colors.CYAN}[RS-FS Current]{Colors.RESET} After filter: {len(recs)} records (required tag: {required_monitor_tag!r})")
+            if len(recs) == 0 and len(zephyr_release_feed_parser.parse_release_feed_records(txt) or []) > 0:
+                # Show why records were filtered out
+                all_recs = zephyr_release_feed_parser.parse_release_feed_records(txt) or []
+                for r in all_recs[:3]:
+                    rt = str(getattr(r, "raw_text", "") or "")[:150]
+                    print(f"{Colors.YELLOW}[RS-FS Current]{Colors.RESET} Filtered out: raw_text={rt!r}")
+        except Exception:
+            pass
         
         rows: List[List[str]] = []
         last_seen = rs_fs_sheet_sync.RsFsSheetSync._utc_now_iso()  # type: ignore[attr-defined]
@@ -1129,6 +1150,19 @@ class RSForwarderBot:
         if not parts:
             return "", 0, False
         merged = "\n".join(reversed(parts))
+        
+        # Debug: check if merged text contains Full Send monitor tag
+        required_monitor_tag = "💶┃full-send-🤖"
+        has_tag = required_monitor_tag in merged
+        try:
+            print(f"{Colors.CYAN}[RS-FS Sheet]{Colors.RESET} Collected merged text (chunks={len(parts)}, len={len(merged)}, has_full_send_tag={has_tag})")
+            if not has_tag and len(merged) > 0:
+                # Show a sample to help debug
+                sample = merged[:300].replace("\n", "\\n")
+                print(f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Merged text sample (no Full Send tag): {sample!r}")
+        except Exception:
+            pass
+        
         return merged, len(parts), bool(found_header)
 
     async def _build_rsfs_check_embed(self) -> discord.Embed:
