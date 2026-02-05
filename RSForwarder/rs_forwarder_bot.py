@@ -4595,7 +4595,7 @@ class RSForwarderBot:
                 try:
                     await ctx.send(f"✅ Running RS-FS LIVE mirror sync from <#{ch_id}> (max={lim})…")
 
-                    def _progress_embed(stage: str, done: int, total: int, *, monitor_hits: int = 0, remaining: int = 0, web_errors: int = 0, monitor_hit_skus: List[str] = None, error_skus: List[Tuple[str, str]] = None) -> discord.Embed:
+                    def _progress_embed(stage: str, done: int, total: int, *, monitor_hits: int = 0, remaining: int = 0, web_errors: int = 0, monitor_hit_skus: List[Tuple[str, str, str]] = None, error_skus: List[Tuple[str, str]] = None) -> discord.Embed:
                         emb = discord.Embed(title="RS-FS Live Sync", color=discord.Color.dark_teal())
                         emb.add_field(name="Stage", value=stage or "…", inline=False)
                         emb.add_field(name="Progress", value=self._format_progress_bar(done, total), inline=False)
@@ -4604,12 +4604,24 @@ class RSForwarderBot:
                         if web_errors:
                             emb.add_field(name="Website errors", value=str(int(web_errors)), inline=True)
                         
-                        # Show monitor hit SKUs (limit to avoid embed size issues)
+                        # Show monitor hit SKUs with title and URL (limit to avoid embed size issues)
                         if monitor_hit_skus:
                             hit_list = monitor_hit_skus[:10]  # Show first 10
-                            hit_text = "\n".join([f"`{sku}`" for sku in hit_list])
+                            hit_lines = []
+                            for sku_display, title, url in hit_list:
+                                title_display = title[:60] + "..." if len(title) > 60 else title
+                                url_display = url[:60] + "..." if len(url) > 60 else url
+                                if title and url:
+                                    hit_lines.append(f"`{sku_display}`\n  Title: {title_display}\n  Store URL: {url_display}")
+                                elif title:
+                                    hit_lines.append(f"`{sku_display}`\n  Title: {title_display}")
+                                elif url:
+                                    hit_lines.append(f"`{sku_display}`\n  Store URL: {url_display}")
+                                else:
+                                    hit_lines.append(f"`{sku_display}`")
+                            hit_text = "\n\n".join(hit_lines)
                             if len(monitor_hit_skus) > 10:
-                                hit_text += f"\n... and {len(monitor_hit_skus) - 10} more"
+                                hit_text += f"\n\n... and {len(monitor_hit_skus) - 10} more"
                             emb.add_field(name="Monitor hit SKUs", value=hit_text or "—", inline=False)
                         
                         # Show error SKUs with their problems
@@ -4793,7 +4805,7 @@ class RSForwarderBot:
                     # Stage 1: monitor lookup (history+manual overrides count as hits)
                     monitor_hits: List[rs_fs_sheet_sync.RsFsPreviewEntry] = list(history_hits) + list(manual_hits)
                     remaining: List[Tuple[str, str]] = []
-                    monitor_hit_skus: List[str] = []  # Track SKUs that were monitor hits
+                    monitor_hit_skus: List[Tuple[str, str, str]] = []  # Track monitor hits: (sku_display, title, url)
                     error_skus: List[Tuple[str, str]] = []  # Track SKUs with errors: (sku, error_message)
                     # Initialize monitor hit SKUs from history and manual hits
                     for h in history_hits + manual_hits:
@@ -4801,8 +4813,11 @@ class RSForwarderBot:
                         sk = str(getattr(h, "sku", "") or "").strip()
                         if st and sk:
                             sku_display = f"{st} {sk}"
-                            if sku_display not in monitor_hit_skus:
-                                monitor_hit_skus.append(sku_display)
+                            title = str(getattr(h, "title", "") or "").strip()
+                            url = str(getattr(h, "monitor_url", "") or getattr(h, "url", "") or "").strip()
+                            # Avoid duplicates by SKU
+                            if not any(s == sku_display for s, _, _ in monitor_hit_skus):
+                                monitor_hit_skus.append((sku_display, title, url))
                             err_msg = str(getattr(h, "error", "") or "").strip()
                             if err_msg:
                                 error_skus.append((sku_display, err_msg))
@@ -4916,10 +4931,13 @@ class RSForwarderBot:
 
                         if found:
                             monitor_hits.append(found)
-                            # Track successful monitor hits
+                            # Track successful monitor hits with title and URL
                             sku_display = f"{st} {sk}"
-                            if sku_display not in monitor_hit_skus:
-                                monitor_hit_skus.append(sku_display)
+                            title = str(getattr(found, "title", "") or "").strip()
+                            url = str(getattr(found, "monitor_url", "") or getattr(found, "url", "") or "").strip()
+                            # Avoid duplicates by SKU
+                            if not any(s == sku_display for s, _, _ in monitor_hit_skus):
+                                monitor_hit_skus.append((sku_display, title, url))
                             # Track if there's an error even though it was found
                             err_msg = str(getattr(found, "error", "") or "").strip()
                             if err_msg:
@@ -5169,21 +5187,54 @@ class RSForwarderBot:
                         pass
 
                     if ok:
-                        # Summary embed
+                        # Summary embed - always show detailed changes
+                        n_manual = 0
+                        n_monitor = 0
+                        n_web = 0
+                        n_blocked = 0
                         try:
                             n_manual = sum(1 for e in entries if str(getattr(e, "source", "") or "").startswith("manual"))
                             n_monitor = sum(1 for e in entries if str(getattr(e, "source", "") or "").startswith("monitor"))
                             n_web = sum(1 for e in entries if str(getattr(e, "source", "") or "").strip() == "website")
                             n_blocked = sum(1 for e in entries if "blocked" in str(getattr(e, "error", "") or "").lower())
-                            summ = discord.Embed(title="RS-FS Sheet Sync (mirror)", color=discord.Color.green())
-                            summ.add_field(name="Sheet changes", value=f"added `{added}`\nupdated `{updated}`\nremoved `{deleted}`", inline=True)
-                            summ.add_field(name="Resolution", value=f"manual `{n_manual}`\nmonitor `{n_monitor}`\nwebsite `{n_web}`", inline=True)
-                            if n_blocked:
-                                summ.add_field(name="Blocked pages", value=str(n_blocked), inline=True)
-                            await ctx.send(embed=summ, allowed_mentions=discord.AllowedMentions.none())
                         except Exception:
+                            pass
+                        
+                        try:
+                            summ = discord.Embed(title="RS-FS Sheet Sync (mirror)", color=discord.Color.green())
+                            
+                            # Sheet changes - always show even if zeros
+                            changes_text = f"added `{added}`\nupdated `{updated}`\nremoved `{deleted}`"
+                            if added == 0 and updated == 0 and deleted == 0:
+                                changes_text = "No changes"
+                            summ.add_field(name="Sheet changes", value=changes_text, inline=True)
+                            
+                            # Resolution methods
+                            resolution_text = f"manual `{n_manual}`\nmonitor `{n_monitor}`\nwebsite `{n_web}`"
+                            summ.add_field(name="Resolution", value=resolution_text, inline=True)
+                            
+                            # Blocked pages breakdown by resolution method
+                            if n_blocked:
+                                try:
+                                    blocked_manual = sum(1 for e in entries if str(getattr(e, "source", "") or "").startswith("manual") and "blocked" in str(getattr(e, "error", "") or "").lower())
+                                    blocked_monitor = sum(1 for e in entries if str(getattr(e, "source", "") or "").startswith("monitor") and "blocked" in str(getattr(e, "error", "") or "").lower())
+                                    blocked_web = sum(1 for e in entries if str(getattr(e, "source", "") or "").strip() == "website" and "blocked" in str(getattr(e, "error", "") or "").lower())
+                                    blocked_text = f"manual `{blocked_manual}`\nmonitor `{blocked_monitor}`\nwebsite `{blocked_web}`"
+                                    summ.add_field(name="Blocked pages", value=blocked_text, inline=True)
+                                except Exception:
+                                    summ.add_field(name="Blocked pages", value=str(n_blocked), inline=True)
+                            
+                            await ctx.send(embed=summ, allowed_mentions=discord.AllowedMentions.none())
+                        except Exception as e:
+                            # Fallback: always show summary even if embed fails
+                            try:
+                                print(f"[RS-FS] Summary embed error: {e}")
+                            except Exception:
+                                pass
                             await ctx.send(
-                                f"RS-FS Sheet (mirror): ✅ added {added}, updated {updated}, removed {deleted}.",
+                                f"**RS-FS Sheet Sync (mirror)**\n"
+                                f"Sheet changes: added `{added}`, updated `{updated}`, removed `{deleted}`\n"
+                                f"Resolution: manual `{n_manual}`, monitor `{n_monitor}`, website `{n_web}`",
                                 allowed_mentions=discord.AllowedMentions.none(),
                             )
 
