@@ -4459,9 +4459,12 @@ class RSForwarderBot:
                         await self._rsfs_write_current_list(merged_text, reason="rsfsrun-start")
                     except Exception:
                         pass
-                    items = zephyr_release_feed_parser.parse_release_feed_items(merged_text)
+                    # Parse ALL records (like Current List), then filter to store+sku for Live List sync
+                    all_recs = zephyr_release_feed_parser.parse_release_feed_records(merged_text) or []
+                    # Filter to items with store+sku for Live List sync (but keep all for Current List)
+                    items = [r for r in all_recs if r.store and r.is_sku_candidate]
                     if not items:
-                        await ctx.send("❌ Parsed 0 items from the merged Zephyr text.")
+                        await ctx.send("❌ Parsed 0 items with store+sku from the merged Zephyr text.")
                         return
 
                     # Limit to the requested max (preserve order).
@@ -4927,8 +4930,8 @@ class RSForwarderBot:
 
                                 es = sorted(es, key=lambda e2: (_rid_for(e2) or 10**9, str(getattr(e2, "sku", "") or "")))
 
-                                # Build (info_line, cmd_line) pairs so we can show commands in a code block (copy button).
-                                pairs2: List[Tuple[str, str]] = []
+                                # Build formatted lines with command directly under each product
+                                formatted_lines: List[str] = []
                                 for e2 in es:
                                     sku2 = str(getattr(e2, "sku", "") or "").strip()
                                     title2 = str(getattr(e2, "title", "") or "").strip()
@@ -4936,83 +4939,79 @@ class RSForwarderBot:
                                     if len(title2) > 60:
                                         title2 = title2[:57] + "..."
                                     info = f"`{rid2}` `{sku2}`" + (f" — {title2}" if title2 else "")
-                                    cmd_line = f"/removereleaseid release_id: {rid2}" if rid2 else "/removereleaseid release_id: ?"
-                                    pairs2.append((info, cmd_line))
+                                    if rid2:
+                                        # Format: product info line followed immediately by remove command
+                                        formatted_lines.append(f"{info}\n```\n/removereleaseid release_id: {rid2}\n```")
+                                    else:
+                                        formatted_lines.append(info)
 
                                 # Split across multiple embeds if needed.
                                 part = 1
-                                cur_info: List[str] = []
-                                cur_cmds: List[str] = []
+                                cur_lines: List[str] = []
 
-                                def _render_desc(info_lines: List[str], cmd_lines: List[str]) -> str:
-                                    info_block = "\n".join(info_lines).strip()
-                                    if not cmd_lines:
-                                        return info_block
-                                    # Each command gets its own code block wrapper for individual copying
-                                    cmd_blocks = "\n".join([f"```\n{cmd}\n```" for cmd in cmd_lines])
-                                    return (info_block + "\n\nCommands (copy):\n" + cmd_blocks).strip()
+                                def _render_desc(lines: List[str]) -> str:
+                                    return "\n\n".join(lines).strip()
 
-                                for info_ln, cmd_ln in pairs2:
-                                    next_info = cur_info + [info_ln]
-                                    next_cmds = cur_cmds + [cmd_ln]
-                                    desc_try = _render_desc(next_info, next_cmds)
-                                    if len(desc_try) > 3800 and cur_info:
+                                for line in formatted_lines:
+                                    next_lines = cur_lines + [line]
+                                    desc_try = _render_desc(next_lines)
+                                    if len(desc_try) > 3800 and cur_lines:
                                         emb2 = discord.Embed(
                                             title=f"RS-FS Remove Helper — {st}" + (f" (part {part})" if part > 1 else ""),
                                             color=discord.Color.dark_teal(),
                                         )
-                                        emb2.description = _render_desc(cur_info, cur_cmds)
+                                        emb2.description = _render_desc(cur_lines)
                                         emb2.set_footer(text="Use the code block copy button")
                                         await ctx.send(embed=emb2, allowed_mentions=discord.AllowedMentions.none())
                                         part += 1
-                                        cur_info = [info_ln]
-                                        cur_cmds = [cmd_ln]
+                                        cur_lines = [line]
                                     else:
-                                        cur_info.append(info_ln)
-                                        cur_cmds.append(cmd_ln)
+                                        cur_lines.append(line)
 
-                                if cur_info:
+                                if cur_lines:
                                     emb2 = discord.Embed(
                                         title=f"RS-FS Remove Helper — {st}" + (f" (part {part})" if part > 1 else ""),
                                         color=discord.Color.dark_teal(),
                                     )
-                                    emb2.description = _render_desc(cur_info, cur_cmds)
+                                    emb2.description = _render_desc(cur_lines)
                                     emb2.set_footer(text="Use the code block copy button")
                                     await ctx.send(embed=emb2, allowed_mentions=discord.AllowedMentions.none())
 
                             if unparseable_recs:
-                                up_info: List[str] = []
-                                up_cmds: List[str] = []
+                                up_lines: List[str] = []
                                 for r in unparseable_recs[:25]:
                                     rid2 = int(getattr(r, "release_id", 0) or 0)
                                     sk2 = str(getattr(r, "sku", "") or "").strip()
                                     st2 = str(getattr(r, "store", "") or "").strip()
                                     is_sku2 = bool(getattr(r, "is_sku_candidate", True))
                                     kind = "non-SKU" if not is_sku2 else ("unknown-store" if not st2 else "unknown")
-                                    up_info.append(f"`{rid2}` `{kind}` `{sk2}`")
+                                    # Format: product info line followed immediately by remove command
+                                    info_line = f"`{rid2}` `{kind}` {sk2}"
                                     if rid2:
-                                        up_cmds.append(f"/removereleaseid release_id: {rid2}")
+                                        up_lines.append(f"{info_line}\n```\n/removereleaseid release_id: {rid2}\n```")
+                                    else:
+                                        up_lines.append(info_line)
                                 emb_u = discord.Embed(
                                     title="RS-FS Remove Helper — Unparseable (could not parse store/SKU)",
                                     color=discord.Color.orange(),
                                 )
-                                desc = "\n".join(up_info).strip()
-                                if up_cmds:
-                                    # Each command gets its own code block wrapper for individual copying
-                                    cmd_blocks_up = "\n".join([f"```\n{cmd}\n```" for cmd in up_cmds])
-                                    desc = (desc + "\n\nCommands (copy):\n" + cmd_blocks_up).strip()
+                                desc = "\n\n".join(up_lines).strip()
                                 emb_u.description = desc
                                 emb_u.set_footer(text="These release IDs could not be mapped to a store/SKU automatically • Use code block copy")
                                 await ctx.send(embed=emb_u, allowed_mentions=discord.AllowedMentions.none())
                         except Exception:
                             pass
 
-                        # Offer manual resolution for any remaining blocked/empty items.
+                        # Offer manual resolution for any items missing titles or URLs (regardless of source)
                         needs_manual = [
                             e
                             for e in entries
-                            if str(getattr(e, "source", "") or "").strip() == "website"
-                            and ("blocked" in str(getattr(e, "error", "") or "").lower() or "title not found" in str(getattr(e, "error", "") or "").lower())
+                            if (
+                                not str(getattr(e, "title", "") or "").strip()
+                                or not str(getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
+                                or "blocked" in str(getattr(e, "error", "") or "").lower()
+                                or "title not found" in str(getattr(e, "error", "") or "").lower()
+                            )
                         ]
                         if needs_manual:
                             view = _RsFsManualResolveView(self, ctx, needs_manual)  # type: ignore[name-defined]
