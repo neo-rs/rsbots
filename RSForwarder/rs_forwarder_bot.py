@@ -3612,6 +3612,19 @@ class RSForwarderBot:
             if not (is_zephyr_companion or is_zephyr_monitors):
                 return
             
+            # Try to fetch the message with embeds if they're not loaded
+            try:
+                if not (message.embeds or []) and hasattr(message, "channel"):
+                    # Try fetching the message to get embeds
+                    try:
+                        fetched = await message.channel.fetch_message(message.id)
+                        if fetched and fetched.embeds:
+                            message = fetched
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            
             # Check if message contains removal confirmation
             text = self._collect_embed_text(message)
             # Also check message.content directly in case embed extraction fails
@@ -3623,6 +3636,16 @@ class RSForwarderBot:
                 except Exception:
                     pass
             
+            # Debug logging
+            try:
+                embeds_n = len(message.embeds or [])
+                print(f"{Colors.CYAN}[RS-FS Removal]{Colors.RESET} Checking removal: author={author_name}({author_id}) embeds={embeds_n} text_len={len(text or '')}")
+                if text:
+                    short = (text or "").replace("\n", " ").strip()[:200]
+                    print(f"{Colors.CYAN}[RS-FS Removal]{Colors.RESET} Text sample: {short!r}")
+            except Exception:
+                pass
+            
             text_lower = (text or "").lower()
             if "release feed has been removed" not in text_lower and "removed:" not in text_lower:
                 return
@@ -3630,7 +3653,27 @@ class RSForwarderBot:
             # Extract release ID from /removereleaseid command
             rid_match = re.search(r"/removereleaseid\s+release_id:\s*(\d+)", text, re.IGNORECASE)
             if not rid_match:
-                return
+                # Also try searching in the raw embed data if text extraction failed
+                if not text:
+                    try:
+                        for embed in (message.embeds or []):
+                            # Check footer
+                            footer_text = getattr(getattr(embed, "footer", None), "text", "") or ""
+                            rid_match = re.search(r"/removereleaseid\s+release_id:\s*(\d+)", footer_text, re.IGNORECASE)
+                            if rid_match:
+                                text = footer_text  # Use footer as text for later checks
+                                break
+                            # Check description
+                            desc = getattr(embed, "description", "") or ""
+                            if desc:
+                                rid_match = re.search(r"/removereleaseid\s+release_id:\s*(\d+)", desc, re.IGNORECASE)
+                                if rid_match:
+                                    text = desc
+                                    break
+                    except Exception:
+                        pass
+                if not rid_match:
+                    return
             
             release_id = int(rid_match.group(1))
             if release_id <= 0:
