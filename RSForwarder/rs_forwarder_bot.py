@@ -500,6 +500,197 @@ class _RsFsCheckButtonView(discord.ui.View):
                 pass
 
 
+class _RsFsSyncSummaryView(discord.ui.View):
+    """View with buttons for sync summary: View Current List and Run Resolver."""
+    def __init__(self, bot_obj: "RSForwarderBot", ctx, entries: List[rs_fs_sheet_sync.RsFsPreviewEntry], merged_text: str, rid_by_key: Dict[str, int]):
+        super().__init__(timeout=3600)  # 1 hour timeout
+        self._bot = bot_obj
+        self._ctx = ctx
+        self._entries = entries
+        self._merged_text = merged_text
+        self._rid_by_key = rid_by_key
+        self._owner_id = int(getattr(getattr(ctx, "author", None), "id", 0) or 0)
+    
+    async def _guard(self, interaction: discord.Interaction) -> bool:
+        try:
+            uid = int(getattr(getattr(interaction, "user", None), "id", 0) or 0)
+        except Exception:
+            uid = 0
+        if self._owner_id and uid and uid != self._owner_id:
+            try:
+                await interaction.response.send_message("❌ This view belongs to the command invoker.", ephemeral=True)
+            except Exception:
+                pass
+            return False
+        return True
+    
+    @discord.ui.button(label="View Current List", style=discord.ButtonStyle.secondary, row=0)
+    async def view_current_list(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        if not await self._guard(interaction):
+            return
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+        
+        try:
+            if not getattr(self._bot, "_rs_fs_sheet", None) or not self._bot._rs_fs_sheet.enabled():
+                await interaction.followup.send("❌ Sheet sync is not enabled.", ephemeral=True)
+                return
+            
+            current_list_rows = await self._bot._rs_fs_sheet.fetch_current_list_rows()
+            if not current_list_rows:
+                await interaction.followup.send("❌ Could not fetch Current List.", ephemeral=True)
+                return
+            
+            # Build list of SKUs with product info
+            # Filter by "Full Send" column contains "full-send"
+            items: List[str] = []
+            count = 0
+            for row in current_list_rows:
+                if count >= 50:  # Limit to first 50
+                    break
+                if len(row) < 3:
+                    continue
+                # Skip header row
+                if str(row[0] or "").strip().lower() == "release id":
+                    continue
+                # Filter: Only show rows where "Full Send" column contains "full-send" (case-insensitive)
+                full_send = str(row[12] or "").strip() if len(row) > 12 else ""
+                full_send_lower = full_send.lower()
+                if "full-send" not in full_send_lower and "💶┃full-send-🤖" not in full_send:
+                    continue
+                rid = str(row[0] or "").strip()
+                store = str(row[1] or "").strip()
+                sku = str(row[2] or "").strip()
+                title = str(row[6] or "").strip() if len(row) > 6 else ""
+                url = str(row[7] or "").strip() if len(row) > 7 else ""
+                
+                if not (store and sku):
+                    continue
+                
+                # Filter out URLs being used as titles
+                if title and self._bot._rsfs_title_is_bad(title, url=url):
+                    title = ""
+                
+                item_parts = [f"`{store} {sku}`"]
+                if rid:
+                    item_parts.append(f"Release ID: `{rid}`")
+                if title:
+                    item_parts.append(f"Title: {title[:60]}")
+                if url:
+                    item_parts.append(f"URL: {url[:60]}")
+                
+                # Add remove command in code block
+                if rid:
+                    item_parts.append(f"```\n/removereleaseid release_id: {rid}\n```")
+                
+                items.append(" • ".join(item_parts))
+                count += 1
+            
+            if not items:
+                await interaction.followup.send("❌ No Full Send items found in Current List.", ephemeral=True)
+                return
+            
+            # Split into multiple embeds if needed
+            items_text = "\n\n".join(items)
+            if len(items_text) > 4000:
+                # Split into chunks
+                chunk_size = 3500
+                chunks = []
+                current_chunk = []
+                current_length = 0
+                
+                for item in items:
+                    item_len = len(item) + 2  # +2 for "\n\n"
+                    if current_length + item_len > chunk_size and current_chunk:
+                        chunks.append("\n\n".join(current_chunk))
+                        current_chunk = []
+                        current_length = 0
+                    current_chunk.append(item)
+                    current_length += item_len
+                
+                if current_chunk:
+                    chunks.append("\n\n".join(current_chunk))
+                
+                for i, chunk_text in enumerate(chunks):
+                    emb = discord.Embed(
+                        title="RS-FS Current List" if i == 0 else f"RS-FS Current List (continued {i + 1})",
+                        description=chunk_text,
+                        color=discord.Color.blue(),
+                    )
+                    if i == 0:
+                        emb.set_footer(text=f"Showing {len(current_list_rows)} total items" if i == 0 else "")
+                    await interaction.followup.send(embed=emb, ephemeral=True)
+            else:
+                emb = discord.Embed(
+                    title="RS-FS Current List",
+                    description=items_text,
+                    color=discord.Color.blue(),
+                )
+                if len(current_list_rows) > 50:
+                    emb.set_footer(text=f"Showing first 50 of {len(current_list_rows)} items")
+                else:
+                    emb.set_footer(text=f"Total: {len(current_list_rows)} items")
+                await interaction.followup.send(embed=emb, ephemeral=True)
+        except Exception as e:
+            try:
+                await interaction.followup.send(f"❌ Failed to load Current List: {str(e)[:200]}", ephemeral=True)
+            except Exception:
+                pass
+    
+    @discord.ui.button(label="Run Resolver", style=discord.ButtonStyle.primary, row=0)
+    async def run_resolver(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        if not await self._guard(interaction):
+            return
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+        
+        try:
+            # Find items that need manual resolution
+            needs_manual = [
+                e
+                for e in self._entries
+                if (
+                    not str(getattr(e, "title", "") or "").strip()
+                    or not str(getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
+                    or "blocked" in str(getattr(e, "error", "") or "").lower()
+                    or "title not found" in str(getattr(e, "error", "") or "").lower()
+                )
+            ]
+            
+            if not needs_manual:
+                await interaction.followup.send("✅ All items already have titles and URLs. No resolution needed.", ephemeral=True)
+                # Generate Remove Helper list since no manual resolution needed
+                try:
+                    await self._bot._generate_remove_helper_list(self._ctx, self._entries, self._merged_text, self._rid_by_key)
+                except Exception:
+                    pass
+                return
+            
+            # Show manual resolver
+            view = _RsFsManualResolveView(
+                self._bot,
+                self._ctx,
+                needs_manual,
+                merged_text=self._merged_text,
+                rid_by_key=self._rid_by_key,
+                all_entries=self._entries,
+            )
+            await interaction.followup.send(
+                embed=view._render_embed(),
+                view=view,
+                ephemeral=True,
+            )
+        except Exception as e:
+            try:
+                await interaction.followup.send(f"❌ Failed to start resolver: {str(e)[:200]}", ephemeral=True)
+            except Exception:
+                pass
+
+
 class _RsFsViewCurrentListView(discord.ui.View):
     """View with button to show current list of SKUs."""
     def __init__(self, bot_obj: "RSForwarderBot", ctx):
@@ -5783,18 +5974,36 @@ class RSForwarderBot:
                                 affiliate_url="",
                             )
                     entries = list(entries_by_key.values())
+                    # Fetch history cache to check for existing affiliate URLs
+                    history = {}
+                    try:
+                        history = await self._rs_fs_sheet.fetch_history_cache(force=False)
+                    except Exception:
+                        history = {}
+                    
                     try:
                         rewrite_enabled = bool(self.config.get("affiliate_rewrite_enabled", True))
                     except Exception:
                         rewrite_enabled = True
                     if entries:
                         try:
+                            # First, check History for existing affiliate URLs
                             url_list: List[str] = []
+                            url_to_key_map: Dict[str, str] = {}  # url -> store|sku key
                             for e in entries:
                                 u0 = (getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
                                 if u0:
-                                    url_list.append(u0)
+                                    store = str(getattr(e, "store", "") or "").strip()
+                                    sku = str(getattr(e, "sku", "") or "").strip()
+                                    if store and sku:
+                                        key = self._rsfs_key_store_sku(store, sku)
+                                        url_to_key_map[u0] = key
+                                        # Only add to rewrite list if not in history
+                                        if key not in history or not str(history.get(key, {}).get("affiliate_url", "") or "").strip():
+                                            url_list.append(u0)
+                            
                             aff_map: Dict[str, str] = {}
+                            # Only generate affiliate links for URLs not found in History
                             if rewrite_enabled and url_list:
                                 seen_u: Set[str] = set()
                                 unique_urls: List[str] = []
@@ -5803,20 +6012,37 @@ class RSForwarderBot:
                                         continue
                                     seen_u.add(u)
                                     unique_urls.append(u)
-                                mapped, _notes = await affiliate_rewriter.compute_affiliate_rewrites_plain(self.config, unique_urls)
-                                aff_map = {str(k or "").strip(): str(v or "").strip() for k, v in (mapped or {}).items()}
+                                if unique_urls:
+                                    mapped, _notes = await affiliate_rewriter.compute_affiliate_rewrites_plain(self.config, unique_urls)
+                                    aff_map = {str(k or "").strip(): str(v or "").strip() for k, v in (mapped or {}).items()}
 
                             enriched: List[rs_fs_sheet_sync.RsFsPreviewEntry] = []
                             for e in entries:
                                 u0 = (getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
-                                prev_aff = str(getattr(e, "affiliate_url", "") or "").strip()
-                                aff = (aff_map.get(u0) or "").strip() if u0 else ""
+                                store = str(getattr(e, "store", "") or "").strip()
+                                sku = str(getattr(e, "sku", "") or "").strip()
+                                
+                                # Check History first for affiliate URL
+                                aff = ""
+                                if store and sku:
+                                    key = self._rsfs_key_store_sku(store, sku)
+                                    if key in history:
+                                        hist_aff = str(history.get(key, {}).get("affiliate_url", "") or "").strip()
+                                        if hist_aff:
+                                            aff = hist_aff
+                                
+                                # If not in History, use newly generated affiliate URL
+                                if not aff and u0:
+                                    aff = (aff_map.get(u0) or "").strip()
+                                
+                                # Fallback to existing affiliate URL if still empty
                                 if not aff:
-                                    aff = prev_aff
+                                    aff = str(getattr(e, "affiliate_url", "") or "").strip()
+                                
                                 enriched.append(
                                     rs_fs_sheet_sync.RsFsPreviewEntry(
-                                        store=getattr(e, "store", "") or "",
-                                        sku=getattr(e, "sku", "") or "",
+                                        store=store,
+                                        sku=sku,
                                         url=getattr(e, "url", "") or "",
                                         title=getattr(e, "title", "") or "",
                                         error=getattr(e, "error", "") or "",
@@ -5873,8 +6099,19 @@ class RSForwarderBot:
                     # Re-read Current List to get all items (including ones that already had titles/URLs)
                     # and merge with newly resolved data
                     try:
+                        # Fetch history cache to check for existing affiliate URLs
+                        history_cache = {}
+                        try:
+                            history_cache = await self._rs_fs_sheet.fetch_history_cache(force=False)
+                        except Exception:
+                            history_cache = {}
+                        
                         all_current_rows = await self._rs_fs_sheet.fetch_current_list_rows()
                         all_rows: List[List[str]] = []
+                        # Collect all URLs that need affiliate rewriting (only if not in History)
+                        urls_to_rewrite: List[str] = []
+                        url_to_key_map: Dict[str, str] = {}  # url -> store|sku key
+                        
                         for row in all_current_rows:
                             if len(row) < 3:
                                 continue
@@ -5901,7 +6138,48 @@ class RSForwarderBot:
                                 title = str(row[6] or "").strip() if len(row) > 6 else ""
                                 url = str(row[7] or "").strip() if len(row) > 7 else ""
                                 aff = str(row[8] or "").strip() if len(row) > 8 else ""
+                            
+                            # Check History first for affiliate URL
+                            if url and not aff:
+                                if key in history_cache:
+                                    hist_aff = str(history_cache.get(key, {}).get("affiliate_url", "") or "").strip()
+                                    if hist_aff:
+                                        aff = hist_aff
+                            
+                            # If still no affiliate URL, queue for rewriting (only if not in History)
+                            if url and not aff:
+                                # Only add to rewrite list if not found in History
+                                if key not in history_cache or not str(history_cache.get(key, {}).get("affiliate_url", "") or "").strip():
+                                    urls_to_rewrite.append(url)
+                                    url_to_key_map[url] = key
+                            
                             all_rows.append([store, sku, title, aff, url])
+                        
+                        # Generate affiliate links only for items not found in History
+                        if urls_to_rewrite:
+                            try:
+                                rewrite_enabled = bool(self.config.get("affiliate_rewrite_enabled", True))
+                            except Exception:
+                                rewrite_enabled = True
+                            if rewrite_enabled:
+                                try:
+                                    unique_urls = list(dict.fromkeys(urls_to_rewrite))
+                                    mapped, _notes = await affiliate_rewriter.compute_affiliate_rewrites_plain(self.config, unique_urls)
+                                    aff_map = {str(k or "").strip(): str(v or "").strip() for k, v in (mapped or {}).items()}
+                                    
+                                    # Update all_rows with newly generated affiliate links
+                                    for i, row_data in enumerate(all_rows):
+                                        store, sku, title, aff, url = row_data
+                                        # If this row has a URL but no affiliate URL, try to get one from generated map
+                                        if url and not aff:
+                                            new_aff = aff_map.get(url, "").strip()
+                                            if new_aff:
+                                                all_rows[i] = [store, sku, title, new_aff, url]
+                                except Exception as e:
+                                    try:
+                                        print(f"[RS-FS] Warning: Failed to generate affiliate links for existing items: {e}")
+                                    except Exception:
+                                        pass
                         
                         # Track changes: get current Live List state before sync
                         try:
@@ -6002,99 +6280,85 @@ class RSForwarderBot:
                         except Exception:
                             pass
                         
-                        try:
-                            summ = discord.Embed(title="RS-FS Sheet Sync (mirror)", color=discord.Color.green())
+                        # Always use embed format (never fallback to plain text)
+                        summ = discord.Embed(title="RS-FS Sheet Sync (mirror)", color=discord.Color.green())
+                        
+                        # Sheet changes - always show (even if zeros)
+                        changes_text = f"added `{added}`\nupdated `{updated}`\nremoved `{deleted}`"
+                        summ.add_field(name="Sheet changes", value=changes_text, inline=True)
+                        
+                        # Show detailed list of ALL changes (title/url → SKU)
+                        if changes_list:
+                            changes_detail = []
+                            # Show all changes, split into multiple fields if needed (Discord embed field limit is 1024 chars)
+                            current_field_content = []
+                            current_field_length = 0
+                            field_count = 0
+                            max_field_length = 1000  # Leave room for "... and X more"
                             
-                            # Sheet changes - only show if there are values
-                            if added > 0 or updated > 0 or deleted > 0:
-                                changes_text = f"added `{added}`\nupdated `{updated}`\nremoved `{deleted}`"
-                                summ.add_field(name="Sheet changes", value=changes_text, inline=True)
-                            
-                            # Show detailed list of changes (title/url → SKU)
-                            if changes_list:
-                                changes_detail = []
-                                for sku, store, title, url in changes_list[:20]:  # Limit to first 20
-                                    # Filter out URLs being used as titles
-                                    if title and self._rsfs_title_is_bad(title, url=url):
-                                        title = ""
-                                    title_display = title[:50] + "..." if len(title) > 50 else title
-                                    url_display = url[:60] + "..." if len(url) > 60 else url
-                                    if title and url:
-                                        changes_detail.append(f"`{store} {sku}`\n  Title: {title_display}\n  Store URL: {url_display}")
-                                    elif title:
-                                        changes_detail.append(f"`{store} {sku}`\n  Title: {title_display}")
-                                    elif url:
-                                        changes_detail.append(f"`{store} {sku}`\n  Store URL: {url_display}")
+                            for sku, store, title, url in changes_list:
+                                # Filter out URLs being used as titles
+                                if title and self._rsfs_title_is_bad(title, url=url):
+                                    title = ""
+                                title_display = title[:50] + "..." if len(title) > 50 else title
+                                url_display = url[:60] + "..." if len(url) > 60 else url
+                                
+                                if title and url:
+                                    item_text = f"`{store} {sku}`\n  Title: {title_display}\n  Store URL: {url_display}"
+                                elif title:
+                                    item_text = f"`{store} {sku}`\n  Title: {title_display}"
+                                elif url:
+                                    item_text = f"`{store} {sku}`\n  Store URL: {url_display}"
+                                else:
+                                    item_text = f"`{store} {sku}`"
+                                
+                                item_length = len(item_text) + 2  # +2 for "\n\n"
+                                
+                                # If adding this item would exceed field limit, finalize current field and start new one
+                                if current_field_length + item_length > max_field_length and current_field_content:
+                                    field_text = "\n\n".join(current_field_content)
+                                    if field_count == 0:
+                                        summ.add_field(name="Changes (Title/URL → SKU)", value=field_text, inline=False)
                                     else:
-                                        changes_detail.append(f"`{store} {sku}`")
-                                changes_detail_text = "\n\n".join(changes_detail)
-                                if len(changes_list) > 20:
-                                    changes_detail_text += f"\n\n... and {len(changes_list) - 20} more"
-                                summ.add_field(name="Changes (Title/URL → SKU)", value=changes_detail_text or "—", inline=False)
+                                        summ.add_field(name=f"Changes (continued {field_count + 1})", value=field_text, inline=False)
+                                    field_count += 1
+                                    current_field_content = []
+                                    current_field_length = 0
+                                
+                                current_field_content.append(item_text)
+                                current_field_length += item_length
                             
-                            # Resolution methods - only show if there are values
-                            if n_manual > 0 or n_monitor > 0 or n_web > 0:
-                                resolution_text = f"manual `{n_manual}`\nmonitor `{n_monitor}`\nwebsite `{n_web}`"
-                                summ.add_field(name="Resolution", value=resolution_text, inline=True)
-                            
-                            # Blocked pages breakdown by resolution method
-                            if n_blocked:
-                                try:
-                                    blocked_manual = sum(1 for e in entries if str(getattr(e, "source", "") or "").startswith("manual") and "blocked" in str(getattr(e, "error", "") or "").lower())
-                                    blocked_monitor = sum(1 for e in entries if str(getattr(e, "source", "") or "").startswith("monitor") and "blocked" in str(getattr(e, "error", "") or "").lower())
-                                    blocked_web = sum(1 for e in entries if str(getattr(e, "source", "") or "").strip() == "website" and "blocked" in str(getattr(e, "error", "") or "").lower())
-                                    blocked_text = f"manual `{blocked_manual}`\nmonitor `{blocked_monitor}`\nwebsite `{blocked_web}`"
-                                    summ.add_field(name="Blocked pages", value=blocked_text, inline=True)
-                                except Exception:
-                                    summ.add_field(name="Blocked pages", value=str(n_blocked), inline=True)
-                            
-                            # Add View Current List button
-                            view = _RsFsViewCurrentListView(self, ctx)
-                            await ctx.send(embed=summ, view=view, allowed_mentions=discord.AllowedMentions.none())
-                        except Exception as e:
-                            # Fallback: always show summary even if embed fails
-                            try:
-                                print(f"[RS-FS] Summary embed error: {e}")
-                            except Exception:
-                                pass
-                            await ctx.send(
-                                f"**RS-FS Sheet Sync (mirror)**\n"
-                                f"Sheet changes: added `{added}`, updated `{updated}`, removed `{deleted}`\n"
-                                f"Resolution: manual `{n_manual}`, monitor `{n_monitor}`, website `{n_web}`",
-                                allowed_mentions=discord.AllowedMentions.none(),
-                            )
-
-                        # Remove Helper list generation moved to after Finish button click
-                        # (see _generate_remove_helper_list method)
-
-                        # Offer manual resolution for any items missing titles or URLs (regardless of source)
-                        needs_manual = [
-                            e
-                            for e in entries
-                            if (
-                                not str(getattr(e, "title", "") or "").strip()
-                                or not str(getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
-                                or "blocked" in str(getattr(e, "error", "") or "").lower()
-                                or "title not found" in str(getattr(e, "error", "") or "").lower()
-                            )
-                        ]
-                        if needs_manual:
-                            view = _RsFsManualResolveView(
-                                self, 
-                                ctx, 
-                                needs_manual,
-                                merged_text=merged_text,
-                                rid_by_key=rid_by_key,
-                                all_entries=entries,
-                            )  # type: ignore[name-defined]
-                            await ctx.send(
-                                embed=view._render_embed(),
-                                view=view,
-                                allowed_mentions=discord.AllowedMentions.none(),
-                            )
+                            # Add final field with remaining items
+                            if current_field_content:
+                                field_text = "\n\n".join(current_field_content)
+                                if field_count == 0:
+                                    summ.add_field(name="Changes (Title/URL → SKU)", value=field_text, inline=False)
+                                else:
+                                    summ.add_field(name=f"Changes (continued {field_count + 1})", value=field_text, inline=False)
                         else:
-                            # If no manual resolution needed, generate Remove Helper list immediately
-                            await self._generate_remove_helper_list(ctx, entries, merged_text, rid_by_key)
+                            summ.add_field(name="Changes (Title/URL → SKU)", value="No changes", inline=False)
+                        
+                        # Resolution methods - always show (even if zeros)
+                        resolution_text = f"manual `{n_manual}`\nmonitor `{n_monitor}`\nwebsite `{n_web}`"
+                        summ.add_field(name="Resolution", value=resolution_text, inline=True)
+                        
+                        # Blocked pages breakdown by resolution method
+                        if n_blocked:
+                            try:
+                                blocked_manual = sum(1 for e in entries if str(getattr(e, "source", "") or "").startswith("manual") and "blocked" in str(getattr(e, "error", "") or "").lower())
+                                blocked_monitor = sum(1 for e in entries if str(getattr(e, "source", "") or "").startswith("monitor") and "blocked" in str(getattr(e, "error", "") or "").lower())
+                                blocked_web = sum(1 for e in entries if str(getattr(e, "source", "") or "").strip() == "website" and "blocked" in str(getattr(e, "error", "") or "").lower())
+                                blocked_text = f"manual `{blocked_manual}`\nmonitor `{blocked_monitor}`\nwebsite `{blocked_web}`"
+                                summ.add_field(name="Blocked pages", value=blocked_text, inline=True)
+                            except Exception:
+                                summ.add_field(name="Blocked pages", value=str(n_blocked), inline=True)
+                        
+                        # Create view with both buttons: View Current List and Run Resolver
+                        view = _RsFsSyncSummaryView(self, ctx, entries, merged_text, rid_by_key)
+                        await ctx.send(embed=summ, view=view, allowed_mentions=discord.AllowedMentions.none())
+
+                        # Manual resolver and Remove Helper list are now triggered by buttons in the summary view
+                        # (see _RsFsSyncSummaryView class)
                     else:
                         await ctx.send(f"❌ RS-FS live run failed: {msg}", allowed_mentions=discord.AllowedMentions.none())
                 finally:
