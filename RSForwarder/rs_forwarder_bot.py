@@ -990,6 +990,19 @@ class RSForwarderBot:
             overrides = {}
 
         recs = zephyr_release_feed_parser.parse_release_feed_records(txt) or []
+        
+        # Filter: Only process records with Full Send monitor tag and correct channel ID
+        required_monitor_tag = "💶┃full-send-🤖"
+        required_channel_id = "1429649205714227260"
+        filtered_recs = []
+        for r in recs:
+            monitor_tag = str(getattr(r, "monitor_tag", "") or "").strip()
+            ch_id = str(getattr(r, "channel_id", "") or "").strip()
+            # Include if monitor tag contains the required tag (channel ID already filtered at message level)
+            if required_monitor_tag in monitor_tag:
+                filtered_recs.append(r)
+        recs = filtered_recs
+        
         rows: List[List[str]] = []
         last_seen = rs_fs_sheet_sync.RsFsSheetSync._utc_now_iso()  # type: ignore[attr-defined]
 
@@ -1096,7 +1109,15 @@ class RSForwarderBot:
         parts: List[str] = []
         found_header = False
         try:
+            # Only collect messages from the specific Full Send channel with the monitor tag
+            required_channel_id = 1429649205714227260
+            required_monitor_tag = "💶┃full-send-🤖"
+            
             async for m in ch.history(limit=int(history_limit or 350)):
+                # Filter by channel ID
+                if int(getattr(m.channel, "id", 0) or 0) != int(required_channel_id):
+                    continue
+                    
                 if not (getattr(m, "embeds", None) or []) and not (getattr(m, "content", None) or ""):
                     continue
                 t = self._collect_embed_text(m)
@@ -1104,6 +1125,11 @@ class RSForwarderBot:
                     continue
                 if not zephyr_release_feed_parser.looks_like_release_feed_embed_text(t):
                     continue
+                
+                # Filter by monitor tag - must contain the Full Send monitor tag
+                if required_monitor_tag not in t:
+                    continue
+                    
                 parts.append(t)
                 if "release feed" in t.lower():
                     found_header = True
@@ -1255,6 +1281,17 @@ class RSForwarderBot:
 
         # Analyze the merged run using the robust record parser (handles chunk splits + non-SKU entries).
         recs = zephyr_release_feed_parser.parse_release_feed_records(merged_text) or []
+        
+        # Filter: Only analyze records with Full Send monitor tag (channel already filtered at collection)
+        required_monitor_tag = "💶┃full-send-🤖"
+        filtered_recs = []
+        for r in recs:
+            monitor_tag = str(getattr(r, "monitor_tag", "") or "").strip()
+            # Include if monitor tag contains the required tag
+            if required_monitor_tag in monitor_tag:
+                filtered_recs.append(r)
+        recs = filtered_recs
+        
         all_ids = sorted({int(getattr(r, "release_id", 0) or 0) for r in recs if int(getattr(r, "release_id", 0) or 0) > 0})
         total_items = len(all_ids)
 
@@ -1625,6 +1662,17 @@ class RSForwarderBot:
             except Exception:
                 pass
             recs0 = zephyr_release_feed_parser.parse_release_feed_records(merged_text) or []
+            
+            # Filter: Only process records with Full Send monitor tag (channel already filtered at collection)
+            required_monitor_tag = "💶┃full-send-🤖"
+            filtered_recs0 = []
+            for r in recs0:
+                monitor_tag = str(getattr(r, "monitor_tag", "") or "").strip()
+                # Include if monitor tag contains the required tag
+                if required_monitor_tag in monitor_tag:
+                    filtered_recs0.append(r)
+            recs0 = filtered_recs0
+            
             unparseable_recs = [
                 r
                 for r in recs0
@@ -3014,7 +3062,9 @@ class RSForwarderBot:
             target_ch = self._zephyr_release_feed_channel_id()
             if not target_ch:
                 return
-            if int(getattr(message.channel, "id", 0) or 0) != int(target_ch):
+            # Only process messages from the specific Full Send channel
+            required_channel_id = 1429649205714227260
+            if int(getattr(message.channel, "id", 0) or 0) != int(required_channel_id):
                 return
 
             # If a manual rsfsrun is in progress, do not process live Zephyr messages here.
@@ -3171,7 +3221,18 @@ class RSForwarderBot:
 
             # Dry-run path below uses SKU-only pairs for preview output.
             items = zephyr_release_feed_parser.parse_release_feed_items(text_for_parse)
-            pairs = [(it.store, it.sku) for it in (items or [])]
+            
+            # Filter: Only process items with Full Send monitor tag (channel already filtered at message level)
+            required_monitor_tag = "💶┃full-send-🤖"
+            filtered_items = []
+            for it in (items or []):
+                monitor_tag = str(getattr(it, "monitor_tag", "") or "").strip()
+                # Include if monitor tag contains the required tag
+                if required_monitor_tag in monitor_tag:
+                    filtered_items.append(it)
+            items = filtered_items
+            
+            pairs = [(it.store, it.sku) for it in items]
             rid_by_key: Dict[str, int] = {}
             try:
                 for it in (items or []):
