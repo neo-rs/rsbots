@@ -21,6 +21,7 @@ import shlex
 import time
 import hashlib
 import unicodedata
+import re
 from urllib.parse import urlparse
 
 from RSForwarder import affiliate_rewriter
@@ -316,8 +317,11 @@ class _RsFsManualResolveView(discord.ui.View):
             overrides = self._bot._load_rs_fs_manual_overrides()
             overrides[self._bot._rs_fs_override_key(store, sku)] = {"url": u, "title": t}
             self._bot._save_rs_fs_manual_overrides(overrides)
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                print(f"[RS-FS] Warning: Failed to save manual override for {store} {sku}: {e}")
+            except Exception:
+                pass
 
         it["resolved_url"] = u
         it["resolved_title"] = t
@@ -495,6 +499,123 @@ class _RsFsCheckButtonView(discord.ui.View):
             except Exception:
                 pass
 
+
+class _RsFsViewCurrentListView(discord.ui.View):
+    """View with button to show current list of SKUs."""
+    def __init__(self, bot_obj: "RSForwarderBot", ctx):
+        super().__init__(timeout=3600)  # 1 hour timeout
+        self._bot = bot_obj
+        self._ctx = ctx
+        self._owner_id = int(getattr(getattr(ctx, "author", None), "id", 0) or 0)
+    
+    async def _guard(self, interaction: discord.Interaction) -> bool:
+        try:
+            uid = int(getattr(getattr(interaction, "user", None), "id", 0) or 0)
+        except Exception:
+            uid = 0
+        if self._owner_id and uid and uid != self._owner_id:
+            try:
+                await interaction.response.send_message("❌ This view belongs to the command invoker.", ephemeral=True)
+            except Exception:
+                pass
+            return False
+        return True
+    
+    @discord.ui.button(label="View Current List", style=discord.ButtonStyle.secondary)
+    async def view_current_list(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        if not await self._guard(interaction):
+            return
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+        
+        try:
+            if not getattr(self._bot, "_rs_fs_sheet", None) or not self._bot._rs_fs_sheet.enabled():
+                await interaction.followup.send("❌ Sheet sync is not enabled.", ephemeral=True)
+                return
+            
+            current_list_rows = await self._bot._rs_fs_sheet.fetch_current_list_rows()
+            if not current_list_rows:
+                await interaction.followup.send("❌ Could not fetch Current List.", ephemeral=True)
+                return
+            
+            # Build list of SKUs with product info
+            items: List[str] = []
+            for row in current_list_rows[:50]:  # Limit to first 50
+                if len(row) < 3:
+                    continue
+                rid = str(row[0] or "").strip()
+                store = str(row[1] or "").strip()
+                sku = str(row[2] or "").strip()
+                title = str(row[6] or "").strip() if len(row) > 6 else ""
+                url = str(row[7] or "").strip() if len(row) > 7 else ""
+                
+                if not (store and sku):
+                    continue
+                
+                # Filter out URLs being used as titles
+                if title and self._bot._rsfs_title_is_bad(title, url=url):
+                    title = ""
+                
+                item_parts = [f"`{store} {sku}`"]
+                if rid:
+                    item_parts.append(f"Release ID: `{rid}`")
+                if title:
+                    item_parts.append(f"Title: {title[:60]}")
+                if url:
+                    item_parts.append(f"URL: {url[:60]}")
+                
+                items.append(" • ".join(item_parts))
+            
+            if not items:
+                await interaction.followup.send("❌ No items found in Current List.", ephemeral=True)
+                return
+            
+            # Split into multiple embeds if needed
+            items_text = "\n".join(items)
+            if len(items_text) > 4000:
+                # Split into chunks
+                chunk_size = 3500
+                chunks = []
+                current_chunk = []
+                current_len = 0
+                for item in items:
+                    item_len = len(item) + 1  # +1 for newline
+                    if current_len + item_len > chunk_size and current_chunk:
+                        chunks.append("\n".join(current_chunk))
+                        current_chunk = [item]
+                        current_len = item_len
+                    else:
+                        current_chunk.append(item)
+                        current_len += item_len
+                if current_chunk:
+                    chunks.append("\n".join(current_chunk))
+                
+                for i, chunk in enumerate(chunks):
+                    emb = discord.Embed(
+                        title=f"RS-FS Current List" + (f" (part {i+1}/{len(chunks)})" if len(chunks) > 1 else ""),
+                        description=chunk,
+                        color=discord.Color.blue(),
+                    )
+                    emb.set_footer(text=f"Showing {len(current_list_rows)} total items" if i == 0 else "")
+                    await interaction.followup.send(embed=emb, ephemeral=True)
+            else:
+                emb = discord.Embed(
+                    title="RS-FS Current List",
+                    description=items_text,
+                    color=discord.Color.blue(),
+                )
+                if len(current_list_rows) > 50:
+                    emb.set_footer(text=f"Showing first 50 of {len(current_list_rows)} items")
+                else:
+                    emb.set_footer(text=f"Total: {len(current_list_rows)} items")
+                await interaction.followup.send(embed=emb, ephemeral=True)
+        except Exception as e:
+            try:
+                await interaction.followup.send(f"❌ Failed to load Current List: {str(e)[:200]}", ephemeral=True)
+            except Exception:
+                pass
 
 class _RsFsCheckView(discord.ui.View):
     def __init__(self, bot_obj: "RSForwarderBot", *, owner_id: int = 0, run_limit: int = 250):
@@ -1377,7 +1498,11 @@ class RSForwarderBot:
                 seen.add(i)
                 uniq.append(i)
             return uniq
-        except Exception:
+        except Exception as e:
+            try:
+                print(f"[RS-FS] Warning: Failed to load Mavely alert user IDs: {e}")
+            except Exception:
+                pass
             return []
 
     def _mavely_admin_user_ids(self) -> List[int]:
@@ -1476,11 +1601,29 @@ class RSForwarderBot:
 
             # Collect "unparseable" records as: release IDs present in the merged list that
             # did NOT parse into a (store, sku) item for the public sheet.
+            # Check both rid_by_key (from current run) AND Current List sheet (for all existing items)
             parsed_ids: Set[int] = set()
             try:
                 parsed_ids = {int(v) for v in (rid_by_key or {}).values() if int(v or 0) > 0}
             except Exception:
                 parsed_ids = set()
+            # Also check Current List sheet for all release IDs that have store/SKU
+            try:
+                current_list_rows = await self._rs_fs_sheet.fetch_current_list_rows()
+                for row in current_list_rows:
+                    if len(row) >= 3:
+                        rid_str = str(row[0] or "").strip()
+                        store = str(row[1] or "").strip()
+                        sku = str(row[2] or "").strip()
+                        if store and sku:  # Has store and SKU, so it's parseable
+                            try:
+                                rid = int(rid_str)
+                                if rid > 0:
+                                    parsed_ids.add(rid)
+                            except (ValueError, TypeError):
+                                pass
+            except Exception:
+                pass
             recs0 = zephyr_release_feed_parser.parse_release_feed_records(merged_text) or []
             unparseable_recs = [
                 r
@@ -1508,8 +1651,11 @@ class RSForwarderBot:
                         sku = str(row[2] or "").strip()  # Column C: SKU/Label
                         if store and sku:
                             sku_to_store[sku.lower()] = store
-            except Exception:
-                pass
+            except Exception as e:
+                try:
+                    print(f"[RS-FS] Warning: Failed to build SKU->Store map for unparseable items: {e}")
+                except Exception:
+                    pass
 
             # Sort stores for stability.
             for st in sorted(by_store.keys(), key=lambda s: s.lower()):
@@ -2751,6 +2897,97 @@ class RSForwarderBot:
             return ""
         return "\n".join(parts).strip()
 
+    async def _maybe_handle_zephyr_removal(self, message: discord.Message) -> None:
+        """
+        Detect Zephyr Companion Bot removal messages and remove corresponding SKUs from the sheet.
+        Example message: "The following Release Feed has been removed: +94884499 | 💶┃full-send-🤖"
+        With command: "/removereleaseid release_id: 30"
+        """
+        try:
+            if not getattr(self, "_rs_fs_sheet", None) or not self._rs_fs_sheet.enabled():
+                return
+            
+            # Check if message is from Zephyr Companion Bot
+            author = getattr(message, "author", None)
+            author_name = str(getattr(author, "name", "") or "").strip().lower()
+            if "zephyr" not in author_name or "companion" not in author_name:
+                return
+            
+            # Check if message contains removal confirmation
+            text = self._collect_embed_text(message)
+            text_lower = (text or "").lower()
+            if "release feed has been removed" not in text_lower and "removed:" not in text_lower:
+                return
+            
+            # Extract release ID from /removereleaseid command
+            rid_match = re.search(r"/removereleaseid\s+release_id:\s*(\d+)", text, re.IGNORECASE)
+            if not rid_match:
+                return
+            
+            release_id = int(rid_match.group(1))
+            if release_id <= 0:
+                return
+            
+            # Find rows in Current List with matching release ID
+            current_list_rows = await self._rs_fs_sheet.fetch_current_list_rows()
+            rows_to_delete: List[int] = []  # 1-based row indices
+            
+            for i, row in enumerate(current_list_rows, start=2):  # Start at 2 (row 1 is header)
+                if len(row) < 1:
+                    continue
+                row_rid_str = str(row[0] or "").strip()
+                try:
+                    row_rid = int(row_rid_str)
+                    if row_rid == release_id:
+                        rows_to_delete.append(i)
+                except (ValueError, TypeError):
+                    continue
+            
+            if not rows_to_delete:
+                try:
+                    print(f"{Colors.CYAN}[RS-FS Removal]{Colors.RESET} Release ID {release_id} not found in Current List")
+                except Exception:
+                    pass
+                return
+            
+            # Delete rows from Current List
+            deleted_count = await self._rs_fs_sheet._delete_rows_by_indices(rows_to_delete)
+            
+            # Also remove from Live List by syncing Current List (which no longer has these rows)
+            # This ensures Live List stays in sync
+            try:
+                all_current_rows = await self._rs_fs_sheet.fetch_current_list_rows()
+                all_rows: List[List[str]] = []
+                for row in all_current_rows:
+                    if len(row) < 3:
+                        continue
+                    store = str(row[1] or "").strip()
+                    sku = str(row[2] or "").strip()
+                    if not (store and sku):
+                        continue
+                    title = str(row[6] or "").strip() if len(row) > 6 else ""
+                    aff = str(row[8] or "").strip() if len(row) > 8 else ""
+                    url = str(row[7] or "").strip() if len(row) > 7 else ""
+                    all_rows.append([store, sku, title, aff, url])
+                
+                if all_rows:
+                    ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(all_rows)
+                    try:
+                        print(f"{Colors.GREEN}[RS-FS Removal]{Colors.RESET} Removed release ID {release_id}: deleted {deleted_count} row(s) from Current List, synced Live List (added={added}, updated={updated}, deleted={deleted})")
+                    except Exception:
+                        pass
+            except Exception as e:
+                try:
+                    print(f"{Colors.YELLOW}[RS-FS Removal]{Colors.RESET} Removed {deleted_count} row(s) from Current List, but Live List sync failed: {e}")
+                except Exception:
+                    pass
+                
+        except Exception as e:
+            try:
+                print(f"{Colors.RED}[RS-FS Removal]{Colors.RESET} Error handling Zephyr removal: {e}")
+            except Exception:
+                pass
+
     async def _maybe_sync_rs_fs_sheet_from_message(self, message: discord.Message) -> None:
         """
         Auto handler for Zephyr /listreleases output.\n
@@ -3689,6 +3926,12 @@ class RSForwarderBot:
             # Optional: Zephyr release feed -> RS-FS Google Sheet sync
             try:
                 await self._maybe_sync_rs_fs_sheet_from_message(message)
+            except Exception:
+                pass
+            
+            # Handle Zephyr Companion Bot removal messages - remove SKUs from sheet
+            try:
+                await self._maybe_handle_zephyr_removal(message)
             except Exception:
                 pass
             
@@ -4859,6 +5102,9 @@ class RSForwarderBot:
                             hit_list = monitor_hit_skus[:10]  # Show first 10
                             hit_lines = []
                             for sku_display, title, url in hit_list:
+                                # Filter out URLs being used as titles
+                                if title and self._rsfs_title_is_bad(title, url=url):
+                                    title = ""  # Don't show URL as title
                                 title_display = title[:60] + "..." if len(title) > 60 else title
                                 url_display = url[:60] + "..." if len(url) > 60 else url
                                 if title and url:
@@ -5258,7 +5504,18 @@ class RSForwarderBot:
                     # Stage 3: affiliate links (plain URL for sheet)
                     if progress_msg:
                         try:
-                            await progress_msg.edit(embed=_progress_embed("affiliate", total, total, monitor_hits=len(monitor_hits), remaining=0))
+                            await progress_msg.edit(
+                                embed=_progress_embed(
+                                    "affiliate",
+                                    total,
+                                    total,
+                                    monitor_hits=len(monitor_hits),
+                                    remaining=0,
+                                    web_errors=len(error_skus),
+                                    monitor_hit_skus=monitor_hit_skus,
+                                    error_skus=error_skus,
+                                )
+                            )
                         except Exception:
                             pass
 
@@ -5489,16 +5746,18 @@ class RSForwarderBot:
                         try:
                             summ = discord.Embed(title="RS-FS Sheet Sync (mirror)", color=discord.Color.green())
                             
-                            # Sheet changes - always show even if zeros
-                            changes_text = f"added `{added}`\nupdated `{updated}`\nremoved `{deleted}`"
-                            if added == 0 and updated == 0 and deleted == 0:
-                                changes_text = "No changes"
-                            summ.add_field(name="Sheet changes", value=changes_text, inline=True)
+                            # Sheet changes - only show if there are values
+                            if added > 0 or updated > 0 or deleted > 0:
+                                changes_text = f"added `{added}`\nupdated `{updated}`\nremoved `{deleted}`"
+                                summ.add_field(name="Sheet changes", value=changes_text, inline=True)
                             
                             # Show detailed list of changes (title/url → SKU)
                             if changes_list:
                                 changes_detail = []
                                 for sku, store, title, url in changes_list[:20]:  # Limit to first 20
+                                    # Filter out URLs being used as titles
+                                    if title and self._rsfs_title_is_bad(title, url=url):
+                                        title = ""
                                     title_display = title[:50] + "..." if len(title) > 50 else title
                                     url_display = url[:60] + "..." if len(url) > 60 else url
                                     if title and url:
@@ -5514,9 +5773,10 @@ class RSForwarderBot:
                                     changes_detail_text += f"\n\n... and {len(changes_list) - 20} more"
                                 summ.add_field(name="Changes (Title/URL → SKU)", value=changes_detail_text or "—", inline=False)
                             
-                            # Resolution methods
-                            resolution_text = f"manual `{n_manual}`\nmonitor `{n_monitor}`\nwebsite `{n_web}`"
-                            summ.add_field(name="Resolution", value=resolution_text, inline=True)
+                            # Resolution methods - only show if there are values
+                            if n_manual > 0 or n_monitor > 0 or n_web > 0:
+                                resolution_text = f"manual `{n_manual}`\nmonitor `{n_monitor}`\nwebsite `{n_web}`"
+                                summ.add_field(name="Resolution", value=resolution_text, inline=True)
                             
                             # Blocked pages breakdown by resolution method
                             if n_blocked:
@@ -5529,7 +5789,9 @@ class RSForwarderBot:
                                 except Exception:
                                     summ.add_field(name="Blocked pages", value=str(n_blocked), inline=True)
                             
-                            await ctx.send(embed=summ, allowed_mentions=discord.AllowedMentions.none())
+                            # Add View Current List button
+                            view = _RsFsViewCurrentListView(self, ctx)
+                            await ctx.send(embed=summ, view=view, allowed_mentions=discord.AllowedMentions.none())
                         except Exception as e:
                             # Fallback: always show summary even if embed fails
                             try:
