@@ -3523,37 +3523,128 @@ class RSAdminBot:
         async def _cmd_delete(ctx: commands.Context, channel: Optional[discord.TextChannel] = None) -> None:
             if not await _guard(ctx):
                 return
-            ch = channel
-            if ch is None:
-                if isinstance(getattr(ctx, "channel", None), discord.TextChannel):
-                    ch = ctx.channel  # type: ignore[assignment]
-            if not isinstance(ch, discord.TextChannel):
-                await _deny(ctx, "❌ Provide a text channel or run in a text channel.")
+            if not ctx.guild:
                 return
-            me = ctx.guild.me if ctx.guild else None
-            if not me or not ch.permissions_for(me).manage_channels:
-                await _deny(ctx, "❌ Missing permission: Manage Channels.")
-                return
+            
+            # If channel is provided, use it directly
+            if channel and isinstance(channel, discord.TextChannel):
+                ch = channel
+                me = ctx.guild.me
+                if not me or not ch.permissions_for(me).manage_channels:
+                    await _deny(ctx, "❌ Missing permission: Manage Channels.")
+                    return
 
-            async def _do(interaction: discord.Interaction) -> None:
-                try:
-                    await interaction.followup.send(f"🗑️ Deleting {ch.mention}…", ephemeral=False)
-                except Exception:
-                    pass
-                try:
-                    await ch.delete(reason=f"Deleted by {ctx.author} via RSAdminBot")
-                except Exception as e:
+                async def _do(interaction: discord.Interaction) -> None:
                     try:
-                        await interaction.followup.send(f"❌ Delete failed: {str(e)[:200]}", ephemeral=False)
+                        await interaction.followup.send(f"🗑️ Deleting {ch.mention}…", ephemeral=False)
                     except Exception:
                         pass
+                    try:
+                        await ch.delete(reason=f"Deleted by {ctx.author} via RSAdminBot")
+                    except Exception as e:
+                        try:
+                            await interaction.followup.send(f"❌ Delete failed: {str(e)[:200]}", ephemeral=False)
+                        except Exception:
+                            pass
 
+                embed = discord.Embed(
+                    title="Confirm delete",
+                    description=f"Delete {ch.mention}? This cannot be undone.",
+                    color=discord.Color.red(),
+                )
+                await ctx.send(embed=embed, view=_ConfirmView(author_id=int(ctx.author.id), on_confirm=_do))
+                return
+            
+            # Show channel selection dropdown
+            class _DeleteChannelView(ui.View):
+                def __init__(self):
+                    super().__init__(timeout=180)
+                    self.selected_channel_id: Optional[int] = None
+                    
+                    channels = [ch for ch in ctx.guild.channels if isinstance(ch, discord.TextChannel)]
+                    channels = sorted(channels, key=lambda x: x.position)
+                    opts: List[discord.SelectOption] = []
+                    for ch in channels[:25]:
+                        opts.append(discord.SelectOption(
+                            label=str(ch.name)[:100] or "channel",
+                            value=str(ch.id),
+                            description=f"#{ch.name}"
+                        ))
+                    if opts:
+                        self.channel_select = ui.Select(placeholder="Select channel to delete…", options=opts, min_values=1, max_values=1)
+                        self.channel_select.callback = self.on_channel_selected
+                        self.add_item(self.channel_select)
+                    else:
+                        self.channel_select = None
+                    
+                    self._refresh_buttons()
+                
+                async def interaction_check(self, interaction: discord.Interaction) -> bool:
+                    try:
+                        return int(getattr(getattr(interaction, "user", None), "id", 0) or 0) == int(ctx.author.id)
+                    except Exception:
+                        return False
+                
+                def _refresh_buttons(self) -> None:
+                    self.confirm_btn.disabled = not bool(self.selected_channel_id)  # type: ignore[attr-defined]
+                
+                async def on_channel_selected(self, i: discord.Interaction):
+                    try:
+                        self.selected_channel_id = int(self.channel_select.values[0])
+                    except Exception:
+                        self.selected_channel_id = None
+                    self._refresh_buttons()
+                    await i.response.edit_message(view=self)
+                
+                @ui.button(label="Confirm Delete", style=discord.ButtonStyle.danger)
+                async def confirm_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
+                    if not self.selected_channel_id:
+                        return
+                    ch = ctx.guild.get_channel(self.selected_channel_id)
+                    if not isinstance(ch, discord.TextChannel):
+                        try:
+                            await i.response.send_message("❌ Channel not found.", ephemeral=True)
+                        except Exception:
+                            pass
+                        return
+                    
+                    me = ctx.guild.me
+                    if not me or not ch.permissions_for(me).manage_channels:
+                        try:
+                            await i.response.send_message("❌ Missing permission: Manage Channels.", ephemeral=True)
+                        except Exception:
+                            pass
+                        return
+                    
+                    for child in self.children:
+                        if isinstance(child, ui.Button) or isinstance(child, ui.Select):
+                            child.disabled = True
+                    try:
+                        await i.response.edit_message(content="🗑️ Deleting channel…", view=self)
+                    except Exception:
+                        pass
+                    try:
+                        await ch.delete(reason=f"Deleted by {ctx.author} via RSAdminBot")
+                        await i.followup.send(f"✅ Deleted {ch.name}", ephemeral=False)
+                    except Exception as e:
+                        try:
+                            await i.followup.send(f"❌ Delete failed: {str(e)[:200]}", ephemeral=False)
+                        except Exception:
+                            pass
+                
+                @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+                async def cancel_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
+                    for child in self.children:
+                        if isinstance(child, ui.Button) or isinstance(child, ui.Select):
+                            child.disabled = True
+                    await i.response.edit_message(content="Cancelled.", view=self)
+            
             embed = discord.Embed(
-                title="Confirm delete",
-                description=f"Delete {ch.mention}? This cannot be undone.",
+                title="🗑️ Delete Channel",
+                description="Select a channel from the dropdown to delete.",
                 color=discord.Color.red(),
             )
-            await ctx.send(embed=embed, view=_ConfirmView(author_id=int(ctx.author.id), on_confirm=_do))
+            await ctx.send(embed=embed, view=_DeleteChannelView())
 
         @self.bot.command(name="transfer")
         async def _cmd_transfer(ctx: commands.Context, *args: str) -> None:
@@ -3564,64 +3655,242 @@ class RSAdminBot:
             if not isinstance(getattr(ctx, "channel", None), discord.TextChannel):
                 await _deny(ctx, "❌ Run this in a server text channel.")
                 return
-            if not args:
-                await _deny(ctx, "Usage: `!transfer <category_id>` or `!transfer <#channel> <category_id>`")
-                return
+            
+            # Legacy support: if args provided, try to parse them
+            if args:
+                conv_ch = commands.TextChannelConverter()
+                conv_cat = commands.CategoryChannelConverter()
+                channel: discord.TextChannel = ctx.channel  # type: ignore[assignment]
+                cat: Optional[discord.CategoryChannel] = None
 
-            conv_ch = commands.TextChannelConverter()
-            conv_cat = commands.CategoryChannelConverter()
-            channel: discord.TextChannel = ctx.channel  # type: ignore[assignment]
-            cat: Optional[discord.CategoryChannel] = None
+                raw = list(args)
+                if len(raw) >= 2:
+                    try:
+                        channel = await conv_ch.convert(ctx, raw[0])
+                        raw = raw[1:]
+                    except Exception:
+                        channel = ctx.channel  # type: ignore[assignment]
 
-            raw = list(args)
-            if len(raw) >= 2:
+                target = " ".join(raw).strip()
                 try:
-                    channel = await conv_ch.convert(ctx, raw[0])
-                    raw = raw[1:]
-                except Exception:
-                    channel = ctx.channel  # type: ignore[assignment]
-
-            target = " ".join(raw).strip()
-            try:
-                cat = await conv_cat.convert(ctx, target)
-            except Exception:
-                cat = None
-            if cat is None:
-                try:
-                    if target.isdigit():
-                        c = ctx.guild.get_channel(int(target))
-                        if isinstance(c, discord.CategoryChannel):
-                            cat = c
+                    cat = await conv_cat.convert(ctx, target)
                 except Exception:
                     cat = None
-            if cat is None:
-                await _deny(ctx, "❌ Category not found. Use a category ID.")
-                return
-
-            me = ctx.guild.me
-            if not me or not channel.permissions_for(me).manage_channels:
-                await _deny(ctx, "❌ Missing permission: Manage Channels.")
-                return
-
-            async def _do(interaction: discord.Interaction) -> None:
-                try:
-                    await interaction.followup.send(f"📦 Moving {channel.mention} → **{cat.name}**…", ephemeral=False)
-                except Exception:
-                    pass
-                try:
-                    await channel.edit(category=cat, sync_permissions=True, reason=f"Transferred by {ctx.author} via RSAdminBot")
-                except Exception as e:
+                if cat is None:
                     try:
-                        await interaction.followup.send(f"❌ Transfer failed: {str(e)[:200]}", ephemeral=False)
+                        if target.isdigit():
+                            c = ctx.guild.get_channel(int(target))
+                            if isinstance(c, discord.CategoryChannel):
+                                cat = c
                     except Exception:
-                        pass
+                        cat = None
+                if cat is not None:
+                    me = ctx.guild.me
+                    if not me or not channel.permissions_for(me).manage_channels:
+                        await _deny(ctx, "❌ Missing permission: Manage Channels.")
+                        return
 
+                    async def _do(interaction: discord.Interaction) -> None:
+                        try:
+                            await interaction.followup.send(f"📦 Moving {channel.mention} → **{cat.name}**…", ephemeral=False)
+                        except Exception:
+                            pass
+                        try:
+                            await channel.edit(category=cat, sync_permissions=True, reason=f"Transferred by {ctx.author} via RSAdminBot")
+                        except Exception as e:
+                            try:
+                                await interaction.followup.send(f"❌ Transfer failed: {str(e)[:200]}", ephemeral=False)
+                            except Exception:
+                                pass
+
+                    embed = discord.Embed(
+                        title="Confirm transfer",
+                        description=f"Move {channel.mention} into category **{cat.name}**?",
+                        color=discord.Color.orange(),
+                    )
+                    await ctx.send(embed=embed, view=_ConfirmView(author_id=int(ctx.author.id), on_confirm=_do))
+                    return
+            
+            # Interactive UI with dropdowns and search
+            class _CategorySearchModal(ui.Modal, title="Search Category"):
+                search_input = ui.TextInput(label="Category Name", placeholder="Type to search...", required=True, max_length=100)
+                
+                def __init__(self, view_instance):
+                    super().__init__()
+                    self.view_instance = view_instance
+                
+                async def on_submit(self, interaction: discord.Interaction):
+                    search_term = self.search_input.value.lower().strip()
+                    if not search_term:
+                        await interaction.response.send_message("❌ Please enter a search term.", ephemeral=True)
+                        return
+                    
+                    # Filter categories by search term
+                    all_cats = [c for c in ctx.guild.categories if isinstance(c, discord.CategoryChannel)]
+                    filtered = [c for c in all_cats if search_term in c.name.lower()]
+                    filtered = sorted(filtered, key=lambda x: x.position)[:25]
+                    
+                    if not filtered:
+                        await interaction.response.send_message(f"❌ No categories found matching '{search_term}'.", ephemeral=True)
+                        return
+                    
+                    # Update category select options
+                    opts: List[discord.SelectOption] = []
+                    for cat in filtered:
+                        opts.append(discord.SelectOption(
+                            label=str(cat.name)[:100] or "category",
+                            value=str(cat.id),
+                            description=f"Category: {cat.name}"
+                        ))
+                    
+                    # Remove old category select and add new one
+                    for item in list(self.view_instance.children):
+                        if isinstance(item, ui.Select) and item.placeholder and "category" in item.placeholder.lower():
+                            self.view_instance.remove_item(item)
+                    
+                    self.view_instance.category_select = ui.Select(
+                        placeholder=f"Select category (filtered: {len(filtered)})…",
+                        options=opts,
+                        min_values=1,
+                        max_values=1
+                    )
+                    self.view_instance.category_select.callback = self.view_instance.on_category_selected
+                    self.view_instance.add_item(self.view_instance.category_select)
+                    
+                    await interaction.response.edit_message(view=self.view_instance)
+            
+            class _TransferView(ui.View):
+                def __init__(self):
+                    super().__init__(timeout=300)
+                    self.selected_channel_id: Optional[int] = None
+                    self.selected_category_id: Optional[int] = None
+                    
+                    # Channel select
+                    channels = [ch for ch in ctx.guild.channels if isinstance(ch, discord.TextChannel)]
+                    channels = sorted(channels, key=lambda x: x.position)
+                    channel_opts: List[discord.SelectOption] = []
+                    for ch in channels[:25]:
+                        channel_opts.append(discord.SelectOption(
+                            label=str(ch.name)[:100] or "channel",
+                            value=str(ch.id),
+                            description=f"#{ch.name}"
+                        ))
+                    if channel_opts:
+                        self.channel_select = ui.Select(placeholder="Select channel to transfer…", options=channel_opts, min_values=1, max_values=1)
+                        self.channel_select.callback = self.on_channel_selected
+                        self.add_item(self.channel_select)
+                    else:
+                        self.channel_select = None
+                    
+                    # Category select
+                    categories = [c for c in ctx.guild.categories if isinstance(c, discord.CategoryChannel)]
+                    categories = sorted(categories, key=lambda x: x.position)
+                    category_opts: List[discord.SelectOption] = []
+                    for cat in categories[:25]:
+                        category_opts.append(discord.SelectOption(
+                            label=str(cat.name)[:100] or "category",
+                            value=str(cat.id),
+                            description=f"Category: {cat.name}"
+                        ))
+                    if category_opts:
+                        self.category_select = ui.Select(placeholder="Select category…", options=category_opts, min_values=1, max_values=1)
+                        self.category_select.callback = self.on_category_selected
+                        self.add_item(self.category_select)
+                    else:
+                        self.category_select = None
+                    
+                    self._refresh_buttons()
+                
+                async def interaction_check(self, interaction: discord.Interaction) -> bool:
+                    try:
+                        return int(getattr(getattr(interaction, "user", None), "id", 0) or 0) == int(ctx.author.id)
+                    except Exception:
+                        return False
+                
+                def _refresh_buttons(self) -> None:
+                    self.confirm_btn.disabled = not bool(self.selected_channel_id and self.selected_category_id)  # type: ignore[attr-defined]
+                
+                async def on_channel_selected(self, i: discord.Interaction):
+                    try:
+                        self.selected_channel_id = int(self.channel_select.values[0])
+                    except Exception:
+                        self.selected_channel_id = None
+                    self._refresh_buttons()
+                    if self.selected_channel_id and self.selected_category_id:
+                        await i.response.defer()
+                        await self._perform_transfer(i)
+                    else:
+                        await i.response.send_message(f"✅ Channel selected. Now select a category.", ephemeral=True)
+                
+                async def on_category_selected(self, i: discord.Interaction):
+                    try:
+                        self.selected_category_id = int(self.category_select.values[0])
+                    except Exception:
+                        self.selected_category_id = None
+                    self._refresh_buttons()
+                    if self.selected_channel_id and self.selected_category_id:
+                        await i.response.defer()
+                        await self._perform_transfer(i)
+                    else:
+                        await i.response.send_message(f"✅ Category selected. Now select a channel.", ephemeral=True)
+                
+                @ui.button(label="🔍 Search Category", style=discord.ButtonStyle.secondary)
+                async def search_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
+                    await i.response.send_modal(_CategorySearchModal(self))
+                
+                @ui.button(label="Confirm Transfer", style=discord.ButtonStyle.success)
+                async def confirm_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
+                    if not self.selected_channel_id or not self.selected_category_id:
+                        return
+                    await i.response.defer()
+                    await self._perform_transfer(i)
+                
+                @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+                async def cancel_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
+                    for child in self.children:
+                        if isinstance(child, ui.Button) or isinstance(child, ui.Select):
+                            child.disabled = True
+                    await i.response.edit_message(content="Cancelled.", view=self)
+                
+                async def _perform_transfer(self, interaction: discord.Interaction):
+                    try:
+                        channel = ctx.guild.get_channel(self.selected_channel_id)
+                        category = ctx.guild.get_channel(self.selected_category_id)
+                        
+                        if not channel or not isinstance(channel, discord.TextChannel):
+                            await interaction.followup.send("❌ Channel not found", ephemeral=False)
+                            return
+                        
+                        if not category or not isinstance(category, discord.CategoryChannel):
+                            await interaction.followup.send("❌ Category not found", ephemeral=False)
+                            return
+                        
+                        me = ctx.guild.me
+                        if not me or not channel.permissions_for(me).manage_channels:
+                            await interaction.followup.send("❌ Missing permission: Manage Channels.", ephemeral=False)
+                            return
+                        
+                        for child in self.children:
+                            if isinstance(child, ui.Button) or isinstance(child, ui.Select):
+                                child.disabled = True
+                        try:
+                            await interaction.edit_original_response(content="📦 Transferring channel…", view=self)
+                        except Exception:
+                            pass
+                        
+                        await channel.edit(category=category, sync_permissions=True, reason=f"Transferred by {ctx.author} via RSAdminBot")
+                        await interaction.followup.send(f"✅ Moved {channel.mention} → **{category.name}**", ephemeral=False)
+                    except discord.Forbidden:
+                        await interaction.followup.send("❌ I don't have permission to edit this channel", ephemeral=False)
+                    except Exception as e:
+                        await interaction.followup.send(f"❌ Transfer failed: {str(e)[:200]}", ephemeral=False)
+            
             embed = discord.Embed(
-                title="Confirm transfer",
-                description=f"Move {channel.mention} into category **{cat.name}**?",
+                title="📦 Transfer Channel",
+                description="Select a channel and category from the dropdowns, or use the search button to find a category.",
                 color=discord.Color.orange(),
             )
-            await ctx.send(embed=embed, view=_ConfirmView(author_id=int(ctx.author.id), on_confirm=_do))
+            await ctx.send(embed=embed, view=_TransferView())
 
         @self.bot.command(name="archive")
         async def _cmd_archive(ctx: commands.Context) -> None:
@@ -3637,6 +3906,53 @@ class RSAdminBot:
                 cfg = {}
             delay_ms = int(cfg.get("replay_delay_ms") or 350)
             delay_ms = max(0, min(delay_ms, 2000))
+
+            class _ArchiveCategorySearchModal(ui.Modal, title="Search Archive Category"):
+                search_input = ui.TextInput(label="Category Name", placeholder="Type to search...", required=True, max_length=100)
+                
+                def __init__(self, view_instance):
+                    super().__init__()
+                    self.view_instance = view_instance
+                
+                async def on_submit(self, interaction: discord.Interaction):
+                    search_term = self.search_input.value.lower().strip()
+                    if not search_term:
+                        await interaction.response.send_message("❌ Please enter a search term.", ephemeral=True)
+                        return
+                    
+                    # Filter categories by search term
+                    all_cats = [c for c in ctx.guild.categories if isinstance(c, discord.CategoryChannel)]
+                    filtered = [c for c in all_cats if search_term in c.name.lower()]
+                    filtered = sorted(filtered, key=lambda x: x.position)[:25]
+                    
+                    if not filtered:
+                        await interaction.response.send_message(f"❌ No categories found matching '{search_term}'.", ephemeral=True)
+                        return
+                    
+                    # Update category select options
+                    opts: List[discord.SelectOption] = []
+                    for cat in filtered:
+                        opts.append(discord.SelectOption(
+                            label=str(cat.name)[:100] or "category",
+                            value=str(cat.id),
+                            description=f"Category: {cat.name}"
+                        ))
+                    
+                    # Remove old category select and add new one
+                    for item in list(self.view_instance.children):
+                        if isinstance(item, ui.Select) and item.placeholder and "category" in item.placeholder.lower():
+                            self.view_instance.remove_item(item)
+                    
+                    self.view_instance.category_select = ui.Select(
+                        placeholder=f"Select archive category (filtered: {len(filtered)})…",
+                        options=opts,
+                        min_values=1,
+                        max_values=1
+                    )
+                    self.view_instance.category_select.callback = self.view_instance.on_category_selected
+                    self.view_instance.add_item(self.view_instance.category_select)
+                    
+                    await interaction.response.edit_message(view=self.view_instance)
 
             class _ArchiveView(ui.View):
                 def __init__(self):
@@ -3673,6 +3989,10 @@ class RSAdminBot:
                         self.category_id = None
                     self._refresh_buttons()
                     await i.response.edit_message(view=self)
+                
+                @ui.button(label="🔍 Search Category", style=discord.ButtonStyle.secondary)
+                async def search_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
+                    await i.response.send_modal(_ArchiveCategorySearchModal(self))
 
                 @ui.button(label="Archive (lock + move)", style=discord.ButtonStyle.primary)
                 async def archive_lock_move(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
@@ -3727,6 +4047,179 @@ class RSAdminBot:
                 color=discord.Color.blurple(),
             )
             await ctx.send(embed=embed, view=_ArchiveView())
+
+        @self.bot.command(name="clear")
+        async def _cmd_clear(ctx: commands.Context, include_pins: bool = False) -> None:
+            if not await _guard(ctx):
+                return
+            if not ctx.guild or not isinstance(getattr(ctx, "channel", None), discord.TextChannel):
+                await _deny(ctx, "❌ Run this in a server text channel.")
+                return
+            
+            ch: discord.TextChannel = ctx.channel  # type: ignore[assignment]
+            me = ctx.guild.me
+            if not me or not ch.permissions_for(me).manage_messages:
+                await _deny(ctx, "❌ Missing permission: Manage Messages.")
+                return
+            
+            class _ClearConfirmView(ui.View):
+                def __init__(self):
+                    super().__init__(timeout=60)
+                    self._started = False
+                
+                async def interaction_check(self, interaction: discord.Interaction) -> bool:
+                    try:
+                        return int(getattr(getattr(interaction, "user", None), "id", 0) or 0) == int(ctx.author.id)
+                    except Exception:
+                        return False
+                
+                @ui.button(label="Confirm clear", style=discord.ButtonStyle.danger)
+                async def confirm(self, i: discord.Interaction, btn: ui.Button) -> None:
+                    if self._started:
+                        await i.response.send_message("Already running.", ephemeral=True)
+                        return
+                    self._started = True
+                    for child in self.children:
+                        if isinstance(child, ui.Button):
+                            child.disabled = True
+                    try:
+                        await i.response.edit_message(content="🧹 Clearing messages… (running)", view=self)
+                    except Exception:
+                        pass
+                    
+                    # Discord bulk delete rule: messages older than 14 days cannot be bulk-deleted.
+                    BULK_DELETE_MAX_AGE_DAYS = 14
+                    cutoff = discord.utils.utcnow() - timedelta(days=BULK_DELETE_MAX_AGE_DAYS)
+                    
+                    total = 0
+                    bulk = 0
+                    single = 0
+                    skipped = 0
+                    failures = 0
+                    
+                    # We delete newest-first.
+                    recent_batch: List[discord.Message] = []
+                    try:
+                        async for msg in ch.history(limit=None, oldest_first=False):
+                            try:
+                                if msg.pinned and not include_pins:
+                                    skipped += 1
+                                    continue
+                                # Never try to delete system messages that are not deletable
+                                if not getattr(msg, "deletable", True):
+                                    skipped += 1
+                                    continue
+                            except Exception:
+                                pass
+                            
+                            created = getattr(msg, "created_at", None)
+                            is_recent = bool(created and created.replace(tzinfo=timezone.utc) >= cutoff)
+                            
+                            if is_recent:
+                                recent_batch.append(msg)
+                                if len(recent_batch) >= 100:
+                                    try:
+                                        await ch.delete_messages(recent_batch)
+                                        bulk += len(recent_batch)
+                                        total += len(recent_batch)
+                                    except Exception:
+                                        for m in recent_batch:
+                                            try:
+                                                await m.delete()
+                                                single += 1
+                                                total += 1
+                                            except Exception:
+                                                failures += 1
+                                    recent_batch = []
+                            else:
+                                # Flush any remaining recent batch before individual deletes.
+                                if recent_batch:
+                                    try:
+                                        await ch.delete_messages(recent_batch)
+                                        bulk += len(recent_batch)
+                                        total += len(recent_batch)
+                                    except Exception:
+                                        for m in recent_batch:
+                                            try:
+                                                await m.delete()
+                                                single += 1
+                                                total += 1
+                                            except Exception:
+                                                failures += 1
+                                    recent_batch = []
+                                
+                                try:
+                                    await msg.delete()
+                                    single += 1
+                                    total += 1
+                                except Exception:
+                                    failures += 1
+                            
+                            # Progress ping every ~50 deletions
+                            if total and total % 50 == 0:
+                                try:
+                                    await i.edit_original_response(
+                                        content=f"🧹 Clearing… deleted={total} (bulk={bulk}, single={single}) skipped={skipped} failures={failures}"
+                                    )
+                                except Exception:
+                                    pass
+                        # Flush any remaining recent batch at the end.
+                        if recent_batch:
+                            try:
+                                await ch.delete_messages(recent_batch)
+                                bulk += len(recent_batch)
+                                total += len(recent_batch)
+                            except Exception:
+                                for m in recent_batch:
+                                    try:
+                                        await m.delete()
+                                        single += 1
+                                        total += 1
+                                    except Exception:
+                                        failures += 1
+                    except Exception as e:
+                        try:
+                            await i.followup.send(f"❌ Clear failed: {str(e)[:200]}", ephemeral=False)
+                        except Exception:
+                            pass
+                        return
+                    
+                    try:
+                        await i.edit_original_response(
+                            content=f"✅ Clear complete. deleted={total} (bulk={bulk}, single={single}) skipped={skipped} failures={failures}"
+                        )
+                    except Exception:
+                        try:
+                            await i.followup.send(
+                                content=f"✅ Clear complete. deleted={total} (bulk={bulk}, single={single}) skipped={skipped} failures={failures}",
+                                ephemeral=False
+                            )
+                        except Exception:
+                            pass
+                
+                @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+                async def cancel(self, i: discord.Interaction, btn: ui.Button) -> None:
+                    for child in self.children:
+                        if isinstance(child, ui.Button):
+                            child.disabled = True
+                    try:
+                        await i.response.edit_message(content="Cancelled.", view=self)
+                    except Exception:
+                        pass
+            
+            warn = (
+                f"Channel: {ch.mention}\n"
+                f"- This will delete messages in this channel.\n"
+                f"- Bulk-delete works only for messages newer than ~14 days; older messages are deleted one-by-one.\n"
+                f"- Pinned messages will {'also be deleted' if include_pins else 'be kept'}.\n\n"
+                f"Proceed?"
+            )
+            embed = discord.Embed(
+                title="🧹 Clear Messages",
+                description=warn,
+                color=discord.Color.orange(),
+            )
+            await ctx.send(embed=embed, view=_ClearConfirmView())
 
     def _load_ssh_config(self):
         """Load SSH server configuration from the canonical oraclekeys/servers.json.
