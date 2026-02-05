@@ -1435,16 +1435,68 @@ class RSForwarderBot:
             inline=False,
         )
 
-        # Explain why items are not expected to appear in the public sheet.
+        # Filter non-SKU and unknown-store items by Full Send tag, and only show those NOT in Live List
+        # Check Current List to see which items are actually there (they might be synced to Live List)
         why_lines: List[str] = []
         cmd_lines: List[str] = []
-        for r in (sku_unknown_store_recs[:6] + non_sku_recs[:6]):
+        required_monitor_tag = "💶┃full-send-🤖"
+        
+        # Get Current List rows to check which items are actually there
+        current_list_skus: Set[str] = set()
+        current_list_rids: Set[int] = set()
+        try:
+            if ok and getattr(self, "_rs_fs_sheet", None):
+                current_list_rows_check = await self._rs_fs_sheet.fetch_current_list_rows()
+                for row in current_list_rows_check:
+                    if len(row) >= 3:
+                        if str(row[0] or "").strip().lower() == "release id":
+                            continue
+                        sku_check = str(row[2] or "").strip().lower()
+                        if sku_check:
+                            current_list_skus.add(sku_check)
+                        rid_check_str = str(row[0] or "").strip()
+                        try:
+                            rid_check = int(rid_check_str) if rid_check_str else 0
+                            if rid_check > 0:
+                                current_list_rids.add(rid_check)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        
+        # Only show items that:
+        # 1. Have Full Send tag in raw_text
+        # 2. Are NOT in the Live List (missing from existing_set for SKUs, or not found for non-SKUs)
+        filtered_non_sku = []
+        filtered_unknown_store = []
+        for r in non_sku_recs:
+            raw_text = str(getattr(r, "raw_text", "") or "").strip()
+            raw_text_lower = raw_text.lower()
+            if "full-send" in raw_text_lower or "full send" in raw_text_lower or required_monitor_tag in raw_text:
+                rid = int(getattr(r, "release_id", 0) or 0)
+                # Check if this release ID is in Current List (meaning it might be synced to Live List)
+                if rid not in current_list_rids:
+                    filtered_non_sku.append(r)
+        
+        for r in sku_unknown_store_recs:
+            raw_text = str(getattr(r, "raw_text", "") or "").strip()
+            raw_text_lower = raw_text.lower()
+            if "full-send" in raw_text_lower or "full send" in raw_text_lower or required_monitor_tag in raw_text:
+                sk = str(getattr(r, "sku", "") or "").strip().lower()
+                # Check if this SKU is in Live List
+                if sk not in existing_set:
+                    filtered_unknown_store.append(r)
+        
+        for r in (filtered_unknown_store[:6] + filtered_non_sku[:6]):
             rid = int(getattr(r, "release_id", 0) or 0)
             sk = str(getattr(r, "sku", "") or "").strip()
             st = str(getattr(r, "store", "") or "").strip()
             is_sku = bool(getattr(r, "is_sku_candidate", True))
             kind = "non-SKU" if not is_sku else "unknown-store"
-            why_lines.append(f"- `{rid}` `{kind}` {('`'+st+'`' if st else '')} `{sk}`")
+            # Format: Release ID, Store (if available), SKU/Label, with product info
+            store_display = st if st else "unknown"
+            info_line = f"`{rid}` `{kind}` `{store_display}` `{sk}`"
+            why_lines.append(info_line)
             if rid:
                 cmd_lines.append(f"/removereleaseid release_id: {rid}")
         if why_lines:
@@ -5291,15 +5343,6 @@ class RSForwarderBot:
                         emb.set_footer(text="This message updates live.")
                         return emb
 
-                    progress_msg = None
-                    try:
-                        progress_msg = await ctx.send(
-                            embed=_progress_embed("collect", 0, lim),
-                            allowed_mentions=discord.AllowedMentions.none(),
-                        )
-                    except Exception:
-                        progress_msg = None
-
                     # Collect the most recent listreleases run (merged from Zephyr chunks).
                     merged_text, _chunk_n, _found_header = await self._collect_latest_zephyr_release_feed_text(ch)
                     if not merged_text:
@@ -5331,7 +5374,7 @@ class RSForwarderBot:
                     # 1. Exist in both Current List and History (matched)
                     # 2. Are missing title or URL (or both) - need resolution
                     # Current List columns: Release ID (0), Store (1), SKU/Label (2), Monitor Tag (3), Category (4), Channel ID (5), Resolved Title (6), Resolved URL (7), Affiliate URL (8), Status (9), Remove Command (10), Last Seen (11), Full Send (12)
-                    # Filter by "Full Send" column = "Yes"
+                    # Filter by "Full Send" column contains "full-send"
                     pairs: List[Tuple[str, str]] = []
                     rid_by_key: Dict[str, int] = {}
                     for row in current_list_rows:
@@ -5340,9 +5383,10 @@ class RSForwarderBot:
                         # Skip header row
                         if str(row[0] or "").strip().lower() == "release id":
                             continue
-                        # Filter: Only process rows where "Full Send" column = "Yes"
+                        # Filter: Only process rows where "Full Send" column contains "full-send"
                         full_send = str(row[12] or "").strip() if len(row) > 12 else ""
-                        if full_send.lower() != "yes":
+                        full_send_lower = full_send.lower()
+                        if "full-send" not in full_send_lower and "💶┃full-send-🤖" not in full_send:
                             continue
                         rid_str = str(row[0] or "").strip()
                         store = str(row[1] or "").strip()
@@ -5372,6 +5416,16 @@ class RSForwarderBot:
                     # Limit to the requested max (preserve order).
                     pairs = pairs[:lim]
                     total = len(pairs)
+
+                    # Create progress message AFTER we know the actual count
+                    progress_msg = None
+                    try:
+                        progress_msg = await ctx.send(
+                            embed=_progress_embed("collect", 0, total),
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    except Exception:
+                        progress_msg = None
 
                     if progress_msg:
                         try:
