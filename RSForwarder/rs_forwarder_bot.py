@@ -543,12 +543,14 @@ class _RsFsSyncSummaryView(discord.ui.View):
                 await interaction.followup.send("❌ Could not fetch Current List.", ephemeral=True)
                 return
             
-            # Build list of SKUs with product info
+            # Build list of SKUs with product info, organized by store
             # Filter by "Full Send" column contains "full-send"
-            items: List[str] = []
-            count = 0
+            items_by_store: Dict[str, List[str]] = {}  # store -> list of item strings
+            total_count = 0
+            max_items = 100  # Increased limit since we're organizing
+            
             for row in current_list_rows:
-                if count >= 50:  # Limit to first 50
+                if total_count >= max_items:
                     break
                 if len(row) < 3:
                     continue
@@ -585,30 +587,58 @@ class _RsFsSyncSummaryView(discord.ui.View):
                 if rid:
                     item_parts.append(f"```\n/removereleaseid release_id: {rid}\n```")
                 
-                items.append(" • ".join(item_parts))
-                count += 1
+                item_text = " • ".join(item_parts)
+                if store not in items_by_store:
+                    items_by_store[store] = []
+                items_by_store[store].append(item_text)
+                total_count += 1
             
-            if not items:
+            if not items_by_store:
                 await interaction.followup.send("❌ No Full Send items found in Current List.", ephemeral=True)
                 return
             
+            # Build organized text by store
+            organized_sections: List[str] = []
+            for store in sorted(items_by_store.keys()):  # Sort stores alphabetically
+                store_items = items_by_store[store]
+                store_header = f"**{store}**"
+                organized_sections.append(store_header)
+                organized_sections.extend(store_items)
+                organized_sections.append("")  # Empty line between stores
+            
+            items_text = "\n\n".join(organized_sections)
+            
             # Split into multiple embeds if needed
-            items_text = "\n\n".join(items)
             if len(items_text) > 4000:
-                # Split into chunks
+                # Split into chunks, trying to keep stores together
                 chunk_size = 3500
                 chunks = []
                 current_chunk = []
                 current_length = 0
+                current_store = ""
                 
-                for item in items:
-                    item_len = len(item) + 2  # +2 for "\n\n"
-                    if current_length + item_len > chunk_size and current_chunk:
+                for line in organized_sections:
+                    is_store_header = line.startswith("**") and line.endswith("**")
+                    line_len = len(line) + 2  # +2 for "\n\n"
+                    
+                    # If starting a new store and current chunk is getting large, finalize it
+                    if is_store_header and current_length > chunk_size * 0.7 and current_chunk:
                         chunks.append("\n\n".join(current_chunk))
                         current_chunk = []
                         current_length = 0
-                    current_chunk.append(item)
-                    current_length += item_len
+                    
+                    # If adding this line would exceed limit, finalize current chunk
+                    if current_length + line_len > chunk_size and current_chunk:
+                        chunks.append("\n\n".join(current_chunk))
+                        current_chunk = []
+                        current_length = 0
+                        # If this is a store header, add it to the new chunk
+                        if is_store_header:
+                            current_chunk.append(line)
+                            current_length = line_len
+                    else:
+                        current_chunk.append(line)
+                        current_length += line_len
                 
                 if current_chunk:
                     chunks.append("\n\n".join(current_chunk))
@@ -620,7 +650,7 @@ class _RsFsSyncSummaryView(discord.ui.View):
                         color=discord.Color.blue(),
                     )
                     if i == 0:
-                        emb.set_footer(text=f"Showing {len(current_list_rows)} total items" if i == 0 else "")
+                        emb.set_footer(text=f"Showing {total_count} items organized by store")
                     await interaction.followup.send(embed=emb, ephemeral=True)
             else:
                 emb = discord.Embed(
@@ -628,10 +658,10 @@ class _RsFsSyncSummaryView(discord.ui.View):
                     description=items_text,
                     color=discord.Color.blue(),
                 )
-                if len(current_list_rows) > 50:
-                    emb.set_footer(text=f"Showing first 50 of {len(current_list_rows)} items")
+                if total_count >= max_items:
+                    emb.set_footer(text=f"Showing first {max_items} of {len(current_list_rows)} items")
                 else:
-                    emb.set_footer(text=f"Total: {len(current_list_rows)} items")
+                    emb.set_footer(text=f"Total: {total_count} items organized by store")
                 await interaction.followup.send(embed=emb, ephemeral=True)
         except Exception as e:
             try:
@@ -920,6 +950,150 @@ class _RsFsCheckView(discord.ui.View):
                 await interaction.message.edit(embed=emb, view=self)
         except Exception as e:
             await interaction.followup.send(f"❌ Refresh failed: {str(e)[:200]}", ephemeral=True)
+    
+    @discord.ui.button(label="View Current List", style=discord.ButtonStyle.secondary, row=1)
+    async def view_current_list(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
+        if not await self._guard(interaction):
+            return
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+        
+        try:
+            if not getattr(self._bot, "_rs_fs_sheet", None) or not self._bot._rs_fs_sheet.enabled():
+                await interaction.followup.send("❌ Sheet sync is not enabled.", ephemeral=True)
+                return
+            
+            current_list_rows = await self._bot._rs_fs_sheet.fetch_current_list_rows()
+            if not current_list_rows:
+                await interaction.followup.send("❌ Could not fetch Current List.", ephemeral=True)
+                return
+            
+            # Build list of SKUs with product info, organized by store
+            # Filter by "Full Send" column contains "full-send"
+            items_by_store: Dict[str, List[str]] = {}  # store -> list of item strings
+            total_count = 0
+            max_items = 100  # Increased limit since we're organizing
+            
+            for row in current_list_rows:
+                if total_count >= max_items:
+                    break
+                if len(row) < 3:
+                    continue
+                # Skip header row
+                if str(row[0] or "").strip().lower() == "release id":
+                    continue
+                # Filter: Only show rows where "Full Send" column contains "full-send" (case-insensitive)
+                full_send = str(row[12] or "").strip() if len(row) > 12 else ""
+                full_send_lower = full_send.lower()
+                if "full-send" not in full_send_lower and "💶┃full-send-🤖" not in full_send:
+                    continue
+                rid = str(row[0] or "").strip()
+                store = str(row[1] or "").strip()
+                sku = str(row[2] or "").strip()
+                title = str(row[6] or "").strip() if len(row) > 6 else ""
+                url = str(row[7] or "").strip() if len(row) > 7 else ""
+                
+                if not (store and sku):
+                    continue
+                
+                # Filter out URLs being used as titles
+                if title and self._bot._rsfs_title_is_bad(title, url=url):
+                    title = ""
+                
+                item_parts = [f"`{store} {sku}`"]
+                if rid:
+                    item_parts.append(f"Release ID: `{rid}`")
+                if title:
+                    item_parts.append(f"Title: {title[:60]}")
+                if url:
+                    item_parts.append(f"URL: {url[:60]}")
+                
+                # Add remove command in code block
+                if rid:
+                    item_parts.append(f"```\n/removereleaseid release_id: {rid}\n```")
+                
+                item_text = " • ".join(item_parts)
+                if store not in items_by_store:
+                    items_by_store[store] = []
+                items_by_store[store].append(item_text)
+                total_count += 1
+            
+            if not items_by_store:
+                await interaction.followup.send("❌ No Full Send items found in Current List.", ephemeral=True)
+                return
+            
+            # Build organized text by store
+            organized_sections: List[str] = []
+            for store in sorted(items_by_store.keys()):  # Sort stores alphabetically
+                store_items = items_by_store[store]
+                store_header = f"**{store}**"
+                organized_sections.append(store_header)
+                organized_sections.extend(store_items)
+                organized_sections.append("")  # Empty line between stores
+            
+            items_text = "\n\n".join(organized_sections)
+            
+            # Split into multiple embeds if needed
+            if len(items_text) > 4000:
+                # Split into chunks, trying to keep stores together
+                chunk_size = 3500
+                chunks = []
+                current_chunk = []
+                current_length = 0
+                
+                for line in organized_sections:
+                    is_store_header = line.startswith("**") and line.endswith("**")
+                    line_len = len(line) + 2  # +2 for "\n\n"
+                    
+                    # If starting a new store and current chunk is getting large, finalize it
+                    if is_store_header and current_length > chunk_size * 0.7 and current_chunk:
+                        chunks.append("\n\n".join(current_chunk))
+                        current_chunk = []
+                        current_length = 0
+                    
+                    # If adding this line would exceed limit, finalize current chunk
+                    if current_length + line_len > chunk_size and current_chunk:
+                        chunks.append("\n\n".join(current_chunk))
+                        current_chunk = []
+                        current_length = 0
+                        # If this is a store header, add it to the new chunk
+                        if is_store_header:
+                            current_chunk.append(line)
+                            current_length = line_len
+                    else:
+                        current_chunk.append(line)
+                        current_length += line_len
+                
+                if current_chunk:
+                    chunks.append("\n\n".join(current_chunk))
+                
+                for i, chunk_text in enumerate(chunks):
+                    emb = discord.Embed(
+                        title="RS-FS Current List" if i == 0 else f"RS-FS Current List (continued {i + 1})",
+                        description=chunk_text,
+                        color=discord.Color.blue(),
+                    )
+                    if i == 0:
+                        emb.set_footer(text=f"Showing {total_count} items organized by store")
+                    await interaction.followup.send(embed=emb, ephemeral=True)
+            else:
+                emb = discord.Embed(
+                    title="RS-FS Current List",
+                    description=items_text,
+                    color=discord.Color.blue(),
+                )
+                if total_count >= max_items:
+                    emb.set_footer(text=f"Showing first {max_items} of {len(current_list_rows)} items")
+                else:
+                    emb.set_footer(text=f"Total: {total_count} items organized by store")
+                await interaction.followup.send(embed=emb, ephemeral=True)
+        except Exception as e:
+            try:
+                await interaction.followup.send(f"❌ Failed to load Current List: {str(e)[:200]}", ephemeral=True)
+            except Exception:
+                pass
 
 
 class RSForwarderBot:
