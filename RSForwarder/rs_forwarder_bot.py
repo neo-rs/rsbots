@@ -8107,6 +8107,19 @@ class RSForwarderBot:
             
             # Check if we need to add role mention (works for both normal messages and embeds)
             role_mention_text = self._get_role_mention_text(channel_config)
+            
+            # Conditional role mention for "Price Glitch!" messages (when price_glitch_role_id is configured)
+            price_glitch_role_id = self.config.get("price_glitch_role_id", "").strip()
+            if price_glitch_role_id:
+                # Check if any embed description contains exact phrase "Price Glitch!" (case-sensitive match)
+                # Instorebotforwarder adds "**Price Glitch!**" which appears as "Price Glitch!" in embed description
+                for embed_dict in embeds_raw:
+                    description = embed_dict.get("description", "") or ""
+                    # Check for exact phrase "Price Glitch!" (case-sensitive, with exclamation mark)
+                    if "Price Glitch!" in description:
+                        role_mention_text = f"<@&{price_glitch_role_id}> Possible Price Error"
+                        break
+            
             # Never add @Members even if configured
             if role_mention_text:
                 for rid in self._members_role_ids():

@@ -843,7 +843,15 @@ class InstorebotForwarder:
         )
 
     async def _fetch_ebay_sold_page(self, url: str) -> Tuple[Optional[str], Optional[str]]:
-        """Fetch one eBay sold search page; return (html, error). Tries Playwright if response is a challenge page."""
+        """Fetch one eBay sold search page; return (html, error). Uses Playwright first when enabled (eBay is JS-rendered); else aiohttp with Playwright fallback on challenge."""
+        if self._playwright_enabled():
+            pw_html, pw_err = await self._fetch_ebay_sold_page_playwright(url)
+            if pw_html and not pw_err:
+                _log_flow("EBAY_PW_OK", url=url[:60])
+                return pw_html, None
+            if pw_err:
+                _log_flow("EBAY_PW_FAIL", err=(pw_err or "no_content")[:80])
+            # Fall through to aiohttp only when Playwright failed
         try:
             import aiohttp
         except Exception:
@@ -3898,6 +3906,7 @@ class InstorebotForwarder:
                 return None, {"urls": urls, "amazon": {"asin": asin, "final_url": final_url, "url_used": det.url_used}, "skip_reason": "current_gt_before"}
 
         _log_flow("PRICES", current_src=price_src, before_src=before_src, has_current=("1" if bool(price) else "0"), has_before=("1" if bool(before_price) else "0"))
+        price_glitch = False
         if (cur_val is not None) and (bef_val is not None) and bef_val > 0 and cur_val < bef_val:
             # Only show when symbols match (or one is missing).
             if (not cur_sym) or (not bef_sym) or (cur_sym == bef_sym):
@@ -3905,6 +3914,12 @@ class InstorebotForwarder:
                 if pct > 0:
                     discount_pct_str = f"{pct}% OFF"
                     _log_flow("PCT_OFF", pct=str(pct), current=str(price), before=str(before_price))
+                    # Price Glitch: 90% OFF or more
+                    if pct >= 90:
+                        price_glitch = True
+        # Price Glitch: current price below $1
+        if cur_val is not None and cur_val < 1.0:
+            price_glitch = True
 
         # Deal notes (coupon/sub&save/limited time deal) from scrape, rendered in your preferred wording.
         raw_discount = str((scraped or {}).get("discount_notes") or "").strip()
@@ -4081,6 +4096,9 @@ class InstorebotForwarder:
 
         # Build the "card body" to match your desired format (no footer/timestamp, one key link).
         card_lines: List[str] = []
+        if price_glitch:
+            card_lines.append("**Price Glitch!**")
+            card_lines.append("")
         card_lines.append(f"Current Price: **{price}**" if price else "Current Price:")
         if before_price and str(before_price).strip() and str(before_price).strip().upper() != "N/A":
             card_lines.append(f"Before: **{before_price}**")
