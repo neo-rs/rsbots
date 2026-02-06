@@ -7,8 +7,7 @@
     1435268379521847369
   ],
   "source_channel_routes": {
-    "1438969997178306661": "deals",
-    "1435985494356918333": "deals"
+    "1438969997178306661": "deals"
   },
   "output_channels": {
     "personal": "1464853876988706969",
@@ -33,10 +32,13 @@
   "amazon_playwright_try_headful_on_block": false,
   "amazon_playwright_profile_dir": "Instorebotforwarder/playwright_profile",
   "amazon_delivery_zip": "10001",
-  "ebay_scrape_enabled": false,
+  "ebay_scrape_enabled": true,
   "ebay_scrape_timeout_s": 12,
   "ebay_scrape_cache_ttl_s": 3600,
   "ebay_min_sold_price": 5.0,
+  "ebay_max_listings_per_condition": 10,
+  "ebay_max_search_words": 10,
+  "stockx_scrape_timeout_s": 15,
   "openai_rephrase_enabled": "auto",
   "openai_model": "gpt-4o-mini",
   "openai_timeout_s": 12,
@@ -103,7 +105,12 @@
   "simple_forward_mappings": {
     "1435268379521847369": {
       "dest_channel_id": 1457129505050202377,
-      "merge_window_s": 3.0
+      "merge_window_s": 3.0,
+      "enrich_stockx": true
+    },
+    "1435985494356918333": {
+      "dest_channel_id": 1457129557067960482,
+      "mirror_as_is": true
     }
   }
 }
