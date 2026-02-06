@@ -3692,10 +3692,25 @@ class RSAdminBot:
             category_input = " ".join(args).strip() if args else None
 
             if not category_input:
-                prompt_msg = await ctx.send(
-                    "**Transfer this channel to category.**\n"
-                    "Reply with a **category ID** or **category name** (matches as you type):"
+                # Embed listing all categories with their IDs so user can reply with an ID
+                all_cats = [c for c in ctx.guild.categories if isinstance(c, discord.CategoryChannel)]
+                all_cats = sorted(all_cats, key=lambda x: x.position)
+                lines: List[str] = []
+                for c in all_cats:
+                    name = (c.name or "category")[:80]
+                    lines.append(f"• **{name}** — `{c.id}`")
+                body = "\n".join(lines) if lines else "*No categories.*"
+                if len(body) > 3800:
+                    body = body[:3797] + "\n…"
+                embed = discord.Embed(
+                    title="📦 Transfer this channel to category",
+                    description=(
+                        "Reply with the **category ID** (the number in code blocks above) to move this channel there.\n\n"
+                        "**Categories:**\n" + body
+                    ),
+                    color=discord.Color.orange(),
                 )
+                prompt_msg = await ctx.send(embed=embed)
                 to_delete.append(prompt_msg)
 
                 def check(m: discord.Message) -> bool:
@@ -3705,7 +3720,7 @@ class RSAdminBot:
                     reply_msg = await self.bot.wait_for("message", timeout=60.0, check=check)
                 except asyncio.TimeoutError:
                     try:
-                        await prompt_msg.edit(content="⏱️ Timed out. Run `!transfer` again.")
+                        await prompt_msg.edit(content="⏱️ Timed out. Run `!transfer` again.", embed=None)
                     except Exception:
                         pass
                     return
