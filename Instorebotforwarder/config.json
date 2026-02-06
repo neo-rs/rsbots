@@ -107,10 +107,6 @@
       "dest_channel_id": 1457129505050202377,
       "merge_window_s": 3.0,
       "enrich_stockx": true
-    },
-    "1435985494356918333": {
-      "dest_channel_id": 1457129557067960482,
-      "mirror_as_is": true
     }
   }
 }

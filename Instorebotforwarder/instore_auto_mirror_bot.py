@@ -4137,6 +4137,51 @@ class InstorebotForwarder:
             src_id = 0
         dest_id, route_reason = self._pick_dest_channel_id(source_channel_id=(src_id or None), category=category, enrich_failed=False)
         _log_flow("ROUTE", dest_id=(dest_id or ""), reason=route_reason)
+        
+        # Strict filter for channel 1457129557067960482: only Amazon links with "glitch"/"price error" keywords (case-insensitive) AND >= 80% OFF
+        if dest_id and int(dest_id) == 1457129557067960482:
+            # Check 1: Must have Amazon link (already verified above, but double-check)
+            if not asin or not det:
+                _log_flow("FILTER_SKIP", channel=dest_id, reason="no_amazon_link")
+                if dedupe_reserved and asin:
+                    self._dedupe_release(asin)
+                return None, {"urls": urls, "amazon": {"asin": asin, "final_url": final_url, "url_used": det.url_used if det else None}, "filter_reason": "no_amazon_link"}
+            
+            # Check 2: Message must contain "glitch" or "price error" keywords (case-insensitive, matches variations)
+            message_text = (message.content or "").lower()
+            if message.embeds:
+                for e in message.embeds:
+                    if getattr(e, "description", None):
+                        message_text += " " + (str(e.description) or "").lower()
+                    if getattr(e, "title", None):
+                        message_text += " " + (str(e.title) or "").lower()
+            # Match variations: "glitch", "glitched", "price error", "priceerror", "price-error", etc.
+            has_keyword = (
+                "glitch" in message_text or
+                "price error" in message_text or
+                "priceerror" in message_text or
+                "price-error" in message_text or
+                "pricemismatch" in message_text or
+                "price mismatch" in message_text
+            )
+            if not has_keyword:
+                _log_flow("FILTER_SKIP", channel=dest_id, reason="no_keyword")
+                if dedupe_reserved and asin:
+                    self._dedupe_release(asin)
+                return None, {"urls": urls, "amazon": {"asin": asin, "final_url": final_url, "url_used": det.url_used if det else None}, "filter_reason": "no_keyword"}
+            
+            # Check 3: Must have discount >= 80% OFF
+            cur_val, cur_sym = self._price_to_float(price)
+            bef_val, bef_sym = self._price_to_float(before_price)
+            discount_pct = None
+            if (cur_val is not None) and (bef_val is not None) and bef_val > 0 and cur_val < bef_val:
+                if (not cur_sym) or (not bef_sym) or (cur_sym == bef_sym):
+                    discount_pct = int(round(((bef_val - cur_val) / bef_val) * 100.0))
+            if discount_pct is None or discount_pct < 80:
+                _log_flow("FILTER_SKIP", channel=dest_id, reason=f"discount_too_low_{discount_pct or 'none'}%")
+                if dedupe_reserved and asin:
+                    self._dedupe_release(asin)
+                return None, {"urls": urls, "amazon": {"asin": asin, "final_url": final_url, "url_used": det.url_used if det else None}, "filter_reason": f"discount_too_low_{discount_pct or 'none'}%"}
 
         tpl, tpl_key = self._pick_template(dest_id, enrich_failed=False)
         _log_flow("TEMPLATE", key=tpl_key)
