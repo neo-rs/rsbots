@@ -4082,7 +4082,8 @@ class InstorebotForwarder:
         # Build the "card body" to match your desired format (no footer/timestamp, one key link).
         card_lines: List[str] = []
         card_lines.append(f"Current Price: **{price}**" if price else "Current Price:")
-        card_lines.append(f"Before: **{before_price}**" if before_price else "Before:")
+        if before_price and str(before_price).strip() and str(before_price).strip().upper() != "N/A":
+            card_lines.append(f"Before: **{before_price}**")
         if discount_pct_str:
             card_lines.append(f"Discount: **{discount_pct_str}**")
         if discount_lines:
@@ -4101,7 +4102,8 @@ class InstorebotForwarder:
         if ebay_comps_url:
             card_lines.append("")
             card_lines.append(f"**eBay Comps:** [view sold listings]({ebay_comps_url})")
-            card_lines.append(f"Recent eBay sales near {ebay_sold_new_near} (sold range for New)")
+            if ebay_sold_new_near and ebay_sold_new_near != "N/A":
+                card_lines.append(f"Recent eBay sales near {ebay_sold_new_near} (sold range for New)")
             if ebay_upside_str:
                 card_lines.append(ebay_upside_str)
             if ebay_sold_pre_owned != "N/A":

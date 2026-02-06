@@ -578,11 +578,14 @@ class _RsFsCurrentListByStoreView(discord.ui.View):
             self._idx -= 1
             self._update_buttons()
             try:
-                await interaction.response.defer(ephemeral=True)
+                await interaction.response.edit_message(embed=self._render_embed(), view=self)
             except Exception:
-                pass
-            if interaction.message:
-                await interaction.message.edit(embed=self._render_embed(), view=self)
+                try:
+                    await interaction.response.defer(ephemeral=True)
+                except Exception:
+                    pass
+                if interaction.message:
+                    await interaction.message.edit(embed=self._render_embed(), view=self)
         else:
             try:
                 await interaction.response.defer(ephemeral=True)
@@ -597,11 +600,14 @@ class _RsFsCurrentListByStoreView(discord.ui.View):
             self._idx += 1
             self._update_buttons()
             try:
-                await interaction.response.defer(ephemeral=True)
+                await interaction.response.edit_message(embed=self._render_embed(), view=self)
             except Exception:
-                pass
-            if interaction.message:
-                await interaction.message.edit(embed=self._render_embed(), view=self)
+                try:
+                    await interaction.response.defer(ephemeral=True)
+                except Exception:
+                    pass
+                if interaction.message:
+                    await interaction.message.edit(embed=self._render_embed(), view=self)
         else:
             try:
                 await interaction.response.defer(ephemeral=True)
