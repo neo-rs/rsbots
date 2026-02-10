@@ -11820,7 +11820,7 @@ async def run_whop_membership_report_for_user(user: discord.abc.User, start_str:
             break
         max_pages -= 1
 
-    def _table_for_memberships(mships: list[dict], label: str) -> tuple[str, float]:
+    def _buckets_for_memberships(mships: list[dict]) -> tuple[dict[str, int], float]:
         buckets: dict[str, int] = {
             "new_paying": 0, "new_trials": 0, "canceling": 0, "churned": 0, "completed": 0, "other_lifetime": 0, "other": 0,
         }
@@ -11830,23 +11830,7 @@ async def run_whop_membership_report_for_user(user: discord.abc.User, start_str:
         total = len(mships)
         churned_n = buckets.get("churned", 0)
         churn_pct = (float(churned_n) / float(total) * 100.0) if total else 0.0
-
-        lines = [
-            f"--- {label} ({total} total) ---",
-            "| Metric                   | Total |",
-            "|--------------------------|-------|",
-            f"| New Paying Members       | {buckets.get('new_paying', 0):>5} |",
-            f"| New Trials               | {buckets.get('new_trials', 0):>5} |",
-            f"| Members set to cancel    | {buckets.get('canceling', 0):>5} |",
-            f"| Churned                  | {buckets.get('churned', 0):>5} |",
-            f"| Completed (1-time ended) | {buckets.get('completed', 0):>5} |",
-            f"| Other (Lifetime)         | {buckets.get('other_lifetime', 0):>5} |",
-            f"| Other                    | {buckets.get('other', 0):>5} |",
-            "|--------------------------|-------|",
-            f"| Total                    | {total:>5} |",
-            f"Churn %: {churn_pct:.2f}%",
-        ]
-        return "\n".join(lines), churn_pct
+        return buckets, churn_pct
 
     lite_ms = [m for m in all_memberships if _is_lite_product(
         str((m.get("product") or {}).get("title") or "") if isinstance(m.get("product"), dict) else "")]
@@ -11855,21 +11839,35 @@ async def run_whop_membership_report_for_user(user: discord.abc.User, start_str:
 
     label = f"{start_d.strftime('%m-%d-%y')}" if start_d == end_d else f"{start_d.strftime('%m-%d-%y')}-{end_d.strftime('%m-%d-%y')}"
 
-    table_lite, churn_lite = _table_for_memberships(lite_ms, "Reselling Secrets LITE")
-    table_full, churn_full = _table_for_memberships(full_ms, "Reselling Secrets FULL")
+    buck_lite, churn_lite = _buckets_for_memberships(lite_ms)
+    buck_full, churn_full = _buckets_for_memberships(full_ms)
 
     total_all = len(all_memberships)
     churned_all = sum(1 for m in all_memberships if _metrics_bucket_for_membership(m) == "churned")
     overall_churn = (float(churned_all) / float(total_all) * 100.0) if total_all else 0.0
 
-    body = f"{table_lite}\n\n{table_full}\n\n**Overall Churn %:** {overall_churn:.2f}%"
+    def _field_value(buck: dict[str, int], total: int, churn_pct: float) -> str:
+        return (
+            f"**New Paying:** {buck.get('new_paying', 0)}\n"
+            f"**New Trials:** {buck.get('new_trials', 0)}\n"
+            f"**Members set to cancel:** {buck.get('canceling', 0)}\n"
+            f"**Churned:** {buck.get('churned', 0)}\n"
+            f"**Completed (1-time):** {buck.get('completed', 0)}\n"
+            f"**Other (Lifetime):** {buck.get('other_lifetime', 0)}\n"
+            f"**Other:** {buck.get('other', 0)}\n"
+            f"**Total:** {total}\n"
+            f"Churn: {churn_pct:.2f}%"
+        )
 
     e = discord.Embed(
         title=f"METRICS: {label} (Whop Memberships Joined)",
-        description=f"Range: {start_d.isoformat()} to {end_d.isoformat()}\n\n{body}"[:4096],
+        description=f"Range: **{start_d.isoformat()}** to **{end_d.isoformat()}**",
         color=0x5865F2,
         timestamp=datetime.now(timezone.utc),
     )
+    e.add_field(name=f"Reselling Secrets LITE ({len(lite_ms)})", value=_field_value(buck_lite, len(lite_ms), churn_lite), inline=True)
+    e.add_field(name=f"Reselling Secrets FULL ({len(full_ms)})", value=_field_value(buck_full, len(full_ms), churn_full), inline=True)
+    e.add_field(name="Overall", value=f"**Total:** {total_all}\n**Churn %:** {overall_churn:.2f}%", inline=False)
     e.set_footer(text="RSCheckerbot • Whop API")
 
     buf = io.StringIO()
