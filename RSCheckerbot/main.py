@@ -11731,8 +11731,40 @@ def _parse_whop_report_user_day(s: str) -> date | None:
     return None
 
 
+def _metrics_bucket_for_membership(m: dict) -> str:
+    """Assign a membership to one METRICS bucket (priority order)."""
+    st = str(m.get("status") or "").strip().lower()
+    cape = m.get("cancel_at_period_end") is True or _whop_report_norm_bool(m.get("cancel_at_period_end"))
+    brief = _whop_report_brief_from_membership(m, api_client=None)
+    spent = float(usd_amount(brief.get("total_spent")))
+    product_title = ""
+    if isinstance(m.get("product"), dict):
+        product_title = str(m["product"].get("title") or "").strip().lower()
+    is_lifetime = "lifetime" in product_title
+
+    if st in {"canceled", "cancelled", "expired", "churned"}:
+        return "churned"
+    if st == "completed":
+        return "completed"
+    if cape and st in {"active", "trialing"}:
+        return "canceling"
+    if is_lifetime:
+        return "other_lifetime"
+    if st == "active" and spent > 0:
+        return "new_paying"
+    if st == "trialing":
+        return "new_trials"
+    return "other"
+
+
+def _is_lite_product(product_title: str) -> bool:
+    """True if product is LITE (excludes Lifetime)."""
+    low = str(product_title or "").strip().lower()
+    return "lite" in low and "lifetime" not in low
+
+
 async def run_whop_membership_report_for_user(user: discord.abc.User, start_str: str, end_str: str) -> tuple[bool, str]:
-    """Run Whop memberships-joined report and DM the user. Returns (success, message)."""
+    """Run Whop memberships-joined METRICS report and DM the user. Returns (success, message)."""
     if not whop_api_client:
         return False, "Whop API client is not initialized."
     start_d = _parse_whop_report_user_day(start_str)
@@ -11744,16 +11776,6 @@ async def run_whop_membership_report_for_user(user: discord.abc.User, start_str:
     if start_d > end_d:
         start_d, end_d = end_d, start_d
 
-    try:
-        require_dj = bool(WHOP_API_CONFIG.get("joined_report_require_date_joined", True))
-    except Exception:
-        require_dj = False
-    statuses_cfg = WHOP_API_CONFIG.get("joined_report_statuses")
-    allowed_statuses: set[str] = set()
-    if isinstance(statuses_cfg, list):
-        allowed_statuses = {str(x).strip().lower() for x in statuses_cfg if str(x).strip()}
-    if not allowed_statuses:
-        allowed_statuses = {"active", "trialing", "canceling", "completed", "canceled", "expired"}
     prefixes_cfg = WHOP_API_CONFIG.get("joined_report_product_title_prefixes")
     product_prefixes: list[str] = []
     if isinstance(prefixes_cfg, list):
@@ -11764,63 +11786,27 @@ async def run_whop_membership_report_for_user(user: discord.abc.User, start_str:
         max_pages = 50
     max_pages = max(1, min(max_pages, 200))
 
-    tz = timezone.utc
-    tz_name = str(REPORTING_CONFIG.get("timezone") or "UTC").strip() or "UTC"
-    if ZoneInfo is not None:
-        with suppress(Exception):
-            tz = ZoneInfo(tz_name)
-    start_local = datetime(start_d.year, start_d.month, start_d.day, 0, 0, 0, tzinfo=tz)
-    end_local = datetime(end_d.year, end_d.month, end_d.day, 23, 59, 59, tzinfo=tz)
+    start_local = datetime(start_d.year, start_d.month, start_d.day, 0, 0, 0, tzinfo=timezone.utc)
+    end_local = datetime(end_d.year, end_d.month, end_d.day, 23, 59, 59, tzinfo=timezone.utc)
     start_utc_iso = start_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     end_utc_iso = end_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
-    def _extract_member_id_from_membership(mship: dict) -> str:
-        if not isinstance(mship, dict):
-            return ""
-        mm = mship.get("member")
-        if isinstance(mm, str) and mm.strip().startswith("mber_"):
-            return mm.strip()
-        if isinstance(mm, dict):
-            mid0 = str(mm.get("id") or mm.get("member_id") or "").strip()
-            if mid0.startswith("mber_"):
-                return mid0
-        mid2 = str(mship.get("member_id") or "").strip()
-        return mid2 if mid2.startswith("mber_") else ""
-
-    mber_to_memberships: dict[str, dict] = {}
+    all_memberships: list[dict] = []
     after: str | None = None
-    pages = 0
     per_page = 100
-    while pages < max_pages:
+    while max_pages > 0:
         batch, page_info = await whop_api_client.list_memberships(
             first=per_page, after=after,
             params={"created_after": start_utc_iso, "created_before": end_utc_iso, "order": "created_at", "direction": "asc"},
         )
         if not batch:
             break
-        pages += 1
         for rec in batch:
             if not isinstance(rec, dict):
                 continue
             m = _whop_report_normalize_membership(rec)
             if not isinstance(m, dict):
                 continue
-            mid = _whop_report_membership_id(m)
-            st = str(m.get("status") or "").strip().lower() or "unknown"
-            if st not in allowed_statuses:
-                continue
-            email_s = _whop_report_extract_email(m)
-            created_at = str(m.get("created_at") or "").strip()
-            created_dt = _parse_dt_any(created_at) if created_at else None
-            date_joined = str(m.get("date_joined") or m.get("date_joined_at") or "").strip()
-            dj_dt = _parse_dt_any(date_joined) if date_joined else None
-            joined_dt = dj_dt if isinstance(dj_dt, datetime) else created_dt
-            if require_dj and not isinstance(dj_dt, datetime):
-                continue
-            if isinstance(joined_dt, datetime):
-                joined_d = joined_dt.astimezone(tz).date()
-                if joined_d < start_d or joined_d > end_d:
-                    continue
             product_title = ""
             if isinstance(m.get("product"), dict):
                 product_title = str(m["product"].get("title") or "").strip()
@@ -11828,124 +11814,74 @@ async def run_whop_membership_report_for_user(user: discord.abc.User, start_str:
                 low = product_title.lower()
                 if not any(low.startswith(p.lower()) for p in product_prefixes):
                     continue
-            mber_id = _extract_member_id_from_membership(m)
-            if not mber_id:
-                continue
-            rec0 = mber_to_memberships.get(mber_id)
-            if not isinstance(rec0, dict):
-                rec0 = {"products": set(), "membership_ids": set()}
-                mber_to_memberships[mber_id] = rec0
-            with suppress(Exception):
-                if product_title:
-                    rec0["products"].add(str(product_title))
-                if mid:
-                    rec0["membership_ids"].add(str(mid))
+            all_memberships.append(m)
         after = str(page_info.get("end_cursor") or "") if isinstance(page_info, dict) else ""
         if not (bool(page_info.get("has_next_page")) if isinstance(page_info, dict) else False) or not after:
             break
+        max_pages -= 1
 
-    user_rows: list[dict] = []
-    after = None
-    pages = 0
-    stop = False
-    while pages < max_pages and not stop:
-        batch, page_info = await whop_api_client.list_members(
-            first=per_page, after=after, params={"order": "joined_at", "direction": "desc"},
-        )
-        if not batch:
-            break
-        pages += 1
-        for rec in batch:
-            if not isinstance(rec, dict):
-                continue
-            mber_id = str(rec.get("id") or "").strip()
-            joined_at_raw = str(rec.get("joined_at") or rec.get("created_at") or "").strip()
-            dtj = _parse_dt_any(joined_at_raw) if joined_at_raw else None
-            if not isinstance(dtj, datetime):
-                continue
-            joined_d = dtj.astimezone(tz).date()
-            if joined_d < start_d:
-                stop = True
-                break
-            if joined_d > end_d:
-                continue
-            mm = mber_to_memberships.get(mber_id)
-            status = str(rec.get("status") or "").strip().lower() or "unknown"
-            action = str(rec.get("most_recent_action") or "").strip().lower()
-            bucket = action if action in {"joined", "trialing", "canceling", "churned", "left", "past_due"} else status
-            if bucket not in {"joined", "trialing", "canceling", "churned", "left", "past_due"}:
-                bucket = "joined" if status == "joined" else ("left" if status == "left" else "joined")
-            u = rec.get("user") if isinstance(rec.get("user"), dict) else {}
-            user_id = str(u.get("id") or "").strip()
-            email_s = str(u.get("email") or "").strip()
-            name_s = str(u.get("name") or "").strip()
-            username_s = str(u.get("username") or "").strip()
-            spent = rec.get("usd_total_spent")
-            spent_s = f"${float(spent or 0.0):.2f}"
-            products = []
-            mids = []
-            if isinstance(mm, dict):
-                products = sorted([str(x).strip() for x in (mm.get("products") or set()) if str(x).strip()])
-                mids = sorted([str(x).strip() for x in (mm.get("membership_ids") or set()) if str(x).strip()])
-            user_rows.append({
-                "member_id": mber_id, "user_id": user_id, "email": email_s, "name": name_s, "username": username_s,
-                "status_bucket": bucket, "most_recent_action": action, "products": ", ".join(products),
-                "membership_ids": ", ".join(mids), "joined_at": dtj.isoformat().replace("+00:00", "Z"), "total_spent": spent_s,
-            })
-        after = str(page_info.get("end_cursor") or "") if isinstance(page_info, dict) else ""
-        if not (bool(page_info.get("has_next_page")) if isinstance(page_info, dict) else False) or not after:
-            break
+    def _table_for_memberships(mships: list[dict], label: str) -> tuple[str, float]:
+        buckets: dict[str, int] = {
+            "new_paying": 0, "new_trials": 0, "canceling": 0, "churned": 0, "completed": 0, "other_lifetime": 0, "other": 0,
+        }
+        for m in mships:
+            b = _metrics_bucket_for_membership(m)
+            buckets[b] = buckets.get(b, 0) + 1
+        total = len(mships)
+        churned_n = buckets.get("churned", 0)
+        churn_pct = (float(churned_n) / float(total) * 100.0) if total else 0.0
+
+        lines = [
+            f"--- {label} ({total} total) ---",
+            "| Metric                   | Total |",
+            "|--------------------------|-------|",
+            f"| New Paying Members       | {buckets.get('new_paying', 0):>5} |",
+            f"| New Trials               | {buckets.get('new_trials', 0):>5} |",
+            f"| Members set to cancel    | {buckets.get('canceling', 0):>5} |",
+            f"| Churned                  | {buckets.get('churned', 0):>5} |",
+            f"| Completed (1-time ended) | {buckets.get('completed', 0):>5} |",
+            f"| Other (Lifetime)         | {buckets.get('other_lifetime', 0):>5} |",
+            f"| Other                    | {buckets.get('other', 0):>5} |",
+            "|--------------------------|-------|",
+            f"| Total                    | {total:>5} |",
+            f"Churn %: {churn_pct:.2f}%",
+        ]
+        return "\n".join(lines), churn_pct
+
+    lite_ms = [m for m in all_memberships if _is_lite_product(
+        str((m.get("product") or {}).get("title") or "") if isinstance(m.get("product"), dict) else "")]
+    full_ms = [m for m in all_memberships if not _is_lite_product(
+        str((m.get("product") or {}).get("title") or "") if isinstance(m.get("product"), dict) else "")]
 
     label = f"{start_d.strftime('%m-%d-%y')}" if start_d == end_d else f"{start_d.strftime('%m-%d-%y')}-{end_d.strftime('%m-%d-%y')}"
-    total_users = len(user_rows)
-    counts: dict[str, int] = {}
-    for r in user_rows:
-        k = str(r.get("status_bucket") or "unknown").strip().lower() or "unknown"
-        counts[k] = int(counts.get(k, 0)) + 1
-    joined = int(counts.get("joined", 0))
-    trialing = int(counts.get("trialing", 0))
-    canceling = int(counts.get("canceling", 0))
-    churned = int(counts.get("churned", 0))
-    left = int(counts.get("left", 0))
-    past_due = int(counts.get("past_due", 0))
-    churn_pct = (float(churned) / float(total_users) * 100.0) if total_users else 0.0
-    prod_counts: dict[str, int] = {}
-    for r in user_rows:
-        prods = [p.strip() for p in str(r.get("products") or "").split(",") if p.strip()]
-        for p in prods:
-            prod_counts[p] = int(prod_counts.get(p, 0)) + 1
-    prod_lines: list[str] = []
-    for p, n in sorted(prod_counts.items(), key=lambda kv: kv[1], reverse=True)[:8]:
-        prod_lines.append(f"**{p}** — {n}")
-    if len(prod_counts) > 8:
-        prod_lines.append(f"_… +{len(prod_counts) - 8} more product(s)_")
+
+    table_lite, churn_lite = _table_for_memberships(lite_ms, "Reselling Secrets LITE")
+    table_full, churn_full = _table_for_memberships(full_ms, "Reselling Secrets FULL")
+
+    total_all = len(all_memberships)
+    churned_all = sum(1 for m in all_memberships if _metrics_bucket_for_membership(m) == "churned")
+    overall_churn = (float(churned_all) / float(total_all) * 100.0) if total_all else 0.0
+
+    body = f"{table_lite}\n\n{table_full}\n\n**Overall Churn %:** {overall_churn:.2f}%"
 
     e = discord.Embed(
-        title=f"Whop Joined Summary — {label}",
-        description=f"Range: `{start_d.isoformat()} → {end_d.isoformat()}`",
+        title=f"METRICS: {label} (Whop Memberships Joined)",
+        description=f"Range: {start_d.isoformat()} to {end_d.isoformat()}\n\n{body}"[:4096],
         color=0x5865F2,
         timestamp=datetime.now(timezone.utc),
     )
-    e.add_field(name="Users (range)", value=str(total_users), inline=True)
-    e.add_field(name="Joined", value=str(joined), inline=True)
-    e.add_field(name="Trialing", value=str(trialing), inline=True)
-    e.add_field(name="Canceling", value=str(canceling), inline=True)
-    e.add_field(name="Churned", value=str(churned), inline=True)
-    e.add_field(name="Left", value=str(left), inline=True)
-    e.add_field(name="Past due", value=str(past_due), inline=True)
-    e.add_field(name="Churn %", value=f"{churn_pct:.2f}%", inline=True)
-    if prod_lines:
-        e.add_field(name="By product", value="\n".join(prod_lines)[:1024], inline=False)
     e.set_footer(text="RSCheckerbot • Whop API")
 
     buf = io.StringIO()
-    fieldnames = ["member_id", "user_id", "email", "name", "username", "status_bucket", "most_recent_action", "products", "membership_ids", "total_spent", "joined_at"]
-    w = csv.DictWriter(buf, fieldnames=fieldnames)
-    w.writeheader()
-    for r in user_rows:
-        with suppress(Exception):
-            w.writerow({k: str(r.get(k, "") or "") for k in fieldnames})
-    fname = f"whop-joined-report_{label}.csv".replace("/", "-")
+    buf.write("product,metric,count\n")
+    for tag, ms in [("LITE", lite_ms), ("FULL", full_ms)]:
+        buck: dict[str, int] = {}
+        for m in ms:
+            b = _metrics_bucket_for_membership(m)
+            buck[b] = buck.get(b, 0) + 1
+        for b, n in buck.items():
+            buf.write(f"Reselling Secrets {tag},{b},{n}\n")
+    fname = f"whop-metrics-report_{label}.csv".replace("/", "-")
     file_obj = discord.File(fp=io.BytesIO(buf.getvalue().encode("utf-8")), filename=fname)
 
     try:
