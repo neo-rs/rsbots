@@ -114,6 +114,7 @@ _TZ_NAME = "UTC"
 _CONTROLS_VIEW: "SupportTicketControlsView | None" = None
 _MEMBER_LOOKUP_VIEW: "MemberLookupPanelView | None" = None
 _WHOP_API_CLIENT = None  # optional WhopAPIClient injected by main.py
+_RUN_MEMBERSHIP_REPORT_CALLBACK = None  # async (user, start_str, end_str) -> (success, message)
 _LOOKUP_LIVE_CACHE: dict[int, dict] = {}
 _LOOKUP_LIVE_CACHE_AT: dict[int, float] = {}
 
@@ -180,13 +181,16 @@ def initialize(
     is_whop_linked=None,
     timezone_name: str = "UTC",
     whop_api_client=None,
+    run_membership_report_callback=None,
 ) -> None:
     """Initialize the support ticket subsystem.
 
     This is called from RSCheckerbot/main.py after config load.
+    run_membership_report_callback: async (user, start_str, end_str) -> (success, message)
     """
-    global _BOT, _CFG, _LOG_FUNC, _IS_WHOP_LINKED, _TZ_NAME, _WHOP_API_CLIENT
+    global _BOT, _CFG, _LOG_FUNC, _IS_WHOP_LINKED, _TZ_NAME, _WHOP_API_CLIENT, _RUN_MEMBERSHIP_REPORT_CALLBACK
     _BOT = bot
+    _RUN_MEMBERSHIP_REPORT_CALLBACK = run_membership_report_callback
     _LOG_FUNC = log_func
     _IS_WHOP_LINKED = is_whop_linked
     _TZ_NAME = str(timezone_name or "UTC").strip() or "UTC"
@@ -3798,6 +3802,50 @@ class SupportTicketControlsView(discord.ui.View):
             )
 
 
+class _MembershipReportModal(discord.ui.Modal, title="Membership Report"):
+    """User-friendly date range for Whop memberships joined report."""
+
+    start_date = discord.ui.TextInput(
+        label="Start date",
+        placeholder="e.g. 2/2/26 or 2026-02-02",
+        required=True,
+        max_length=32,
+    )
+    end_date = discord.ui.TextInput(
+        label="End date",
+        placeholder="e.g. 2/9/26 or 2026-02-09",
+        required=False,
+        max_length=32,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not _ensure_cfg_loaded() or not _BOT:
+            with suppress(Exception):
+                await interaction.response.send_message("❌ Bot not ready.", ephemeral=True)
+            return
+        if not isinstance(interaction.user, discord.Member) or not _is_staff_member(interaction.user):
+            with suppress(Exception):
+                await interaction.response.send_message("❌ Not allowed (staff only).", ephemeral=True)
+            return
+        cb = _RUN_MEMBERSHIP_REPORT_CALLBACK
+        if not cb or not callable(cb):
+            with suppress(Exception):
+                await interaction.response.send_message("❌ Membership report is not configured.", ephemeral=True)
+            return
+        with suppress(Exception):
+            await interaction.response.defer(ephemeral=True)
+        try:
+            ok, msg = await cb(interaction.user, str(self.start_date.value or "").strip(), str(self.end_date.value or "").strip())
+        except Exception as e:
+            ok, msg = False, str(e)[:200]
+        if ok:
+            with suppress(Exception):
+                await interaction.followup.send(f"✅ {msg}", ephemeral=True)
+        else:
+            with suppress(Exception):
+                await interaction.followup.send(f"❌ {msg}", ephemeral=True)
+
+
 class _MemberLookupModal(discord.ui.Modal, title="Lookup Member"):
     query = discord.ui.TextInput(
         label="Discord ID or @mention",
@@ -3952,6 +4000,18 @@ class MemberLookupPanelView(discord.ui.View):
             return
         with suppress(Exception):
             await interaction.response.send_modal(_MemberLookupModal())
+
+    @discord.ui.button(
+        label="Membership Report",
+        style=discord.ButtonStyle.secondary,
+        custom_id="rsmember:report",
+    )
+    async def membership_report(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        if not self._allowed(interaction.user):
+            await self._deny(interaction)
+            return
+        with suppress(Exception):
+            await interaction.response.send_modal(_MembershipReportModal())
 
 
 def _format_discord_id(uid: int) -> str:

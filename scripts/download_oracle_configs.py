@@ -8,6 +8,7 @@ Why:
 
 Output:
   <out_dir>/server_configs_<timestamp>/<BotName>/{config.json,config.secrets.json}
+  For RSCheckerbot only: member_history.json
 
 Notes:
 - This tool downloads config.secrets.json too (contains secrets). The repo ignores:
@@ -112,6 +113,8 @@ def _iter_targets(bots: Iterable[str], include_secrets: bool) -> Iterable[tuple[
         yield bot, "config.json"
         if include_secrets:
             yield bot, "config.secrets.json"
+        if bot == "RSCheckerbot":
+            yield bot, "member_history.json"
 
 
 def main(argv: Optional[List[str]] = None) -> int:

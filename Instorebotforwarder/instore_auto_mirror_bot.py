@@ -8,7 +8,7 @@ and renders RS-style embeds using JSON templates (config-driven).
 
 Includes:
 - /testallmessage diagnostics (ephemeral)
-- /embedbuild template manager (list/edit/preview) via Discord modals
+- /embed template manager (list/edit/preview) via Discord modals
 """
 
 from __future__ import annotations
@@ -2407,35 +2407,33 @@ class InstorebotForwarder:
     def _extract_amazon_availability_from_html(self, html_txt: str) -> str:
         """
         Best-effort availability signal from an Amazon product page.
+        Only looks at the availability element to avoid false positives from
+        "out of stock" elsewhere on the page (e.g. "Other sellers - out of stock").
 
         Returns:
-        - "out_of_stock" when we see strong OOS/unavailable wording
-        - "" when unknown/in-stock (we don't try to guarantee "in stock")
+        - "out_of_stock" when the availability block clearly says OOS/unavailable
+        - "" when unknown or in-stock (we don't try to guarantee "in stock")
         """
         t = html_txt or ""
         if not t:
             return ""
-        low = t.lower()
-
+        # Only use the availability container; do NOT scan the whole page (causes false OOS).
+        # Use non-greedy so we stop at the first </ (this block's close), not a later tag.
+        try:
+            m = re.search(r'id=["\']availability["\'][\s\S]{0,1200}?</', t, re.IGNORECASE)
+            snippet = (m.group(0) or "").lower() if m else ""
+        except Exception:
+            snippet = ""
+        if not snippet:
+            return ""
         strong = (
             "currently unavailable",
             "temporarily out of stock",
             "we don't know when or if this item will be back in stock",
             "out of stock",
         )
-        if any(s in low for s in strong):
+        if any(s in snippet for s in strong):
             return "out_of_stock"
-
-        # Common availability container (sometimes contains "In Stock." / "Out of Stock.")
-        try:
-            m = re.search(r'id=["\']availability["\'][\s\S]{0,1200}</', t, re.IGNORECASE)
-            snippet = (m.group(0) or "").lower() if m else ""
-        except Exception:
-            snippet = ""
-        if snippet:
-            if ("currently unavailable" in snippet) or ("temporarily out of stock" in snippet) or ("out of stock" in snippet):
-                return "out_of_stock"
-
         return ""
 
     def _extract_jsonld_product(self, html: str) -> Dict[str, Any]:
@@ -4327,13 +4325,67 @@ class InstorebotForwarder:
             log.info("Bot ready user=%s guild_id=%s config=%s secrets=%s", self.bot.user, guild_id, self.config_path, self.secrets_path)
             log.info("bot_token=%s", mask_secret(self.config.get("bot_token")))
 
-            if guild_id:
+            # Sync slash commands so /embed, /testallmessage appear in all servers the bot is in
+            await asyncio.sleep(1)
+
+            def _format_tree_commands() -> List[str]:
+                out: List[str] = []
+                for c in self.bot.tree.get_commands():
+                    if isinstance(c, app_commands.Group):
+                        subs = ", ".join(getattr(sc, "name", "") for sc in c.commands)
+                        out.append(f"/{c.name} ({subs})")
+                    else:
+                        out.append(f"/{c.name}")
+                return out
+
+            commands_summary = _format_tree_commands()
+            log.info("Slash commands to register: %s", " | ".join(commands_summary))
+
+            results: List[Tuple[Optional[int], Optional[str], str]] = []  # (guild_id or None, name, status)
+            cmd_list = " | ".join(commands_summary)
+
+            # Global tree: commands appear in all servers (may take up to ~1 hour to propagate)
+            try:
+                await self.bot.tree.sync()
+                results.append((None, "global", "registered"))
+            except Exception as e:
+                results.append((None, "global", f"failed: {e!s}"[:120]))
+                log.warning("Slash commands | global: failed: %s", str(e)[:200])
+
+            # Per-guild sync: immediate in these servers
+            config_guild = self.bot.get_guild(guild_id) if guild_id else None
+            if guild_id and config_guild:
                 try:
-                    await asyncio.sleep(1)
-                    synced = await self.bot.tree.sync(guild=discord.Object(id=guild_id))
-                    log.info("Synced slash commands to guild=%s count=%s", guild_id, len(synced))
+                    await self.bot.tree.sync(guild=discord.Object(id=guild_id))
+                    results.append((guild_id, getattr(config_guild, "name", None), "registered"))
                 except Exception as e:
-                    log.warning("Slash command sync failed guild=%s err=%s", guild_id, str(e)[:200])
+                    results.append((guild_id, getattr(config_guild, "name", None), f"failed: {e!s}"[:120]))
+            elif guild_id:
+                results.append((guild_id, None, "skipped (bot not in this guild)"))
+
+            for guild in (self.bot.guilds or []):
+                gid = getattr(guild, "id", None)
+                if not gid or gid == (guild_id or 0):
+                    continue
+                try:
+                    await self.bot.tree.sync(guild=discord.Object(id=gid))
+                    results.append((gid, getattr(guild, "name", None), "registered"))
+                except Exception as e:
+                    results.append((gid, getattr(guild, "name", None), f"failed: {e!s}"[:120]))
+
+            for gid, gname, status in results:
+                where = "global" if gid is None else (f"{gname} ({gid})" if gname else str(gid))
+                if status == "registered":
+                    suffix = " (global can take up to 1h to show everywhere)" if gid is None else ""
+                    log.info("Slash commands | %s: registered -> %s%s", where, cmd_list, suffix)
+                else:
+                    log.info("Slash commands | %s: %s", where, status)
+            if not results:
+                log.warning("Slash commands were not synced to any guild.")
+            else:
+                failed = [r for r in results if not r[2].startswith("registered")]
+                if failed:
+                    log.warning("Slash commands not registered in %s guild(s): %s", len(failed), [r[2] for r in failed])
 
             try:
                 await self._startup_smoketest()
@@ -4434,8 +4486,8 @@ class InstorebotForwarder:
             else:
                 await interaction.followup.send(content=out, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
-        # ---- /embedbuild ----
-        embedbuild = app_commands.Group(name="embedbuild", description="Manage amazon embed templates (admin only)")
+        # ---- /embed ----
+        embedbuild = app_commands.Group(name="embed", description="Manage amazon embed templates (admin only)")
 
         def _route_choices() -> List[app_commands.Choice[str]]:
             return [app_commands.Choice(name=r, value=r) for r in self._TEMPLATE_ROUTES]

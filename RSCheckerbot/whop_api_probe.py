@@ -2119,6 +2119,315 @@ async def _probe_whoplogs_baseline(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_bullet_kv_with_email(desc: str) -> dict[str, str]:
+    """Parse '• Key: Value' lines from embed description, including email (for events scan linking)."""
+    out: dict[str, str] = {}
+    s = str(desc or "").strip()
+    if not s:
+        return out
+    for line in (s.splitlines() or []):
+        ln = line.strip()
+        if not ln:
+            continue
+        m = re.match(r"^[•*\-]\s*([^:]{1,64})\s*:\s*(.+?)\s*$", ln)
+        if not m:
+            continue
+        k = re.sub(r"\s+", " ", str(m.group(1) or "").strip().lower())
+        v = str(m.group(2) or "").strip()
+        if not k or not v:
+            continue
+        out[k[:64]] = v[:1500]
+    with suppress(Exception):
+        m2 = re.search(r"(?i)\buser=(user_[A-Za-z0-9]+)\b", s)
+        if m2:
+            out.setdefault("whop user id", m2.group(1))
+        m3 = re.search(r"(?i)\bmem=(mem_[A-Za-z0-9]+)\b", s)
+        if m3:
+            out.setdefault("membership id", m3.group(1))
+        m4 = re.search(r"(?i)\bplan=(plan_[A-Za-z0-9]+)\b", s)
+        if m4:
+            out.setdefault("plan id", m4.group(1))
+    return out
+
+
+async def _probe_whop_logs_events_scan(args: argparse.Namespace) -> int:
+    """Scan whop-logs channel and write events to a standalone JSON file."""
+    cfg = load_config()
+    token = str(cfg.get("bot_token") or "").strip()
+    if not token:
+        print("Missing bot_token in config.secrets.json")
+        return 2
+
+    inv = cfg.get("invite_tracking") or {}
+    channel_id = int(str(getattr(args, "channel_id", "") or inv.get("whop_logs_channel_id") or 0))
+    if not channel_id:
+        print("Missing --channel-id and invite_tracking.whop_logs_channel_id.")
+        return 2
+
+    limit = int(getattr(args, "limit", 3000) or 3000)
+    limit = max(100, min(limit, 20000))
+    out_raw = str(getattr(args, "out", "") or "").strip()
+    out_path = Path(out_raw) if out_raw else (BASE_DIR / "data" / "whop_logs_events.json")
+
+    start_str = str(getattr(args, "start", "") or "2026-01-01").strip()
+    end_str = str(getattr(args, "end", "") or "").strip()
+    if not end_str:
+        end_d = datetime.now(timezone.utc).date()
+        end_str = end_d.isoformat()
+    start_d = _parse_user_day(start_str)
+    end_d = _parse_user_day(end_str)
+    if not start_d or not end_d:
+        print("Invalid --start or --end. Use YYYY-MM-DD.")
+        return 2
+
+    intents = discord.Intents.none()
+    intents.guilds = True
+    intents.messages = True
+    intents.message_content = True
+    bot = discord.Client(intents=intents)
+
+    by_email: dict[str, dict[str, Any]] = {}
+    scanned = 0
+    extracted = 0
+
+    @bot.event
+    async def on_ready():
+        nonlocal scanned, extracted
+        ch = bot.get_channel(channel_id)
+        if ch is None:
+            with suppress(Exception):
+                ch = await bot.fetch_channel(channel_id)
+        if not isinstance(ch, discord.TextChannel):
+            print("Channel not found or not text.")
+            await bot.close()
+            return
+        start_dt = datetime.combine(start_d, time(0, 0, 0), tzinfo=timezone.utc)
+        end_dt = datetime.combine(end_d, time(23, 59, 59), tzinfo=timezone.utc)
+        async for msg in ch.history(limit=limit):
+            scanned += 1
+            if scanned % 200 == 0:
+                print(f"\r  scanned={scanned} unique_emails={len(by_email)}", end="", flush=True)
+            try:
+                created = getattr(msg, "created_at", None)
+                if created:
+                    created_utc = created.astimezone(timezone.utc)
+                    if created_utc < start_dt or created_utc > end_dt:
+                        continue
+            except Exception:
+                continue
+            if not msg.embeds:
+                continue
+            e0 = msg.embeds[0]
+            if not isinstance(e0, discord.Embed):
+                continue
+            title = str(getattr(e0, "title", "") or "").strip() or "(no title)"
+            email = str(_extract_email_from_native_embed(e0) or "").strip().lower()
+            if not email or "@" not in email:
+                continue
+            jump = str(getattr(msg, "jump_url", "") or "").strip()
+            created_iso = ""
+            with suppress(Exception):
+                if getattr(msg, "created_at", None):
+                    created_iso = msg.created_at.astimezone(timezone.utc).isoformat()
+            did = str(_extract_discord_id_from_native_embed(e0) or "").strip()
+            key_val = ""
+            access_pass = ""
+            mstatus = ""
+            with suppress(Exception):
+                for f in (getattr(e0, "fields", None) or []):
+                    n = str(getattr(f, "name", "") or "").strip().lower()
+                    v = str(getattr(f, "value", "") or "").strip()
+                    if n == "key":
+                        key_val = v
+                    elif n in {"access pass", "access_pass"}:
+                        access_pass = v
+                    elif n in {"membership status", "membership_status", "status"}:
+                        mstatus = v
+            evt = {
+                "created_at_iso": created_iso,
+                "message_id": int(getattr(msg, "id", 0) or 0),
+                "jump_url": jump[:400],
+                "title": title[:256],
+                "membership_status": mstatus[:64] if mstatus else "",
+                "access_pass": access_pass[:128] if access_pass else "",
+                "key": key_val[:128] if key_val else "",
+            }
+            if email not in by_email:
+                by_email[email] = {"discord_id": did or "", "events": {}}
+            rec = by_email[email]
+            if did:
+                rec["discord_id"] = did
+            tkey = _norm_title_key(title)
+            rec["events"][tkey] = evt
+            extracted += 1
+        print(f"\r  scanned={scanned} unique_emails={len(by_email)}")
+        await bot.close()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    async with bot:
+        await bot.start(token)
+
+    result = {
+        "meta": {
+            "source_channel_id": channel_id,
+            "source_channel_name": "whop-logs",
+            "scanned_at": datetime.now(timezone.utc).isoformat(),
+            "date_range": {"start": start_str, "end": end_str},
+            "messages_scanned": scanned,
+            "unique_emails": len(by_email),
+        },
+        "by_email": by_email,
+    }
+    try:
+        save_json(out_path, result)
+    except Exception:
+        _save_json_file(out_path, result)
+    print(f"Written to {out_path}")
+    return 0
+
+
+async def _probe_whop_membership_logs_events_scan(args: argparse.Namespace) -> int:
+    """Scan whop-membership-logs channel and write events to a standalone JSON file."""
+    cfg = load_config()
+    token = str(cfg.get("bot_token") or "").strip()
+    if not token:
+        print("Missing bot_token in config.secrets.json")
+        return 2
+
+    inv = cfg.get("invite_tracking") or {}
+    channel_id = int(str(getattr(args, "channel_id", "") or inv.get("whop_webhook_channel_id") or 0))
+    if not channel_id:
+        print("Missing --channel-id and invite_tracking.whop_webhook_channel_id.")
+        return 2
+
+    limit = int(getattr(args, "limit", 3000) or 3000)
+    limit = max(100, min(limit, 20000))
+    out_raw = str(getattr(args, "out", "") or "").strip()
+    out_path = Path(out_raw) if out_raw else (BASE_DIR / "data" / "whop_membership_logs_events.json")
+
+    start_str = str(getattr(args, "start", "") or "2026-01-01").strip()
+    end_str = str(getattr(args, "end", "") or "").strip()
+    if not end_str:
+        end_d = datetime.now(timezone.utc).date()
+        end_str = end_d.isoformat()
+    start_d = _parse_user_day(start_str)
+    end_d = _parse_user_day(end_str)
+    if not start_d or not end_d:
+        print("Invalid --start or --end. Use YYYY-MM-DD.")
+        return 2
+
+    intents = discord.Intents.none()
+    intents.guilds = True
+    intents.messages = True
+    intents.message_content = True
+    bot = discord.Client(intents=intents)
+
+    by_email: dict[str, dict[str, Any]] = {}
+    scanned = 0
+    extracted = 0
+
+    @bot.event
+    async def on_ready():
+        nonlocal scanned, extracted
+        ch = bot.get_channel(channel_id)
+        if ch is None:
+            with suppress(Exception):
+                ch = await bot.fetch_channel(channel_id)
+        if not isinstance(ch, discord.TextChannel):
+            print("Channel not found or not text.")
+            await bot.close()
+            return
+        start_dt = datetime.combine(start_d, time(0, 0, 0), tzinfo=timezone.utc)
+        end_dt = datetime.combine(end_d, time(23, 59, 59), tzinfo=timezone.utc)
+        async for msg in ch.history(limit=limit):
+            scanned += 1
+            if scanned % 200 == 0:
+                print(f"\r  scanned={scanned} unique_emails={len(by_email)}", end="", flush=True)
+            try:
+                created = getattr(msg, "created_at", None)
+                if created:
+                    created_utc = created.astimezone(timezone.utc)
+                    if created_utc < start_dt or created_utc > end_dt:
+                        continue
+            except Exception:
+                continue
+            if not msg.embeds:
+                continue
+            e0 = msg.embeds[0]
+            if not isinstance(e0, discord.Embed):
+                continue
+            title = str(getattr(e0, "title", "") or "").strip() or "(no title)"
+            jump = str(getattr(msg, "jump_url", "") or "").strip()
+            created_iso = ""
+            with suppress(Exception):
+                if getattr(msg, "created_at", None):
+                    created_iso = msg.created_at.astimezone(timezone.utc).isoformat()
+            desc = str(getattr(e0, "description", "") or "")
+            fmap = _extract_embed_fields_map(e0)
+            bullet = _parse_bullet_kv_with_email(desc)
+            merged = {**bullet, **fmap}
+            email = str(merged.get("email", "") or "").strip().lower()
+            if not email:
+                email = str(_extract_email_from_native_embed(e0) or "").strip().lower()
+            if not email or "@" not in email:
+                m = re.search(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", desc, re.I)
+                if m:
+                    email = m.group(1).strip().lower()
+            if not email or "@" not in email:
+                continue
+            whop_user_id = str(merged.get("whop user id", "") or _extract_whop_user_id_from_text(jump, title, desc) or "").strip()
+            membership_id = str(merged.get("membership id", "") or _extract_membership_id_from_text(jump, title, desc) or "").strip()
+            username = str(merged.get("username", "") or _extract_whop_username_from_embed(e0) or "").strip()
+            evt = {
+                "created_at_iso": created_iso,
+                "message_id": int(getattr(msg, "id", 0) or 0),
+                "jump_url": jump[:400],
+                "title": title[:256],
+                "membership_id": membership_id or "",
+                "status": str(merged.get("status", "") or "").strip()[:64],
+                "first_membership": str(merged.get("first membership", "") or "").strip()[:32],
+                "total_spent": str(merged.get("total spent", "") or "").strip()[:64],
+                "trial_days": str(merged.get("trial days", "") or "").strip()[:32],
+                "cancel_at_period_end": str(merged.get("cancel at period end", "") or merged.get("cancel_at_period_end", "") or "").strip()[:32],
+                "renewal_window": str(merged.get("renewal window", "") or "").strip()[:200],
+                "fields": {k: v for k, v in list(merged.items())[:20]},
+            }
+            if email not in by_email:
+                by_email[email] = {"whop_user_id": whop_user_id or "", "username": username or "", "events": {}}
+            rec = by_email[email]
+            if whop_user_id:
+                rec["whop_user_id"] = whop_user_id
+            if username:
+                rec["username"] = username
+            tkey = _norm_title_key(title)
+            rec["events"][tkey] = evt
+            extracted += 1
+        print(f"\r  scanned={scanned} unique_emails={len(by_email)}")
+        await bot.close()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    async with bot:
+        await bot.start(token)
+
+    result = {
+        "meta": {
+            "source_channel_id": channel_id,
+            "source_channel_name": "whop-membership-logs",
+            "scanned_at": datetime.now(timezone.utc).isoformat(),
+            "date_range": {"start": start_str, "end": end_str},
+            "messages_scanned": scanned,
+            "unique_emails": len(by_email),
+        },
+        "by_email": by_email,
+    }
+    try:
+        save_json(out_path, result)
+    except Exception:
+        _save_json_file(out_path, result)
+    print(f"Written to {out_path}")
+    return 0
+
+
 def _parse_user_day(s: str) -> Optional[date]:
     ss = str(s or "").strip()
     if not ss:
@@ -6012,6 +6321,20 @@ def main() -> int:
 
     pbl = sub.add_parser("whoplogs-baseline", help="Scan a whop-logs channel and record a per-user baseline into member_history.json.")
     pbl.add_argument("--channel-id", required=True, help="Discord whop-logs channel id to scan.")
+
+    pwl = sub.add_parser("whop-logs-events-scan", help="Scan whop-logs channel and write events to a standalone JSON file.")
+    pwl.add_argument("--channel-id", default="", help="Discord whop-logs channel id (defaults to invite_tracking.whop_logs_channel_id).")
+    pwl.add_argument("--start", default="2026-01-01", help="Start date YYYY-MM-DD.")
+    pwl.add_argument("--end", default="", help="End date YYYY-MM-DD (default: today).")
+    pwl.add_argument("--limit", type=int, default=3000, help="Max messages to scan (100-20000).")
+    pwl.add_argument("--out", default="", help="Output JSON path (default: RSCheckerbot/data/whop_logs_events.json).")
+
+    pwml = sub.add_parser("whop-membership-logs-events-scan", help="Scan whop-membership-logs channel and write events to a standalone JSON file.")
+    pwml.add_argument("--channel-id", default="", help="Discord whop-membership-logs channel id (defaults to invite_tracking.whop_webhook_channel_id).")
+    pwml.add_argument("--start", default="2026-01-01", help="Start date YYYY-MM-DD.")
+    pwml.add_argument("--end", default="", help="End date YYYY-MM-DD (default: today).")
+    pwml.add_argument("--limit", type=int, default=3000, help="Max messages to scan (100-20000).")
+    pwml.add_argument("--out", default="", help="Output JSON path (default: RSCheckerbot/data/whop_membership_logs_events.json).")
     pbl.add_argument("--limit", type=int, default=5000, help="How many messages to scan this run (50-20000).")
     pbl.add_argument("--before-message-id", default="", help="Scan messages before this message id (to go further back).")
     pbl.add_argument("--resume", action="store_true", default=False, help="Resume using saved cursor from state file.")
@@ -6069,6 +6392,10 @@ def main() -> int:
         return _probe_memberstatus_codeview(args)
     if args.mode == "whoplogs-baseline":
         return asyncio.run(_probe_whoplogs_baseline(args))
+    if args.mode == "whop-logs-events-scan":
+        return asyncio.run(_probe_whop_logs_events_scan(args))
+    if args.mode == "whop-membership-logs-events-scan":
+        return asyncio.run(_probe_whop_membership_logs_events_scan(args))
     return 2
 
 

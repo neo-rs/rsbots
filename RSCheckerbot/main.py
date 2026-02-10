@@ -197,6 +197,8 @@ from whop_webhook_handler import (
     handle_whop_webhook_message,
     extract_native_whop_card_debug,
     resolve_discord_id_from_whop_logs as _resolve_discord_id_from_whop_logs,
+    _extract_email_from_embed,
+    _extract_discord_id_from_embed,
 )
 
 # Import Whop API client
@@ -4116,6 +4118,8 @@ def _save_member_history(db: dict) -> None:
 # -----------------------------
 MEMBER_HISTORY_INGEST_STATE_FILE = BASE_DIR / "data" / "member_history_ingest_state.json"
 BLANK_OUTPUTS_JSONL = BASE_DIR / "data" / "blank_outputs.jsonl"
+WHOP_LOGS_EVENTS_FILE = BASE_DIR / "data" / "whop_logs_events.json"
+WHOP_MEMBERSHIP_LOGS_EVENTS_FILE = BASE_DIR / "data" / "whop_membership_logs_events.json"
 
 
 def _ensure_data_dir() -> None:
@@ -4167,6 +4171,34 @@ def _strip_emails(text: str) -> str:
 
 def _norm_title_key(title: str) -> str:
     return re.sub(r"\s+", " ", str(title or "").strip().lower())[:80] or "unknown"
+
+
+def _parse_bullet_kv_with_email(desc: str) -> dict[str, str]:
+    """Parse '• Key: Value' lines including email (for events by_email linkage)."""
+    out: dict[str, str] = {}
+    s = str(desc or "").strip()
+    for line in (s.splitlines() or []):
+        ln = line.strip()
+        if not ln:
+            continue
+        m = re.match(r"^[•*\-]\s*([^:]{1,64})\s*:\s*(.+?)\s*$", ln)
+        if not m:
+            continue
+        k = re.sub(r"\s+", " ", str(m.group(1) or "").strip().lower())
+        v = str(m.group(2) or "").strip()
+        if not k or not v:
+            continue
+        out[k[:64]] = v[:1500]
+    with suppress(Exception):
+        for pat, key in [
+            (r"(?i)\buser=(user_[A-Za-z0-9]+)\b", "whop user id"),
+            (r"(?i)\bmem=(mem_[A-Za-z0-9]+)\b", "membership id"),
+            (r"(?i)\bplan=(plan_[A-Za-z0-9]+)\b", "plan id"),
+        ]:
+            m2 = re.search(pat, s)
+            if m2:
+                out.setdefault(key, m2.group(1))
+    return out
 
 
 def _parse_bullet_kv(desc: str) -> dict[str, str]:
@@ -4223,6 +4255,24 @@ def _extract_username_from_text(desc: str) -> str:
     s = _strip_emails(str(desc or ""))
     m = re.search(r"(?im)^\s*[•*\-]\s*username\s*:\s*([A-Za-z0-9][A-Za-z0-9_.-]{1,62}[A-Za-z0-9]?)\s*$", s)
     return str(m.group(1)).strip().lower() if m else ""
+
+
+def _extract_embed_fields_map(embed: object) -> dict[str, str]:
+    """Return normalized field_name -> value (emails stripped) from embed fields."""
+    out: dict[str, str] = {}
+    if not hasattr(embed, "fields"):
+        return out
+    fields = getattr(embed, "fields", None) or []
+    for f in fields:
+        n = str(getattr(f, "name", "") or "").strip()
+        v = str(getattr(f, "value", "") or "").strip()
+        if not n or not v:
+            continue
+        n_low = re.sub(r"\s+", " ", n.strip().lower())
+        if "email" in n_low or "phone" in n_low:
+            continue
+        out[n_low[:64]] = _strip_emails(v)[:1500]
+    return out
 
 
 def _ensure_whop_users_shape(db: dict) -> dict:
@@ -4392,6 +4442,130 @@ def _apply_whop_logs_to_history(
     return True
 
 
+def _load_events_by_email(path: Path) -> dict[str, dict]:
+    """Load by_email from events JSON; return {} on missing/invalid."""
+    raw = load_json(path)
+    if not isinstance(raw, dict):
+        return {}
+    be = raw.get("by_email")
+    return be if isinstance(be, dict) else {}
+
+
+def _save_events_by_email(path: Path, by_email: dict, *, source_name: str, channel_id: int) -> None:
+    """Save by_email to events JSON with meta."""
+    result = {
+        "meta": {
+            "source_channel_id": channel_id,
+            "source_channel_name": source_name,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "unique_emails": len(by_email),
+        },
+        "by_email": by_email,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save_json(path, result)
+
+
+def _apply_whop_logs_event_to_by_email(
+    by_email: dict,
+    *,
+    embed: object,
+    title: str,
+    message_id: int,
+    jump_url: str,
+    created_at_iso: str,
+) -> bool:
+    """Update by_email with one whop-logs event. Returns True if added."""
+    if not isinstance(embed, discord.Embed):
+        return False
+    email = str(_extract_email_from_embed(embed) or "").strip().lower()
+    if not email or "@" not in email:
+        return False
+    did = str(_extract_discord_id_from_embed(embed) or "").strip()
+    key_val = ""
+    access_pass = ""
+    mstatus = ""
+    with suppress(Exception):
+        for f in (getattr(embed, "fields", None) or []):
+            n = str(getattr(f, "name", "") or "").strip().lower()
+            v = str(getattr(f, "value", "") or "").strip()
+            if n == "key":
+                key_val = v
+            elif n in {"access pass", "access_pass"}:
+                access_pass = v
+            elif n in {"membership status", "membership_status", "status"}:
+                mstatus = v
+    evt = {
+        "created_at_iso": created_at_iso,
+        "message_id": int(message_id or 0),
+        "jump_url": (jump_url or "")[:400],
+        "title": (title or "")[:256],
+        "membership_status": (mstatus or "")[:64],
+        "access_pass": (access_pass or "")[:128],
+        "key": (key_val or "")[:128],
+    }
+    if email not in by_email:
+        by_email[email] = {"discord_id": did or "", "events": {}}
+    rec = by_email[email]
+    if did:
+        rec["discord_id"] = did
+    tkey = _norm_title_key(title)
+    rec.setdefault("events", {})[tkey] = evt
+    return True
+
+
+def _apply_whop_membership_log_event_to_by_email(
+    by_email: dict,
+    *,
+    embed: object,
+    desc: str,
+    title: str,
+    message_id: int,
+    jump_url: str,
+    created_at_iso: str,
+) -> bool:
+    """Update by_email with one whop-membership-logs event. Returns True if added."""
+    fmap = _extract_embed_fields_map(embed)
+    bullet = _parse_bullet_kv_with_email(desc)
+    merged = {**bullet, **fmap}
+    email = str(merged.get("email", "") or "").strip().lower()
+    if not email and isinstance(embed, discord.Embed):
+        email = str(_extract_email_from_embed(embed) or "").strip().lower()
+    if not email or "@" not in email:
+        m = re.search(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", desc, re.I)
+        if m:
+            email = m.group(1).strip().lower()
+    if not email or "@" not in email:
+        return False
+    whop_user_id = str(merged.get("whop user id", "") or _extract_user_id_from_text(desc, jump_url)).strip()
+    membership_id = str(merged.get("membership id", "") or _extract_membership_id_from_text(desc, jump_url)).strip()
+    username = str(merged.get("username", "") or _extract_username_from_text(desc)).strip()
+    evt = {
+        "created_at_iso": created_at_iso,
+        "message_id": int(message_id or 0),
+        "jump_url": (jump_url or "")[:400],
+        "title": (title or "")[:256],
+        "membership_id": membership_id or "",
+        "status": str(merged.get("status", "") or "").strip()[:64],
+        "first_membership": str(merged.get("first membership", "") or "").strip()[:32],
+        "total_spent": str(merged.get("total spent", "") or "").strip()[:64],
+        "trial_days": str(merged.get("trial days", "") or "").strip()[:32],
+        "cancel_at_period_end": str(merged.get("cancel at period end", "") or merged.get("cancel_at_period_end", "") or "").strip()[:32],
+        "renewal_window": str(merged.get("renewal window", "") or "").strip()[:200],
+        "fields": dict(list(merged.items())[:20]),
+    }
+    if email not in by_email:
+        by_email[email] = {"whop_user_id": whop_user_id or "", "username": username or "", "events": {}}
+    rec = by_email[email]
+    if whop_user_id:
+        rec["whop_user_id"] = whop_user_id
+    if username:
+        rec["username"] = username
+    tkey = _norm_title_key(title)
+    rec.setdefault("events", {})[tkey] = evt
+    return True
+
+
 @tasks.loop(seconds=300)
 async def member_history_ingest_loop() -> None:
     """Tail whop-logs + whop-membership-logs and update member_history.json (resume-safe)."""
@@ -4419,6 +4593,9 @@ async def member_history_ingest_loop() -> None:
                     ch0 = await bot.fetch_channel(int(cid))
             if not isinstance(ch0, discord.TextChannel):
                 return 0
+            events_path = WHOP_MEMBERSHIP_LOGS_EVENTS_FILE if mode == "whop_membership_logs" else WHOP_LOGS_EVENTS_FILE
+            source_name = "whop-membership-logs" if mode == "whop_membership_logs" else "whop-logs"
+            by_email = _load_events_by_email(events_path)
             after_id = _ingest_after_id(st, int(cid))
             after_obj = discord.Object(id=int(after_id)) if int(after_id) > 0 else None
             processed = 0
@@ -4437,29 +4614,52 @@ async def member_history_ingest_loop() -> None:
                 with suppress(Exception):
                     if getattr(m, "created_at", None):
                         created_iso = m.created_at.astimezone(timezone.utc).isoformat()  # type: ignore[union-attr]
+                mid = int(getattr(m, "id", 0) or 0)
                 if mode == "whop_membership_logs":
                     desc = str(getattr(e0, "description", "") or "")
                     _apply_whop_membership_log_to_history(
                         db,
                         channel_id=int(cid),
-                        message_id=int(getattr(m, "id", 0) or 0),
+                        message_id=mid,
                         jump_url=jump,
                         created_at_iso=created_iso,
                         title=title,
                         desc=desc,
                     )
+                    with suppress(Exception):
+                        _apply_whop_membership_log_event_to_by_email(
+                            by_email,
+                            embed=e0,
+                            desc=desc,
+                            title=title,
+                            message_id=mid,
+                            jump_url=jump,
+                            created_at_iso=created_iso,
+                        )
                 else:
                     _apply_whop_logs_to_history(
                         db,
                         channel_id=int(cid),
-                        message_id=int(getattr(m, "id", 0) or 0),
+                        message_id=mid,
                         jump_url=jump,
                         created_at_iso=created_iso,
                         title=title,
                         embed=e0,
                     )
+                    with suppress(Exception):
+                        _apply_whop_logs_event_to_by_email(
+                            by_email,
+                            embed=e0,
+                            title=title,
+                            message_id=mid,
+                            jump_url=jump,
+                            created_at_iso=created_iso,
+                        )
             if newest_seen and int(newest_seen) > int(after_id or 0):
                 _ingest_set_after_id(st, int(cid), int(newest_seen))
+            if processed > 0 and by_email:
+                with suppress(Exception):
+                    _save_events_by_email(events_path, by_email, source_name=source_name, channel_id=int(cid))
             return processed
 
         logs_cid = int(WHOP_LOGS_CHANNEL_ID or 0) if str(WHOP_LOGS_CHANNEL_ID or "").strip().isdigit() else 0
@@ -8484,6 +8684,7 @@ async def on_ready():
             is_whop_linked=_is_whop_linked,
             timezone_name=tz_name,
             whop_api_client=whop_api_client,
+            run_membership_report_callback=run_whop_membership_report_for_user,
         )
     except Exception as e:
         # Don't silently disable the whole ticket system.
@@ -11514,6 +11715,246 @@ async def whop_membership_lookup(ctx, membership_id: str):
     with suppress(Exception):
         await ctx.message.delete()
 
+def _parse_whop_report_user_day(s: str) -> date | None:
+    """Parse user-friendly date strings for membership report."""
+    ss = str(s or "").strip()
+    if not ss:
+        return None
+    for fmt in ("%Y-%m-%d", "%m-%d-%y", "%m-%d-%Y", "%m/%d/%y", "%m/%d/%Y"):
+        with suppress(Exception):
+            return datetime.strptime(ss, fmt).date()
+    for fmt in ("%m/%d", "%m-%d"):
+        with suppress(Exception):
+            d0 = datetime.strptime(ss, fmt).date()
+            now0 = datetime.now(timezone.utc).date()
+            return date(now0.year, d0.month, d0.day)
+    return None
+
+
+async def run_whop_membership_report_for_user(user: discord.abc.User, start_str: str, end_str: str) -> tuple[bool, str]:
+    """Run Whop memberships-joined report and DM the user. Returns (success, message)."""
+    if not whop_api_client:
+        return False, "Whop API client is not initialized."
+    start_d = _parse_whop_report_user_day(start_str)
+    end_d = _parse_whop_report_user_day(end_str)
+    if not start_d:
+        return False, "Invalid start date. Use formats like 2/2/26, 2026-02-02, or MM/DD."
+    if not end_d:
+        end_d = start_d
+    if start_d > end_d:
+        start_d, end_d = end_d, start_d
+
+    try:
+        require_dj = bool(WHOP_API_CONFIG.get("joined_report_require_date_joined", True))
+    except Exception:
+        require_dj = False
+    statuses_cfg = WHOP_API_CONFIG.get("joined_report_statuses")
+    allowed_statuses: set[str] = set()
+    if isinstance(statuses_cfg, list):
+        allowed_statuses = {str(x).strip().lower() for x in statuses_cfg if str(x).strip()}
+    if not allowed_statuses:
+        allowed_statuses = {"active", "trialing", "canceling", "completed", "canceled", "expired"}
+    prefixes_cfg = WHOP_API_CONFIG.get("joined_report_product_title_prefixes")
+    product_prefixes: list[str] = []
+    if isinstance(prefixes_cfg, list):
+        product_prefixes = [str(x).strip() for x in prefixes_cfg if str(x).strip()]
+    try:
+        max_pages = int(WHOP_API_CONFIG.get("joined_report_max_pages", 50))
+    except Exception:
+        max_pages = 50
+    max_pages = max(1, min(max_pages, 200))
+
+    tz = timezone.utc
+    tz_name = str(REPORTING_CONFIG.get("timezone") or "UTC").strip() or "UTC"
+    if ZoneInfo is not None:
+        with suppress(Exception):
+            tz = ZoneInfo(tz_name)
+    start_local = datetime(start_d.year, start_d.month, start_d.day, 0, 0, 0, tzinfo=tz)
+    end_local = datetime(end_d.year, end_d.month, end_d.day, 23, 59, 59, tzinfo=tz)
+    start_utc_iso = start_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    end_utc_iso = end_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _extract_member_id_from_membership(mship: dict) -> str:
+        if not isinstance(mship, dict):
+            return ""
+        mm = mship.get("member")
+        if isinstance(mm, str) and mm.strip().startswith("mber_"):
+            return mm.strip()
+        if isinstance(mm, dict):
+            mid0 = str(mm.get("id") or mm.get("member_id") or "").strip()
+            if mid0.startswith("mber_"):
+                return mid0
+        mid2 = str(mship.get("member_id") or "").strip()
+        return mid2 if mid2.startswith("mber_") else ""
+
+    mber_to_memberships: dict[str, dict] = {}
+    after: str | None = None
+    pages = 0
+    per_page = 100
+    while pages < max_pages:
+        batch, page_info = await whop_api_client.list_memberships(
+            first=per_page, after=after,
+            params={"created_after": start_utc_iso, "created_before": end_utc_iso, "order": "created_at", "direction": "asc"},
+        )
+        if not batch:
+            break
+        pages += 1
+        for rec in batch:
+            if not isinstance(rec, dict):
+                continue
+            m = _whop_report_normalize_membership(rec)
+            if not isinstance(m, dict):
+                continue
+            mid = _whop_report_membership_id(m)
+            st = str(m.get("status") or "").strip().lower() or "unknown"
+            if st not in allowed_statuses:
+                continue
+            email_s = _whop_report_extract_email(m)
+            created_at = str(m.get("created_at") or "").strip()
+            created_dt = _parse_dt_any(created_at) if created_at else None
+            date_joined = str(m.get("date_joined") or m.get("date_joined_at") or "").strip()
+            dj_dt = _parse_dt_any(date_joined) if date_joined else None
+            joined_dt = dj_dt if isinstance(dj_dt, datetime) else created_dt
+            if require_dj and not isinstance(dj_dt, datetime):
+                continue
+            if isinstance(joined_dt, datetime):
+                joined_d = joined_dt.astimezone(tz).date()
+                if joined_d < start_d or joined_d > end_d:
+                    continue
+            product_title = ""
+            if isinstance(m.get("product"), dict):
+                product_title = str(m["product"].get("title") or "").strip()
+            if product_prefixes:
+                low = product_title.lower()
+                if not any(low.startswith(p.lower()) for p in product_prefixes):
+                    continue
+            mber_id = _extract_member_id_from_membership(m)
+            if not mber_id:
+                continue
+            rec0 = mber_to_memberships.get(mber_id)
+            if not isinstance(rec0, dict):
+                rec0 = {"products": set(), "membership_ids": set()}
+                mber_to_memberships[mber_id] = rec0
+            with suppress(Exception):
+                if product_title:
+                    rec0["products"].add(str(product_title))
+                if mid:
+                    rec0["membership_ids"].add(str(mid))
+        after = str(page_info.get("end_cursor") or "") if isinstance(page_info, dict) else ""
+        if not (bool(page_info.get("has_next_page")) if isinstance(page_info, dict) else False) or not after:
+            break
+
+    user_rows: list[dict] = []
+    after = None
+    pages = 0
+    stop = False
+    while pages < max_pages and not stop:
+        batch, page_info = await whop_api_client.list_members(
+            first=per_page, after=after, params={"order": "joined_at", "direction": "desc"},
+        )
+        if not batch:
+            break
+        pages += 1
+        for rec in batch:
+            if not isinstance(rec, dict):
+                continue
+            mber_id = str(rec.get("id") or "").strip()
+            joined_at_raw = str(rec.get("joined_at") or rec.get("created_at") or "").strip()
+            dtj = _parse_dt_any(joined_at_raw) if joined_at_raw else None
+            if not isinstance(dtj, datetime):
+                continue
+            joined_d = dtj.astimezone(tz).date()
+            if joined_d < start_d:
+                stop = True
+                break
+            if joined_d > end_d:
+                continue
+            mm = mber_to_memberships.get(mber_id)
+            status = str(rec.get("status") or "").strip().lower() or "unknown"
+            action = str(rec.get("most_recent_action") or "").strip().lower()
+            bucket = action if action in {"joined", "trialing", "canceling", "churned", "left", "past_due"} else status
+            if bucket not in {"joined", "trialing", "canceling", "churned", "left", "past_due"}:
+                bucket = "joined" if status == "joined" else ("left" if status == "left" else "joined")
+            u = rec.get("user") if isinstance(rec.get("user"), dict) else {}
+            user_id = str(u.get("id") or "").strip()
+            email_s = str(u.get("email") or "").strip()
+            name_s = str(u.get("name") or "").strip()
+            username_s = str(u.get("username") or "").strip()
+            spent = rec.get("usd_total_spent")
+            spent_s = f"${float(spent or 0.0):.2f}"
+            products = []
+            mids = []
+            if isinstance(mm, dict):
+                products = sorted([str(x).strip() for x in (mm.get("products") or set()) if str(x).strip()])
+                mids = sorted([str(x).strip() for x in (mm.get("membership_ids") or set()) if str(x).strip()])
+            user_rows.append({
+                "member_id": mber_id, "user_id": user_id, "email": email_s, "name": name_s, "username": username_s,
+                "status_bucket": bucket, "most_recent_action": action, "products": ", ".join(products),
+                "membership_ids": ", ".join(mids), "joined_at": dtj.isoformat().replace("+00:00", "Z"), "total_spent": spent_s,
+            })
+        after = str(page_info.get("end_cursor") or "") if isinstance(page_info, dict) else ""
+        if not (bool(page_info.get("has_next_page")) if isinstance(page_info, dict) else False) or not after:
+            break
+
+    label = f"{start_d.strftime('%m-%d-%y')}" if start_d == end_d else f"{start_d.strftime('%m-%d-%y')}-{end_d.strftime('%m-%d-%y')}"
+    total_users = len(user_rows)
+    counts: dict[str, int] = {}
+    for r in user_rows:
+        k = str(r.get("status_bucket") or "unknown").strip().lower() or "unknown"
+        counts[k] = int(counts.get(k, 0)) + 1
+    joined = int(counts.get("joined", 0))
+    trialing = int(counts.get("trialing", 0))
+    canceling = int(counts.get("canceling", 0))
+    churned = int(counts.get("churned", 0))
+    left = int(counts.get("left", 0))
+    past_due = int(counts.get("past_due", 0))
+    churn_pct = (float(churned) / float(total_users) * 100.0) if total_users else 0.0
+    prod_counts: dict[str, int] = {}
+    for r in user_rows:
+        prods = [p.strip() for p in str(r.get("products") or "").split(",") if p.strip()]
+        for p in prods:
+            prod_counts[p] = int(prod_counts.get(p, 0)) + 1
+    prod_lines: list[str] = []
+    for p, n in sorted(prod_counts.items(), key=lambda kv: kv[1], reverse=True)[:8]:
+        prod_lines.append(f"**{p}** — {n}")
+    if len(prod_counts) > 8:
+        prod_lines.append(f"_… +{len(prod_counts) - 8} more product(s)_")
+
+    e = discord.Embed(
+        title=f"Whop Joined Summary — {label}",
+        description=f"Range: `{start_d.isoformat()} → {end_d.isoformat()}`",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    e.add_field(name="Users (range)", value=str(total_users), inline=True)
+    e.add_field(name="Joined", value=str(joined), inline=True)
+    e.add_field(name="Trialing", value=str(trialing), inline=True)
+    e.add_field(name="Canceling", value=str(canceling), inline=True)
+    e.add_field(name="Churned", value=str(churned), inline=True)
+    e.add_field(name="Left", value=str(left), inline=True)
+    e.add_field(name="Past due", value=str(past_due), inline=True)
+    e.add_field(name="Churn %", value=f"{churn_pct:.2f}%", inline=True)
+    if prod_lines:
+        e.add_field(name="By product", value="\n".join(prod_lines)[:1024], inline=False)
+    e.set_footer(text="RSCheckerbot • Whop API")
+
+    buf = io.StringIO()
+    fieldnames = ["member_id", "user_id", "email", "name", "username", "status_bucket", "most_recent_action", "products", "membership_ids", "total_spent", "joined_at"]
+    w = csv.DictWriter(buf, fieldnames=fieldnames)
+    w.writeheader()
+    for r in user_rows:
+        with suppress(Exception):
+            w.writerow({k: str(r.get(k, "") or "") for k in fieldnames})
+    fname = f"whop-joined-report_{label}.csv".replace("/", "-")
+    file_obj = discord.File(fp=io.BytesIO(buf.getvalue().encode("utf-8")), filename=fname)
+
+    try:
+        await user.send(embed=e, file=file_obj)
+    except Exception:
+        return False, "I couldn't DM you (your DMs are likely closed)."
+    return True, "Report sent to your DMs."
+
+
 @bot.command(name="syncsummary", aliases=["whopsync", "whopsyncsummary", "sync-report"])
 @commands.has_permissions(administrator=True)
 async def whop_sync_summary_dm(ctx, start: str = "", end: str = ""):
@@ -11529,23 +11970,8 @@ async def whop_sync_summary_dm(ctx, start: str = "", end: str = ""):
     - MM/DD/YY / MM/DD/YYYY
     - MM/DD or MM-DD (assumes current year)
     """
-    # Build label
-    def _parse_user_day(s: str) -> date | None:
-        ss = str(s or "").strip()
-        if not ss:
-            return None
-        for fmt in ("%Y-%m-%d", "%m-%d-%y", "%m-%d-%Y", "%m/%d/%y", "%m/%d/%Y"):
-            with suppress(Exception):
-                return datetime.strptime(ss, fmt).date()
-        for fmt in ("%m/%d", "%m-%d"):
-            with suppress(Exception):
-                d0 = datetime.strptime(ss, fmt).date()
-                now0 = datetime.now(timezone.utc).date()
-                return date(now0.year, d0.month, d0.day)
-        return None
-
-    start_d = _parse_user_day(start)
-    end_d = _parse_user_day(end)
+    start_d = _parse_whop_report_user_day(start)
+    end_d = _parse_whop_report_user_day(end)
     if start_d and not end_d:
         end_d = start_d
     if (not start_d) and end_d:
@@ -11556,296 +11982,12 @@ async def whop_sync_summary_dm(ctx, start: str = "", end: str = ""):
     if not end_d:
         end_d = start_d
 
-    label = f"{start_d.strftime('%m-%d-%y')}" if start_d == end_d else f"{start_d.strftime('%m-%d-%y')}-{end_d.strftime('%m-%d-%y')}"
-
-    # ------------------------------------------------------------------
-    # Mode 1: date range => Whop "joined" report (filter by created_after/before)
-    # ------------------------------------------------------------------
     if has_user_range:
-        if not whop_api_client:
-            await ctx.send("❌ Whop API client is not initialized.", delete_after=20)
-            with suppress(Exception):
-                await ctx.message.delete()
-            return
-
-        # Filters to match Whop dashboard "Users" view (Joined at).
-        try:
-            require_dj = bool(WHOP_API_CONFIG.get("joined_report_require_date_joined", True))
-        except Exception:
-            require_dj = False
-        statuses_cfg = WHOP_API_CONFIG.get("joined_report_statuses")
-        allowed_statuses: set[str] = set()
-        if isinstance(statuses_cfg, list):
-            allowed_statuses = {str(x).strip().lower() for x in statuses_cfg if str(x).strip()}
-        if not allowed_statuses:
-            # Safe default excludes draft attempts.
-            allowed_statuses = {"active", "trialing", "canceling", "completed", "canceled", "expired"}
-        prefixes_cfg = WHOP_API_CONFIG.get("joined_report_product_title_prefixes")
-        product_prefixes: list[str] = []
-        if isinstance(prefixes_cfg, list):
-            product_prefixes = [str(x).strip() for x in prefixes_cfg if str(x).strip()]
-        try:
-            max_pages = int(WHOP_API_CONFIG.get("joined_report_max_pages", 50))
-        except Exception:
-            max_pages = 50
-        max_pages = max(1, min(max_pages, 200))
-
-        tz = timezone.utc
-        tz_name = str(REPORTING_CONFIG.get("timezone") or "UTC").strip() or "UTC"
-        if ZoneInfo is not None:
-            with suppress(Exception):
-                tz = ZoneInfo(tz_name)
-        start_local = datetime(start_d.year, start_d.month, start_d.day, 0, 0, 0, tzinfo=tz)
-        end_local = datetime(end_d.year, end_d.month, end_d.day, 23, 59, 59, tzinfo=tz)
-        start_utc_iso = start_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-        end_utc_iso = end_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-        # Pull memberships in range (server-side filter) to map member_id -> products/memberships.
-        # Then pull members in range (Whop dashboard "Users" view) and join via member_id.
-        mber_to_memberships: dict[str, dict] = {}
-
-        def _extract_member_id_from_membership(mship: dict) -> str:
-            if not isinstance(mship, dict):
-                return ""
-            mm = mship.get("member")
-            if isinstance(mm, str) and mm.strip().startswith("mber_"):
-                return mm.strip()
-            if isinstance(mm, dict):
-                mid0 = str(mm.get("id") or mm.get("member_id") or "").strip()
-                if mid0.startswith("mber_"):
-                    return mid0
-            mid2 = str(mship.get("member_id") or "").strip()
-            return mid2 if mid2.startswith("mber_") else ""
-
-        after: str | None = None
-        pages = 0
-        per_page = 100
-        while pages < max_pages:
-            batch, page_info = await whop_api_client.list_memberships(
-                first=per_page,
-                after=after,
-                params={
-                    "created_after": start_utc_iso,
-                    "created_before": end_utc_iso,
-                    "order": "created_at",
-                    "direction": "asc",
-                },
-            )
-            if not batch:
-                break
-            pages += 1
-            for rec in batch:
-                if not isinstance(rec, dict):
-                    continue
-                m = _whop_report_normalize_membership(rec)
-                if not isinstance(m, dict):
-                    continue
-                mid = _whop_report_membership_id(m)
-                st = str(m.get("status") or "").strip().lower() or "unknown"
-                if st not in allowed_statuses:
-                    continue
-                cape = (m.get("cancel_at_period_end") is True) or _whop_report_norm_bool(m.get("cancel_at_period_end"))
-
-                email_s = _whop_report_extract_email(m)
-                user_id = _whop_report_extract_user_id(m)
-                created_at = str(m.get("created_at") or "").strip()
-                # Whop UI "Joined at" matches membership created_at in most cases.
-                created_dt = _parse_dt_any(created_at) if created_at else None
-                date_joined = str(m.get("date_joined") or m.get("date_joined_at") or "").strip()
-                dj_dt = _parse_dt_any(date_joined) if date_joined else None
-                joined_dt = dj_dt if isinstance(dj_dt, datetime) else created_dt
-                if require_dj and not isinstance(dj_dt, datetime):
-                    continue
-                if isinstance(joined_dt, datetime):
-                    joined_d = joined_dt.astimezone(tz).date()
-                    if joined_d < start_d or joined_d > end_d:
-                        continue
-                renewal_end = str(m.get("renewal_period_end") or "").strip()
-                product_title = ""
-                if isinstance(m.get("product"), dict):
-                    product_title = str(m["product"].get("title") or "").strip()
-                if product_prefixes:
-                    low = product_title.lower()
-                    if not any(low.startswith(p.lower()) for p in product_prefixes):
-                        continue
-
-                mber_id = _extract_member_id_from_membership(m)
-                if not mber_id:
-                    continue
-                rec0 = mber_to_memberships.get(mber_id)
-                if not isinstance(rec0, dict):
-                    rec0 = {"products": set(), "membership_ids": set()}
-                    mber_to_memberships[mber_id] = rec0
-                with suppress(Exception):
-                    if product_title:
-                        rec0["products"].add(str(product_title))
-                    if mid:
-                        rec0["membership_ids"].add(str(mid))
-
-            after = str(page_info.get("end_cursor") or "") if isinstance(page_info, dict) else ""
-            has_next = bool(page_info.get("has_next_page")) if isinstance(page_info, dict) else False
-            if not has_next or not after:
-                break
-
-        # Pull members in range (descending by joined_at; stop once we're before start boundary).
-        user_rows: list[dict] = []
-        after = None
-        pages = 0
-        stop = False
-        while pages < max_pages and not stop:
-            batch, page_info = await whop_api_client.list_members(
-                first=per_page,
-                after=after,
-                params={"order": "joined_at", "direction": "desc"},
-            )
-            if not batch:
-                break
-            pages += 1
-            for rec in batch:
-                if not isinstance(rec, dict):
-                    continue
-                mber_id = str(rec.get("id") or "").strip()
-                joined_at_raw = str(rec.get("joined_at") or rec.get("created_at") or "").strip()
-                dtj = _parse_dt_any(joined_at_raw) if joined_at_raw else None
-                if not isinstance(dtj, datetime):
-                    continue
-                joined_d = dtj.astimezone(tz).date()
-                if joined_d < start_d:
-                    stop = True
-                    break
-                if joined_d > end_d:
-                    continue
-
-                # Membership mapping (best-effort). Some Whop "Users" rows may not have membership IDs in the export;
-                # keep them in the report to match the dashboard, but product/membership columns may be blank.
-                mm = mber_to_memberships.get(mber_id)
-
-                # Bucket: prefer most_recent_action (Whop UI status), fall back to status.
-                status = str(rec.get("status") or "").strip().lower() or "unknown"
-                action = str(rec.get("most_recent_action") or "").strip().lower()
-                bucket = action if action in {"joined", "trialing", "canceling", "churned", "left", "past_due"} else status
-                if bucket not in {"joined", "trialing", "canceling", "churned", "left", "past_due"}:
-                    bucket = "joined" if status == "joined" else ("left" if status == "left" else "joined")
-
-                u = rec.get("user") if isinstance(rec.get("user"), dict) else {}
-                user_id = str(u.get("id") or "").strip()
-                email_s = str(u.get("email") or "").strip()
-                name_s = str(u.get("name") or "").strip()
-                username_s = str(u.get("username") or "").strip()
-                spent = rec.get("usd_total_spent")
-                spent_s = f"${float(spent or 0.0):.2f}"
-
-                products = []
-                mids = []
-                if isinstance(mm, dict):
-                    products = sorted([str(x).strip() for x in (mm.get("products") or set()) if str(x).strip()])
-                    mids = sorted([str(x).strip() for x in (mm.get("membership_ids") or set()) if str(x).strip()])
-
-                user_rows.append(
-                    {
-                        "member_id": mber_id,
-                        "user_id": user_id,
-                        "email": email_s,
-                        "name": name_s,
-                        "username": username_s,
-                        "status_bucket": bucket,
-                        "most_recent_action": action,
-                        "products": ", ".join(products),
-                        "membership_ids": ", ".join(mids),
-                        "joined_at": dtj.isoformat().replace("+00:00", "Z"),
-                        "total_spent": spent_s,
-                    }
-                )
-
-            after = str(page_info.get("end_cursor") or "") if isinstance(page_info, dict) else ""
-            has_next = bool(page_info.get("has_next_page")) if isinstance(page_info, dict) else False
-            if not has_next or not after:
-                break
-
-        total_users = len(user_rows)
-        counts: dict[str, int] = {}
-        for r in user_rows:
-            k = str(r.get("status_bucket") or "unknown").strip().lower() or "unknown"
-            counts[k] = int(counts.get(k, 0)) + 1
-
-        joined = int(counts.get("joined", 0))
-        trialing = int(counts.get("trialing", 0))
-        canceling = int(counts.get("canceling", 0))
-        churned = int(counts.get("churned", 0))
-        left = int(counts.get("left", 0))
-        past_due = int(counts.get("past_due", 0))
-
-        churn_pct = (float(churned) / float(total_users) * 100.0) if total_users else 0.0
-
-        # Per-product breakdown (unique users; based on membership mapping).
-        prod_counts: dict[str, int] = {}
-        unknown_products = 0
-        for r in user_rows:
-            prods = [p.strip() for p in str(r.get("products") or "").split(",") if p.strip()]
-            if not prods:
-                unknown_products += 1
-            for p in prods:
-                prod_counts[p] = int(prod_counts.get(p, 0)) + 1
-        prod_lines: list[str] = []
-        for p, n in sorted(prod_counts.items(), key=lambda kv: kv[1], reverse=True)[:8]:
-            prod_lines.append(f"**{p}** — {n}")
-        extra = max(0, len(prod_counts) - 8)
-        if extra:
-            prod_lines.append(f"_… +{extra} more product(s)_")
-        if unknown_products:
-            prod_lines.append(f"**(Unknown product)** — {unknown_products}")
-
-        e = discord.Embed(
-            title=f"Whop Joined Summary — {label}",
-            description=f"Range: `{start_d.isoformat()} → {end_d.isoformat()}`",
-            color=0x5865F2,
-            timestamp=datetime.now(timezone.utc),
-        )
-        e.add_field(name="Users (range)", value=str(total_users), inline=True)
-        e.add_field(name="Joined", value=str(joined), inline=True)
-        e.add_field(name="Trialing", value=str(trialing), inline=True)
-        e.add_field(name="Canceling", value=str(canceling), inline=True)
-        e.add_field(name="Churned", value=str(churned), inline=True)
-        e.add_field(name="Left", value=str(left), inline=True)
-        e.add_field(name="Past due", value=str(past_due), inline=True)
-        e.add_field(name="Churn %", value=f"{churn_pct:.2f}%", inline=True)
-        if prod_lines:
-            e.add_field(name="By product", value="\n".join(prod_lines)[:1024], inline=False)
-        e.set_footer(text="RSCheckerbot • Whop API")
-
-        # CSV attachment (DM-only)
-        buf = io.StringIO()
-        fieldnames = [
-            "member_id",
-            "user_id",
-            "email",
-            "name",
-            "username",
-            "status_bucket",
-            "most_recent_action",
-            "products",
-            "membership_ids",
-            "total_spent",
-            "joined_at",
-        ]
-        w = csv.DictWriter(buf, fieldnames=fieldnames)
-        w.writeheader()
-        for r in user_rows:
-            with suppress(Exception):
-                w.writerow({k: str(r.get(k, "") or "") for k in fieldnames})
-        data = buf.getvalue().encode("utf-8")
-        fname = f"whop-joined-report_{label}.csv".replace("/", "-")
-        file_obj = discord.File(fp=io.BytesIO(data), filename=fname)
-
-        try:
-            await ctx.author.send(embed=e, file=file_obj)
-        except Exception:
-            await ctx.send("❌ I couldn't DM you (your DMs are likely closed).", delete_after=20)
-            with suppress(Exception):
-                await ctx.message.delete()
-            return
-
-        await ctx.send("✅ Sent Whop joined report via DM.", delete_after=10)
+        ok, msg = await run_whop_membership_report_for_user(ctx.author, start, end)
+        if ok:
+            await ctx.send("✅ Sent Whop joined report via DM.", delete_after=10)
+        else:
+            await ctx.send(f"❌ {msg}", delete_after=20)
         with suppress(Exception):
             await ctx.message.delete()
         return
