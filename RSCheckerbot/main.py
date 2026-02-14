@@ -273,6 +273,7 @@ def _load_reporting_config(cfg: dict) -> dict:
 
     enabled = _as_bool(base.get("enabled", False))
     dm_user_id = _as_int(base.get("dm_user_id"))
+    dm_staff_roles = _as_bool(base.get("dm_staff_roles", False))
     tz = _as_str(base.get("timezone") or "America/New_York") or "America/New_York"
     report_time = _as_str(base.get("report_time_local") or "09:00") or "09:00"
     weekly_day = _as_str(base.get("weekly_day_local") or "mon").lower() or "mon"
@@ -360,8 +361,8 @@ def _load_reporting_config(cfg: dict) -> dict:
     cleaned_days = sorted(set(cleaned_days), reverse=True)
 
     # Basic validation; on invalid config, disable reporting but keep bot running.
-    if enabled and (dm_user_id is None or dm_user_id <= 0):
-        print("[Config] reporting.enabled=true but reporting.dm_user_id is missing/invalid; disabling reporting.")
+    if enabled and (dm_user_id is None or dm_user_id <= 0) and not dm_staff_roles:
+        print("[Config] reporting.enabled=true but reporting.dm_user_id is missing/invalid and dm_staff_roles is false; disabling reporting.")
         enabled = False
     if retention_weeks < 4 or retention_weeks > 260:
         print("[Config] reporting.retention_weeks out of range (4..260); using 26.")
@@ -375,6 +376,7 @@ def _load_reporting_config(cfg: dict) -> dict:
     return {
         "enabled": bool(enabled),
         "dm_user_id": dm_user_id or 0,
+        "dm_staff_roles": bool(dm_staff_roles),
         "timezone": tz,
         "report_time_local": report_time,
         "weekly_day_local": weekly_day,
@@ -2944,7 +2946,23 @@ async def reporting_loop() -> None:
             return
 
         dm_uid = int(REPORTING_CONFIG.get("dm_user_id") or 0)
-        if not dm_uid:
+        dm_staff_roles = bool(REPORTING_CONFIG.get("dm_staff_roles", False))
+        recipient_ids: list[int] = []
+        if dm_uid and dm_uid > 0:
+            recipient_ids.append(int(dm_uid))
+        if dm_staff_roles:
+            gid = int(config.get("guild_id") or 0) if isinstance(config, dict) else 0
+            guild = bot.get_guild(gid) if gid else None
+            if guild:
+                staff_ids, _ = _channel_limits_staff_admin_role_ids()
+                for member in guild.members:
+                    if not getattr(member, "id", None):
+                        continue
+                    rids = {int(getattr(r, "id", 0) or 0) for r in (getattr(member, "roles", []) or [])}
+                    if rids & staff_ids:
+                        recipient_ids.append(int(member.id))
+            recipient_ids = list(dict.fromkeys(recipient_ids))
+        if not recipient_ids:
             return
 
         weekly_day = _weekday_idx(str(REPORTING_CONFIG.get("weekly_day_local") or "mon"))
@@ -2965,7 +2983,7 @@ async def reporting_loop() -> None:
 
         # Run daily reminders outside lock (will re-lock for per-member reminder writes)
         if should_daily:
-            await _run_daily_cancel_reminders(dm_uid)
+            await _run_daily_cancel_reminders(recipient_ids)
 
         # Weekly report (once per date, only on weekly day)
         if today_wd == weekly_day:
@@ -3024,7 +3042,7 @@ async def _build_report_embed(start_utc: datetime, end_utc: datetime, *, title_p
     return e
 
 
-async def _run_daily_cancel_reminders(dm_uid: int) -> None:
+async def _run_daily_cancel_reminders(recipient_user_ids: list[int]) -> None:
     now_local = _tz_now()
     today = now_local.date()
     days = REPORTING_CONFIG.get("reminder_days_before_cancel") or [7, 3, 1]
@@ -3033,7 +3051,7 @@ async def _run_daily_cancel_reminders(dm_uid: int) -> None:
     except Exception:
         days = [7, 3, 1]
 
-    rows: list[str] = []
+    pending: list[tuple[int, int, int]] = []  # (discord_id, end_ts, delta_days)
     to_mark: list[tuple[int, int]] = []  # (discord_id, day)
 
     async with _REPORTING_STORE_LOCK:
@@ -3059,8 +3077,7 @@ async def _run_daily_cancel_reminders(dm_uid: int) -> None:
             if last == today.isoformat():
                 continue
 
-            # Build a clickable profile link without pings
-            rows.append(f"- <@{did}> ends <t:{int(end_ts)}:D> (in {delta_days}d)")
+            pending.append((int(did), int(end_ts), int(delta_days)))
             to_mark.append((int(did), int(delta_days)))
 
         # Mark reminders as sent (persist)
@@ -3081,8 +3098,21 @@ async def _run_daily_cancel_reminders(dm_uid: int) -> None:
             global _REPORTING_STORE
             _REPORTING_STORE = store
 
-    if not rows:
+    if not pending:
         return
+
+    # Build rows with optional clickable ticket channel link (outside lock, may await)
+    rows: list[str] = []
+    for did, end_ts, delta_days in pending:
+        ch_id = 0
+        try:
+            ch_id = await support_tickets.get_open_cancellation_ticket_channel_id(did)
+        except Exception:
+            pass
+        line = f"- <@{did}> ends <t:{end_ts}:D> (in {delta_days}d)"
+        if ch_id:
+            line += f" <#{ch_id}>"
+        rows.append(line)
 
     e = discord.Embed(
         title="Cancellation Reminders",
@@ -3091,7 +3121,11 @@ async def _run_daily_cancel_reminders(dm_uid: int) -> None:
         timestamp=datetime.now(timezone.utc),
     )
     e.set_footer(text="RSCheckerbot • Reporting")
-    await _dm_user(dm_uid, embed=e)
+    for uid in recipient_user_ids:
+        try:
+            await _dm_user(uid, embed=e)
+        except Exception:
+            pass
 
     # Optional: mirror reminders into a test channel (no pings).
     try:
@@ -11786,18 +11820,62 @@ async def run_whop_membership_report_for_user(user: discord.abc.User, start_str:
         max_pages = 50
     max_pages = max(1, min(max_pages, 200))
 
-    start_local = datetime(start_d.year, start_d.month, start_d.day, 0, 0, 0, tzinfo=timezone.utc)
-    end_local = datetime(end_d.year, end_d.month, end_d.day, 23, 59, 59, tzinfo=timezone.utc)
-    start_utc_iso = start_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-    end_utc_iso = end_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    tz_name = str(REPORTING_CONFIG.get("timezone") or "America/New_York").strip() or "America/New_York"
+    if ZoneInfo:
+        try:
+            tz = ZoneInfo(tz_name)
+            start_local = datetime(start_d.year, start_d.month, start_d.day, 0, 0, 0, tzinfo=tz)
+            end_local = datetime(end_d.year, end_d.month, end_d.day, 23, 59, 59, tzinfo=tz)
+        except Exception:
+            start_local = datetime(start_d.year, start_d.month, start_d.day, 0, 0, 0, tzinfo=timezone.utc)
+            end_local = datetime(end_d.year, end_d.month, end_d.day, 23, 59, 59, tzinfo=timezone.utc)
+    else:
+        start_local = datetime(start_d.year, start_d.month, start_d.day, 0, 0, 0, tzinfo=timezone.utc)
+        end_local = datetime(end_d.year, end_d.month, end_d.day, 23, 59, 59, tzinfo=timezone.utc)
+    start_utc = start_local.astimezone(timezone.utc)
+    end_utc = end_local.astimezone(timezone.utc)
+    start_utc_iso = start_utc.isoformat().replace("+00:00", "Z")
+    end_utc_iso = end_utc.isoformat().replace("+00:00", "Z")
+
+    joined_member_ids: set[str] = set()
+    after: str | None = None
+    for _ in range(max_pages):
+        batch, page_info = await whop_api_client.list_members(
+            first=100, after=after,
+            params={"joined_after": start_utc_iso, "joined_before": end_utc_iso, "order": "joined_at", "direction": "asc"},
+        )
+        if not batch:
+            break
+        for rec in batch:
+            if not isinstance(rec, dict):
+                continue
+            mid = str(rec.get("id") or rec.get("member_id") or "").strip()
+            if mid.startswith("mber_"):
+                joined_member_ids.add(mid)
+        after = str(page_info.get("end_cursor") or "") if isinstance(page_info, dict) else ""
+        if not (bool(page_info.get("has_next_page")) if isinstance(page_info, dict) else False) or not after:
+            break
+
+    def _membership_member_id(m: dict) -> str:
+        mm = m.get("member")
+        if isinstance(mm, str) and mm.strip().startswith("mber_"):
+            return mm.strip()
+        if isinstance(mm, dict):
+            mid = str(mm.get("id") or mm.get("member_id") or "").strip()
+            if mid.startswith("mber_"):
+                return mid
+        return str(m.get("member_id") or "").strip()
+
+    window_start = (start_utc - timedelta(days=7)).isoformat().replace("+00:00", "Z")
+    window_end = (end_utc + timedelta(days=31)).isoformat().replace("+00:00", "Z")
 
     all_memberships: list[dict] = []
-    after: str | None = None
+    after = None
     per_page = 100
     while max_pages > 0:
         batch, page_info = await whop_api_client.list_memberships(
             first=per_page, after=after,
-            params={"created_after": start_utc_iso, "created_before": end_utc_iso, "order": "created_at", "direction": "asc"},
+            params={"created_after": window_start, "created_before": window_end, "order": "created_at", "direction": "asc"},
         )
         if not batch:
             break
@@ -11806,6 +11884,9 @@ async def run_whop_membership_report_for_user(user: discord.abc.User, start_str:
                 continue
             m = _whop_report_normalize_membership(rec)
             if not isinstance(m, dict):
+                continue
+            mber_id = _membership_member_id(m)
+            if mber_id and mber_id not in joined_member_ids:
                 continue
             product_title = ""
             if isinstance(m.get("product"), dict):
@@ -11846,32 +11927,40 @@ async def run_whop_membership_report_for_user(user: discord.abc.User, start_str:
     churned_all = sum(1 for m in all_memberships if _metrics_bucket_for_membership(m) == "churned")
     overall_churn = (float(churned_all) / float(total_all) * 100.0) if total_all else 0.0
 
-    def _field_value(buck: dict[str, int], total: int, churn_pct: float) -> str:
-        return (
-            f"**New Paying:** {buck.get('new_paying', 0)}\n"
-            f"**New Trials:** {buck.get('new_trials', 0)}\n"
-            f"**Members set to cancel:** {buck.get('canceling', 0)}\n"
-            f"**Churned:** {buck.get('churned', 0)}\n"
-            f"**Completed (1-time):** {buck.get('completed', 0)}\n"
-            f"**Other (Lifetime):** {buck.get('other_lifetime', 0)}\n"
-            f"**Other:** {buck.get('other', 0)}\n"
-            f"**Total:** {total}\n"
-            f"Churn: {churn_pct:.2f}%"
-        )
+    new_member_count = len(joined_member_ids)
+
+    def _field_value(buck: dict[str, int], total: int, churn_pct: float, new_members: int = 0) -> str:
+        lines = [f"**New Members:** {new_members}"]
+        lines.extend([
+            f"**New Paying:** {buck.get('new_paying', 0)}",
+            f"**New Trials:** {buck.get('new_trials', 0)}",
+            f"**Members set to cancel:** {buck.get('canceling', 0)}",
+            f"**Churned:** {buck.get('churned', 0)}",
+            f"**Completed (1-time):** {buck.get('completed', 0)}",
+            f"**Other (Lifetime):** {buck.get('other_lifetime', 0)}",
+            f"**Other:** {buck.get('other', 0)}",
+            f"**Total:** {total}",
+            f"Churn: {churn_pct:.2f}%",
+        ])
+        return "\n".join(lines)
+
+    lite_member_ids = {_membership_member_id(m) for m in lite_ms if _membership_member_id(m)}
+    full_member_ids = {_membership_member_id(m) for m in full_ms if _membership_member_id(m)}
 
     e = discord.Embed(
-        title=f"METRICS: {label} (Whop Memberships Joined)",
-        description=f"Range: **{start_d.isoformat()}** to **{end_d.isoformat()}**",
+        title=f"METRICS: {label} (Whop Members Joined)",
+        description=f"Range: **{start_d.isoformat()}** to **{end_d.isoformat()}** ({tz_name})\n**New Members:** {new_member_count} unique members joined in range",
         color=0x5865F2,
         timestamp=datetime.now(timezone.utc),
     )
-    e.add_field(name=f"Reselling Secrets LITE ({len(lite_ms)})", value=_field_value(buck_lite, len(lite_ms), churn_lite), inline=True)
-    e.add_field(name=f"Reselling Secrets FULL ({len(full_ms)})", value=_field_value(buck_full, len(full_ms), churn_full), inline=True)
-    e.add_field(name="Overall", value=f"**Total:** {total_all}\n**Churn %:** {overall_churn:.2f}%", inline=False)
+    e.add_field(name=f"Reselling Secrets LITE ({len(lite_ms)})", value=_field_value(buck_lite, len(lite_ms), churn_lite, len(lite_member_ids)), inline=True)
+    e.add_field(name=f"Reselling Secrets FULL ({len(full_ms)})", value=_field_value(buck_full, len(full_ms), churn_full, len(full_member_ids)), inline=True)
+    e.add_field(name="Overall", value=f"**New Members:** {new_member_count}\n**Total memberships:** {total_all}\n**Churn %:** {overall_churn:.2f}%", inline=False)
     e.set_footer(text="RSCheckerbot • Whop API")
 
     buf = io.StringIO()
     buf.write("product,metric,count\n")
+    buf.write(f"overall,new_members,{new_member_count}\n")
     for tag, ms in [("LITE", lite_ms), ("FULL", full_ms)]:
         buck: dict[str, int] = {}
         for m in ms:
@@ -11895,8 +11984,8 @@ async def whop_sync_summary_dm(ctx, start: str = "", end: str = ""):
     """DM a boss-friendly report to the invoker.
 
     - With NO dates: re-send the latest **Whop Sync Summary (mirror)** + CSV.
-    - With dates: generate a **Whop memberships joined report** filtered by join/created date
-      (from Whop API `created_after/created_before`) and DM an embed + CSV.
+    - With dates: generate a **Whop members joined report** filtered by joined_at (America/New_York)
+      and DM an embed + CSV.
 
     Date formats accepted:
     - YYYY-MM-DD

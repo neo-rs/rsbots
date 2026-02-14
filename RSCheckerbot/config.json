@@ -74,6 +74,8 @@
     "_comment": "Reporting + reminders (DM Neo). Runtime data is stored server-side and not synced.",
     "enabled": true,
     "dm_user_id": 971528709876113478,
+    "_comment_dm_staff_roles": "If true, cancellation reminder DMs are also sent to every member with support_tickets.permissions.staff_role_ids in the main guild.",
+    "dm_staff_roles": false,
     "timezone": "America/New_York",
     "report_time_local": "09:00",
     "weekly_day_local": "mon",

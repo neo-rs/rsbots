@@ -3436,6 +3436,22 @@ async def has_open_ticket_for_user(*, ticket_type: str, user_id: int) -> bool:
         return bool(found and _ticket_is_open(found[1]))
 
 
+async def get_open_cancellation_ticket_channel_id(user_id: int) -> int:
+    """Return the channel ID of the user's open cancellation ticket, or 0 if none."""
+    uid = int(user_id or 0)
+    if uid <= 0:
+        return 0
+    async with _INDEX_LOCK:
+        db = _index_load()
+        found = _ticket_find_open(db, ticket_type="cancellation", user_id=uid, fingerprint="")
+        if not found:
+            return 0
+        rec = found[1]
+        if not _ticket_is_open(rec):
+            return 0
+        return int(rec.get("channel_id") or 0)
+
+
 async def record_activity_from_message(message: discord.Message) -> None:
     """Update last_activity_at for ticket channels (non-bot messages only)."""
     if not _ensure_cfg_loaded():
