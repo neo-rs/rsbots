@@ -68,7 +68,7 @@
   "bot_groups": {
     "rsadminbot": ["rsadminbot"],
     "rs_bots": ["rsforwarder", "rsonboarding", "rsmentionpinger", "rscheckerbot", "rssuccessbot"],
-    "mirror_bots": ["datamanagerbot", "pingbot", "discumbot"]
+    "mirror_bots": ["datamanagerbot", "discumbot", "instorebotforwarder", "pingbot"]
   },
   "ssh_server_name": "instance-enhance (rsadmin)",
   "logging": {

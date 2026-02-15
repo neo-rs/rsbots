@@ -15,8 +15,9 @@ BOT_NAME="${2:-}"
 # Service name mapping for mirror-world bots
 declare -A SERVICES=(
     ["datamanagerbot"]="mirror-world-datamanagerbot.service"
-    ["pingbot"]="mirror-world-pingbot.service"
     ["discumbot"]="mirror-world-discumbot.service"
+    ["instorebotforwarder"]="mirror-world-instorebotforwarder.service"
+    ["pingbot"]="mirror-world-pingbot.service"
 )
 
 # Handle "all" or "allbots" case

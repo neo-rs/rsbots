@@ -43,6 +43,7 @@ reqs=(
   "$ROOT_DIR/MWDataManagerBot/requirements.txt"
   "$ROOT_DIR/MWPingBot/requirements.txt"
   "$ROOT_DIR/MWDiscumBot/requirements.txt"
+  "$ROOT_DIR/Instorebotforwarder/requirements.txt"
 )
 
 args=()

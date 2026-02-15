@@ -1,6 +1,6 @@
 """
-Run METRICS report logic for Feb 2-9 (matching main.py run_whop_membership_report_for_user).
-Prints the result without Discord/DM.
+Inspect what the "Other" bucket actually contains - print raw Whop API fields
+for memberships that fall into "other" so we can define a proper breakdown.
 """
 import asyncio
 import json
@@ -100,12 +100,29 @@ def _membership_member_id(m: dict) -> str:
     return str(m.get("member_id") or "").strip()
 
 
+def _extract_email(m: dict) -> str:
+    for key in ("email", "user_email"):
+        v = m.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    u = m.get("user")
+    if isinstance(u, dict):
+        e = str(u.get("email") or "").strip()
+        if e:
+            return e
+    mm = m.get("member")
+    if isinstance(mm, dict):
+        e = str(mm.get("email") or "").strip()
+        if e:
+            return e
+    return ""
+
+
 async def main():
     cfg = load_config()
     wh = cfg.get("whop_api") or {}
     api_key = str(wh.get("api_key") or "").strip()
     company_id = str(wh.get("company_id") or "").strip()
-    tz_name = str((cfg.get("reporting") or {}).get("timezone") or "America/New_York").strip()
     whop_cfg = cfg.get("whop_api") or {}
     prefixes = [str(x).strip() for x in whop_cfg.get("joined_report_product_title_prefixes") or ["Reselling Secrets"]]
     if not prefixes:
@@ -116,7 +133,7 @@ async def main():
     max_pages = 50
 
     if ZoneInfo:
-        tz = ZoneInfo(tz_name)
+        tz = ZoneInfo("America/New_York")
         start_local = datetime(start_d.year, start_d.month, start_d.day, 0, 0, 0, tzinfo=tz)
         end_local = datetime(end_d.year, end_d.month, end_d.day, 23, 59, 59, tzinfo=tz)
     else:
@@ -170,40 +187,38 @@ async def main():
         if not page_info.get("has_next_page") or not after:
             break
 
-    lite_ms = [m for m in all_memberships if _is_lite(str((m.get("product") or {}).get("title") or ""))]
-    full_ms = [m for m in all_memberships if not _is_lite(str((m.get("product") or {}).get("title") or ""))]
+    other_ms = [m for m in all_memberships if _metrics_bucket(m) == "other"]
+    full_other = [m for m in other_ms if not _is_lite(str((m.get("product") or {}).get("title") or ""))]
+    lite_other = [m for m in other_ms if _is_lite(str((m.get("product") or {}).get("title") or ""))]
 
-    def buckets(ms):
-        b = {}
-        for m in ms:
-            k = _metrics_bucket(m)
-            b[k] = b.get(k, 0) + 1
-        return b
+    print("=== 'Other' bucket inspection (Feb 8-15, 2026) ===\n")
+    print(f"Total in Other: {len(other_ms)} (LITE: {len(lite_other)}, FULL: {len(full_other)})\n")
 
-    buck_lite = buckets(lite_ms)
-    buck_full = buckets(full_ms)
-    churned_lite = buck_lite.get("churned", 0)
-    churned_full = buck_full.get("churned", 0)
-    churn_lite = (churned_lite / len(lite_ms) * 100) if lite_ms else 0
-    churn_full = (churned_full / len(full_ms) * 100) if full_ms else 0
+    for tag, ms in [("LITE", lite_other), ("FULL", full_other)]:
+        if not ms:
+            continue
+        print(f"--- {tag} ---")
+        for i, m in enumerate(ms):
+            st = str(m.get("status") or "").strip()
+            total_raw = m.get("total_spent") or m.get("total_spent_usd") or m.get("total_spend") or m.get("total_spend_usd")
+            spent = float(usd_amount(total_raw))
+            cape = m.get("cancel_at_period_end")
+            product = str((m.get("product") or {}).get("title") or "")
+            email = _extract_email(m)
+            mid = str(m.get("id") or m.get("membership_id") or "")
+            print(f"  [{i+1}] status={st!r} total_spent={total_raw!r} (usd={spent}) cancel_at_period_end={cape}")
+            print(f"      product={product!r} email={email[:40] if email else ''}... membership_id={mid}")
+            extra = ["payment_collection_paused", "promo_code", "plan", "trial_end", "trial_days", "plan_is_renewal", "is_first_membership"]
+            for k in extra:
+                v = m.get(k)
+                if v is not None:
+                    print(f"      {k}={v!r}")
+        print()
 
-    print("=== METRICS Report: Feb 8–15, 2026 (joined_at filter, America/New_York) ===\n")
-    lite_member_ids = {_membership_member_id(m) for m in lite_ms if _membership_member_id(m)}
-    full_member_ids = {_membership_member_id(m) for m in full_ms if _membership_member_id(m)}
-    print("Reselling Secrets LITE ({})".format(len(lite_ms)))
-    print("  New Members: {}".format(len(lite_member_ids)))
-    print("  New Paying: {}".format(buck_lite.get("new_paying", 0)))
-    print("  New Trials: {}".format(buck_lite.get("new_trials", 0)))
-    print("  Members set to cancel: {}".format(buck_lite.get("canceling", 0)))
-    print("  Churned: {}".format(buck_lite.get("churned", 0)))
-    print("  Total: {}\n".format(len(lite_ms)))
-    print("Reselling Secrets FULL ({})".format(len(full_ms)))
-    print("  New Members: {}".format(len(full_member_ids)))
-    print("  New Paying: {}".format(buck_full.get("new_paying", 0)))
-    print("  New Trials: {}".format(buck_full.get("new_trials", 0)))
-    print("  Members set to cancel: {}".format(buck_full.get("canceling", 0)))
-    print("  Churned: {}".format(buck_full.get("churned", 0)))
-    print("  Total: {}".format(len(full_ms)))
+    print("--- All top-level keys on a sample 'other' membership ---")
+    if other_ms:
+        sample = other_ms[0]
+        print(sorted(k for k in sample.keys() if not k.startswith("_")))
 
 
 if __name__ == "__main__":

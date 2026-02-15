@@ -41,6 +41,7 @@ declare -A SERVICES=(
   ["rsmentionpinger"]="mirror-world-rsmentionpinger.service"
   ["datamanagerbot"]="mirror-world-datamanagerbot.service"
   ["discumbot"]="mirror-world-discumbot.service"
+  ["instorebotforwarder"]="mirror-world-instorebotforwarder.service"
   ["pingbot"]="mirror-world-pingbot.service"
 )
 
@@ -97,7 +98,7 @@ case "$ACTION" in
           exit 0
         fi
         ;;
-      datamanagerbot|pingbot|discumbot)
+      datamanagerbot|discumbot|instorebotforwarder|pingbot)
         if [ -f "$ROOT_DIR/manage_mirror_bots.sh" ]; then
           bash "$ROOT_DIR/manage_mirror_bots.sh" "$ACTION" "$bot"
           exit 0

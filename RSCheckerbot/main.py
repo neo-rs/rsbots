@@ -11780,10 +11780,10 @@ def _metrics_bucket_for_membership(m: dict) -> str:
         return "churned"
     if st == "completed":
         return "completed"
-    if cape and st in {"active", "trialing"}:
+    if cape and st == "active":
         return "canceling"
     if is_lifetime:
-        return "other_lifetime"
+        return "other"
     if st == "active" and spent > 0:
         return "new_paying"
     if st == "trialing":
@@ -11903,7 +11903,7 @@ async def run_whop_membership_report_for_user(user: discord.abc.User, start_str:
 
     def _buckets_for_memberships(mships: list[dict]) -> tuple[dict[str, int], float]:
         buckets: dict[str, int] = {
-            "new_paying": 0, "new_trials": 0, "canceling": 0, "churned": 0, "completed": 0, "other_lifetime": 0, "other": 0,
+            "new_paying": 0, "new_trials": 0, "canceling": 0, "churned": 0, "completed": 0, "other": 0,
         }
         for m in mships:
             b = _metrics_bucket_for_membership(m)
@@ -11928,46 +11928,47 @@ async def run_whop_membership_report_for_user(user: discord.abc.User, start_str:
     overall_churn = (float(churned_all) / float(total_all) * 100.0) if total_all else 0.0
 
     new_member_count = len(joined_member_ids)
+    lite_member_ids = {_membership_member_id(m) for m in lite_ms if _membership_member_id(m)}
+    full_member_ids = {_membership_member_id(m) for m in full_ms if _membership_member_id(m)}
 
-    def _field_value(buck: dict[str, int], total: int, churn_pct: float, new_members: int = 0) -> str:
-        lines = [f"**New Members:** {new_members}"]
-        lines.extend([
+    def _field_value(buck: dict[str, int], total: int, new_members: int) -> str:
+        lines = [
+            f"**New Members:** {new_members}",
             f"**New Paying:** {buck.get('new_paying', 0)}",
             f"**New Trials:** {buck.get('new_trials', 0)}",
             f"**Members set to cancel:** {buck.get('canceling', 0)}",
             f"**Churned:** {buck.get('churned', 0)}",
-            f"**Completed (1-time):** {buck.get('completed', 0)}",
-            f"**Other (Lifetime):** {buck.get('other_lifetime', 0)}",
-            f"**Other:** {buck.get('other', 0)}",
             f"**Total:** {total}",
-            f"Churn: {churn_pct:.2f}%",
-        ])
+        ]
         return "\n".join(lines)
-
-    lite_member_ids = {_membership_member_id(m) for m in lite_ms if _membership_member_id(m)}
-    full_member_ids = {_membership_member_id(m) for m in full_ms if _membership_member_id(m)}
 
     e = discord.Embed(
         title=f"METRICS: {label} (Whop Members Joined)",
-        description=f"Range: **{start_d.isoformat()}** to **{end_d.isoformat()}** ({tz_name})\n**New Members:** {new_member_count} unique members joined in range",
+        description=f"Range: **{start_d.isoformat()}** to **{end_d.isoformat()}** ({tz_name})",
         color=0x5865F2,
         timestamp=datetime.now(timezone.utc),
     )
-    e.add_field(name=f"Reselling Secrets LITE ({len(lite_ms)})", value=_field_value(buck_lite, len(lite_ms), churn_lite, len(lite_member_ids)), inline=True)
-    e.add_field(name=f"Reselling Secrets FULL ({len(full_ms)})", value=_field_value(buck_full, len(full_ms), churn_full, len(full_member_ids)), inline=True)
-    e.add_field(name="Overall", value=f"**New Members:** {new_member_count}\n**Total memberships:** {total_all}\n**Churn %:** {overall_churn:.2f}%", inline=False)
+    e.add_field(name=f"Reselling Secrets LITE ({len(lite_ms)})", value=_field_value(buck_lite, len(lite_ms), len(lite_member_ids)), inline=True)
+    e.add_field(name=f"Reselling Secrets FULL ({len(full_ms)})", value=_field_value(buck_full, len(full_ms), len(full_member_ids)), inline=True)
     e.set_footer(text="RSCheckerbot • Whop API")
 
     buf = io.StringIO()
-    buf.write("product,metric,count\n")
-    buf.write(f"overall,new_members,{new_member_count}\n")
+    writer = csv.writer(buf)
+    header = ["product", "email", "member_id", "membership_id", "status", "bucket", "created_at", "total_spent", "cancel_at_period_end", "renewal_end"]
+    writer.writerow(header)
     for tag, ms in [("LITE", lite_ms), ("FULL", full_ms)]:
-        buck: dict[str, int] = {}
         for m in ms:
-            b = _metrics_bucket_for_membership(m)
-            buck[b] = buck.get(b, 0) + 1
-        for b, n in buck.items():
-            buf.write(f"Reselling Secrets {tag},{b},{n}\n")
+            brief = _whop_report_brief_from_membership(m, api_client=None)
+            email = _whop_report_extract_email(m)
+            mber_id = _membership_member_id(m)
+            mid = str(m.get("id") or m.get("membership_id") or "").strip()
+            st = str(m.get("status") or "").strip()
+            bucket = _metrics_bucket_for_membership(m)
+            created = str(brief.get("member_since") or "").strip()
+            total_spent = str(brief.get("total_spent") or "").strip()
+            cape = str(brief.get("cancel_at_period_end") or "").strip()
+            renewal = str(brief.get("renewal_end") or "").strip()
+            writer.writerow([f"Reselling Secrets {tag}", email, mber_id, mid, st, bucket, created, total_spent, cape, renewal])
     fname = f"whop-metrics-report_{label}.csv".replace("/", "-")
     file_obj = discord.File(fp=io.BytesIO(buf.getvalue().encode("utf-8")), filename=fname)
 

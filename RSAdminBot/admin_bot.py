@@ -3099,6 +3099,12 @@ class RSAdminBot:
             "folder": "MWDiscumBot",
             "script": "discumbot.py"  # For pkill command
         },
+        "instorebotforwarder": {
+            "name": "Instore Bot Forwarder",
+            "service": "mirror-world-instorebotforwarder.service",
+            "folder": "Instorebotforwarder",
+            "script": "instore_auto_mirror_bot.py"  # For pkill command
+        },
         "pingbot": {
             "name": "Ping Bot",
             "service": "mirror-world-pingbot.service",

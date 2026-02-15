@@ -125,9 +125,13 @@ case "$BOT_KEY" in
     cd "$ROOT_DIR/MWDiscumBot"
     exec "$PY" -u "discumbot.py"
     ;;
+  instorebotforwarder)
+    cd "$ROOT_DIR/Instorebotforwarder"
+    exec "$PY" -u "instore_auto_mirror_bot.py"
+    ;;
   *)
     echo "ERROR: Unknown bot_key: $BOT_KEY"
-    echo "Valid bot_key values: rsadminbot rsforwarder rsonboarding rscheckerbot rsmentionpinger rssuccessbot datamanagerbot pingbot discumbot"
+    echo "Valid bot_key values: rsadminbot rsforwarder rsonboarding rscheckerbot rsmentionpinger rssuccessbot datamanagerbot discumbot instorebotforwarder pingbot"
     exit 1
     ;;
 esac

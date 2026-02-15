@@ -28,6 +28,7 @@ units=(
   "mirror-world-datamanagerbot.service"
   "mirror-world-pingbot.service"
   "mirror-world-discumbot.service"
+  "mirror-world-instorebotforwarder.service"
 )
 
 echo "Bootstrapping shared venv..."
@@ -66,6 +67,8 @@ echo "      Copy MW secrets (.env/tokens.env/channel_map.json) first, then start
 echo "        sudo systemctl restart mirror-world-datamanagerbot.service"
 echo "        sudo systemctl restart mirror-world-pingbot.service"
 echo "        sudo systemctl restart mirror-world-discumbot.service"
+echo "      Instorebotforwarder: ensure Instorebotforwarder/config.secrets.json has bot_token, then:"
+echo "        sudo systemctl restart mirror-world-instorebotforwarder.service"
 
 echo "Done. Current status summary:"
 for unit in "${units[@]}"; do
