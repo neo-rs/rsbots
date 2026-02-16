@@ -12195,6 +12195,10 @@ async def run_whop_membership_report_for_user(user: discord.abc.User, start_str:
                 return str(u.get("email") or "").strip()
             return ""
 
+        # Define full_ms/lite_ms for shared CSV attachment (list_members has member format)
+        full_ms = full_members
+        lite_ms = lite_members
+
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow(["product", "email", "member_id", "most_recent_action", "usd_total_spent", "joined_at"])
