@@ -9753,6 +9753,9 @@ async def on_message(message: discord.Message):
     # Support tickets: track last_activity for non-bot messages (always, even when webhooks are enabled).
     with suppress(Exception):
         await support_tickets.record_activity_from_message(message)
+    # Support tickets: ping staff role when a member replies in a ticket channel (with cooldown to avoid spam).
+    with suppress(Exception):
+        await support_tickets.maybe_ping_staff_on_member_reply(message)
     # Ticket audit logs (human messages in ticket categories).
     with suppress(Exception):
         await support_tickets.audit_message_create(message)
@@ -11776,7 +11779,7 @@ def _metrics_bucket_for_membership(m: dict) -> str:
         product_title = str(m["product"].get("title") or "").strip().lower()
     is_lifetime = "lifetime" in product_title
 
-    if st in {"canceled", "cancelled", "expired", "churned"}:
+    if st in {"canceled", "cancelled", "expired", "churned"} and spent > 0:
         return "churned"
     if st == "completed":
         return "completed"
@@ -11837,25 +11840,6 @@ async def run_whop_membership_report_for_user(user: discord.abc.User, start_str:
     start_utc_iso = start_utc.isoformat().replace("+00:00", "Z")
     end_utc_iso = end_utc.isoformat().replace("+00:00", "Z")
 
-    joined_member_ids: set[str] = set()
-    after: str | None = None
-    for _ in range(max_pages):
-        batch, page_info = await whop_api_client.list_members(
-            first=100, after=after,
-            params={"joined_after": start_utc_iso, "joined_before": end_utc_iso, "order": "joined_at", "direction": "asc"},
-        )
-        if not batch:
-            break
-        for rec in batch:
-            if not isinstance(rec, dict):
-                continue
-            mid = str(rec.get("id") or rec.get("member_id") or "").strip()
-            if mid.startswith("mber_"):
-                joined_member_ids.add(mid)
-        after = str(page_info.get("end_cursor") or "") if isinstance(page_info, dict) else ""
-        if not (bool(page_info.get("has_next_page")) if isinstance(page_info, dict) else False) or not after:
-            break
-
     def _membership_member_id(m: dict) -> str:
         mm = m.get("member")
         if isinstance(mm, str) and mm.strip().startswith("mber_"):
@@ -11866,16 +11850,13 @@ async def run_whop_membership_report_for_user(user: discord.abc.User, start_str:
                 return mid
         return str(m.get("member_id") or "").strip()
 
-    window_start = (start_utc - timedelta(days=7)).isoformat().replace("+00:00", "Z")
-    window_end = (end_utc + timedelta(days=31)).isoformat().replace("+00:00", "Z")
-
     all_memberships: list[dict] = []
-    after = None
+    after: str | None = None
     per_page = 100
     while max_pages > 0:
         batch, page_info = await whop_api_client.list_memberships(
             first=per_page, after=after,
-            params={"created_after": window_start, "created_before": window_end, "order": "created_at", "direction": "asc"},
+            params={"created_after": start_utc_iso, "created_before": end_utc_iso, "order": "created_at", "direction": "asc"},
         )
         if not batch:
             break
@@ -11884,9 +11865,6 @@ async def run_whop_membership_report_for_user(user: discord.abc.User, start_str:
                 continue
             m = _whop_report_normalize_membership(rec)
             if not isinstance(m, dict):
-                continue
-            mber_id = _membership_member_id(m)
-            if mber_id and mber_id not in joined_member_ids:
                 continue
             product_title = ""
             if isinstance(m.get("product"), dict):
@@ -11918,38 +11896,93 @@ async def run_whop_membership_report_for_user(user: discord.abc.User, start_str:
     full_ms = [m for m in all_memberships if not _is_lite_product(
         str((m.get("product") or {}).get("title") or "") if isinstance(m.get("product"), dict) else "")]
 
+    canceling_lite: list[dict] = []
+    canceling_full: list[dict] = []
+    churned_lite: list[dict] = []
+    churned_full: list[dict] = []
+
+    async def _fetch_global_memberships(status_filter: str) -> list[dict]:
+        out: list[dict] = []
+        after: str | None = None
+        for _ in range(max_pages):
+            batch, page_info = await whop_api_client.list_memberships(
+                first=100, after=after,
+                params={"statuses[]": status_filter, "order": "created_at", "direction": "desc"},
+            )
+            if not batch:
+                break
+            for rec in batch:
+                if not isinstance(rec, dict):
+                    continue
+                m = _whop_report_normalize_membership(rec)
+                if not isinstance(m, dict):
+                    continue
+                pt = str((m.get("product") or {}).get("title") or "") if isinstance(m.get("product"), dict) else ""
+                if product_prefixes and not any(pt.lower().startswith(p.lower()) for p in product_prefixes):
+                    continue
+                out.append(m)
+            after = str(page_info.get("end_cursor") or "") if isinstance(page_info, dict) else ""
+            if not (bool(page_info.get("has_next_page")) if isinstance(page_info, dict) else False) or not after:
+                break
+        return out
+
+    canceling_all = await _fetch_global_memberships("canceling")
+    for m in canceling_all:
+        brief = _whop_report_brief_from_membership(m, api_client=None)
+        if float(usd_amount(brief.get("total_spent"))) <= 0:
+            continue
+        pt = str((m.get("product") or {}).get("title") or "") if isinstance(m.get("product"), dict) else ""
+        if _is_lite_product(pt):
+            canceling_lite.append(m)
+        else:
+            canceling_full.append(m)
+
+    seen_churned_lite: set[str] = set()
+    seen_churned_full: set[str] = set()
+    for st in ("canceled", "expired"):
+        raw = await _fetch_global_memberships(st)
+        for m in raw:
+            mid = str(m.get("id") or m.get("membership_id") or "").strip()
+            brief = _whop_report_brief_from_membership(m, api_client=None)
+            if float(usd_amount(brief.get("total_spent"))) <= 0:
+                continue
+            pt = str((m.get("product") or {}).get("title") or "") if isinstance(m.get("product"), dict) else ""
+            if _is_lite_product(pt):
+                if mid and mid not in seen_churned_lite:
+                    seen_churned_lite.add(mid)
+                    churned_lite.append(m)
+            else:
+                if mid and mid not in seen_churned_full:
+                    seen_churned_full.add(mid)
+                    churned_full.append(m)
+
     label = f"{start_d.strftime('%m-%d-%y')}" if start_d == end_d else f"{start_d.strftime('%m-%d-%y')}-{end_d.strftime('%m-%d-%y')}"
 
-    buck_lite, churn_lite = _buckets_for_memberships(lite_ms)
-    buck_full, churn_full = _buckets_for_memberships(full_ms)
+    buck_lite, _ = _buckets_for_memberships(lite_ms)
+    buck_full, _ = _buckets_for_memberships(full_ms)
 
-    total_all = len(all_memberships)
-    churned_all = sum(1 for m in all_memberships if _metrics_bucket_for_membership(m) == "churned")
-    overall_churn = (float(churned_all) / float(total_all) * 100.0) if total_all else 0.0
-
-    new_member_count = len(joined_member_ids)
     lite_member_ids = {_membership_member_id(m) for m in lite_ms if _membership_member_id(m)}
     full_member_ids = {_membership_member_id(m) for m in full_ms if _membership_member_id(m)}
 
-    def _field_value(buck: dict[str, int], total: int, new_members: int) -> str:
+    def _field_value(buck: dict[str, int], total: int, new_members: int, canceling: int, churned: int) -> str:
         lines = [
             f"**New Members:** {new_members}",
             f"**New Paying:** {buck.get('new_paying', 0)}",
             f"**New Trials:** {buck.get('new_trials', 0)}",
-            f"**Members set to cancel:** {buck.get('canceling', 0)}",
-            f"**Churned:** {buck.get('churned', 0)}",
+            f"**Members set to cancel:** {canceling}",
+            f"**Churned:** {churned}",
             f"**Total:** {total}",
         ]
         return "\n".join(lines)
 
     e = discord.Embed(
-        title=f"METRICS: {label} (Whop Members Joined)",
+        title=f"METRICS: {label} (Memberships Created)",
         description=f"Range: **{start_d.isoformat()}** to **{end_d.isoformat()}** ({tz_name})",
         color=0x5865F2,
         timestamp=datetime.now(timezone.utc),
     )
-    e.add_field(name=f"Reselling Secrets LITE ({len(lite_ms)})", value=_field_value(buck_lite, len(lite_ms), len(lite_member_ids)), inline=True)
-    e.add_field(name=f"Reselling Secrets FULL ({len(full_ms)})", value=_field_value(buck_full, len(full_ms), len(full_member_ids)), inline=True)
+    e.add_field(name=f"Reselling Secrets LITE / New Future Members ({len(lite_ms)})", value=_field_value(buck_lite, len(lite_ms), len(lite_member_ids), len(canceling_lite), len(churned_lite)), inline=True)
+    e.add_field(name=f"Reselling Secrets FULL ({len(full_ms)})", value=_field_value(buck_full, len(full_ms), len(full_member_ids), len(canceling_full), len(churned_full)), inline=True)
     e.set_footer(text="RSCheckerbot • Whop API")
 
     buf = io.StringIO()
@@ -11985,8 +12018,8 @@ async def whop_sync_summary_dm(ctx, start: str = "", end: str = ""):
     """DM a boss-friendly report to the invoker.
 
     - With NO dates: re-send the latest **Whop Sync Summary (mirror)** + CSV.
-    - With dates: generate a **Whop members joined report** filtered by joined_at (America/New_York)
-      and DM an embed + CSV.
+    - With dates: generate a **METRICS report** filtered by membership created_at (America/New_York)
+      (memberships created in range) and DM an embed + CSV.
 
     Date formats accepted:
     - YYYY-MM-DD

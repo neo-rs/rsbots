@@ -69,7 +69,7 @@ def _metrics_bucket(m: dict) -> str:
     product_title = str((m.get("product") or {}).get("title") or "").lower() if isinstance(m.get("product"), dict) else ""
     is_lifetime = "lifetime" in product_title
 
-    if st in {"canceled", "cancelled", "expired", "churned"}:
+    if st in {"canceled", "cancelled", "expired", "churned"} and spent > 0:
         return "churned"
     if st == "completed":
         return "completed"
@@ -126,42 +126,20 @@ async def main():
     end_utc = end_local.astimezone(timezone.utc)
     start_utc_iso = start_utc.isoformat().replace("+00:00", "Z")
     end_utc_iso = end_utc.isoformat().replace("+00:00", "Z")
-    window_start = (start_utc - timedelta(days=7)).isoformat().replace("+00:00", "Z")
-    window_end = (end_utc + timedelta(days=31)).isoformat().replace("+00:00", "Z")
 
     client = WhopAPIClient(api_key, str(wh.get("base_url") or "https://api.whop.com/api/v1"), company_id)
-
-    joined_member_ids = set()
-    after = None
-    for _ in range(max_pages):
-        batch, page_info = await client.list_members(
-            first=100, after=after,
-            params={"joined_after": start_utc_iso, "joined_before": end_utc_iso, "order": "joined_at", "direction": "asc"},
-        )
-        if not batch:
-            break
-        for rec in batch:
-            mid = str(rec.get("id") or rec.get("member_id") or "").strip()
-            if mid.startswith("mber_"):
-                joined_member_ids.add(mid)
-        after = str(page_info.get("end_cursor") or "")
-        if not page_info.get("has_next_page") or not after:
-            break
 
     all_memberships = []
     after = None
     for _ in range(max_pages):
         batch, page_info = await client.list_memberships(
             first=100, after=after,
-            params={"created_after": window_start, "created_before": window_end, "order": "created_at", "direction": "asc"},
+            params={"created_after": start_utc_iso, "created_before": end_utc_iso, "order": "created_at", "direction": "asc"},
         )
         if not batch:
             break
         for rec in batch:
             m = _norm_membership(rec)
-            mber_id = _membership_member_id(m)
-            if mber_id and mber_id not in joined_member_ids:
-                continue
             pt = str((m.get("product") or {}).get("title") or "")
             if prefixes and not any(pt.lower().startswith(p.lower()) for p in prefixes):
                 continue
@@ -182,27 +160,71 @@ async def main():
 
     buck_lite = buckets(lite_ms)
     buck_full = buckets(full_ms)
-    churned_lite = buck_lite.get("churned", 0)
-    churned_full = buck_full.get("churned", 0)
-    churn_lite = (churned_lite / len(lite_ms) * 100) if lite_ms else 0
-    churn_full = (churned_full / len(full_ms) * 100) if full_ms else 0
 
-    print("=== METRICS Report: Feb 8–15, 2026 (joined_at filter, America/New_York) ===\n")
+    canceling_lite, canceling_full = [], []
+    churned_lite, churned_full = [], []
+    async def _fetch_global(s):
+        out = []
+        after = None
+        for _ in range(max_pages):
+            batch, pi = await client.list_memberships(first=100, after=after, params={"statuses[]": s, "order": "created_at", "direction": "desc"})
+            if not batch:
+                break
+            for rec in batch:
+                m = _norm_membership(rec)
+                pt = str((m.get("product") or {}).get("title") or "")
+                if prefixes and not any(pt.lower().startswith(p.lower()) for p in prefixes):
+                    continue
+                out.append(m)
+            after = str(pi.get("end_cursor") or "")
+            if not pi.get("has_next_page") or not after:
+                break
+        return out
+
+    canceling_all = await _fetch_global("canceling")
+    for m in canceling_all:
+        total_raw = m.get("total_spent") or m.get("total_spent_usd") or m.get("total_spend") or m.get("total_spend_usd")
+        if float(usd_amount(total_raw)) <= 0:
+            continue
+        pt = str((m.get("product") or {}).get("title") or "")
+        if _is_lite(pt):
+            canceling_lite.append(m)
+        else:
+            canceling_full.append(m)
+
+    seen_l, seen_f = set(), set()
+    for st in ("canceled", "expired"):
+        raw = await _fetch_global(st)
+        for m in raw:
+            mid = str(m.get("id") or m.get("membership_id") or "").strip()
+            total_raw = m.get("total_spent") or m.get("total_spent_usd") or m.get("total_spend") or m.get("total_spend_usd")
+            if float(usd_amount(total_raw)) <= 0:
+                continue
+            pt = str((m.get("product") or {}).get("title") or "")
+            if _is_lite(pt):
+                if mid and mid not in seen_l:
+                    seen_l.add(mid)
+                    churned_lite.append(m)
+            else:
+                if mid and mid not in seen_f:
+                    seen_f.add(mid)
+                    churned_full.append(m)
+    print("=== METRICS Report: Feb 8–15, 2026 (memberships created in range, America/New_York) ===\n")
     lite_member_ids = {_membership_member_id(m) for m in lite_ms if _membership_member_id(m)}
     full_member_ids = {_membership_member_id(m) for m in full_ms if _membership_member_id(m)}
     print("Reselling Secrets LITE ({})".format(len(lite_ms)))
     print("  New Members: {}".format(len(lite_member_ids)))
     print("  New Paying: {}".format(buck_lite.get("new_paying", 0)))
     print("  New Trials: {}".format(buck_lite.get("new_trials", 0)))
-    print("  Members set to cancel: {}".format(buck_lite.get("canceling", 0)))
-    print("  Churned: {}".format(buck_lite.get("churned", 0)))
+    print("  Members set to cancel: {}".format(len(canceling_lite)))
+    print("  Churned: {}".format(len(churned_lite)))
     print("  Total: {}\n".format(len(lite_ms)))
     print("Reselling Secrets FULL ({})".format(len(full_ms)))
     print("  New Members: {}".format(len(full_member_ids)))
     print("  New Paying: {}".format(buck_full.get("new_paying", 0)))
     print("  New Trials: {}".format(buck_full.get("new_trials", 0)))
-    print("  Members set to cancel: {}".format(buck_full.get("canceling", 0)))
-    print("  Churned: {}".format(buck_full.get("churned", 0)))
+    print("  Members set to cancel: {}".format(len(canceling_full)))
+    print("  Churned: {}".format(len(churned_full)))
     print("  Total: {}".format(len(full_ms)))
 
 

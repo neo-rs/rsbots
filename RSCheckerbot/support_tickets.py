@@ -104,6 +104,8 @@ class SupportTicketConfig:
     member_lookup_panel_description: str
     whop_logs_channel_id: int
     whop_membership_logs_channel_id: int
+    member_response_ping_enabled: bool
+    member_response_ping_cooldown_seconds: int
 
 
 _BOT: commands.Bot | None = None
@@ -117,6 +119,8 @@ _WHOP_API_CLIENT = None  # optional WhopAPIClient injected by main.py
 _RUN_MEMBERSHIP_REPORT_CALLBACK = None  # async (user, start_str, end_str) -> (success, message)
 _LOOKUP_LIVE_CACHE: dict[int, dict] = {}
 _LOOKUP_LIVE_CACHE_AT: dict[int, float] = {}
+# Per-channel cooldown for member-response staff pings (channel_id -> last ping timestamp)
+_MEMBER_RESPONSE_PING_LAST: dict[int, float] = {}
 
 
 def _as_int(v: object) -> int:
@@ -294,6 +298,8 @@ def initialize(
         or "Use the buttons below to look up a member’s Discord + Whop baseline history.",
         whop_logs_channel_id=_as_int(inv.get("whop_logs_channel_id")),
         whop_membership_logs_channel_id=_as_int(inv.get("whop_webhook_channel_id")),
+        member_response_ping_enabled=_as_bool((st.get("member_response_ping") or {}).get("enabled", True)),
+        member_response_ping_cooldown_seconds=max(60, _as_int((st.get("member_response_ping") or {}).get("cooldown_seconds")) or 300),
     )
 
     # Register persistent view so buttons survive restarts.
@@ -3478,6 +3484,39 @@ async def record_activity_from_message(message: discord.Message) -> None:
         rec["last_activity_at_iso"] = (message.created_at or _now_utc()).astimezone(timezone.utc).isoformat()
         db["tickets"][tid] = rec  # type: ignore[index]
         _index_save(db)
+
+
+async def maybe_ping_staff_on_member_reply(message: discord.Message) -> None:
+    """When a non-staff member sends a message in a ticket channel, ping the staff role once per cooldown to avoid spam."""
+    if not _ensure_cfg_loaded() or not _BOT:
+        return
+    cfg = _cfg()
+    if not cfg or not getattr(cfg, "member_response_ping_enabled", True):
+        return
+    if not message or not getattr(message, "channel", None) or not message.guild:
+        return
+    if not message.author or getattr(message.author, "bot", False):
+        return
+    if not isinstance(message.author, discord.Member):
+        return
+    if _is_staff_member(message.author):
+        return
+    cid = int(getattr(message.channel, "id", 0) or 0)
+    if cid <= 0 or not is_ticket_channel(cid):
+        return
+    cooldown = max(60, getattr(cfg, "member_response_ping_cooldown_seconds", 300))
+    now = _now_utc().timestamp()
+    if _MEMBER_RESPONSE_PING_LAST.get(cid, 0) + cooldown > now:
+        return
+    ping = _support_ping_role_mention()
+    if not ping or not isinstance(message.channel, discord.TextChannel):
+        return
+    _MEMBER_RESPONSE_PING_LAST[cid] = now
+    with suppress(Exception):
+        await message.channel.send(
+            content=f"Member replied — {ping}".strip(),
+            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+        )
 
 
 def _ticket_find_open(

@@ -75,7 +75,7 @@
     "enabled": true,
     "dm_user_id": 971528709876113478,
     "_comment_dm_staff_roles": "If true, cancellation reminder DMs are also sent to every member with support_tickets.permissions.staff_role_ids in the main guild.",
-    "dm_staff_roles": false,
+    "dm_staff_roles": true,
     "timezone": "America/New_York",
     "report_time_local": "09:00",
     "weekly_day_local": "mon",
@@ -234,6 +234,11 @@
       "admin_role_ids": [876598078092754985],
       "_comment_include_owner": "When true, the ticket owner can see/respond in their ticket channel.",
       "include_ticket_owner_in_channel": true
+    },
+    "_comment_member_response_ping": "When a member (non-staff) replies in a support ticket channel, ping the staff role once per cooldown to avoid spam.",
+    "member_response_ping": {
+      "enabled": true,
+      "cooldown_seconds": 300
     },
     "ticket_roles": {
       "_comment": "Auto-assign roles when a ticket is OPEN; remove on close.",
