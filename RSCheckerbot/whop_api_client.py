@@ -475,6 +475,37 @@ class WhopAPIClient:
             log.warning(f"Failed to list members: {e}")
             return ([], {})
     
+    async def list_payments(
+        self,
+        *,
+        first: int = 100,
+        after: str | None = None,
+        params: Optional[Dict] = None,
+    ) -> tuple[List[Dict], Dict]:
+        """List payments for the company with optional filters (created_after, created_before, product_ids, statuses).
+
+        Returns: (payments, page_info)
+        """
+        try:
+            q: Dict = {"company_id": self.company_id}
+            try:
+                if int(first) > 0:
+                    q["first"] = int(first)
+            except Exception:
+                q["first"] = 100
+            if after:
+                q["after"] = str(after)
+            if isinstance(params, dict):
+                q.update(params)
+            response = await self._request("GET", "/payments", params=q)
+            data = response.get("data", []) if isinstance(response, dict) else []
+            page_info = response.get("page_info", {}) if isinstance(response, dict) else {}
+            payments: List[Dict] = data if isinstance(data, list) else []
+            return (payments, page_info)
+        except WhopAPIError as e:
+            log.warning(f"Failed to list payments: {e}")
+            return ([], {})
+
     async def get_payments_for_membership(self, membership_id: str) -> List[Dict]:
         """
         Get payment history for a membership.

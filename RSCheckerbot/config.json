@@ -204,6 +204,15 @@
     "joined_report_statuses": ["active", "trialing", "canceling", "completed", "canceled", "expired"],
     "joined_report_product_title_prefixes": ["Reselling Secrets"],
     "joined_report_max_pages": 50,
+    "_comment_metrics_product_ids": "Product IDs for METRICS report (matches Whop Users tab). FULL=Reselling Secrets+Lifetime, LITE=Reselling Secrets Lite. From Whop dashboard URL access_pass_ids.",
+    "_comment_metrics_include_lite": "When false, LITE section is omitted from METRICS report (set true when Cho wants it back).",
+    "metrics_report_include_lite": false,
+    "_comment_metrics_new_paying_min_spent": "New Paying = usd_total_spent > this (from $0 to >$1).",
+    "metrics_report_new_paying_min_spent": 1.0,
+    "metrics_report_product_ids": {
+      "full": ["prod_RrcvGelB8tVgu", "prod_76xygbFOv0aUM"],
+      "lite": ["prod_U52ytqRZdCFak"]
+    },
     "_comment_sync_behavior": "Controls what the startup/6h Whop sync is allowed to do.",
     "enforce_role_removals": false,
     "startup_scan_dm_report": true,
