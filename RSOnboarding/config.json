@@ -28,5 +28,6 @@
     "pending": "⬜"
   },
   "welcome_log_message": "<@{welcome_ping_user_id}> New welcome ticket opened for {member.mention}: {ticket.jump_url}",
-  "full_access_message": "✅ You now have full access!"
+  "full_access_message": "✅ You now have full access!",
+  "completion_staff_role_id": 1351371587617558539
 }

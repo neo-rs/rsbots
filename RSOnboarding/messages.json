@@ -38,6 +38,7 @@
     }
   },
   "auto_close_message": "⏰ 24 hours passed. Access granted automatically.",
+  "completion_message": "Yo {member_mention} 🎉 you're officially in.\n\nOnboarding is done! Now it's time to start cookin.\nCheck out the <#1255590577144201358>, <#1463165076218576947>, <#1420975781143642232>, turn notifications on and get the right <#1345505161409335389> for you to not miss anything, and don't hesitate to ask <#1354516451389739170>.\n\n{staff_mention} is here if you need anything. Let's get to work.",
   "button_labels": {
     "get_full_access": "Get Full Access",
     "close_ticket": "Close Ticket",

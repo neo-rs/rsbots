@@ -675,19 +675,36 @@ class RSOnboardingBot:
                     if data:
                         ch = await self.safe_get_channel(guild, data.get("channel_id"))
 
-                # Best-effort message + delete if channel exists
+                # When member finishes onboarding: send completion message and keep channel. Otherwise message + delete.
+                member_finished = source in ("button_persistent_finish", "button_stepper_finish")
                 if ch:
                     try:
-                        auto_close_msg = self.messages.get("auto_close_message", "⏰ 24 hours passed. Access granted automatically.")
-                        try:
-                            await ch.send(auto_close_msg)
-                        except discord.NotFound:
-                            ch = None
-                        if ch and ch.permissions_for(guild.me).manage_channels:
+                        if member_finished:
+                            completion_msg = self.messages.get("completion_message") or self.config.get("completion_message")
+                            staff_role_id = self.config.get("completion_staff_role_id")
+                            if completion_msg:
+                                staff_mention = f"<@&{staff_role_id}>" if staff_role_id else ""
+                                text = completion_msg.replace("{member_mention}", member.mention).replace("{staff_mention}", staff_mention)
+                                staff_role = guild.get_role(staff_role_id) if staff_role_id else None
+                                allowed = discord.AllowedMentions(users=[member], roles=[staff_role] if staff_role else [])
+                                try:
+                                    await ch.send(text, allowed_mentions=allowed)
+                                except discord.NotFound:
+                                    ch = None
+                                except Exception as e:
+                                    await self.log_error(guild, f"Could not send completion message: {e}", context=f"grant_member_and_close - {source}")
+                            # Do not delete channel when member finished
+                        else:
+                            auto_close_msg = self.messages.get("auto_close_message", "⏰ 24 hours passed. Access granted automatically.")
                             try:
-                                await ch.delete()
+                                await ch.send(auto_close_msg)
                             except discord.NotFound:
-                                pass
+                                ch = None
+                            if ch and ch.permissions_for(guild.me).manage_channels:
+                                try:
+                                    await ch.delete()
+                                except discord.NotFound:
+                                    pass
                     except Exception as e:
                         if "10003" not in str(e):
                             await self.log_error(
