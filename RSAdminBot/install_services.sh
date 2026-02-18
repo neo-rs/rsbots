@@ -28,6 +28,7 @@ units=(
   "mirror-world-datamanagerbot.service"
   "mirror-world-pingbot.service"
   "mirror-world-discumbot.service"
+  "mirror-world-dailyschedulereminder.service"
   "mirror-world-instorebotforwarder.service"
 )
 
@@ -69,6 +70,8 @@ echo "        sudo systemctl restart mirror-world-pingbot.service"
 echo "        sudo systemctl restart mirror-world-discumbot.service"
 echo "      Instorebotforwarder: ensure Instorebotforwarder/config.secrets.json has bot_token, then:"
 echo "        sudo systemctl restart mirror-world-instorebotforwarder.service"
+echo "      DailyScheduleReminder: ensure DailyScheduleReminder/config.secrets.json has token (Discord user token), then:"
+echo "        sudo systemctl restart mirror-world-dailyschedulereminder.service"
 
 echo "Done. Current status summary:"
 for unit in "${units[@]}"; do

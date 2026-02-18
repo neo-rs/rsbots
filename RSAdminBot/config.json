@@ -65,11 +65,11 @@
     "branch": "main",
     "include_folders": ["RSAdminBot", "RSForwarder", "RSCheckerbot", "RSMentionPinger", "RSOnboarding", "RSuccessBot"]
   },
-  "bot_groups": {
-    "rsadminbot": ["rsadminbot"],
-    "rs_bots": ["rsforwarder", "rsonboarding", "rsmentionpinger", "rscheckerbot", "rssuccessbot"],
-    "mirror_bots": ["datamanagerbot", "discumbot", "instorebotforwarder", "pingbot"]
-  },
+    "bot_groups": {
+      "rsadminbot": ["rsadminbot"],
+      "rs_bots": ["rsforwarder", "rsonboarding", "rsmentionpinger", "rscheckerbot", "rssuccessbot"],
+      "mirror_bots": ["dailyschedulereminder", "datamanagerbot", "discumbot", "instorebotforwarder", "pingbot"]
+    },
   "ssh_server_name": "instance-enhance (rsadmin)",
   "logging": {
     "log_channel_id": "1452590450631376906",

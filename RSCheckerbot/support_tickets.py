@@ -28,6 +28,7 @@ from whop_brief import enrich_whop_brief_from_membership_logs as _enrich_whop_br
 
 BASE_DIR = Path(__file__).resolve().parent
 INDEX_PATH = BASE_DIR / "data" / "tickets_index.json"
+PENDING_STARTUP_PATH = BASE_DIR / "data" / "pending_ticket_startup_messages.json"
 MIGRATIONS_STATE_PATH = BASE_DIR / "data" / "support_tickets_migrations.json"
 MEMBER_HISTORY_PATH = BASE_DIR / "member_history.json"
 WHOP_IDENTITY_CACHE_PATH = BASE_DIR / "whop_identity_cache.json"
@@ -70,6 +71,7 @@ class SupportTicketConfig:
     cooldown_cancellation_seconds: int
     cooldown_member_welcome_seconds: int
     startup_enabled: bool
+    startup_external_sender_enabled: bool
     startup_delay_seconds: int
     startup_recent_history_limit: int
     startup_templates: dict[str, str]
@@ -261,6 +263,7 @@ def initialize(
         cooldown_cancellation_seconds=max(0, _as_int((dd.get("cancellation") or {}).get("cooldown_seconds")) or 86400),
         cooldown_member_welcome_seconds=max(0, _as_int((dd.get("member_welcome") or {}).get("cooldown_seconds")) or 86400),
         startup_enabled=_as_bool(sm.get("enabled")),
+        startup_external_sender_enabled=_as_bool(sm.get("external_sender_enabled")),
         startup_delay_seconds=max(5, _as_int(sm.get("delay_seconds")) or 300),
         startup_recent_history_limit=max(10, min(200, _as_int(sm.get("recent_history_limit")) or 50)),
         startup_templates={str(k).strip().lower(): str(v) for k, v in (sm_templates or {}).items() if str(k or "").strip()},
@@ -2362,6 +2365,7 @@ async def sweep_startup_messages() -> None:
         return
 
     now = _now_utc()
+    pending_list: list[dict] = []
 
     # Copy candidates under lock to avoid holding lock across awaits.
     candidates: list[tuple[str, dict]] = []
@@ -2436,6 +2440,16 @@ async def sweep_startup_messages() -> None:
         if not content:
             continue
 
+        if cfg.startup_external_sender_enabled:
+            # Do not send: DailyScheduleReminder sends as the Discord user (single-sender rule).
+            pending_list.append({
+                "ticket_id": tid,
+                "channel_id": ch_id,
+                "user_id": uid,
+                "ticket_type": ttype,
+            })
+            continue
+
         ok = True
         try:
             allow = discord.AllowedMentions(
@@ -2459,6 +2473,13 @@ async def sweep_startup_messages() -> None:
                         rec2["startup_sent_at_iso"] = _now_iso()
                         db2["tickets"][tid2] = rec2  # type: ignore[index]
                         _index_save(db2)
+
+    if pending_list and cfg.startup_external_sender_enabled:
+        try:
+            PENDING_STARTUP_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _save_json(PENDING_STARTUP_PATH, {"pending": pending_list, "updated_at_iso": _now_iso()})
+        except Exception as ex:
+            await _log(f"❌ support_tickets: failed to write pending startup file: {str(ex)[:180]}")
 
 
 def _ticket_by_channel_id(db: dict, channel_id: int) -> tuple[str, dict] | None:

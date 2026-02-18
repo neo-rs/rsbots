@@ -54,6 +54,7 @@ class RSOnboardingBot:
         self.messages: Dict[str, Any] = {}
         
         self.ticket_data: Dict[str, Any] = {}
+        self._completion_sent_channels: set = set()  # channel IDs that already received the completion message
         self._close_locks = defaultdict(asyncio.Lock)
         self._open_locks = defaultdict(asyncio.Lock)
         self._recent_member_dm: Dict[int, float] = {}
@@ -72,6 +73,7 @@ class RSOnboardingBot:
         self.load_config()
         self.load_messages()
         self.load_tickets()
+        self._load_completion_sent()
         
         # Validate required config
         if not self.config.get("bot_token"):
@@ -161,6 +163,29 @@ class RSOnboardingBot:
                 self.ticket_data = {}
         else:
             self.ticket_data = {}
+    
+    def _load_completion_sent(self):
+        """Load set of channel IDs that already received the completion message"""
+        path = self.base_path / "completion_sent.json"
+        if path.exists():
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                self._completion_sent_channels = set(int(x) for x in data.get("channel_ids", []))
+            except Exception:
+                self._completion_sent_channels = set()
+        else:
+            self._completion_sent_channels = set()
+    
+    def _save_completion_sent(self):
+        """Persist channel IDs that received the completion message"""
+        path = self.base_path / "completion_sent.json"
+        try:
+            data = {"channel_ids": list(self._completion_sent_channels)}
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"{Colors.RED}[Completion] Failed to save completion_sent: {e}{Colors.RESET}")
     
     def save_tickets(self):
         """Save ticket data to file (active tickets only) with atomic writes"""
@@ -680,19 +705,25 @@ class RSOnboardingBot:
                 if ch:
                     try:
                         if member_finished:
-                            completion_msg = self.messages.get("completion_message") or self.config.get("completion_message")
-                            staff_role_id = self.config.get("completion_staff_role_id")
-                            if completion_msg:
-                                staff_mention = f"<@&{staff_role_id}>" if staff_role_id else ""
-                                text = completion_msg.replace("{member_mention}", member.mention).replace("{staff_mention}", staff_mention)
-                                staff_role = guild.get_role(staff_role_id) if staff_role_id else None
-                                allowed = discord.AllowedMentions(users=[member], roles=[staff_role] if staff_role else [])
-                                try:
-                                    await ch.send(text, allowed_mentions=allowed)
-                                except discord.NotFound:
-                                    ch = None
-                                except Exception as e:
-                                    await self.log_error(guild, f"Could not send completion message: {e}", context=f"grant_member_and_close - {source}")
+                            channel_id = getattr(ch, 'id', None)
+                            already_sent = channel_id in self._completion_sent_channels
+                            if not already_sent:
+                                completion_msg = self.messages.get("completion_message") or self.config.get("completion_message")
+                                staff_role_id = self.config.get("completion_staff_role_id")
+                                if completion_msg:
+                                    staff_mention = f"<@&{staff_role_id}>" if staff_role_id else ""
+                                    text = completion_msg.replace("{member_mention}", member.mention).replace("{staff_mention}", staff_mention)
+                                    staff_role = guild.get_role(staff_role_id) if staff_role_id else None
+                                    allowed = discord.AllowedMentions(users=[member], roles=[staff_role] if staff_role else [])
+                                    try:
+                                        await ch.send(text, allowed_mentions=allowed)
+                                        if channel_id is not None:
+                                            self._completion_sent_channels.add(channel_id)
+                                            self._save_completion_sent()
+                                    except discord.NotFound:
+                                        ch = None
+                                    except Exception as e:
+                                        await self.log_error(guild, f"Could not send completion message: {e}", context=f"grant_member_and_close - {source}")
                             # Do not delete channel when member finished
                         else:
                             auto_close_msg = self.messages.get("auto_close_message", "⏰ 24 hours passed. Access granted automatically.")

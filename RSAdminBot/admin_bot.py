@@ -3093,6 +3093,12 @@ class RSAdminBot:
             "folder": "MWDataManagerBot",
             "script": "datamanagerbot.py"  # For pkill command
         },
+        "dailyschedulereminder": {
+            "name": "Daily Schedule Reminder",
+            "service": "mirror-world-dailyschedulereminder.service",
+            "folder": "DailyScheduleReminder",
+            "script": "reminder_bot.py"  # For pkill command
+        },
         "discumbot": {
             "name": "Discum Bot",
             "service": "mirror-world-discumbot.service",

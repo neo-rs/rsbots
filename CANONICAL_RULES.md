@@ -200,6 +200,29 @@ It must stage updates and apply them on restart via the systemd wrapper (`RSAdmi
 
 ---
 
+## 📬 Ticket startup message (single sender – RSCheckerbot vs DailyScheduleReminder)
+
+The **5-minute “checking in” message** in support ticket channels must be sent by **exactly one** sender. No parallel sending.
+
+| Config | Who sends | Where |
+|--------|-----------|--------|
+| `RSCheckerbot` **`support_tickets.startup_messages.external_sender_enabled: false`** (default) | RSCheckerbot | In-ticket (bot account) |
+| `external_sender_enabled: true` **and** `DailyScheduleReminder` **`ticket_startup.enabled: true`** | DailyScheduleReminder | In-ticket (Discord **user** account) |
+
+**Rules:**
+
+1. **Never enable both sending paths.** If `external_sender_enabled: true`, RSCheckerbot must only write `RSCheckerbot/data/pending_ticket_startup_messages.json` and must not call send in that flow. DailyScheduleReminder reads that file and sends; then it updates `tickets_index.json` (`startup_sent_at_iso`) so RSCheckerbot does not re-enqueue.
+2. **One source of truth for “pending”:** RSCheckerbot is the only writer of the pending file. DailyScheduleReminder is the only consumer and the only updater of `startup_sent_at_iso` for that flow.
+3. If DailyScheduleReminder is used for sending, it must run from the same repo root as RSCheckerbot (it reads RSCheckerbot config and data paths).
+
+### DailyScheduleReminder on Oracle server
+
+- **Service:** `mirror-world-dailyschedulereminder.service` (installed via `RSAdminBot/install_services.sh`).
+- **Run:** `run_bot.sh dailyschedulereminder` (WorkingDirectory = repo root; runs `DailyScheduleReminder/reminder_bot.py`).
+- **Secrets:** `DailyScheduleReminder/config.secrets.json` (Discord **user** token) must be created on the server; it is **not** synced. See `DailyScheduleReminder/README.md` (Oracle server section).
+
+---
+
 ## 🧪 VERIFICATION RULE
 
 If old code is removed and something breaks:
@@ -263,6 +286,7 @@ Notes:
    - `registry.json` - Runtime registry (RSCheckerbot only, NOT synced)
    - `queue.json` - Runtime queue (RSCheckerbot only, NOT synced)
    - `invites.json` - Invite tracking (RSCheckerbot only, NOT synced)
+   - `pending_ticket_startup_messages.json` - Pending ticket startup (RSCheckerbot only, NOT synced; used when `startup_messages.external_sender_enabled` is true)
    - Other bot-specific runtime JSON files (NOT synced)
 
 3. **Forbidden data files:**

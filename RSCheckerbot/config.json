@@ -325,6 +325,8 @@
     "startup_messages": {
       "_comment": "5-minute startup acknowledgement (Pattern A sweeper). Disabled by default.",
       "enabled": true,
+      "_comment_external_sender": "When true, RSCheckerbot writes pending tickets to data/pending_ticket_startup_messages.json; DailyScheduleReminder sends the message (as the Discord user).",
+      "external_sender_enabled": false,
       "delay_seconds": 300,
       "_comment_check_interval_seconds": "How often the maintenance loop checks for tickets needing a startup message.",
       "check_interval_seconds": 60,

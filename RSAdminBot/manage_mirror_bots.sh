@@ -14,6 +14,7 @@ BOT_NAME="${2:-}"
 
 # Service name mapping for mirror-world bots
 declare -A SERVICES=(
+    ["dailyschedulereminder"]="mirror-world-dailyschedulereminder.service"
     ["datamanagerbot"]="mirror-world-datamanagerbot.service"
     ["discumbot"]="mirror-world-discumbot.service"
     ["instorebotforwarder"]="mirror-world-instorebotforwarder.service"
