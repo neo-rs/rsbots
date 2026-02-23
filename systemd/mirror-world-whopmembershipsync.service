@@ -1,0 +1,16 @@
+[Unit]
+Description=Mirror World - Whop Membership to Google Sheets Sync (continuous sync)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=rsadmin
+WorkingDirectory=/home/rsadmin/bots/mirror-world
+ExecStart=/bin/bash /home/rsadmin/bots/mirror-world/RSAdminBot/run_bot.sh whopmembershipsync
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

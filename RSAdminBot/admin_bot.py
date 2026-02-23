@@ -3099,6 +3099,12 @@ class RSAdminBot:
             "folder": "DailyScheduleReminder",
             "script": "reminder_bot.py"  # For pkill command
         },
+        "whopmembershipsync": {
+            "name": "Whop Membership Sync",
+            "service": "mirror-world-whopmembershipsync.service",
+            "folder": "WhopMembershipSync",
+            "script": "main.py"  # For pkill command
+        },
         "discumbot": {
             "name": "Discum Bot",
             "service": "mirror-world-discumbot.service",

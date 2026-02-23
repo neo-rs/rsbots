@@ -49,7 +49,7 @@ if not defined PY_EXE (
   exit /b 1
 )
 
-set "MW_BOTS=MWDataManagerBot,MWPingBot,MWDiscumBot"
+set "MW_BOTS=DailyScheduleReminder,Instorebotforwarder,MWDataManagerBot,MWPingBot,MWDiscumBot"
 set "DEFAULT_OUT_DIR=%cd%\Oraclserver-files-mwbots"
 set "OUT_DIR=%DEFAULT_OUT_DIR%"
 set "KEEP_SNAPSHOTS=1"
@@ -72,19 +72,23 @@ echo [1] MWBots: Download snapshot now
 echo [2] MWBots: Baseline check (latest snapshot)
 echo [3] MWBots: Baseline check + download first
 echo [4] Prune old snapshots only (no download)
+echo [5] Sync and deploy ticket startup (local -^> Oracle)
+echo [6] WhopMembershipSync full setup (sync + install on Oracle)
 echo.
 echo [S] Settings
 echo [Q] Quit
 echo.
 
-choice /c 1234SQ /n /m "Choose: "
+choice /c 123456SQ /n /m "Choose: "
 set "ERR=%errorlevel%"
 if "%ERR%"=="1" goto do_mw_download
 if "%ERR%"=="2" goto do_mw_baseline
 if "%ERR%"=="3" goto do_mw_baseline_download
 if "%ERR%"=="4" goto do_prune
-if "%ERR%"=="5" goto settings
-if "%ERR%"=="6" goto done
+if "%ERR%"=="5" goto do_sync_ticket_startup
+if "%ERR%"=="6" goto do_whop_sync_setup
+if "%ERR%"=="7" goto settings
+if "%ERR%"=="8" goto done
 goto menu
 
 :settings
@@ -156,6 +160,36 @@ goto menu
 echo.
 echo Pruning old snapshots only (no download)...
 "%PY_EXE%" %PY_ARGS% scripts\download_oracle_snapshot_mwbots.py --out-dir "%OUT_DIR%" --keep-snapshots %KEEP_SNAPSHOTS% --prune-only
+goto menu
+
+:do_sync_ticket_startup
+echo.
+echo Running sync and deploy ticket startup...
+if defined SERVER_NAME (
+  "%PY_EXE%" %PY_ARGS% scripts\sync_and_deploy_ticket_startup.py --server-name "%SERVER_NAME%"
+) else (
+  "%PY_EXE%" %PY_ARGS% scripts\sync_and_deploy_ticket_startup.py
+)
+if errorlevel 1 (
+  echo.
+  echo NOTE: If SSH timed out, copy scripts\on_oracle_finish_ticket_startup.sh to the
+  echo       server and run it there: bash on_oracle_finish_ticket_startup.sh
+)
+goto menu
+
+:do_whop_sync_setup
+echo.
+echo WhopMembershipSync full setup (sync + install on Oracle)...
+if defined SERVER_NAME (
+  "%PY_EXE%" %PY_ARGS% scripts\setup_whopmembershipsync_on_oracle.py --server-name "%SERVER_NAME%"
+) else (
+  "%PY_EXE%" %PY_ARGS% scripts\setup_whopmembershipsync_on_oracle.py
+)
+if errorlevel 1 (
+  echo.
+  echo NOTE: If SSH timed out, sync is done. On Oracle run:
+  echo   bash /home/rsadmin/bots/mirror-world/scripts/on_oracle_setup_whopmembershipsync.sh
+)
 goto menu
 
 :done

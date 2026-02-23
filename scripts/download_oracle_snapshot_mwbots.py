@@ -7,6 +7,8 @@ Creates a tar.gz snapshot on the Oracle server and downloads/extracts it into:
 
 Scope:
 - MW bot folders (if present on the server):
+  - DailyScheduleReminder
+  - Instorebotforwarder
   - MWDataManagerBot
   - MWPingBot
   - MWDiscumBot
@@ -42,9 +44,12 @@ SERVERS_PATH = REPO_ROOT / "oraclekeys" / "servers.json"
 
 
 INCLUDES_DEFAULT = [
+    "DailyScheduleReminder",
+    "Instorebotforwarder",
     "MWDataManagerBot",
     "MWPingBot",
     "MWDiscumBot",
+    "WhopMembershipSync",
     "systemd",
 ]
 

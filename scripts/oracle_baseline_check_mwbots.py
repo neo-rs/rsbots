@@ -27,7 +27,7 @@ DEFAULT_LOCAL_MANIFEST = DEFAULT_OUT_DIR / "mwbots_manifest_local.json"
 DEFAULT_SERVER_MANIFEST = DEFAULT_OUT_DIR / "mwbots_manifest_server.json"
 DEFAULT_DIFF_OUT = DEFAULT_OUT_DIR / "mwbots_manifest_diff.json"
 
-MW_BOTS = ["MWDataManagerBot", "MWPingBot", "MWDiscumBot"]
+MW_BOTS = ["DailyScheduleReminder", "Instorebotforwarder", "MWDataManagerBot", "MWPingBot", "MWDiscumBot"]
 
 
 def _default_local_repo_root() -> Path:

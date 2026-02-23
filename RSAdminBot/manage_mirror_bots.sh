@@ -19,6 +19,7 @@ declare -A SERVICES=(
     ["discumbot"]="mirror-world-discumbot.service"
     ["instorebotforwarder"]="mirror-world-instorebotforwarder.service"
     ["pingbot"]="mirror-world-pingbot.service"
+    ["whopmembershipsync"]="mirror-world-whopmembershipsync.service"
 )
 
 # Handle "all" or "allbots" case

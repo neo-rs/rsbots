@@ -30,6 +30,7 @@ units=(
   "mirror-world-discumbot.service"
   "mirror-world-dailyschedulereminder.service"
   "mirror-world-instorebotforwarder.service"
+  "mirror-world-whopmembershipsync.service"
 )
 
 echo "Bootstrapping shared venv..."
@@ -72,6 +73,8 @@ echo "      Instorebotforwarder: ensure Instorebotforwarder/config.secrets.json 
 echo "        sudo systemctl restart mirror-world-instorebotforwarder.service"
 echo "      DailyScheduleReminder: ensure DailyScheduleReminder/config.secrets.json has token (Discord user token), then:"
 echo "        sudo systemctl restart mirror-world-dailyschedulereminder.service"
+echo "      WhopMembershipSync: ensure WhopMembershipSync/config.secrets.json has whop_api.api_key and google_service_account_json, then:"
+echo "        sudo systemctl restart mirror-world-whopmembershipsync.service"
 
 echo "Done. Current status summary:"
 for unit in "${units[@]}"; do

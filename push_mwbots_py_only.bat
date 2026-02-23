@@ -75,8 +75,8 @@ if errorlevel 1 (
 
 echo.
 echo === PUSH COMPLETE ===
-echo Pushed commit: %SHA% to origin/main
-
+echo Pushed commit %SHA% to GitHub (origin/main)
+echo NOTE: This pushes to GitHub only. To deploy to Oracle: use RSAdminBot /mwupdate or /botsync.
 echo.
 echo DONE.
 exit /b 0
