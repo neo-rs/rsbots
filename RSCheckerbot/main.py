@@ -6651,6 +6651,20 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
         if not isinstance(brief, dict) or not brief:
             return
 
+        # Whop API sometimes omits user.email in membership payload; use webhook payload as fallback so
+        # we can resolve Discord from whop-logs (email match) and persist identity cache.
+        if not str((brief or {}).get("email") or "").strip():
+            with suppress(Exception):
+                pay_email = str(
+                    _deep_get(payload, "data.user.email")
+                    or _deep_get(payload, "data.member.email")
+                    or _deep_get(payload, "data.data.user.email")
+                    or _deep_get(payload, "data.data.member.email")
+                    or ""
+                ).strip()
+                if pay_email and "@" in pay_email:
+                    brief["email"] = pay_email
+
         mid2 = str(brief.get("membership_id") or mid).strip() or mid
         renewal_end_iso = str(brief.get("renewal_end_iso") or "").strip()
         cur = {
@@ -6744,7 +6758,7 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
 
         # Whop API does not always include Discord linkage in the membership payload.
         # Before we emit "(Discord not linked)", try to resolve Discord ID from the native `#whop-logs`
-        # cards (email/key match). This avoids false "not linked" staff cards and fixes downstream ticketing.
+        # cards (email/key/membership_id match). This avoids false "not linked" staff cards and fixes downstream ticketing.
         if not did:
             try:
                 email_hint = str((brief or {}).get("email") or "").strip()
@@ -6790,6 +6804,40 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                                 if not isinstance(db_ic2, dict):
                                     db_ic2 = {}
                                 db_ic2[str(email_hint).strip().lower()] = {
+                                    "discord_id": str(did),
+                                    "discord_username": "",
+                                    "last_seen": datetime.now(timezone.utc).isoformat(),
+                                }
+                                save_json(WHOP_IDENTITY_CACHE_FILE, db_ic2)
+            # When API omits email we can still resolve from whop-logs by membership_id or Key (native cards show Key R-xxx or membership id in fields).
+            if not did and str(mid2 or "").strip():
+                try:
+                    lim = int(WHOP_API_CONFIG.get("logs_lookup_limit", 50))
+                except Exception:
+                    lim = 50
+                whop_key_hint = str((brief or {}).get("key") or (brief or {}).get("whop_key") or (brief or {}).get("membership_id") or "").strip()
+                with suppress(Exception):
+                    did2 = await _resolve_discord_id_from_whop_logs(
+                        guild,
+                        client=bot,
+                        email="",
+                        membership_id_hint=str(mid2 or "").strip(),
+                        whop_key=whop_key_hint,
+                        limit=int(max(10, min(250, lim))),
+                    )
+                    did = int(did2) if str(did2 or "").strip().isdigit() else 0
+                    if did > 0:
+                        connected_disp = str(did)
+                        if isinstance(brief, dict):
+                            brief["connected_discord"] = connected_disp
+                        # Persist by email if we have it now (from payload or brief) for future lookups.
+                        with suppress(Exception):
+                            eh = str((brief or {}).get("email") or "").strip()
+                            if eh and "@" in eh:
+                                db_ic2 = load_json(WHOP_IDENTITY_CACHE_FILE)
+                                if not isinstance(db_ic2, dict):
+                                    db_ic2 = {}
+                                db_ic2[str(eh).strip().lower()] = {
                                     "discord_id": str(did),
                                     "discord_username": "",
                                     "last_seen": datetime.now(timezone.utc).isoformat(),
