@@ -6516,8 +6516,10 @@ fi
 # Build the sync list (tracked, safe, non-secret):
 # - include: .py/.md/.json/.txt + requirements.txt
 # - exclude: config.secrets.json (even if tracked by mistake)
+# - exclude: MWPingBot/config/settings.json (server keeps ping_channel_ids; do not overwrite with repo)
 TMP_SYNC_LIST="/tmp/mw_sync_${{BOT_FOLDER}}.txt"
 grep -E \"(\\\\.py$|\\\\.md$|\\\\.json$|\\\\.txt$|(^|/)requirements\\\\.txt$)\" "$TMP_ALL_LIST" | grep -v -E \"(^|/)config\\\\.secrets\\\\.json$\" > "$TMP_SYNC_LIST" || true
+grep -v \"^$BOT_FOLDER/config/settings\\.json$\" "$TMP_SYNC_LIST" > "$TMP_SYNC_LIST.ex" 2>/dev/null && mv "$TMP_SYNC_LIST.ex" "$TMP_SYNC_LIST" || true
 sort -u "$TMP_SYNC_LIST" -o "$TMP_SYNC_LIST" || true
 
 # Also include shared utilities if present (repo-level, not in BOT_FOLDER)
