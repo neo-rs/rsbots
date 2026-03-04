@@ -107,6 +107,7 @@ RSAdminBot/original_files/**
 
 # Never include local server snapshots
 Oraclserver-files/**
+Oraclserver-files-mwbots/**
 
 # Never include downloaded runtime data (may contain PII; analysis-only)
 OracleServerData/**

@@ -2597,20 +2597,87 @@ class RSAdminSlashCog(commands.Cog):
                 else:
                     stopped += 1
 
+        def _clip(s: str, n: int = 900) -> str:
+            s = (s or "").strip()
+            if not s:
+                return "(no output)"
+            return s[:n] + "\n...(truncated)" if len(s) > n else s
+
+        fields = [
+            {"name": "Local exec", "value": "YES" if local_exec else "NO", "inline": True},
+            {"name": "ServiceManager", "value": "YES" if svc_ok else "NO", "inline": True},
+            {"name": "rsbots-code", "value": f"{'✅' if rs_code.exists() else '❌'} `{rs_code}`", "inline": False},
+            {"name": "mwbots-code", "value": f"{'✅' if mw_code.exists() else '❌'} `{mw_code}`", "inline": False},
+            {"name": "live_root", "value": f"{'✅' if live_root.exists() else '❌'} `{live_root}`", "inline": False},
+            {"name": "Services", "value": f"total={total} running={running} stopped={stopped} unknown={unknown}", "inline": False},
+        ]
+
+        # Oracle health: RAM, disk, storage (same as legacy !systemcheck)
+        def _cmd(cmd: str, timeout_s: int = 8) -> str:
+            ok, out, err = self.admin_bot._execute_ssh_command(cmd, timeout=timeout_s, log_it=False)
+            return (out or err or "").strip()
+
+        uptime_txt = _cmd("uptime", timeout_s=5)
+        top_head = _cmd("top -bn1 | head -n 5", timeout_s=6)
+        mem_txt = _cmd("free -h | head -n 3", timeout_s=5)
+        disk_root = _cmd("df -h / | head -n 2", timeout_s=5)
+        journal_usage = _cmd("journalctl --disk-usage 2>/dev/null || true", timeout_s=6)
+        bots_du = _cmd("du -sh /home/rsadmin/bots 2>/dev/null | head -n 1 || true", timeout_s=10)
+
+        if uptime_txt or mem_txt or disk_root:
+            fields.extend([
+                {"name": "CPU/Load", "value": f"```{_clip(uptime_txt, 500)}```", "inline": False},
+                {"name": "Memory", "value": f"```{_clip(mem_txt, 700)}```", "inline": False},
+                {"name": "Disk (/)", "value": f"```{_clip(disk_root, 700)}```", "inline": False},
+                {"name": "journald", "value": f"```{_clip(journal_usage, 500)}```", "inline": True},
+                {"name": "bots folder", "value": f"```{_clip(bots_du, 250)}```", "inline": True},
+            ])
+        if top_head.strip():
+            fields.append({"name": "top (header)", "value": f"```{_clip(top_head, 700)}```", "inline": False})
+
+        svc_list = sorted({str((v or {}).get("service") or "").strip() for v in (self.admin_bot.BOTS or {}).values() if (v or {}).get("service")})
+        if svc_list:
+            svc_cmd = (
+                "set +e; "
+                + "for s in " + " ".join(shlex.quote(s) for s in svc_list) + "; do "
+                + "st=$(systemctl is-active \"$s\" 2>/dev/null || echo unknown); "
+                + "pid=$(systemctl show \"$s\" -p ExecMainPID --value 2>/dev/null || echo 0); "
+                + "echo \"$s $st pid=$pid\"; done"
+            )
+            svc_txt = _cmd(svc_cmd, timeout_s=10)
+            if svc_txt.strip():
+                fields.append({"name": "Services (systemd)", "value": f"```{_clip(svc_txt, 950)}```", "inline": False})
+
         embed = MessageHelper.create_info_embed(
             title="System Check",
-            message="",
-            fields=[
-                {"name": "Local exec", "value": "YES" if local_exec else "NO", "inline": True},
-                {"name": "ServiceManager", "value": "YES" if svc_ok else "NO", "inline": True},
-                {"name": "rsbots-code", "value": f"{'✅' if rs_code.exists() else '❌'} `{rs_code}`", "inline": False},
-                {"name": "mwbots-code", "value": f"{'✅' if mw_code.exists() else '❌'} `{mw_code}`", "inline": False},
-                {"name": "live_root", "value": f"{'✅' if live_root.exists() else '❌'} `{live_root}`", "inline": False},
-                {"name": "Services", "value": f"total={total} running={running} stopped={stopped} unknown={unknown}", "inline": False},
-            ],
+            message="Runtime + paths + Oracle health (RAM, disk, storage).",
+            fields=fields,
             footer=f"Triggered by {interaction.user}",
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+        # Disk hotspots (second message, only when Oracle commands succeeded)
+        if uptime_txt or mem_txt or disk_root:
+            log_base = str(((self.admin_bot.config.get("logging") or {}).get("file_logging") or {}).get("base_path") or "")
+            log_du = _cmd(f"du -sh {shlex.quote(log_base)} 2>/dev/null || true", timeout_s=6) if log_base else ""
+            top_files = _cmd(
+                "find /home/rsadmin/bots -xdev -type f -printf '%s\\t%p\\n' 2>/dev/null | sort -nr | head -n 10 | "
+                "awk -F'\\t' '{printf \"%8.1f MB\\t%s\\n\", ($1/1024/1024), $2}'",
+                timeout_s=12,
+            )
+            lf_fields = []
+            if log_base:
+                lf_fields.append({"name": "RSAdminBot log path", "value": f"`{log_base}`", "inline": False})
+                if log_du.strip():
+                    lf_fields.append({"name": "RSAdminBot logs size", "value": f"```{_clip(log_du, 250)}```", "inline": True})
+            lf_fields.append({"name": "Top 10 largest files (/home/rsadmin/bots)", "value": f"```{_clip(top_files, 950)}```", "inline": False})
+            lf_embed = MessageHelper.create_info_embed(
+                title="Disk Hotspots",
+                message="Largest files under `/home/rsadmin/bots`.",
+                fields=lf_fields,
+                footer=f"Triggered by {interaction.user}",
+            )
+            await interaction.followup.send(embed=lf_embed, ephemeral=True)
 
     @app_commands.command(name="botlist", description="List configured bots (owner-only).")
     async def botlist(self, interaction: discord.Interaction) -> None:

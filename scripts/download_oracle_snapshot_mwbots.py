@@ -5,23 +5,20 @@ Download Oracle Full Snapshot (MWBots-focused)
 Creates a tar.gz snapshot on the Oracle server and downloads/extracts it into:
   Oraclserver-files-mwbots/server_full_snapshot_<timestamp>/
 
+Output dir is gitignored; use as a full local backup (includes config, channel_map, tokens).
+
 Scope:
 - MW bot folders (if present on the server):
-  - DailyScheduleReminder
-  - Instorebotforwarder
-  - MWDataManagerBot
-  - MWPingBot
-  - MWDiscumBot
-- systemd templates folder (repo-local)
+  - DailyScheduleReminder, Instorebotforwarder, MWDataManagerBot, MWPingBot, MWDiscumBot,
+  - WhopMembershipSync, systemd
 
-Safety:
-- Excludes secrets and key material.
-- Excludes *.env and token files.
-- Uses tar --ignore-failed-read so missing MW folders don't fail the snapshot.
+Default: full backup (includes channel_map.json, tokens.env, config.secrets.json, etc.).
+Use --no-secrets for code-only snapshot (excludes secrets and runtime data).
 
 Usage:
   python scripts/download_oracle_snapshot_mwbots.py
-  python scripts/download_oracle_snapshot_mwbots.py --server-name "instance-enhance (rsadmin)"
+  python scripts/download_oracle_snapshot_mwbots.py --no-secrets
+  python scripts/download_oracle_snapshot_mwbots.py --scp-timeout 1800   # if download times out (e.g. large backup)
   python scripts/download_oracle_snapshot_mwbots.py --out-dir Oraclserver-files-mwbots
 """
 
@@ -53,7 +50,17 @@ INCLUDES_DEFAULT = [
     "systemd",
 ]
 
-EXCLUDES_DEFAULT = [
+# Full backup: only exclude paths that break Windows extract (long paths / caches)
+EXCLUDES_FULL = [
+    "--exclude=playwright_profile",
+    "--exclude=*CacheStorage*",
+    "--exclude=*Service Worker*",
+    "--exclude=node_modules",
+    "--exclude=.cache",
+]
+
+# Code-only snapshot: also exclude secrets and runtime data
+EXCLUDES_NO_SECRETS = EXCLUDES_FULL + [
     "--exclude=config.secrets.json",
     "--exclude=rs-bot-tokens.txt",
     "--exclude=*.key",
@@ -120,7 +127,14 @@ def _build_ssh_base(entry: ServerEntry) -> List[str]:
 
 
 def _build_scp_base(entry: ServerEntry) -> List[str]:
-    cmd: List[str] = ["scp", "-i", _resolve_key_path(entry.key), "-o", "StrictHostKeyChecking=no"]
+    # Canonical: absolute key path, stability options (CANONICAL_RULES.md)
+    cmd: List[str] = [
+        "scp",
+        "-i", _resolve_key_path(entry.key),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ServerAliveInterval=60",
+        "-o", "ConnectTimeout=60",
+    ]
     if entry.ssh_options:
         cmd.extend(shlex.split(entry.ssh_options))
     return cmd
@@ -131,12 +145,44 @@ def _run(cmd: List[str], timeout: int) -> subprocess.CompletedProcess:
 
 
 def _safe_extract(tar_path: Path, dest_dir: Path) -> None:
+    # Windows path length limit; skip members that would exceed it when joined to dest_dir
+    max_path = 259
+    dest_str = str(dest_dir.resolve())
+    skipped = 0
     with tarfile.open(tar_path, "r:gz") as tf:
         for member in tf.getmembers():
             name = member.name
             if name.startswith("/") or name.startswith("\\") or ".." in Path(name).parts:
                 raise RuntimeError(f"Unsafe tar member path: {name}")
-        tf.extractall(dest_dir)
+            target = os.path.normpath(os.path.join(dest_str, name))
+            if len(target) > max_path:
+                skipped += 1
+                continue
+            try:
+                tf.extract(member, dest_dir)
+            except OSError as e:
+                if getattr(e, "winerror", None) == 3 or "path" in str(e).lower():
+                    skipped += 1
+                    continue
+                raise
+    if skipped:
+        print(f"[extract] Skipped {skipped} member(s) (path too long or inaccessible on this OS)")
+
+
+def _verify_snapshot(snap_dir: Path, full_backup: bool) -> None:
+    """Check that key bot folders and files exist after extract."""
+    checks = [
+        ("MWDiscumBot", snap_dir / "MWDiscumBot"),
+        ("MWDiscumBot/config", snap_dir / "MWDiscumBot" / "config"),
+        ("MWDiscumBot/config/settings.json", snap_dir / "MWDiscumBot" / "config" / "settings.json"),
+    ]
+    if full_backup:
+        checks.append(("MWDiscumBot/config/channel_map.json", snap_dir / "MWDiscumBot" / "config" / "channel_map.json"))
+    missing = [label for label, path in checks if not path.exists()]
+    if missing:
+        print(f"[verify] Missing: {', '.join(missing)}")
+    else:
+        print(f"[verify] OK: MWDiscumBot + config present" + (" (incl. channel_map.json)" if full_backup else ""))
 
 
 def main() -> int:
@@ -146,6 +192,8 @@ def main() -> int:
     ap.add_argument("--remote-root", default=None, help="Remote root override (default: from servers.json)")
     ap.add_argument("--keep-snapshots", type=int, default=1, help="Keep only newest N snapshot folders (default: 1)")
     ap.add_argument("--prune-only", action="store_true", help="Only prune old local snapshot folders (no SSH)")
+    ap.add_argument("--no-secrets", action="store_true", help="Exclude secrets and runtime data (code-only snapshot)")
+    ap.add_argument("--scp-timeout", type=int, default=900, help="SCP download timeout in seconds (default 900 for full backup)")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -186,31 +234,36 @@ def main() -> int:
 
     remote_tar = f"/tmp/mwbots_full_snapshot_{ts}.tar.gz"
     includes = list(INCLUDES_DEFAULT)
+    excludes = EXCLUDES_NO_SECRETS if args.no_secrets else EXCLUDES_FULL
+    mode = "code-only (no secrets)" if args.no_secrets else "full backup"
 
     remote_cmd = (
         "set -euo pipefail; "
         f"cd {shlex.quote(entry.remote_root)}; "
         f"rm -f {shlex.quote(remote_tar)} || true; "
         f"tar --ignore-failed-read -czf {shlex.quote(remote_tar)} "
-        + " ".join(EXCLUDES_DEFAULT)
+        + " ".join(excludes)
         + " "
         + " ".join(shlex.quote(x) for x in includes)
         + f"; echo REMOTE_TAR={shlex.quote(remote_tar)}; ls -lh {shlex.quote(remote_tar)}"
     )
 
-    print(f"[1/3] Building remote tar on {entry.user}@{entry.host} ...")
-    ssh_cmd = _build_ssh_base(entry) + ["bash", "-lc", remote_cmd]
+    print(f"[1/3] Building remote tar on {entry.user}@{entry.host} ({mode}) ...")
+    ssh_cmd = _build_ssh_base(entry) + ["bash", "-c", remote_cmd]
     res = _run(ssh_cmd, timeout=300)
     if res.returncode != 0:
         print(res.stdout)
         print(res.stderr)
         raise RuntimeError(f"Remote snapshot build failed (exit {res.returncode})")
-    print(res.stdout.strip())
+    # Only print last lines (REMOTE_TAR= and ls) to avoid env dump from login shell
+    for line in res.stdout.strip().splitlines():
+        if line.startswith("REMOTE_TAR=") or line.strip().startswith("-"):
+            print(line)
 
-    print("[2/3] Downloading tar via scp ...")
+    print(f"[2/3] Downloading tar via scp (timeout={args.scp_timeout}s) ...")
     local_tar = snap_dir / f"mwbots_full_snapshot_{ts}.tar.gz"
     scp_cmd = _build_scp_base(entry) + [f"{entry.user}@{entry.host}:{remote_tar}", str(local_tar)]
-    res2 = _run(scp_cmd, timeout=300)
+    res2 = _run(scp_cmd, timeout=args.scp_timeout)
     if res2.returncode != 0:
         print(res2.stdout)
         print(res2.stderr)
@@ -219,6 +272,7 @@ def main() -> int:
     print("[3/3] Extracting ...")
     _safe_extract(local_tar, snap_dir)
 
+    _verify_snapshot(snap_dir, full_backup=not args.no_secrets)
     print(f"DONE: {snap_dir}")
     return 0
 

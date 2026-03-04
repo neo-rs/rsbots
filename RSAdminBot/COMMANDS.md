@@ -98,7 +98,7 @@ These commands open a **dropdown** to pick a bot. All outputs are ephemeral.
 - **What**: runtime proof (cwd, file path, python, local_exec, git heads)
 
 #### `/systemcheck`
-- **What**: quick health report (roots exist + service counts)
+- **What**: health report (paths + service counts) and **Oracle machine stats** when reachable: RAM (`free -h`), disk (`df -h /`), CPU/load (`uptime`, `top`), journald usage, bots folder size, systemd service list. Second ephemeral message: **Disk Hotspots** (top 10 largest files under `/home/rsadmin/bots`, RSAdminBot log size if configured).
 
 #### `/fileview`
 - **What**: file sizes + mtimes for a bot folder
