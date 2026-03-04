@@ -121,6 +121,7 @@ These commands open a **dropdown** to pick a bot. All outputs are ephemeral.
 
 #### `/ssh`
 - **What**: run an SSH/local-exec command (use carefully)
+- **Log trim on Oracle**: to cap movement logs (e.g. 30MB per file), run: `bash /home/rsadmin/bots/mirror-world/RSAdminBot/scripts/trim_oracle_logs.sh` (or set `MIRROR_WORLD`/`MAX_FILE_MB` if needed)
 
 #### `/syncstatus`
 - **What**: compare `rsbots-code` vs live tree using `rsbots_manifest.py`

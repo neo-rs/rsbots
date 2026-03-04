@@ -77,7 +77,7 @@
       "enabled": true,
       "base_path": "/home/rsadmin/bots/logs/rsadminbot",
       "retention_days": 30,
-      "max_file_size_mb": 100
+      "max_total_mb": 50
     },
     "log_ssh_commands": true,
     "log_config_validation": true,

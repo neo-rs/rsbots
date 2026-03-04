@@ -295,7 +295,11 @@ Notes:
    - `*.sqlite3` - SQLite databases (FORBIDDEN)
    - Any database files must be deleted and replaced with JSON
 
-4. **File sync rules:**
+4. **Log and disk limits (Oracle):**
+   - **RSAdminBot file logs**: `logging.file_logging.max_total_mb` (default 50). CommandLogger trims oldest daily `.jsonl` files so the log directory stays under this limit. Configure in `RSAdminBot/config.json`.
+   - **Movement/bot logs**: Single log files (e.g. `decision_traces.jsonl`, `systemd_*.log`) should be capped (e.g. 30MB). Run on Oracle: `bash RSAdminBot/scripts/trim_oracle_logs.sh` (or via `/ssh`). Bots that write large `.json` log arrays (e.g. `discumlogs.json`, `datamanagerbotlogs.json`) must implement their own rotation/limit to avoid unbounded growth.
+
+5. **File sync rules:**
    - `.db` files are NEVER synced to remote
    - Runtime JSON files (tickets.json, registry.json, etc.) are NOT synced
    - Only `config.json` and `messages.json` are synced
@@ -303,14 +307,14 @@ Notes:
    - `COMMANDS.md` files are ALWAYS synced (documentation files, same as .py files)
    - `COMMANDS.md` files are part of code deployment and must be kept in sync with command implementations
 
-5. **Migration requirement:**
+6. **Migration requirement:**
    - If a bot currently uses a database, it MUST be migrated to JSON
    - Database code must be completely removed
    - No `sqlite3` imports allowed in RS bots
    - No `_init_db`, `_save_to_db`, or similar database methods
    - **Data migration:** Before removing database code, export all data to JSON
 
-6. **JSON Storage Structure (Standardized):**
+7. **JSON Storage Structure (Standardized):**
    
    **RSuccessBot (`success_points.json`):**
    ```json

@@ -210,8 +210,10 @@ class CommandLogger:
         """
         self.admin_bot = admin_bot_instance
         self.log_config = admin_bot_instance.config.get("logging", {})
-        self.file_logging_enabled = self.log_config.get("file_logging", {}).get("enabled", True)
-        self.log_base_path = self.log_config.get("file_logging", {}).get("base_path", "/home/rsadmin/bots/logs/rsadminbot")
+        fl = self.log_config.get("file_logging") or {}
+        self.file_logging_enabled = fl.get("enabled", True)
+        self.log_base_path = fl.get("base_path", "/home/rsadmin/bots/logs/rsadminbot")
+        self.log_max_total_mb = max(1, int(fl.get("max_total_mb", 50)))
         self.log_ssh_commands = self.log_config.get("log_ssh_commands", True)
         self.log_config_validation_enabled = self.log_config.get("log_config_validation", True)
         self.log_all_commands = self.log_config.get("log_all_commands", True)
@@ -261,6 +263,26 @@ class CommandLogger:
         entry.update(kwargs)
         return entry
     
+    def _trim_log_dir_if_needed(self) -> None:
+        """Keep log directory under max_total_mb by removing oldest files (never today's)."""
+        try:
+            limit_bytes = self.log_max_total_mb * 1024 * 1024
+            today = datetime.now().strftime("%Y-%m-%d")
+            # Delete oldest rsadminbot_*.jsonl first (never touch today's file) until total <= limit
+            cmd = (
+                f"cd {shlex.quote(self.log_base_path)} 2>/dev/null && "
+                f"today=rsadminbot_{today}.jsonl; "
+                f"for f in $(ls -tr rsadminbot_*.jsonl 2>/dev/null); do "
+                f'[ \"$f\" = \"$today\" ] && continue; '
+                f"sz=$(du -sb . 2>/dev/null | cut -f1); "
+                f"[ \"$sz\" -le {limit_bytes} ] && break; "
+                f"rm -f \"$f\"; "
+                f"done"
+            )
+            self.admin_bot._execute_ssh_command(cmd, timeout=10, log_it=False)
+        except Exception:
+            pass
+
     def write_log_file(self, log_entry: Dict[str, Any]):
         """Write log entry to JSON file on remote server.
         
@@ -283,6 +305,7 @@ class CommandLogger:
                 f"printf %s\\\\n {shlex.quote(json_line)} >> {shlex.quote(log_file)}"
             )
             self.admin_bot._execute_ssh_command(cmd, timeout=5, log_it=False)
+            self._trim_log_dir_if_needed()
         except Exception as e:
             # Don't fail if logging fails - just print error
             print(f"{Colors.YELLOW}[Logger] Failed to write log file: {e}{Colors.RESET}")
