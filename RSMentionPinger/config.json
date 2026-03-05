@@ -2,7 +2,7 @@
   "guild_id": 876528050081251379,
   "log_channel_id": 1399088859245051954,
   "monitor_roles": {
-    "picker_channel_id": 1478908612507340861,
+    "picker_channel_id": 1345505161409335389,
     "embed_description": "Choose the channels you want alerts from by clicking the buttons below. **ADD** or **REMOVE** roles to receive notifications when new items drop or restocks occur.",
     "embed_footer": "RS Monitor Roles",
     "channel_display_names": {
