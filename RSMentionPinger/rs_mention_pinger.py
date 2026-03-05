@@ -12,7 +12,7 @@ import os
 import sys
 import json
 from pathlib import Path
-from typing import Set, Optional
+from typing import Any, List, Optional, Set, Tuple
 
 # Ensure repo root is importable when executed as a script (matches Ubuntu run_bot.sh PYTHONPATH).
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -99,20 +99,49 @@ class RSMentionPinger:
             return None
         return mr
     
-    def _build_monitor_entries(self, guild: discord.Guild) -> list[tuple[int, str]]:
-        """Build list of (role_id, label) for monitor role buttons. Uses config 'entries' or 'categories'."""
+    def _channel_display_name(self, ch_name: str) -> str:
+        """Human-readable label from channel name; strip -monitor, use config map or heuristic."""
+        mr = self._monitor_roles_config()
+        if mr:
+            names = mr.get("channel_display_names") or {}
+            if isinstance(names, dict) and ch_name in names:
+                return str(names[ch_name])
+        s = ch_name.replace("-monitor", "").replace("_", " ").replace("-", " ").strip()
+        return s.title() if s else ch_name
+
+    def _resolve_button_emoji(self, guild: discord.Guild, ch_name: str) -> Optional[Any]:
+        """Resolve config button_emojis[ch_name] to a Discord emoji (for Button). Returns None if not set."""
+        mr = self._monitor_roles_config()
+        if not mr:
+            return None
+        emojis_cfg = mr.get("button_emojis")
+        if not isinstance(emojis_cfg, dict) or ch_name not in emojis_cfg:
+            return None
+        val = emojis_cfg[ch_name]
+        if isinstance(val, int):
+            em = guild.get_emoji(val)
+            return em
+        if isinstance(val, str):
+            em = discord.utils.get(guild.emojis, name=val)
+            return em
+        return None
+
+    def _build_monitor_entries_by_category(self, guild: discord.Guild) -> List[Tuple[str, List[Tuple[int, str, Optional[Any]]]]:
+        """Build per-category list of (role_id, display_label, emoji) for buttons. Uses config 'entries' or 'categories'."""
         mr = self._monitor_roles_config()
         if not mr:
             return []
         entries_cfg = mr.get("entries")
         if entries_cfg:
-            return [(int(e["role_id"]), e.get("label") or str(e.get("role_id", ""))) for e in entries_cfg]
+            flat = [(int(e["role_id"]), e.get("label") or str(e.get("role_id", "")), None) for e in entries_cfg]
+            return [("Monitor channels", flat)]
         categories_cfg = mr.get("categories") or []
-        out: list[tuple[int, str]] = []
+        out: List[Tuple[str, List[Tuple[int, str, Optional[Any]]]] = []
         for cat_cfg in categories_cfg:
             cat_id = cat_cfg.get("id") if isinstance(cat_cfg, dict) else cat_cfg
             if not cat_id:
                 continue
+            cat_title = cat_cfg.get("title", "Monitor channels") if isinstance(cat_cfg, dict) else "Monitor channels"
             excluded_ids: Set[int] = set()
             if isinstance(cat_cfg, dict):
                 for cid in cat_cfg.get("excluded_channel_ids") or []:
@@ -120,14 +149,24 @@ class RSMentionPinger:
             category = guild.get_channel(int(cat_id))
             if not category or not isinstance(category, discord.CategoryChannel):
                 continue
+            cat_entries: List[Tuple[int, str, Optional[Any]]] = []
             for ch in category.text_channels:
                 if ch.id in excluded_ids:
                     continue
                 role_name = f"Monitor | {ch.name}"
                 role = discord.utils.get(guild.roles, name=role_name)
                 if role:
-                    out.append((role.id, ch.name))
+                    label = self._channel_display_name(ch.name)
+                    emoji = self._resolve_button_emoji(guild, ch.name)
+                    cat_entries.append((role.id, label, emoji))
+            if cat_entries:
+                out.append((cat_title, cat_entries))
         return out
+
+    def _build_monitor_entries(self, guild: discord.Guild) -> List[Tuple[int, str, Optional[Any]]]:
+        """Flat list of (role_id, label, emoji) for persistent view registration (same order as by_category)."""
+        by_cat = self._build_monitor_entries_by_category(guild)
+        return [e for _, entries in by_cat for e in entries]
     
     async def _ensure_monitor_roles_and_overwrites(self, guild: discord.Guild) -> None:
         """Create missing 'Monitor | channel' roles and set channel overwrites. Only for categories."""
@@ -176,14 +215,15 @@ class RSMentionPinger:
 class MonitorRoleView(discord.ui.View):
     """Persistent view: buttons toggle roles so members can show/hide monitor channels."""
 
-    def __init__(self, pinger: RSMentionPinger, entries: list[tuple[int, str]], **kwargs):
+    def __init__(self, pinger: RSMentionPinger, entries: List[Tuple[int, str, Optional[Any]]], **kwargs):
         super().__init__(timeout=None, **kwargs)
         self.pinger = pinger
-        for role_id, label in entries:
+        for role_id, label, emoji in entries:
             btn = discord.ui.Button(
                 label=label[:80],
                 style=discord.ButtonStyle.primary,
                 custom_id=f"monitor_toggle:{role_id}",
+                emoji=emoji if emoji is not None else None,
             )
             btn.callback = self._make_callback(role_id, label)
             self.add_item(btn)
@@ -688,37 +728,38 @@ class _RSMentionPingerImpl:
                 pass
             try:
                 await self._ensure_monitor_roles_and_overwrites(guild)
-                entries = self._build_monitor_entries(guild)
-                if not entries:
+                by_category = self._build_monitor_entries_by_category(guild)
+                if not by_category:
                     await picker_channel.send("No monitor entries found. Check `monitor_roles.categories` or `monitor_roles.entries` in config.")
                     return
-                # Optional: delete previous bot messages in picker channel to avoid duplicates
+                # Delete previous bot messages in picker channel to avoid duplicates
                 try:
                     async for msg in picker_channel.history(limit=50):
                         if msg.author == self.bot.user:
                             await msg.delete()
                 except Exception:
                     pass
-                desc = (mr.get("embed_description") or "Choose the channels you want alerts from by clicking the buttons below. Add or remove roles to receive notifications when new items drop or restocks occur.").strip()
+                default_desc = "Choose the channels you want alerts from by clicking the buttons below. **ADD** or **REMOVE** roles to receive notifications when new items drop or restocks occur."
+                desc = (mr.get("embed_description") or default_desc).strip()
                 footer = mr.get("embed_footer") or "RS Monitor Roles"
-                total_pages = (len(entries) + MONITOR_BUTTONS_PER_VIEW - 1) // MONITOR_BUTTONS_PER_VIEW
-                for i in range(0, len(entries), MONITOR_BUTTONS_PER_VIEW):
-                    chunk = entries[i : i + MONITOR_BUTTONS_PER_VIEW]
-                    view = MonitorRoleView(self, chunk)
-                    title = "Monitor channels"
-                    if total_pages > 1:
-                        page = i // MONITOR_BUTTONS_PER_VIEW + 1
-                        title += f" (page {page}/{total_pages})"
-                    embed = discord.Embed(
-                        title=title,
-                        description=desc,
-                        color=self.get_embed_color(),
-                    )
-                    embed.set_footer(text=footer)
-                    if guild.icon:
-                        embed.set_thumbnail(url=guild.icon.url)
-                    await picker_channel.send(embed=embed, view=view)
-                await picker_channel.send("✅ Use the buttons above to show or hide monitor channels.")
+                for cat_title, entries in by_category:
+                    total_pages = (len(entries) + MONITOR_BUTTONS_PER_VIEW - 1) // MONITOR_BUTTONS_PER_VIEW
+                    for i in range(0, len(entries), MONITOR_BUTTONS_PER_VIEW):
+                        chunk = entries[i : i + MONITOR_BUTTONS_PER_VIEW]
+                        view = MonitorRoleView(self, chunk)
+                        title = f"Monitor Channels - {cat_title}"
+                        if total_pages > 1:
+                            page = i // MONITOR_BUTTONS_PER_VIEW + 1
+                            title += f" (page {page}/{total_pages})"
+                        embed = discord.Embed(
+                            title=title,
+                            description=desc,
+                            color=self.get_embed_color(),
+                        )
+                        embed.set_footer(text=footer)
+                        if guild.icon:
+                            embed.set_thumbnail(url=guild.icon.url)
+                        await picker_channel.send(embed=embed, view=view)
             except Exception as e:
                 print(f"{Colors.RED}[MonitorRoles] postmonitorroles error: {e}{Colors.RESET}")
                 await picker_channel.send(f"❌ Error: {e}")
