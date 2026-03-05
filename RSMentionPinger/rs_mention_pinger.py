@@ -14,6 +14,10 @@ import json
 from pathlib import Path
 from typing import Any, List, Optional, Set, Tuple
 
+# Type alias to avoid deep nesting that can trigger SyntaxError on older Python
+_MonitorEntry = Tuple[int, str, Optional[Any]]
+_MonitorEntriesByCategory = List[Tuple[str, List[_MonitorEntry]]]
+
 # Ensure repo root is importable when executed as a script (matches Ubuntu run_bot.sh PYTHONPATH).
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -126,17 +130,17 @@ class RSMentionPinger:
             return em
         return None
 
-    def _build_monitor_entries_by_category(self, guild: discord.Guild) -> List[Tuple[str, List[Tuple[int, str, Optional[Any]]]]:
+    def _build_monitor_entries_by_category(self, guild: discord.Guild) -> _MonitorEntriesByCategory:
         """Build per-category list of (role_id, display_label, emoji) for buttons. Uses config 'entries' or 'categories'."""
         mr = self._monitor_roles_config()
         if not mr:
             return []
         entries_cfg = mr.get("entries")
         if entries_cfg:
-            flat = [(int(e["role_id"]), e.get("label") or str(e.get("role_id", "")), None) for e in entries_cfg]
+            flat: List[_MonitorEntry] = [(int(e["role_id"]), e.get("label") or str(e.get("role_id", "")), None) for e in entries_cfg]
             return [("Monitor channels", flat)]
         categories_cfg = mr.get("categories") or []
-        out: List[Tuple[str, List[Tuple[int, str, Optional[Any]]]] = []
+        out: _MonitorEntriesByCategory = []
         for cat_cfg in categories_cfg:
             cat_id = cat_cfg.get("id") if isinstance(cat_cfg, dict) else cat_cfg
             if not cat_id:
@@ -149,7 +153,7 @@ class RSMentionPinger:
             category = guild.get_channel(int(cat_id))
             if not category or not isinstance(category, discord.CategoryChannel):
                 continue
-            cat_entries: List[Tuple[int, str, Optional[Any]]] = []
+            cat_entries: List[_MonitorEntry] = []
             for ch in category.text_channels:
                 if ch.id in excluded_ids:
                     continue
@@ -163,7 +167,7 @@ class RSMentionPinger:
                 out.append((cat_title, cat_entries))
         return out
 
-    def _build_monitor_entries(self, guild: discord.Guild) -> List[Tuple[int, str, Optional[Any]]]:
+    def _build_monitor_entries(self, guild: discord.Guild) -> List[_MonitorEntry]:
         """Flat list of (role_id, label, emoji) for persistent view registration (same order as by_category)."""
         by_cat = self._build_monitor_entries_by_category(guild)
         return [e for _, entries in by_cat for e in entries]
@@ -215,7 +219,7 @@ class RSMentionPinger:
 class MonitorRoleView(discord.ui.View):
     """Persistent view: buttons toggle roles so members can show/hide monitor channels."""
 
-    def __init__(self, pinger: RSMentionPinger, entries: List[Tuple[int, str, Optional[Any]]], **kwargs):
+    def __init__(self, pinger: RSMentionPinger, entries: List[_MonitorEntry], **kwargs):
         super().__init__(timeout=None, **kwargs)
         self.pinger = pinger
         for role_id, label, emoji in entries:
