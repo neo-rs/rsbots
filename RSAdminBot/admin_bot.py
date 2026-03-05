@@ -984,6 +984,14 @@ class BotSelectView(ui.View):
                 description=f"{action_display} all bots"
             ))
 
+        # Add "All Bots (config labels)" for config action
+        if self.action == "config":
+            options.insert(0, discord.SelectOption(
+                label="📋 All Bots (config labels)",
+                value="all_configs",
+                description="List config keys/labels for every bot",
+            ))
+
         # Add group-scoped "All ..." options for update action (python-only).
         if self.action in ["update"]:
             groups = set()
@@ -1076,8 +1084,11 @@ class BotSelectView(ui.View):
             bot_info = self.admin_bot.BOTS[bot_name]
             await self._handle_info(interaction, bot_name, bot_info)
         elif self.action == "config":
-            bot_info = self.admin_bot.BOTS[bot_name]
-            await self._handle_config(interaction, bot_name, bot_info)
+            if bot_name == "all_configs":
+                await self._handle_config_all(interaction)
+            else:
+                bot_info = self.admin_bot.BOTS[bot_name]
+                await self._handle_config(interaction, bot_name, bot_info)
         elif self.action == "secrets":
             bot_info = self.admin_bot.BOTS[bot_name]
             await self._handle_secrets(interaction, bot_name, bot_info)
@@ -1879,6 +1890,26 @@ class BotSelectView(ui.View):
             return
         embed = self.admin_bot._build_botconfig_embed(bot_name, triggered_by=interaction.user)
         await interaction.followup.send(embed=embed, view=BotConfigActionsView(self.admin_bot, bot_name), ephemeral=True)
+
+    async def _handle_config_all(self, interaction):
+        """Handle config labels for all bots (no single-bot view)."""
+        ok, err = await self.admin_bot._slash_owner_guard(interaction)
+        if not ok:
+            await interaction.followup.send(err, ephemeral=True)
+            return
+        embeds = self.admin_bot._build_all_config_labels_embeds(triggered_by=interaction.user)
+        if not embeds:
+            await interaction.followup.send(
+                embed=MessageHelper.create_error_embed(
+                    title="No config data",
+                    message="Could not load config labels for any bot.",
+                    footer=f"Triggered by {interaction.user}",
+                ),
+                ephemeral=True,
+            )
+            return
+        for emb in embeds:
+            await interaction.followup.send(embed=emb, ephemeral=True)
 
     async def _handle_secrets(self, interaction, bot_name, bot_info):
         """Handle bot secrets status (masked) + update flow."""
@@ -4322,8 +4353,8 @@ class RSAdminBot:
             return  # Only needed on Windows
         
         try:
-            import win32security
-            import ntsecuritycon as con
+            import win32security  # type: ignore[import-untyped]
+            import ntsecuritycon as con  # type: ignore[import-untyped]
             
             # Get current file security descriptor
             sd = win32security.GetFileSecurity(str(key_path), win32security.DACL_SECURITY_INFORMATION)
@@ -7930,6 +7961,63 @@ echo "CHANGED_END"
                 if total_pages > 1:
                     e.title = f"{e.title} ({idx}/{total_pages})"
                 await send(embed=e)
+
+    def _build_all_config_labels_embeds(self, *, triggered_by: Optional[Any] = None) -> List[discord.Embed]:
+        """Build embed(s) listing config keys/labels for every bot (RS: config.json keys; MW: config file names)."""
+        who = f"Triggered by {triggered_by}" if triggered_by else None
+        bot_keys = [k for k in self._get_rs_bot_keys() + self._get_mw_bot_keys() if k in self.BOTS]
+        if not bot_keys:
+            return []
+
+        # Per-bot labels: RS = config dict keys; mirror = required + optional file names
+        def labels_for_bot(bot_key: str) -> List[str]:
+            group = self._get_bot_group(bot_key) or ""
+            if group == "mirror_bots":
+                required = ["settings.json", "tokens.env"]
+                optional: List[str] = []
+                if bot_key == "discumbot":
+                    required = ["settings.json", "tokens.env", "channel_map.json", "destination_channels.json"]
+                    optional = ["source_channels.json"]
+                elif bot_key == "datamanagerbot":
+                    optional = ["keywords.json", "fetchall_mappings.json"]
+                return required + optional
+            config = self.inspector.get_bot_config(bot_key) if self.inspector else None
+            if config and isinstance(config, dict):
+                return sorted(config.keys())
+            return []
+
+        embeds: List[discord.Embed] = []
+        embed = discord.Embed(
+            title="📋 All Bots — Config Labels",
+            description="Top-level config keys (RS) or config file names (Mirror-World) for each bot.",
+            color=discord.Color.blue(),
+            timestamp=datetime.now(),
+        )
+        embed.set_footer(text=who or "Use /botconfig <bot> for full config")
+        field_count = 0
+        max_fields = 10
+
+        for bot_key in bot_keys:
+            info = self.BOTS.get(bot_key) or {}
+            display_name = str(info.get("name") or bot_key)
+            labels = labels_for_bot(bot_key)
+            value = ", ".join(labels) if labels else "(none)"
+            if len(value) > 1020:
+                value = value[:1020] + "…"
+            embed.add_field(name=display_name, value=value or "—", inline=False)
+            field_count += 1
+            if field_count >= max_fields and (bot_keys.index(bot_key) + 1) < len(bot_keys):
+                embeds.append(embed)
+                embed = discord.Embed(
+                    title="📋 All Bots — Config Labels (continued)",
+                    color=discord.Color.blue(),
+                    timestamp=datetime.now(),
+                )
+                embed.set_footer(text=who or "")
+                field_count = 0
+        if field_count > 0:
+            embeds.append(embed)
+        return embeds
 
     def _build_botconfig_embed(self, bot_name: str, *, triggered_by: Optional[Any] = None) -> discord.Embed:
         """Build a botconfig embed for a bot (RS inspector when available; MW file-based summary otherwise)."""

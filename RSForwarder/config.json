@@ -86,6 +86,7 @@
   ],
   "rs_server_icon_url": "https://cdn.discordapp.com/icons/876528050081251379/a_a9a346601bbd93532d931e5280616797.gif?size=256",
   "mavely_autologin_on_fail": true,
+  "mavely_alert_dm_enabled": false,
   "mavely_autologin_cooldown_s": 300,
   "_notes_rs_fs_sheet": "RS - Full Send List sheet sync (Zephyr release feed -> Google Sheet). Secrets go in config.secrets.json.",
   "rs_fs_sheet_enabled": true,

@@ -2382,10 +2382,14 @@ class RSForwarderBot:
                     if log_path:
                         body += f"\nRefresher log (server path): `{log_path}`"
 
-                # DM only if targets exist; automation still runs regardless.
-                if targets:
+                # DM only if enabled, targets exist; automation still runs regardless.
+                dm_enabled = (self.config or {}).get("mavely_alert_dm_enabled", True)
+                if dm_enabled and targets:
                     for uid in targets:
                         await self._dm_user(uid, header + body)
+                    self._mavely_last_alert_ts = now
+                    self._mavely_write_status()
+                elif not dm_enabled and targets:
                     self._mavely_last_alert_ts = now
                     self._mavely_write_status()
                 else:
