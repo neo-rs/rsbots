@@ -3,6 +3,8 @@
   "log_channel_id": 1399088859245051954,
   "monitor_roles": {
     "picker_channel_id": 1478908612507340861,
+    "embed_description": "Choose the channels you want alerts from by clicking the buttons below. Add or remove roles to receive notifications when new items drop or restocks occur.",
+    "embed_footer": "RS Monitor Roles",
     "categories": [
       {
         "id": 1350953333069713528,

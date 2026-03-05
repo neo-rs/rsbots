@@ -699,15 +699,25 @@ class _RSMentionPingerImpl:
                             await msg.delete()
                 except Exception:
                     pass
+                desc = (mr.get("embed_description") or "Choose the channels you want alerts from by clicking the buttons below. Add or remove roles to receive notifications when new items drop or restocks occur.").strip()
+                footer = mr.get("embed_footer") or "RS Monitor Roles"
+                total_pages = (len(entries) + MONITOR_BUTTONS_PER_VIEW - 1) // MONITOR_BUTTONS_PER_VIEW
                 for i in range(0, len(entries), MONITOR_BUTTONS_PER_VIEW):
                     chunk = entries[i : i + MONITOR_BUTTONS_PER_VIEW]
                     view = MonitorRoleView(self, chunk)
-                    title = "Monitor channels — click to subscribe/unsubscribe"
-                    if (len(entries) + MONITOR_BUTTONS_PER_VIEW - 1) // MONITOR_BUTTONS_PER_VIEW > 1:
+                    title = "Monitor channels"
+                    if total_pages > 1:
                         page = i // MONITOR_BUTTONS_PER_VIEW + 1
-                        total = (len(entries) + MONITOR_BUTTONS_PER_VIEW - 1) // MONITOR_BUTTONS_PER_VIEW
-                        title += f" (page {page}/{total})"
-                    await picker_channel.send(title, view=view)
+                        title += f" (page {page}/{total_pages})"
+                    embed = discord.Embed(
+                        title=title,
+                        description=desc,
+                        color=self.get_embed_color(),
+                    )
+                    embed.set_footer(text=footer)
+                    if guild.icon:
+                        embed.set_thumbnail(url=guild.icon.url)
+                    await picker_channel.send(embed=embed, view=view)
                 await picker_channel.send("✅ Use the buttons above to show or hide monitor channels.")
             except Exception as e:
                 print(f"{Colors.RED}[MonitorRoles] postmonitorroles error: {e}{Colors.RESET}")
