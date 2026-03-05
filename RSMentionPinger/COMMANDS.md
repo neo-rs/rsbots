@@ -48,10 +48,18 @@ RSMentionPinger monitors Discord channels for mentions of specific roles and sen
   - Detailed command descriptions
   (Does not auto-delete)
 
+#### `!postmonitorroles`
+- **Description**: Post or update monitor role picker messages so members can subscribe/unsubscribe to monitor channels via buttons
+- **Aliases**: None
+- **Parameters**: None
+- **Usage**: `!postmonitorroles`
+- **Admin Only**: Yes (requires Manage Server)
+- **Returns**: Sends button messages in the configured `monitor_roles.picker_channel_id`. Creates "Monitor \| channel-name" roles and channel overwrites when using `monitor_roles.categories`. See `MONITOR_ROLES_PLAN.md` for config.
+
 ## Command Summary
 
-- **Total Commands**: 5
-- **Admin Commands**: 0
+- **Total Commands**: 6
+- **Admin Commands**: 1
 - **Public Commands**: 5
 - **Commands with Aliases**: 2
 - **Command Prefix**: `!`

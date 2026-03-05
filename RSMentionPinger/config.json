@@ -1,6 +1,26 @@
 {
   "guild_id": 876528050081251379,
   "log_channel_id": 1399088859245051954,
+  "monitor_roles": {
+    "picker_channel_id": 1478908612507340861,
+    "categories": [
+      {
+        "id": 1350953333069713528,
+        "title": "Flips / Card",
+        "emoji": "🤖",
+        "excluded_channel_ids": [
+          1429547977529360546,
+          1418246598193844255,
+          1418246657845235795
+        ]
+      },
+      {
+        "id": 1351327970463060088,
+        "title": "Sneaker",
+        "emoji": "👟"
+      }
+    ]
+  },
   "excluded_category_ids": [
     1215316814469533696,
     1387520841704673360

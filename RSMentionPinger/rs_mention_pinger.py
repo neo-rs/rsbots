@@ -25,6 +25,9 @@ from discord.ext import commands
 from mirror_world_config import load_config_with_secrets
 from mirror_world_config import is_placeholder_secret, mask_secret
 
+# Max buttons per Discord message (5 rows x 5)
+MONITOR_BUTTONS_PER_VIEW = 25
+
 # Colors for terminal
 class Colors:
     GREEN = '\033[92m'
@@ -87,23 +90,153 @@ class RSMentionPinger:
             return discord.Color.from_rgb(r, g, b)
         return discord.Color.blue()
     
-    def _first_image_from_message(self, message: discord.Message) -> Optional[str]:
-        """Extract first image URL from message attachments or embeds"""
-        # Check attachments
-        for att in message.attachments:
-            if (att.content_type and att.content_type.startswith("image/")) or \
-               att.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
-                return att.url
-        
-        # Check embeds
-        for e in message.embeds:
-            if e.image and e.image.url:
-                return e.image.url
-            if e.type == "image" and e.url:
-                return e.url
-        
-        return None
+    # ----- Monitor role picker (button-based channel subscription) -----
     
+    def _monitor_roles_config(self) -> Optional[dict]:
+        """Return monitor_roles config section or None if disabled."""
+        mr = self.config.get("monitor_roles")
+        if not mr or not mr.get("picker_channel_id"):
+            return None
+        return mr
+    
+    def _build_monitor_entries(self, guild: discord.Guild) -> list[tuple[int, str]]:
+        """Build list of (role_id, label) for monitor role buttons. Uses config 'entries' or 'categories'."""
+        mr = self._monitor_roles_config()
+        if not mr:
+            return []
+        entries_cfg = mr.get("entries")
+        if entries_cfg:
+            return [(int(e["role_id"]), e.get("label") or str(e.get("role_id", ""))) for e in entries_cfg]
+        categories_cfg = mr.get("categories") or []
+        out: list[tuple[int, str]] = []
+        for cat_cfg in categories_cfg:
+            cat_id = cat_cfg.get("id") if isinstance(cat_cfg, dict) else cat_cfg
+            if not cat_id:
+                continue
+            excluded_ids: Set[int] = set()
+            if isinstance(cat_cfg, dict):
+                for cid in cat_cfg.get("excluded_channel_ids") or []:
+                    excluded_ids.add(int(cid))
+            category = guild.get_channel(int(cat_id))
+            if not category or not isinstance(category, discord.CategoryChannel):
+                continue
+            for ch in category.text_channels:
+                if ch.id in excluded_ids:
+                    continue
+                role_name = f"Monitor | {ch.name}"
+                role = discord.utils.get(guild.roles, name=role_name)
+                if role:
+                    out.append((role.id, ch.name))
+        return out
+    
+    async def _ensure_monitor_roles_and_overwrites(self, guild: discord.Guild) -> None:
+        """Create missing 'Monitor | channel' roles and set channel overwrites. Only for categories."""
+        mr = self._monitor_roles_config()
+        if not mr:
+            return
+        categories_cfg = mr.get("categories") or []
+        for cat_cfg in categories_cfg:
+            cat_id = cat_cfg.get("id") if isinstance(cat_cfg, dict) else cat_cfg
+            if not cat_id:
+                continue
+            excluded_ids: Set[int] = set()
+            if isinstance(cat_cfg, dict):
+                for cid in cat_cfg.get("excluded_channel_ids") or []:
+                    excluded_ids.add(int(cid))
+            category = guild.get_channel(int(cat_id))
+            if not category or not isinstance(category, discord.CategoryChannel):
+                continue
+            for ch in category.text_channels:
+                if ch.id in excluded_ids:
+                    continue
+                role_name = f"Monitor | {ch.name}"
+                role = discord.utils.get(guild.roles, name=role_name)
+                if not role:
+                    try:
+                        role = await guild.create_role(
+                            name=role_name,
+                            permissions=discord.Permissions.none(),
+                            reason="Monitor role for channel subscription",
+                        )
+                        print(f"{Colors.GREEN}[MonitorRoles] Created role: {role.name}{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.RED}[MonitorRoles] Failed to create role {role_name}: {e}{Colors.RESET}")
+                        continue
+                try:
+                    await ch.set_permissions(guild.default_role, view_channel=False)
+                    await ch.set_permissions(role, view_channel=True, read_message_history=True)
+                except Exception as e:
+                    print(f"{Colors.RED}[MonitorRoles] Failed to set overwrites for #{ch.name}: {e}{Colors.RESET}")
+    
+    def _first_image_from_message(self, message: discord.Message) -> Optional[str]:
+        """Extract first image URL from message attachments or embeds."""
+        return _first_image_from_message_impl(message)
+
+
+class MonitorRoleView(discord.ui.View):
+    """Persistent view: buttons toggle roles so members can show/hide monitor channels."""
+
+    def __init__(self, pinger: RSMentionPinger, entries: list[tuple[int, str]], **kwargs):
+        super().__init__(timeout=None, **kwargs)
+        self.pinger = pinger
+        for role_id, label in entries:
+            btn = discord.ui.Button(
+                label=label[:80],
+                style=discord.ButtonStyle.primary,
+                custom_id=f"monitor_toggle:{role_id}",
+            )
+            btn.callback = self._make_callback(role_id, label)
+            self.add_item(btn)
+
+    def _make_callback(self, role_id: int, label: str):
+        async def callback(interaction: discord.Interaction):
+            await self._toggle_role(interaction, role_id, label)
+        return callback
+
+    async def _toggle_role(self, interaction: discord.Interaction, role_id: int, label: str):
+        if not interaction.guild or not interaction.user:
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+        member = interaction.guild.get_member(interaction.user.id)
+        if not member:
+            await interaction.response.send_message("Could not find you as a member.", ephemeral=True)
+            return
+        role = interaction.guild.get_role(role_id)
+        if not role:
+            await interaction.response.send_message(f"Role for **{label}** no longer exists.", ephemeral=True)
+            return
+        try:
+            if role in member.roles:
+                await member.remove_roles(role, reason="Monitor role toggle (unsubscribe)")
+                await interaction.response.send_message(f"Unsubscribed from **{label}**. Channel hidden.", ephemeral=True)
+            else:
+                await member.add_roles(role, reason="Monitor role toggle (subscribe)")
+                await interaction.response.send_message(f"Subscribed to **{label}**. Channel visible.", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message("I don't have permission to manage that role.", ephemeral=True)
+        except Exception as e:
+            print(f"{Colors.RED}[MonitorRoles] Toggle error: {e}{Colors.RESET}")
+            await interaction.response.send_message("Something went wrong. Try again or ask an admin.", ephemeral=True)
+
+
+def _first_image_from_message_impl(message: discord.Message) -> Optional[str]:
+    """Extract first image URL from message attachments or embeds."""
+    for att in message.attachments:
+        if (att.content_type and att.content_type.startswith("image/")) or (
+            att.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+        ):
+            return att.url
+    for e in message.embeds:
+        if e.image and e.image.url:
+            return e.image.url
+        if e.type == "image" and e.url:
+            return e.url
+    return None
+
+
+class _RSMentionPingerImpl:
+    """Placeholder: methods below belong to RSMentionPinger (see next fix)."""
+
     async def _log_role_mention(self, message: discord.Message) -> None:
         """Log role mentions to log channel"""
         watched_role_ids: Set[int] = set(self.config.get("watched_role_ids", []))
@@ -258,6 +391,15 @@ class RSMentionPinger:
                 print(f"   • Ignores bot mentions")
             else:
                 print(f"{Colors.YELLOW}⚠️  Guild not found (ID: {guild_id}){Colors.RESET}")
+            
+            # Register persistent monitor role views so buttons work after restart
+            if guild and self._monitor_roles_config():
+                entries = self._build_monitor_entries(guild)
+                if entries:
+                    for i in range(0, len(entries), MONITOR_BUTTONS_PER_VIEW):
+                        chunk = entries[i : i + MONITOR_BUTTONS_PER_VIEW]
+                        self.bot.add_view(MonitorRoleView(self, chunk))
+                    print(f"{Colors.GREEN}[MonitorRoles] Registered {len(entries)} role button(s) in {(len(entries) + MONITOR_BUTTONS_PER_VIEW - 1) // MONITOR_BUTTONS_PER_VIEW} view(s){Colors.RESET}")
             
             print(f"{Colors.CYAN}{'-'*60}{Colors.RESET}")
             print(f"{Colors.CYAN}{'='*60}{Colors.RESET}\n")
@@ -513,6 +655,63 @@ class RSMentionPinger:
                 await ctx.message.delete()
             except Exception:
                 pass
+        
+        @self.bot.command(name='postmonitorroles')
+        @commands.has_permissions(manage_guild=True)
+        async def post_monitor_roles(ctx):
+            """Post or update monitor role picker messages (admin). Creates roles/overwrites if using categories."""
+            mr = self._monitor_roles_config()
+            if not mr:
+                await ctx.send("❌ `monitor_roles` is not configured in config.json.", delete_after=10)
+                try:
+                    await ctx.message.delete()
+                except Exception:
+                    pass
+                return
+            guild = ctx.guild
+            if not guild:
+                await ctx.send("❌ Use this command in a server.", delete_after=10)
+                return
+            picker_channel_id = mr.get("picker_channel_id")
+            picker_channel = guild.get_channel(picker_channel_id) if picker_channel_id else None
+            if not picker_channel or not isinstance(picker_channel, discord.TextChannel):
+                await ctx.send(f"❌ Picker channel not found (ID: {picker_channel_id}).", delete_after=10)
+                try:
+                    await ctx.message.delete()
+                except Exception:
+                    pass
+                return
+            await ctx.send("⏳ Setting up roles and overwrites (if using categories), then posting buttons…", delete_after=5)
+            try:
+                await ctx.message.delete()
+            except Exception:
+                pass
+            try:
+                await self._ensure_monitor_roles_and_overwrites(guild)
+                entries = self._build_monitor_entries(guild)
+                if not entries:
+                    await picker_channel.send("No monitor entries found. Check `monitor_roles.categories` or `monitor_roles.entries` in config.")
+                    return
+                # Optional: delete previous bot messages in picker channel to avoid duplicates
+                try:
+                    async for msg in picker_channel.history(limit=50):
+                        if msg.author == self.bot.user:
+                            await msg.delete()
+                except Exception:
+                    pass
+                for i in range(0, len(entries), MONITOR_BUTTONS_PER_VIEW):
+                    chunk = entries[i : i + MONITOR_BUTTONS_PER_VIEW]
+                    view = MonitorRoleView(self, chunk)
+                    title = "Monitor channels — click to subscribe/unsubscribe"
+                    if (len(entries) + MONITOR_BUTTONS_PER_VIEW - 1) // MONITOR_BUTTONS_PER_VIEW > 1:
+                        page = i // MONITOR_BUTTONS_PER_VIEW + 1
+                        total = (len(entries) + MONITOR_BUTTONS_PER_VIEW - 1) // MONITOR_BUTTONS_PER_VIEW
+                        title += f" (page {page}/{total})"
+                    await picker_channel.send(title, view=view)
+                await picker_channel.send("✅ Use the buttons above to show or hide monitor channels.")
+            except Exception as e:
+                print(f"{Colors.RED}[MonitorRoles] postmonitorroles error: {e}{Colors.RESET}")
+                await picker_channel.send(f"❌ Error: {e}")
     
     def run(self):
         """Start the bot"""
@@ -528,6 +727,11 @@ class RSMentionPinger:
         except Exception as e:
             print(f"{Colors.RED}[Bot] Fatal error: {e}{Colors.RESET}")
             sys.exit(1)
+
+
+# Attach methods that are defined later in the file (after MonitorRoleView)
+for _m in ("_log_role_mention", "_dm_mentioned_users", "_setup_events", "run"):
+    setattr(RSMentionPinger, _m, getattr(_RSMentionPingerImpl, _m))
 
 
 if __name__ == "__main__":
