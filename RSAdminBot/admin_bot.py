@@ -8232,7 +8232,7 @@ echo "CHANGED_END"
                     inline=True
                 )
 
-            # Other short scalar fields
+            # All remaining config keys (scalars as value; dict/list as type summary so every key is visible)
             other_fields = []
             skip = {
                 "bot_token", "guild_id", "brand_name", "log_channel_id",
@@ -8242,16 +8242,23 @@ echo "CHANGED_END"
             for key, value in config.items():
                 if key in skip:
                     continue
+                label = key.replace("_", " ").title()
                 if isinstance(value, (str, int, float, bool)):
-                    if len(str(value)) < 100:
-                        other_fields.append(f"**{key.replace('_', ' ').title()}**: `{value}`")
+                    s = str(value)
+                    other_fields.append(f"**{label}**: `{s[:80]}...`" if len(s) > 80 else f"**{label}**: `{value}`")
+                elif isinstance(value, list):
+                    other_fields.append(f"**{label}**: list ({len(value)} items)")
+                elif isinstance(value, dict):
+                    other_fields.append(f"**{label}**: object ({len(value)} keys)")
+                else:
+                    other_fields.append(f"**{label}**: {type(value).__name__}")
             if other_fields:
-                other_text = "\n".join(other_fields[:10])
-                if len(other_fields) > 10:
-                    other_text += f"\n*... and {len(other_fields) - 10} more field(s)*"
+                other_text = "\n".join(other_fields)
+                if len(other_text) > 1020:
+                    other_text = other_text[:1020] + "…"
                 embed.add_field(
-                    name="⚙️ Other Settings",
-                    value=other_text[:1000],
+                    name="⚙️ All config keys",
+                    value=other_text,
                     inline=False
                 )
 
