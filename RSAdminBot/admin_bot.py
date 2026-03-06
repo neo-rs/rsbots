@@ -27,7 +27,7 @@ import time
 import re
 from collections import deque
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable
+from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable, Union
 from datetime import datetime, timezone, timedelta
 from contextlib import suppress
 
@@ -1883,13 +1883,26 @@ class BotSelectView(ui.View):
         await interaction.followup.send(embed=embed, ephemeral=True)
     
     async def _handle_config(self, interaction, bot_name, bot_info):
-        """Handle bot config"""
+        """Handle bot config: one or multiple cards (grouped by IDs, channels, booleans, etc.) with code-block copy."""
         ok, err = await self.admin_bot._slash_owner_guard(interaction)
         if not ok:
             await interaction.followup.send(err, ephemeral=True)
             return
-        embed = self.admin_bot._build_botconfig_embed(bot_name, triggered_by=interaction.user)
-        await interaction.followup.send(embed=embed, view=BotConfigActionsView(self.admin_bot, bot_name), ephemeral=True)
+        result = self.admin_bot._build_botconfig_embed(bot_name, triggered_by=interaction.user)
+        view = BotConfigActionsView(self.admin_bot, bot_name)
+        if isinstance(result, list):
+            embeds = result
+            chunk_size = 10
+            for i in range(0, len(embeds), chunk_size):
+                chunk = embeds[i : i + chunk_size]
+                is_last = (i + chunk_size) >= len(embeds)
+                await interaction.followup.send(
+                    embeds=chunk,
+                    view=view if is_last else None,
+                    ephemeral=True,
+                )
+        else:
+            await interaction.followup.send(embed=result, view=view, ephemeral=True)
 
     async def _handle_config_all(self, interaction):
         """Handle config labels for all bots (no single-bot view)."""
@@ -8019,8 +8032,8 @@ echo "CHANGED_END"
             embeds.append(embed)
         return embeds
 
-    def _build_botconfig_embed(self, bot_name: str, *, triggered_by: Optional[Any] = None) -> discord.Embed:
-        """Build a botconfig embed for a bot (RS inspector when available; MW file-based summary otherwise)."""
+    def _build_botconfig_embed(self, bot_name: str, *, triggered_by: Optional[Any] = None) -> Union[discord.Embed, List[discord.Embed]]:
+        """Build a botconfig embed (or list of grouped cards for RS bots) for a bot."""
         who = f"Triggered by {triggered_by}" if triggered_by else None
         bot_key = str(bot_name or "").strip().lower()
 
@@ -8125,145 +8138,14 @@ echo "CHANGED_END"
             bot_display_name = self.BOTS[bot_key]["name"]
 
         try:
-            embed = discord.Embed(
-                title=f"⚙️ {bot_display_name} Configuration",
-                color=discord.Color.blue(),
-                timestamp=datetime.now()
-            )
-
-            # Basic settings
-            if "bot_token" in config:
-                embed.add_field(
-                    name="🔐 Authentication",
-                    value="✅ Token configured (hidden)",
-                    inline=False
+            embeds = self._build_rs_botconfig_cards(bot_display_name, config, who)
+            if not embeds:
+                return MessageHelper.create_error_embed(
+                    title="Config Render Error",
+                    message="No config groups to display.",
+                    footer=who,
                 )
-
-            if "guild_id" in config:
-                embed.add_field(
-                    name="🏠 Server ID",
-                    value=f"`{config.get('guild_id')}`",
-                    inline=True
-                )
-
-            if "brand_name" in config:
-                embed.add_field(
-                    name="🏷️ Brand Name",
-                    value=str(config.get("brand_name") or ""),
-                    inline=True
-                )
-
-            # Channel IDs
-            channel_fields = []
-            if "log_channel_id" in config:
-                channel_fields.append(f"📝 Log Channel: `{config['log_channel_id']}`")
-            if "forwarding_logs_channel_id" in config:
-                channel_fields.append(f"📤 Forwarding Logs: `{config['forwarding_logs_channel_id']}`")
-            if "whop_logs_channel_id" in config:
-                channel_fields.append(f"💳 Whop Logs: `{config['whop_logs_channel_id']}`")
-            if "ssh_commands_channel_id" in config:
-                channel_fields.append(f"🖥️ SSH Commands: `{config['ssh_commands_channel_id']}`")
-            if channel_fields:
-                embed.add_field(
-                    name="📡 Channels",
-                    value="\n".join(channel_fields)[:1000],
-                    inline=False
-                )
-
-            # Forwarder channels array
-            if "channels" in config and isinstance(config["channels"], list):
-                channels_info = []
-                for i, channel in enumerate(config["channels"][:5], 1):
-                    source_name = channel.get("source_channel_name", "Unknown")
-                    source_id = channel.get("source_channel_id", "N/A")
-                    role_id = (channel.get("role_mention") or {}).get("role_id", "None")
-                    channels_info.append(f"**{i}. {source_name}**\n   Source: `{source_id}`\n   Role: `{role_id}`")
-                if len(config["channels"]) > 5:
-                    channels_info.append(f"\n*... and {len(config['channels']) - 5} more channel(s)*")
-                embed.add_field(
-                    name="🔄 Forwarding Channels",
-                    value="\n".join(channels_info)[:1000],
-                    inline=False
-                )
-
-            # Invite tracking
-            if "invite_tracking" in config and isinstance(config.get("invite_tracking"), dict):
-                invite = config["invite_tracking"]
-                invite_info = []
-                if "invite_channel_id" in invite:
-                    invite_info.append(f"📨 Invite Channel: `{invite['invite_channel_id']}`")
-                if "fallback_invite" in invite and invite.get("fallback_invite"):
-                    fb = str(invite.get("fallback_invite"))
-                    invite_info.append(f"🔗 Fallback: `{fb[:50]}...`" if len(fb) > 50 else f"🔗 Fallback: `{fb}`")
-                if invite_info:
-                    embed.add_field(
-                        name="📨 Invite Tracking",
-                        value="\n".join(invite_info)[:1000],
-                        inline=False
-                    )
-
-            # DM sequence
-            if "dm_sequence" in config and isinstance(config.get("dm_sequence"), dict):
-                dm = config["dm_sequence"]
-                dm_info = []
-                if "send_spacing_seconds" in dm:
-                    dm_info.append(f"⏱️ Spacing: {dm['send_spacing_seconds']}s")
-                if "day_gap_hours" in dm:
-                    dm_info.append(f"📅 Day Gap: {dm['day_gap_hours']}h")
-                if dm_info:
-                    embed.add_field(
-                        name="💬 DM Sequence",
-                        value="\n".join(dm_info)[:1000],
-                        inline=True
-                    )
-
-            # Tickets / success
-            if "ticket_category_id" in config:
-                embed.add_field(
-                    name="🎫 Tickets",
-                    value=f"Category: `{config['ticket_category_id']}`",
-                    inline=True
-                )
-            if "success_channel_ids" in config:
-                count = len(config["success_channel_ids"]) if isinstance(config["success_channel_ids"], list) else 1
-                embed.add_field(
-                    name="🏆 Success Channels",
-                    value=f"{count} channel(s) configured",
-                    inline=True
-                )
-
-            # All remaining config keys (scalars as value; dict/list as type summary so every key is visible)
-            other_fields = []
-            skip = {
-                "bot_token", "guild_id", "brand_name", "log_channel_id",
-                "forwarding_logs_channel_id", "whop_logs_channel_id", "ssh_commands_channel_id",
-                "channels", "invite_tracking", "dm_sequence", "ticket_category_id", "success_channel_ids",
-            }
-            for key, value in config.items():
-                if key in skip:
-                    continue
-                label = key.replace("_", " ").title()
-                if isinstance(value, (str, int, float, bool)):
-                    s = str(value)
-                    other_fields.append(f"**{label}**: `{s[:80]}...`" if len(s) > 80 else f"**{label}**: `{value}`")
-                elif isinstance(value, list):
-                    other_fields.append(f"**{label}**: list ({len(value)} items)")
-                elif isinstance(value, dict):
-                    other_fields.append(f"**{label}**: object ({len(value)} keys)")
-                else:
-                    other_fields.append(f"**{label}**: {type(value).__name__}")
-            if other_fields:
-                other_text = "\n".join(other_fields)
-                if len(other_text) > 1020:
-                    other_text = other_text[:1020] + "…"
-                embed.add_field(
-                    name="⚙️ All config keys",
-                    value=other_text,
-                    inline=False
-                )
-
-            embed.set_footer(text=who or "Use !botconfig <bot> to view full config")
-            return embed
+            return embeds
         except Exception as e:
             return MessageHelper.create_error_embed(
                 title="Config Render Error",
@@ -8271,6 +8153,125 @@ echo "CHANGED_END"
                 error_details=str(e)[:900],
                 footer=who,
             )
+
+    def _build_rs_botconfig_cards(
+        self, bot_display_name: str, config: Dict[str, Any], footer: Optional[str] = None
+    ) -> List[discord.Embed]:
+        """Build one embed per config group (IDs, Channels, Booleans, etc.) with code blocks for copy."""
+        who = footer or ""
+        embeds: List[discord.Embed] = []
+        base_title = f"⚙️ {bot_display_name} Configuration"
+
+        def _card(title_suffix: str, code_lines: List[str], description: str = "") -> discord.Embed:
+            e = discord.Embed(
+                title=f"{base_title} — {title_suffix}",
+                color=discord.Color.blue(),
+                timestamp=datetime.now(),
+            )
+            if description:
+                e.description = description
+            if code_lines:
+                block = "\n".join(code_lines)
+                if len(block) > 1018:
+                    block = block[:1018] + "…"
+                e.add_field(name="Copy below", value=f"```\n{block}\n```", inline=False)
+            e.set_footer(text=who or "Use the copy button on the code block")
+            return e
+
+        # —— IDs (guild, server, category, role IDs) ——
+        id_keys = [
+            "guild_id", "rs_server_guild_id", "test_server_guild_id", "guild_ids",
+            "log_channel_id", "forwarding_logs_channel_id", "whop_logs_channel_id", "ssh_commands_channel_id",
+            "ticket_category_id", "success_channel_ids", "price_glitch_role_id",
+            "invite_channel_id",
+        ]
+        id_lines = []
+        for k in id_keys:
+            if k not in config:
+                continue
+            v = config[k]
+            if isinstance(v, list):
+                id_lines.append(f"{k}: list ({len(v)} items)")
+            else:
+                id_lines.append(f"{k}: {v}")
+        if id_lines:
+            embeds.append(_card("IDs", id_lines, "🏠 Server, channel, category, and role IDs."))
+
+        # —— Forwarding channels (source/role pairs) ——
+        if "channels" in config and isinstance(config["channels"], list):
+            fwd_lines = []
+            for i, ch in enumerate(config["channels"][:15], 1):
+                name = ch.get("source_channel_name", "Unknown")
+                src = ch.get("source_channel_id", "N/A")
+                role = (ch.get("role_mention") or {}).get("role_id", "None")
+                fwd_lines.append(f"{i}. {name}\n   source_channel_id: {src}\n   role_id: {role}")
+            if len(config["channels"]) > 15:
+                fwd_lines.append(f"... and {len(config['channels']) - 15} more")
+            if fwd_lines:
+                embeds.append(_card("Forwarding Channels", fwd_lines, "🔄 Source channel → role mappings."))
+
+        # —— Booleans ——
+        bool_lines = []
+        for k, v in sorted(config.items()):
+            if v is True or v is False:
+                bool_lines.append(f"{k}: {v}")
+        if bool_lines:
+            embeds.append(_card("Booleans", bool_lines, "✅ True/False settings."))
+
+        # —— Text / templates (short strings) ——
+        text_lines = []
+        skip_text = {"bot_token"}
+        for k, v in sorted(config.items()):
+            if k in skip_text:
+                continue
+            if isinstance(v, str):
+                s = (v[:100] + "…") if len(v) > 100 else v
+                text_lines.append(f"{k}: {s}")
+        if text_lines:
+            embeds.append(_card("Text & templates", text_lines, "📝 Strings and message templates."))
+
+        # —— Lists & objects (summary) ——
+        list_lines = []
+        skip_all = {
+            "bot_token", "guild_id", "rs_server_guild_id", "test_server_guild_id", "guild_ids",
+            "log_channel_id", "forwarding_logs_channel_id", "whop_logs_channel_id", "ssh_commands_channel_id",
+            "channels", "invite_tracking", "dm_sequence", "ticket_category_id", "success_channel_ids",
+            "brand_name", "price_glitch_role_id", "invite_channel_id",
+        }
+        for k, v in sorted(config.items()):
+            if k in skip_all:
+                continue
+            if isinstance(v, list):
+                list_lines.append(f"{k}: list ({len(v)} items)")
+            elif isinstance(v, dict):
+                list_lines.append(f"{k}: object ({len(v)} keys)")
+        if list_lines:
+            embeds.append(_card("Lists & objects", list_lines, "📦 Config keys that are lists or nested objects."))
+
+        # —— Invite / DM / other known structs (one line each) ——
+        extra_lines = []
+        if "invite_tracking" in config and isinstance(config["invite_tracking"], dict):
+            inv = config["invite_tracking"]
+            extra_lines.append(f"invite_tracking.invite_channel_id: {inv.get('invite_channel_id', '')}")
+            if inv.get("fallback_invite"):
+                extra_lines.append("invite_tracking.fallback_invite: (set)")
+        if "dm_sequence" in config and isinstance(config["dm_sequence"], dict):
+            dm = config["dm_sequence"]
+            extra_lines.append(f"dm_sequence.send_spacing_seconds: {dm.get('send_spacing_seconds', '')}")
+            extra_lines.append(f"dm_sequence.day_gap_hours: {dm.get('day_gap_hours', '')}")
+        if extra_lines:
+            embeds.append(_card("Invite & DM", extra_lines, "📨 Invite and DM sequence settings."))
+
+        if not embeds:
+            e = discord.Embed(
+                title=base_title,
+                description="No config keys to display.",
+                color=discord.Color.blue(),
+                timestamp=datetime.now(),
+            )
+            e.set_footer(text=who)
+            embeds.append(e)
+        return embeds
     
     def _setup_events(self):
         """Setup Discord event handlers"""
@@ -11556,8 +11557,12 @@ sha256sum {quoted_files} 2>&1 | sed 's#^#sha256 #'
                 await ctx.send(embed=embed, view=view)
                 return
             
-            embed = self._build_botconfig_embed(bot_name, triggered_by=ctx.author)
-            await ctx.send(embed=embed)
+            result = self._build_botconfig_embed(bot_name, triggered_by=ctx.author)
+            if isinstance(result, list):
+                for i in range(0, len(result), 10):
+                    await ctx.send(embeds=result[i : i + 10])
+            else:
+                await ctx.send(embed=result)
 
         # Whop tracking commands
         @self.bot.command(name="whopscan")

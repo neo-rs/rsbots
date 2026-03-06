@@ -490,16 +490,17 @@ def _rsfs_build_items_by_store_from_rows(
             continue
         if title and bot._rsfs_title_is_bad(title, url=url):
             title = ""
-        item_parts = [f"`{store} {sku}`"]
+        # One card per item: store/sku, Release ID, Title, URL, then command in code block (copy button)
+        lines = [f"{store} {sku}"]
         if rid:
-            item_parts.append(f"Release ID: `{rid}`")
+            lines.append(f"Release ID: {rid}")
         if title:
-            item_parts.append(f"Title: {title[:60]}")
+            lines.append(f"Title: {title[:80]}")
         if url:
-            item_parts.append(f"URL: {url[:60]}")
+            lines.append(f"URL: {url[:80]}")
         if rid:
-            item_parts.append(f"```\n/removereleaseid release_id: {rid}\n```")
-        item_text = " • ".join(item_parts)
+            lines.append(f"```\n/removereleaseid release_id: {rid}\n```")
+        item_text = "\n".join(lines)
         if store not in items_by_store:
             items_by_store[store] = []
         items_by_store[store].append(item_text)
@@ -554,7 +555,7 @@ class _RsFsCurrentListByStoreView(discord.ui.View):
             description=desc or "(no items)",
             color=discord.Color.blue(),
         )
-        emb.set_footer(text=f"Store {page}/{total_stores} • {len(items)} item(s) • {self._total_items} total")
+        emb.set_footer(text=f"Store {page}/{total_stores} • {len(items)} item(s) • {self._total_items} total • Copy: use button on each command block")
         return emb
     
     async def _guard(self, interaction: discord.Interaction) -> bool:
