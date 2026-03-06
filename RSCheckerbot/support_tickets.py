@@ -4436,6 +4436,16 @@ async def _get_or_create_member_welcome_category_id(*, guild: discord.Guild) -> 
         return 0
 
 
+def _is_lite_membership(whop_brief: dict | None) -> bool:
+    """True if the brief is for Reselling Secrets (Lite); we do not open cancellation tickets for Lite."""
+    b = whop_brief if isinstance(whop_brief, dict) else {}
+    product = str(b.get("product") or "").strip()
+    if not product:
+        return False
+    p = product.lower()
+    return "(lite" in p or p == "lite" or "reselling secrets (lite)" in p
+
+
 async def open_cancellation_ticket(
     *,
     member: discord.Member,
@@ -4446,6 +4456,8 @@ async def open_cancellation_ticket(
 ) -> discord.TextChannel | None:
     cfg = _cfg()
     if not cfg:
+        return None
+    if _is_lite_membership(whop_brief):
         return None
     embed = build_cancellation_preview_embed(
         member=member,
@@ -5037,6 +5049,79 @@ async def purge_no_whop_link_open_tickets(
             failed += 1
 
     await _log(f"🧹 support_tickets: purged no_whop_link tickets deleted={deleted} skipped={skipped} failed={failed}")
+    return {"deleted": int(deleted), "skipped": int(skipped), "failed": int(failed)}
+
+
+async def _get_membership_from_cancellation_channel(ch: discord.TextChannel) -> str | None:
+    """Read channel history for the first Cancellation embed and return the Membership field value, or None."""
+    try:
+        async for m in ch.history(limit=25, oldest_first=True):
+            for emb in getattr(m, "embeds", None) or []:
+                if str(getattr(emb, "title", "") or "").strip() != "Cancellation":
+                    continue
+                for f in getattr(emb, "fields", None) or []:
+                    if str(getattr(f, "name", "") or "").strip() == "Membership":
+                        return str(getattr(f, "value", "") or "").strip()
+    except Exception:
+        pass
+    return None
+
+
+async def purge_cancellation_tickets_lite(
+    *,
+    do_transcript: bool = True,
+    delete_channel: bool = True,
+) -> dict:
+    """Delete all OPEN cancellation ticket channels where Membership is Reselling Secrets (Lite).
+    Identifies Lite by reading the ticket's Cancellation embed Membership field."""
+    if not _ensure_cfg_loaded() or not _BOT:
+        return {"deleted": 0, "skipped": 0, "failed": 0}
+    cfg = _cfg()
+    if not cfg:
+        return {"deleted": 0, "skipped": 0, "failed": 0}
+    guild = _BOT.get_guild(int(cfg.guild_id))
+    if not isinstance(guild, discord.Guild):
+        return {"deleted": 0, "skipped": 0, "failed": 0}
+
+    targets: list[int] = []
+    async with _INDEX_LOCK:
+        db = _index_load()
+        for _tid, rec in _ticket_iter(db):
+            if not _ticket_is_open(rec):
+                continue
+            if str(rec.get("ticket_type") or "").strip().lower() != "cancellation":
+                continue
+            cid = _as_int(rec.get("channel_id"))
+            if cid > 0:
+                targets.append(int(cid))
+
+    deleted = 0
+    skipped = 0
+    failed = 0
+    for cid in targets:
+        try:
+            ch = guild.get_channel(int(cid))
+            if not isinstance(ch, discord.TextChannel):
+                skipped += 1
+                continue
+            membership_val = await _get_membership_from_cancellation_channel(ch)
+            if membership_val is None:
+                skipped += 1
+                continue
+            if not _is_lite_membership({"product": membership_val}):
+                skipped += 1
+                continue
+            await close_ticket_by_channel_id(
+                int(cid),
+                close_reason="purge_lite_cancellation",
+                do_transcript=bool(do_transcript),
+                delete_channel=bool(delete_channel),
+            )
+            deleted += 1
+        except Exception:
+            failed += 1
+
+    await _log(f"🧹 support_tickets: purged cancellation (Lite) tickets deleted={deleted} skipped={skipped} failed={failed}")
     return {"deleted": int(deleted), "skipped": int(skipped), "failed": int(failed)}
 
 

@@ -2168,6 +2168,17 @@ async def _run_startup_scans() -> None:
     if delay_s:
         await asyncio.sleep(delay_s)
 
+    # Optional one-time purge of cancellation tickets for Reselling Secrets (Lite).
+    if os.environ.get("RUN_PURGE_LITE_CANCEL", "").strip() == "1":
+        with suppress(Exception):
+            stats = await support_tickets.purge_cancellation_tickets_lite(do_transcript=True, delete_channel=True)
+            log.info(
+                "[BOOT][purge_lite_cancel] deleted=%s skipped=%s failed=%s",
+                int((stats or {}).get("deleted") or 0),
+                int((stats or {}).get("skipped") or 0),
+                int((stats or {}).get("failed") or 0),
+            )
+
     try:
         _STARTUP_SCANS_DONE.clear()
         # Run in order (cheap -> expensive).
@@ -10023,6 +10034,27 @@ async def purge_no_whop_link_tickets(ctx, confirm: str = ""):
     stats = await support_tickets.purge_no_whop_link_open_tickets(do_transcript=True, delete_channel=True)
     await ctx.send(
         f"✅ purgenowhop complete — deleted: {int((stats or {}).get('deleted') or 0)}, "
+        f"skipped: {int((stats or {}).get('skipped') or 0)}, failed: {int((stats or {}).get('failed') or 0)}",
+        delete_after=30,
+    )
+
+
+@bot.command(name="purgelitecancel", aliases=["purgecancelite", "purge-lite-cancel", "wipe-lite-cancellation"])
+@commands.has_permissions(administrator=True)
+async def purge_lite_cancellation_tickets(ctx, confirm: str = ""):
+    """Delete all OPEN cancellation ticket channels where Membership is Reselling Secrets (Lite).
+
+    Usage:
+      .checker purgelitecancel confirm
+    """
+    if str(confirm or "").strip().lower() != "confirm":
+        await ctx.send("❌ Confirmation required. Use: `.checker purgelitecancel confirm`", delete_after=20)
+        return
+    with suppress(Exception):
+        await ctx.send("⏳ Purging cancellation tickets (Reselling Secrets Lite)…", delete_after=10)
+    stats = await support_tickets.purge_cancellation_tickets_lite(do_transcript=True, delete_channel=True)
+    await ctx.send(
+        f"✅ purgelitecancel complete — deleted: {int((stats or {}).get('deleted') or 0)}, "
         f"skipped: {int((stats or {}).get('skipped') or 0)}, failed: {int((stats or {}).get('failed') or 0)}",
         delete_after=30,
     )
