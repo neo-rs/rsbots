@@ -8157,26 +8157,44 @@ echo "CHANGED_END"
     def _build_rs_botconfig_cards(
         self, bot_display_name: str, config: Dict[str, Any], footer: Optional[str] = None
     ) -> List[discord.Embed]:
-        """Build one embed per config group (IDs, Channels, Booleans, etc.) with code blocks for copy."""
+        """Build one embed per config group; one field per key so each value has its own copy button."""
         who = footer or ""
         embeds: List[discord.Embed] = []
         base_title = f"⚙️ {bot_display_name} Configuration"
+        max_fields = 25  # Discord limit per embed
+        max_value_len = 1018  # leave room for ``` wrapper
 
-        def _card(title_suffix: str, code_lines: List[str], description: str = "") -> discord.Embed:
-            e = discord.Embed(
-                title=f"{base_title} — {title_suffix}",
-                color=discord.Color.blue(),
-                timestamp=datetime.now(),
-            )
-            if description:
-                e.description = description
-            if code_lines:
-                block = "\n".join(code_lines)
-                if len(block) > 1018:
-                    block = block[:1018] + "…"
-                e.add_field(name="Copy below", value=f"```\n{block}\n```", inline=False)
-            e.set_footer(text=who or "Use the copy button on the code block")
-            return e
+        def _value_block(v: Any) -> str:
+            s = str(v)
+            return (s[: max_value_len - 3] + "…") if len(s) > max_value_len else s
+
+        def _card_with_fields(
+            title_suffix: str, pairs: List[Tuple[str, str]], description: str = ""
+        ) -> List[discord.Embed]:
+            out: List[discord.Embed] = []
+            for chunk_start in range(0, len(pairs), max_fields):
+                chunk = pairs[chunk_start : chunk_start + max_fields]
+                part = (chunk_start // max_fields) + 1
+                total_parts = (len(pairs) + max_fields - 1) // max_fields
+                title = f"{base_title} — {title_suffix}"
+                if total_parts > 1:
+                    title += f" ({part}/{total_parts})"
+                e = discord.Embed(
+                    title=title,
+                    color=discord.Color.blue(),
+                    timestamp=datetime.now(),
+                )
+                if description and chunk_start == 0:
+                    e.description = description
+                for key, value in chunk:
+                    e.add_field(
+                        name=key,
+                        value=f"```\n{value}\n```",
+                        inline=True,
+                    )
+                e.set_footer(text=who or "Copy: use the copy button on the value you need")
+                out.append(e)
+            return out
 
         # —— IDs (guild, server, category, role IDs) ——
         id_keys = [
@@ -8185,82 +8203,77 @@ echo "CHANGED_END"
             "ticket_category_id", "success_channel_ids", "price_glitch_role_id",
             "invite_channel_id",
         ]
-        id_lines = []
+        id_pairs = []
         for k in id_keys:
             if k not in config:
                 continue
             v = config[k]
             if isinstance(v, list):
-                id_lines.append(f"{k}: list ({len(v)} items)")
+                id_pairs.append((k, f"list ({len(v)} items)"))
             else:
-                id_lines.append(f"{k}: {v}")
-        if id_lines:
-            embeds.append(_card("IDs", id_lines, "🏠 Server, channel, category, and role IDs."))
+                id_pairs.append((k, _value_block(v)))
+        if id_pairs:
+            embeds.extend(_card_with_fields("IDs", id_pairs, "🏠 Server, channel, category, and role IDs."))
 
         # —— Forwarding channels (source/role pairs) ——
         if "channels" in config and isinstance(config["channels"], list):
-            fwd_lines = []
-            for i, ch in enumerate(config["channels"][:15], 1):
+            fwd_pairs = []
+            for i, ch in enumerate(config["channels"][:max_fields], 1):
                 name = ch.get("source_channel_name", "Unknown")
                 src = ch.get("source_channel_id", "N/A")
                 role = (ch.get("role_mention") or {}).get("role_id", "None")
-                fwd_lines.append(f"{i}. {name}\n   source_channel_id: {src}\n   role_id: {role}")
-            if len(config["channels"]) > 15:
-                fwd_lines.append(f"... and {len(config['channels']) - 15} more")
-            if fwd_lines:
-                embeds.append(_card("Forwarding Channels", fwd_lines, "🔄 Source channel → role mappings."))
+                fwd_pairs.append((f"{i}. {name}", f"source: {src}\nrole: {role}"))
+            if len(config["channels"]) > max_fields:
+                fwd_pairs.append(("…", f"+{len(config['channels']) - max_fields} more"))
+            if fwd_pairs:
+                embeds.extend(_card_with_fields("Forwarding Channels", fwd_pairs, "🔄 Source channel → role mappings."))
 
         # —— Booleans ——
-        bool_lines = []
-        for k, v in sorted(config.items()):
-            if v is True or v is False:
-                bool_lines.append(f"{k}: {v}")
-        if bool_lines:
-            embeds.append(_card("Booleans", bool_lines, "✅ True/False settings."))
+        bool_pairs = [(k, str(v)) for k, v in sorted(config.items()) if v is True or v is False]
+        if bool_pairs:
+            embeds.extend(_card_with_fields("Booleans", bool_pairs, "✅ True/False settings."))
 
-        # —— Text / templates (short strings) ——
-        text_lines = []
-        skip_text = {"bot_token"}
+        # —— Text / templates (strings) ——
+        text_pairs = []
         for k, v in sorted(config.items()):
-            if k in skip_text:
+            if k == "bot_token":
                 continue
             if isinstance(v, str):
-                s = (v[:100] + "…") if len(v) > 100 else v
-                text_lines.append(f"{k}: {s}")
-        if text_lines:
-            embeds.append(_card("Text & templates", text_lines, "📝 Strings and message templates."))
+                text_pairs.append((k, _value_block(v)))
+        if text_pairs:
+            embeds.extend(_card_with_fields("Text & templates", text_pairs, "📝 Strings and message templates."))
 
         # —— Lists & objects (summary) ——
-        list_lines = []
-        skip_all = {
+        skip_list = {
             "bot_token", "guild_id", "rs_server_guild_id", "test_server_guild_id", "guild_ids",
             "log_channel_id", "forwarding_logs_channel_id", "whop_logs_channel_id", "ssh_commands_channel_id",
             "channels", "invite_tracking", "dm_sequence", "ticket_category_id", "success_channel_ids",
             "brand_name", "price_glitch_role_id", "invite_channel_id",
         }
+        list_pairs = []
         for k, v in sorted(config.items()):
-            if k in skip_all:
+            if k in skip_list:
                 continue
             if isinstance(v, list):
-                list_lines.append(f"{k}: list ({len(v)} items)")
+                list_pairs.append((k, f"list ({len(v)} items)"))
             elif isinstance(v, dict):
-                list_lines.append(f"{k}: object ({len(v)} keys)")
-        if list_lines:
-            embeds.append(_card("Lists & objects", list_lines, "📦 Config keys that are lists or nested objects."))
+                list_pairs.append((k, f"object ({len(v)} keys)"))
+        if list_pairs:
+            embeds.extend(_card_with_fields("Lists & objects", list_pairs, "📦 Keys that are lists or nested objects."))
 
-        # —— Invite / DM / other known structs (one line each) ——
-        extra_lines = []
+        # —— Invite / DM (dot paths for Edit modal) ——
+        extra_pairs = []
         if "invite_tracking" in config and isinstance(config["invite_tracking"], dict):
             inv = config["invite_tracking"]
-            extra_lines.append(f"invite_tracking.invite_channel_id: {inv.get('invite_channel_id', '')}")
+            extra_pairs.append(("invite_tracking.invite_channel_id", _value_block(inv.get("invite_channel_id", ""))))
             if inv.get("fallback_invite"):
-                extra_lines.append("invite_tracking.fallback_invite: (set)")
+                extra_pairs.append(("invite_tracking.fallback_invite", "(set)"))
         if "dm_sequence" in config and isinstance(config["dm_sequence"], dict):
             dm = config["dm_sequence"]
-            extra_lines.append(f"dm_sequence.send_spacing_seconds: {dm.get('send_spacing_seconds', '')}")
-            extra_lines.append(f"dm_sequence.day_gap_hours: {dm.get('day_gap_hours', '')}")
-        if extra_lines:
-            embeds.append(_card("Invite & DM", extra_lines, "📨 Invite and DM sequence settings."))
+            extra_pairs.append(("dm_sequence.send_spacing_seconds", _value_block(dm.get("send_spacing_seconds", ""))))
+            extra_pairs.append(("dm_sequence.day_gap_hours", _value_block(dm.get("day_gap_hours", ""))))
+        if extra_pairs:
+            embeds.extend(_card_with_fields("Invite & DM", extra_pairs, "📨 Use these key paths in Edit config.json."))
 
         if not embeds:
             e = discord.Embed(
