@@ -69,6 +69,18 @@ Where they live in config (canonical):
 
 ---
 
+## 📺 Discord channel display (one format)
+
+When a bot shows Discord channels in messages (lists, dropdowns, embeds), use a **single canonical format** so users see the same thing everywhere:
+
+- **Display**: Prefer **channel name** (and server name when helpful), not raw IDs. Fallback to `Channel-XXXXXX` only when the name is unknown (e.g. bot not in guild; use `source_channels.json` or equivalent when available).
+- **Clickable**: When guild ID + channel ID are known, render the channel as a markdown link: `[channel name](https://discord.com/channels/GUILD_ID/CHANNEL_ID)` so the name is clickable in Discord.
+- **No duplication**: One helper (or one module) should provide “display name + guild ID for link”; all command outputs that list channels use it. Do not invent a new format per command or per bot for the same concept (Discord channels).
+
+Example (MWBots /discum): `_source_channel_display_and_guild` + `_format_mapping_line` in `MWDiscumBot/discum_command_bot.py` are the canonical place for “source channel” display; Channel Mappings, Manage Mappings preview, and dropdowns all use them.
+
+---
+
 ## Ubuntu access and RS-bots deployment (canonical)
 
 This section documents the canonical operational workflow for managing RS bots on the Oracle Ubuntu host.
@@ -77,6 +89,8 @@ This section documents the canonical operational workflow for managing RS bots o
 
 - **Server list (non-secret, tracked in git)**: `oraclekeys/servers.json`
 - **SSH private key (secret, NEVER committed)**: `oraclekeys/ssh-key-*.key`
+- PATH OF THE KEY -> C:\Users\apaap\OneDrive\Desktop\mirror-world\oraclekey\ssh-key-2025-12-15.key
+
   - The `key` field in `oraclekeys/servers.json` is typically a **filename**, e.g. `"ssh-key-2025-12-15.key"`.
   - After a Windows reinstall/clone, you must restore the `.key` file from your private backup into `oraclekeys/`.
   - **Example (Windows)**: `ssh -i oraclekeys/ssh-key-2025-12-15.key rsadmin@137.131.14.157`

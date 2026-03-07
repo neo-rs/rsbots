@@ -98,9 +98,10 @@ def _resolve_key_path(key_value: str) -> str:
     p = Path(key_value)
     if p.is_absolute() and p.exists():
         return str(p)
-    candidate = REPO_ROOT / "oraclekeys" / key_value
-    if candidate.exists():
-        return str(candidate)
+    for folder in ("oraclekeys", "oraclekey"):
+        candidate = REPO_ROOT / folder / key_value
+        if candidate.exists():
+            return str(candidate)
     candidate2 = REPO_ROOT / key_value
     if candidate2.exists():
         return str(candidate2)
