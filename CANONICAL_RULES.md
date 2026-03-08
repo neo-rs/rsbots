@@ -73,11 +73,32 @@ Where they live in config (canonical):
 
 When a bot shows Discord channels in messages (lists, dropdowns, embeds), use a **single canonical format** so users see the same thing everywhere:
 
-- **Display**: Prefer **channel name** (and server name when helpful), not raw IDs. Fallback to `Channel-XXXXXX` only when the name is unknown (e.g. bot not in guild; use `source_channels.json` or equivalent when available).
-- **Clickable**: When guild ID + channel ID are known, render the channel as a markdown link: `[channel name](https://discord.com/channels/GUILD_ID/CHANNEL_ID)` so the name is clickable in Discord.
-- **No duplication**: One helper (or one module) should provide “display name + guild ID for link”; all command outputs that list channels use it. Do not invent a new format per command or per bot for the same concept (Discord channels).
+- **Format**: Use Discord channel mentions only: **`<#channel_id>`**. Discord resolves these to the channel name and server; no separate “server name” or fallback text (e.g. `Channel-XXXXXX`) in the message.
+- **Lists**: Use numbered lines, e.g. `1. <#channel_id>`, `2. <#channel_id>`.
+- **No duplication**: One helper (or one module) provides the format; all command outputs that list channels use it. Do not invent a new format per command or per bot.
 
-Example (MWBots /discum): `_source_channel_display_and_guild` + `_format_mapping_line` in `MWDiscumBot/discum_command_bot.py` are the canonical place for “source channel” display; Channel Mappings, Manage Mappings preview, and dropdowns all use them.
+Example (MWBots /discum): `_format_channel_mention(channel_id)` in `MWDiscumBot/discum_command_bot.py` returns `<#channel_id>`. Channel Mappings list, dropdowns, and Selected field all use this. Optional guild name for sorting only (from `source_channels.json`); not shown next to channel mentions.
+
+---
+
+## MWDiscumBot vs MWDataManagerBot (no overlapping code)
+
+**Rule: /discum and all channel-mapping logic live in exactly one place. The two bots must not duplicate that code.**
+
+| Responsibility | Canonical owner | Must NOT appear in |
+|----------------|-----------------|---------------------|
+| `/discum` slash command and handler | `MWDiscumBot/discum_command_bot.py` | MWDataManagerBot |
+| Channel-mapping UI (View Current Mappings, Browse source & map, Remove/Update Webhook) | `MWDiscumBot/discum_command_bot.py` | MWDataManagerBot |
+| Channel display (`_format_channel_mention`; guild name from `source_channels.json` for sorting only) | `MWDiscumBot/discum_command_bot.py` | MWDataManagerBot |
+| `channel_map.json` / `source_channels.json` load/save and usage | `MWDiscumBot` (discum_config.py + discum_command_bot.py) | MWDataManagerBot (except via the imported module) |
+| Registering `/discum` on a bot | `MWDiscumBot/discum_command_bot.py` → **`register_discum_commands_to_bot(bot)`** only (single registration path; no duplicate decorator) | — |
+| **DataManagerBot’s only role for /discum** | Import `discum_command_bot` and call `register_discum_commands_to_bot(bot)` once before `bot.run()`; no copy of handlers, views, or channel logic | — |
+
+**Enforcement:**
+
+- MWDataManagerBot must **not** implement any /discum handler, channel list UI, or channel name resolution. It must only import the canonical module and call `register_discum_commands_to_bot(bot)` **once** (no duplicate registration; otherwise two messages appear for one /discum trigger).
+- All enhancements to /discum behavior (new buttons, new views, channel display) must be made **only** in `MWDiscumBot/discum_command_bot.py` (and MWDiscumBot config/helpers). Do not add parallel logic in MWDataManagerBot.
+- Deploy/sync must keep both MWDiscumBot and MWDataManagerBot in sync so that the imported `discum_command_bot.py` is the same code that would run in a standalone DiscumBot.
 
 ---
 
@@ -567,178 +588,3 @@ Any deviation means:
   * Do **not** clean up
   * Do **not** add features
 * Fix deployment or execution first.
-
----
-
-## 3️⃣ Why this directly fixes your current problems
-
-Your pasted output:
-
-```
-cwd=/home/rsadmin/bots/mirror-world/RSAdminBot
-file=/home/rsadmin/bots/mirror-world/RSAdminBot/admin_bot.py
-python=/home/rsadmin/bots/mirror-world/.venv/bin/python
-local_exec=yes
-live_root=/home/rsadmin/bots/mirror-world
-rsbots_code_head=81c6dee2456af976491263af359503d0287fa8d5
-live_tree_head=no_git
-```
-
-Export products
-Read products
-Manage product control center settings
-Create products
-Delete products
-Export product statistics
-Read product statistics
-Update products
-ad_campaign:conversion:create
-ad_campaign:create
-ad_campaign:credit:create
-ad_campaign:read
-ad_campaign:update
-ad_publisher:read
-Read affiliates
-Create affiliates
-Update affiliates
-authorized_role:create
-Read app permissions
-Manage chat webhooks
-Moderate chats
-Read chat messages
-Read chats
-Create forum posts
-Read forum posts
-Moderate forum posts
-Read team members
-Read team member emails
-Read company balance
-Read logs
-Manage checkout settings
-Manage legal settings
-Read business information
-Update business details
-company:create_child
-company:delete_child
-company:update_child_fees
-child_company:basic:export
-Update social links
-custom_emoji:update
-Export content rewards
-Read content rewards
-Create content rewards
-Delete content rewards
-Moderate content reward submissions
-Update content rewards
-Read developer settings
-Create apps
-Manage OAuth settings
-Manage webhooks
-Manage app builds
-Update apps
-Attach apps to products
-Create apps
-Delete apps
-Detach apps from products
-Read hidden apps
-Update apps
-iap:read
-Create livestreams
-Delete livestreams
-Manage livestream recordings
-Read livestream chat
-Moderate livestreams
-Export members
-Read members
-Read member emails
-Read member phone numbers
-Read member payment methods
-Manage members
-Update memberships
-Moderate members
-Export member statistics
-Read member statistics
-Export payments
-Read payments
-payment:charge
-payment:dispute
-Export disputes
-Read disputes
-payment:setup_intent:read
-Manage payments
-payment:resolution_center
-Export resolution center cases
-Read resolution center cases
-Create payout destinations
-Delete payout destinations
-Read payout destinations
-Transfer funds
-Read transfers
-payout:transfer:export
-Update payout destinations
-Withdraw funds
-Read withdrawals
-payout:withdrawal:export
-Read payout accounts
-Update payout accounts
-Export plans
-Read plans
-Create plans
-Delete plans
-Export plan statistics
-Read plan statistics
-Update plans
-Manage waitlist entries
-Export waitlist entries
-Read waitlist entries
-Export promo codes
-Read promo codes
-Create promo codes
-Delete promo codes
-Update promo codes
-stats:read
-Read support chats
-Create support chats
-Send messages in support chats
-Export tracking links
-Read tracking links
-Create tracking links
-Delete tracking links
-Export tracking link statistics
-Read tracking link statistics
-Update tracking links
-Read courses
-Update courses
-Read student-lesson interactions
-Read course analytics
-Read leads
-Export leads
-Create invoices
-Read invoices
-Export invoices
-Update invoices
-Read changes to invoices
-webhook_receive:setup_intents
-webhook_receive:withdrawals
-webhook_receive:payout_methods
-webhook_receive:verifications
-Read changes to waitlist entries
-Read changes to courses
-Read changes to memberships
-Read changes to payments
-Read changes to refunds
-Read changes to disputes
-Read changes to resolution center cases
-Read changes to app payments
-Read changes to app memberships
-Create shipments
-Read shipments
-Read checkout configurations
-Create checkout configurations
-Delete checkout configurations
-Create checkout requests
-Read checkout requests
-airdrop_link:basic:read
-airdrop_link:manage
-lead:manage
-notification:create

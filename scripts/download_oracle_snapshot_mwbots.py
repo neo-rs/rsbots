@@ -15,11 +15,16 @@ Scope:
 Default: full backup (includes channel_map.json, tokens.env, config.secrets.json, etc.).
 Use --no-secrets for code-only snapshot (excludes secrets and runtime data).
 
+After a full backup (default), config files (channel_map.json, source_channels.json, etc.)
+are copied from the snapshot into REPO_ROOT/MWBots/<bot>/config/ so local matches server.
+Use --no-sync-config to skip that. Use --local-mwbots PATH to override the target.
+
 Usage:
   python scripts/download_oracle_snapshot_mwbots.py
   python scripts/download_oracle_snapshot_mwbots.py --no-secrets
   python scripts/download_oracle_snapshot_mwbots.py --scp-timeout 1800   # if download times out (e.g. large backup)
   python scripts/download_oracle_snapshot_mwbots.py --out-dir Oraclserver-files-mwbots
+  python scripts/download_oracle_snapshot_mwbots.py --no-sync-config     # do not update local MWBots config
 """
 
 import argparse
@@ -75,6 +80,14 @@ EXCLUDES_NO_SECRETS = EXCLUDES_FULL + [
     "--exclude=systemlogs.json",
     "--exclude=*.log",
     "--exclude=*.jsonl",
+]
+
+# Config files to copy from snapshot into local MWBots (so local matches server). tokens.env excluded for safety.
+CONFIG_FILES_TO_SYNC = [
+    "channel_map.json",
+    "source_channels.json",
+    "destination_channels.json",
+    "settings.json",
 ]
 
 
@@ -186,6 +199,36 @@ def _verify_snapshot(snap_dir: Path, full_backup: bool) -> None:
         print(f"[verify] OK: MWDiscumBot + config present" + (" (incl. channel_map.json)" if full_backup else ""))
 
 
+def _sync_config_to_local_mwbots(snap_dir: Path, local_mwbots_root: Path, full_backup: bool) -> None:
+    """Copy config files from snapshot into local MWBots so local config matches server. Skips tokens.env."""
+    if not full_backup:
+        return
+    if not local_mwbots_root.is_dir():
+        print(f"[sync-config] Local MWBots not found at {local_mwbots_root}, skip.")
+        return
+    copied = 0
+    for bot_name in INCLUDES_DEFAULT:
+        snap_config = snap_dir / bot_name / "config"
+        local_config = local_mwbots_root / bot_name / "config"
+        if not snap_config.is_dir():
+            continue
+        local_config.mkdir(parents=True, exist_ok=True)
+        for fname in CONFIG_FILES_TO_SYNC:
+            src = snap_config / fname
+            if not src.is_file():
+                continue
+            dst = local_config / fname
+            try:
+                shutil.copy2(src, dst)
+                copied += 1
+            except OSError as e:
+                print(f"[sync-config] Copy failed {src.name} -> {local_config}: {e}")
+    if copied:
+        print(f"[sync-config] Copied {copied} config file(s) from snapshot -> {local_mwbots_root}")
+    else:
+        print(f"[sync-config] No config files copied (snapshot may be code-only or no matching files).")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--server-name", default=None, help="Server name from oraclekeys/servers.json (defaults to first entry)")
@@ -195,6 +238,8 @@ def main() -> int:
     ap.add_argument("--prune-only", action="store_true", help="Only prune old local snapshot folders (no SSH)")
     ap.add_argument("--no-secrets", action="store_true", help="Exclude secrets and runtime data (code-only snapshot)")
     ap.add_argument("--scp-timeout", type=int, default=900, help="SCP download timeout in seconds (default 900 for full backup)")
+    ap.add_argument("--no-sync-config", action="store_true", help="Do not copy snapshot config into local MWBots (default: copy after full backup)")
+    ap.add_argument("--local-mwbots", default=None, help="Local MWBots root (default: REPO_ROOT/MWBots)")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -274,6 +319,9 @@ def main() -> int:
     _safe_extract(local_tar, snap_dir)
 
     _verify_snapshot(snap_dir, full_backup=not args.no_secrets)
+    if not args.no_sync_config and not args.no_secrets:
+        local_mwbots = Path(args.local_mwbots).resolve() if (args.local_mwbots and str(args.local_mwbots).strip()) else (REPO_ROOT / "MWBots")
+        _sync_config_to_local_mwbots(snap_dir, local_mwbots, full_backup=True)
     print(f"DONE: {snap_dir}")
     return 0
 
