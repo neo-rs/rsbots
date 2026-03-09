@@ -190,21 +190,35 @@ async def fetch_product_title(store: str, sku: str) -> Tuple[str, Optional[str]]
     url = build_store_link(store, sku)
     if not url:
         return "", "no store url"
-    html, err = await _fetch_html(url)
-    if err or not html:
-        return "", err
-    title = _extract_title_from_html(html, store=store)
-    t0 = (title or "").strip()
-    t0_l = t0.lower()
-    # Common anti-bot / interstitial titles (especially Walmart)
-    if t0_l in {"robot or human?", "robot or human"} or "robot or human" in t0_l:
-        return "", "blocked (anti-bot)"
-    if "access denied" in t0_l or "verify you are a human" in t0_l:
-        return "", "blocked (anti-bot)"
-    # Generic/non-product titles (treat as missing to avoid writing junk like "Amazon.com" or "Target")
-    if t0_l in {"amazon.com", "amazon", "target", "walmart", "best buy", "bestbuy", "costco", "gamestop"}:
-        return "", "title not found"
-    return title, None if title else "title not found"
+    for attempt in range(2):
+        html, err = await _fetch_html(url)
+        if err or not html:
+            # No retry for 404 (permanent)
+            if err and "404" in str(err):
+                return "", err
+            if attempt == 0 and err:
+                await asyncio.sleep(2.5)
+                continue
+            return "", err
+        title = _extract_title_from_html(html, store=store)
+        t0 = (title or "").strip()
+        t0_l = t0.lower()
+        # Common anti-bot / interstitial titles (especially Walmart)
+        if t0_l in {"robot or human?", "robot or human"} or "robot or human" in t0_l:
+            if attempt == 0:
+                await asyncio.sleep(2.5)
+                continue
+            return "", "blocked (anti-bot)"
+        if "access denied" in t0_l or "verify you are a human" in t0_l:
+            if attempt == 0:
+                await asyncio.sleep(2.5)
+                continue
+            return "", "blocked (anti-bot)"
+        # Generic/non-product titles (treat as missing to avoid writing junk like "Amazon.com" or "Target")
+        if t0_l in {"amazon.com", "amazon", "target", "walmart", "best buy", "bestbuy", "costco", "gamestop"}:
+            return "", "title not found"
+        return title, None if title else "title not found"
+    return "", "title not found"
 
 
 @dataclass(frozen=True)
@@ -934,12 +948,12 @@ class RsFsSheetSync:
         self._tab_name_cache = name
         return name
 
-    async def _fetch_existing_skus_if_needed(self) -> None:
+    async def _fetch_existing_skus_if_needed(self, *, force: bool = False) -> None:
         if not self.enabled():
             return
 
         now = time.time()
-        if self._dedupe_skus and (now - self._dedupe_last_fetch_ts) < float(self._sheet_cfg.dedupe_cache_ttl_s):
+        if not force and self._dedupe_skus and (now - self._dedupe_last_fetch_ts) < float(self._sheet_cfg.dedupe_cache_ttl_s):
             return
 
         tab = await self._resolve_tab_name()

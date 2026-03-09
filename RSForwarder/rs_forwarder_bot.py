@@ -1166,10 +1166,10 @@ class RSForwarderBot:
 
     def _rsfs_auto_check_debounce_s(self) -> float:
         try:
-            v = float((self.config or {}).get("rs_fs_auto_check_debounce_s", 45.0) or 45.0)
+            v = float((self.config or {}).get("rs_fs_auto_check_debounce_s", 90.0) or 90.0)
         except Exception:
-            v = 45.0
-        return max(10.0, min(v, 300.0))
+            v = 90.0
+        return max(60.0, min(v, 300.0))
 
     def _rsfs_auto_write_current_list(self) -> bool:
         try:
@@ -1413,6 +1413,9 @@ class RSForwarderBot:
                     continue
                 if not zephyr_release_feed_parser.looks_like_release_feed_embed_text(t):
                     continue
+                # Skip footer-only chunks (e.g. "Discord Companion v7.3.0") that corrupt parsing
+                if zephyr_release_feed_parser.is_footer_only_chunk(t):
+                    continue
                 parts.append(t)
                 if "release feed" in t.lower():
                     found_header = True
@@ -1647,7 +1650,7 @@ class RSForwarderBot:
         existing_set: Set[str] = set()
         try:
             if ok and getattr(self, "_rs_fs_sheet", None):
-                await self._rs_fs_sheet._fetch_existing_skus_if_needed()  # type: ignore[attr-defined]
+                await self._rs_fs_sheet._fetch_existing_skus_if_needed(force=True)  # type: ignore[attr-defined]
                 existing_set = set(getattr(self._rs_fs_sheet, "_dedupe_skus", set()) or set())
         except Exception:
             existing_set = set()
@@ -1701,6 +1704,7 @@ class RSForwarderBot:
         # Get Current List rows to check which items are actually there
         current_list_skus: Set[str] = set()
         current_list_rids: Set[int] = set()
+        current_list_rid_by_sku: Dict[str, int] = {}
         try:
             if ok and getattr(self, "_rs_fs_sheet", None):
                 current_list_rows_check = await self._rs_fs_sheet.fetch_current_list_rows()
@@ -1716,6 +1720,8 @@ class RSForwarderBot:
                             rid_check = int(rid_check_str) if rid_check_str else 0
                             if rid_check > 0:
                                 current_list_rids.add(rid_check)
+                                if sku_check:
+                                    current_list_rid_by_sku[sku_check] = rid_check
                         except Exception:
                             pass
         except Exception:
@@ -1750,18 +1756,17 @@ class RSForwarderBot:
             st = str(getattr(r, "store", "") or "").strip()
             is_sku = bool(getattr(r, "is_sku_candidate", True))
             kind = "non-SKU" if not is_sku else "unknown-store"
-            # Format: Release ID, Store (if available), SKU/Label, with product info
             store_display = st if st else "unknown"
-            info_line = f"`{rid}` `{kind}` `{store_display}` `{sk}`"
-            why_lines.append(info_line)
+            # Format: rid kind store_display sku (no backticks), command directly below
+            info_line = f"{rid} {kind} {store_display} {sk}"
             if rid:
+                info_line += f"\n/removereleaseid release_id: {rid}"
                 cmd_lines.append(f"/removereleaseid release_id: {rid}")
+            why_lines.append(info_line)
         if why_lines:
-            why_val = "\n".join(why_lines).strip()
+            why_val = "\n\n".join(why_lines).strip()
             if cmd_lines:
-                # Each command gets its own code block wrapper for individual copying
-                cmd_blocks = "\n".join([f"```\n{cmd}\n```" for cmd in cmd_lines])
-                why_val = (why_val + "\n\nCommands (copy):\n" + cmd_blocks).strip()
+                why_val = (why_val + "\n\nCommands (copy):\n" + "\n".join(cmd_lines)).strip()
             emb.add_field(
                 name="Why some items aren’t in the public sheet",
                 value=why_val,
@@ -1785,10 +1790,20 @@ class RSForwarderBot:
                 inline=False,
             )
         if extra:
-            sample = [f"- `{k}`" for k in extra[:12]]
+            sample_lines: List[str] = []
+            cmd_lines_extra: List[str] = []
+            for k in extra[:12]:
+                rid_extra = current_list_rid_by_sku.get(k)
+                sample_lines.append(f"- `{k}`")
+                if rid_extra:
+                    sample_lines.append(f"  /removereleaseid release_id: {rid_extra}")
+                    cmd_lines_extra.append(f"/removereleaseid release_id: {rid_extra}")
+            val_extra = f"`{len(extra)}`\n" + "\n".join(sample_lines)
+            if cmd_lines_extra:
+                val_extra = (val_extra + "\n\nCommands (copy):\n" + "\n".join(cmd_lines_extra)).strip()
             emb.add_field(
                 name="In sheet but not in latest list",
-                value=f"`{len(extra)}`\n" + "\n".join(sample),
+                value=val_extra,
                 inline=False,
             )
 
@@ -5712,18 +5727,9 @@ class RSForwarderBot:
                         await ctx.send("❌ Could not fetch rows from Current List tab.")
                         return
                     
-                    # Get History SKUs for cross-matching (raw - all non-empty SKUs in column B)
-                    history_rows = await self._rs_fs_sheet.fetch_history_rows()
-                    history_skus: Set[str] = set()
-                    for row in history_rows:
-                        if len(row) >= 2:
-                            sku = str(row[1] or "").strip()  # Column B: SKU
-                            if sku and sku.lower() != "sku":  # Skip header
-                                history_skus.add(sku.lower())
-                    
-                    # Extract store+sku pairs from Current List that:
-                    # 1. Exist in both Current List and History (matched)
-                    # 2. Are missing title or URL (or both) - need resolution
+                    # Extract store+sku pairs from Current List that need resolution:
+                    # - Full Send items with store+SKU (parseable)
+                    # - Missing title or URL, or have bad title (URL-as-title, blank, etc.)
                     # Current List columns: Release ID (0), Store (1), SKU/Label (2), Monitor Tag (3), Category (4), Channel ID (5), Resolved Title (6), Resolved URL (7), Affiliate URL (8), Status (9), Remove Command (10), Last Seen (11), Full Send (12)
                     # Filter by "Full Send" column contains "full-send"
                     pairs: List[Tuple[str, str]] = []
@@ -5745,13 +5751,11 @@ class RSForwarderBot:
                         if not (store and sku):
                             continue
                         sku_lower = sku.lower()
-                        # Only process SKUs that exist in both Current List and History (matched)
-                        if sku_lower not in history_skus:
-                            continue
                         title = str(row[6] or "").strip() if len(row) > 6 else ""
                         url = str(row[7] or "").strip() if len(row) > 7 else ""
-                        # Only include matched SKUs that are missing title or URL (need resolution)
-                        if not title or not url:
+                        # Include if missing title, missing URL, or has bad title (URL-as-title, blank, etc.)
+                        needs_resolution = (not title or not url) or self._rsfs_title_is_bad(title, url=url)
+                        if needs_resolution:
                             pairs.append((store, sku))
                             try:
                                 rid = int(rid_str) if rid_str else 0

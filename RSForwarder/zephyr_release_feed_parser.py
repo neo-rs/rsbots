@@ -28,6 +28,28 @@ _MD_BOLD_RE = re.compile(r"\*\*")
 _CHANNEL_ID_RE = re.compile(r"\bchannel\s*id\s*:\s*(\d{10,})\b", re.IGNORECASE)
 
 
+_RELEASE_LINE_RE = re.compile(r"\d{1,4}\s*\.\s*[+-]", re.IGNORECASE)
+
+
+def is_footer_only_chunk(text: str) -> bool:
+    """
+    Return True if the chunk looks like a Zephyr/Companion footer with no actual release content.
+    Such chunks (e.g. "Discord Companion v7.3.0 | Reselling Secrets...") can corrupt parsing
+    when merged, causing the previous item to lose its monitor tag (unknown-store).
+    """
+    t = (text or "").strip()
+    if not t:
+        return True
+    low = t.lower()
+    # Must have zephyr/companion flavor to be a footer candidate
+    if "discord companion" not in low and "zephyr" not in low:
+        return False
+    # Footer-only: no numbered release line and no [*-monitor] bracket tag
+    has_release_line = bool(_RELEASE_LINE_RE.search(t))
+    has_bracket_monitor = bool(_BRACKET_RE.search(t) and "-monitor" in low)
+    return not has_release_line and not has_bracket_monitor
+
+
 def looks_like_release_feed_embed_text(text: str) -> bool:
     t = (text or "").strip()
     if not t:
