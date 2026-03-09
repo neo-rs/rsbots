@@ -54,7 +54,7 @@ RSMentionPinger monitors Discord channels for mentions of specific roles and sen
 - **Parameters**: None
 - **Usage**: `!postmonitorroles`
 - **Admin Only**: Yes (requires Manage Server)
-- **Returns**: Sends button messages in the configured `monitor_roles.picker_channel_id`. Creates "Monitor \| channel-name" roles and channel overwrites when using `monitor_roles.categories`. See `MONITOR_ROLES_PLAN.md` for config.
+- **Returns**: Sends button messages in the configured `monitor_roles.picker_channel_id`. Creates "Monitor \| channel-name" roles and channel overwrites when using `monitor_roles.categories`. If `monitor_roles.members_role_id` is set, the Members role is denied view on monitor channels so only users with the Monitor role (from clicking buttons) can see them.
 
 ## Command Summary
 

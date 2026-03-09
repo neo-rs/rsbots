@@ -173,10 +173,12 @@ class RSMentionPinger:
         return [e for _, entries in by_cat for e in entries]
     
     async def _ensure_monitor_roles_and_overwrites(self, guild: discord.Guild) -> None:
-        """Create missing 'Monitor | channel' roles and set channel overwrites. Only for categories."""
+        """Create missing 'Monitor | channel' roles and set channel overwrites. Members role gets no view by default."""
         mr = self._monitor_roles_config()
         if not mr:
             return
+        members_role_id = mr.get("members_role_id")
+        members_role = guild.get_role(int(members_role_id)) if members_role_id else None
         categories_cfg = mr.get("categories") or []
         for cat_cfg in categories_cfg:
             cat_id = cat_cfg.get("id") if isinstance(cat_cfg, dict) else cat_cfg
@@ -207,6 +209,8 @@ class RSMentionPinger:
                         continue
                 try:
                     await ch.set_permissions(guild.default_role, view_channel=False)
+                    if members_role:
+                        await ch.set_permissions(members_role, view_channel=False)
                     await ch.set_permissions(role, view_channel=True, read_message_history=True)
                 except Exception as e:
                     print(f"{Colors.RED}[MonitorRoles] Failed to set overwrites for #{ch.name}: {e}{Colors.RESET}")
