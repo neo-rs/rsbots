@@ -4482,6 +4482,9 @@ def _apply_whop_logs_to_history(
         "recorded_at": datetime.now(timezone.utc).isoformat(),
     }
     wh["native_whop_logs_latest"] = latest
+    # Ever-flags: set once when we see Trialing in a native card; never cleared.
+    if str(mstatus or "").strip().lower() == "trialing":
+        wh["ever_trialing"] = True
     rec["whop"] = wh
     db[str(did)] = rec
     return True
@@ -5257,6 +5260,16 @@ def record_member_whop_summary(
             st = str(summary.get("status") or "").strip().lower()
             if st:
                 wh["last_status"] = st
+            # Ever-flags: set once when we see trialing or trial_days with a value; never cleared.
+            if st == "trialing":
+                wh["ever_trialing"] = True
+            trial_days_raw = str(summary.get("trial_days") or "").strip()
+            if trial_days_raw and trial_days_raw not in ("—", "", "0"):
+                try:
+                    if int(float(trial_days_raw)) > 0:
+                        wh["ever_had_trial_days"] = True
+                except (ValueError, TypeError):
+                    wh["ever_had_trial_days"] = True
         if event_type:
             wh["last_event_type"] = str(event_type).strip()
         wh["last_event_ts"] = int(now)
@@ -5444,6 +5457,17 @@ def _backfill_whop_timeline_from_whop_history() -> None:
             if status == "canceled" or event_type == "cancellation":
                 if "last_canceled_ts" not in whop_timeline or whop_timeline["last_canceled_ts"] is None or event_ts > whop_timeline["last_canceled_ts"]:
                     whop_timeline["last_canceled_ts"] = event_ts
+            
+            # Ever-flags: set once when we see trialing or trial_days; never cleared.
+            if status == "trialing":
+                whop_timeline["ever_trialing"] = True
+            trial_days_ev = event.get("trial_days") or event.get("trial_period_days")
+            if trial_days_ev is not None and str(trial_days_ev).strip() not in ("", "0"):
+                try:
+                    if int(float(str(trial_days_ev))) > 0:
+                        whop_timeline["ever_had_trial_days"] = True
+                except (ValueError, TypeError):
+                    whop_timeline["ever_had_trial_days"] = True
             
             # last_status: most recent status (normalize to lowercase)
             if status:
@@ -6056,6 +6080,26 @@ def has_member_role(member: discord.Member) -> bool:
 
 def has_former_member_role(member: discord.Member) -> bool:
     return any(r.id == FORMER_MEMBER_ROLE for r in member.roles)
+
+
+def _is_repeat_trial_no_payment(discord_id: int) -> bool:
+    """True if member had a trial before (ever_trialing or ever_had_trial_days) and total spend is at or below threshold (no real payment)."""
+    try:
+        guard = WHOP_API_CONFIG.get("repeat_trial_guard") or {}
+        if not isinstance(guard, dict) or not guard.get("enabled", False):
+            return False
+        max_spent = float(guard.get("max_total_spent_usd", 0) or 0)
+    except Exception:
+        return False
+    hist = get_member_history(int(discord_id)) or {}
+    wh = hist.get("whop") if isinstance(hist.get("whop"), dict) else {}
+    if not wh.get("ever_trialing") and not wh.get("ever_had_trial_days"):
+        return False
+    last = wh.get("last_summary") if isinstance(wh.get("last_summary"), dict) else {}
+    spent_raw = str(last.get("total_spent") or "").strip()
+    spent = float(usd_amount(spent_raw)) if spent_raw else 0.0
+    return spent <= max_spent
+
 
 # -----------------------------
 # Message loader/sender
@@ -7951,6 +7995,10 @@ async def sync_whop_memberships():
             if st_final != "active":
                 continue
 
+            # Repeat-trial guard: do not auto-heal if they had trial before with no payment.
+            if _is_repeat_trial_no_payment(mbr.id):
+                continue
+
             try:
                 # Prevent startup/sync-driven role adds from spamming member-status channels.
                 _suppress_member_update_logs(mbr.id, seconds=300.0)
@@ -9636,6 +9684,41 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         asyncio.create_task(delayed_assign_former_member(after))
 
     if (ROLE_CANCEL_A not in before_roles) and (ROLE_CANCEL_A in after_roles):
+        # Repeat-trial guard: had trial before + no payment → remove Member role and alert staff
+        if _is_repeat_trial_no_payment(after.id):
+            member_role_obj = after.guild.get_role(ROLE_CANCEL_A) if after.guild else None
+            if member_role_obj and member_role_obj in after.roles:
+                with suppress(Exception):
+                    await after.remove_roles(
+                        member_role_obj,
+                        reason="Repeat trial with no payment (ever_trialing/ever_had_trial_days + total_spent <= threshold)",
+                    )
+                if log_member_status:
+                    hist = get_member_history(after.id) or {}
+                    wh = hist.get("whop") or {}
+                    last = wh.get("last_summary") or {}
+                    spent_s = str(last.get("total_spent") or "").strip() or "—"
+                    e = _build_member_status_detailed_embed(
+                        title="🚫 Repeat Trial — Member Role Removed",
+                        member=after,
+                        access_roles=_access_roles_plain(after),
+                        color=0xED4245,
+                        event_kind="repeat_trial_blocked",
+                        discord_kv=[
+                            ("reason", "Had trial before; total spend at or below threshold"),
+                            ("total_spent", spent_s),
+                            ("ever_trialing", "yes" if wh.get("ever_trialing") else "no"),
+                            ("ever_had_trial_days", "yes" if wh.get("ever_had_trial_days") else "no"),
+                        ],
+                        whop_brief=last if isinstance(last, dict) else {},
+                    )
+                    await log_member_status("", embed=e)
+                if log_other:
+                    await log_other(
+                        f"🚫 **Repeat trial guard:** Removed Member role from {_fmt_user(after)} — had trial before, total spend $0 or below threshold."
+                    )
+                return
+        
         # Show all role changes when Member role is regained
         all_removed_in_update = before_roles - after_roles
         all_added_in_update = after_roles - before_roles

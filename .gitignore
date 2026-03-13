@@ -102,6 +102,16 @@
 !systemd/**/
 !systemd/*.service
 
+# Telnyx SMS sender
+!telnyx_sms/
+!telnyx_sms/**/
+!telnyx_sms/*.py
+!telnyx_sms/*.bat
+!telnyx_sms/*.txt
+!telnyx_sms/.env.example
+telnyx_sms/sent_ids.json
+telnyx_sms/inbound.json
+
 # Explicitly keep legacy/original sources out of GitHub
 RSAdminBot/original_files/**
 

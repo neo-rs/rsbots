@@ -7990,9 +7990,9 @@ echo "CHANGED_END"
                 optional: List[str] = []
                 if bot_key == "discumbot":
                     required = ["settings.json", "tokens.env", "channel_map.json", "destination_channels.json"]
-                    optional = ["source_channels.json"]
+                    optional = ["source_channels.json", "keywords.json", "fetchall_mappings.json"]
                 elif bot_key == "datamanagerbot":
-                    optional = ["keywords.json", "fetchall_mappings.json"]
+                    optional = ["keywords.json"]
                 return required + optional
             config = self.inspector.get_bot_config(bot_key) if self.inspector else None
             if config and isinstance(config, dict):
@@ -8059,9 +8059,9 @@ echo "CHANGED_END"
             optional: List[str] = []
             if bot_key == "discumbot":
                 required = ["settings.json", "tokens.env", "channel_map.json", "destination_channels.json"]
-                optional = ["source_channels.json"]
+                optional = ["source_channels.json", "keywords.json", "fetchall_mappings.json"]
             elif bot_key == "datamanagerbot":
-                optional = ["keywords.json", "fetchall_mappings.json"]
+                optional = ["keywords.json"]
 
             files = required + optional
             checks: Dict[str, bool] = {}

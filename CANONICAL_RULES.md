@@ -85,20 +85,43 @@ Example (MWBots /discum): `_format_channel_mention(channel_id)` in `MWDiscumBot/
 
 **Rule: /discum and all channel-mapping logic live in exactly one place. The two bots must not duplicate that code.**
 
+### User token and platform manipulation (Discord ToS)
+
+**Only one process must use the Discord user token (discum token).** Multiple processes or scripts using the same user token can be flagged by Discord as "platform manipulation" and lead to account restrictions.
+
+- **Single consumer of user token:** Only **MWDiscumBot** (discumbot process) must run a discum `Client` or make API calls with the user token (e.g. reading source channels, fetchall, channel list for UI). DataManagerBot must **not** use the user token at all.
+- **Fetchall:** All fetchall logic (and `fetchall_mappings.json` usage) must live **only in MWDiscumBot**. DataManagerBot must not run fetchall or use the user token for bulk/source-channel reads.
+- **DataManagerBot’s only role for /discum:** Register the slash command by importing `discum_command_bot` and calling `register_discum_commands_to_bot(bot)` once before `bot.run()`. The handler code runs in DataManagerBot’s process when users invoke /discum; that code path must **not** call the Discord API with the user token (use bot token or read from files DiscumBot maintains, e.g. `source_channels.json` / `channel_map_info.json`).
+- **Scripts:** `verify_discum_channel_ids.py` and any other script that uses the user token should not be run while DiscumBot is running, or use minimal use.
+
 | Responsibility | Canonical owner | Must NOT appear in |
 |----------------|-----------------|---------------------|
 | `/discum` slash command and handler | `MWDiscumBot/discum_command_bot.py` | MWDataManagerBot |
 | Channel-mapping UI (View Current Mappings, Browse source & map, Remove/Update Webhook) | `MWDiscumBot/discum_command_bot.py` | MWDataManagerBot |
 | Channel display (`_format_channel_mention`; guild name from `source_channels.json` for sorting only) | `MWDiscumBot/discum_command_bot.py` | MWDataManagerBot |
 | `channel_map.json` / `source_channels.json` load/save and usage | `MWDiscumBot` (discum_config.py + discum_command_bot.py) | MWDataManagerBot (except via the imported module) |
+| **Fetchall (user-token reads of source channels)** | **MWDiscumBot only** (`fetchall_mappings.json`, discum Client) | **MWDataManagerBot** (must not use user token or run fetchall) |
 | Registering `/discum` on a bot | `MWDiscumBot/discum_command_bot.py` → **`register_discum_commands_to_bot(bot)`** only (single registration path; no duplicate decorator) | — |
-| **DataManagerBot’s only role for /discum** | Import `discum_command_bot` and call `register_discum_commands_to_bot(bot)` once before `bot.run()`; no copy of handlers, views, or channel logic | — |
+| **DataManagerBot’s only role for /discum** | Import `discum_command_bot` and call `register_discum_commands_to_bot(bot)` once before `bot.run()`; no copy of handlers, views, or channel logic; **no user token usage** | — |
 
 **Enforcement:**
 
 - MWDataManagerBot must **not** implement any /discum handler, channel list UI, or channel name resolution. It must only import the canonical module and call `register_discum_commands_to_bot(bot)` **once** (no duplicate registration; otherwise two messages appear for one /discum trigger).
+- **MWDataManagerBot must not use the user token or run fetchall.** All user-token API usage and fetchall must be in MWDiscumBot only.
 - All enhancements to /discum behavior (new buttons, new views, channel display) must be made **only** in `MWDiscumBot/discum_command_bot.py` (and MWDiscumBot config/helpers). Do not add parallel logic in MWDataManagerBot.
 - Deploy/sync must keep both MWDiscumBot and MWDataManagerBot in sync so that the imported `discum_command_bot.py` is the same code that would run in a standalone DiscumBot.
+
+### Oracle server vs local (fetchall and config)
+
+- **Fetchall lives only in MWDiscumBot** (on Oracle and locally). MWDiscumBot is the single consumer of the user token and the only process that runs fetchall or reads `fetchall_mappings.json`.
+- **On Oracle**, after deploying the fetchall migration:
+  - **MWDiscumBot/config/** must contain: `settings.json` (with `destination_guild_ids`, `fetchall_*`, `fetchsync_*`, `use_webhooks_for_forwarding`, etc.), `fetchall_mappings.json` (and optionally `fetchall_mappings.runtime.json`, `destination_webhooks.json`). These are the canonical fetchall config files.
+  - **MWDataManagerBot** must not run fetchall or use the user token. Its `config/` may still contain an old `fetchall_mappings.json` from before migration; that file is not used by DataManagerBot and can be removed or left for reference.
+- **Baseline check (MWBots):** Use `oracle_baseline_check_mwbots.bat --download` to download a fresh Oracle snapshot and compare. If your local bot folders live under `MWBots/` (not at repo root), run with `--local-root MWBots` so the manifest compares the same structure:
+  - `py -3 scripts/oracle_baseline_check_mwbots.py --download --local-root MWBots`
+- **Config sync:** `download_oracle_snapshot_mwbots.py` copies from the snapshot into local `MWBots/<bot>/config/` for: `channel_map.json`, `source_channels.json`, `destination_channels.json`, `settings.json`, `fetchall_mappings.json`. So after a full download, local config (including fetchall_mappings.json for DiscumBot) matches the server snapshot. Re-apply any local-only settings (e.g. fetchall keys in DiscumBot `settings.json`) if the server snapshot did not yet include them.
+
+- **Reconciliation (fetchall migration):** Baseline compare with `--local-root MWBots` will show: **MWDataManagerBot** — server has `fetchall.py` (remove on deploy), local has updated `commands.py`, `datamanagerbot.py`, `live_forwarder.py`, `logging_utils.py`, `settings_store.py`. **MWDiscumBot** — local has `fetchall.py`, `fetchall_config.py`, `fetchall_logging.py`, `fetchall_utils.py`, `fetchall_webhook_sender.py` and updated `discumbot.py`; server does not until you deploy. After deploy: on Oracle, ensure `MWDiscumBot/config/fetchall_mappings.json` exists (copy once from `MWDataManagerBot/config/` if needed) and `MWDiscumBot/config/settings.json` includes `destination_guild_ids` and `fetchall_*` / `fetchsync_*` keys.
 
 ---
 
@@ -109,11 +132,10 @@ This section documents the canonical operational workflow for managing RS bots o
 ### Source of truth: server target and key
 
 - **Server list (non-secret, tracked in git)**: `oraclekeys/servers.json`
-- **SSH private key (secret, NEVER committed)**: `oraclekeys/ssh-key-*.key`
-- PATH OF THE KEY -> C:\Users\apaap\OneDrive\Desktop\mirror-world\oraclekey\ssh-key-2025-12-15.key
-
+- **SSH private key (secret, NEVER committed)**: `oraclekeys/ssh-key-*.key` (or `oraclekey/` — scripts check both).
+  - Example absolute path (Windows): `C:\Users\apaap\OneDrive\Desktop\mirror-world\oraclekeys\ssh-key-2025-12-15.key`
   - The `key` field in `oraclekeys/servers.json` is typically a **filename**, e.g. `"ssh-key-2025-12-15.key"`.
-  - After a Windows reinstall/clone, you must restore the `.key` file from your private backup into `oraclekeys/`.
+  - After a Windows reinstall/clone, you must restore the `.key` file from your private backup into `oraclekeys/` (or `oraclekey/`).
   - **Example (Windows)**: `ssh -i oraclekeys/ssh-key-2025-12-15.key rsadmin@137.131.14.157`
 - **Ubuntu repo root**: `/home/<user>/bots/mirror-world` (usually `/home/rsadmin/bots/mirror-world`)
   - **Note (Ubuntu local-exec mode)**: when you are already on Oracle Ubuntu and `local_exec=yes`, no SSH key is needed.

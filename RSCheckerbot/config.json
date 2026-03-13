@@ -229,7 +229,12 @@
     "_comment_webhook_receiver": "Whop Developer Webhooks (real-time). Set whop_api.webhook_secret in config.secrets.json and keep webhook_verify=true in production.",
     "webhook_verify": true,
     "webhook_tolerance_seconds": 300,
-    "webhook_secret": ""
+    "webhook_secret": "",
+    "_comment_repeat_trial_guard": "When Member role is added: if member had a trial before (ever_trialing/ever_had_trial_days) and total_spent <= max_total_spent_usd, remove Member role and post staff alert.",
+    "repeat_trial_guard": {
+      "enabled": true,
+      "max_total_spent_usd": 0
+    }
   }
   ,
   "support_tickets": {

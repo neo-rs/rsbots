@@ -83,11 +83,13 @@ EXCLUDES_NO_SECRETS = EXCLUDES_FULL + [
 ]
 
 # Config files to copy from snapshot into local MWBots (so local matches server). tokens.env excluded for safety.
+# fetchall_mappings.json: used only by MWDiscumBot (canonical); sync so local/server stay aligned.
 CONFIG_FILES_TO_SYNC = [
     "channel_map.json",
     "source_channels.json",
     "destination_channels.json",
     "settings.json",
+    "fetchall_mappings.json",
 ]
 
 
