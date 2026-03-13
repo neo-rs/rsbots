@@ -6522,10 +6522,8 @@ echo "CHANGED_END"
 
         Safety:
         - Never deletes first; overwrite-in-place only
-        - Only copies files tracked by git under the target folder:
-          - *.py
-          - COMMANDS.md (if present)
-          - config.json / messages.json / vouch_config.json (if present + tracked)
+        - Copies files tracked by git under the target folder: *.py, *.md, *.json, *.txt, requirements.txt
+        - Excludes: config.secrets.json, tokens.env (server keeps these; all other config JSON e.g. settings.json is synced)
         """
         try:
             folder = (bot_folder or "").strip()
@@ -6583,10 +6581,10 @@ fi
 # Build the sync list (tracked, safe, non-secret):
 # - include: .py/.md/.json/.txt + requirements.txt
 # - exclude: config.secrets.json (even if tracked by mistake)
-# - exclude: MWPingBot/config/settings.json (server keeps ping_channel_ids; do not overwrite with repo)
+# - exclude: tokens.env only (never overwrite server secrets; all other config .json files are synced)
 TMP_SYNC_LIST="/tmp/mw_sync_${{BOT_FOLDER}}.txt"
 grep -E \"(\\\\.py$|\\\\.md$|\\\\.json$|\\\\.txt$|(^|/)requirements\\\\.txt$)\" "$TMP_ALL_LIST" | grep -v -E \"(^|/)config\\\\.secrets\\\\.json$\" > "$TMP_SYNC_LIST" || true
-grep -v \"^$BOT_FOLDER/config/settings\\.json$\" "$TMP_SYNC_LIST" > "$TMP_SYNC_LIST.ex" 2>/dev/null && mv "$TMP_SYNC_LIST.ex" "$TMP_SYNC_LIST" || true
+grep -v -E \"(^|/)tokens\\\\.env$\" "$TMP_SYNC_LIST" > "$TMP_SYNC_LIST.ex" 2>/dev/null && mv "$TMP_SYNC_LIST.ex" "$TMP_SYNC_LIST" || true
 sort -u "$TMP_SYNC_LIST" -o "$TMP_SYNC_LIST" || true
 
 # Also include shared utilities if present (repo-level, not in BOT_FOLDER)
