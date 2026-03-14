@@ -9687,6 +9687,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         )
         if not suppress_logs:
             await log_role_event(embed=removed_embed)
+            await log_other(f"📤 **Member role removed** from {_fmt_user(after)}")
         
         # If Member role was removed and user has active DM sequence, cancel it
         if str(after.id) in queue_state:
@@ -9697,6 +9698,8 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         asyncio.create_task(delayed_assign_former_member(after))
 
     if (ROLE_CANCEL_A not in before_roles) and (ROLE_CANCEL_A in after_roles):
+        if not suppress_logs:
+            await log_other(f"📥 **Member role added** to {_fmt_user(after)}")
         # Repeat-trial guard: had trial before + no payment → remove Member role and alert staff
         if _is_repeat_trial_no_payment(after.id):
             member_role_obj = after.guild.get_role(ROLE_CANCEL_A) if after.guild else None
