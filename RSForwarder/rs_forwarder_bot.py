@@ -1184,6 +1184,13 @@ class RSForwarderBot:
             v = 20.0
         return max(5.0, min(v, 180.0))
 
+    def _rsfs_use_history_cache(self) -> bool:
+        """When False, resolver and sync do not use History for pre-fill or affiliate; all items get fresh resolution."""
+        try:
+            return bool((self.config or {}).get("rs_fs_use_history_cache", False))
+        except Exception:
+            return False
+
     @staticmethod
     def _rsfs_key_store_sku(store: str, sku: str) -> str:
         return f"{str(store or '').strip().lower()}|{str(sku or '').strip().lower()}"
@@ -1242,17 +1249,17 @@ class RSForwarderBot:
         self._rs_fs_last_current_list_hash = h
         self._rs_fs_last_current_list_ts = now
 
-        # Pull cached history once (cheap) so we can pre-fill title/url without scanning.
-        history = {}
-        try:
-            history = await self._rs_fs_sheet.fetch_history_cache(force=False)
-        except Exception as e:
-            # Best-effort: continue with empty history if cache fetch fails
+        # Pull cached history only when enabled (for pre-fill title/url).
+        history: Dict[str, Dict[str, str]] = {}
+        if self._rsfs_use_history_cache():
             try:
-                print(f"[RS-FS] Warning: History cache fetch failed: {e}")
-            except Exception:
-                pass
-            history = {}
+                history = await self._rs_fs_sheet.fetch_history_cache(force=False)
+            except Exception as e:
+                try:
+                    print(f"[RS-FS] Warning: History cache fetch failed: {e}")
+                except Exception:
+                    pass
+                history = {}
         overrides = {}
         try:
             overrides = self._load_rs_fs_manual_overrides()
@@ -1330,8 +1337,7 @@ class RSForwarderBot:
                         title = ov_t
                     status_bits.append("manual")
                     src = src or "manual"
-            # History cache
-            if key and not url and key in (history or {}):
+            if key and not url and self._rsfs_use_history_cache() and key in (history or {}):
                 hrec = history.get(key) or {}
                 url = str(hrec.get("url") or "").strip()
                 ht = str(hrec.get("title") or "").strip()
@@ -5819,18 +5825,18 @@ class RSForwarderBot:
                         except Exception:
                             pass
 
-                    # Stage 0: History cache (fast, avoids monitor/website scanning when already known)
+                    # Stage 0: History cache (optional; when disabled, all pairs go to monitor/website for fresh resolution)
                     history_hits: List[rs_fs_sheet_sync.RsFsPreviewEntry] = []
                     remaining_pairs_0: List[Tuple[str, str]] = []
-                    try:
-                        hist = await self._rs_fs_sheet.fetch_history_cache(force=False)
-                    except Exception as e:
-                        # Best-effort: continue with empty history if cache fetch fails
+                    hist: Dict[str, Dict[str, str]] = {}
+                    if self._rsfs_use_history_cache():
                         try:
-                            print(f"[RS-FS Run] Warning: History cache fetch failed: {e}")
-                        except Exception:
-                            pass
-                        hist = {}
+                            hist = await self._rs_fs_sheet.fetch_history_cache(force=False)
+                        except Exception as e:
+                            try:
+                                print(f"[RS-FS Run] Warning: History cache fetch failed: {e}")
+                            except Exception:
+                                pass
                     for st, sk in (pairs or []):
                         key = self._rsfs_key_store_sku(st, sk)
                         hrec = (hist or {}).get(key) if key else None
@@ -6173,12 +6179,13 @@ class RSForwarderBot:
                                 affiliate_url="",
                             )
                     entries = list(entries_by_key.values())
-                    # Fetch history cache to check for existing affiliate URLs
-                    history = {}
-                    try:
-                        history = await self._rs_fs_sheet.fetch_history_cache(force=False)
-                    except Exception:
-                        history = {}
+                    # Fetch history cache only when used (for affiliate fallback)
+                    history: Dict[str, Dict[str, str]] = {}
+                    if self._rsfs_use_history_cache():
+                        try:
+                            history = await self._rs_fs_sheet.fetch_history_cache(force=False)
+                        except Exception:
+                            history = {}
                     
                     try:
                         rewrite_enabled = bool(self.config.get("affiliate_rewrite_enabled", True))
@@ -6197,8 +6204,7 @@ class RSForwarderBot:
                                     if store and sku:
                                         key = self._rsfs_key_store_sku(store, sku)
                                         url_to_key_map[u0] = key
-                                        # Only add to rewrite list if not in history
-                                        if key not in history or not str(history.get(key, {}).get("affiliate_url", "") or "").strip():
+                                        if not self._rsfs_use_history_cache() or key not in history or not str(history.get(key, {}).get("affiliate_url", "") or "").strip():
                                             url_list.append(u0)
                             
                             aff_map: Dict[str, str] = {}
@@ -6221,20 +6227,15 @@ class RSForwarderBot:
                                 store = str(getattr(e, "store", "") or "").strip()
                                 sku = str(getattr(e, "sku", "") or "").strip()
                                 
-                                # Check History first for affiliate URL
                                 aff = ""
-                                if store and sku:
+                                if store and sku and self._rsfs_use_history_cache():
                                     key = self._rsfs_key_store_sku(store, sku)
                                     if key in history:
                                         hist_aff = str(history.get(key, {}).get("affiliate_url", "") or "").strip()
                                         if hist_aff:
                                             aff = hist_aff
-                                
-                                # If not in History, use newly generated affiliate URL
                                 if not aff and u0:
                                     aff = (aff_map.get(u0) or "").strip()
-                                
-                                # Fallback to existing affiliate URL if still empty
                                 if not aff:
                                     aff = str(getattr(e, "affiliate_url", "") or "").strip()
                                 
@@ -6298,36 +6299,35 @@ class RSForwarderBot:
                     # Re-read Current List to get all items (including ones that already had titles/URLs)
                     # and merge with newly resolved data
                     try:
-                        # Fetch history cache to check for existing affiliate URLs
-                        history_cache = {}
-                        try:
-                            history_cache = await self._rs_fs_sheet.fetch_history_cache(force=False)
-                        except Exception:
-                            history_cache = {}
+                        # Fetch history cache only when used (for affiliate fallback)
+                        history_cache: Dict[str, Dict[str, str]] = {}
+                        if self._rsfs_use_history_cache():
+                            try:
+                                history_cache = await self._rs_fs_sheet.fetch_history_cache(force=False)
+                            except Exception:
+                                history_cache = {}
                         
                         all_current_rows = await self._rs_fs_sheet.fetch_current_list_rows()
                         all_rows: List[List[str]] = []
-                        # Collect all URLs that need affiliate rewriting (only if not in History)
                         urls_to_rewrite: List[str] = []
-                        url_to_key_map: Dict[str, str] = {}  # url -> store|sku key
-                        
+                        full_send_total = 0
+                        skipped_no_store_sku = 0
                         for row in all_current_rows:
                             if len(row) < 3:
                                 continue
-                            # Skip header row
                             if str(row[0] or "").strip().lower() == "release id":
                                 continue
-                            # Filter: Only process rows where "Full Send" column contains "full-send"
                             full_send = str(row[12] or "").strip() if len(row) > 12 else ""
                             full_send_lower = full_send.lower()
                             if "full-send" not in full_send_lower and "💶┃full-send-🤖" not in full_send:
                                 continue
+                            full_send_total += 1
                             store = str(row[1] or "").strip()
                             sku = str(row[2] or "").strip()
                             if not (store and sku):
+                                skipped_no_store_sku += 1
                                 continue
                             key = self._rsfs_key_store_sku(store, sku)
-                            # Use resolved data if available, otherwise use existing Current List data
                             if key in resolved_by_key:
                                 res = resolved_by_key[key]
                                 title = res.get("title", "")
@@ -6337,24 +6337,20 @@ class RSForwarderBot:
                                 title = str(row[6] or "").strip() if len(row) > 6 else ""
                                 url = str(row[7] or "").strip() if len(row) > 7 else ""
                                 aff = str(row[8] or "").strip() if len(row) > 8 else ""
-                            
-                            # Check History first for affiliate URL
+                            if url and not aff and self._rsfs_use_history_cache() and key in history_cache:
+                                hist_aff = str(history_cache.get(key, {}).get("affiliate_url", "") or "").strip()
+                                if hist_aff:
+                                    aff = hist_aff
                             if url and not aff:
-                                if key in history_cache:
-                                    hist_aff = str(history_cache.get(key, {}).get("affiliate_url", "") or "").strip()
-                                    if hist_aff:
-                                        aff = hist_aff
-                            
-                            # If still no affiliate URL, queue for rewriting (only if not in History)
-                            if url and not aff:
-                                # Only add to rewrite list if not found in History
-                                if key not in history_cache or not str(history_cache.get(key, {}).get("affiliate_url", "") or "").strip():
+                                if not self._rsfs_use_history_cache() or not str(history_cache.get(key, {}).get("affiliate_url", "") or "").strip():
                                     urls_to_rewrite.append(url)
-                                    url_to_key_map[url] = key
-                            
                             all_rows.append([store, sku, title, aff, url])
+                        try:
+                            print(f"{Colors.CYAN}[RS-FS Sync]{Colors.RESET} Full Send rows: {full_send_total} total, {len(all_rows)} with store+sku syncing to Live List (skipped {skipped_no_store_sku} without store or SKU)")
+                        except Exception:
+                            pass
                         
-                        # Generate affiliate links only for items not found in History
+                        # Generate affiliate links for every row that has a store URL but no affiliate
                         if urls_to_rewrite:
                             try:
                                 rewrite_enabled = bool(self.config.get("affiliate_rewrite_enabled", True))
@@ -6365,15 +6361,42 @@ class RSForwarderBot:
                                     unique_urls = list(dict.fromkeys(urls_to_rewrite))
                                     mapped, _notes = await affiliate_rewriter.compute_affiliate_rewrites_plain(self.config, unique_urls)
                                     aff_map = {str(k or "").strip(): str(v or "").strip() for k, v in (mapped or {}).items()}
-                                    
+
+                                    def _get_affiliate_for_url(u: str, am: Dict[str, str]) -> str:
+                                        u = (u or "").strip()
+                                        if not u:
+                                            return ""
+                                        # Exact match first
+                                        out = (am.get(u) or "").strip()
+                                        if out:
+                                            return out
+                                        # Try normalized variants (trailing slash, etc.)
+                                        u_rstrip = u.rstrip("/")
+                                        if u_rstrip != u:
+                                            out = (am.get(u_rstrip) or "").strip()
+                                            if out:
+                                                return out
+                                        for orig, aff_val in am.items():
+                                            orig = (orig or "").strip()
+                                            if not orig or not aff_val:
+                                                continue
+                                            if orig == u or orig.rstrip("/") == u or orig.rstrip("/") == u_rstrip:
+                                                return (aff_val or "").strip()
+                                        return ""
+
                                     # Update all_rows with newly generated affiliate links
+                                    filled = 0
                                     for i, row_data in enumerate(all_rows):
                                         store, sku, title, aff, url = row_data
-                                        # If this row has a URL but no affiliate URL, try to get one from generated map
                                         if url and not aff:
-                                            new_aff = aff_map.get(url, "").strip()
+                                            new_aff = _get_affiliate_for_url(url, aff_map)
                                             if new_aff:
                                                 all_rows[i] = [store, sku, title, new_aff, url]
+                                                filled += 1
+                                    try:
+                                        print(f"{Colors.CYAN}[RS-FS]{Colors.RESET} Affiliate rewrite: {len(unique_urls)} URL(s) requested, {len(aff_map)} resolved, {filled} row(s) updated")
+                                    except Exception:
+                                        pass
                                 except Exception as e:
                                     try:
                                         print(f"[RS-FS] Warning: Failed to generate affiliate links for existing items: {e}")

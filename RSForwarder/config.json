@@ -112,5 +112,6 @@
   "rs_fs_auto_write_current_list": true,
   "rs_fs_current_list_debounce_s": 20.0,
   "rs_fs_history_cache_ttl_s": 900,
+  "rs_fs_use_history_cache": false,
   "zephyr_release_feed_channel_id": "1438893232686895194"
 }
