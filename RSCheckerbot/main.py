@@ -6906,6 +6906,73 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                 with suppress(Exception):
                     member_obj = await guild.fetch_member(int(did))
 
+        # When we have no Discord ID yet, wait so the native Whop Events message can land in #whop-logs first (same event often fires both API webhook and native log at once).
+        if member_obj is None and not did:
+            try:
+                delay_s = int(WHOP_API_CONFIG.get("unlinked_post_delay_seconds", 0) or 0)
+            except Exception:
+                delay_s = 0
+            if delay_s > 0:
+                await asyncio.sleep(delay_s)
+                email_hint = str((brief or {}).get("email") or "").strip()
+                if email_hint:
+                    with suppress(Exception):
+                        db_ic = load_json(WHOP_IDENTITY_CACHE_FILE)
+                        if isinstance(db_ic, dict):
+                            rec0 = db_ic.get(str(email_hint).strip().lower() or "")
+                            if isinstance(rec0, dict):
+                                v0 = str(rec0.get("discord_id") or "").strip()
+                                if v0.isdigit():
+                                    did = int(v0)
+                                    if did > 0:
+                                        connected_disp = str(did)
+                                        if isinstance(brief, dict):
+                                            brief["connected_discord"] = connected_disp
+                if not did and email_hint:
+                    try:
+                        lim = int(WHOP_API_CONFIG.get("logs_lookup_limit", 50))
+                    except Exception:
+                        lim = 50
+                    with suppress(Exception):
+                        did2 = await _resolve_discord_id_from_whop_logs(
+                            guild,
+                            client=bot,
+                            email=email_hint,
+                            membership_id_hint=str(mid2 or "").strip(),
+                            whop_key=str((brief or {}).get("membership_id") or "").strip(),
+                            limit=int(max(10, min(250, lim))),
+                        )
+                        did = int(did2) if str(did2 or "").strip().isdigit() else 0
+                        if did > 0:
+                            connected_disp = str(did)
+                            if isinstance(brief, dict):
+                                brief["connected_discord"] = connected_disp
+                if not did and str(mid2 or "").strip():
+                    try:
+                        lim = int(WHOP_API_CONFIG.get("logs_lookup_limit", 50))
+                    except Exception:
+                        lim = 50
+                    whop_key_hint = str((brief or {}).get("key") or (brief or {}).get("whop_key") or (brief or {}).get("membership_id") or "").strip()
+                    with suppress(Exception):
+                        did2 = await _resolve_discord_id_from_whop_logs(
+                            guild,
+                            client=bot,
+                            email="",
+                            membership_id_hint=str(mid2 or "").strip(),
+                            whop_key=whop_key_hint,
+                            limit=int(max(10, min(250, lim))),
+                        )
+                        did = int(did2) if str(did2 or "").strip().isdigit() else 0
+                        if did > 0:
+                            connected_disp = str(did)
+                            if isinstance(brief, dict):
+                                brief["connected_discord"] = connected_disp
+                if did:
+                    member_obj = guild.get_member(int(did))
+                    if member_obj is None:
+                        with suppress(Exception):
+                            member_obj = await guild.fetch_member(int(did))
+
         # Persist brief for later role-driven cards.
         if did and isinstance(brief, dict) and brief:
             with suppress(Exception):
@@ -6966,7 +7033,7 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                     always_post=always_post,
                     extra_fields=extra_fields,
                 )
-        else:
+        if member_obj is not None:
             relevant = coerce_role_ids(ROLE_TRIGGER, WELCOME_ROLE_ID, ROLE_CANCEL_A, ROLE_CANCEL_B)
             access = access_roles_plain(member_obj, relevant)
             detailed = _build_member_status_detailed_embed(

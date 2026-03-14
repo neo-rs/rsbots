@@ -199,6 +199,8 @@
     "sync_summary_report_format": "csv",
     "_comment_logs_lookup": "Limit for searching Discord whop-logs history when resolving Discord IDs (anti-rate-limit).",
     "logs_lookup_limit": 250,
+    "_comment_unlinked_post_delay": "Seconds to wait before posting a 'Discord not linked' card so whop-logs native message can arrive first (avoids race with Whop Events). 0 = no delay.",
+    "unlinked_post_delay_seconds": 15,
     "_comment_joined_report": "For `.checker syncsummary <start> <end>`: filters Whop memberships by JOINED date (excludes draft attempts) and optionally restricts to RS product titles.",
     "joined_report_require_date_joined": false,
     "joined_report_statuses": ["active", "trialing", "canceling", "completed", "canceled", "expired"],
