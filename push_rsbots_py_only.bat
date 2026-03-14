@@ -28,6 +28,8 @@ if errorlevel 1 (
   echo ERROR: git add failed.
   exit /b 1
 )
+REM Never push runtime data (server-owned)
+git reset HEAD -- RSCheckerbot/member_history.json 2>nul
 
 REM If nothing is staged, exit cleanly
 git diff --cached --quiet
