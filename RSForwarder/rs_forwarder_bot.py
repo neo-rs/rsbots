@@ -5666,6 +5666,26 @@ class RSForwarderBot:
                 try:
                     await ctx.send(f"✅ Running RS-FS LIVE mirror sync from <#{ch_id}> (max={lim})…")
 
+                    # Discord embed: per-field value max 1024; total embed max 6000
+                    _FIELD_VALUE_MAX = 1024
+                    _EMBED_SAFE_TOTAL = 5500
+
+                    def _truncate_field(lines: List[str], separator: str, suffix: str, max_chars: int = _FIELD_VALUE_MAX) -> str:
+                        reserve = 45  # room for "... and N more"
+                        out: List[str] = []
+                        n_more = 0
+                        for line in lines:
+                            trial = separator.join(out + [line]) if out else line
+                            if len(trial) <= max_chars - reserve:
+                                out.append(line)
+                            else:
+                                n_more = len(lines) - len(out)
+                                break
+                        text = separator.join(out) if out else ""
+                        if n_more > 0:
+                            text = (text + separator + suffix.format(n_more)).strip()
+                        return text or "—"
+
                     def _progress_embed(stage: str, done: int, total: int, *, monitor_hits: int = 0, remaining: int = 0, web_errors: int = 0, monitor_hit_skus: List[Tuple[str, str, str]] = None, error_skus: List[Tuple[str, str]] = None) -> discord.Embed:
                         emb = discord.Embed(title="RS-FS Live Sync", color=discord.Color.dark_teal())
                         emb.add_field(name="Stage", value=stage or "…", inline=False)
@@ -5675,38 +5695,50 @@ class RSForwarderBot:
                         if web_errors:
                             emb.add_field(name="Website errors", value=str(int(web_errors)), inline=True)
                         
-                        # Show monitor hit SKUs with title and URL (limit to avoid embed size issues)
+                        # Show monitor hit SKUs (cap field at 1024 to avoid embed size limit)
                         if monitor_hit_skus:
-                            hit_list = monitor_hit_skus[:10]  # Show first 10
                             hit_lines = []
-                            for sku_display, title, url in hit_list:
-                                # Filter out URLs being used as titles
+                            for sku_display, title, url in monitor_hit_skus:
                                 if title and self._rsfs_title_is_bad(title, url=url):
-                                    title = ""  # Don't show URL as title
-                                title_display = title[:60] + "..." if len(title) > 60 else title
-                                url_display = url[:60] + "..." if len(url) > 60 else url
-                                if title and url:
-                                    hit_lines.append(f"`{sku_display}`\n  Title: {title_display}\n  Store URL: {url_display}")
-                                elif title:
-                                    hit_lines.append(f"`{sku_display}`\n  Title: {title_display}")
-                                elif url:
-                                    hit_lines.append(f"`{sku_display}`\n  Store URL: {url_display}")
+                                    title = ""
+                                title_display = (title[:40] + "...") if len(title or "") > 40 else (title or "")
+                                url_display = (url[:45] + "...") if len(url or "") > 45 else (url or "")
+                                if title_display and url_display:
+                                    hit_lines.append(f"`{sku_display}`\n  {title_display}\n  {url_display}")
+                                elif title_display:
+                                    hit_lines.append(f"`{sku_display}`\n  {title_display}")
+                                elif url_display:
+                                    hit_lines.append(f"`{sku_display}`\n  {url_display}")
                                 else:
                                     hit_lines.append(f"`{sku_display}`")
-                            hit_text = "\n\n".join(hit_lines)
-                            if len(monitor_hit_skus) > 10:
-                                hit_text += f"\n\n... and {len(monitor_hit_skus) - 10} more"
-                            emb.add_field(name="Monitor hit SKUs", value=hit_text or "—", inline=False)
+                            hit_text = _truncate_field(hit_lines, "\n\n", "... and {} more")
+                            emb.add_field(name="Monitor hit SKUs", value=hit_text, inline=False)
                         
-                        # Show error SKUs with their problems
+                        # Show error SKUs (cap field at 1024)
                         if error_skus:
-                            error_list = error_skus[:10]  # Show first 10
-                            error_text = "\n".join([f"`{sku}` — {problem[:100]}" for sku, problem in error_list])
-                            if len(error_skus) > 10:
-                                error_text += f"\n... and {len(error_skus) - 10} more"
-                            emb.add_field(name="Problem SKUs", value=error_text or "—", inline=False)
+                            error_lines = [f"`{sku}` — {(problem or "")[:80]}" for sku, problem in error_skus]
+                            error_text = _truncate_field(error_lines, "\n", "... and {} more")
+                            emb.add_field(name="Problem SKUs", value=error_text, inline=False)
                         
                         emb.set_footer(text="This message updates live.")
+                        # Ensure total embed size stays under Discord limit (6000)
+                        total_len = len(emb.title or "") + len(emb.description or "") + len(emb.footer.text or "")
+                        for f in emb.fields:
+                            total_len += len(f.name or "") + len(f.value or "")
+                        if total_len > _EMBED_SAFE_TOTAL:
+                            # Rebuild with fewer items: drop optional list fields and use counts only
+                            emb = discord.Embed(title="RS-FS Live Sync", color=discord.Color.dark_teal())
+                            emb.add_field(name="Stage", value=stage or "…", inline=False)
+                            emb.add_field(name="Progress", value=self._format_progress_bar(done, total), inline=False)
+                            emb.add_field(name="Monitor hits", value=str(int(monitor_hits)), inline=True)
+                            emb.add_field(name="Remaining", value=str(int(remaining)), inline=True)
+                            if web_errors:
+                                emb.add_field(name="Website errors", value=str(int(web_errors)), inline=True)
+                            if monitor_hit_skus:
+                                emb.add_field(name="Monitor hit SKUs", value=f"{len(monitor_hit_skus)} items (list truncated)", inline=False)
+                            if error_skus:
+                                emb.add_field(name="Problem SKUs", value=f"{len(error_skus)} items (list truncated)", inline=False)
+                            emb.set_footer(text="This message updates live.")
                         return emb
 
                     # Collect the most recent listreleases run (merged from Zephyr chunks).
