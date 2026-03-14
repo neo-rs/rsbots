@@ -5716,7 +5716,10 @@ class RSForwarderBot:
                         
                         # Show error SKUs (cap field at 1024)
                         if error_skus:
-                            error_lines = [f"`{sku}` — {(problem or "")[:80]}" for sku, problem in error_skus]
+                            error_lines = []
+                            for sku, problem in error_skus:
+                                p = (problem or "")[:80]
+                                error_lines.append(f"`{sku}` — {p}")
                             error_text = _truncate_field(error_lines, "\n", "... and {} more")
                             emb.add_field(name="Problem SKUs", value=error_text, inline=False)
                         
