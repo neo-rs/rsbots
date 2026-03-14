@@ -901,7 +901,8 @@ class RSOnboardingBot:
             # Mark as creating immediately to prevent race conditions (still in lock)
             self.ticket_data[str(member.id)] = {"channel_id": 0, "opened_at": time.time()}
             self.save_tickets()
-            
+            print(f"{Colors.CYAN}[Event] Opening onboarding ticket for {member.name} ({member.id}){Colors.RESET}")
+
             try:
                 await self._assert_core_perms_or_log(guild, f"open_onboarding_ticket for {member.id}")
 
@@ -1709,6 +1710,14 @@ class RSOnboardingBot:
             
             # Welcome role added -> open ticket (match original - no duplicate check here)
             if (welcome_role_id not in before_roles) and (welcome_role_id in after_roles):
+                print(f"{Colors.CYAN}[Event] Welcome role added to {after.name} ({after.id}){Colors.RESET}")
+                await self.log_action(
+                    guild,
+                    f"Welcome role added to {after.mention} - opening onboarding ticket",
+                    log_type="info",
+                    member=after,
+                    source="on_member_update"
+                )
                 await self.remove_cleanup_roles(after, reason="Welcome-gained cleanup")
                 if member_role_id not in after_roles:
                     await self.open_onboarding_ticket(after)
