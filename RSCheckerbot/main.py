@@ -9513,6 +9513,19 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     roles_added = after_roles - before_roles
     roles_removed = before_roles - after_roles
 
+    # When Welcome role is added, log to join-logs (canonical channel 1144408172757536768) so it appears there.
+    if (
+        not suppress_logs
+        and WELCOME_ROLE_ID
+        and (int(WELCOME_ROLE_ID) in roles_added)
+    ):
+        welcome_embed = _make_dyno_embed(
+            member=after,
+            description=f"{after.mention} was given the Welcome role",
+            footer=f"ID: {after.id} • CID: {_cid_for(after.id)}",
+        )
+        await log_first(embed=welcome_embed)
+
     # Persist a bounded, high-signal role-change timeline for staff triage.
     try:
         relevant_added = {rid for rid in roles_added if int(rid) in HISTORY_RELEVANT_ROLE_IDS}

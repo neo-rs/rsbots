@@ -3,6 +3,17 @@
 ## Overview
 RSCheckerbot manages member verification, payment tracking, and DM sequences for Reselling Secrets. It handles Whop API integration, membership status tracking, and automated DM sequences for members.
 
+## When RSCheckerbot Removes the Member Role
+
+RSCheckerbot is the **only** bot that removes the Member role. It does so in two situations:
+
+| When | What happens | Config / condition |
+|------|---------------------------|--------------------|
+| **Whop sync** (startup + 6h loop) | For each Discord user linked to a Whop membership, the bot calls the Whop API. If the membership is **not entitled** (e.g. status `canceled`, `completed`, `past_due`, `unpaid`) and the user has the Member role, the bot can remove it. | **Only if** `config.json → whop_api.enforce_role_removals` is **`true`**. Default is **`false`** (audit-only: logs “would remove” but does not remove). Lifetime members are never stripped. |
+| **Repeat-trial guard** | When the Member role is **added** (e.g. by payment_activation), the bot checks if the user had a trial before and total spend is at or below the threshold. If so, it removes the Member role again and posts a staff card. | `config.json → whop_api.repeat_trial_guard` (e.g. `enabled`, `max_total_spent_usd`). |
+
+RSOnboarding never removes the Member role.
+
 ## Command Categories
 
 ### Slash Commands (Staff/Admin)

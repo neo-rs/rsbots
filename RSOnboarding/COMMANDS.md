@@ -3,6 +3,37 @@
 ## Overview
 RSOnboarding manages the onboarding ticket system for new members. It automatically creates private ticket channels when members join and guides them through the onboarding process.
 
+## When RSOnboarding Creates an Onboarding Ticket
+
+A ticket (private `#welcome-<username>` channel) is created **only** when the member has the **Welcome** role and does **not** have the **Member** role. Triggers:
+
+| Trigger | When it runs |
+|--------|-------------------------------|
+| **Welcome role added** | `on_member_update`: Discord fires when the member gains the Welcome role. If they still don’t have the Member role, RSOnboarding calls `open_onboarding_ticket`. |
+| **Member joins with Welcome** | `on_member_join`: Member already has Welcome and does not have Member (e.g. rejoin or role assigned before join). RSOnboarding calls `open_onboarding_ticket`. |
+| **Reconcile on startup** | After `on_ready`, RSOnboarding runs `reconcile_tickets`: for every guild member who has Welcome, does **not** have Member, has **no** ticket in storage, and joined **&lt; 24h ago**, it creates a ticket. |
+| **Manual** | Staff can run `?test` / `?test @user` to open a ticket. |
+
+**Important:** RSOnboarding does **not** add the Welcome role. Something else (e.g. native Whop Discord integration, RSCheckerbot if you add it, or manual assignment) must add Welcome first. If Welcome is never added, no ticket is created.
+
+## Who Adds and Removes the Member Role
+
+- **Who adds Member**
+  - **RSCheckerbot** (Whop webhooks): `payment_activation` and `payment_renewal` add the Member role.
+  - **RSOnboarding**: When the user clicks “Get Full Access” (or staff closes the ticket in a way that grants access), it adds Member and removes Welcome.
+  - **RSCheckerbot** (Whop sync): Optional “auto-heal” can add Member when Whop shows active, entitled access (config: `whop_api.auto_heal_add_members_role`).
+
+- **Who removes Member**
+  - **RSCheckerbot only.** RSOnboarding never removes the Member role.
+  - **Whop sync** (RSCheckerbot, startup + 6h loop): If the Whop API says the membership is not entitled (e.g. `canceled`, `completed`, `past_due`, `unpaid`) and the Discord user is linked to that membership, RSCheckerbot can remove the Member role. This only happens if `config.json → whop_api.enforce_role_removals` is **true** (default is **false** = audit-only, “would remove” logged but role not removed).
+  - **Repeat-trial guard** (RSCheckerbot): When Member is added, if the member had a trial before and total spend is at or below the configured threshold, RSCheckerbot removes the Member role again and posts a staff card.
+
+Whop (the product) does not run a Discord bot; RSCheckerbot uses the Whop API and webhooks and is what actually adds/removes roles based on Whop data.
+
+## Who Removes the Welcome Role
+
+- **RSOnboarding only.** When the Member role is added (by any source), RSOnboarding’s `on_member_update` sees it and removes the Welcome role so the user no longer has both.
+
 ## Command Categories
 
 ### Configuration Commands

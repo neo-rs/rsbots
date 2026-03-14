@@ -5694,8 +5694,10 @@ async def sweep_no_whop_link_cleanup(*, force: bool = False) -> str:
 
     summary = f"closed={closed} skipped={skipped} failed={failed} role_removed={role_removed} role_skipped={role_skipped}"
     _scan_state_set("no_whop_link_cleanup", {"last_run_at_iso": _now_iso(), "last_summary": summary})
-    with suppress(Exception):
-        await _log(f"🧹 support_tickets: no_whop_link cleanup {summary}")
+    # Only post to channel when something changed (avoid spam)
+    if closed > 0 or role_removed > 0:
+        with suppress(Exception):
+            await _log(f"🧹 support_tickets: no_whop_link cleanup {summary}")
     return summary
 
 
