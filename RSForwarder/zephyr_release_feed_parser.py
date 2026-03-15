@@ -86,6 +86,7 @@ def tag_to_store(tag: str) -> Optional[str]:
     m = _norm_token(tag)
     base = m[:-len("-monitor")] if m.endswith("-monitor") else m
 
+    # Canonical store mapping: tag (or base without -monitor) -> display name for Full-Send-Current-List column B.
     direct = {
         "amazon": "Amazon",
         "walmart": "Walmart",
@@ -99,9 +100,16 @@ def tag_to_store(tag: str) -> Optional[str]:
         "hotopic": "Hotopic",
         "mattel": "Mattel",
         "shopify": "Shopify",
+        "shopify-unfiltered": "Shopify",
         "us-mint": "US Mint",
         "funkopop": "Funkopop",
         "funko": "Funkopop",
+        "scheels": "Scheels",
+        "five-below": "Five Below",
+        "walgreens": "Walgreens",
+        "boxlunch-hottopic": "BoxLunch",
+        "crunchy-roll": "Crunchyroll",
+        "pokemon-center": "Pokemon Center",
         # Some deployments use these variants:
         "barnes": "Barnes and Nobles",
         "barnesandnobles": "Barnes and Nobles",

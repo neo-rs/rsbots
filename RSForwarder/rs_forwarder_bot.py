@@ -1227,9 +1227,12 @@ class RSForwarderBot:
     @staticmethod
     def _rsfs_monitor_tag_to_store(mtag: str) -> str:
         """
-        Derive a store name from Monitor Tag when Store column is blank.
-        Used so rows with tags like scheels, five-below, boxlunch-hottopic can sync to Live List.
+        Derive store name from Monitor Tag when Store column is blank (e.g. when reading Current List for pairs/sync).
+        Parser (tag_to_store) is canonical; this adds fallback for tags not yet in parser (e.g. time-like).
         """
+        s = zephyr_release_feed_parser.tag_to_store(mtag or "")
+        if s:
+            return s
         m = str(mtag or "").strip().lower()
         if not m:
             return ""
@@ -1240,17 +1243,6 @@ class RSForwarderBot:
             if base in ("target", "walmart", "amazon", "topps", "costco"):
                 return base.title()
             return base.replace("-", " ").title()
-        known = {
-            "five-below": "Five Below",
-            "scheels": "Scheels",
-            "boxlunch-hottopic": "BoxLunch",
-            "crunchy-roll": "Crunchyroll",
-            "shopify-unfiltered": "Shopify",
-            "walgreens": "Walgreens",
-            "bestbuy": "Bestbuy",
-        }
-        if m in known:
-            return known[m]
         return m.replace("-", " ").title()
 
     @staticmethod
@@ -1355,6 +1347,9 @@ class RSForwarderBot:
             store = str(getattr(r, "store", "") or "").strip()
             sku_label = str(getattr(r, "sku", "") or "").strip()
             monitor_tag = str(getattr(r, "monitor_tag", "") or "").strip()
+            # Column B (Store): when parser left it blank, derive from Monitor Tag (parser is canonical; forwarder fallback for edge cases)
+            if not store and monitor_tag:
+                store = (zephyr_release_feed_parser.tag_to_store(monitor_tag) or "") or self._rsfs_monitor_tag_to_store(monitor_tag)
             category = str(getattr(r, "category", "") or "").strip()
             ch_id = str(getattr(r, "channel_id", "") or "").strip()
             is_sku = bool(getattr(r, "is_sku_candidate", True))
