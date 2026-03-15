@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 import discord
@@ -10,7 +10,7 @@ ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 def utc_now() -> datetime:
-    return datetime.now(UTC)
+    return datetime.now(timezone.utc)
 
 
 
@@ -23,7 +23,7 @@ def parse_iso(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.strptime(value, ISO_FORMAT).replace(tzinfo=UTC)
+        return datetime.strptime(value, ISO_FORMAT).replace(tzinfo=timezone.utc)
     except ValueError:
         return None
 
