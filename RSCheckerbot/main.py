@@ -8161,9 +8161,15 @@ async def sync_whop_memberships():
             if st_final != "active":
                 continue
 
-            # Repeat-trial guard: do not auto-heal if they had trial before with no payment.
+            # Repeat-trial guard: do not auto-heal only if they had trial before AND API total_spent is at or below threshold.
             if _is_repeat_trial_no_payment(mbr.id):
-                continue
+                try:
+                    guard = WHOP_API_CONFIG.get("repeat_trial_guard") or {}
+                    max_spent = float(guard.get("max_total_spent_usd", 0) or 0)
+                    if spent <= max_spent:
+                        continue  # Cached + API both say no payment; skip add
+                except Exception:
+                    continue  # On error, skip add to be safe
 
             try:
                 # Prevent startup/sync-driven role adds from spamming member-status channels.
@@ -9871,39 +9877,64 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         if not suppress_logs:
             await log_other(f"📥 **Member role added** to {_fmt_user(after)}")
         # Repeat-trial guard: had trial before + no payment → remove Member role and alert staff
+        # Before removing, refresh total_spent from Whop API so paid first-time trials aren't blocked (member_history can be stale).
         if _is_repeat_trial_no_payment(after.id):
-            member_role_obj = after.guild.get_role(ROLE_CANCEL_A) if after.guild else None
-            if member_role_obj and member_role_obj in after.roles:
-                with suppress(Exception):
-                    await after.remove_roles(
-                        member_role_obj,
-                        reason="Repeat trial with no payment (ever_trialing/ever_had_trial_days + total_spent <= threshold)",
-                    )
-                if log_member_status:
-                    hist = get_member_history(after.id) or {}
-                    wh = hist.get("whop") or {}
-                    last = wh.get("last_summary") or {}
-                    spent_s = str(last.get("total_spent") or "").strip() or "—"
-                    e = _build_member_status_detailed_embed(
-                        title="🚫 Repeat Trial — Member Role Removed",
-                        member=after,
-                        access_roles=_access_roles_plain(after),
-                        color=0xED4245,
-                        event_kind="repeat_trial_blocked",
-                        discord_kv=[
+            # Only remove when we successfully got a fresh total_spent from API and it's <= threshold.
+            # If we can't fetch (no mid, no client, API error), do not remove (fail open for paid users).
+            do_remove = False
+            spent_display = None  # total_spent we used for the decision (from API when available)
+            mid_used = None
+            try:
+                guard = WHOP_API_CONFIG.get("repeat_trial_guard") or {}
+                max_spent = float(guard.get("max_total_spent_usd", 0) or 0)
+                mid = _membership_id_from_history(after.id)
+                if mid and whop_api_client:
+                    fresh_brief = await _fetch_whop_brief_by_membership_id(mid)
+                    if isinstance(fresh_brief, dict) and fresh_brief:
+                        fresh_spent = float(usd_amount(fresh_brief.get("total_spent")))
+                        if fresh_spent <= max_spent:
+                            do_remove = True  # Confirmed at or below threshold; safe to remove
+                            spent_display = (fresh_brief.get("total_spent") or "").strip() or f"${fresh_spent:.2f}"
+                            mid_used = mid
+            except Exception:
+                pass
+            if do_remove:
+                member_role_obj = after.guild.get_role(ROLE_CANCEL_A) if after.guild else None
+                if member_role_obj and member_role_obj in after.roles:
+                    with suppress(Exception):
+                        await after.remove_roles(
+                            member_role_obj,
+                            reason="Repeat trial with no payment (ever_trialing/ever_had_trial_days + total_spent <= threshold)",
+                        )
+                    if log_member_status:
+                        hist = get_member_history(after.id) or {}
+                        wh = hist.get("whop") or {}
+                        last = wh.get("last_summary") or {}
+                        # Show the total_spent we used for the decision (from API), not stale member_history
+                        spent_s = spent_display or str(last.get("total_spent") or "").strip() or "—"
+                        discord_kv = [
                             ("reason", "Had trial before; total spend at or below threshold"),
                             ("total_spent", spent_s),
                             ("ever_trialing", "yes" if wh.get("ever_trialing") else "no"),
                             ("ever_had_trial_days", "yes" if wh.get("ever_had_trial_days") else "no"),
-                        ],
-                        whop_brief=last if isinstance(last, dict) else {},
-                    )
-                    await log_member_status("", embed=e)
-                if log_other:
-                    await log_other(
-                        f"🚫 **Repeat trial guard:** Removed Member role from {_fmt_user(after)} — had trial before, total spend $0 or below threshold."
-                    )
-                return
+                        ]
+                        if mid_used:
+                            discord_kv.append(("membership_id", mid_used))
+                        e = _build_member_status_detailed_embed(
+                            title="🚫 Repeat Trial — Member Role Removed",
+                            member=after,
+                            access_roles=_access_roles_plain(after),
+                            color=0xED4245,
+                            event_kind="repeat_trial_blocked",
+                            discord_kv=discord_kv,
+                            whop_brief=last if isinstance(last, dict) else {},
+                        )
+                        await log_member_status("", embed=e)
+                    if log_other:
+                        await log_other(
+                            f"🚫 **Repeat trial guard:** Removed Member role from {_fmt_user(after)} — had trial before, total spend $0 or below threshold."
+                        )
+                    return
         
         # Show all role changes when Member role is regained
         all_removed_in_update = before_roles - after_roles
