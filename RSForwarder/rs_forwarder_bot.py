@@ -433,7 +433,22 @@ class _RsFsManualResolveView(discord.ui.View):
         except Exception:
             pass
         
-        # After Finish, trigger Remove Helper list generation
+        # After Finish: write Current List (so manual overrides fill Resolved Title) and sync to Live List
+        try:
+            await self._bot._rsfs_write_current_list(self._merged_text, reason="manual-resolve-finish")
+        except Exception:
+            pass
+        try:
+            ok, msg, added, updated, deleted = await self._bot._rsfs_sync_current_to_live_list()
+            try:
+                await interaction.followup.send(
+                    f"Current List updated with your resolutions. Live List synced: {added} added, {updated} updated, {deleted} removed.",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
         try:
             await self._bot._generate_remove_helper_list(
                 self._ctx,
@@ -1396,6 +1411,38 @@ class RSForwarderBot:
         except Exception:
             pass
         return ok, msg, n
+
+    async def _rsfs_sync_current_to_live_list(self) -> Tuple[bool, str, int, int, int]:
+        """
+        Build Full Send rows from Current List (store+sku only) and sync to Live List.
+        Used after manual-resolve Finish so Live List count matches Current List.
+        Returns (ok, message, added, updated, deleted).
+        """
+        try:
+            all_current_rows = await self._rs_fs_sheet.fetch_current_list_rows()
+        except Exception:
+            return False, "fetch current list failed", 0, 0, 0
+        all_rows: List[List[str]] = []
+        for row in all_current_rows:
+            if len(row) < 3:
+                continue
+            if str(row[0] or "").strip().lower() == "release id":
+                continue
+            full_send = str(row[12] or "").strip() if len(row) > 12 else ""
+            full_send_lower = (full_send or "").lower()
+            if "full-send" not in full_send_lower and "💶┃full-send-🤖" not in full_send:
+                continue
+            store = str(row[1] or "").strip()
+            sku = str(row[2] or "").strip()
+            if not (store and sku):
+                continue
+            title = str(row[6] or "").strip() if len(row) > 6 else ""
+            url = str(row[7] or "").strip() if len(row) > 7 else ""
+            aff = str(row[8] or "").strip() if len(row) > 8 else ""
+            all_rows.append([store, sku, title, aff, url])
+        if not all_rows:
+            return True, "no Full Send rows with store+sku", 0, 0, 0
+        return await self._rs_fs_sheet.sync_rows_mirror(all_rows)
 
     async def _collect_latest_zephyr_release_feed_text(
         self,
