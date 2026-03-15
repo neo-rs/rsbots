@@ -433,9 +433,37 @@ class _RsFsManualResolveView(discord.ui.View):
         except Exception:
             pass
         
-        # After Finish: write Current List (so manual overrides fill Resolved Title) and sync to Live List
+        # Build resolved_by_key from run's entries so Current List keeps resolver data (monitor/website)
+        # and doesn't get wiped back to raw feed state; merge in user's manual fixes from _items
+        resolved_by_key: Dict[str, Dict[str, str]] = {}
+        for e in self._all_entries or []:
+            st = str(getattr(e, "store", "") or "").strip()
+            sk = str(getattr(e, "sku", "") or "").strip()
+            if not (st and sk):
+                continue
+            key = self._bot._rsfs_key_store_sku(st, sk)
+            u0 = str(getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
+            t0 = str(getattr(e, "title", "") or "").strip()
+            a0 = str(getattr(e, "affiliate_url", "") or "").strip()
+            src0 = str(getattr(e, "source", "") or "").strip()
+            resolved_by_key[key] = {"title": t0, "url": u0, "affiliate_url": a0, "source": src0}
+        for it in self._items or []:
+            st = str(it.get("store") or "").strip()
+            sk = str(it.get("sku") or "").strip()
+            rt = str(it.get("resolved_title") or "").strip()
+            ru = str(it.get("resolved_url") or "").strip()
+            if st and sk and (rt or ru):
+                key = self._bot._rsfs_key_store_sku(st, sk)
+                resolved_by_key.setdefault(key, {})
+                if rt:
+                    resolved_by_key[key]["title"] = rt
+                if ru:
+                    resolved_by_key[key]["url"] = ru
+        # Write Current List with resolved data so it matches Live List; then sync
         try:
-            await self._bot._rsfs_write_current_list(self._merged_text, reason="manual-resolve-finish")
+            await self._bot._rsfs_write_current_list(
+                self._merged_text, resolved_by_key=resolved_by_key, reason="manual-resolve-finish"
+            )
         except Exception:
             pass
         try:
