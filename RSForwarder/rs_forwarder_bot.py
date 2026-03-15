@@ -1570,6 +1570,7 @@ class RSForwarderBot:
         current_list_raw_count = 0
         full_send_count = 0
         others_count = 0
+        full_send_with_store_sku = 0
         matched_skus_count = 0
         matched_complete_count = 0
         new_items_count = 0
@@ -1649,13 +1650,14 @@ class RSForwarderBot:
                 current_list_raw_count = len(current_list_raw_skus)
                 full_send_count = len(current_list_full_send_skus)
                 others_count = len(current_list_others_skus)
+                # Full Send rows that have SKU = what mirror sync will send (store filled from column or mtag, else "unknown")
+                full_send_with_store_sku = len(current_list_full_send_skus)
                 
                 # Cross-match: Find SKUs that exist in both Current List (Full Send only) and History
-                # Only use Full Send items for matched/complete/new calculations
                 matched_skus: Set[str] = current_list_full_send_skus.intersection(history_raw_skus)
                 matched_skus_count = len(matched_skus)
                 
-                # From matched SKUs (Full Send only), find those with both title and URL (complete)
+                # From matched SKUs, find those with both title and URL in Current List (complete)
                 complete_skus: Set[str] = set()
                 for sku_lower in matched_skus:
                     data = current_list_all_data.get(sku_lower, {})
@@ -1665,8 +1667,15 @@ class RSForwarderBot:
                         complete_skus.add(sku_lower)
                 matched_complete_count = len(complete_skus)
                 
-                # New items = matched SKUs (Full Send only) that are missing title or URL (or both)
-                new_items_count = matched_skus_count - matched_complete_count
+                # New (need resolution) = Full Send items in Current List missing title or URL (regardless of History).
+                # Previously this only counted incomplete items that were also in History, so it showed 0 when History was empty.
+                new_items_count = 0
+                for sku_lower in current_list_full_send_skus:
+                    data = current_list_all_data.get(sku_lower, {})
+                    title = str(data.get("title", "") or "").strip()
+                    url = str(data.get("url", "") or "").strip()
+                    if not title or not url:
+                        new_items_count += 1
         except Exception as e:
             # Best-effort counting: log error but continue with zero counts
             try:
@@ -1685,6 +1694,7 @@ class RSForwarderBot:
                 ("Full-Send-Current-List", f"SKU `{current_list_raw_count}` (raw)", True),
                 ("Full Send channel", f"`{full_send_count}`", True),
                 ("Others", f"`{others_count}`", True),
+                ("To sync (store+sku)", f"`{full_send_with_store_sku}`", True),
                 ("Matched SKU (Current ∩ History)", f"`{matched_skus_count}`", True),
                 ("Matched SKU Complete (Title+URL)", f"`{matched_complete_count}`", True),
                 ("New (need resolution)", f"`{new_items_count}`", True),
@@ -5782,8 +5792,10 @@ class RSForwarderBot:
                             if mtag:
                                 store = self._rsfs_monitor_tag_to_store(mtag)
                         sku = str(row[2] or "").strip()
-                        if not (store and sku):
+                        if not sku:
                             continue
+                        if not store:
+                            store = "unknown"
                         sku_lower = sku.lower()
                         title = str(row[6] or "").strip() if len(row) > 6 else ""
                         url = str(row[7] or "").strip() if len(row) > 7 else ""
@@ -6321,9 +6333,12 @@ class RSForwarderBot:
                                 if mtag:
                                     store = self._rsfs_monitor_tag_to_store(mtag)
                             sku = str(row[2] or "").strip()
-                            if not (store and sku):
+                            if not sku:
                                 skipped_no_store_sku += 1
                                 continue
+                            # Include every Full Send row that has a SKU; use "unknown" store when blank so all 78 sync
+                            if not store:
+                                store = "unknown"
                             key = self._rsfs_key_store_sku(store, sku)
                             if key in resolved_by_key:
                                 res = resolved_by_key[key]
