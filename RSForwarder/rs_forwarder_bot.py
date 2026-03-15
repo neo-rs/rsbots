@@ -6406,7 +6406,7 @@ class RSForwarderBot:
                             if len(row) < 5:
                                 continue
                             store, sku, title, aff, url = row[0], row[1], row[2], row[3], row[4]
-                            key = f"{(store or "").strip().lower()}|{(sku or "").strip().lower()}"
+                            key = f"{(store or '').strip().lower()}|{(sku or '').strip().lower()}"
                             if not key or key == "|":
                                 continue
                             existing = seen_key_to_row.get(key)
