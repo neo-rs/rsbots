@@ -1211,6 +1211,35 @@ class RSForwarderBot:
         return f"{str(store or '').strip().lower()}|{str(sku or '').strip().lower()}"
 
     @staticmethod
+    def _rsfs_monitor_tag_to_store(mtag: str) -> str:
+        """
+        Derive a store name from Monitor Tag when Store column is blank.
+        Used so rows with tags like scheels, five-below, boxlunch-hottopic can sync to Live List.
+        """
+        m = str(mtag or "").strip().lower()
+        if not m:
+            return ""
+        if m.endswith("-monitor"):
+            base = m[: -len("-monitor")]
+            if base == "bestbuy":
+                return "Bestbuy"
+            if base in ("target", "walmart", "amazon", "topps", "costco"):
+                return base.title()
+            return base.replace("-", " ").title()
+        known = {
+            "five-below": "Five Below",
+            "scheels": "Scheels",
+            "boxlunch-hottopic": "BoxLunch",
+            "crunchy-roll": "Crunchyroll",
+            "shopify-unfiltered": "Shopify",
+            "walgreens": "Walgreens",
+            "bestbuy": "Bestbuy",
+        }
+        if m in known:
+            return known[m]
+        return m.replace("-", " ").title()
+
+    @staticmethod
     def _rsfs_title_is_bad(title: str, *, url: str = "") -> bool:
         """
         Detect cached "titles" that are actually URLs or generic placeholders.
@@ -1433,6 +1462,10 @@ class RSForwarderBot:
             if "full-send" not in full_send_lower and "💶┃full-send-🤖" not in full_send:
                 continue
             store = str(row[1] or "").strip()
+            if not store and len(row) > 3:
+                mtag = str(row[3] or "").strip()
+                if mtag:
+                    store = self._rsfs_monitor_tag_to_store(mtag)
             sku = str(row[2] or "").strip()
             if not (store and sku):
                 continue
@@ -6370,6 +6403,10 @@ class RSForwarderBot:
                                 continue
                             full_send_total += 1
                             store = str(row[1] or "").strip()
+                            if not store and len(row) > 3:
+                                mtag = str(row[3] or "").strip()
+                                if mtag:
+                                    store = self._rsfs_monitor_tag_to_store(mtag)
                             sku = str(row[2] or "").strip()
                             if not (store and sku):
                                 skipped_no_store_sku += 1
