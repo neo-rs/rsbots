@@ -6587,22 +6587,25 @@ class RSForwarderBot:
                             pass
                         
                         # Always use embed format (never fallback to plain text)
+                        # Discord embed total limit 6000; cap change items to avoid 50035
                         summ = discord.Embed(title="RS-FS Sheet Sync (mirror)", color=discord.Color.green())
                         
                         # Sheet changes - always show (even if zeros)
                         changes_text = f"added `{added}`\nupdated `{updated}`\nremoved `{deleted}`"
                         summ.add_field(name="Sheet changes", value=changes_text, inline=True)
                         
-                        # Show detailed list of ALL changes (title/url → SKU)
+                        # Show detailed list of changes (title/url → SKU); cap items to stay under Discord 6000 embed limit
+                        _MAX_CHANGE_ITEMS = 18  # keeps embed under ~5500 with other fields
                         if changes_list:
-                            changes_detail = []
-                            # Show all changes, split into multiple fields if needed (Discord embed field limit is 1024 chars)
                             current_field_content = []
                             current_field_length = 0
                             field_count = 0
-                            max_field_length = 1000  # Leave room for "... and X more"
-                            
-                            for sku, store, title, url in changes_list:
+                            max_field_length = 950
+                            for idx, (sku, store, title, url) in enumerate(changes_list):
+                                if idx >= _MAX_CHANGE_ITEMS:
+                                    excess = len(changes_list) - _MAX_CHANGE_ITEMS
+                                    current_field_content.append(f"… and {excess} more change(s)")
+                                    break
                                 # Filter out URLs being used as titles
                                 if title and self._rsfs_title_is_bad(title, url=url):
                                     title = ""
@@ -6619,7 +6622,6 @@ class RSForwarderBot:
                                     item_text = f"`{store} {sku}`"
                                 
                                 item_length = len(item_text) + 2  # +2 for "\n\n"
-                                
                                 # If adding this item would exceed field limit, finalize current field and start new one
                                 if current_field_length + item_length > max_field_length and current_field_content:
                                     field_text = "\n\n".join(current_field_content)
