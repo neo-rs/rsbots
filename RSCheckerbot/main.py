@@ -3338,6 +3338,14 @@ try:
 except Exception:
     CID_TTL_MINUTES = 10.0
 VERBOSE_ROLE_LISTS = bool(LOG_CONTROLS.get("verbose_role_lists", False))
+try:
+    ROLE_AUDIT_CHANNEL_ID = int(LOG_CONTROLS.get("role_audit_channel_id") or 0)
+except Exception:
+    ROLE_AUDIT_CHANNEL_ID = 0
+try:
+    ONBOARDING_LOGS_CHANNEL_ID = int(LOG_CONTROLS.get("onboarding_logs_channel_id") or 0)
+except Exception:
+    ONBOARDING_LOGS_CHANNEL_ID = 0
 
 # Channel limits monitor (posts counts/warnings on channel create/delete + staff slash command).
 CHANNEL_LIMITS_CONFIG = config.get("channel_limits", {}) if isinstance(config, dict) else {}
@@ -5639,6 +5647,97 @@ async def log_other(msg: str | None = None, *, embed: discord.Embed | None = Non
 
 async def log_role_event(message: str | None = None, *, embed: discord.Embed | None = None):
     await log_other(message, embed=embed)
+
+
+def _find_onboarding_ticket_channel(member: discord.Member) -> discord.TextChannel | None:
+    """Find RSOnboarding ticket channel for this member (e.g. #welcome-username)."""
+    if not member.guild:
+        return None
+    want = "welcome"
+    name_lower = (getattr(member, "name", "") or "").lower()
+    display_lower = (getattr(member, "display_name", "") or "").lower().replace(" ", "")
+    for ch in member.guild.text_channels:
+        if not isinstance(ch, discord.TextChannel):
+            continue
+        cn = (ch.name or "").lower()
+        if want not in cn:
+            continue
+        cn_clean = "".join(c for c in cn if c.isalnum() or c in "-_")
+        if name_lower and name_lower in cn_clean:
+            return ch
+        if display_lower and display_lower in cn_clean:
+            return ch
+    return None
+
+
+async def log_role_audit(
+    after: discord.Member,
+    roles_added: set,
+    roles_removed: set,
+) -> None:
+    """Log every Discord role add/remove to discord-role-logs. Highlights Welcome role; links onboarding ticket when found."""
+    if not ROLE_AUDIT_CHANNEL_ID or (not roles_added and not roles_removed):
+        return
+    ch = bot.get_channel(ROLE_AUDIT_CHANNEL_ID)
+    if not ch or not isinstance(ch, discord.TextChannel):
+        return
+    guild = after.guild
+    welcome_id = int(WELCOME_ROLE_ID or 0)
+
+    def _role_label(rid: int, highlight: bool) -> str:
+        role = guild.get_role(rid) if guild else None
+        name = role.name if role else str(rid)
+        if highlight and rid == welcome_id:
+            return f"**👋 {name}**"
+        return name
+
+    added_names = [_role_label(int(rid), True) for rid in sorted(roles_added)]
+    removed_names = [_role_label(int(rid), True) for rid in sorted(roles_removed)]
+    added_str = ", ".join(added_names) if added_names else "—"
+    removed_str = ", ".join(removed_names) if removed_names else "—"
+
+    welcome_in_added = welcome_id in roles_added
+    welcome_in_removed = welcome_id in roles_removed
+    if welcome_in_added:
+        color = 0x57F287
+    elif welcome_in_removed:
+        color = 0xED4245
+    else:
+        color = 0x5865F2
+
+    desc = f"{after.mention} — roles updated"
+    e = _make_dyno_embed(
+        member=after,
+        description=desc,
+        footer=f"ID: {after.id} • CID: {_cid_for(after.id)}",
+        color=color,
+    )
+    e.add_field(name="Added", value=added_str[:1024] or "—", inline=False)
+    e.add_field(name="Removed", value=removed_str[:1024] or "—", inline=False)
+    if welcome_in_added or welcome_in_removed:
+        e.add_field(
+            name="👋 Welcome role",
+            value="Added" if welcome_in_added else "Removed",
+            inline=True,
+        )
+    ticket_ch = _find_onboarding_ticket_channel(after)
+    if ticket_ch:
+        e.add_field(
+            name="Onboarding ticket",
+            value=f"[Jump to {ticket_ch.name}](https://discord.com/channels/{guild.id}/{ticket_ch.id})",
+            inline=False,
+        )
+    elif ONBOARDING_LOGS_CHANNEL_ID:
+        ob_ch = bot.get_channel(ONBOARDING_LOGS_CHANNEL_ID)
+        if ob_ch:
+            e.add_field(
+                name="Onboarding",
+                value=f"Correlate by ID in [#{getattr(ob_ch, 'name', 'onboarding-logs')}](https://discord.com/channels/{guild.id}/{ob_ch.id})",
+                inline=False,
+            )
+    with suppress(Exception):
+        await ch.send(embed=e, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+
 
 async def log_whop(msg: str):
     """Log to Whop logs channel (for subscription data from Whop system)"""
@@ -9579,6 +9678,10 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     # Detect all role changes (added and removed)
     roles_added = after_roles - before_roles
     roles_removed = before_roles - after_roles
+
+    # Raw role audit: every add/remove to discord-role-logs (no batching, no suppress)
+    if roles_added or roles_removed:
+        asyncio.create_task(log_role_audit(after, roles_added, roles_removed))
 
     # When Welcome role is added, log to join-logs (canonical channel 1144408172757536768) so it appears there.
     if (
