@@ -1667,15 +1667,18 @@ class RSForwarderBot:
                         complete_skus.add(sku_lower)
                 matched_complete_count = len(complete_skus)
                 
-                # New (need resolution) = Full Send items in Current List missing title or URL (regardless of History).
-                # Previously this only counted incomplete items that were also in History, so it showed 0 when History was empty.
-                new_items_count = 0
-                for sku_lower in current_list_full_send_skus:
-                    data = current_list_all_data.get(sku_lower, {})
-                    title = str(data.get("title", "") or "").strip()
-                    url = str(data.get("url", "") or "").strip()
-                    if not title or not url:
-                        new_items_count += 1
+                # New (need resolution): when Live List and History are both blank, treat as fresh start — resolve everything (New = Full Send count).
+                # Otherwise count Full Send items that are missing title or URL in Current List.
+                if live_list_raw_count == 0 and history_raw_count == 0:
+                    new_items_count = full_send_count
+                else:
+                    new_items_count = 0
+                    for sku_lower in current_list_full_send_skus:
+                        data = current_list_all_data.get(sku_lower, {})
+                        title = str(data.get("title", "") or "").strip()
+                        url = str(data.get("url", "") or "").strip()
+                        if not title or not url:
+                            new_items_count += 1
         except Exception as e:
             # Best-effort counting: log error but continue with zero counts
             try:
@@ -1768,29 +1771,6 @@ class RSForwarderBot:
         missing = sorted([k for k in unique_skus if k not in existing_set]) if existing_set else []
         extra = sorted([k for k in existing_set if k not in unique_skus]) if existing_set else []
 
-        # Detect "bad" titles already in the sheet (URL-as-title / placeholders).
-        bad_titles: List[Tuple[int, str, str, str]] = []  # (rid, store, sku_lower, title)
-        try:
-            abc_map: Dict[str, Dict[str, str]] = {}
-            if ok and getattr(self, "_rs_fs_sheet", None):
-                abc_map = await self._rs_fs_sheet.fetch_sheet_abc_map()  # type: ignore[attr-defined]
-            for sku_l in sorted(list(unique_skus)):
-                rec = (abc_map or {}).get(sku_l) or {}
-                title0 = str(rec.get("title") or "").strip()
-                store0 = str(rec.get("store") or "").strip() or str(sku_to_store.get(sku_l) or "").strip()
-                sku0 = str(rec.get("sku") or "").strip() or sku_l
-                url0 = ""
-                try:
-                    if store0 and sku0:
-                        url0 = rs_fs_sheet_sync.build_store_link(store0, sku0)
-                except Exception:
-                    url0 = ""
-                if self._rsfs_title_is_bad(title0, url=url0):
-                    rid0 = int(sku_to_rid.get(sku_l) or 0)
-                    bad_titles.append((rid0, store0 or "?", sku_l, title0))
-        except Exception:
-            bad_titles = []
-
         emb.add_field(
             name="Latest /listreleases",
             value="\n".join(
@@ -1805,15 +1785,7 @@ class RSForwarderBot:
             inline=False,
         )
 
-        # Filter non-SKU and unknown-store items by Full Send tag, and only show those NOT in Live List
-        # Check Current List to see which items are actually there (they might be synced to Live List)
-        why_lines: List[str] = []
-        cmd_lines: List[str] = []
-        required_monitor_tag = "💶┃full-send-🤖"
-        
-        # Get Current List rows to check which items are actually there
-        current_list_skus: Set[str] = set()
-        current_list_rids: Set[int] = set()
+        # Current List SKU -> release ID (for "In sheet but not in latest list")
         current_list_rid_by_sku: Dict[str, int] = {}
         try:
             if ok and getattr(self, "_rs_fs_sheet", None):
@@ -1823,65 +1795,16 @@ class RSForwarderBot:
                         if str(row[0] or "").strip().lower() == "release id":
                             continue
                         sku_check = str(row[2] or "").strip().lower()
-                        if sku_check:
-                            current_list_skus.add(sku_check)
                         rid_check_str = str(row[0] or "").strip()
                         try:
                             rid_check = int(rid_check_str) if rid_check_str else 0
-                            if rid_check > 0:
-                                current_list_rids.add(rid_check)
-                                if sku_check:
-                                    current_list_rid_by_sku[sku_check] = rid_check
+                            if rid_check > 0 and sku_check:
+                                current_list_rid_by_sku[sku_check] = rid_check
                         except Exception:
                             pass
         except Exception:
             pass
-        
-        # Only show items that:
-        # 1. Have Full Send tag in raw_text
-        # 2. Are NOT in the Live List (missing from existing_set for SKUs, or not found for non-SKUs)
-        filtered_non_sku = []
-        filtered_unknown_store = []
-        for r in non_sku_recs:
-            raw_text = str(getattr(r, "raw_text", "") or "").strip()
-            raw_text_lower = raw_text.lower()
-            if "full-send" in raw_text_lower or "full send" in raw_text_lower or required_monitor_tag in raw_text:
-                rid = int(getattr(r, "release_id", 0) or 0)
-                # Check if this release ID is in Current List (meaning it might be synced to Live List)
-                if rid not in current_list_rids:
-                    filtered_non_sku.append(r)
-        
-        for r in sku_unknown_store_recs:
-            raw_text = str(getattr(r, "raw_text", "") or "").strip()
-            raw_text_lower = raw_text.lower()
-            if "full-send" in raw_text_lower or "full send" in raw_text_lower or required_monitor_tag in raw_text:
-                sk = str(getattr(r, "sku", "") or "").strip().lower()
-                # Check if this SKU is in Live List
-                if sk not in existing_set:
-                    filtered_unknown_store.append(r)
-        
-        for r in (filtered_unknown_store[:6] + filtered_non_sku[:6]):
-            rid = int(getattr(r, "release_id", 0) or 0)
-            sk = str(getattr(r, "sku", "") or "").strip()
-            st = str(getattr(r, "store", "") or "").strip()
-            is_sku = bool(getattr(r, "is_sku_candidate", True))
-            kind = "non-SKU" if not is_sku else "unknown-store"
-            store_display = st if st else "unknown"
-            # Format: rid kind store_display sku (no backticks), command directly below
-            info_line = f"{rid} {kind} {store_display} {sk}"
-            if rid:
-                info_line += f"\n/removereleaseid release_id: {rid}"
-                cmd_lines.append(f"/removereleaseid release_id: {rid}")
-            why_lines.append(info_line)
-        if why_lines:
-            why_val = "\n\n".join(why_lines).strip()
-            if cmd_lines:
-                why_val = (why_val + "\n\nCommands (copy):\n" + "\n".join(cmd_lines)).strip()
-            emb.add_field(
-                name="Why some items aren’t in the public sheet",
-                value=why_val,
-                inline=False,
-            )
+
         if missing:
             sample = []
             for k in missing[:12]:
@@ -1914,20 +1837,6 @@ class RSForwarderBot:
             emb.add_field(
                 name="In sheet but not in latest list",
                 value=val_extra,
-                inline=False,
-            )
-
-        if bad_titles:
-            # Keep this field short; this is a "diagnostic" list.
-            lines: List[str] = []
-            for rid0, store0, sku_l, title0 in bad_titles[:10]:
-                t = (title0 or "").replace("\n", " ").strip()
-                if len(t) > 60:
-                    t = t[:57] + "..."
-                lines.append(f"- `{rid0}` `{store0}` `{sku_l}` — {t if t else '(blank)'}")
-            emb.add_field(
-                name="Bad titles in sheet (will be re-resolved)",
-                value=f"`{len(bad_titles)}`\n" + "\n".join(lines),
                 inline=False,
             )
 
@@ -5767,11 +5676,29 @@ class RSForwarderBot:
                         await ctx.send("❌ Could not fetch rows from Current List tab.")
                         return
                     
+                    # When Live List and History are both blank, resolve everything (fresh start). Otherwise only rows missing title/URL or bad title.
+                    live_empty = False
+                    history_empty = False
+                    try:
+                        if getattr(self, "_rs_fs_sheet", None):
+                            live_rows = await self._rs_fs_sheet.fetch_live_list_rows()
+                            live_empty = not any(
+                                str((r or [])[1] or "").strip() and str((r or [])[1] or "").strip().lower() != "sku-upc"
+                                for r in (live_rows or []) if len(r) >= 2
+                            )
+                            hist_rows = await self._rs_fs_sheet.fetch_history_rows()
+                            history_empty = not any(
+                                str((r or [])[1] or "").strip() and str((r or [])[1] or "").strip().lower() != "sku"
+                                for r in (hist_rows or []) if len(r) >= 2
+                            )
+                    except Exception:
+                        pass
+                    fresh_start = live_empty and history_empty
+                    
                     # Extract store+sku pairs from Current List that need resolution:
                     # - Full Send items with store+SKU (parseable)
-                    # - Missing title or URL, or have bad title (URL-as-title, blank, etc.)
+                    # - When fresh_start (Live + History blank): include every Full Send row. Otherwise: only missing title/URL or bad title.
                     # Current List columns: Release ID (0), Store (1), SKU/Label (2), Monitor Tag (3), Category (4), Channel ID (5), Resolved Title (6), Resolved URL (7), Affiliate URL (8), Status (9), Remove Command (10), Last Seen (11), Full Send (12)
-                    # Filter by "Full Send" column contains "full-send"
                     pairs: List[Tuple[str, str]] = []
                     rid_by_key: Dict[str, int] = {}
                     for row in current_list_rows:
@@ -5796,12 +5723,10 @@ class RSForwarderBot:
                             continue
                         if not store:
                             store = "unknown"
-                        sku_lower = sku.lower()
                         title = str(row[6] or "").strip() if len(row) > 6 else ""
                         url = str(row[7] or "").strip() if len(row) > 7 else ""
-                        # Include if missing title, missing URL, or has bad title (URL-as-title, blank, etc.)
                         needs_resolution = (not title or not url) or self._rsfs_title_is_bad(title, url=url)
-                        if needs_resolution:
+                        if fresh_start or needs_resolution:
                             pairs.append((store, sku))
                             try:
                                 rid = int(rid_str) if rid_str else 0
