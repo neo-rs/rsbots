@@ -1011,6 +1011,40 @@ class RsFsSheetSync:
 
         return await asyncio.to_thread(_do)
 
+    async def _fetch_existing_store_sku_row_map(self) -> Dict[str, int]:
+        """
+        Return mapping: (store_lower + "|" + sku_lower) -> 1-based row index (columns A and B).
+        Header row and blanks are ignored. Used to update existing rows by store+sku and avoid duplicates.
+        """
+        if not self.enabled():
+            return {}
+        tab = await self._resolve_tab_name()
+        service = self._get_service()
+        if not (service and tab and self._sheet_cfg.spreadsheet_id):
+            return {}
+
+        rng = f"'{tab}'!A:B"
+
+        def _do() -> Dict[str, int]:
+            resp = service.spreadsheets().values().get(spreadsheetId=self._sheet_cfg.spreadsheet_id, range=rng).execute()
+            values = resp.get("values") if isinstance(resp, dict) else None
+            out: Dict[str, int] = {}
+            if isinstance(values, list):
+                for i, row in enumerate(values, start=1):
+                    if not isinstance(row, list) or len(row) < 2:
+                        continue
+                    store = str(row[0] or "").strip()
+                    sku = str(row[1] or "").strip()
+                    if not sku:
+                        continue
+                    if sku.lower() == "sku-upc":
+                        continue
+                    key = f"{store.lower()}|{sku.lower()}"
+                    out[key] = i
+            return out
+
+        return await asyncio.to_thread(_do)
+
     async def fetch_sheet_abc_map(self) -> Dict[str, Dict[str, str]]:
         """
         Fetch the public sheet tab A:C (store, sku, title) into a dict:
@@ -1125,10 +1159,11 @@ class RsFsSheetSync:
     async def sync_rows_mirror(self, rows: Sequence[Sequence[str]]) -> Tuple[bool, str, int, int, int]:
         """
         Mirror-mode sync:
-        - Update A/B/C + G/H for existing SKUs (by column B match)
-        - Append missing SKUs
-        - Delete rows for SKUs no longer present in `rows`
+        - Update A/B/C + G/H for existing rows (by store+sku, columns A and B)
+        - Append missing (store, sku)
+        - Delete rows no longer present in `rows`
 
+        Keyed by store+sku to avoid duplicate rows for the same product when SKU strings differ.
         Returns: (ok, message, added_count, updated_count, deleted_count)
         """
         if not self.enabled():
@@ -1143,9 +1178,9 @@ class RsFsSheetSync:
         if not tab:
             return False, "missing tab name/gid", 0, 0, 0
 
-        # Current sheet rows keyed by SKU (column B)
+        # Existing sheet rows keyed by store|sku (columns A and B)
         async with self._api_lock:
-            existing = await self._fetch_existing_sku_row_map()
+            existing = await self._fetch_existing_store_sku_row_map()
 
         desired_keys: Set[str] = set()
         to_update: List[Tuple[int, List[str], List[str]]] = []
@@ -1160,14 +1195,13 @@ class RsFsSheetSync:
             mon = (row[4] if len(row) > 4 else "").strip()
             if not (store and sku_raw):
                 continue
-            key = sku_raw.lower()
+            key = f"{store.lower()}|{sku_raw.lower()}"
             desired_keys.add(key)
             abc = [store, sku_raw, title]
             gh = [aff, mon]
             if key in existing:
                 to_update.append((int(existing[key]), abc, gh))
             else:
-                # append_rows expects [A,B,C, G, H]
                 to_add.append([store, sku_raw, title, aff, mon])
 
         # Update existing rows in batch (A:C and G:H), without touching D/E/F.
@@ -1198,8 +1232,8 @@ class RsFsSheetSync:
         if not ok_add:
             return False, msg_add, 0, updated_count, 0
 
-        # Delete stale SKUs (rows present in sheet but not in desired list)
-        stale_rows = [row_i for (sku, row_i) in (existing or {}).items() if sku not in desired_keys]
+        # Delete stale rows (present in sheet but not in desired store|sku set)
+        stale_rows = [row_i for (k, row_i) in (existing or {}).items() if k not in desired_keys]
         async with self._api_lock:
             deleted_count = await self._delete_rows_by_indices(stale_rows)
 

@@ -9896,6 +9896,15 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                             do_remove = True  # Confirmed at or below threshold; safe to remove
                             spent_display = (fresh_brief.get("total_spent") or "").strip() or f"${fresh_spent:.2f}"
                             mid_used = mid
+                        # Persist API total_spent (and other brief fields) so member_history stays correct
+                        with suppress(Exception):
+                            record_member_whop_summary(
+                                after.id,
+                                fresh_brief,
+                                event_type="repeat_trial_refresh",
+                                membership_id=str(mid or "").strip(),
+                                whop_key=str(mid or "").strip(),
+                            )
             except Exception:
                 pass
             if do_remove:

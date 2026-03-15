@@ -6400,17 +6400,73 @@ class RSForwarderBot:
                                     except Exception:
                                         pass
                         
-                        # Track changes: get current Live List state before sync
+                        # Dedupe by store|sku so we don't add duplicate Live List rows for the same product (Fix: one row per store+sku)
+                        seen_key_to_row: Dict[str, List[str]] = {}
+                        for row in all_rows:
+                            if len(row) < 5:
+                                continue
+                            store, sku, title, aff, url = row[0], row[1], row[2], row[3], row[4]
+                            key = f"{(store or "").strip().lower()}|{(sku or "").strip().lower()}"
+                            if not key or key == "|":
+                                continue
+                            existing = seen_key_to_row.get(key)
+                            # Prefer row that has title or URL over one that doesn't
+                            if existing is None or ((title or url) and not (existing[2] or existing[4])):
+                                seen_key_to_row[key] = [store, sku, title, aff, url]
+                        all_rows = list(seen_key_to_row.values())
+                        
+                        # Write Current List and History BEFORE sync so Current List is source of truth (Fix: Step 2 updates Current List; Finish won't overwrite Live List with stale data)
+                        try:
+                            now_iso = rs_fs_sheet_sync.RsFsSheetSync._utc_now_iso()  # type: ignore[attr-defined]
+                        except Exception:
+                            now_iso = ""
+                        history_rows = []
+                        for e in (entries or []):
+                            st0 = str(getattr(e, "store", "") or "").strip()
+                            sk0 = str(getattr(e, "sku", "") or "").strip()
+                            if not (st0 and sk0):
+                                continue
+                            k0 = self._rsfs_key_store_sku(st0, sk0)
+                            u0 = str(getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
+                            t0 = str(getattr(e, "title", "") or "").strip()
+                            a0 = str(getattr(e, "affiliate_url", "") or "").strip()
+                            src0 = str(getattr(e, "source", "") or "").strip()
+                            try:
+                                rid0 = int(rid_by_key.get(self._rs_fs_override_key(st0, sk0)) or 0)
+                            except Exception:
+                                rid0 = 0
+                            if k0 in resolved_by_key:
+                                resolved_by_key[k0]["last_release_id"] = str(rid0 or "")
+                            history_rows.append([st0, sk0, t0, u0, a0, "", now_iso, str(rid0 or ""), src0])
+                        if history_rows:
+                            try:
+                                ok_h, msg_h, added_h, updated_h = await self._rs_fs_sheet.upsert_history_rows(history_rows)
+                                try:
+                                    print(
+                                        f"{Colors.CYAN}[RS-FS History]{Colors.RESET} upsert ok={ok_h} added={added_h} updated={updated_h} msg={msg_h}"
+                                    )
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                        try:
+                            await self._rsfs_write_current_list(merged_text, resolved_by_key=resolved_by_key, reason="rsfsrun-end")
+                        except Exception:
+                            pass
+                        
+                        # Track changes: get current Live List state before sync (key by store|sku to match sync)
                         try:
                             live_before = await self._rs_fs_sheet.fetch_live_list_rows()
-                            live_before_map: Dict[str, Tuple[str, str]] = {}  # sku_lower -> (title, url)
+                            live_before_map: Dict[str, Tuple[str, str]] = {}  # store|sku -> (title, url)
                             for row in live_before:
                                 if len(row) >= 3:
+                                    store = str(row[0] or "").strip()
                                     sku = str(row[1] or "").strip()
                                     title = str(row[2] or "").strip() if len(row) > 2 else ""
                                     url = str(row[3] or "").strip() if len(row) > 3 else ""
                                     if sku:
-                                        live_before_map[sku.lower()] = (title, url)
+                                        key = f"{store.lower()}|{sku.lower()}"
+                                        live_before_map[key] = (title, url)
                         except Exception:
                             live_before_map = {}
                         
@@ -6418,10 +6474,10 @@ class RSForwarderBot:
                         if all_rows:
                             ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(all_rows)
                             
-                            # Track what was added/updated
+                            # Track what was added/updated (key by store|sku to match sync)
                             for store, sku, title, aff, url in all_rows:
-                                sku_lower = sku.lower()
-                                prev_title, prev_url = live_before_map.get(sku_lower, ("", ""))
+                                key = f"{store.lower()}|{sku.lower()}"
+                                prev_title, prev_url = live_before_map.get(key, ("", ""))
                                 # Track if title or URL was added/updated
                                 if (title and title != prev_title) or (url and url != prev_url):
                                     changes_list.append((sku, store, title, url))
@@ -6442,48 +6498,6 @@ class RSForwarderBot:
                             u = str(getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
                             if st and sk and (t or u):
                                 changes_list.append((sk, st, t, u))
-
-                    # Write back to History cache + update Current List with resolved columns.
-                    try:
-                        now_iso = rs_fs_sheet_sync.RsFsSheetSync._utc_now_iso()  # type: ignore[attr-defined]
-                    except Exception:
-                        now_iso = ""
-                    # Build history rows and update resolved_by_key with release IDs
-                    history_rows: List[List[str]] = []
-                    for e in (entries or []):
-                        st0 = str(getattr(e, "store", "") or "").strip()
-                        sk0 = str(getattr(e, "sku", "") or "").strip()
-                        if not (st0 and sk0):
-                            continue
-                        k0 = self._rsfs_key_store_sku(st0, sk0)
-                        u0 = str(getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
-                        t0 = str(getattr(e, "title", "") or "").strip()
-                        a0 = str(getattr(e, "affiliate_url", "") or "").strip()
-                        src0 = str(getattr(e, "source", "") or "").strip()
-                        try:
-                            rid0 = int(rid_by_key.get(self._rs_fs_override_key(st0, sk0)) or 0)
-                        except Exception:
-                            rid0 = 0
-                        # Update resolved_by_key with release ID (it was already created earlier)
-                        if k0 in resolved_by_key:
-                            resolved_by_key[k0]["last_release_id"] = str(rid0 or "")
-                        history_rows.append([st0, sk0, t0, u0, a0, "", now_iso, str(rid0 or ""), src0])
-
-                    if history_rows:
-                        try:
-                            ok_h, msg_h, added_h, updated_h = await self._rs_fs_sheet.upsert_history_rows(history_rows)
-                            try:
-                                print(
-                                    f"{Colors.CYAN}[RS-FS History]{Colors.RESET} upsert ok={ok_h} added={added_h} updated={updated_h} msg={msg_h}"
-                                )
-                            except Exception:
-                                pass
-                        except Exception:
-                            pass
-                    try:
-                        await self._rsfs_write_current_list(merged_text, resolved_by_key=resolved_by_key, reason="rsfsrun-end")
-                    except Exception:
-                        pass
 
                     if ok:
                         # Summary embed - always show detailed changes

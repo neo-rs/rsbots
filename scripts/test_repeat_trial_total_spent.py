@@ -1,12 +1,14 @@
 """
-Test that total_spent used by the repeat-trial guard is correctly fetched from the Whop API.
+Test that total_spent used by the repeat-trial guard is correctly fetched from the Whop API,
+and that the "had trial before" check reads the right fields from member_history.
 
 Usage (from repo root):
   python scripts/test_repeat_trial_total_spent.py --membership-id mem_xxxx
   python scripts/test_repeat_trial_total_spent.py --discord-id 731728830108270643
+  python scripts/test_repeat_trial_total_spent.py --check-had-trial-before --discord-id 731728830108270643
 
-Uses the same path as the guard: fetch_whop_brief -> brief["total_spent"] -> usd_amount(brief["total_spent"]).
-Prints the result and, with --verbose, the raw member record keys related to spend.
+--check-had-trial-before: Same logic as main._is_repeat_trial_no_payment (member_history + config).
+  Prints ever_trialing, ever_had_trial_days, last_summary.total_spent, and whether guard would fire.
 """
 import argparse
 import asyncio
@@ -77,6 +79,81 @@ def membership_id_from_history(discord_id: int) -> str:
         if str(x).startswith("R-"):
             return str(x)
     return cands[0] if cands else ""
+
+
+def load_member_history() -> dict:
+    """Load member_history.json (same file main uses)."""
+    mh_path = RSC_DIR / "member_history.json"
+    if not mh_path.exists():
+        return {}
+    try:
+        with open(mh_path, encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def is_repeat_trial_no_payment(discord_id: int, cfg: dict) -> bool:
+    """
+    Same logic as main._is_repeat_trial_no_payment (no bot/discord deps).
+    True => guard would remove Member role (had trial before + spend <= threshold).
+    """
+    from rschecker_utils import usd_amount
+    try:
+        guard = (cfg.get("whop_api") or {}).get("repeat_trial_guard") or {}
+        if not isinstance(guard, dict) or not guard.get("enabled", False):
+            return False
+        max_spent = float(guard.get("max_total_spent_usd", 0) or 0)
+    except Exception:
+        return False
+    db = load_member_history()
+    hist = db.get(str(discord_id), {}) if isinstance(db, dict) else {}
+    wh = hist.get("whop") if isinstance(hist.get("whop"), dict) else {}
+    if not wh.get("ever_trialing") and not wh.get("ever_had_trial_days"):
+        return False
+    last = wh.get("last_summary") if isinstance(wh.get("last_summary"), dict) else {}
+    spent_raw = str(last.get("total_spent") or "").strip()
+    spent = float(usd_amount(spent_raw)) if spent_raw else 0.0
+    return spent <= max_spent
+
+
+def run_check_had_trial_before(discord_id: int) -> int:
+    """Print what main reads for 'had trial before' and whether guard would fire."""
+    cfg = load_config()
+    db = load_member_history()
+    hist = db.get(str(discord_id), {}) if isinstance(db, dict) else {}
+    wh = hist.get("whop") if isinstance(hist.get("whop"), dict) else {}
+    last = wh.get("last_summary") if isinstance(wh.get("last_summary"), dict) else {}
+
+    print(f"Discord ID: {discord_id}")
+    print(f"In member_history: {'yes' if hist else 'no'}")
+    if not hist:
+        print("(No record -> guard treats as no prior trial; would NOT remove.)")
+        return 0
+    print()
+    print("--- Same fields main._is_repeat_trial_no_payment reads ---")
+    ever_trialing = wh.get("ever_trialing")
+    ever_had_trial_days = wh.get("ever_had_trial_days")
+    print(f"  ever_trialing:          {ever_trialing!r}")
+    print(f"  ever_had_trial_days:    {ever_had_trial_days!r}")
+    had_trial_before = bool(ever_trialing or ever_had_trial_days)
+    print(f"  => 'Had trial before':  {had_trial_before}")
+    print()
+    spent_raw = str(last.get("total_spent") or "").strip()
+    print(f"  last_summary.total_spent: {spent_raw!r}")
+    guard = (cfg.get("whop_api") or {}).get("repeat_trial_guard") or {}
+    max_spent = float(guard.get("max_total_spent_usd", 0) or 0)
+    from rschecker_utils import usd_amount
+    spent = float(usd_amount(spent_raw)) if spent_raw else 0.0
+    print(f"  repeat_trial_guard.max_total_spent_usd: {max_spent}")
+    print(f"  parsed spend (from history): {spent}")
+    print()
+    would_fire = is_repeat_trial_no_payment(discord_id, cfg)
+    print(f"Would guard REMOVE Member role? {would_fire}  (True = repeat trial blocked)")
+    print()
+    if not had_trial_before:
+        print("First-time trial: ever_trialing and ever_had_trial_days both falsy → guard does NOT run.")
+    return 0
 
 
 async def run(membership_id: str, verbose: bool) -> int:
@@ -169,8 +246,15 @@ def main():
     ap = argparse.ArgumentParser(description="Test total_spent used by repeat-trial guard")
     ap.add_argument("--membership-id", type=str, help="Whop membership ID (mem_... or R-...)")
     ap.add_argument("--discord-id", type=int, help="Discord user ID (look up membership_id from member_history)")
+    ap.add_argument("--check-had-trial-before", action="store_true", help="Test 'had trial before' from member_history (same logic as main)")
     ap.add_argument("--verbose", "-v", action="store_true", help="Print raw API member record spend keys")
     args = ap.parse_args()
+
+    if args.check_had_trial_before:
+        if args.discord_id is None:
+            print("ERROR: --check-had-trial-before requires --discord-id", file=sys.stderr)
+            return 1
+        return run_check_had_trial_before(args.discord_id)
 
     mid = (args.membership_id or "").strip()
     if args.discord_id:
