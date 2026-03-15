@@ -1,0 +1,24 @@
+{
+  "guild_id": "YOUR_GUILD_ID",
+  "allowed_launcher_role_ids": [
+    "ROLE_ID_1",
+    "ROLE_ID_2"
+  ],
+  "log_channel_id": "LOG_CHANNEL_ID",
+  "embed_color": 5814783,
+  "default_batch_size": 5,
+  "default_batch_interval_minutes": 5,
+  "default_banner_url": "https://cdn.discordapp.com/attachments/1381747904846364865/1389885150724227134/banner.png",
+  "max_batch_size": 10,
+  "max_batch_interval_minutes": 60,
+  "max_campaign_recipients": 5000,
+  "preview_recipient_user_id": "",
+  "cta_button_style": "link",
+  "status_update_interval_seconds": 15,
+  "session_timeout_minutes": 60,
+  "send_timeout_seconds": 20,
+  "exclude_bots": true,
+  "default_test_mode": false,
+  "data_dir": "data",
+  "logs_dir": "logs"
+}

@@ -25,6 +25,7 @@ units=(
   "mirror-world-rscheckerbot.service"
   "mirror-world-rsmentionpinger.service"
   "mirror-world-rssuccessbot.service"
+  "mirror-world-rspromobot.service"
   "mirror-world-datamanagerbot.service"
   "mirror-world-pingbot.service"
   "mirror-world-discumbot.service"
@@ -59,11 +60,12 @@ for unit in "${units[@]}"; do
 done
 
 echo "Restarting RS services (non-admin bots first, then RSAdminBot)..."
-for unit in "mirror-world-rsforwarder.service" "mirror-world-rsonboarding.service" "mirror-world-rscheckerbot.service" "mirror-world-rsmentionpinger.service" "mirror-world-rssuccessbot.service"; do
+for unit in "mirror-world-rsforwarder.service" "mirror-world-rsonboarding.service" "mirror-world-rscheckerbot.service" "mirror-world-rsmentionpinger.service" "mirror-world-rssuccessbot.service" "mirror-world-rspromobot.service"; do
   sudo systemctl restart "$unit" || true
 done
 sudo systemctl restart "mirror-world-rsadminbot.service" || true
 
+echo "NOTE: RS Promo Bot: ensure RSPromoBot/.env has DISCORD_TOKEN, then: sudo systemctl restart mirror-world-rspromobot.service"
 echo "NOTE: MW bot services were installed/enabled but NOT restarted by this script."
 echo "      Copy MW secrets (.env/tokens.env/channel_map.json) first, then start them:"
 echo "        sudo systemctl restart mirror-world-datamanagerbot.service"

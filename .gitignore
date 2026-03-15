@@ -91,6 +91,17 @@
 !RSuccessBot/messages.json
 !RSuccessBot/vouch_config.json
 
+!RSPromoBot/
+!RSPromoBot/**/
+!RSPromoBot/*.py
+!RSPromoBot/**/*.py
+!RSPromoBot/COMMANDS.md
+!RSPromoBot/config.json
+!RSPromoBot/config.json.example
+!RSPromoBot/messages.json
+!RSPromoBot/README.md
+!RSPromoBot/requirements.txt
+
 # Allow shared scripts used by RSAdminBot (Oracle data tools)
 !scripts/
 !scripts/**/
@@ -181,3 +192,7 @@ RSCheckerbot/reporting_store.json
 
 RSOnboarding/tickets.json
 RSOnboarding/completion_sent.json
+
+# RSPromoBot runtime (server-owned)
+RSPromoBot/data/
+RSPromoBot/logs/

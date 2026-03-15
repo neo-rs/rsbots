@@ -3287,6 +3287,12 @@ class RSAdminBot:
             "folder": "RSuccessBot",
             "script": "bot_runner.py"  # For pkill command - from reference doc
         },
+        "rspromobot": {
+            "name": "RS Promo Bot",
+            "service": "mirror-world-rspromobot.service",
+            "folder": "RSPromoBot",
+            "script": "promo_bot.py"
+        },
         "rsadminbot": {
             "name": "RSAdminBot",
             "service": "mirror-world-rsadminbot.service",
