@@ -1,67 +1,77 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Start all bots locally with usage monitoring
+Start all MW bots locally (no neonxt). Uses subprocess like run_start_all_once.
 """
 
 import os
 import sys
 import time
+import subprocess
 from pathlib import Path
 
-# Add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
+if sys.platform == "win32":
+    os.environ["PYTHONIOENCODING"] = "utf-8"
 
-if sys.platform == 'win32':
-    os.environ['PYTHONIOENCODING'] = 'utf-8'
+# MW bots only, priority order
+BOT_SCRIPTS = [
+    ("datamanagerbot", "MWBots/MWDataManagerBot/datamanagerbot.py", "DataManager"),
+    ("discumbot", "MWBots/MWDiscumBot/discumbot.py", "Discum"),
+    ("pingbot", "MWBots/MWPingBot/pingbot.py", "Ping"),
+]
 
-from neonxt.core.basic_bot_runner import start_bot, BOT_SCRIPTS
 
 def start_all_bots_local():
-    """Start all bots locally"""
-    print("="*70)
-    print("STARTING ALL BOTS LOCALLY")
-    print("="*70)
+    """Start all MW bots locally via subprocess."""
+    print("=" * 70)
+    print("STARTING MW BOTS LOCALLY")
+    print("=" * 70)
     print()
-    
-    # Start bots in priority order
-    bots_sorted = sorted(BOT_SCRIPTS.items(), key=lambda x: x[1].priority)
-    
     results = {}
-    for bot_key, bot_config in bots_sorted:
-        print(f"Starting {bot_config.name}...", end=" ", flush=True)
-        result = start_bot(bot_key, force=False)
-        
-        if result.get("success"):
-            pid = result.get("pid", "?")
-            print(f"[OK] PID: {pid}")
-            results[bot_key] = True
-        else:
-            error = result.get("error", "Unknown error")
-            print(f"[FAIL] {error}")
+    for bot_key, rel_path, display_name in BOT_SCRIPTS:
+        script_path = project_root / rel_path
+        print(f"Starting {display_name}...", end=" ", flush=True)
+        if not script_path.exists():
+            print(f"[FAIL] script not found: {script_path}")
             results[bot_key] = False
-        
-        time.sleep(2)  # Brief pause between starts
-    
-    print("\n" + "="*70)
+            continue
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONPATH"] = str(project_root)
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, str(script_path)],
+                cwd=project_root,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            time.sleep(1)
+            if proc.poll() is None:
+                print(f"[OK] PID: {proc.pid}")
+                results[bot_key] = True
+            else:
+                err = (proc.stderr.read() or b"").decode("utf-8", errors="replace")[:200]
+                print(f"[FAIL] exited: {err}")
+                results[bot_key] = False
+        except Exception as e:
+            print(f"[FAIL] {e}")
+            results[bot_key] = False
+        time.sleep(2)
+    print("\n" + "=" * 70)
     print("SUMMARY")
-    print("="*70)
-    
-    success_count = sum(1 for v in results.values() if v)
-    total_count = len(results)
-    
-    for bot_key, success in results.items():
-        status = "[OK]" if success else "[FAIL]"
-        bot_name = BOT_SCRIPTS[bot_key].name
-        print(f"  {status} {bot_name}")
-    
-    print(f"\nStarted: {success_count}/{total_count} bots")
+    print("=" * 70)
+    for bot_key, _, display_name in BOT_SCRIPTS:
+        status = "[OK]" if results.get(bot_key) else "[FAIL]"
+        print(f"  {status} {display_name}")
+    print(f"\nStarted: {sum(1 for v in results.values() if v)}/{len(results)} bots")
     print("\nTo monitor usage, run:")
     print("  python scripts/monitor_bot_usage.py")
-    print("="*70)
-    
-    return success_count == total_count
+    print("=" * 70)
+    return all(results.values())
 
 if __name__ == "__main__":
     try:

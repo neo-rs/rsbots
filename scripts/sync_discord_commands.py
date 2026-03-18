@@ -25,7 +25,6 @@ if sys.platform == 'win32':
 # Add project root to path
 _project_root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_project_root))
-sys.path.insert(0, str(_project_root / "neonxt"))
 
 # Try to use ResellingSecrets path system
 try:

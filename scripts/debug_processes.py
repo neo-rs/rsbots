@@ -30,7 +30,7 @@ for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
             cmdline = proc.cmdline()
             if cmdline and len(cmdline) > 1:
                 script = cmdline[-1] if cmdline else ''
-                if 'bot' in script.lower() or 'neonxt' in ' '.join(cmdline).lower():
+                if 'bot' in script.lower() or 'datamanagerbot' in ' '.join(cmdline).lower() or 'discumbot' in ' '.join(cmdline).lower() or 'pingbot' in ' '.join(cmdline).lower():
                     print(f"\nPID {proc.pid}: {script}")
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         pass

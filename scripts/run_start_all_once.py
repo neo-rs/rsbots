@@ -18,12 +18,11 @@ sys.path.insert(0, str(project_root))
 LOG_TAIL_LINES = 80
 BOT_TIMEOUT_SECONDS = 12
 
-# Bot script map (in priority order)
+# Bot script map (in priority order) — MW bots only, no neonxt
 BOT_SCRIPTS = [
-    ("testcenter", "neonxt/bots/testcenter_bot.py"),
-    ("datamanagerbot", "neonxt/bots/datamanagerbot.py"),
-    ("discumbot", "MWDiscumBot/discumbot.py"),
-    ("pingbot", "MWPingBot/pingbot.py"),
+    ("datamanagerbot", "MWBots/MWDataManagerBot/datamanagerbot.py"),
+    ("discumbot", "MWBots/MWDiscumBot/discumbot.py"),
+    ("pingbot", "MWBots/MWPingBot/pingbot.py"),
 ]
 
 
@@ -72,7 +71,7 @@ def run_bot(bot_name: str, script_path: Path):
 
 def dump_log_tails():
     logs_dir = project_root / "logs"
-    for bot in ["testcenter", "datamanagerbot", "discumbot", "pingbot"]:
+    for bot in ["datamanagerbot", "discumbot", "pingbot"]:
         log_path = logs_dir / f"unified_runner_{bot}.log"
         print(f"\n=== {log_path.name} (last {LOG_TAIL_LINES} lines) ===")
         if not log_path.exists():

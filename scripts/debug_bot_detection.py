@@ -1,66 +1,39 @@
 #!/usr/bin/env python3
+"""Debug MW bot process detection (no neonxt)."""
 import sys
 from pathlib import Path
+
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 import psutil
-from neonxt.core.basic_bot_runner import BOT_SCRIPTS, _iter_bot_pids, _normalize_bot_name
 
-print("="*70)
-print("DEBUG: Bot Process Detection")
-print("="*70)
+BOT_SCRIPTS = [
+    ("datamanagerbot", "datamanagerbot.py"),
+    ("discumbot", "discumbot.py"),
+    ("pingbot", "pingbot.py"),
+]
 
-bot_scripts = {
-    "testcenter": "testcenter_bot.py",
-    "datamanagerbot": "datamanagerbot.py",
-    "discumbot": "discumbot.py",
-    "pingbot": "pingbot.py",
-}
-
-print("\n[Method 1: Using basic_bot_runner]")
-print("-"*70)
-for bot_key, script_name in bot_scripts.items():
-    normalized = _normalize_bot_name(bot_key)
-    cfg = BOT_SCRIPTS.get(normalized)
-    if cfg:
-        pids = list(_iter_bot_pids(cfg))
-        print(f"{bot_key:20} -> PIDs: {pids}")
-        if pids:
-            try:
-                proc = psutil.Process(pids[0])
-                print(f"  {'':20} -> CMDLINE: {' '.join(proc.cmdline()[:3])}...")
-            except Exception as e:
-                print(f"  {'':20} -> ERROR: {e}")
-    else:
-        print(f"{bot_key:20} -> Config not found")
-
-print("\n[Method 2: Using psutil search]")
-print("-"*70)
-for bot_key, script_name in bot_scripts.items():
-    found = False
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+print("=" * 70)
+print("DEBUG: MW Bot Process Detection")
+print("=" * 70)
+print("\n[psutil search by script name]")
+print("-" * 70)
+for bot_key, script_name in BOT_SCRIPTS:
+    found = []
+    for proc in psutil.process_iter(["pid", "cmdline"]):
         try:
-            cmdline = proc.cmdline()
+            cmdline = proc.info.get("cmdline") or []
             if not cmdline:
                 continue
-            cmdline_str = ' '.join(str(arg) for arg in cmdline).lower()
+            cmdline_str = " ".join(str(a) for a in cmdline).lower()
             if script_name.lower() in cmdline_str:
-                print(f"{bot_key:20} -> PID {proc.pid}: {cmdline[0]} ... {cmdline[-1] if cmdline else ''}")
-                found = True
-                break
+                found.append((proc.info["pid"], cmdline))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
-    if not found:
+    if found:
+        pid, cmd = found[0]
+        print(f"{bot_key:20} -> PID {pid}: {' '.join(str(a) for a in cmd[:2])} ... {cmd[-1] if cmd else ''}")
+    else:
         print(f"{bot_key:20} -> NOT FOUND")
-
-print("\n" + "="*70)
-
-
-
-
-
-
-
-
-
+print("\n" + "=" * 70)

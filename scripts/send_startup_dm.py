@@ -17,10 +17,9 @@ async def send_dm(status: str, errors: int, warnings: int):
     """Send startup DM to Neo."""
     try:
         import discord
-        from neonxt.core.config import MENTION_BOT_TOKEN
-        
+        MENTION_BOT_TOKEN = os.environ.get("MENTION_BOT_TOKEN", "").strip()
         if not MENTION_BOT_TOKEN:
-            print("    [WARN] No MENTION_BOT_TOKEN (testcenter) token")
+            print("    [WARN] No MENTION_BOT_TOKEN in environment")
             return False
         
         intents = discord.Intents.default()

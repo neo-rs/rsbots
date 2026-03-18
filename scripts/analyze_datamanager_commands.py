@@ -74,7 +74,7 @@ def analyze_command_function(content: str, func_start: int) -> Dict[str, any]:
 
 def scan_all_commands() -> Dict[str, Dict]:
     """Scan all prefix commands in datamanagerbot.py."""
-    bot_file = Path(__file__).parent.parent / "neonxt" / "bots" / "datamanagerbot.py"
+    bot_file = Path(__file__).parent.parent / "MWBots" / "MWDataManagerBot" / "datamanagerbot.py"
     
     with open(bot_file, 'r', encoding='utf-8', errors='ignore') as f:
         content = f.read()

@@ -11,33 +11,15 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 def stop_all_bots():
-    """Stop all bot processes."""
+    """Stop all bot processes (MW bots only; no neonxt)."""
     print("Stopping all bot processes...")
-    
-    # Try using unified_bot_runner first
-    try:
-        from neonxt.core.unified_bot_runner import stop_all_bots, stop_service
-        print("  Stopping bot service...")
-        stop_service()
-        print("  Stopping all bots...")
-        results = stop_all_bots()
-        for bot, result in results.items():
-            if result.get('success'):
-                print(f"  ✓ {bot}: {result.get('message', 'stopped')}")
-            else:
-                print(f"  ✗ {bot}: {result.get('error', 'failed')}")
-    except Exception as e:
-        print(f"  Warning: Could not use unified_bot_runner: {e}")
-    
-    # Also kill by process name (Windows)
     if platform.system() == "Windows":
-        print("\nKilling remaining Python bot processes...")
+        print("Killing Python bot processes by script name...")
         bot_scripts = [
-            "testcenter_bot.py",
             "datamanagerbot.py",
             "discumbot.py",
             "pingbot.py",
-            "rs_forwarder_bot.py"
+            "rs_forwarder_bot.py",
         ]
         
         for script in bot_scripts:
@@ -61,7 +43,8 @@ def stop_all_bots():
                                 pass
             except Exception as e:
                 print(f"  ✗ Error killing {script}: {e}")
-    
+    else:
+        print("  (Non-Windows: run pkill or kill manually for bot processes)")
     print("\nDone!")
 
 if __name__ == "__main__":

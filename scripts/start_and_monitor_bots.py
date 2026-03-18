@@ -19,23 +19,28 @@ sys.path.insert(0, str(project_root))
 if sys.platform == 'win32':
     os.environ['PYTHONIOENCODING'] = 'utf-8'
 
-# Import bot starter
-from neonxt.core.basic_bot_runner import start_bot, BOT_SCRIPTS
-
 try:
     import psutil
 except ImportError:
     print("[ERROR] psutil not installed. Install with: pip install psutil")
     sys.exit(1)
 
+import subprocess
+
+# MW bots only (no neonxt)
+BOT_SCRIPTS_ORDER = [
+    ("datamanagerbot", "MWBots/MWDataManagerBot/datamanagerbot.py", "DataManager"),
+    ("discumbot", "MWBots/MWDiscumBot/discumbot.py", "Discum"),
+    ("pingbot", "MWBots/MWPingBot/pingbot.py", "Ping"),
+]
+
 
 class StartAndMonitor:
-    """Start bots and monitor them"""
-    
+    """Start MW bots and monitor them (no neonxt)."""
+
     def __init__(self):
         self.running = True
         self.bot_scripts = {
-            "testcenter": "testcenter_bot.py",
             "datamanagerbot": "datamanagerbot.py",
             "discumbot": "discumbot.py",
             "pingbot": "pingbot.py",
@@ -54,49 +59,54 @@ class StartAndMonitor:
         self.last_net_io = None
         
     def start_all_bots(self):
-        """Start all bots"""
-        print("="*70)
-        print("STARTING ALL BOTS")
-        print("="*70)
+        """Start all MW bots via subprocess."""
+        print("=" * 70)
+        print("STARTING MW BOTS")
+        print("=" * 70)
         print()
-        
-        # Start bots in priority order
-        bots_sorted = sorted(BOT_SCRIPTS.items(), key=lambda x: x[1].priority)
-        
+        project_root = Path(__file__).parent.parent
         results = {}
-        for bot_key, bot_config in bots_sorted:
-            print(f"Starting {bot_config.name}...", end=" ", flush=True)
-            result = start_bot(bot_key, force=False)
-            
-            if result.get("success"):
-                pid = result.get("pid", "?")
-                print(f"[OK] PID: {pid}")
-                results[bot_key] = True
-            else:
-                error = result.get("error", "Unknown error")
-                print(f"[FAIL] {error}")
+        for bot_key, rel_path, display_name in BOT_SCRIPTS_ORDER:
+            script_path = project_root / rel_path
+            print(f"Starting {display_name}...", end=" ", flush=True)
+            if not script_path.exists():
+                print(f"[FAIL] not found: {script_path}")
                 results[bot_key] = False
-            
-            time.sleep(2)  # Brief pause between starts
-        
-        print("\n" + "="*70)
+                continue
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONPATH"] = str(project_root)
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, str(script_path)],
+                    cwd=project_root,
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                time.sleep(1)
+                if proc.poll() is None:
+                    print(f"[OK] PID: {proc.pid}")
+                    results[bot_key] = True
+                else:
+                    print("[FAIL] exited")
+                    results[bot_key] = False
+            except Exception as e:
+                print(f"[FAIL] {e}")
+                results[bot_key] = False
+            time.sleep(2)
+        print("\n" + "=" * 70)
         print("STARTUP SUMMARY")
-        print("="*70)
-        
-        success_count = sum(1 for v in results.values() if v)
-        total_count = len(results)
-        
-        for bot_key, success in results.items():
-            status = "[OK]" if success else "[FAIL]"
-            bot_name = BOT_SCRIPTS[bot_key].name
-            print(f"  {status} {bot_name}")
-        
-        print(f"\nStarted: {success_count}/{total_count} bots")
+        print("=" * 70)
+        for bot_key, _, display_name in BOT_SCRIPTS_ORDER:
+            status = "[OK]" if results.get(bot_key) else "[FAIL]"
+            print(f"  {status} {display_name}")
+        print(f"\nStarted: {sum(1 for v in results.values() if v)}/{len(results)} bots")
         print("\nStarting live monitor in 3 seconds...")
-        print("="*70)
+        print("=" * 70)
         time.sleep(3)
-        
-        return success_count == total_count
+        return all(results.values())
     
     def format_bytes(self, bytes_val: int) -> str:
         """Format bytes to human-readable format"""

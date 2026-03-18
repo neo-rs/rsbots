@@ -40,7 +40,6 @@ def get_bot_status():
         'discumbot': False,
         'datamanager': False,
         'pingbot': False,
-        'testcenter': False,
         'dashboard': False
     }
     
@@ -54,8 +53,6 @@ def get_bot_status():
             bots['datamanager'] = True
         if 'pingbot' in output:
             bots['pingbot'] = True
-        if 'testcenter' in output:
-            bots['testcenter'] = True
     except:
         pass
     
@@ -85,16 +82,27 @@ def get_last_log_entry(bot_name: str) -> dict:
     return {}
 
 def get_channel_stats():
-    """Get monitored channel counts."""
+    """Get monitored channel counts from MWDataManagerBot config (no neonxt)."""
     try:
-        from neonxt.core.config import SMART_SOURCE_CHANNELS, SMART_SOURCE_CHANNELS_ONLINE, SMART_SOURCE_CHANNELS_INSTORE
-        return {
-            'total': len(SMART_SOURCE_CHANNELS),
-            'online': len(SMART_SOURCE_CHANNELS_ONLINE),
-            'instore': len(SMART_SOURCE_CHANNELS_INSTORE)
-        }
-    except:
-        return {'total': 0, 'online': 0, 'instore': 0}
+        from pathlib import Path
+        import json
+        root = Path(__file__).parent.parent
+        path = root / "MWBots" / "MWDataManagerBot" / "config" / "settings.json"
+        if path.exists():
+            with open(path, "r", encoding="utf-8-sig") as f:
+                s = json.load(f)
+            online = s.get("source_channel_ids_online") or []
+            instore = s.get("source_channel_ids_instore") or []
+            clearance = s.get("source_channel_ids_clearance") or []
+            misc = s.get("source_channel_ids_misc") or []
+            return {
+                'total': len(online) + len(instore) + len(clearance) + len(misc),
+                'online': len(online),
+                'instore': len(instore)
+            }
+    except Exception:
+        pass
+    return {'total': 0, 'online': 0, 'instore': 0}
 
 def format_timestamp(ts_str: str) -> str:
     """Format timestamp to relative time."""
@@ -147,7 +155,6 @@ def display_status():
         ('DiscumBot', 'discumbot', 'Source channel listener'),
         ('DataManager', 'datamanager', 'Message classifier'),
         ('PingBot', 'pingbot', 'Mention handler'),
-        ('TestCenter', 'testcenter', 'Slash commands'),
     ]
     
     for name, key, desc in bot_info:

@@ -12,7 +12,7 @@ from typing import Dict, List, Any
 
 def scan_datamanager_commands() -> Dict[str, Any]:
     """Scan datamanagerbot.py for all prefix commands."""
-    bot_file = Path(__file__).parent.parent / "neonxt" / "bots" / "datamanagerbot.py"
+    bot_file = Path(__file__).parent.parent / "MWBots" / "MWDataManagerBot" / "datamanagerbot.py"
     
     if not bot_file.exists():
         return {"error": "datamanagerbot.py not found"}

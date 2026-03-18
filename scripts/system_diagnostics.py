@@ -114,7 +114,6 @@ class SystemDiagnostics:
             'discumbot': BotDiagnostics('discumbot'),
             'datamanagerbot': BotDiagnostics('datamanagerbot'),
             'pingbot': BotDiagnostics('pingbot'),
-            'testcenter': BotDiagnostics('testcenter'),
         }
         self.dashboard_status = False
         self.ports: Dict[int, str] = {}
@@ -139,83 +138,91 @@ class SystemDiagnostics:
         return status
     
     def load_config(self) -> Dict[str, Any]:
-        """Load and validate configuration."""
+        """Load and validate configuration from MWDataManagerBot (no neonxt)."""
         config = {}
-        
         try:
-            from neonxt.core.config import (
-                DISCUM_BOT, PING_BOT, DATAMANAGER_BOT,
-                SMART_SOURCE_CHANNELS, SMART_SOURCE_CHANNELS_ONLINE, SMART_SOURCE_CHANNELS_INSTORE,
-                SMARTFILTER_AMAZON_CHANNEL_ID, SMARTFILTER_MAJOR_STORES_CHANNEL_ID,
-                SMARTFILTER_DEFAULT_CHANNEL_ID, MIRRORWORLD_SERVER
-            )
-            
-            config['tokens'] = {
-                'DISCUM_BOT': bool(DISCUM_BOT),
-                'PING_BOT': bool(PING_BOT),
-                'DATAMANAGER_BOT': bool(DATAMANAGER_BOT),
-            }
-            
+            config_dir = PROJECT_ROOT / "MWBots" / "MWDataManagerBot" / "config"
+            settings_path = config_dir / "settings.json"
+            tokens_path = config_dir / "tokens.env"
+            if not settings_path.exists():
+                config['error'] = f"Config not found: {settings_path}"
+                return config
+            with open(settings_path, "r", encoding="utf-8-sig") as f:
+                settings = json.load(f)
+            source_online = settings.get("source_channel_ids_online") or []
+            source_instore = settings.get("source_channel_ids_instore") or []
+            source_clearance = settings.get("source_channel_ids_clearance") or []
+            source_misc = settings.get("source_channel_ids_misc") or []
+            source_total = len(source_online) + len(source_instore) + len(source_clearance) + len(source_misc)
             config['channels'] = {
-                'source_total': len(SMART_SOURCE_CHANNELS),
-                'source_online': len(SMART_SOURCE_CHANNELS_ONLINE),
-                'source_instore': len(SMART_SOURCE_CHANNELS_INSTORE),
+                'source_total': source_total,
+                'source_online': len(source_online),
+                'source_instore': len(source_instore),
             }
-            
+            dests = settings.get("smartfilter_destinations") or {}
             config['destinations'] = {
-                'AMAZON': SMARTFILTER_AMAZON_CHANNEL_ID,
-                'MAJOR_STORES': SMARTFILTER_MAJOR_STORES_CHANNEL_ID,
-                'DEFAULT': SMARTFILTER_DEFAULT_CHANNEL_ID,
+                'AMAZON': dests.get("AMAZON"),
+                'AFFILIATED_LINKS': dests.get("AFFILIATED_LINKS"),
+                'MAJOR_STORES': dests.get("MAJOR_STORES"),
+                'DEFAULT': dests.get("DEFAULT"),
             }
-            
-            config['server'] = MIRRORWORLD_SERVER
+            config['server'] = (settings.get("destination_guild_ids") or [None])[0]
+            if tokens_path.exists():
+                tokens = {}
+                with open(tokens_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and "=" in line and not line.startswith("#"):
+                            k, _, v = line.partition("=")
+                            tokens[k.strip()] = v.strip()
+                config['tokens'] = {
+                    'DISCUM_BOT': bool(tokens.get("DISCUM_BOT")),
+                    'PING_BOT': bool(tokens.get("PING_BOT")),
+                    'DATAMANAGER_BOT': bool(tokens.get("DATAMANAGER_BOT") or tokens.get("DISCORD_BOT_DATAMANAGER")),
+                }
+            else:
+                config['tokens'] = {'DISCUM_BOT': False, 'PING_BOT': False, 'DATAMANAGER_BOT': False}
             self.config_loaded = True
-            
         except Exception as e:
             config['error'] = str(e)
-            
         return config
     
     def get_channel_details(self) -> Dict[str, Any]:
-        """Get detailed channel configuration."""
+        """Get detailed channel configuration (MWDataManagerBot settings_store; no FULL_SEND/MAJOR_CLEARANCE)."""
         details = {'source': [], 'destination': {}}
-        
         try:
-            from neonxt.core.config import (
-                SMART_SOURCE_CHANNELS,
-                SMARTFILTER_AMAZON_CHANNEL_ID, SMARTFILTER_MAJOR_STORES_CHANNEL_ID,
-                SMARTFILTER_DEFAULT_CHANNEL_ID, SMARTFILTER_AFFILIATED_LINKS_CHANNEL_ID,
-                SMARTFILTER_UPCOMING_CHANNEL_ID, SMARTFILTER_INSTORE_LEADS_CHANNEL_ID,
-                SMARTFILTER_DISCOUNTED_STORES_CHANNEL_ID, SMARTFILTER_INSTORE_SEASONAL_CHANNEL_ID,
-                SMARTFILTER_INSTORE_SNEAKERS_CHANNEL_ID, SMARTFILTER_INSTORE_CARDS_CHANNEL_ID,
-                SMARTFILTER_MONITORED_KEYWORD_CHANNEL_ID, SMARTFILTER_FULL_SEND_CHANNEL_ID,
-                SMARTFILTER_PRICE_ERROR_GLITCHED_CHANNEL_ID, SMARTFILTER_FLIPS_PROFITABLE_CHANNEL_ID,
-                SMARTFILTER_MAJOR_CLEARANCE_CHANNEL_ID
-            )
-            
-            details['source'] = list(SMART_SOURCE_CHANNELS)[:20]  # Limit for display
-            
-            details['destination'] = {
-                'AMAZON': SMARTFILTER_AMAZON_CHANNEL_ID or "NOT SET",
-                'MAJOR_STORES': SMARTFILTER_MAJOR_STORES_CHANNEL_ID or "NOT SET",
-                'AFFILIATED_LINKS': SMARTFILTER_AFFILIATED_LINKS_CHANNEL_ID or "NOT SET",
-                'UPCOMING': SMARTFILTER_UPCOMING_CHANNEL_ID or "NOT SET",
-                'INSTORE_LEADS': SMARTFILTER_INSTORE_LEADS_CHANNEL_ID or "NOT SET",
-                'DISCOUNTED_STORES': SMARTFILTER_DISCOUNTED_STORES_CHANNEL_ID or "NOT SET",
-                'INSTORE_SEASONAL': SMARTFILTER_INSTORE_SEASONAL_CHANNEL_ID or "NOT SET",
-                'INSTORE_SNEAKERS': SMARTFILTER_INSTORE_SNEAKERS_CHANNEL_ID or "NOT SET",
-                'INSTORE_CARDS': SMARTFILTER_INSTORE_CARDS_CHANNEL_ID or "NOT SET",
-                'MONITORED_KEYWORD': SMARTFILTER_MONITORED_KEYWORD_CHANNEL_ID or "NOT SET",
-                'FULL_SEND': SMARTFILTER_FULL_SEND_CHANNEL_ID or "NOT SET",
-                'PRICE_ERROR': SMARTFILTER_PRICE_ERROR_GLITCHED_CHANNEL_ID or "NOT SET",
-                'FLIPS_PROFITABLE': SMARTFILTER_FLIPS_PROFITABLE_CHANNEL_ID or "NOT SET",
-                'MAJOR_CLEARANCE': SMARTFILTER_MAJOR_CLEARANCE_CHANNEL_ID or "NOT SET",
-                'DEFAULT': SMARTFILTER_DEFAULT_CHANNEL_ID or "NOT SET",
-            }
-            
+            config_dir = PROJECT_ROOT / "MWBots" / "MWDataManagerBot" / "config"
+            settings_path = config_dir / "settings.json"
+            if settings_path.exists():
+                with open(settings_path, "r", encoding="utf-8-sig") as f:
+                    settings = json.load(f)
+                sys.path.insert(0, str(PROJECT_ROOT / "MWBots" / "MWDataManagerBot"))
+                import settings_store as cfg
+                cfg.init(settings)
+                details['source'] = list(getattr(cfg, "SMART_SOURCE_CHANNELS", set()))[:20]
+                dests = settings.get("smartfilter_destinations") or {}
+                gd = settings.get("global_trigger_destinations") or {}
+                details['destination'] = {
+                    'AMAZON': dests.get("AMAZON") or "NOT SET",
+                    'AMAZON_FALLBACK': dests.get("AMAZON_FALLBACK") or "NOT SET",
+                    'MAJOR_STORES': dests.get("MAJOR_STORES") or "NOT SET",
+                    'AFFILIATED_LINKS': dests.get("AFFILIATED_LINKS") or "NOT SET",
+                    'UPCOMING': dests.get("UPCOMING") or "NOT SET",
+                    'INSTORE_LEADS': dests.get("INSTORE_LEADS") or "NOT SET",
+                    'DISCOUNTED_STORES': dests.get("DISCOUNTED_STORES") or "NOT SET",
+                    'INSTORE_SEASONAL': dests.get("INSTORE_SEASONAL") or "NOT SET",
+                    'INSTORE_SNEAKERS': dests.get("INSTORE_SNEAKERS") or "NOT SET",
+                    'INSTORE_CARDS': dests.get("INSTORE_CARDS") or "NOT SET",
+                    'MONITORED_KEYWORD': dests.get("MONITORED_KEYWORD") or "NOT SET",
+                    'PRICE_ERROR': gd.get("PRICE_ERROR") or "NOT SET",
+                    'PROFITABLE_FLIP': gd.get("PROFITABLE_FLIP") or "NOT SET",
+                    'LUNCHMONEY_FLIP': gd.get("LUNCHMONEY_FLIP") or "NOT SET",
+                    'DEFAULT': dests.get("DEFAULT") or "NOT SET",
+                }
+            else:
+                details['error'] = f"Config not found: {settings_path}"
         except Exception as e:
             details['error'] = str(e)
-            
         return details
     
     def get_log_paths(self) -> Dict[str, Dict]:
@@ -228,7 +235,6 @@ class SystemDiagnostics:
                 'discumbot': log_dir / "discumlogs.json",
                 'datamanagerbot': log_dir / "datamanagerlogs.json",
                 'pingbot': log_dir / "pingbotlogs.json",
-                'testcenter': log_dir / "testcenterlogs.json",
             },
             'Data Logs': {
                 'mirror_world_sol': data_dir / "Mirror_World_SOL.json",
@@ -281,7 +287,6 @@ class SystemDiagnostics:
             ('DiscumBot', bot_status.get('discumbot', False), 'Source channel listener'),
             ('DataManagerBot', bot_status.get('datamanagerbot', False), 'Message classifier'),
             ('PingBot', bot_status.get('pingbot', False), 'Mention handler'),
-            ('TestCenter', bot_status.get('testcenter', False), 'Slash commands'),
         ]
         
         running_count = 0
@@ -293,7 +298,7 @@ class SystemDiagnostics:
                 status = f"{C.RED}○ STOPPED{C.RESET}"
             lines.append(f"  {name:18} {status:20} {C.DIM}{desc}{C.RESET}")
         
-        lines.append(f"\n  {C.WHITE}Total: {running_count}/5 services running{C.RESET}")
+        lines.append(f"\n  {C.WHITE}Total: {running_count}/4 services running{C.RESET}")
         
         # Configuration
         lines.append(f"\n{C.WHITE}[CONFIGURATION]{C.RESET}")

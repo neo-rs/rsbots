@@ -108,6 +108,16 @@
 !scripts/*.py
 !scripts/**/*.py
 
+# Kit (GHL and other integration tools)
+!kit/
+!kit/**/
+!kit/*.py
+!kit/**/*.py
+!kit/*.bat
+!kit/ghl_token.example.txt
+kit/ghl_token.txt
+kit/*.csv
+
 # Allow systemd unit templates (used for deployment)
 !systemd/
 !systemd/**/

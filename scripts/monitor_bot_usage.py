@@ -21,15 +21,10 @@ sys.path.insert(0, str(project_root))
 if sys.platform == 'win32':
     os.environ['PYTHONIOENCODING'] = 'utf-8'
 
-# Import central logger to read logs
-try:
-    from neonxt.core.central_logger import (
-        LOG_FILES, BOT_LOGS_DIR, DATA_LOGS_DIR, NETWORK_LOGS_DIR,
-        CentralLogger
-    )
-except ImportError:
-    print("[ERROR] Could not import central_logger")
-    sys.exit(1)
+# MW bot log paths (no neonxt)
+BOT_LOGS_DIR = project_root / "logs" / "Botlogs"
+DATA_LOGS_DIR = project_root / "logs" / "Datalogs"
+NETWORK_LOGS_DIR = project_root / "logs" / "Network"
 
 class BotUsageMonitor:
     """Monitor and measure bot usage"""
@@ -113,10 +108,9 @@ class BotUsageMonitor:
             "by_guild": defaultdict(int),
         }
         
-        # Check bot logs for message activity
+        # Check bot logs for message activity (MW bots only)
         bot_logs = {
-            "testcenter": BOT_LOGS_DIR / "testcenterlogs.json",
-            "datamanagerbot": BOT_LOGS_DIR / "datamanagerlogs.json",
+            "datamanagerbot": BOT_LOGS_DIR / "datamanagerbotlogs.json",
             "discumbot": BOT_LOGS_DIR / "discumlogs.json",
             "pingbot": BOT_LOGS_DIR / "pingbotlogs.json",
         }
@@ -160,7 +154,6 @@ class BotUsageMonitor:
         }
         
         bot_scripts = {
-            "testcenter": "testcenter_bot.py",
             "datamanagerbot": "datamanagerbot.py",
             "discumbot": "discumbot.py",
             "pingbot": "pingbot.py",

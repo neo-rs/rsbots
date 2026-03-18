@@ -23,25 +23,18 @@ def load_env() -> Dict[str, str]:
     """Load tokens and guild IDs from config."""
     env = {}
     
-    # Try using config_loader first (preferred method)
-    try:
-        from neonxt.core.config_loader import config as _cfg
-        token = _cfg.get_discord_bot_token('testcenter')
-        if token:
-            env['TESTCENTER_BOT_TOKEN'] = token
-            env['DISCORD_BOT_TESTCENTER'] = token
-        
-        guild_id = _cfg.get_guild_id('mirrorworld')
-        if guild_id:
-            env['MIRRORWORLD_SERVER'] = str(guild_id)
-        
-        # If we got both, return early
-        if token and guild_id:
-            return env
-    except Exception as e:
-        print(f"[WARN] Could not load from config_loader: {e}")
-    
-    # Fallback: Try tokens-api.env
+    # Load from environment first
+    token = os.environ.get("TESTCENTER_BOT_TOKEN") or os.environ.get("DISCORD_BOT_TESTCENTER")
+    if token:
+        env["TESTCENTER_BOT_TOKEN"] = token
+        env["DISCORD_BOT_TESTCENTER"] = token
+    guild_id = os.environ.get("MIRRORWORLD_SERVER")
+    if guild_id:
+        env["MIRRORWORLD_SERVER"] = str(guild_id)
+    if token and guild_id:
+        return env
+
+    # Try tokens-api.env or config files
     env_path = _project_root / "config" / "tokens-api.env"
     if env_path.exists():
         with open(env_path, 'r', encoding='utf-8') as f:
