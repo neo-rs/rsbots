@@ -48,6 +48,8 @@
   "whop_member_detail_fetch_enabled": false,
   "ghl_phone_enrichment_enabled": true,
   "ghl_phone_tab_name": "GHL Website Data Info",
+  "member_history_total_spent_enabled": true,
+  "member_history_path": "RSCheckerbot/member_history.json",
   "whop_api": {
     "base_url": "https://api.whop.com/api/v1",
     "company_id": "biz_s58kr1WWnL1bzH"

@@ -90,6 +90,25 @@ def _extract_total_spend(mship: Dict[str, Any], member_record: Optional[Dict[str
     Best-effort Total Spend extraction.
     Returns a string suitable for a sheet cell (e.g. "$30.00" or "30.00").
     """
+    def _walk_find(obj: Any, *, keys: Set[str], out: List[Any], max_nodes: int = 2000) -> None:
+        """Best-effort recursive search for keys in nested dict/list payloads."""
+        seen = 0
+        stack: List[Any] = [obj]
+        while stack and seen < max_nodes:
+            cur = stack.pop()
+            seen += 1
+            if isinstance(cur, dict):
+                for k, v in cur.items():
+                    ks = str(k or "").strip().lower()
+                    if ks in keys:
+                        out.append(v)
+                    if isinstance(v, (dict, list)):
+                        stack.append(v)
+            elif isinstance(cur, list):
+                for v in cur:
+                    if isinstance(v, (dict, list)):
+                        stack.append(v)
+
     candidates: List[Any] = []
     if isinstance(mship, dict):
         candidates.extend(
@@ -99,6 +118,12 @@ def _extract_total_spend(mship: Dict[str, Any], member_record: Optional[Dict[str
                 mship.get("amount_spent"),
                 mship.get("lifetime_spend"),
             ]
+        )
+        # Try to find nested spend fields too (Whop payloads sometimes nest summaries)
+        _walk_find(
+            mship,
+            keys={"total_spent", "total spend", "lifetime_spend", "lifetime spend", "amount_spent", "amount spent"},
+            out=candidates,
         )
         # Special /members payload passthrough if present
         for k in ("_left_member_data", "_churned_member_data", "_canceling_member_data"):
@@ -113,6 +138,11 @@ def _extract_total_spend(mship: Dict[str, Any], member_record: Optional[Dict[str
                 member_record.get("amount_spent"),
                 member_record.get("lifetime_spend"),
             ]
+        )
+        _walk_find(
+            member_record,
+            keys={"total_spent", "total spend", "lifetime_spend", "lifetime spend", "amount_spent", "amount spent"},
+            out=candidates,
         )
 
     for v in candidates:
@@ -445,6 +475,10 @@ class WhopSheetsSync:
         # GHL Website Data Info cache (email -> phone)
         self._ghl_phone_map: Dict[str, str] = {}
         self._ghl_phone_map_at: float = 0.0
+        # Member history cache (discord_id -> total_spent string)
+        self._mh_total_spent: Dict[str, str] = {}
+        self._mh_total_spent_mtime: float = 0.0
+        self._mh_total_spent_at: float = 0.0
 
     def _identity_cache_enabled(self) -> bool:
         return _cfg_bool(self.cfg, "discord_identity_cache_enabled", True)
@@ -605,6 +639,77 @@ class WhopSheetsSync:
     def _whop_member_detail_fetch_enabled(self) -> bool:
         # For your Whop account, /members/{id} does not return phone/discord, so this should usually be disabled.
         return _cfg_bool(self.cfg, "whop_member_detail_fetch_enabled", False)
+
+    def _member_history_spend_enabled(self) -> bool:
+        return _cfg_bool(self.cfg, "member_history_total_spent_enabled", True)
+
+    def _member_history_path(self) -> Path:
+        p = _cfg_str(self.cfg, "member_history_path", "RSCheckerbot/member_history.json")
+        path = Path(p)
+        if not path.is_absolute():
+            repo_root = Path(__file__).resolve().parents[1]
+            path = (repo_root / path).resolve()
+        return path
+
+    def _load_member_history_total_spent_if_needed(self, *, force: bool = False) -> Dict[str, str]:
+        """Load discord_id -> total_spent from member_history.json (cached)."""
+        if not self._member_history_spend_enabled():
+            self._mh_total_spent = {}
+            self._mh_total_spent_mtime = 0.0
+            self._mh_total_spent_at = 0.0
+            return {}
+
+        now = 0.0
+        try:
+            now = float(datetime.now(timezone.utc).timestamp())
+        except Exception:
+            now = 0.0
+        ttl_s = 60.0
+        if (not force) and self._mh_total_spent and self._mh_total_spent_at and (now - self._mh_total_spent_at) < ttl_s:
+            return dict(self._mh_total_spent)
+
+        path = self._member_history_path()
+        try:
+            mtime = float(path.stat().st_mtime)
+        except Exception:
+            mtime = 0.0
+        if (not force) and self._mh_total_spent and mtime and self._mh_total_spent_mtime and mtime == self._mh_total_spent_mtime:
+            self._mh_total_spent_at = now
+            return dict(self._mh_total_spent)
+
+        raw: Dict[str, Any] = {}
+        try:
+            if path.exists():
+                obj = json.loads(path.read_text(encoding="utf-8") or "{}")
+                raw = obj if isinstance(obj, dict) else {}
+        except Exception:
+            raw = {}
+
+        out: Dict[str, str] = {}
+        # member_history is keyed by discord_id string
+        for did, rec in (raw or {}).items():
+            if not (isinstance(did, str) and did.isdigit() and isinstance(rec, dict)):
+                continue
+            wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+            ls = wh.get("last_summary") if isinstance(wh.get("last_summary"), dict) else {}
+            ts = str((ls or {}).get("total_spent") or "").strip()
+            if ts:
+                out[did] = ts
+
+        self._mh_total_spent = dict(out)
+        self._mh_total_spent_mtime = mtime
+        self._mh_total_spent_at = now
+        return dict(out)
+
+    def _enrich_total_spend_from_member_history(self, *, discord_id: str, current_total_spend: str) -> str:
+        cur = str(current_total_spend or "").strip()
+        if cur:
+            return cur
+        did = str(discord_id or "").strip()
+        if not did.isdigit():
+            return ""
+        m = self._load_member_history_total_spent_if_needed()
+        return str(m.get(did) or "").strip()
 
     def _ghl_phone_tab_title(self) -> str:
         # Tab in the same spreadsheet: contains Email + Phone Number columns
@@ -1574,6 +1679,16 @@ class WhopSheetsSync:
                 date_left = _format_date_mmddyy(str(updated_at or "")) if status in left_statuses else ""
 
                 total_spend = _extract_total_spend(mship, member_record)
+                if not total_spend and discord_id:
+                    total_spend = self._enrich_total_spend_from_member_history(
+                        discord_id=discord_id,
+                        current_total_spend=total_spend,
+                    )
+                if not total_spend and discord_id:
+                    total_spend = self._enrich_total_spend_from_member_history(
+                        discord_id=discord_id,
+                        current_total_spend=total_spend,
+                    )
 
                 # Joined/Left dates (MM/DD/YY)
                 created_at = mship.get("created_at") or ""
