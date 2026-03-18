@@ -724,6 +724,34 @@ class WhopSheetsSync:
         m = self._load_member_history_total_spent_if_needed()
         return str(m.get(did) or "").strip()
 
+    def _resolve_discord_id_for_spend(
+        self,
+        *,
+        email: str,
+        discord_id: str,
+        existing_discord_by_email: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """
+        Resolve a Discord ID for spend lookup without requiring column F to be populated.
+        Order:
+          1) provided discord_id
+          2) existing sheet discord_id by email (if available)
+          3) RSCheckerbot identity cache (email -> discord_id)
+        """
+        did = str(discord_id or "").strip()
+        if did.isdigit():
+            return did
+        em = str(email or "").strip().lower()
+        if em and isinstance(existing_discord_by_email, dict):
+            did2 = str(existing_discord_by_email.get(em) or "").strip()
+            if did2.isdigit():
+                return did2
+        if em:
+            did3 = str(self._enrich_discord_id(email=em, current_discord_id="") or "").strip()
+            if did3.isdigit():
+                return did3
+        return ""
+
     def _ghl_phone_tab_title(self) -> str:
         # Tab in the same spreadsheet: contains Email + Phone Number columns
         return _cfg_str(self.cfg, "ghl_phone_tab_name", "GHL Website Data Info")
@@ -1701,17 +1729,37 @@ class WhopSheetsSync:
                 date_left = _format_date_mmddyy(str(updated_at or "")) if status in left_statuses else ""
 
                 total_spend = _extract_total_spend(mship, member_record)
+                if not total_spend:
+                    # Spend fallback: resolve DID via email (no need for column F to be present)
+                    did_for_spend = self._resolve_discord_id_for_spend(
+                        email=email,
+                        discord_id=discord_id,
+                        existing_discord_by_email=None,
+                    )
+                    if did_for_spend:
+                        total_spend = self._enrich_total_spend_from_member_history(
+                            discord_id=did_for_spend,
+                            current_total_spend=total_spend,
+                        )
                 if total_spend:
                     rows_with_spend += 1
                     rows_spend_from_whop += 1
-                if not total_spend and discord_id:
-                    total_spend = self._enrich_total_spend_from_member_history(
+
+                # Spend fallback: resolve DID via email (no need for column F to be present)
+                if not total_spend:
+                    did_for_spend = self._resolve_discord_id_for_spend(
+                        email=email,
                         discord_id=discord_id,
-                        current_total_spend=total_spend,
+                        existing_discord_by_email=existing_discord_by_email,
                     )
-                    if total_spend:
-                        rows_with_spend += 1
-                        rows_spend_from_member_history += 1
+                    if did_for_spend:
+                        total_spend = self._enrich_total_spend_from_member_history(
+                            discord_id=did_for_spend,
+                            current_total_spend=total_spend,
+                        )
+                        if total_spend:
+                            rows_with_spend += 1
+                            rows_spend_from_member_history += 1
 
                 if total_spend and len(spend_samples) < 5:
                     spend_samples.append(f"{email or '-'} did={discord_id or '-'} spend={total_spend}")
