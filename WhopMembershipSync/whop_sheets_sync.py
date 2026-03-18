@@ -468,10 +468,6 @@ class WhopSheetsSync:
         self._identity_cache: Dict[str, Any] = {}
         self._identity_cache_mtime: float = 0.0
         self._identity_cache_loaded_at: float = 0.0
-        # Member detail cache (mber_id -> {phone, fetched_at_iso})
-        self._member_detail_cache: Dict[str, Any] = {}
-        self._member_detail_cache_mtime: float = 0.0
-        self._member_detail_cache_loaded_at: float = 0.0
         # GHL Website Data Info cache (email -> phone)
         self._ghl_phone_map: Dict[str, str] = {}
         self._ghl_phone_map_at: float = 0.0
@@ -479,6 +475,204 @@ class WhopSheetsSync:
         self._mh_total_spent: Dict[str, str] = {}
         self._mh_total_spent_mtime: float = 0.0
         self._mh_total_spent_at: float = 0.0
+        # Whop payments spend cache (email -> {"total_spent": str, "fetched_at": iso})
+        self._whop_payments_spend: Dict[str, Any] = {}
+        self._whop_payments_spend_mtime: float = 0.0
+        self._whop_payments_spend_at: float = 0.0
+
+    def _whop_payments_spend_enabled(self) -> bool:
+        return _cfg_bool(self.cfg, "whop_payments_total_spent_enabled", False)
+
+    def _whop_payments_spend_cache_path(self) -> Path:
+        p = _cfg_str(self.cfg, "whop_payments_total_spent_cache_path", "WhopMembershipSync/whop_payments_spend_cache.json")
+        path = Path(p)
+        if not path.is_absolute():
+            repo_root = Path(__file__).resolve().parents[1]
+            path = (repo_root / path).resolve()
+        return path
+
+    def _whop_payments_spend_cache_ttl_s(self) -> float:
+        try:
+            hours = float((self.cfg or {}).get("whop_payments_total_spent_cache_ttl_hours") or 24)
+        except Exception:
+            hours = 24.0
+        if hours <= 0:
+            hours = 24.0
+        return hours * 3600.0
+
+    def _whop_payments_spend_max_lookups_per_sync(self) -> int:
+        try:
+            n = int((self.cfg or {}).get("whop_payments_total_spent_max_lookups_per_sync") or 200)
+        except Exception:
+            n = 200
+        if n <= 0:
+            n = 0
+        return n
+
+    def _load_whop_payments_spend_cache_if_needed(self, *, force: bool = False) -> Dict[str, Any]:
+        """Load email->spend cache from disk (cached)."""
+        if not self._whop_payments_spend_enabled():
+            self._whop_payments_spend = {}
+            self._whop_payments_spend_mtime = 0.0
+            self._whop_payments_spend_at = 0.0
+            return {}
+
+        now = 0.0
+        try:
+            now = float(datetime.now(timezone.utc).timestamp())
+        except Exception:
+            now = 0.0
+
+        ttl_s = 30.0
+        if (not force) and self._whop_payments_spend and self._whop_payments_spend_at and (now - self._whop_payments_spend_at) < ttl_s:
+            return dict(self._whop_payments_spend)
+
+        path = self._whop_payments_spend_cache_path()
+        try:
+            mtime = float(path.stat().st_mtime)
+        except Exception:
+            mtime = 0.0
+        if (not force) and self._whop_payments_spend and mtime and self._whop_payments_spend_mtime and mtime == self._whop_payments_spend_mtime:
+            self._whop_payments_spend_at = now
+            return dict(self._whop_payments_spend)
+
+        raw: Dict[str, Any] = {}
+        try:
+            if path.exists():
+                obj = json.loads(path.read_text(encoding="utf-8") or "{}")
+                raw = obj if isinstance(obj, dict) else {}
+        except Exception:
+            raw = {}
+
+        self._whop_payments_spend = dict(raw)
+        self._whop_payments_spend_mtime = mtime
+        self._whop_payments_spend_at = now
+        return dict(self._whop_payments_spend)
+
+    def _save_whop_payments_spend_cache(self, cache: Dict[str, Any]) -> None:
+        if not self._whop_payments_spend_enabled():
+            return
+        path = self._whop_payments_spend_cache_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                if "tmp" in locals() and tmp.exists():
+                    tmp.unlink(missing_ok=True)  # type: ignore[arg-type]
+            except Exception:
+                pass
+
+    def _cache_get_whop_payments_spend(self, email: str) -> str:
+        em = str(email or "").strip().lower()
+        if not em or "@" not in em:
+            return ""
+        cache = self._load_whop_payments_spend_cache_if_needed()
+        rec = cache.get(em)
+        if not isinstance(rec, dict):
+            return ""
+        fetched_at = str(rec.get("fetched_at") or "").strip()
+        total_spent = str(rec.get("total_spent") or "").strip()
+        if not (fetched_at and total_spent):
+            return ""
+        try:
+            dt = datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age_s = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()
+            if age_s > self._whop_payments_spend_cache_ttl_s():
+                return ""
+        except Exception:
+            return ""
+        return total_spent
+
+    async def _compute_total_spend_via_payments_query(self, whop_client: WhopAPIClient, *, query: str) -> str:
+        """Compute lifetime spend by summing successful payments returned by /payments?query=... (USD)."""
+        q = str(query or "").strip()
+        if not q:
+            return ""
+        success_statuses = {"paid", "succeeded", "successful", "success"}
+        after: Optional[str] = None
+        total = 0.0
+        pages = 0
+        while True:
+            pages += 1
+            payments, page_info = await whop_client.list_payments(first=100, after=after, params={"query": q})
+            if not payments:
+                break
+            for p in payments:
+                if not isinstance(p, dict):
+                    continue
+                st = str(p.get("status") or "").strip().lower()
+                if st not in success_statuses:
+                    continue
+                v = p.get("usd_total")
+                if v is None or v == "":
+                    v = p.get("total")
+                try:
+                    if isinstance(v, (int, float)):
+                        amt = float(v)
+                    else:
+                        s = str(v or "").strip().replace("$", "").replace(",", "")
+                        amt = float(s) if s else 0.0
+                    total += amt
+                except Exception:
+                    continue
+            if not (isinstance(page_info, dict) and page_info.get("has_next_page")):
+                break
+            after = str(page_info.get("end_cursor") or "").strip() or None
+            if not after:
+                break
+            # Safety cap: avoid unbounded loops on API bugs
+            if pages >= 100:
+                break
+        if total <= 0:
+            return ""
+        return f"${total:,.2f}"
+
+    async def _enrich_total_spend_from_whop_payments(
+        self,
+        whop_client: WhopAPIClient,
+        *,
+        email: str,
+        current_total_spend: str,
+        lookups_remaining: Optional[int] = None,
+    ) -> Tuple[str, bool]:
+        """
+        Enrich Total Spend using Whop payments aggregation:
+          /payments?query=<email>
+
+        Returns: (total_spend, used_whop_payments)
+        """
+        cur = str(current_total_spend or "").strip()
+        if cur:
+            return (cur, False)
+        if not self._whop_payments_spend_enabled():
+            return ("", False)
+        em = str(email or "").strip().lower()
+        if not em or "@" not in em:
+            return ("", False)
+        if lookups_remaining is not None and lookups_remaining <= 0:
+            return ("", False)
+
+        cached = self._cache_get_whop_payments_spend(em)
+        if cached:
+            return (cached, True)
+
+        # Compute and cache
+        total_spent = await self._compute_total_spend_via_payments_query(whop_client, query=em)
+        if not total_spent:
+            return ("", False)
+
+        cache = self._load_whop_payments_spend_cache_if_needed()
+        now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        cache[em] = {"total_spent": total_spent, "fetched_at": now_iso}
+        self._whop_payments_spend = dict(cache)
+        self._whop_payments_spend_at = float(datetime.now(timezone.utc).timestamp())
+        self._save_whop_payments_spend_cache(cache)
+        return (total_spent, True)
 
     def _identity_cache_enabled(self) -> bool:
         return _cfg_bool(self.cfg, "discord_identity_cache_enabled", True)
@@ -542,103 +736,8 @@ class WhopSheetsSync:
         cache = self._load_identity_cache_if_needed()
         return _resolve_discord_id_from_identity_cache(cache, em)
 
-    def _member_detail_cache_enabled(self) -> bool:
-        return _cfg_bool(self.cfg, "member_detail_cache_enabled", True)
-
-    def _member_detail_cache_path(self) -> Path:
-        p = _cfg_str(self.cfg, "member_detail_cache_path", "WhopMembershipSync/member_detail_cache.json")
-        path = Path(p)
-        if not path.is_absolute():
-            repo_root = Path(__file__).resolve().parents[1]
-            path = (repo_root / path).resolve()
-        return path
-
-    def _load_member_detail_cache_if_needed(self, *, force: bool = False) -> Dict[str, Any]:
-        if not self._member_detail_cache_enabled():
-            self._member_detail_cache = {}
-            self._member_detail_cache_mtime = 0.0
-            self._member_detail_cache_loaded_at = 0.0
-            return {}
-
-        now = 0.0
-        try:
-            now = float(datetime.now(timezone.utc).timestamp())
-        except Exception:
-            now = 0.0
-        ttl_s = 30.0
-        if (not force) and self._member_detail_cache and self._member_detail_cache_loaded_at and (now - self._member_detail_cache_loaded_at) < ttl_s:
-            return self._member_detail_cache
-
-        path = self._member_detail_cache_path()
-        try:
-            mtime = float(path.stat().st_mtime)
-        except Exception:
-            mtime = 0.0
-
-        if (not force) and self._member_detail_cache and mtime and self._member_detail_cache_mtime and mtime == self._member_detail_cache_mtime:
-            self._member_detail_cache_loaded_at = now
-            return self._member_detail_cache
-
-        raw: Dict[str, Any] = {}
-        try:
-            if path.exists():
-                obj = json.loads(path.read_text(encoding="utf-8") or "{}")
-                raw = obj if isinstance(obj, dict) else {}
-        except Exception:
-            raw = {}
-
-        self._member_detail_cache = raw
-        self._member_detail_cache_mtime = mtime
-        self._member_detail_cache_loaded_at = now
-        return self._member_detail_cache
-
-    def _save_member_detail_cache(self) -> None:
-        if not self._member_detail_cache_enabled():
-            return
-        path = self._member_detail_cache_path()
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(json.dumps(self._member_detail_cache, indent=2, ensure_ascii=False), encoding="utf-8")
-            os.replace(tmp, path)
-            try:
-                self._member_detail_cache_mtime = float(path.stat().st_mtime)
-            except Exception:
-                self._member_detail_cache_mtime = 0.0
-        except Exception:
-            pass
-
-    def _cached_member_phone(self, member_id: str) -> str:
-        mid = str(member_id or "").strip()
-        if not mid:
-            return ""
-        cache = self._load_member_detail_cache_if_needed()
-        rec = cache.get(mid) if isinstance(cache, dict) else None
-        if not isinstance(rec, dict):
-            return ""
-        return str(rec.get("phone") or "").strip()
-
-    def _set_cached_member_phone(self, member_id: str, phone: str) -> None:
-        mid = str(member_id or "").strip()
-        ph = str(phone or "").strip()
-        if not (mid and ph):
-            return
-        cache = self._load_member_detail_cache_if_needed()
-        if not isinstance(cache, dict):
-            return
-        try:
-            fetched_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        except Exception:
-            fetched_at = ""
-        cache[mid] = {"phone": ph, "fetched_at": fetched_at}
-        self._member_detail_cache = cache
-
     def _ghl_phone_enabled(self) -> bool:
         return _cfg_bool(self.cfg, "ghl_phone_enrichment_enabled", True)
-
-    def _whop_member_detail_fetch_enabled(self) -> bool:
-        # For your Whop account, /members/{id} does not return phone/discord, so this should usually be disabled.
-        return _cfg_bool(self.cfg, "whop_member_detail_fetch_enabled", False)
 
     def _member_history_spend_enabled(self) -> bool:
         return _cfg_bool(self.cfg, "member_history_total_spent_enabled", True)
@@ -1464,106 +1563,13 @@ class WhopSheetsSync:
         log.info(f"  -> Processing {len(all_memberships)} memberships...")
         print(f"  -> Processing {len(all_memberships)} memberships...")
         
-        # Extract member IDs for fetching detailed records (phone primarily; Discord ID is Discord-side cache).
-        # We only fetch detail records when we cannot satisfy phone from:
-        #  - existing sheet row (by email), or
-        #  - local member_detail_cache (by member_id)
-        member_ids: Set[str] = set()
-        member_id_email_map: Dict[str, str] = {}
-        for mship in all_memberships:
-            # Get member_id from membership.member field
-            member_obj = mship.get("member") or {}
-            if isinstance(member_obj, dict):
-                member_id = str(member_obj.get("id") or "").strip()
-                if member_id and member_id.startswith("mber_"):
-                    member_ids.add(member_id)
-                    user_obj = mship.get("user") or {}
-                    em = ""
-                    if isinstance(user_obj, dict):
-                        em = str(user_obj.get("email") or "").strip().lower()
-                    if em:
-                        member_id_email_map[member_id] = em
-        
-        total_member_ids = len(member_ids)
-        log.info(f"  -> Extracted {total_member_ids} unique member IDs (detail fetch minimized)")
-        print(f"  -> Extracted {total_member_ids} unique member IDs (detail fetch minimized)")
-
-        # Decide which member IDs actually need a detail fetch.
-        # If phone is already known (sheet or cache), skip.
+        # Phone number is NOT reliably available from Whop API for this account.
+        # We intentionally do NOT call /members/{mber_...} at all.
+        # Phone sources are limited to:
+        #  - existing sheet (by email)
+        #  - GHL Website Data Info tab (by email)
         member_cache: Dict[str, Any] = {}
-        need_fetch: List[str] = []
         ghl_map = await self._load_ghl_phone_map_if_needed()
-        for mid in sorted(member_ids):
-            em = member_id_email_map.get(mid, "")
-            phone_from_sheet = existing_phone_by_email.get(em, "") if em else ""
-            phone_from_cache = self._cached_member_phone(mid)
-            phone_from_ghl = str(ghl_map.get(em) or "").strip() if em else ""
-            if phone_from_sheet or phone_from_cache or phone_from_ghl:
-                if phone_from_cache:
-                    member_cache[mid] = {"phone": phone_from_cache}
-                continue
-            need_fetch.append(mid)
-
-        member_ids_list = list(need_fetch)
-        log.info(f"  -> Detail fetch required for {len(member_ids_list)}/{total_member_ids} members (missing phone)")
-        print(f"  -> Detail fetch required for {len(member_ids_list)}/{total_member_ids} members (missing phone)")
-
-        if not self._whop_member_detail_fetch_enabled():
-            log.info("  -> Detail fetch disabled (whop_member_detail_fetch_enabled=false). Using sheet+GHL only.")
-            print("  -> Detail fetch disabled (whop_member_detail_fetch_enabled=false). Using sheet+GHL only.")
-            member_ids_list = []
-        
-        log.info(f"  -> Fetching {len(member_ids_list)} member records from /members/{{mber_...}} endpoint...")
-        print(f"  -> Fetching {len(member_ids_list)} member records from /members/{{mber_...}} endpoint...")
-        
-        success_count = 0
-        error_count = 0
-        
-        for i, member_id in enumerate(member_ids_list):
-            try:
-                # Update progress more frequently
-                if (i + 1) % 10 == 0 or i == 0 or (i + 1) == len(member_ids_list):
-                    progress_pct = int((i + 1) / len(member_ids_list) * 100)
-                    log.debug(f"    Fetching member records: {i + 1}/{len(member_ids_list)} ({progress_pct}%)")
-                    print(f"    Fetching member records: {i + 1}/{len(member_ids_list)} ({progress_pct}%) - Found: {success_count}, Not found: {error_count}", end="\r")
-                
-                # Use member_id (mber_...) to fetch member record - this is the correct endpoint
-                member = await whop_client.get_member_by_id(member_id)
-                if member:
-                    member_cache[member_id] = member
-                    # Persist phone into local cache for future cycles
-                    if isinstance(member, dict):
-                        ph = str(member.get("phone") or "").strip()
-                        if ph:
-                            self._set_cached_member_phone(member_id, ph)
-                    success_count += 1
-                else:
-                    # "Not found" is normal - some member IDs might not exist
-                    error_count += 1
-                
-                # Small delay every 10 requests to avoid rate limiting
-                if (i + 1) % 10 == 0:
-                    await asyncio.sleep(0.1)
-                    
-            except WhopAPIError as e:
-                error_count += 1
-                # Only log if it's not a "not found" error (those are expected)
-                if "not found" not in str(e).lower():
-                    log.debug(f"    Whop API error fetching member {uid}: {str(e)}")
-                # Only print progress every 50th error to avoid spam
-                if (i + 1) % 50 == 0:
-                    print(f"    WARNING: Some members not found (normal) - Progress: {i + 1}/{len(member_ids_list)} ({int((i + 1) / len(member_ids_list) * 100)}%)", end="\r")
-            except Exception as e:
-                error_count += 1
-                log.debug(f"    Unexpected error fetching member {member_id}: {type(e).__name__}: {str(e)}")
-                if (i + 1) % 50 == 0:
-                    print(f"    WARNING: Errors encountered (checking member {i + 1}/{len(member_ids_list)})...", end="\r")
-        
-        print()  # New line after progress
-        log.info(f"  ✓ Fetched {success_count} member records successfully ({error_count} errors)")
-        print(f"  OK Fetched {success_count} member records successfully ({error_count} errors)")
-        # Best-effort persist cache changes
-        self._save_member_detail_cache()
         
         # Build rows:
         #   A Name, B Phone Number, C Email, D Product, E Status, F Discord ID, G Status Updated,
@@ -1592,6 +1598,10 @@ class WhopSheetsSync:
         rows_with_spend = 0
         rows_spend_from_member_history = 0
         rows_spend_from_whop = 0
+        rows_spend_from_payments = 0
+        payments_spend_lookups_remaining = self._whop_payments_spend_max_lookups_per_sync()
+        rows_spend_from_payments = 0
+        payments_spend_lookups_remaining = self._whop_payments_spend_max_lookups_per_sync()
         spend_samples: List[str] = []
         
         # Status priority: IMPORTANT - "left" only applies if member has NO active membership
@@ -1728,9 +1738,20 @@ class WhopSheetsSync:
                 left_statuses = {"left", "expired", "completed", "churned"}
                 date_left = _format_date_mmddyy(str(updated_at or "")) if status in left_statuses else ""
 
+                # Total Spend (prefer Whop payload, then Whop payments by email, then member_history by resolved Discord ID)
                 total_spend = _extract_total_spend(mship, member_record)
+                spend_from_whop = bool(total_spend)
+                used_payments = False
                 if not total_spend:
-                    # Spend fallback: resolve DID via email (no need for column F to be present)
+                    total_spend, used_payments = await self._enrich_total_spend_from_whop_payments(
+                        whop_client,
+                        email=email,
+                        current_total_spend=total_spend,
+                        lookups_remaining=payments_spend_lookups_remaining,
+                    )
+                    if used_payments and payments_spend_lookups_remaining is not None and payments_spend_lookups_remaining > 0:
+                        payments_spend_lookups_remaining -= 1
+                if not total_spend:
                     did_for_spend = self._resolve_discord_id_for_spend(
                         email=email,
                         discord_id=discord_id,
@@ -1743,40 +1764,14 @@ class WhopSheetsSync:
                         )
                 if total_spend:
                     rows_with_spend += 1
-                    rows_spend_from_whop += 1
-
-                # Spend fallback: resolve DID via email (no need for column F to be present)
-                if not total_spend:
-                    did_for_spend = self._resolve_discord_id_for_spend(
-                        email=email,
-                        discord_id=discord_id,
-                        existing_discord_by_email=existing_discord_by_email,
-                    )
-                    if did_for_spend:
-                        total_spend = self._enrich_total_spend_from_member_history(
-                            discord_id=did_for_spend,
-                            current_total_spend=total_spend,
-                        )
-                        if total_spend:
-                            rows_with_spend += 1
-                            rows_spend_from_member_history += 1
-
-                if total_spend and len(spend_samples) < 5:
-                    spend_samples.append(f"{email or '-'} did={discord_id or '-'} spend={total_spend}")
-                if not total_spend and discord_id:
-                    total_spend = self._enrich_total_spend_from_member_history(
-                        discord_id=discord_id,
-                        current_total_spend=total_spend,
-                    )
-
-                # Joined/Left dates (MM/DD/YY)
-                created_at = mship.get("created_at") or ""
-                date_joined = _format_date_mmddyy(str(created_at or ""))
-                # Only populate Date Left for left-ish statuses
-                left_statuses = {"left", "expired", "completed", "churned"}
-                date_left = _format_date_mmddyy(str(updated_at or "")) if status in left_statuses else ""
-
-                total_spend = _extract_total_spend(mship, member_record)
+                    if spend_from_whop:
+                        rows_spend_from_whop += 1
+                    elif used_payments:
+                        rows_spend_from_payments += 1
+                    else:
+                        rows_spend_from_member_history += 1
+                    if len(spend_samples) < 5:
+                        spend_samples.append(f"{email or '-'} did={discord_id or '-'} spend={total_spend}")
                 
                 # Determine member key (prefer email, fallback to Discord ID, then member ID)
                 # CRITICAL: Active members should NEVER be skipped - use member ID as last resort
@@ -1979,10 +1974,10 @@ class WhopSheetsSync:
         log.info(f"  OK Built {len(rows)} rows (Email: {rows_with_email}, Phone: {rows_with_phone}, Discord: {rows_with_discord})")
         print(f"  OK Built {len(rows)} rows (Email: {rows_with_email}, Phone: {rows_with_phone}, Discord: {rows_with_discord})")
         log.info(
-            f"  Spend coverage: {rows_with_spend}/{len(rows)} (from_whop={rows_spend_from_whop}, from_member_history={rows_spend_from_member_history})"
+            f"  Spend coverage: {rows_with_spend}/{len(rows)} (from_whop={rows_spend_from_whop}, from_payments={rows_spend_from_payments}, from_member_history={rows_spend_from_member_history})"
         )
         print(
-            f"  Spend coverage: {rows_with_spend}/{len(rows)} (from_whop={rows_spend_from_whop}, from_member_history={rows_spend_from_member_history})"
+            f"  Spend coverage: {rows_with_spend}/{len(rows)} (from_whop={rows_spend_from_whop}, from_payments={rows_spend_from_payments}, from_member_history={rows_spend_from_member_history})"
         )
         if spend_samples:
             log.info("  Spend samples (up to 5): " + " | ".join(spend_samples))
@@ -2042,7 +2037,7 @@ class WhopSheetsSync:
         Upsert rows to a tab with minimal writes:
         - Update only member rows whose values changed (keyed by Discord ID, else Email)
         - Append missing members
-        - Clear rows for members no longer present (does not rewrite whole sheet)
+        - Remove rows for members no longer present (does not rewrite whole sheet)
         """
         spreadsheet_id = _cfg_str(self.cfg, "spreadsheet_id", "")
         if not spreadsheet_id:
@@ -2104,8 +2099,12 @@ class WhopSheetsSync:
 
         # Build map key -> (row_index_1_based, row_values)
         existing_by_key: Dict[str, Tuple[int, List[str]]] = {}
+        empty_row_indices_1b: List[int] = []
         for i, row in enumerate(existing_values, start=1):
             if i == 1:
+                continue
+            if not any(str(c or "").strip() for c in (row or [])):
+                empty_row_indices_1b.append(i)
                 continue
             k = _member_key_from_row(row)
             if not k:
@@ -2131,16 +2130,93 @@ class WhopSheetsSync:
         to_add = [desired_by_key[k] for k in desired_by_key.keys() if k not in existing_by_key]
         stale_keys = [k for k in existing_by_key.keys() if k not in desired_by_key]
 
-        # Clear stale member rows (only rows that existed and now disappeared)
-        to_clear: List[Dict[str, Any]] = []
+        delete_stale_rows = _cfg_bool(self.cfg, "diff_upsert_delete_stale_rows", True)
+        delete_blank_rows = _cfg_bool(self.cfg, "diff_upsert_delete_blank_rows", True)
+        try:
+            delete_blank_rows_max = int((self.cfg or {}).get("diff_upsert_delete_blank_rows_max") or 5000)
+        except Exception:
+            delete_blank_rows_max = 5000
+        if delete_blank_rows_max < 0:
+            delete_blank_rows_max = 0
+        stale_row_indices_1b: List[int] = []
         for k in stale_keys:
             row_i, _existing = existing_by_key[k]
-            to_clear.append(
-                {
-                    "range": f"'{tab_title}'!A{row_i}:{end_col}{row_i}",
-                    "values": [[""] * col_count],
-                }
-            )
+            if row_i > 1:
+                stale_row_indices_1b.append(int(row_i))
+        stale_row_indices_1b.sort()
+
+        async def _get_sheet_id_for_title(title: str) -> Optional[int]:
+            """Resolve sheetId for a tab title (needed for deleteDimension)."""
+            try:
+                service2 = self._get_service()
+                if not service2:
+                    return None
+                def _do_get_meta():
+                    return service2.spreadsheets().get(
+                        spreadsheetId=spreadsheet_id,
+                        fields="sheets(properties(sheetId,title))",
+                    ).execute()
+                resp2 = await asyncio.to_thread(_do_get_meta)
+                sheets = resp2.get("sheets") if isinstance(resp2, dict) else None
+                if isinstance(sheets, list):
+                    for sh in sheets:
+                        props = sh.get("properties") if isinstance(sh, dict) else None
+                        if isinstance(props, dict) and str(props.get("title") or "") == title:
+                            sid = props.get("sheetId")
+                            try:
+                                return int(sid)
+                            except Exception:
+                                return None
+            except Exception:
+                return None
+            return None
+
+        def _group_contiguous(rows_1b: List[int]) -> List[Tuple[int, int]]:
+            """Group sorted 1-based row indices into contiguous (start,end_inclusive) ranges."""
+            if not rows_1b:
+                return []
+            out: List[Tuple[int, int]] = []
+            s = e = rows_1b[0]
+            for r in rows_1b[1:]:
+                if r == e + 1:
+                    e = r
+                else:
+                    out.append((s, e))
+                    s = e = r
+            out.append((s, e))
+            return out
+
+        # Build deleteDimension requests (descending order) so indices remain valid as we delete.
+        delete_requests: List[Dict[str, Any]] = []
+        rows_to_delete_1b: List[int] = []
+        if delete_stale_rows and stale_row_indices_1b:
+            rows_to_delete_1b.extend(stale_row_indices_1b)
+        if delete_blank_rows and empty_row_indices_1b:
+            # Cap deletions per run for safety
+            rows_to_delete_1b.extend(empty_row_indices_1b[:delete_blank_rows_max])
+
+        if delete_requests is not None and rows_to_delete_1b:
+            sheet_id = await _get_sheet_id_for_title(tab_title)
+            if sheet_id is not None:
+                rows_to_delete_1b = sorted(set(int(x) for x in rows_to_delete_1b if int(x) > 1))
+                ranges = _group_contiguous(rows_to_delete_1b)
+                # delete bottom-up
+                for start_1b, end_1b in reversed(ranges):
+                    # convert 1-based row numbers to 0-based [startIndex,endIndex)
+                    start_index = max(1, int(start_1b)) - 1
+                    end_index = max(1, int(end_1b))
+                    delete_requests.append(
+                        {
+                            "deleteDimension": {
+                                "range": {
+                                    "sheetId": sheet_id,
+                                    "dimension": "ROWS",
+                                    "startIndex": start_index,
+                                    "endIndex": end_index,
+                                }
+                            }
+                        }
+                    )
 
         async with self._api_lock:
             # Header update first (if needed)
@@ -2186,21 +2262,22 @@ class WhopSheetsSync:
                 except Exception as e:
                     return False, f"append failed: {e}"
 
-            if to_clear:
-                def _do_clear_rows() -> None:
-                    service.spreadsheets().values().batchUpdate(
+            # Delete stale rows to avoid huge blank gaps (preferred). If disabled/unavailable, we leave stale
+            # rows in place to avoid full rewrites; status tabs and continuous cycles will still converge.
+            if delete_requests:
+                def _do_delete_rows() -> None:
+                    service.spreadsheets().batchUpdate(
                         spreadsheetId=spreadsheet_id,
-                        body={"valueInputOption": "USER_ENTERED", "data": to_clear},
+                        body={"requests": delete_requests},
                     ).execute()
-
                 try:
-                    await asyncio.to_thread(_do_clear_rows)
+                    await asyncio.to_thread(_do_delete_rows)
                 except Exception as e:
-                    return False, f"clear stale rows failed: {e}"
+                    return False, f"delete stale rows failed: {e}"
 
         if log_context:
             log.debug(
-                f"    {log_context} diff-upsert: updated={updated_members}, added={len(to_add)}, cleared={len(to_clear)}"
+                f"    {log_context} diff-upsert: updated={updated_members}, added={len(to_add)}, stale={len(stale_row_indices_1b)}, deleted_empty={len(rows_to_delete_1b) - len(stale_row_indices_1b) if 'rows_to_delete_1b' in locals() else 0}"
             )
         return True, "ok"
     
@@ -2556,98 +2633,13 @@ class WhopSheetsSync:
         # - Skip "left"
         # - Skip existing members when Status Updated unchanged
         # - Skip per-member detail fetch when phone is already available (sheet or local cache)
-        existing_emails = set(existing_by_email.keys())
-        member_ids: Set[str] = set()
-        member_id_email_map: Dict[str, str] = {}
-        skipped_left_count = 0
-        skipped_unchanged_count = 0
-        skipped_has_phone_count = 0
-        for mship in all_memberships:
-            # Skip "left" members - don't fetch their detailed records
-            if mship.get("_is_left_member") or str(mship.get("status") or "").strip().lower() == "left":
-                skipped_left_count += 1
-                continue
-            
-            user_obj = mship.get("user") or {}
-            email = str(user_obj.get("email") or "").strip().lower() if isinstance(user_obj, dict) else ""
-            # Existing member: only skip fetch if Status Updated is unchanged (same timestamp)
-            if email and email in existing_emails:
-                api_updated = mship.get("updated_at") or mship.get("created_at") or ""
-                formatted_ts = _format_timestamp(api_updated)
-                sheet_ts = existing_email_to_timestamp.get(email, "")
-                if formatted_ts and sheet_ts and formatted_ts.strip() == sheet_ts.strip():
-                    skipped_unchanged_count += 1
-                    continue
-                # Timestamp changed or missing -> fetch to get fresh Discord/phone
-            # New member or timestamp changed -> add to fetch list
-            member_obj = mship.get("member") or {}
-            if isinstance(member_obj, dict):
-                member_id = str(member_obj.get("id") or "").strip()
-                if member_id and member_id.startswith("mber_"):
-                    member_ids.add(member_id)
-                    if email:
-                        member_id_email_map[member_id] = email
-        
-        if skipped_left_count > 0:
-            log.info(f"  -> Skipping {skipped_left_count} 'left' members from detailed record fetch")
-            print(f"  -> Skipping {skipped_left_count} 'left' members from detailed record fetch")
-        if skipped_unchanged_count > 0:
-            log.info(f"  -> Skipping {skipped_unchanged_count} members (Status Updated unchanged, no fetch needed)")
-            print(f"  -> Skipping {skipped_unchanged_count} members (Status Updated unchanged, no fetch needed)")
-        
-        # Further minimize: only fetch detail if phone missing from sheet AND cache.
+        # Phone number is NOT reliably available from Whop API for this account.
+        # We intentionally do NOT call /members/{mber_...} at all.
+        # Phone sources are limited to:
+        #  - existing sheet (by email)
+        #  - GHL Website Data Info tab (by email)
         member_cache: Dict[str, Any] = {}
-        need_fetch: List[str] = []
         ghl_map = await self._load_ghl_phone_map_if_needed()
-        for mid in sorted(member_ids):
-            em = member_id_email_map.get(mid, "")
-            phone_from_sheet = ""
-            if em and em in existing_by_email:
-                idx = existing_by_email[em]
-                if idx < len(existing_rows) and len(existing_rows[idx]) > 1:
-                    phone_from_sheet = str(existing_rows[idx][1] or "").strip()
-            phone_from_cache = self._cached_member_phone(mid)
-            phone_from_ghl = str(ghl_map.get(em) or "").strip() if em else ""
-            if phone_from_sheet or phone_from_cache or phone_from_ghl:
-                skipped_has_phone_count += 1
-                if phone_from_cache:
-                    member_cache[mid] = {"phone": phone_from_cache}
-                continue
-            need_fetch.append(mid)
-
-        if skipped_has_phone_count > 0:
-            log.info(f"  -> Skipping {skipped_has_phone_count} members (phone already known, no detail fetch needed)")
-            print(f"  -> Skipping {skipped_has_phone_count} members (phone already known, no detail fetch needed)")
-
-        member_ids_list = list(need_fetch)
-        
-        if member_ids_list and (not self._whop_member_detail_fetch_enabled()):
-            log.info("  -> Detail fetch disabled (whop_member_detail_fetch_enabled=false). Using sheet+GHL only.")
-            print("  -> Detail fetch disabled (whop_member_detail_fetch_enabled=false). Using sheet+GHL only.")
-            member_ids_list = []
-
-        if member_ids_list:
-            log.info(f"  -> Fetching {len(member_ids_list)} detailed member records for Discord ID/phone...")
-            print(f"  -> Fetching {len(member_ids_list)} detailed member records...")
-            
-            for i, member_id in enumerate(member_ids_list):
-                try:
-                    if (i + 1) % 50 == 0:
-                        print(f"    Fetching: {i + 1}/{len(member_ids_list)}", end="\r")
-                    member = await whop_client.get_member_by_id(member_id)
-                    if member:
-                        member_cache[member_id] = member
-                        if isinstance(member, dict):
-                            ph = str(member.get("phone") or "").strip()
-                            if ph:
-                                self._set_cached_member_phone(member_id, ph)
-                    if (i + 1) % 10 == 0:
-                        await asyncio.sleep(0.1)
-                except Exception:
-                    pass
-            
-            print()  # New line
-            self._save_member_detail_cache()
         
         # Deduplicate memberships: each member should have only ONE status (most recent/highest priority)
         # Status priority: IMPORTANT - "left" only applies if member has NO active membership
@@ -2733,7 +2725,6 @@ class WhopSheetsSync:
                 
                 # Phone:
                 # - Preserve from existing row (sheet)
-                # - Else, if Whop returned it (rare for your account), use it
                 # - Else, try GHL Website Data Info tab (email->phone)
                 phone = ""
                 if email:
@@ -2742,17 +2733,6 @@ class WhopSheetsSync:
                         idx = existing_by_email[email_lower]
                         if idx < len(existing_rows) and len(existing_rows[idx]) > 1:
                             phone = str(existing_rows[idx][1] or "").strip()
-                if not phone and isinstance(member_record, dict):
-                    phone = str(member_record.get("phone") or "").strip()
-                if not phone:
-                    # Try from special member data
-                    for status_type in ["left", "churned"]:
-                        if mship.get(f"_{status_type}_member_data"):
-                            special_data = mship.get(f"_{status_type}_member_data")
-                            if isinstance(special_data, dict):
-                                phone = str(special_data.get("phone") or "").strip()
-                                if phone:
-                                    break
                 if not phone and email:
                     phone = await self._enrich_phone_from_ghl(email=email, current_phone=phone)
                 
@@ -2779,16 +2759,29 @@ class WhopSheetsSync:
                 date_left = _format_date_mmddyy(str(updated_at or "")) if status in left_statuses else ""
 
                 total_spend = _extract_total_spend(mship, member_record)
-                if total_spend:
-                    rows_with_spend += 1
-                    rows_spend_from_whop += 1
+                spend_from_whop = bool(total_spend)
+                used_payments = False
+                if not total_spend:
+                    total_spend, used_payments = await self._enrich_total_spend_from_whop_payments(
+                        whop_client,
+                        email=email,
+                        current_total_spend=total_spend,
+                        lookups_remaining=payments_spend_lookups_remaining,
+                    )
+                    if used_payments and payments_spend_lookups_remaining is not None and payments_spend_lookups_remaining > 0:
+                        payments_spend_lookups_remaining -= 1
                 if not total_spend and discord_id:
                     total_spend = self._enrich_total_spend_from_member_history(
                         discord_id=discord_id,
                         current_total_spend=total_spend,
                     )
-                    if total_spend:
-                        rows_with_spend += 1
+                if total_spend:
+                    rows_with_spend += 1
+                    if spend_from_whop:
+                        rows_spend_from_whop += 1
+                    elif used_payments:
+                        rows_spend_from_payments += 1
+                    else:
                         rows_spend_from_member_history += 1
                 if total_spend and len(spend_samples) < 5:
                     spend_samples.append(f"{email or '-'} did={discord_id or '-'} spend={total_spend}")
@@ -2860,10 +2853,10 @@ class WhopSheetsSync:
         log.info(f"  -> Deduplicated: {len(all_memberships)} memberships -> {len(member_status_map)} unique members")
         print(f"  -> Deduplicated: {len(all_memberships)} memberships -> {len(member_status_map)} unique members")
         log.info(
-            f"  Spend coverage: {rows_with_spend}/{len(member_status_map)} (from_whop={rows_spend_from_whop}, from_member_history={rows_spend_from_member_history})"
+            f"  Spend coverage: {rows_with_spend}/{len(member_status_map)} (from_whop={rows_spend_from_whop}, from_payments={rows_spend_from_payments}, from_member_history={rows_spend_from_member_history})"
         )
         print(
-            f"  Spend coverage: {rows_with_spend}/{len(member_status_map)} (from_whop={rows_spend_from_whop}, from_member_history={rows_spend_from_member_history})"
+            f"  Spend coverage: {rows_with_spend}/{len(member_status_map)} (from_whop={rows_spend_from_whop}, from_payments={rows_spend_from_payments}, from_member_history={rows_spend_from_member_history})"
         )
         if spend_samples:
             log.info("  Spend samples (up to 5): " + " | ".join(spend_samples))

@@ -48,6 +48,13 @@
   "whop_member_detail_fetch_enabled": false,
   "ghl_phone_enrichment_enabled": true,
   "ghl_phone_tab_name": "GHL Website Data Info",
+  "whop_payments_total_spent_enabled": false,
+  "whop_payments_total_spent_cache_path": "WhopMembershipSync/whop_payments_spend_cache.json",
+  "whop_payments_total_spent_cache_ttl_hours": 24,
+  "whop_payments_total_spent_max_lookups_per_sync": 200,
+  "diff_upsert_delete_stale_rows": true,
+  "diff_upsert_delete_blank_rows": true,
+  "diff_upsert_delete_blank_rows_max": 5000,
   "member_history_total_spent_enabled": true,
   "member_history_path": "RSCheckerbot/member_history.json",
   "whop_api": {
