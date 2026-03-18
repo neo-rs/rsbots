@@ -1548,6 +1548,10 @@ class WhopSheetsSync:
         rows_with_email = 0
         rows_with_phone = 0
         rows_with_discord = 0
+        rows_with_spend = 0
+        rows_spend_from_member_history = 0
+        rows_spend_from_whop = 0
+        spend_samples: List[str] = []
         
         # Status priority: IMPORTANT - "left" only applies if member has NO active membership
         # Active memberships take precedence over "left" status from /members endpoint
@@ -1679,11 +1683,20 @@ class WhopSheetsSync:
                 date_left = _format_date_mmddyy(str(updated_at or "")) if status in left_statuses else ""
 
                 total_spend = _extract_total_spend(mship, member_record)
+                if total_spend:
+                    rows_with_spend += 1
+                    rows_spend_from_whop += 1
                 if not total_spend and discord_id:
                     total_spend = self._enrich_total_spend_from_member_history(
                         discord_id=discord_id,
                         current_total_spend=total_spend,
                     )
+                    if total_spend:
+                        rows_with_spend += 1
+                        rows_spend_from_member_history += 1
+
+                if total_spend and len(spend_samples) < 5:
+                    spend_samples.append(f"{email or '-'} did={discord_id or '-'} spend={total_spend}")
                 if not total_spend and discord_id:
                     total_spend = self._enrich_total_spend_from_member_history(
                         discord_id=discord_id,
@@ -1899,6 +1912,14 @@ class WhopSheetsSync:
         
         log.info(f"  OK Built {len(rows)} rows (Email: {rows_with_email}, Phone: {rows_with_phone}, Discord: {rows_with_discord})")
         print(f"  OK Built {len(rows)} rows (Email: {rows_with_email}, Phone: {rows_with_phone}, Discord: {rows_with_discord})")
+        log.info(
+            f"  Spend coverage: {rows_with_spend}/{len(rows)} (from_whop={rows_spend_from_whop}, from_member_history={rows_spend_from_member_history})"
+        )
+        print(
+            f"  Spend coverage: {rows_with_spend}/{len(rows)} (from_whop={rows_spend_from_whop}, from_member_history={rows_spend_from_member_history})"
+        )
+        if spend_samples:
+            log.info("  Spend samples (up to 5): " + " | ".join(spend_samples))
         
         # Write to sheet with diff-upsert (only touches changed/new/stale members)
         log.info(f"  -> Writing {len(rows)} rows to Google Sheets tab '{tab_title}' (diff-upsert)...")
@@ -2585,6 +2606,10 @@ class WhopSheetsSync:
         
         # Group memberships by member identifier (email or Discord ID)
         member_status_map: Dict[str, Dict[str, Any]] = {}  # key: email_lower or discord_id -> {status, row_data, updated_at}
+        rows_with_spend = 0
+        rows_spend_from_member_history = 0
+        rows_spend_from_whop = 0
+        spend_samples: List[str] = []
         
         # Get product name
         product_name = "Reselling Secrets" if "Reselling Secrets" in source_tab and "Lite" not in source_tab else "Reselling Secrets Lite"
@@ -2688,6 +2713,19 @@ class WhopSheetsSync:
                 date_left = _format_date_mmddyy(str(updated_at or "")) if status in left_statuses else ""
 
                 total_spend = _extract_total_spend(mship, member_record)
+                if total_spend:
+                    rows_with_spend += 1
+                    rows_spend_from_whop += 1
+                if not total_spend and discord_id:
+                    total_spend = self._enrich_total_spend_from_member_history(
+                        discord_id=discord_id,
+                        current_total_spend=total_spend,
+                    )
+                    if total_spend:
+                        rows_with_spend += 1
+                        rows_spend_from_member_history += 1
+                if total_spend and len(spend_samples) < 5:
+                    spend_samples.append(f"{email or '-'} did={discord_id or '-'} spend={total_spend}")
                 
                 # Determine member key (prefer email, fallback to Discord ID)
                 member_key = None
@@ -2755,6 +2793,14 @@ class WhopSheetsSync:
         
         log.info(f"  -> Deduplicated: {len(all_memberships)} memberships -> {len(member_status_map)} unique members")
         print(f"  -> Deduplicated: {len(all_memberships)} memberships -> {len(member_status_map)} unique members")
+        log.info(
+            f"  Spend coverage: {rows_with_spend}/{len(member_status_map)} (from_whop={rows_spend_from_whop}, from_member_history={rows_spend_from_member_history})"
+        )
+        print(
+            f"  Spend coverage: {rows_with_spend}/{len(member_status_map)} (from_whop={rows_spend_from_whop}, from_member_history={rows_spend_from_member_history})"
+        )
+        if spend_samples:
+            log.info("  Spend samples (up to 5): " + " | ".join(spend_samples))
         
         # Now update/add rows based on deduplicated data
         # Handle backward compatibility: existing rows might have fewer columns (older sheet layout)
