@@ -479,6 +479,45 @@ class WhopSheetsSync:
         self._whop_payments_spend: Dict[str, Any] = {}
         self._whop_payments_spend_mtime: float = 0.0
         self._whop_payments_spend_at: float = 0.0
+        # Per-sync counters (reset at start of each sync method)
+        self._sync_stats: Dict[str, Any] = {}
+
+    def _change_report_enabled(self) -> bool:
+        return _cfg_bool(self.cfg, "sync_change_report_enabled", True)
+
+    def _change_report_samples_n(self) -> int:
+        try:
+            n = int((self.cfg or {}).get("sync_change_report_samples") or 5)
+        except Exception:
+            n = 5
+        if n < 0:
+            n = 0
+        return n
+
+    def _sync_stats_reset(self, *, context: str) -> None:
+        self._sync_stats = {
+            "context": str(context or "").strip(),
+            "payments": {"attempted": 0, "cache_hits": 0, "api_calls": 0, "failures": 0},
+            "sheet": {},  # filled by writer
+        }
+
+    def _sync_stats_incr(self, path: str, n: int = 1) -> None:
+        """Increment a nested counter in self._sync_stats by dot path."""
+        try:
+            parts = [p for p in str(path or "").split(".") if p]
+            cur: Any = self._sync_stats
+            for p in parts[:-1]:
+                if not isinstance(cur, dict):
+                    return
+                if p not in cur or not isinstance(cur[p], dict):
+                    cur[p] = {}
+                cur = cur[p]
+            if not isinstance(cur, dict) or not parts:
+                return
+            leaf = parts[-1]
+            cur[leaf] = int(cur.get(leaf) or 0) + int(n)
+        except Exception:
+            return
 
     def _whop_payments_spend_enabled(self) -> bool:
         return _cfg_bool(self.cfg, "whop_payments_total_spent_enabled", False)
@@ -499,6 +538,9 @@ class WhopSheetsSync:
         if hours <= 0:
             hours = 24.0
         return hours * 3600.0
+
+    def _whop_payments_spend_write_zero_when_none(self) -> bool:
+        return _cfg_bool(self.cfg, "whop_payments_total_spent_write_zero_when_none", True)
 
     def _whop_payments_spend_max_lookups_per_sync(self) -> int:
         try:
@@ -597,11 +639,13 @@ class WhopSheetsSync:
         after: Optional[str] = None
         total = 0.0
         pages = 0
+        saw_any_payment = False
         while True:
             pages += 1
             payments, page_info = await whop_client.list_payments(first=100, after=after, params={"query": q})
             if not payments:
                 break
+            saw_any_payment = True
             for p in payments:
                 if not isinstance(p, dict):
                     continue
@@ -628,9 +672,13 @@ class WhopSheetsSync:
             # Safety cap: avoid unbounded loops on API bugs
             if pages >= 100:
                 break
-        if total <= 0:
-            return ""
-        return f"${total:,.2f}"
+        if total > 0:
+            return f"${total:,.2f}"
+        # If lookup succeeded but no successful payments exist, optionally write $0.00
+        if self._whop_payments_spend_write_zero_when_none():
+            # Even if there are no payments at all for this email, treat as lifetime $0.00
+            return "$0.00"
+        return ""
 
     async def _enrich_total_spend_from_whop_payments(
         self,
@@ -656,13 +704,29 @@ class WhopSheetsSync:
             return ("", False)
         if lookups_remaining is not None and lookups_remaining <= 0:
             return ("", False)
+        self._sync_stats_incr("payments.attempted", 1)
 
         cached = self._cache_get_whop_payments_spend(em)
         if cached:
+            self._sync_stats_incr("payments.cache_hits", 1)
             return (cached, True)
 
         # Compute and cache
-        total_spent = await self._compute_total_spend_via_payments_query(whop_client, query=em)
+        try:
+            self._sync_stats_incr("payments.api_calls", 1)
+            total_spent = await self._compute_total_spend_via_payments_query(whop_client, query=em)
+        except Exception as e:
+            # Visibility: when enabled but not working, we need to know why (403/timeout/etc).
+            # Keep it low-noise: only log occasionally.
+            try:
+                self._whop_payments_spend_err_count = int(getattr(self, "_whop_payments_spend_err_count", 0)) + 1
+                setattr(self, "_whop_payments_spend_err_count", self._whop_payments_spend_err_count)
+                if self._whop_payments_spend_err_count <= 5 or (self._whop_payments_spend_err_count % 100 == 0):
+                    log.warning(f"  WARNING: payments spend lookup failed for {em}: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+            self._sync_stats_incr("payments.failures", 1)
+            return ("", False)
         if not total_spent:
             return ("", False)
 
@@ -1192,6 +1256,7 @@ class WhopSheetsSync:
             error_msg = f"failed to ensure tab: {err}"
             log.error(f"  ✗ {error_msg}")
             return False, error_msg, 0
+        self._sync_stats_reset(context=f"product_sync:{product_id}:{tab_title}")
         log.info(f"  ✓ Tab '{tab_title}' ready")
         print(f"  OK Tab '{tab_title}' ready")
 
@@ -1600,8 +1665,19 @@ class WhopSheetsSync:
         rows_spend_from_whop = 0
         rows_spend_from_payments = 0
         payments_spend_lookups_remaining = self._whop_payments_spend_max_lookups_per_sync()
-        rows_spend_from_payments = 0
-        payments_spend_lookups_remaining = self._whop_payments_spend_max_lookups_per_sync()
+        if self._whop_payments_spend_enabled():
+            try:
+                ttl_h = self._whop_payments_spend_cache_ttl_s() / 3600.0
+            except Exception:
+                ttl_h = 0.0
+            log.info(
+                "  Payments-by-email spend: enabled=true "
+                f"(max_lookups_per_sync={payments_spend_lookups_remaining}, cache_ttl_hours={ttl_h:.2f})"
+            )
+            print(
+                "  Payments-by-email spend: enabled=true "
+                f"(max_lookups_per_sync={payments_spend_lookups_remaining}, cache_ttl_hours={ttl_h:.2f})"
+            )
         spend_samples: List[str] = []
         
         # Status priority: IMPORTANT - "left" only applies if member has NO active membership
@@ -1995,6 +2071,38 @@ class WhopSheetsSync:
         
         log.info(f"    ✓ Wrote {len(rows)} rows to sheet")
         print(f"    OK Wrote {len(rows)} rows to sheet")
+
+        # Per-sync "what changed" report
+        if self._change_report_enabled():
+            try:
+                p = (self._sync_stats or {}).get("payments") if isinstance(self._sync_stats, dict) else {}
+                sh = (self._sync_stats or {}).get("sheet") if isinstance(self._sync_stats, dict) else {}
+                if isinstance(p, dict) and self._whop_payments_spend_enabled():
+                    log.info(
+                        "  Change report (payments-by-email): "
+                        f"attempted={p.get('attempted',0)} cache_hits={p.get('cache_hits',0)} "
+                        f"api_calls={p.get('api_calls',0)} failures={p.get('failures',0)}"
+                    )
+                    print(
+                        "  Change report (payments-by-email): "
+                        f"attempted={p.get('attempted',0)} cache_hits={p.get('cache_hits',0)} "
+                        f"api_calls={p.get('api_calls',0)} failures={p.get('failures',0)}"
+                    )
+                if isinstance(sh, dict):
+                    rec = sh.get(tab_title) or sh.get(str(tab_title))
+                    if isinstance(rec, dict):
+                        log.info(
+                            "  Change report (sheet write): "
+                            f"updated={rec.get('updated',0)} added={rec.get('added',0)} "
+                            f"stale={rec.get('stale',0)} deleted_rows={rec.get('deleted_rows',0)}"
+                        )
+                        print(
+                            "  Change report (sheet write): "
+                            f"updated={rec.get('updated',0)} added={rec.get('added',0)} "
+                            f"stale={rec.get('stale',0)} deleted_rows={rec.get('deleted_rows',0)}"
+                        )
+            except Exception:
+                pass
         return True, "ok", len(rows)
     
     async def read_source_tab(self, tab_name: str) -> List[List[str]]:
@@ -2114,6 +2222,7 @@ class WhopSheetsSync:
                 existing_by_key[k] = (i, row)
 
         to_update: List[Dict[str, Any]] = []
+        updated_keys: List[str] = []
         updated_members = 0
         for k, desired in desired_by_key.items():
             if k not in existing_by_key:
@@ -2126,6 +2235,7 @@ class WhopSheetsSync:
                         "values": [desired],
                     }
                 )
+                updated_keys.append(k)
 
         to_add = [desired_by_key[k] for k in desired_by_key.keys() if k not in existing_by_key]
         stale_keys = [k for k in existing_by_key.keys() if k not in desired_by_key]
@@ -2279,6 +2389,35 @@ class WhopSheetsSync:
             log.debug(
                 f"    {log_context} diff-upsert: updated={updated_members}, added={len(to_add)}, stale={len(stale_row_indices_1b)}, deleted_empty={len(rows_to_delete_1b) - len(stale_row_indices_1b) if 'rows_to_delete_1b' in locals() else 0}"
             )
+            if self._change_report_enabled():
+                try:
+                    n = self._change_report_samples_n()
+                    if n:
+                        add_keys = list(desired_by_key.keys())
+                        add_samples = [k for k in add_keys if k not in existing_by_key][:n]
+                        upd_samples = updated_keys[:n]
+                        del_samples = stale_keys[:n]
+                        if upd_samples:
+                            log.info(f"  Change report ({log_context}): updated sample keys: {', '.join(upd_samples)}")
+                        if add_samples:
+                            log.info(f"  Change report ({log_context}): added sample keys: {', '.join(add_samples)}")
+                        if del_samples:
+                            log.info(f"  Change report ({log_context}): stale sample keys: {', '.join(del_samples)}")
+                except Exception:
+                    pass
+
+        # Stash per-tab write stats for end-of-sync summary
+        try:
+            if isinstance(self._sync_stats, dict):
+                self._sync_stats.setdefault("sheet", {})
+                self._sync_stats["sheet"][str(tab_title)] = {
+                    "updated": int(updated_members),
+                    "added": int(len(to_add)),
+                    "stale": int(len(stale_keys)),
+                    "deleted_rows": int(len(rows_to_delete_1b)) if "rows_to_delete_1b" in locals() else 0,
+                }
+        except Exception:
+            pass
         return True, "ok"
     
     async def write_status_tab(self, tab_name: str, rows: List[List[str]]) -> Tuple[bool, str]:
