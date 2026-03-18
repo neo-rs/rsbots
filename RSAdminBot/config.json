@@ -67,8 +67,8 @@
   },
     "bot_groups": {
       "rsadminbot": ["rsadminbot"],
-      "rs_bots": ["rsforwarder", "rsonboarding", "rsmentionpinger", "rscheckerbot", "rssuccessbot", "rspromobot"],
-      "mirror_bots": ["dailyschedulereminder", "datamanagerbot", "discumbot", "instorebotforwarder", "pingbot", "whopmembershipsync"]
+      "rs_bots": ["rsforwarder", "rsonboarding", "rsmentionpinger", "rscheckerbot", "rssuccessbot", "rspromobot", "whopmembershipsync"],
+      "mirror_bots": ["dailyschedulereminder", "datamanagerbot", "discumbot", "instorebotforwarder", "pingbot"]
     },
   "ssh_server_name": "instance-enhance (rsadmin)",
   "logging": {
