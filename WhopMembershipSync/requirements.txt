@@ -1,0 +1,5 @@
+# WhopMembershipSync - Oracle/server venv
+# RSCheckerbot is in the repo (parent path); this only adds Sheets API deps.
+aiohttp>=3.9.0
+google-auth>=2.0.0
+google-api-python-client>=2.0.0

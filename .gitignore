@@ -102,6 +102,17 @@
 !RSPromoBot/README.md
 !RSPromoBot/requirements.txt
 
+# WhopMembershipSync service (lives in this repo; deployed to Oracle)
+!WhopMembershipSync/
+!WhopMembershipSync/**/
+!WhopMembershipSync/*.py
+!WhopMembershipSync/**/*.py
+!WhopMembershipSync/*.md
+!WhopMembershipSync/**/*.md
+!WhopMembershipSync/config.json
+!WhopMembershipSync/requirements.txt
+!WhopMembershipSync/*.bat
+
 # Allow shared scripts used by RSAdminBot (Oracle data tools)
 !scripts/
 !scripts/**/

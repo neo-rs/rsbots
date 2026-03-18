@@ -1,0 +1,64 @@
+{
+  "_comment": "Whop Membership to Google Sheets Sync Configuration",
+  "enabled": true,
+  "spreadsheet_id": "1s4rVvBmrsO4L7LlDeVBV7_pqLFUi0ricocyPPQtWdOk",
+  "sync_interval_minutes": 60,
+  "products": [
+    {
+      "product_id": "prod_RrcvGelB8tVgu",
+      "tab_name": "Whop API - Reselling Secrets",
+      "enabled": true
+    },
+    {
+      "product_id": "prod_U52ytqRZdCFak",
+      "tab_name": "Whop API - Reselling Secrets Lite",
+      "enabled": true
+    },
+    {
+      "product_id": "prod_76xygbFOv0aUM",
+      "tab_name": "Whop API - Lifetime",
+      "enabled": true
+    }
+  ],
+  "status_tabs": {
+    "_comment": "Status-based tabs: Segregates members from 'Whop API - Reselling Secrets' by status",
+    "enabled": true,
+    "source_tab": "Whop API - Reselling Secrets",
+    "status_mapping": {
+      "_comment": "Active = paying only (status=active). Left = no longer in Whop (left, expired). Other = past_due/completed/unresolved/drafted. canceling/left/churned from API.",
+      "active": "Active",
+      "canceling": "Canceling",
+      "trialing": "Trialing",
+      "past_due": "Other",
+      "completed": "Other",
+      "expired": "Left",
+      "unresolved": "Other",
+      "drafted": "Other",
+      "left": "Left",
+      "churned": "Churned"
+    },
+    "_note": "These tabs already exist with headers: Name, Phone Number, Email, Product, Status, Discord ID, Status Updated"
+  },
+  "continuous_sync": {
+    "_comment": "Continuous sync mode: Runs periodically and adds new members incrementally",
+    "enabled": true,
+    "check_interval_minutes": 15,
+    "_note": "Set enabled to true to run continuously. Otherwise runs once when executed."
+  },
+  "whop_api": {
+    "base_url": "https://api.whop.com/api/v1",
+    "company_id": "biz_s58kr1WWnL1bzH"
+  },
+  "_note_google_service_account": "Google service account JSON is loaded from config.secrets.json (google_service_account_json) or RSForwarder/config.secrets.json",
+  "email_templates": {
+    "_comment": "Per-status subject/body for send_status_emails.py. Use {{name}}, {{email}}, {{product}}, {{status}}.",
+    "Active": {
+      "subject": "Thanks for being a member!",
+      "body": "Hi {{name}},\n\nThank you for your continued support.\n\nBest regards"
+    },
+    "Left": {
+      "subject": "We miss you",
+      "body": "Hi {{name}},\n\nWe'd love to have you back.\n\nBest regards"
+    }
+  }
+}
