@@ -602,6 +602,10 @@ class WhopSheetsSync:
     def _ghl_phone_enabled(self) -> bool:
         return _cfg_bool(self.cfg, "ghl_phone_enrichment_enabled", True)
 
+    def _whop_member_detail_fetch_enabled(self) -> bool:
+        # For your Whop account, /members/{id} does not return phone/discord, so this should usually be disabled.
+        return _cfg_bool(self.cfg, "whop_member_detail_fetch_enabled", False)
+
     def _ghl_phone_tab_title(self) -> str:
         # Tab in the same spreadsheet: contains Email + Phone Number columns
         return _cfg_str(self.cfg, "ghl_phone_tab_name", "GHL Website Data Info")
@@ -1357,6 +1361,11 @@ class WhopSheetsSync:
         member_ids_list = list(need_fetch)
         log.info(f"  -> Detail fetch required for {len(member_ids_list)}/{total_member_ids} members (missing phone)")
         print(f"  -> Detail fetch required for {len(member_ids_list)}/{total_member_ids} members (missing phone)")
+
+        if not self._whop_member_detail_fetch_enabled():
+            log.info("  -> Detail fetch disabled (whop_member_detail_fetch_enabled=false). Using sheet+GHL only.")
+            print("  -> Detail fetch disabled (whop_member_detail_fetch_enabled=false). Using sheet+GHL only.")
+            member_ids_list = []
         
         log.info(f"  -> Fetching {len(member_ids_list)} member records from /members/{{mber_...}} endpoint...")
         print(f"  -> Fetching {len(member_ids_list)} member records from /members/{{mber_...}} endpoint...")
@@ -2410,6 +2419,11 @@ class WhopSheetsSync:
 
         member_ids_list = list(need_fetch)
         
+        if member_ids_list and (not self._whop_member_detail_fetch_enabled()):
+            log.info("  -> Detail fetch disabled (whop_member_detail_fetch_enabled=false). Using sheet+GHL only.")
+            print("  -> Detail fetch disabled (whop_member_detail_fetch_enabled=false). Using sheet+GHL only.")
+            member_ids_list = []
+
         if member_ids_list:
             log.info(f"  -> Fetching {len(member_ids_list)} detailed member records for Discord ID/phone...")
             print(f"  -> Fetching {len(member_ids_list)} detailed member records...")

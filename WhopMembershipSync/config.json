@@ -45,6 +45,9 @@
     "check_interval_minutes": 15,
     "_note": "Set enabled to true to run continuously. Otherwise runs once when executed."
   },
+  "whop_member_detail_fetch_enabled": false,
+  "ghl_phone_enrichment_enabled": true,
+  "ghl_phone_tab_name": "GHL Website Data Info",
   "whop_api": {
     "base_url": "https://api.whop.com/api/v1",
     "company_id": "biz_s58kr1WWnL1bzH"
