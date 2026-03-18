@@ -1734,7 +1734,7 @@ class WhopSheetsSync:
                     did_for_spend = self._resolve_discord_id_for_spend(
                         email=email,
                         discord_id=discord_id,
-                        existing_discord_by_email=None,
+                        existing_discord_by_email=existing_discord_by_email,
                     )
                     if did_for_spend:
                         total_spend = self._enrich_total_spend_from_member_history(
