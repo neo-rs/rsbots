@@ -699,6 +699,19 @@ class WhopSheetsSync:
         self._mh_total_spent = dict(out)
         self._mh_total_spent_mtime = mtime
         self._mh_total_spent_at = now
+        # One-time-ish visibility: confirm member_history spend coverage on this host.
+        try:
+            if out:
+                sample_items = list(out.items())[:3]
+                sample_txt = ", ".join(f"{k}:{v}" for (k, v) in sample_items)
+            else:
+                sample_txt = ""
+            log.info(
+                f"  Loaded member_history total_spent map: {len(out)} entries"
+                + (f" (samples: {sample_txt})" if sample_txt else "")
+            )
+        except Exception:
+            pass
         return dict(out)
 
     def _enrich_total_spend_from_member_history(self, *, discord_id: str, current_total_spend: str) -> str:
@@ -1659,8 +1672,13 @@ class WhopSheetsSync:
                 if not product_name:
                     product_name = "Reselling Secrets" if "Reselling Secrets" in tab_name and "Lite" not in tab_name else "Reselling Secrets Lite"
                 
-                # Extract Discord ID from member record (Whop-side). If missing, enrich from Discord-side identity cache (email match).
+                # Discord ID:
+                # - Whop-side extraction (usually blank in your account)
+                # - Preserve existing sheet Discord ID by email (keeps previously linked rows stable)
+                # - Fallback to RSCheckerbot identity cache (email -> discord_id)
                 discord_id = _extract_discord_id(mship, member_record)
+                if not discord_id and email:
+                    discord_id = str(existing_discord_by_email.get(email.strip().lower(), "") or "").strip() or discord_id
                 if not discord_id and email:
                     discord_id = self._enrich_discord_id(email=email, current_discord_id=discord_id)
                 
