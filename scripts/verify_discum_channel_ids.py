@@ -32,6 +32,7 @@ import json
 import os
 import sys
 import time
+import codecs
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,7 +44,16 @@ except ImportError:
 
 # Repo root = parent of scripts/
 ROOT = Path(__file__).resolve().parent.parent
-MWDISCUM_CONFIG = ROOT / "MWBots" / "MWDiscumBot" / "config"
+#
+# Canonical path differs between local mirrors vs Oracle layout:
+# - Local repo often has:   MWBots/MWDiscumBot/config
+# - Oracle server tree has: MWDiscumBot/config
+#
+_CONFIG_CANDIDATES = [
+    ROOT / "MWBots" / "MWDiscumBot" / "config",
+    ROOT / "MWDiscumBot" / "config",
+]
+MWDISCUM_CONFIG = next((p for p in _CONFIG_CANDIDATES if p.is_dir()), _CONFIG_CANDIDATES[0])
 TOKENS_ENV = MWDISCUM_CONFIG / "tokens.env"
 CHANNEL_MAP_JSON = MWDISCUM_CONFIG / "channel_map.json"
 CHANNEL_MAP_INFO_JSON = MWDISCUM_CONFIG / "channel_map_info.json"
@@ -153,6 +163,18 @@ def fetch_guild_name(guild_id: int, user_token: str, *, use_bearer: bool = False
 
 
 def main() -> None:
+    # Ensure Windows console can print Discord unicode safely.
+    # Without this, cp1252 can throw UnicodeEncodeError and crash the run.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except Exception:
+        try:
+            sys.stdout = codecs.getwriter("utf-8")(sys.stdout)  # type: ignore[assignment]
+            sys.stderr = codecs.getwriter("utf-8")(sys.stderr)  # type: ignore[assignment]
+        except Exception:
+            pass
+
     argv = [a for a in sys.argv[1:] if a not in ("--remove-failed", "--debug")]
     remove_failed = "--remove-failed" in sys.argv
     debug = "--debug" in sys.argv
