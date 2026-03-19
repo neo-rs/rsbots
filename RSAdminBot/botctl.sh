@@ -38,6 +38,7 @@ declare -A SERVICES=(
   ["rscheckerbot"]="mirror-world-rscheckerbot.service"
   ["rsforwarder"]="mirror-world-rsforwarder.service"
   ["rssuccessbot"]="mirror-world-rssuccessbot.service"
+  ["rspromobot"]="mirror-world-rspromobot.service"
   ["rsmentionpinger"]="mirror-world-rsmentionpinger.service"
   ["datamanagerbot"]="mirror-world-datamanagerbot.service"
   ["dailyschedulereminder"]="mirror-world-dailyschedulereminder.service"
@@ -94,7 +95,7 @@ case "$ACTION" in
           exit 0
         fi
         ;;
-      rsforwarder|rsonboarding|rsmentionpinger|rscheckerbot|rssuccessbot)
+      rsforwarder|rsonboarding|rsmentionpinger|rscheckerbot|rssuccessbot|rspromobot)
         if [ -f "$ROOT_DIR/manage_rs_bots.sh" ]; then
           bash "$ROOT_DIR/manage_rs_bots.sh" "$ACTION" "$bot"
           exit 0
