@@ -415,7 +415,7 @@ class PromoBuilderView(discord.ui.View):
         color = int(self.bot_ref.config["embed_color"])
         embeds = build_dm_embeds(self.session, color)
         preview_content = self.bot_ref.messages.get("preview_label", "**Preview:**")
-        preview_view = build_cta_view(self.session.get("cta_label"), self.session.get("cta_url"))
+        preview_view = self.bot_ref.sender._build_send_view(self.session)
         await interaction.response.send_message(content=preview_content, embeds=embeds, view=preview_view, ephemeral=True)
 
     @discord.ui.button(label="Test Send", style=discord.ButtonStyle.primary)
@@ -430,7 +430,7 @@ class PromoBuilderView(discord.ui.View):
         try:
             color = int(self.bot_ref.config["embed_color"])
             embeds = build_dm_embeds(self.session, color)
-            view = build_cta_view(self.session.get("cta_label"), self.session.get("cta_url"))
+            view = self.bot_ref.sender._build_send_view(self.session)
             await interaction.user.send(embeds=embeds, view=view)
             await interaction.response.send_message(self.bot_ref.messages["test_send_success"], ephemeral=True)
         except Exception as exc:
