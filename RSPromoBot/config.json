@@ -19,7 +19,7 @@
   "send_timeout_seconds": 20,
   "dm_delay_min_seconds": 1,
   "dm_delay_max_seconds": 4,
-  "notify_role_id": "",
+  "notify_role_id": "1484079536457912374",
   "exclude_bots": true,
   "default_test_mode": false,
   "data_dir": "data",
