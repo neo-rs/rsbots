@@ -173,6 +173,8 @@ class RSSuccessBot:
                     self.json_data["image_hashes"] = {}
                 if "point_movements" not in self.json_data:
                     self.json_data["point_movements"] = []
+                if "suggestions_last_post" not in self.json_data:
+                    self.json_data["suggestions_last_post"] = {}
                 print(f"{Colors.GREEN}[JSON] Loaded data from {self.json_data_path}{Colors.RESET}")
                 print(f"{Colors.CYAN}[JSON]   - {len(self.json_data['points'])} users with points{Colors.RESET}")
                 print(f"{Colors.CYAN}[JSON]   - {len(self.json_data['image_hashes'])} image hashes{Colors.RESET}")
@@ -183,6 +185,7 @@ class RSSuccessBot:
                     "points": {},
                     "image_hashes": {},
                     "point_movements": [],
+                    "suggestions_last_post": {},
                     "migrated_at": datetime.now().isoformat()
                 }
                 self.save_json_data()
@@ -551,15 +554,117 @@ class RSSuccessBot:
                 await self.bot.process_commands(message)
                 return
 
-            # Suggestions channel auto-react (no points logic)
-            suggestions_channel_ids = self.config.get("suggestions_reaction_channel_ids", [])
-            if message.channel.id in suggestions_channel_ids:
-                reaction_emojis = self.config.get("suggestions_reaction_emojis", ["✅", "❌"])
+            # Suggestions workflow:
+            # - Parent channel messages: validate length + cooldown, react ✅/❌, create a thread and post "Suggestion Comments".
+            # - Thread messages: no cooldown/delay validation; reactions can still be applied.
+            suggestions_parent_channel_ids = set(self.config.get("suggestions_reaction_channel_ids", []))
+            parent_id = getattr(message.channel, "parent_id", None)
+            is_suggestions_parent_message = message.channel.id in suggestions_parent_channel_ids
+            is_suggestions_thread_message = parent_id in suggestions_parent_channel_ids
+
+            reaction_emojis = self.config.get("suggestions_reaction_emojis", ["✅", "❌"])
+
+            # Parent channel: enforce min chars + cooldown
+            if is_suggestions_parent_message:
+                min_chars = int(self.config.get("suggestions_min_chars", 20))
+                cooldown_seconds = int(self.config.get("suggestions_cooldown_seconds", 300))
+                warn_delete_seconds = int(self.config.get("suggestions_warn_delete_seconds", 10))
+
+                content = (message.content or "").strip()
+                if len(content) < min_chars:
+                    try:
+                        await message.delete()
+                    except Exception:
+                        pass
+
+                    warn = None
+                    try:
+                        warn = await message.channel.send(
+                            content=f"❌ Please write at least {min_chars} characters for suggestions."
+                        )
+                        await asyncio.sleep(warn_delete_seconds)
+                        if warn:
+                            await warn.delete()
+                    except Exception:
+                        pass
+
+                    await self.bot.process_commands(message)
+                    return
+
+                user_id_str = str(message.author.id)
+                now = datetime.now(timezone.utc)
+                suggestions_last_post = self.json_data.get("suggestions_last_post", {})
+                last_iso = suggestions_last_post.get(user_id_str)
+
+                if last_iso:
+                    try:
+                        last_dt = datetime.fromisoformat(last_iso)
+                        if (now - last_dt).total_seconds() < cooldown_seconds:
+                            try:
+                                await message.delete()
+                            except Exception:
+                                pass
+
+                            warn = None
+                            try:
+                                remaining = int(cooldown_seconds - (now - last_dt).total_seconds())
+                                warn = await message.channel.send(
+                                    content=f"❌ Slow down. Please wait {remaining}s before sending another suggestion."
+                                )
+                                await asyncio.sleep(warn_delete_seconds)
+                                if warn:
+                                    await warn.delete()
+                            except Exception:
+                                pass
+
+                            await self.bot.process_commands(message)
+                            return
+                    except Exception:
+                        # If timestamp parsing fails, fall through and allow the message.
+                        pass
+
+                # Accept suggestion: update cooldown, react, then create thread
+                self.json_data.setdefault("suggestions_last_post", {})[user_id_str] = now.isoformat()
+                self.save_json_data()
+
                 for emoji in reaction_emojis:
                     try:
                         await message.add_reaction(emoji)
                     except Exception:
                         pass
+
+                thread = getattr(message, "thread", None)
+                created_new_thread = False
+                if thread is None:
+                    thread_name = self.config.get("suggestions_thread_name", "Suggestion Comments")
+                    auto_archive_duration = int(self.config.get("suggestions_thread_auto_archive_duration_minutes", 1440))
+                    try:
+                        thread = await message.create_thread(
+                            name=thread_name,
+                            auto_archive_duration=auto_archive_duration
+                        )
+                        created_new_thread = True
+                    except Exception:
+                        thread = None
+
+                if thread and created_new_thread:
+                    try:
+                        title_message = self.config.get("suggestions_thread_title_message", "Suggestion Comments")
+                        await thread.send(content=title_message)
+                    except Exception:
+                        pass
+
+                await self.bot.process_commands(message)
+                return
+
+            # Thread messages: no cooldown/delay validation (optional reactions)
+            if is_suggestions_thread_message:
+                if self.config.get("suggestions_react_in_threads", True):
+                    for emoji in reaction_emojis:
+                        try:
+                            await message.add_reaction(emoji)
+                        except Exception:
+                            pass
                 await self.bot.process_commands(message)
                 return
             
