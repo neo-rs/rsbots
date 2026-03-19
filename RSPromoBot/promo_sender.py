@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from typing import Any
 
 import discord
@@ -9,6 +10,78 @@ from promo_campaigns import PromoCampaignStore
 from promo_queue import PromoQueueStore
 from send_log_store import SendLogStore
 from utils import build_dm_embeds, iso_now, next_run_iso, utc_now
+
+
+class OptOutButton(discord.ui.Button):
+    def __init__(self, bot: discord.Client, config: dict[str, Any], logger) -> None:
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            emoji="🔕",
+            custom_id="rspromobot:notify_off",
+        )
+        self._bot = bot
+        self._config = config
+        self._logger = logger
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        guild_id_raw = str(self._config.get("guild_id", "")).strip()
+        role_id_raw = str(self._config.get("notify_role_id", "")).strip()
+        if not guild_id_raw.isdigit() or not role_id_raw.isdigit():
+            await interaction.response.send_message("Opt-out is not configured. Please contact staff.", ephemeral=True)
+            return
+
+        guild = self._bot.get_guild(int(guild_id_raw))
+        if guild is None:
+            try:
+                guild = await self._bot.fetch_guild(int(guild_id_raw))
+            except Exception:
+                guild = None
+        if guild is None:
+            await interaction.response.send_message("Unable to locate the server to opt you out.", ephemeral=True)
+            return
+
+        role = guild.get_role(int(role_id_raw))
+        if role is None:
+            await interaction.response.send_message("Opt-out role was not found. Please contact staff.", ephemeral=True)
+            return
+
+        member: discord.Member | None = None
+        if isinstance(interaction.user, discord.User | discord.Member):
+            member = guild.get_member(interaction.user.id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(interaction.user.id)
+                except Exception:
+                    member = None
+        if member is None:
+            await interaction.response.send_message("Unable to update your notification role.", ephemeral=True)
+            return
+
+        if role not in member.roles:
+            await interaction.response.send_message("You're already opted out.", ephemeral=True)
+            try:
+                self.disabled = True
+                await interaction.message.edit(view=self.view)
+            except Exception:
+                pass
+            return
+
+        try:
+            await member.remove_roles(role, reason="User opted out via DM button")
+        except discord.Forbidden:
+            await interaction.response.send_message("I don't have permission to remove that role.", ephemeral=True)
+            return
+        except Exception as exc:
+            self._logger.warning("dm_optout_failed user_id=%s error=%s", interaction.user.id, exc)
+            await interaction.response.send_message("Something went wrong opting you out.", ephemeral=True)
+            return
+
+        await interaction.response.send_message("Opted out. You won't receive promo DMs anymore.", ephemeral=True)
+        try:
+            self.disabled = True
+            await interaction.message.edit(view=self.view)
+        except Exception:
+            pass
 
 
 class PromoSender:
@@ -80,6 +153,10 @@ class PromoSender:
         batch_size = int(campaign["batch_size"])
         batch = pending[:batch_size]
         timeout_seconds = int(self.config["send_timeout_seconds"])
+        dm_delay_min_seconds = float(self.config["dm_delay_min_seconds"])
+        dm_delay_max_seconds = float(self.config["dm_delay_max_seconds"])
+        dm_delay_lo = min(dm_delay_min_seconds, dm_delay_max_seconds)
+        dm_delay_hi = max(dm_delay_min_seconds, dm_delay_max_seconds)
         send_view = self._build_send_view(campaign)
         embed_color = int(self.config["embed_color"])
         dm_embeds = build_dm_embeds(campaign, embed_color)
@@ -116,6 +193,8 @@ class PromoSender:
                     "error": str(exc)
                 })
                 self.logger.warning("send_failed campaign_id=%s user_id=%s error=%s", campaign_id, user_id, exc)
+            if dm_delay_hi > 0:
+                await asyncio.sleep(random.uniform(max(0.0, dm_delay_lo), dm_delay_hi))
 
         queue["recipients"] = recipient_records
         queue["pending_count"] = len([item for item in recipient_records if item.get("status") == "pending"])
@@ -142,10 +221,16 @@ class PromoSender:
     def _build_send_view(self, campaign: dict[str, Any]) -> discord.ui.View | None:
         label = campaign.get("cta_label", "").strip()
         url = campaign.get("cta_url", "").strip()
-        if not label or not url:
+        notify_role_id = str(self.config.get("notify_role_id", "")).strip()
+
+        if not (label and url) and not notify_role_id.isdigit():
             return None
+
         view = discord.ui.View(timeout=None)
-        view.add_item(discord.ui.Button(label=label, url=url))
+        if label and url:
+            view.add_item(discord.ui.Button(label=label, url=url))
+        if notify_role_id.isdigit():
+            view.add_item(OptOutButton(self.bot, self.config, self.logger))
         return view
 
     async def _log_to_channel(self, message: str, campaign: dict[str, Any]) -> None:

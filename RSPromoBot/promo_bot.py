@@ -127,6 +127,66 @@ class PromoBot(discord.Client):
                 )
             await interaction.response.send_message(embed=embed, view=CampaignReuseView(self, campaigns), ephemeral=True)
 
+        @self.tree.command(name="notify_on", description="Opt in to receive promo DMs.", guild=guild_obj)
+        async def notify_on(interaction: discord.Interaction) -> None:
+            if not interaction.guild:
+                await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+                return
+            if not isinstance(interaction.user, discord.Member):
+                await interaction.response.send_message("Unable to update roles for this user.", ephemeral=True)
+                return
+            role_id_raw = str(self.config.get("notify_role_id", "")).strip()
+            if not role_id_raw.isdigit():
+                await interaction.response.send_message("Notify role is not configured. Ask staff to set it up.", ephemeral=True)
+                return
+            role = interaction.guild.get_role(int(role_id_raw))
+            if role is None:
+                await interaction.response.send_message("Notify role was not found. Ask staff to set it up.", ephemeral=True)
+                return
+            if role in interaction.user.roles:
+                await interaction.response.send_message("You already have notifications enabled.", ephemeral=True)
+                return
+            try:
+                await interaction.user.add_roles(role, reason="User opted in via /notify_on")
+            except discord.Forbidden:
+                await interaction.response.send_message("I don't have permission to add that role.", ephemeral=True)
+                return
+            except Exception as exc:
+                self.logger.warning("notify_on failed user_id=%s error=%s", interaction.user.id, exc)
+                await interaction.response.send_message("Something went wrong enabling notifications.", ephemeral=True)
+                return
+            await interaction.response.send_message("Notifications enabled. You'll receive promo DMs from this server.", ephemeral=True)
+
+        @self.tree.command(name="notify_off", description="Opt out of promo DMs.", guild=guild_obj)
+        async def notify_off(interaction: discord.Interaction) -> None:
+            if not interaction.guild:
+                await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+                return
+            if not isinstance(interaction.user, discord.Member):
+                await interaction.response.send_message("Unable to update roles for this user.", ephemeral=True)
+                return
+            role_id_raw = str(self.config.get("notify_role_id", "")).strip()
+            if not role_id_raw.isdigit():
+                await interaction.response.send_message("Notify role is not configured. Ask staff to set it up.", ephemeral=True)
+                return
+            role = interaction.guild.get_role(int(role_id_raw))
+            if role is None:
+                await interaction.response.send_message("Notify role was not found. Ask staff to set it up.", ephemeral=True)
+                return
+            if role not in interaction.user.roles:
+                await interaction.response.send_message("Notifications are already disabled.", ephemeral=True)
+                return
+            try:
+                await interaction.user.remove_roles(role, reason="User opted out via /notify_off")
+            except discord.Forbidden:
+                await interaction.response.send_message("I don't have permission to remove that role.", ephemeral=True)
+                return
+            except Exception as exc:
+                self.logger.warning("notify_off failed user_id=%s error=%s", interaction.user.id, exc)
+                await interaction.response.send_message("Something went wrong disabling notifications.", ephemeral=True)
+                return
+            await interaction.response.send_message("Notifications disabled. You will no longer receive promo DMs.", ephemeral=True)
+
         async def _do_campaign_control(interaction: discord.Interaction, action: str) -> None:
             if not self.user_can_manage(interaction):
                 self.logger.info("command=promo_%s denied user_id=%s guild_id=%s", action, interaction.user.id, interaction.guild_id)

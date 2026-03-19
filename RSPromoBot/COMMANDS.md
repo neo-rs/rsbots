@@ -28,6 +28,12 @@ Cancel the active promo campaign. (Staff only.)
 ### `/promo_history`
 Show recent campaign history.
 
+### `/notify_on`
+Opt in to receive promo DMs (adds the configured notify role to you).
+
+### `/notify_off`
+Opt out of promo DMs (removes the configured notify role from you).
+
 ## UI Actions
 
 ### Builder Buttons
