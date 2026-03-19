@@ -123,14 +123,18 @@ class PromoSender:
         if queue.get("status") != "running":
             return
 
+        campaign_id = queue.get("campaign_id", "")
         next_run_at = queue.get("next_run_at")
         if next_run_at:
             from utils import parse_iso
             target_dt = parse_iso(next_run_at)
             if target_dt and utc_now() < target_dt:
+                try:
+                    await self.bot.update_live_status(campaign_id)
+                except Exception as exc:
+                    self.logger.debug("update_live_status(waiting): %s", exc)
                 return
 
-        campaign_id = queue.get("campaign_id", "")
         campaign = self.campaign_store.get(campaign_id)
         if not campaign:
             self.logger.warning("Queue references missing campaign: %s", campaign_id)

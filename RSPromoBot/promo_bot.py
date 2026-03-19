@@ -19,7 +19,7 @@ from promo_sessions import PromoSessionStore
 from promo_views import CampaignControlView, CampaignReuseView, PromoBuilderView
 from send_log_store import SendLogStore
 from storage import JSONStorage
-from utils import estimated_duration_str, has_any_allowed_role, human_rate, iso_now, parse_iso
+from utils import estimated_duration_str, has_any_allowed_role, human_rate, iso_now, parse_iso, utc_now
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -342,10 +342,31 @@ class PromoBot(discord.Client):
         embed.add_field(name="Rate", value=human_rate(int(campaign["batch_size"]), int(campaign["batch_interval_minutes"])), inline=True)
         next_run = queue.get("next_run_at", "")
         embed.add_field(name="Next Run", value=next_run or "Immediate / none scheduled", inline=True)
+        next_run_in = "Now"
+        if next_run:
+            target_dt = parse_iso(next_run)
+            if target_dt:
+                seconds_left = max(0, int((target_dt - utc_now()).total_seconds()))
+                if seconds_left <= 0:
+                    next_run_in = "Now"
+                else:
+                    mins, secs = divmod(seconds_left, 60)
+                    hours, mins = divmod(mins, 60)
+                    if hours > 0:
+                        next_run_in = f"{hours}h {mins}m {secs}s"
+                    elif mins > 0:
+                        next_run_in = f"{mins}m {secs}s"
+                    else:
+                        next_run_in = f"{secs}s"
+        embed.add_field(name="Next Run In", value=next_run_in, inline=True)
         started = campaign.get("started_at", "") or "Not started"
         embed.add_field(name="Started", value=started, inline=True)
         completed = campaign.get("completed_at", "") or "Not completed"
         embed.add_field(name="Completed", value=completed, inline=True)
+        preview_text = (campaign.get("message_body", "") or "").strip() or "No message body set."
+        if len(preview_text) > 400:
+            preview_text = f"{preview_text[:397]}..."
+        embed.add_field(name="Preview", value=preview_text, inline=False)
         return embed
 
     def _role_display(self, guild: discord.Guild | None, role_id: str) -> str:
