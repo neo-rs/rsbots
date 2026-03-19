@@ -6200,6 +6200,42 @@ def _is_repeat_trial_no_payment(discord_id: int) -> bool:
     return spent <= max_spent
 
 
+def _consume_repeat_trial_bypass_once(discord_id: int) -> bool:
+    """
+    One-time staff bypass for the repeat-trial guard.
+
+    If a bypass flag is set in member_history for this discord_id, consume it (remove the flag)
+    and return True; otherwise return False.
+    """
+    try:
+        did = int(discord_id)
+    except Exception:
+        return False
+    try:
+        db = _load_member_history()
+        if not isinstance(db, dict):
+            return False
+        key = str(did)
+        rec = db.get(key)
+        if not isinstance(rec, dict):
+            return False
+        wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+        bypass = wh.get("repeat_trial_bypass_once")
+        if not bypass:
+            return False
+        # Consume (one-time)
+        with suppress(Exception):
+            wh.pop("repeat_trial_bypass_once", None)
+        with suppress(Exception):
+            wh.pop("repeat_trial_bypass_set_ts", None)
+        rec["whop"] = wh
+        db[key] = rec
+        _save_member_history(db)
+        return True
+    except Exception:
+        return False
+
+
 # -----------------------------
 # Message loader/sender
 # -----------------------------
@@ -9879,6 +9915,11 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         # Repeat-trial guard: had trial before + no payment → remove Member role and alert staff
         # Before removing, refresh total_spent from Whop API so paid first-time trials aren't blocked (member_history can be stale).
         if _is_repeat_trial_no_payment(after.id):
+            # Staff one-time bypass: allow this member role add once, then revert to normal guard next time.
+            if _consume_repeat_trial_bypass_once(after.id):
+                if log_other:
+                    await log_other(f"🟩 **Repeat trial bypass consumed:** Allowed Member role for {_fmt_user(after)} once.")
+                return
             # Only remove when we successfully got a fresh total_spent from API and it's <= threshold.
             # If we can't fetch (no mid, no client, API error), do not remove (fail open for paid users).
             do_remove = False
@@ -10313,6 +10354,79 @@ async def reload_messages(ctx):
         await ctx.message.delete()
     except Exception:
         pass
+
+
+@bot.command(name="trialbypass", aliases=["repeattrialbypass", "rtbypass"])
+@commands.has_permissions(administrator=True)
+async def trial_bypass(ctx, discord_id: str):
+    """
+    One-time bypass for repeat-trial guard.
+
+    Usage:
+      !trialbypass 822944282364084274
+
+    Effect:
+      Allows the next "Member role added" event for that user to pass without removal,
+      then the bypass is consumed automatically (guard returns to normal next time).
+    """
+    try:
+        did = int(str(discord_id).strip().strip("<@!>").strip())
+    except Exception:
+        await ctx.send("❌ Provide a valid Discord user ID (or mention).", delete_after=10)
+        return
+    try:
+        db = _load_member_history()
+        if not isinstance(db, dict):
+            db = {}
+        key = str(did)
+        now = _history_now_ts()
+        rec = db.get(key, {})
+        rec = _ensure_member_history_shape(rec, now=now)
+        wh = rec.get("whop") if isinstance(rec.get("whop"), dict) else {}
+        wh["repeat_trial_bypass_once"] = True
+        wh["repeat_trial_bypass_set_ts"] = int(now)
+        rec["whop"] = wh
+        db[key] = rec
+        _save_member_history(db)
+        await ctx.send(f"✅ One-time repeat-trial bypass set for `<@{did}>`.", delete_after=10)
+        with suppress(Exception):
+            await ctx.message.delete()
+    except Exception as e:
+        await ctx.send(f"❌ Failed to set bypass: `{str(e)[:300]}`", delete_after=10)
+
+
+@bot.command(name="trialbypassclear", aliases=["repeattrialbypassclear", "rtbypassclear"])
+@commands.has_permissions(administrator=True)
+async def trial_bypass_clear(ctx, discord_id: str):
+    """Clear (remove) the one-time bypass flag if present."""
+    try:
+        did = int(str(discord_id).strip().strip("<@!>").strip())
+    except Exception:
+        await ctx.send("❌ Provide a valid Discord user ID (or mention).", delete_after=10)
+        return
+    try:
+        db = _load_member_history()
+        key = str(did)
+        rec = db.get(key, {}) if isinstance(db, dict) else {}
+        wh = rec.get("whop") if isinstance(rec, dict) and isinstance(rec.get("whop"), dict) else {}
+        had = bool(wh.get("repeat_trial_bypass_once"))
+        with suppress(Exception):
+            wh.pop("repeat_trial_bypass_once", None)
+        with suppress(Exception):
+            wh.pop("repeat_trial_bypass_set_ts", None)
+        if isinstance(rec, dict):
+            rec["whop"] = wh
+            if isinstance(db, dict):
+                db[key] = rec
+                _save_member_history(db)
+        await ctx.send(
+            f"✅ Cleared bypass for `<@{did}>`." if had else f"ℹ️ No bypass was set for `<@{did}>`.",
+            delete_after=10,
+        )
+        with suppress(Exception):
+            await ctx.message.delete()
+    except Exception as e:
+        await ctx.send(f"❌ Failed to clear bypass: `{str(e)[:300]}`", delete_after=10)
 
 @bot.command(name="cleanup")
 @commands.has_permissions(administrator=True)
