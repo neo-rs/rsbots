@@ -73,20 +73,20 @@ def _scp_file(*, user: str, host: str, key_path: Path, ssh_options: str, local_p
 def _action_remote_cmd(action: str, remote_root: str) -> str:
     cd_root = f"cd {shlex.quote(remote_root)}"
     if action == "verify":
-        return f"{cd_root}; python3 scripts/verify_discum_channel_ids.py"
+        return f"{cd_root}; python3 -u scripts/verify_discum_channel_ids.py"
     if action == "verify-remove":
-        return f"{cd_root}; python3 scripts/verify_discum_channel_ids.py --remove-failed"
+        return f"{cd_root}; python3 -u scripts/verify_discum_channel_ids.py --remove-failed"
     if action == "post":
-        return f"{cd_root}; python3 MWDiscumBot/post_mirror_channel_map.py"
+        return f"{cd_root}; python3 -u MWDiscumBot/post_mirror_channel_map.py"
     if action == "post-no-cleanup":
-        return f"{cd_root}; python3 MWDiscumBot/post_mirror_channel_map.py --no-cleanup"
+        return f"{cd_root}; python3 -u MWDiscumBot/post_mirror_channel_map.py --no-cleanup"
     if action == "post-upsert":
-        return f"{cd_root}; python3 MWDiscumBot/post_mirror_channel_map.py --upsert"
+        return f"{cd_root}; python3 -u MWDiscumBot/post_mirror_channel_map.py --upsert"
     if action == "refresh":
         return (
             f"{cd_root}; "
-            "python3 scripts/verify_discum_channel_ids.py && "
-            "python3 MWDiscumBot/post_mirror_channel_map.py"
+            "python3 -u scripts/verify_discum_channel_ids.py && "
+            "python3 -u MWDiscumBot/post_mirror_channel_map.py"
         )
     raise ValueError(f"Unsupported action: {action}")
 
@@ -98,24 +98,24 @@ def _action_remote_cmd_with_ids(action: str, remote_root: str, ids: Optional[Lis
     cd_root = f"cd {shlex.quote(remote_root)}"
     if action == "verify":
         if ids:
-            return f"{cd_root}; python3 scripts/verify_discum_channel_ids.py " + " ".join(shlex.quote(i) for i in ids)
-        return f"{cd_root}; python3 scripts/verify_discum_channel_ids.py"
+            return f"{cd_root}; python3 -u scripts/verify_discum_channel_ids.py " + " ".join(shlex.quote(i) for i in ids)
+        return f"{cd_root}; python3 -u scripts/verify_discum_channel_ids.py"
     if action == "verify-remove":
         if ids:
-            return f"{cd_root}; python3 scripts/verify_discum_channel_ids.py --remove-failed " + " ".join(shlex.quote(i) for i in ids)
-        return f"{cd_root}; python3 scripts/verify_discum_channel_ids.py --remove-failed"
+            return f"{cd_root}; python3 -u scripts/verify_discum_channel_ids.py --remove-failed " + " ".join(shlex.quote(i) for i in ids)
+        return f"{cd_root}; python3 -u scripts/verify_discum_channel_ids.py --remove-failed"
     if action == "post":
-        return f"{cd_root}; python3 MWDiscumBot/post_mirror_channel_map.py"
+        return f"{cd_root}; python3 -u MWDiscumBot/post_mirror_channel_map.py"
     if action == "post-no-cleanup":
-        return f"{cd_root}; python3 MWDiscumBot/post_mirror_channel_map.py --no-cleanup"
+        return f"{cd_root}; python3 -u MWDiscumBot/post_mirror_channel_map.py --no-cleanup"
     if action == "post-upsert":
-        return f"{cd_root}; python3 MWDiscumBot/post_mirror_channel_map.py --upsert"
+        return f"{cd_root}; python3 -u MWDiscumBot/post_mirror_channel_map.py --upsert"
     if action == "refresh":
         # refresh ignores ids for now (verify -> post chain)
         return (
             f"{cd_root}; "
-            "python3 scripts/verify_discum_channel_ids.py && "
-            "python3 MWDiscumBot/post_mirror_channel_map.py"
+            "python3 -u scripts/verify_discum_channel_ids.py && "
+            "python3 -u MWDiscumBot/post_mirror_channel_map.py"
         )
     raise ValueError(f"Unsupported action: {action}")
 
