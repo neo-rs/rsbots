@@ -550,6 +550,18 @@ class RSSuccessBot:
             if message.guild.id != guild_id:
                 await self.bot.process_commands(message)
                 return
+
+            # Suggestions channel auto-react (no points logic)
+            suggestions_channel_ids = self.config.get("suggestions_reaction_channel_ids", [])
+            if message.channel.id in suggestions_channel_ids:
+                reaction_emojis = self.config.get("suggestions_reaction_emojis", ["✅", "❌"])
+                for emoji in reaction_emojis:
+                    try:
+                        await message.add_reaction(emoji)
+                    except Exception:
+                        pass
+                await self.bot.process_commands(message)
+                return
             
             success_channel_ids = self.config.get("success_channel_ids", [])
             if message.channel.id not in success_channel_ids:
