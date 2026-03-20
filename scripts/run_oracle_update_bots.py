@@ -62,6 +62,14 @@ def _build_ssh_cmd(*, user: str, host: str, key_path: Path, ssh_options: str, re
         str(key_path),
         "-o",
         "StrictHostKeyChecking=no",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=20",
+        "-o",
+        "ServerAliveInterval=10",
+        "-o",
+        "ServerAliveCountMax=6",
     ]
     if ssh_options:
         cmd.extend(shlex.split(ssh_options))
@@ -113,10 +121,12 @@ git reset --hard HEAD >/dev/null 2>&1 || true
 git clean -fdx >/dev/null 2>&1 || true
 
 OLD="$(git rev-parse HEAD 2>/dev/null || echo '')"
+echo "INFO: pulling latest code for $BOT_FOLDER ..."
 git fetch origin
 git pull --ff-only origin main
 NEW="$(git rev-parse HEAD)"
 
+echo "INFO: building file sync lists ..."
 TMP_ALL_LIST="/tmp/mw_tracked_${{BOT_FOLDER}}.txt"
 git ls-files "$BOT_FOLDER" 2>/dev/null > "$TMP_ALL_LIST" || true
 
@@ -146,6 +156,7 @@ mv "${{TMP_SYNC_LIST}}.merged" "$TMP_SYNC_LIST"
 
 SYNC_COUNT="$(wc -l < "$TMP_SYNC_LIST" | tr -d " ")"
 if [ "$SYNC_COUNT" = "" ]; then SYNC_COUNT="0"; fi
+echo "INFO: PY_COUNT=$PY_COUNT SYNC_COUNT=$SYNC_COUNT"
 
 # Backup (best-effort)
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -155,8 +166,12 @@ mkdir -p "$BACKUP_DIR" || true
 BACKUP_TAR="$BACKUP_DIR/${{SAFE_BOT}}_preupdate_${{TS}}.tar.gz"
 (cd "$LIVE_ROOT" && env -u TAR_OPTIONS /bin/tar --ignore-failed-read -czf "$BACKUP_TAR" -T "$TMP_SYNC_LIST") || true
 
+echo "INFO: sync backup done (best-effort): $BACKUP_TAR"
+
 # Sync (always overwrite tracked safe list)
 env -u TAR_OPTIONS /bin/tar -cf - -T "$TMP_SYNC_LIST" | (cd "$LIVE_ROOT" && env -u TAR_OPTIONS /bin/tar -xf - --overwrite)
+
+echo "INFO: sync completed for $BOT_FOLDER"
 
 echo "OK=1"
 echo "OLD=$OLD"
@@ -289,17 +304,24 @@ def main(argv: Optional[List[str]] = None) -> int:
             remote_cmd=remote_cmd,
         )
 
-        res = subprocess.run(ssh_cmd, capture_output=True, text=True)
-        if res.stdout:
-            print(res.stdout.strip())
-        if res.stderr:
-            # Some commands print progress to stderr; keep short.
-            stderr_clean = (res.stderr or "").strip()
-            if stderr_clean:
-                print(stderr_clean[:8000])
-        if res.returncode != 0:
-            print(f"\nERROR: Update failed for {bot_key} (exit {res.returncode})")
-            return res.returncode
+        # Stream SSH output live so long-running updates don't look "hung".
+        proc = subprocess.Popen(
+            ssh_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.rstrip("\r\n")
+            if line:
+                print(line)
+        proc.wait()
+
+        if proc.returncode != 0:
+            print(f"\nERROR: Update failed for {bot_key} (exit {proc.returncode})")
+            return proc.returncode
 
     print("\nDONE: Updates complete.")
     return 0
