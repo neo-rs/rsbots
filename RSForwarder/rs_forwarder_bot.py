@@ -6347,13 +6347,18 @@ class RSForwarderBot:
                                 seen_key_to_row[key] = [store, sku, title, aff, url]
                         all_rows = list(seen_key_to_row.values())
 
-                        # Propagate affiliate_url into resolved_by_key (used to write Current List + History).
-                        # Without this, affiliate filled for Live could remain blank in Current/History.
+                        # Persist affiliate_url into resolved_by_key for *all* Full Send rows.
+                        # This is required because Current List + History are written from resolved_by_key,
+                        # not from all_rows.
                         try:
                             for store, sku, title, aff, url in all_rows:
                                 k0 = self._rsfs_key_store_sku(store, sku)
-                                if k0 in resolved_by_key and aff:
-                                    resolved_by_key[k0]["affiliate_url"] = aff
+                                if k0 not in resolved_by_key:
+                                    resolved_by_key[k0] = {}
+                                resolved_by_key[k0]["title"] = title or str(resolved_by_key.get(k0, {}).get("title", "") or "")
+                                resolved_by_key[k0]["url"] = url or str(resolved_by_key.get(k0, {}).get("url", "") or "")
+                                resolved_by_key[k0]["affiliate_url"] = aff or str(resolved_by_key.get(k0, {}).get("affiliate_url", "") or "")
+                                resolved_by_key[k0]["source"] = str(resolved_by_key.get(k0, {}).get("source", "") or "rsfsrun")
                         except Exception:
                             pass
                         
@@ -6363,27 +6368,25 @@ class RSForwarderBot:
                         except Exception:
                             now_iso = ""
                         history_rows = []
-                        for e in (entries or []):
-                            st0 = str(getattr(e, "store", "") or "").strip()
-                            sk0 = str(getattr(e, "sku", "") or "").strip()
+                        # Upsert history from all_rows (Full Send rows), so affiliate_url is persisted for
+                        # SKUs that were already "Matched SKU Complete (Title+URL)" and therefore might
+                        # not be present in `entries`.
+                        for store, sku, title, aff, url in all_rows:
+                            st0 = str(store or "").strip()
+                            sk0 = str(sku or "").strip()
                             if not (st0 and sk0):
                                 continue
                             k0 = self._rsfs_key_store_sku(st0, sk0)
-                            u0 = str(getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
-                            t0 = str(getattr(e, "title", "") or "").strip()
-                            a0 = str(getattr(e, "affiliate_url", "") or "").strip()
-                            src0 = str(getattr(e, "source", "") or "").strip()
+                            u0 = str(url or "").strip()
+                            t0 = str(title or "").strip()
+                            a0 = str(aff or "").strip()
+                            src0 = str(resolved_by_key.get(k0, {}).get("source", "") or "").strip()
                             try:
                                 rid0 = int(rid_by_key.get(self._rs_fs_override_key(st0, sk0)) or 0)
                             except Exception:
                                 rid0 = 0
                             if k0 in resolved_by_key:
                                 resolved_by_key[k0]["last_release_id"] = str(rid0 or "")
-                            # Use resolved_by_key affiliate_url if it was filled during Live sync stage.
-                            if k0 in resolved_by_key:
-                                a1 = str(resolved_by_key.get(k0, {}).get("affiliate_url", "") or "").strip()
-                                if a1:
-                                    a0 = a1
                             history_rows.append([st0, sk0, t0, u0, a0, "", now_iso, str(rid0 or ""), src0])
                         if history_rows:
                             try:

@@ -753,12 +753,34 @@ class RsFsSheetSync:
         to_add: List[List[str]] = []
 
         now_iso = self._utc_now_iso()
+
+        # Dedupe incoming rows by store|sku so we never "add" the same key twice
+        # within a single bot run (which otherwise would create duplicates even if
+        # History is currently missing that key).
+        incoming_by_key: Dict[str, Tuple[List[str], Tuple[int, int, int, str]]] = {}
         for r in (rows or []):
             row = [str(c or "") for c in r]
             store = (row[0] if len(row) > 0 else "").strip()
             sku = (row[1] if len(row) > 1 else "").strip()
             if not (store and sku):
                 continue
+            key = f"{store.lower()}|{sku.lower()}"
+            title = str(row[2] or "").strip() if len(row) > 2 else ""
+            url = str(row[3] or "").strip() if len(row) > 3 else ""
+            aff = str(row[4] or "").strip() if len(row) > 4 else ""
+            last_seen = str(row[6] or "").strip() if len(row) > 6 else ""
+            # Score: prefer affiliate/url/title, then latest last_seen.
+            score = (1 if aff else 0, 1 if url else 0, 1 if title else 0, last_seen or "")
+            if key not in incoming_by_key:
+                incoming_by_key[key] = (row, score)
+            else:
+                _old_row, old_score = incoming_by_key[key]
+                if score > old_score:
+                    incoming_by_key[key] = (row, score)
+
+        for row in [v[0] for v in incoming_by_key.values()]:
+            store = (row[0] if len(row) > 0 else "").strip()
+            sku = (row[1] if len(row) > 1 else "").strip()
             key = f"{store.lower()}|{sku.lower()}"
             if key in existing:
                 ex = existing.get(key) or {}
@@ -833,6 +855,73 @@ class RsFsSheetSync:
                     added = len(to_add)
                 except Exception as e:
                     return False, f"history append failed: {e}", 0, updated
+
+            # Best-effort dedupe: remove duplicate store|sku rows in History.
+            # Historical duplicates can accumulate if older runs already inserted duplicates;
+            # upsert alone does not delete extras.
+            #
+            # We keep the "best" row per key by preferring:
+            # - non-empty Affiliate URL
+            # - non-empty URL
+            # - non-empty Title
+            # - then latest Last Seen (UTC)
+            try:
+                rng_full = f"'{tab}'!A:I"
+
+                def _do_get_full() -> List[List[str]]:
+                    resp = service.spreadsheets().values().get(
+                        spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                        range=rng_full,
+                    ).execute()
+                    values = resp.get("values") if isinstance(resp, dict) else None
+                    return values if isinstance(values, list) else []
+
+                values_full = await asyncio.to_thread(_do_get_full)
+                # Build key -> (best_row_index_1_based, best_score_tuple)
+                best_by_key: Dict[str, Tuple[int, Tuple[int, int, int, str]]] = {}
+                to_delete: List[int] = []
+
+                for row_i, row in enumerate(values_full, start=1):
+                    if row_i == 1:
+                        continue  # header
+                    if not isinstance(row, list) or len(row) < 2:
+                        continue
+                    store = str(row[0] or "").strip()
+                    sku = str(row[1] or "").strip()
+                    if not (store and sku):
+                        continue
+                    if sku.lower() == "sku-upc":
+                        continue
+                    key = f"{store.lower()}|{sku.lower()}"
+
+                    title = str(row[2] or "").strip() if len(row) > 2 else ""
+                    url = str(row[3] or "").strip() if len(row) > 3 else ""
+                    aff = str(row[4] or "").strip() if len(row) > 4 else ""
+                    last_seen = str(row[6] or "").strip() if len(row) > 6 else ""
+
+                    # Score tuple: (aff_non_empty, url_non_empty, title_non_empty, last_seen)
+                    score = (1 if aff else 0, 1 if url else 0, 1 if title else 0, last_seen or "")
+                    if key not in best_by_key:
+                        best_by_key[key] = (row_i, score)
+                        continue
+
+                    best_row_i, best_score = best_by_key[key]
+                    if score > best_score:
+                        # New row is better; delete old keep row.
+                        to_delete.append(best_row_i)
+                        best_by_key[key] = (row_i, score)
+                    else:
+                        # Delete this weaker duplicate.
+                        to_delete.append(row_i)
+
+                # Delete duplicates (bottom-up by design in helper).
+                if to_delete:
+                    # Avoid deleting the same row multiple times.
+                    to_delete = sorted(set(to_delete))
+                    await self._delete_rows_by_indices(to_delete, sheet_id=int(_sheet_id or 0))
+            except Exception:
+                # Never fail the upsert just because dedupe failed.
+                pass
 
         # Refresh cache
         try:
@@ -1089,10 +1178,16 @@ class RsFsSheetSync:
                 out[sku.lower()] = {"store": store, "sku": sku, "title": title}
         return out
 
-    async def _delete_rows_by_indices(self, row_indices_1_based: Sequence[int]) -> int:
+    async def _delete_rows_by_indices(
+        self,
+        row_indices_1_based: Sequence[int],
+        *,
+        sheet_id: Optional[int] = None,
+    ) -> int:
         """
         Delete entire rows by 1-based indices (data rows). Returns deleted row count.
-        Requires tab_gid (sheetId).
+        By default uses `self._sheet_cfg.tab_gid` (sheetId). You can override `sheet_id`
+        when deleting rows from a different tab.
         """
         if not self.enabled():
             return 0
@@ -1101,10 +1196,11 @@ class RsFsSheetSync:
         service = self._get_service()
         if not service:
             return 0
-        try:
-            sheet_id = int(self._sheet_cfg.tab_gid or 0)
-        except Exception:
-            sheet_id = 0
+        if sheet_id is None:
+            try:
+                sheet_id = int(self._sheet_cfg.tab_gid or 0)
+            except Exception:
+                sheet_id = 0
         if not sheet_id:
             return 0
 

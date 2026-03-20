@@ -612,3 +612,24 @@ Any deviation means:
   * Do **not** clean up
   * Do **not** add features
 * Fix deployment or execution first.
+
+---
+## RSForwarder RS-FS Sheet Flow (Canonical)
+
+This section documents the canonical runtime behavior for the `RSForwarder` RS-FS flow and how to reason about sheet state.
+
+### Sheet tab roles
+- `Full-Send-Current-List` is rewritten from the latest Zephyr `/listreleases` run on `/listrelease` auto-trigger.
+- `Full-Send-History` is a long-term cache; `upsert_history_rows()` must upsert existing `Store|SKU` entries and must not create duplicates for the same key during a single run.
+- `Full Send Live List` is operational/persistent; the normal sync path uses `sync_rows_mirror(..., delete_stale=False)` so it must not prune older `Store|SKU` rows just because a row is missing from the latest feed.
+
+### Identity keys
+- Live List and Current/History updates use `store|sku` identity (normalized lowercase).
+
+### Affiliate generation sources
+- Affiliate rewriting uses the bot’s computed `Resolved URL` values from `Full-Send-Current-List` (sheet header “Resolved URL”) as input.
+- The affiliate output is written into `Full Send Live List` (sheet column “Affiliate URL”) and is also persisted into `Full-Send-Current-List` + `Full-Send-History` for the same `store|sku` keys.
+
+### Cleanup expectations
+- Normal workflows do not delete/prompt-removes Live rows.
+- Manual explicit removal (e.g. release-id based delete commands) may prune Live and is intentionally destructive.
