@@ -28,6 +28,8 @@ del /f /q ".git\index.lock" >nul 2>&1
 
 REM Update tracked files (faster + avoids scanning for new untracked files).
 git add -u
+REM Also stage RSForwarder manual override json (was previously git-ignored).
+git add RSForwarder\rs_fs_manual_overrides.json >nul 2>&1
 if errorlevel 1 (
   echo ERROR: git add failed.
   exit /b 1

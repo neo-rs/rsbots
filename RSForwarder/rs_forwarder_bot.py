@@ -1289,7 +1289,12 @@ class RSForwarderBot:
         # Debounce by content hash (avoid rewriting on every chunk)
         h = hashlib.sha1(txt.encode("utf-8", errors="ignore")).hexdigest()[:12]
         now = time.time()
-        force_write = bool(resolved_by_key) or (str(reason or "").strip().lower() != "auto")
+        reason_norm = str(reason or "").strip().lower()
+        use_history_cache = self._rsfs_use_history_cache()
+        # Canonical rule: when History backfill is enabled, every /listrelease write must
+        # re-apply History values (even if merged_text is identical). This prevents stale
+        # "Source=manual"/blank cells from sticking due to debounce.
+        force_write = bool(resolved_by_key) or (reason_norm != "auto") or (use_history_cache and reason_norm == "auto")
         if (
             (not force_write)
             and h == (self._rs_fs_last_current_list_hash or "")
@@ -1301,7 +1306,7 @@ class RSForwarderBot:
 
         # Pull cached history only when enabled (for pre-fill title/url).
         history: Dict[str, Dict[str, str]] = {}
-        if self._rsfs_use_history_cache():
+        if use_history_cache:
             try:
                 history = await self._rs_fs_sheet.fetch_history_cache(force=False)
             except Exception as e:
@@ -1379,8 +1384,21 @@ class RSForwarderBot:
                 aff = str(d.get("affiliate_url") or "").strip()
                 src = str(d.get("source") or "").strip()
                 status_bits.append("resolved")
+
+            # When History backfill is enabled, it should be the canonical source for
+            # missing values. If History has data for this key, do not let old manual
+            # overrides re-populate "Source=manual" fields.
+            history_has_any = False
+            if key and self._rsfs_use_history_cache() and key in (history or {}):
+                hrec = history.get(key) or {}
+                history_has_any = bool(
+                    str(hrec.get("url") or "").strip()
+                    or str(hrec.get("title") or "").strip()
+                    or str(hrec.get("affiliate_url") or "").strip()
+                )
+
             # Manual overrides
-            if key and not url:
+            if key and not url and not history_has_any:
                 ov = overrides.get(self._rs_fs_override_key(store, sku_label)) if store and sku_label else None
                 if isinstance(ov, dict) and str(ov.get("url") or "").strip():
                     url = str(ov.get("url") or "").strip()

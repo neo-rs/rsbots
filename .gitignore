@@ -54,6 +54,7 @@
 !RSForwarder/**/*.py
 !RSForwarder/COMMANDS.md
 !RSForwarder/config.json
+!RSForwarder/rs_fs_manual_overrides.json
 !RSForwarder/messages.json
 !RSForwarder/vouch_config.json
 
