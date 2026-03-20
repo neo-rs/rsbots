@@ -48,6 +48,25 @@ class Colors:
     RESET = '\033[0m'
 
 
+def _rsfs_is_valid_affiliate_url(url: str) -> bool:
+    """
+    True only for affiliate-looking URLs we are willing to persist into sheets.
+    Prevents storing plain store URLs (e.g. from fallback rewrite paths).
+    """
+    s = (url or "").strip()
+    if not s:
+        return False
+    low = s.lower()
+    if "mavely.app.link/" in low:
+        return True
+    # Amazon affiliate outputs should include an associate tag.
+    if "amazon.com" in low and "tag=" in low:
+        return True
+    if "amzn.to/" in low:
+        return True
+    return False
+
+
 def _rsfs_embed(
     title: str,
     *,
@@ -301,12 +320,26 @@ class _RsFsManualResolveView(discord.ui.View):
         # Never use URL as title fallback - keep title empty if not found
 
         # Compute affiliate URL (plain) and upsert into sheet immediately.
-        aff = u
+        # IMPORTANT: Do NOT fall back to storing the raw resolved URL in Affiliate URL
+        # when affiliate rewriting fails (that creates "wrong format" entries).
+        aff = ""
         try:
-            mapped, _notes = await affiliate_rewriter.compute_affiliate_rewrites_plain(self._bot.config, [u])
-            aff = str((mapped or {}).get(u) or u).strip()
+            mapped, notes = await affiliate_rewriter.compute_affiliate_rewrites_plain(self._bot.config, [u])
+            cand = str((mapped or {}).get(u) or "").strip()
+            note = str((notes or {}).get(u) or "").lower()
+            # Accept only real affiliate-looking outputs.
+            if cand and any(
+                x in note
+                for x in (
+                    "mavely affiliate",
+                    "rewrapped mavely link",
+                    "resolves to mavely link",
+                    "amazon affiliate",
+                )
+            ):
+                aff = cand
         except Exception:
-            aff = u
+            aff = ""
 
         store = str(it.get("store") or "")
         sku = str(it.get("sku") or "")
@@ -3895,14 +3928,41 @@ class RSForwarderBot:
                                 continue
                             seen_u.add(u)
                             unique_urls.append(u)
-                        mapped, _notes = await affiliate_rewriter.compute_affiliate_rewrites_plain(self.config, unique_urls)
-                        aff_map = {str(k or "").strip(): str(v or "").strip() for k, v in (mapped or {}).items()}
+                        mapped, notes = await affiliate_rewriter.compute_affiliate_rewrites_plain(self.config, unique_urls)
+                        # Only persist real affiliate outputs. Exclude "expanded only" fallbacks.
+                        # Notes produced by affiliate_rewriter.compute_affiliate_rewrites(...)
+                        # - mavely affiliate
+                        # - rewrapped mavely link
+                        # - resolves to mavely link
+                        # - amazon affiliate
+                        aff_map: Dict[str, str] = {}
+                        for k, v in (mapped or {}).items():
+                            k2 = str(k or "").strip()
+                            v2 = str(v or "").strip()
+                            if not (k2 and v2):
+                                continue
+                            n = str((notes or {}).get(k2) or (notes or {}).get(k) or "").lower()
+                            if any(
+                                x in n
+                                for x in (
+                                    "mavely affiliate",
+                                    "rewrapped mavely link",
+                                    "resolves to mavely link",
+                                    "amazon affiliate",
+                                )
+                            ):
+                                aff_map[k2] = v2
 
                     for e in entries:
                         u0 = (getattr(e, "monitor_url", "") or getattr(e, "url", "") or "").strip()
                         prev_aff = str(getattr(e, "affiliate_url", "") or "").strip()
-                        aff = (aff_map.get(u0) or "").strip() if u0 else ""
-                        if not aff:
+                        if u0:
+                            u_norm = affiliate_rewriter.normalize_input_url(u0) or u0
+                            aff = (aff_map.get(u_norm) or aff_map.get(u0) or "").strip()
+                        else:
+                            aff = ""
+                        # Only carry over previous affiliate if it already looks valid.
+                        if (not aff) and prev_aff and _rsfs_is_valid_affiliate_url(prev_aff):
                             aff = prev_aff
                         enriched.append(
                             rs_fs_sheet_sync.RsFsPreviewEntry(
@@ -6123,8 +6183,24 @@ class RSForwarderBot:
                                     seen_u.add(u)
                                     unique_urls.append(u)
                                 if unique_urls:
-                                    mapped, _notes = await affiliate_rewriter.compute_affiliate_rewrites_plain(self.config, unique_urls)
-                                    aff_map = {str(k or "").strip(): str(v or "").strip() for k, v in (mapped or {}).items()}
+                                    mapped, notes = await affiliate_rewriter.compute_affiliate_rewrites_plain(self.config, unique_urls)
+                                    aff_map: Dict[str, str] = {}
+                                    for k, v in (mapped or {}).items():
+                                        k2 = str(k or "").strip()
+                                        v2 = str(v or "").strip()
+                                        if not (k2 and v2):
+                                            continue
+                                        n = str((notes or {}).get(k2) or (notes or {}).get(k) or "").lower()
+                                        if any(
+                                            x in n
+                                            for x in (
+                                                "mavely affiliate",
+                                                "rewrapped mavely link",
+                                                "resolves to mavely link",
+                                                "amazon affiliate",
+                                            )
+                                        ):
+                                            aff_map[k2] = v2
 
                             enriched: List[rs_fs_sheet_sync.RsFsPreviewEntry] = []
                             for e in entries:
@@ -6140,7 +6216,11 @@ class RSForwarderBot:
                                         if hist_aff:
                                             aff = hist_aff
                                 if not aff and u0:
-                                    aff = (aff_map.get(u0) or "").strip()
+                                    aff = (
+                                        aff_map.get(affiliate_rewriter.normalize_input_url(u0) or u0)
+                                        or aff_map.get(u0)
+                                        or ""
+                                    ).strip()
                                 if not aff:
                                     aff = str(getattr(e, "affiliate_url", "") or "").strip()
                                 
@@ -6249,12 +6329,13 @@ class RSForwarderBot:
                                 title = str(row[6] or "").strip() if len(row) > 6 else ""
                                 url = str(row[7] or "").strip() if len(row) > 7 else ""
                                 aff = str(row[8] or "").strip() if len(row) > 8 else ""
-                            if url and not aff and self._rsfs_use_history_cache() and key in history_cache:
+                            if url and (not aff or not _rsfs_is_valid_affiliate_url(aff)) and self._rsfs_use_history_cache() and key in history_cache:
                                 hist_aff = str(history_cache.get(key, {}).get("affiliate_url", "") or "").strip()
-                                if hist_aff:
+                                if hist_aff and _rsfs_is_valid_affiliate_url(hist_aff):
                                     aff = hist_aff
-                            if url and not aff:
-                                if not self._rsfs_use_history_cache() or not str(history_cache.get(key, {}).get("affiliate_url", "") or "").strip():
+                            if url and (not aff or not _rsfs_is_valid_affiliate_url(aff)):
+                                hist_aff2 = str(history_cache.get(key, {}).get("affiliate_url", "") or "").strip() if key in history_cache else ""
+                                if (not self._rsfs_use_history_cache()) or (not hist_aff2 or not _rsfs_is_valid_affiliate_url(hist_aff2)):
                                     urls_to_rewrite.append(url)
                             all_rows.append([store, sku, title, aff, url])
                         try:
@@ -6271,28 +6352,41 @@ class RSForwarderBot:
                             if rewrite_enabled:
                                 try:
                                     unique_urls = list(dict.fromkeys(urls_to_rewrite))
-                                    mapped, _notes = await affiliate_rewriter.compute_affiliate_rewrites_plain(self.config, unique_urls)
-                                    aff_map = {str(k or "").strip(): str(v or "").strip() for k, v in (mapped or {}).items()}
+                                    mapped, notes = await affiliate_rewriter.compute_affiliate_rewrites_plain(self.config, unique_urls)
+                                    aff_map: Dict[str, str] = {}
+                                    for k, v in (mapped or {}).items():
+                                        k2 = str(k or "").strip()
+                                        v2 = str(v or "").strip()
+                                        if not (k2 and v2):
+                                            continue
+                                        n = str((notes or {}).get(k2) or (notes or {}).get(k) or "").lower()
+                                        if any(
+                                            x in n
+                                            for x in (
+                                                "mavely affiliate",
+                                                "rewrapped mavely link",
+                                                "resolves to mavely link",
+                                                "amazon affiliate",
+                                            )
+                                        ):
+                                            aff_map[k2] = v2
 
                                     def _get_affiliate_for_url(u: str, am: Dict[str, str]) -> str:
-                                        u = (u or "").strip()
-                                        if not u:
+                                        u0 = (u or "").strip()
+                                        if not u0:
                                             return ""
+                                        # Keys from affiliate_rewriter are normalized (spaces -> %20).
+                                        u_norm = affiliate_rewriter.normalize_input_url(u0) or u0
                                         # Exact match first
-                                        out = (am.get(u) or "").strip()
-                                        if out:
-                                            return out
-                                        # Try normalized variants (trailing slash, etc.)
-                                        u_rstrip = u.rstrip("/")
-                                        if u_rstrip != u:
-                                            out = (am.get(u_rstrip) or "").strip()
+                                        for cand in (u_norm, u0, u0.rstrip("/"), u_norm.rstrip("/")):
+                                            out = (am.get(cand) or "").strip()
                                             if out:
                                                 return out
                                         for orig, aff_val in am.items():
                                             orig = (orig or "").strip()
                                             if not orig or not aff_val:
                                                 continue
-                                            if orig == u or orig.rstrip("/") == u or orig.rstrip("/") == u_rstrip:
+                                            if orig in {u0, u0.rstrip("/"), u_norm, u_norm.rstrip("/")}:
                                                 return (aff_val or "").strip()
                                         return ""
 
@@ -6300,15 +6394,10 @@ class RSForwarderBot:
                                     filled = 0
                                     for i, row_data in enumerate(all_rows):
                                         store, sku, title, aff, url = row_data
-                                        if url and not aff:
+                                        if url and (not aff or not _rsfs_is_valid_affiliate_url(aff)):
                                             new_aff = _get_affiliate_for_url(url, aff_map)
-                                            if not new_aff:
-                                                # Best-effort fallback: remove foreign tracking params so affiliate column isn't blank.
-                                                # This preserves your "no empty affiliate_url" operational expectation even when Mavely can't resolve.
-                                                try:
-                                                    new_aff = affiliate_rewriter._strip_tracking_params(url)
-                                                except Exception:
-                                                    new_aff = (url or "").strip()
+                                            # Only write affiliate when we actually generated a tracking link.
+                                            # If rewrite didn't resolve, keep affiliate blank so we don't store non-affiliate URLs.
                                             if new_aff:
                                                 all_rows[i] = [store, sku, title, new_aff, url]
                                                 filled += 1
@@ -6338,7 +6427,7 @@ class RSForwarderBot:
 
                             # Prefer affiliate-populated rows when the existing one is blank.
                             existing_aff = str(existing[3] or "").strip() if len(existing) > 3 else ""
-                            if aff and not existing_aff:
+                            if _rsfs_is_valid_affiliate_url(aff) and not _rsfs_is_valid_affiliate_url(existing_aff):
                                 seen_key_to_row[key] = [store, sku, title, aff, url]
                                 continue
 

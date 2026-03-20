@@ -246,6 +246,11 @@ def normalize_input_url(raw: str) -> str:
         if inner:
             s = inner
 
+    # Normalize whitespace in URLs (some store links contain unencoded spaces)
+    # so downstream affiliate creation doesn't fail and silently fall back.
+    s = s.replace("\r", "").replace("\n", "").replace("\t", " ").strip()
+    s = s.replace(" ", "%20")
+
     if s.startswith("http://") or s.startswith("https://"):
         return s
     return f"https://{s}"

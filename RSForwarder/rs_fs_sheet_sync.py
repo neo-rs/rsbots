@@ -1341,6 +1341,66 @@ class RsFsSheetSync:
                 deleted_count = await self._delete_rows_by_indices(stale_rows)
 
         # Reset dedupe cache so subsequent runs see fresh sheet state.
+        # Also dedupe store|sku duplicates that may already exist in the sheet.
+        # Normal upsert-only sync must never create new duplicates, but prior duplicates
+        # can still remain. We remove extras and keep the "best" row per store|sku.
+        try:
+            tab_title = await self._resolve_tab_name()
+            if tab_title:
+                service = self._get_service()
+                if service:
+                    rng_live = f"'{tab_title}'!A:H"
+
+                    def _do_live_get() -> List[List[str]]:
+                        resp = service.spreadsheets().values().get(
+                            spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                            range=rng_live,
+                        ).execute()
+                        values = resp.get("values") if isinstance(resp, dict) else None
+                        return values if isinstance(values, list) else []
+
+                    values_live = await asyncio.to_thread(_do_live_get)
+
+                    # key -> list of (row_index_1_based, score_tuple)
+                    # Score: prefer affiliate-populated rows, then title/url-populated.
+                    best_map: Dict[str, List[Tuple[int, Tuple[int, int, int]]]] = {}
+                    for i, row in enumerate(values_live, start=1):
+                        if i == 1:
+                            continue
+                        if not isinstance(row, list) or len(row) < 2:
+                            continue
+                        store = str(row[0] or "").strip()
+                        sku = str(row[1] or "").strip()
+                        if not (store and sku):
+                            continue
+                        if sku.lower() == "sku-upc":
+                            continue
+                        key = f"{store.lower()}|{sku.lower()}"
+                        title = str(row[2] or "").strip() if len(row) > 2 else ""
+                        url = str(row[3] or "").strip() if len(row) > 3 else ""
+                        aff = str(row[6] or "").strip() if len(row) > 6 else ""
+                        score = (1 if aff else 0, 1 if title else 0, 1 if url else 0)
+                        best_map.setdefault(key, []).append((i, score))
+
+                    to_delete: List[int] = []
+                    for _key, entries in best_map.items():
+                        if len(entries) <= 1:
+                            continue
+                        # Keep the max score; delete the rest.
+                        entries_sorted = sorted(entries, key=lambda t: t[1], reverse=True)
+                        keep_i = entries_sorted[0][0]
+                        for ri, _score in entries_sorted[1:]:
+                            if ri != keep_i:
+                                to_delete.append(ri)
+
+                    if to_delete:
+                        to_delete = sorted(set(to_delete))
+                        async with self._api_lock:
+                            await self._delete_rows_by_indices(to_delete)
+        except Exception:
+            # Best-effort only: never fail the sync due to dedupe cleanup.
+            pass
+
         self._dedupe_skus = set()
         self._dedupe_last_fetch_ts = 0.0
         return True, "ok", int(added_count), int(updated_count), int(deleted_count)
