@@ -136,6 +136,13 @@ def _strip_tracking_params(url: str) -> str:
         "aff",
         "cid",  # many merchants use cid=affiliate-_-...
         "source",
+        # Target creator branded portal uses TCID=AFL-...
+        # This should not be forwarded into our own affiliate link generation.
+        "tcid",
+        # Target tracking params (non-essential for destination resolution)
+        "clkid",
+        "cpng",
+        "lnm",
         "ref",
         "refid",
         "ref_id",

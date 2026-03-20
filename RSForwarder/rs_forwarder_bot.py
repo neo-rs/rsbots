@@ -64,6 +64,12 @@ def _rsfs_is_valid_affiliate_url(url: str) -> bool:
         return True
     if "amzn.to/" in low:
         return True
+    # Target Creator Branded Portal affiliate links include TCID + AFL marker.
+    # Example contains: TCID=AFL-...&afid=Target%20-%20Creator%20Branded%20Portal
+    if "tcid=" in low and "afl-" in low:
+        return True
+    if "afid=target" in low and "creator" in low:
+        return True
     return False
 
 
@@ -1079,6 +1085,8 @@ class RSForwarderBot:
         # RS - Full Send List sheet sync (Zephyr release feed -> Google Sheet)
         self._rs_fs_sheet = rs_fs_sheet_sync.RsFsSheetSync(self.config)
         self._rs_fs_seen_message_ids: Set[int] = set()
+        # Best-effort: avoid running the Live-list affiliate recovery repeatedly on reconnect.
+        self._rs_fs_live_affiliate_recovery_done: bool = False
         # Guard to prevent concurrent sheet syncs during manual runs (avoids partial-chunk thrash)
         self._rs_fs_manual_run_in_progress: bool = False
         # Debounce for auto check/status messages (avoid spamming on multi-chunk listreleases).
@@ -1511,7 +1519,14 @@ class RSForwarderBot:
                 #   7: Resolved URL, 8: Affiliate URL
                 u = str(row[7] or "").strip() if len(row) > 7 else ""
                 a = str(row[8] or "").strip() if len(row) > 8 else ""
-                if u and (not _rsfs_is_valid_affiliate_url(a)):
+                # Only rewrite when affiliate is missing or clearly wrong (affiliate == resolved).
+                # We intentionally do NOT rely on URL-shape heuristics here; instead we use
+                # affiliate_rewriter `notes` to decide whether the output is truly affiliate.
+                if u and (
+                    (not a)
+                    or (str(a).strip().lower() == str(u).strip().lower())
+                    or (not _rsfs_is_valid_affiliate_url(a))
+                ):
                     needing.append((i, u))
                     if u not in seen_urls:
                         seen_urls.add(u)
@@ -1523,13 +1538,28 @@ class RSForwarderBot:
                 except Exception:
                     mapped, notes = {}, {}
 
-                # Only persist affiliate-looking outputs.
+                # Persist only when we produced a valid affiliate URL.
+                # If rewrite fails to produce a valid affiliate URL, fall back to the
+                # already-present affiliate-looking resolved URL (if any).
+                written = 0
                 for row_idx, u in needing:
                     cand = str((mapped or {}).get(u) or "").strip()
-                    if _rsfs_is_valid_affiliate_url(cand):
+                    if cand and _rsfs_is_valid_affiliate_url(cand):
                         rows[row_idx][8] = cand
-                    else:
-                        rows[row_idx][8] = ""
+                        written += 1
+                        continue
+                    if _rsfs_is_valid_affiliate_url(u):
+                        rows[row_idx][8] = u
+                        written += 1
+                        continue
+                    rows[row_idx][8] = ""
+
+                try:
+                    print(
+                        f"{Colors.CYAN}[RS-FS Current]{Colors.RESET} Affiliate prefill (/listrelease) requested_urls={len(unique_urls)} written_rows={written}"
+                    )
+                except Exception:
+                    pass
 
         ok, msg, n = await self._rs_fs_sheet.write_current_list_mirror(rows)
         try:
@@ -1537,6 +1567,162 @@ class RSForwarderBot:
         except Exception:
             pass
         return ok, msg, n
+
+    async def _rsfs_recover_live_affiliates_from_monitor_on_startup(self) -> None:
+        """
+        Recovery/journal step:
+        - Read `Full Send Live List`
+        - For rows where Affiliate URL (column G) is blank/invalid but Monitor URL (column H) has a value,
+          compute or reuse the affiliate URL from Monitor URL.
+        - Upsert Live rows, then upsert History rows to keep History affiliate_url consistent.
+        """
+        # In-memory guard (on_ready can fire again on reconnect)
+        if self._rs_fs_live_affiliate_recovery_done:
+            return
+        self._rs_fs_live_affiliate_recovery_done = True
+
+        try:
+            enabled = bool(self.config.get("rs_fs_recover_live_affiliate_on_startup", True))
+        except Exception:
+            enabled = True
+        if not enabled:
+            return
+
+        if not getattr(self, "_rs_fs_sheet", None) or not self._rs_fs_sheet.enabled():
+            return
+
+        try:
+            max_rows = int(self.config.get("rs_fs_recover_live_affiliate_max_rows", 300) or 300)
+        except Exception:
+            max_rows = 300
+        max_rows = max(10, min(max_rows, 2000))
+
+        try:
+            rewrite_enabled = bool(self.config.get("affiliate_rewrite_enabled", True))
+        except Exception:
+            rewrite_enabled = True
+
+        now_iso = rs_fs_sheet_sync.RsFsSheetSync._utc_now_iso()  # type: ignore[attr-defined]
+
+        print(f"{Colors.CYAN}[RS-FS Recovery]{Colors.RESET} Starting Live affiliate recovery on startup (max_rows={max_rows}, rewrite_enabled={rewrite_enabled})")
+
+        try:
+            live_rows = await self._rs_fs_sheet.fetch_live_list_rows()
+        except Exception as e:
+            print(f"{Colors.RED}[RS-FS Recovery]{Colors.RESET} fetch_live_list_rows failed: {e}")
+            return
+
+        if not live_rows:
+            print(f"{Colors.YELLOW}[RS-FS Recovery]{Colors.RESET} Live list empty; nothing to do")
+            return
+
+        # Live list columns (A:H) in fetch_live_list_rows:
+        #   0 Store, 1 SKU-UPC, 2 Product Title, 3 STORE LINK, 4 Comps, 5 Category,
+        #   6 Affiliate URL (affiliated link), 7 monitor url link
+        candidates: List[Tuple[int, str, str, str, str]] = []  # (row_idx_0, store, sku, title, monitor_url)
+        unique_monitor_urls: List[str] = []
+        seen_monitor_urls: Set[str] = set()
+
+        for ri, row in enumerate(live_rows):
+            if len(candidates) >= max_rows:
+                break
+            if not isinstance(row, list) or len(row) < 8:
+                continue
+            store = str(row[0] or "").strip()
+            sku = str(row[1] or "").strip()
+            title = str(row[2] or "").strip()
+            aff = str(row[6] or "").strip() if len(row) > 6 else ""
+            mon = str(row[7] or "").strip() if len(row) > 7 else ""
+
+            if not (store and sku and mon):
+                continue
+            if _rsfs_is_valid_affiliate_url(aff):
+                continue
+            candidates.append((ri, store, sku, title, mon))
+            if mon not in seen_monitor_urls:
+                seen_monitor_urls.add(mon)
+                unique_monitor_urls.append(mon)
+
+        print(f"{Colors.CYAN}[RS-FS Recovery]{Colors.RESET} Live rows={len(live_rows)} candidates_affiliate_missing_or_invalid={len(candidates)} unique_monitor_urls={len(unique_monitor_urls)}")
+        if not candidates:
+            return
+
+        # Compute affiliate for monitor URLs.
+        # Even if monitor_url already contains Target tracking params, we still try to
+        # generate our own affiliate (Mavely/Amazon). If rewrite cannot produce a valid
+        # affiliate URL, we fall back to the original monitor_url if it is affiliate-looking.
+        aff_map: Dict[str, str] = {}
+        if rewrite_enabled and unique_monitor_urls:
+            try:
+                mapped, notes = await affiliate_rewriter.compute_affiliate_rewrites_plain(self.config, unique_monitor_urls)
+            except Exception as e:
+                print(f"{Colors.RED}[RS-FS Recovery]{Colors.RESET} affiliate rewrite failed: {e}")
+                mapped, notes = {}, {}
+
+            for u in unique_monitor_urls:
+                cand = str((mapped or {}).get(u) or "").strip()
+                if cand and _rsfs_is_valid_affiliate_url(cand):
+                    aff_map[u] = cand
+                elif _rsfs_is_valid_affiliate_url(u):
+                    aff_map[u] = u
+        else:
+            for u in unique_monitor_urls:
+                if _rsfs_is_valid_affiliate_url(u):
+                    aff_map[u] = u
+
+        # Build Live update rows: [store, sku, title, affiliate_url(G), monitor_url(H)]
+        live_update_rows: List[List[str]] = []
+        history_update_rows: List[List[str]] = []
+
+        # History cache for preserving first_seen + last_release_id
+        try:
+            history_cache = await self._rs_fs_sheet.fetch_history_cache(force=True)
+        except Exception:
+            history_cache = {}
+
+        rewritten = 0
+        for (ri, store, sku, title, mon) in candidates:
+            key = self._rsfs_key_store_sku(store, sku)
+            affiliate_url = aff_map.get(mon) or ""
+
+            # If we still couldn't derive an affiliate, don't blank out existing data.
+            if not _rsfs_is_valid_affiliate_url(affiliate_url):
+                print(f"{Colors.YELLOW}[RS-FS Recovery]{Colors.RESET} skip store={store} sku={sku}: cannot derive affiliate from monitor_url")
+                continue
+
+            rewritten += 1
+            live_update_rows.append([store, sku, title, affiliate_url, mon])
+
+            # Upsert into History to keep affiliate_url consistent
+            hrec = history_cache.get(key) or {}
+            first_seen = str(hrec.get("first_seen") or "").strip() or now_iso
+            last_seen = now_iso
+            url = str(hrec.get("url") or "").strip() or mon
+            src = str(hrec.get("source") or "").strip() or "recovery"
+            last_release_id = str(hrec.get("last_release_id") or "").strip()
+            history_update_rows.append([store, sku, title or str(hrec.get("title") or "").strip(), url, affiliate_url, first_seen, last_seen, last_release_id, src])
+
+            print(f"{Colors.CYAN}[RS-FS Recovery]{Colors.RESET} FILLED store={store} sku={sku} monitor_url_short={mon[:60]!r} affiliate_url_short={affiliate_url[:60]!r}")
+
+        if not live_update_rows:
+            print(f"{Colors.YELLOW}[RS-FS Recovery]{Colors.RESET} No live rows were filled; recovery stops")
+            return
+
+        # Upsert Live without deleting stale rows
+        try:
+            ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(live_update_rows, delete_stale=False)
+            print(f"{Colors.GREEN}[RS-FS Recovery]{Colors.RESET} Live sync ok={ok} msg={msg} added={added} updated={updated} deleted={deleted}")
+        except Exception as e:
+            print(f"{Colors.RED}[RS-FS Recovery]{Colors.RESET} Live sync failed: {e}")
+            return
+
+        # Upsert History with updated affiliate_url
+        if history_update_rows:
+            try:
+                ok_h, msg_h, added_h, updated_h = await self._rs_fs_sheet.upsert_history_rows(history_update_rows)
+                print(f"{Colors.GREEN}[RS-FS Recovery]{Colors.RESET} History upsert ok={ok_h} msg={msg_h} added={added_h} updated={updated_h}")
+            except Exception as e:
+                print(f"{Colors.RED}[RS-FS Recovery]{Colors.RESET} History upsert failed: {e}")
 
     async def _rsfs_sync_current_to_live_list(self) -> Tuple[bool, str, int, int, int]:
         """
@@ -4439,6 +4625,14 @@ class RSForwarderBot:
             except Exception:
                 pass
 
+            # Recovery step:
+            # If Live List has empty Affiliate URL (col G) but monitor URL (col H) is present,
+            # fill affiliate + update History so future syncs are consistent.
+            try:
+                await self._rsfs_recover_live_affiliates_from_monitor_on_startup()
+            except Exception as e:
+                print(f"{Colors.YELLOW}[RS-FS Recovery]{Colors.RESET} start failed (best-effort): {e}")
+
             # Start background Mavely monitor (DM alerts + auto-start login desktop)
             try:
                 if self._mavely_monitor_task is None or self._mavely_monitor_task.done():
@@ -6435,7 +6629,7 @@ class RSForwarderBot:
                                             new_aff = _get_affiliate_for_url(url, aff_map)
                                             # Only write affiliate when we actually generated a tracking link.
                                             # If rewrite didn't resolve, keep affiliate blank so we don't store non-affiliate URLs.
-                                            if new_aff:
+                                            if new_aff and _rsfs_is_valid_affiliate_url(new_aff):
                                                 all_rows[i] = [store, sku, title, new_aff, url]
                                                 filled += 1
                                     try:

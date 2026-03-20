@@ -11,6 +11,7 @@
 !/oracle_tools_menu_mwbots.bat
 !/oracle_baseline_check_mwbots.bat
 !/kill_git_ssh_tasks.bat
+!/oracle_server_specs_menu.bat
 
 # Allow canonical docs at repo root
 !/CANONICAL_RULES.md
