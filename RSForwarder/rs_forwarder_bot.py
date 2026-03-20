@@ -1494,6 +1494,43 @@ class RSForwarderBot:
                 ]
             )
 
+        # Ensure Affiliate URL is populated during the /listrelease auto-write step.
+        # This is what makes the subsequent "Sync New/Updated to Live" button able to
+        # propagate affiliate URLs into the Live tab reliably.
+        try:
+            rewrite_enabled = bool(self.config.get("affiliate_rewrite_enabled", True))
+        except Exception:
+            rewrite_enabled = True
+
+        if rewrite_enabled and rows:
+            needing: List[Tuple[int, str]] = []  # (row_index_in_rows, resolved_url)
+            seen_urls: Set[str] = set()
+            unique_urls: List[str] = []
+            for i, row in enumerate(rows):
+                # Current List columns:
+                #   7: Resolved URL, 8: Affiliate URL
+                u = str(row[7] or "").strip() if len(row) > 7 else ""
+                a = str(row[8] or "").strip() if len(row) > 8 else ""
+                if u and (not _rsfs_is_valid_affiliate_url(a)):
+                    needing.append((i, u))
+                    if u not in seen_urls:
+                        seen_urls.add(u)
+                        unique_urls.append(u)
+
+            if unique_urls:
+                try:
+                    mapped, notes = await affiliate_rewriter.compute_affiliate_rewrites_plain(self.config, unique_urls)
+                except Exception:
+                    mapped, notes = {}, {}
+
+                # Only persist affiliate-looking outputs.
+                for row_idx, u in needing:
+                    cand = str((mapped or {}).get(u) or "").strip()
+                    if _rsfs_is_valid_affiliate_url(cand):
+                        rows[row_idx][8] = cand
+                    else:
+                        rows[row_idx][8] = ""
+
         ok, msg, n = await self._rs_fs_sheet.write_current_list_mirror(rows)
         try:
             print(f"{Colors.CYAN}[RS-FS Current]{Colors.RESET} mirror ok={ok} rows={n} reason={reason} hash={h} msg={msg}")
