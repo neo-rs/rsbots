@@ -6302,6 +6302,13 @@ class RSForwarderBot:
                                         store, sku, title, aff, url = row_data
                                         if url and not aff:
                                             new_aff = _get_affiliate_for_url(url, aff_map)
+                                            if not new_aff:
+                                                # Best-effort fallback: remove foreign tracking params so affiliate column isn't blank.
+                                                # This preserves your "no empty affiliate_url" operational expectation even when Mavely can't resolve.
+                                                try:
+                                                    new_aff = affiliate_rewriter._strip_tracking_params(url)
+                                                except Exception:
+                                                    new_aff = (url or "").strip()
                                             if new_aff:
                                                 all_rows[i] = [store, sku, title, new_aff, url]
                                                 filled += 1
@@ -6339,6 +6346,16 @@ class RSForwarderBot:
                             if (title or url) and not (existing[2] or existing[4]):
                                 seen_key_to_row[key] = [store, sku, title, aff, url]
                         all_rows = list(seen_key_to_row.values())
+
+                        # Propagate affiliate_url into resolved_by_key (used to write Current List + History).
+                        # Without this, affiliate filled for Live could remain blank in Current/History.
+                        try:
+                            for store, sku, title, aff, url in all_rows:
+                                k0 = self._rsfs_key_store_sku(store, sku)
+                                if k0 in resolved_by_key and aff:
+                                    resolved_by_key[k0]["affiliate_url"] = aff
+                        except Exception:
+                            pass
                         
                         # Write Current List and History BEFORE sync so Current List is source of truth (Fix: Step 2 updates Current List; Finish won't overwrite Live List with stale data)
                         try:
@@ -6362,6 +6379,11 @@ class RSForwarderBot:
                                 rid0 = 0
                             if k0 in resolved_by_key:
                                 resolved_by_key[k0]["last_release_id"] = str(rid0 or "")
+                            # Use resolved_by_key affiliate_url if it was filled during Live sync stage.
+                            if k0 in resolved_by_key:
+                                a1 = str(resolved_by_key.get(k0, {}).get("affiliate_url", "") or "").strip()
+                                if a1:
+                                    a0 = a1
                             history_rows.append([st0, sk0, t0, u0, a0, "", now_iso, str(rid0 or ""), src0])
                         if history_rows:
                             try:
