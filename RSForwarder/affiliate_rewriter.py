@@ -478,6 +478,8 @@ def should_expand_url(url: str) -> bool:
     if host in env_hosts:
         return True
     common = {
+        "dealshacks.com",
+        "www.dealshacks.com",
         "bit.ly",
         "t.co",
         "tinyurl.com",
@@ -1027,6 +1029,9 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                         "go.skimresources.com",
                         "howl.link",
                         "howl.me",
+                        # dealshacks.com -> 302 -> hiddendealsociety.com/deal/... (Next.js RSC; outbound URL in payload)
+                        "hiddendealsociety.com",
+                        "www.hiddendealsociety.com",
                     }
 
                     # Some hubs require 2 steps:
