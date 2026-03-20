@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import fnmatch
 import hashlib
 import json
@@ -106,7 +107,30 @@ def _match_any(name: str, globs: Iterable[str]) -> bool:
 
 
 def _should_skip_dir(path: Path) -> bool:
-    return path.name in {"__pycache__", ".git", ".venv", "venv", ".staging-local"} or path.name.startswith(".staging-")
+    # Keep manifest generation fast by pruning directories that are either
+    # never included by our include_globs or are known to be very large runtime artifacts.
+    return (
+        path.name
+        in {
+            "__pycache__",
+            ".git",
+            ".venv",
+            "venv",
+            ".staging-local",
+            ".pytest_cache",
+            ".mypy_cache",
+            ".ruff_cache",
+            ".cache",
+            "node_modules",
+            "dist",
+            "build",
+            "coverage",
+            "logs",
+            ".playwright",
+            "playwright_profile",
+        }
+        or path.name.startswith(".staging-")
+    )
 
 
 def _iter_included_files(
@@ -114,22 +138,30 @@ def _iter_included_files(
     include_globs: List[str],
     exclude_globs: List[str],
 ) -> Iterable[Tuple[str, Path]]:
-    for p in root.rglob("*"):
-        if p.is_dir():
-            if _should_skip_dir(p):
-                # prune by skipping walk descendants via rglob (best-effort)
+    # Use os.walk so we can prune directories *before* they are traversed.
+    # This matters a lot for large bot folders (Instorebotforwarder, etc.).
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirpath_p = Path(dirpath)
+
+        # Prune subdirectories in-place (os.walk will not descend into them).
+        # Use the directory *name* only; _should_skip_dir is name-based.
+        pruned = [d for d in dirnames if not _should_skip_dir(Path(d))]
+        if len(pruned) != len(dirnames):
+            dirnames[:] = pruned
+
+        for fn in filenames:
+            p = dirpath_p / fn
+            rel = p.relative_to(root).as_posix()
+            base = fn
+
+            # Include by base name or full relative path
+            if not (_match_any(base, include_globs) or _match_any(rel, include_globs)):
                 continue
-            continue
 
-        rel = p.relative_to(root).as_posix()
-        base = p.name
+            # Exclude by base name or full relative path
+            if _match_any(base, exclude_globs) or _match_any(rel, exclude_globs):
+                continue
 
-        # Exclude by base name or full relative path
-        if _match_any(base, exclude_globs) or _match_any(rel, exclude_globs):
-            continue
-
-        # Include by base name or full relative path
-        if _match_any(base, include_globs) or _match_any(rel, include_globs):
             yield rel, p
 
 

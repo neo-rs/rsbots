@@ -123,13 +123,32 @@ def _run(cmd: List[str], timeout: int) -> subprocess.CompletedProcess:
 
 
 def _safe_extract(tar_path: Path, dest_dir: Path) -> None:
-    # Prevent path traversal.
+    # Prevent path traversal and avoid Windows path-length failures.
+    # We extract member-by-member so we can skip members that cannot be extracted.
+    max_path = 259
+    dest_str = str(dest_dir.resolve())
+    skipped = 0
     with tarfile.open(tar_path, "r:gz") as tf:
         for member in tf.getmembers():
             name = member.name
             if name.startswith("/") or name.startswith("\\") or ".." in Path(name).parts:
                 raise RuntimeError(f"Unsafe tar member path: {name}")
-        tf.extractall(dest_dir)
+
+            target = os.path.normpath(os.path.join(dest_str, name))
+            if len(target) > max_path:
+                skipped += 1
+                continue
+
+            try:
+                tf.extract(member, dest_dir)
+            except OSError as e:
+                # Windows path length / locked files can fail; skip those safely.
+                if getattr(e, "winerror", None) == 3 or "path" in str(e).lower():
+                    skipped += 1
+                    continue
+                raise
+    if skipped:
+        print(f"[extract] Skipped {skipped} member(s) (path too long or inaccessible on this OS)")
 
 
 def _chmod_tree_writable(path: Path) -> None:
@@ -274,6 +293,18 @@ def main() -> int:
     ap.add_argument("--remote-root", default=None, help="Remote root override (default: /home/rsadmin/bots/mirror-world or server entry)")
     ap.add_argument("--no-oracle-server-data", action="store_true", help="Do not include OracleServerData in the snapshot")
     ap.add_argument(
+        "--scp-timeout",
+        type=int,
+        default=1800,
+        help="SCP download timeout in seconds (default: 1800). Increase if your network is slow.",
+    )
+    ap.add_argument(
+        "--ssh-timeout",
+        type=int,
+        default=300,
+        help="SSH remote command timeout in seconds (default: 300).",
+    )
+    ap.add_argument(
         "--keep-snapshots",
         type=int,
         default=1,
@@ -324,20 +355,27 @@ def main() -> int:
     if not args.no_oracle_server_data:
         includes.append("OracleServerData")
 
+    # set -f prevents bash from expanding our --exclude=*.env patterns.
+    # GNU tar can exit 1 when files change while reading; treat 1 as success.
     remote_cmd = (
-        "set -euo pipefail; "
+        "set -euo pipefail; set -f; "
         f"cd {shlex.quote(entry.remote_root)}; "
         f"rm -f {shlex.quote(remote_tar)} || true; "
+        "set +e; "
         f"tar -czf {shlex.quote(remote_tar)} "
         + " ".join(EXCLUDES_DEFAULT)
         + " "
         + " ".join(shlex.quote(x) for x in includes)
-        + f"; echo REMOTE_TAR={shlex.quote(remote_tar)}; ls -lh {shlex.quote(remote_tar)}"
+        + "; tarc=$?; set -e; "
+        'if [ "$tarc" -ne 0 ] && [ "$tarc" -ne 1 ]; then exit "$tarc"; fi; '
+        + f"echo REMOTE_TAR={shlex.quote(remote_tar)}; ls -lh {shlex.quote(remote_tar)}"
     )
 
     print(f"[1/3] Building remote tar on {entry.user}@{entry.host} ...")
-    ssh_cmd = _build_ssh_base(entry) + ["bash", "-lc", remote_cmd]
-    res = _run(ssh_cmd, timeout=300)
+    # Windows SSH quoting safety:
+    # Use a single remote command argv to avoid bash/ssh truncation issues.
+    ssh_cmd = _build_ssh_base(entry) + [f"bash -lc {shlex.quote(remote_cmd)}"]
+    res = _run(ssh_cmd, timeout=args.ssh_timeout)
     if res.returncode != 0:
         print(res.stdout)
         print(res.stderr)
@@ -347,7 +385,7 @@ def main() -> int:
     print("[2/3] Downloading tar via scp ...")
     local_tar = snap_dir / f"rsbots_full_snapshot_{ts}.tar.gz"
     scp_cmd = _build_scp_base(entry) + [f"{entry.user}@{entry.host}:{remote_tar}", str(local_tar)]
-    res2 = _run(scp_cmd, timeout=300)
+    res2 = _run(scp_cmd, timeout=args.scp_timeout)
     if res2.returncode != 0:
         print(res2.stdout)
         print(res2.stderr)

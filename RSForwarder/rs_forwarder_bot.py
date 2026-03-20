@@ -470,7 +470,7 @@ class _RsFsManualResolveView(discord.ui.View):
             ok, msg, added, updated, deleted = await self._bot._rsfs_sync_current_to_live_list()
             try:
                 await interaction.followup.send(
-                    f"Current List updated with your resolutions. Live List synced: {added} added, {updated} updated, {deleted} removed.",
+                    f"Current List updated with your resolutions. Live List synced: {added} added, {updated} updated.",
                     ephemeral=True,
                 )
             except Exception:
@@ -905,7 +905,7 @@ class _RsFsCheckView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Run mirror sync", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Sync New/Updated to Live", style=discord.ButtonStyle.primary)
     async def run_sync(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[override]
         if not await self._guard(interaction):
             return
@@ -1484,7 +1484,7 @@ class RSForwarderBot:
             all_rows.append([store, sku, title, aff, url])
         if not all_rows:
             return True, "no Full Send rows with store+sku", 0, 0, 0
-        return await self._rs_fs_sheet.sync_rows_mirror(all_rows)
+        return await self._rs_fs_sheet.sync_rows_mirror(all_rows, delete_stale=False)
 
     async def _collect_latest_zephyr_release_feed_text(
         self,
@@ -1764,7 +1764,6 @@ class RSForwarderBot:
             existing_set = set()
 
         missing = sorted([k for k in unique_skus if k not in existing_set]) if existing_set else []
-        extra = sorted([k for k in existing_set if k not in unique_skus]) if existing_set else []
 
         emb.add_field(
             name="Latest /listreleases",
@@ -1779,26 +1778,6 @@ class RSForwarderBot:
             ),
             inline=False,
         )
-
-        # Current List SKU -> release ID (for "In sheet but not in latest list")
-        current_list_rid_by_sku: Dict[str, int] = {}
-        try:
-            if ok and getattr(self, "_rs_fs_sheet", None):
-                current_list_rows_check = await self._rs_fs_sheet.fetch_current_list_rows()
-                for row in current_list_rows_check:
-                    if len(row) >= 3:
-                        if str(row[0] or "").strip().lower() == "release id":
-                            continue
-                        sku_check = str(row[2] or "").strip().lower()
-                        rid_check_str = str(row[0] or "").strip()
-                        try:
-                            rid_check = int(rid_check_str) if rid_check_str else 0
-                            if rid_check > 0 and sku_check:
-                                current_list_rid_by_sku[sku_check] = rid_check
-                        except Exception:
-                            pass
-        except Exception:
-            pass
 
         if missing:
             sample = []
@@ -1815,23 +1794,6 @@ class RSForwarderBot:
             emb.add_field(
                 name="Missing from sheet (parseable SKUs)",
                 value=val2,
-                inline=False,
-            )
-        if extra:
-            sample_lines: List[str] = []
-            cmd_lines_extra: List[str] = []
-            for k in extra[:12]:
-                rid_extra = current_list_rid_by_sku.get(k)
-                sample_lines.append(f"- `{k}`")
-                if rid_extra:
-                    sample_lines.append(f"  /removereleaseid release_id: {rid_extra}")
-                    cmd_lines_extra.append(f"/removereleaseid release_id: {rid_extra}")
-            val_extra = f"`{len(extra)}`\n" + "\n".join(sample_lines)
-            if cmd_lines_extra:
-                val_extra = (val_extra + "\n\nCommands (copy):\n" + "\n".join(cmd_lines_extra)).strip()
-            emb.add_field(
-                name="In sheet but not in latest list",
-                value=val_extra,
                 inline=False,
             )
 
@@ -5567,13 +5529,13 @@ class RSForwarderBot:
                     await ctx.send(f"❌ Could not access Zephyr channel `{ch_id}` (no permission or not found).")
                     return
 
-                # Single merged-run, single mirror sync.
+                # Single merged-run, single Live upsert sync.
                 # Prevent live Zephyr message chunks from also being processed while we run.
                 prev_manual = bool(getattr(self, "_rs_fs_manual_run_in_progress", False))
                 self._rs_fs_manual_run_in_progress = True
                 prev_hist = None
                 try:
-                    await ctx.send(f"✅ Running RS-FS LIVE mirror sync from <#{ch_id}> (max={lim})…")
+                    await ctx.send(f"✅ Running RS-FS LIVE upsert sync from <#{ch_id}> (max={lim})…")
 
                     # Discord embed: per-field value max 1024; total embed max 6000
                     _FIELD_VALUE_MAX = 1024
@@ -6407,7 +6369,7 @@ class RSForwarderBot:
                         
                         # Sync all Current List items (Full Send only) to Live List
                         if all_rows:
-                            ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(all_rows)
+                            ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(all_rows, delete_stale=False)
                             
                             # Track what was added/updated (key by store|sku to match sync)
                             for store, sku, title, aff, url in all_rows:
@@ -6423,7 +6385,7 @@ class RSForwarderBot:
                     except Exception as e:
                         # Fallback to just syncing resolved items if full sync fails
                         rows = [[e.store, e.sku, e.title, e.affiliate_url, e.monitor_url] for e in entries]
-                        ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(rows)
+                        ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(rows, delete_stale=False)
                         # Track changes from resolved entries
                         changes_list = []
                         for e in entries:
@@ -6450,10 +6412,10 @@ class RSForwarderBot:
                         
                         # Always use embed format (never fallback to plain text)
                         # Discord embed total limit 6000; cap change items to avoid 50035
-                        summ = discord.Embed(title="RS-FS Sheet Sync (mirror)", color=discord.Color.green())
+                        summ = discord.Embed(title="RS-FS Live List Sync (Upsert)", color=discord.Color.green())
                         
                         # Sheet changes - always show (even if zeros)
-                        changes_text = f"added `{added}`\nupdated `{updated}`\nremoved `{deleted}`"
+                        changes_text = f"added `{added}`\nupdated `{updated}`"
                         summ.add_field(name="Sheet changes", value=changes_text, inline=True)
                         
                         # Show detailed list of changes (title/url → SKU); cap items to stay under Discord 6000 embed limit

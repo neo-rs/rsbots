@@ -102,6 +102,16 @@ if [ ! -d "$LIVE_ROOT" ]; then
 fi
 
 cd "$CODE_ROOT"
+#
+# Ensure the checkout is clean before git pull.
+# Without this, any untracked runtime artifacts (e.g. Playwright cache files)
+# can cause `git pull --ff-only` to abort with:
+#   "local changes ... would be overwritten by merge"
+#   "untracked working tree files would be overwritten"
+#
+git reset --hard HEAD >/dev/null 2>&1 || true
+git clean -fdx >/dev/null 2>&1 || true
+
 OLD="$(git rev-parse HEAD 2>/dev/null || echo '')"
 git fetch origin
 git pull --ff-only origin main

@@ -7,7 +7,6 @@ REM - Assumes MWBots repo has origin pointing to neo-rs/MWBots
 REM - MWBots/.gitignore must exclude secrets + runtime files
 
 cd /d "%~dp0MWBots"
-
 REM Basic sanity checks
 git rev-parse --is-inside-work-tree >nul 2>&1
 if errorlevel 1 (
@@ -17,20 +16,18 @@ if errorlevel 1 (
 
 REM Make sure we're on main (best effort; do not fail if already correct)
 git branch -M main >nul 2>&1
-
 echo.
 echo === MW BOTS PUSH (tracked files) ===
 echo Repo: %cd%
 echo.
 
-REM Stage all changes (only allow-listed files should be tracked)
-REM If a previous git command crashed, an index.lock can remain and break future pushes.
-del /f /q ".git\index.lock" >nul 2>&1
-
-REM Update tracked files (faster + avoids scanning for new untracked files).
-git add -u
+REM Stage all tracked changes (only allow-listed files should be tracked)
+echo.
+echo === STAGE SAFETY (python-only) ===
+echo Staging only safe tracked files (skip secrets/env/playwright caches).
+powershell -NoProfile -Command "$ErrorActionPreference='Stop'; $safe=(git ls-files | Where-Object {($_ -match '\.(py|md|json|txt)$') -or ($_ -eq 'requirements.txt')}); $safe=$safe | Where-Object { $_ -notmatch '(^|/)config\.secrets\.json$' -and $_ -notmatch '(^|/)tokens\.env$' -and $_ -notmatch '\.env$' -and $_ -notmatch 'member_history\.json$' -and $_ -notmatch 'playwright_profile/' -and $_ -notmatch '(^|/)\.playwright/' -and $_ -notmatch 'api-token\.env$' -and $_ -notmatch 'mavely_(cookies|refresh_token|auth_token|id_token)\.txt$' }; git reset > $null; if($safe.Count -gt 0){ git add -u -- $safe > $null }"
 if errorlevel 1 (
-  echo ERROR: git add failed.
+  echo ERROR: staging safe files failed.
   exit /b 1
 )
 
@@ -51,7 +48,6 @@ git --no-pager diff --cached --stat
 echo.
 
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set TS=%%i
-
 echo.
 echo Changes staged. Committing...
 git commit -m "mwbots py update: %TS%"

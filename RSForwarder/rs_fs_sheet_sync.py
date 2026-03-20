@@ -1156,12 +1156,17 @@ class RsFsSheetSync:
         deleted = sum((b - a + 1) for a, b in runs)
         return int(deleted)
 
-    async def sync_rows_mirror(self, rows: Sequence[Sequence[str]]) -> Tuple[bool, str, int, int, int]:
+    async def sync_rows_mirror(
+        self,
+        rows: Sequence[Sequence[str]],
+        *,
+        delete_stale: bool = True,
+    ) -> Tuple[bool, str, int, int, int]:
         """
         Mirror-mode sync:
         - Update A/B/C + G/H for existing rows (by store+sku, columns A and B)
         - Append missing (store, sku)
-        - Delete rows no longer present in `rows`
+        - Optionally delete rows no longer present in `rows` (controlled by `delete_stale`)
 
         Keyed by store+sku to avoid duplicate rows for the same product when SKU strings differ.
         Returns: (ok, message, added_count, updated_count, deleted_count)
@@ -1232,10 +1237,12 @@ class RsFsSheetSync:
         if not ok_add:
             return False, msg_add, 0, updated_count, 0
 
-        # Delete stale rows (present in sheet but not in desired store|sku set)
-        stale_rows = [row_i for (k, row_i) in (existing or {}).items() if k not in desired_keys]
-        async with self._api_lock:
-            deleted_count = await self._delete_rows_by_indices(stale_rows)
+        deleted_count = 0
+        if delete_stale:
+            # Delete stale rows (present in sheet but not in desired store|sku set)
+            stale_rows = [row_i for (k, row_i) in (existing or {}).items() if k not in desired_keys]
+            async with self._api_lock:
+                deleted_count = await self._delete_rows_by_indices(stale_rows)
 
         # Reset dedupe cache so subsequent runs see fresh sheet state.
         self._dedupe_skus = set()
