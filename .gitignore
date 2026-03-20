@@ -10,6 +10,7 @@
 !/push_mwbots_py_only.bat
 !/oracle_tools_menu_mwbots.bat
 !/oracle_baseline_check_mwbots.bat
+!/kill_git_ssh_tasks.bat
 
 # Allow canonical docs at repo root
 !/CANONICAL_RULES.md
