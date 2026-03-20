@@ -6325,8 +6325,18 @@ class RSForwarderBot:
                             if not key or key == "|":
                                 continue
                             existing = seen_key_to_row.get(key)
-                            # Prefer row that has title or URL over one that doesn't
-                            if existing is None or ((title or url) and not (existing[2] or existing[4])):
+                            if existing is None:
+                                seen_key_to_row[key] = [store, sku, title, aff, url]
+                                continue
+
+                            # Prefer affiliate-populated rows when the existing one is blank.
+                            existing_aff = str(existing[3] or "").strip() if len(existing) > 3 else ""
+                            if aff and not existing_aff:
+                                seen_key_to_row[key] = [store, sku, title, aff, url]
+                                continue
+
+                            # Otherwise prefer a row that has title or URL when existing is missing them.
+                            if (title or url) and not (existing[2] or existing[4]):
                                 seen_key_to_row[key] = [store, sku, title, aff, url]
                         all_rows = list(seen_key_to_row.values())
                         
