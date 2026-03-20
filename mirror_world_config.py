@@ -85,6 +85,25 @@ def get_repo_root() -> Path:
     return Path(__file__).resolve().parent
 
 
+def mwbots_repo_root(repo_root: Optional[Path] = None) -> Path:
+    """Path to the nested MWBots git repo (Oracle `mwbots-code` deploy source)."""
+    return (repo_root or get_repo_root()) / "MWBots"
+
+
+def instore_bot_dir(repo_root: Optional[Path] = None) -> Path:
+    """Local Instorebotforwarder tree: under MWBots/. Live path on Oracle remains mirror-world/Instorebotforwarder."""
+    return mwbots_repo_root(repo_root) / "Instorebotforwarder"
+
+
+def ensure_mwbots_import_path(repo_root: Optional[Path] = None) -> None:
+    """Prepend MWBots to sys.path so `import Instorebotforwarder` resolves."""
+    import sys
+
+    p = str(mwbots_repo_root(repo_root).resolve())
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+
 def load_oracle_servers(repo_root: Optional[Path] = None) -> Tuple[List[Dict[str, Any]], Path]:
     """Load the canonical Oracle server list from oraclekeys/servers.json.
 

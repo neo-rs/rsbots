@@ -9,7 +9,7 @@ Safe output:
 - Prints only presence + lengths + endpoint + high-level errors.
 
 Usage:
-  .\.venv\Scripts\python.exe scripts\test_mavely_refresh_token.py --env-file Instorebotforwarder\\api-token.env
+  .\.venv\Scripts\python.exe scripts\test_mavely_refresh_token.py --env-file MWBots\\Instorebotforwarder\\api-token.env
 """
 
 from __future__ import annotations

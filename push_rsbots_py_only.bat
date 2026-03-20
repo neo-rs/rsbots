@@ -23,7 +23,11 @@ echo Repo: %cd%
 echo.
 
 REM Stage all changes (only allow-listed files should be tracked)
-git add -A
+REM If a previous git command crashed, an index.lock can remain and break future pushes.
+del /f /q ".git\index.lock" >nul 2>&1
+
+REM Update tracked files (faster + avoids scanning for new untracked files).
+git add -u
 if errorlevel 1 (
   echo ERROR: git add failed.
   exit /b 1

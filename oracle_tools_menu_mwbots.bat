@@ -6,7 +6,8 @@ REM - Download Oracle snapshot INCLUDING MW bots folders
 REM - Baseline check for MW bots (local vs latest snapshot)
 REM
 REM This is a wrapper around the canonical Python tools in ./scripts:
-REM - scripts\download_oracle_snapshot_mwbots.py
+REM - scripts\download_oracle_snapshot_mwbots.py (full MW snapshot; merges whole Instore tar)
+REM - scripts\download_instorebotforwarder_direct.py (Instore-only, no excludes)
 REM - scripts\oracle_baseline_check_mwbots.py
 
 cd /d "%~dp0"
@@ -74,12 +75,14 @@ echo [3] MWBots: Baseline check + download first
 echo [4] Prune old snapshots only (no download)
 echo [5] Sync and deploy ticket startup (local -^> Oracle)
 echo [6] WhopMembershipSync full setup (sync + install on Oracle)
+echo [7] Instorebotforwarder: download FULL folder from Oracle + sync MWBots
+echo [8] Instorebotforwarder: [7] then snapshot + compare direct vs snapshot
 echo.
 echo [S] Settings
 echo [Q] Quit
 echo.
 
-choice /c 123456SQ /n /m "Choose: "
+choice /c 12345678SQ /n /m "Choose: "
 set "ERR=%errorlevel%"
 if "%ERR%"=="1" goto do_mw_download
 if "%ERR%"=="2" goto do_mw_baseline
@@ -87,8 +90,10 @@ if "%ERR%"=="3" goto do_mw_baseline_download
 if "%ERR%"=="4" goto do_prune
 if "%ERR%"=="5" goto do_sync_ticket_startup
 if "%ERR%"=="6" goto do_whop_sync_setup
-if "%ERR%"=="7" goto settings
-if "%ERR%"=="8" goto done
+if "%ERR%"=="7" goto do_instore_direct
+if "%ERR%"=="8" goto do_instore_verify
+if "%ERR%"=="9" goto settings
+if "%ERR%"=="10" goto done
 goto menu
 
 :settings
@@ -127,7 +132,7 @@ goto menu
 
 :set_server_name
 echo.
-set /p SERVER_NAME=Enter SERVER_NAME (exact match in oracleserverkeys\servers.json, blank for default): 
+set /p SERVER_NAME=Enter SERVER_NAME (exact match in oraclekeys\servers.json, blank for default): 
 goto menu
 
 :do_mw_download
@@ -189,6 +194,26 @@ if errorlevel 1 (
   echo.
   echo NOTE: If SSH timed out, sync is done. On Oracle run:
   echo   bash /home/rsadmin/bots/mirror-world/scripts/on_oracle_setup_whopmembershipsync.sh
+)
+goto menu
+
+:do_instore_direct
+echo.
+echo Instorebotforwarder: whole folder from Oracle (no tarball excludes^) -^> OUT_DIR and MWBots...
+if defined SERVER_NAME (
+  "%PY_EXE%" %PY_ARGS% scripts\download_instorebotforwarder_direct.py --out-dir "%OUT_DIR%" --apply-mwbots --server-name "%SERVER_NAME%"
+) else (
+  "%PY_EXE%" %PY_ARGS% scripts\download_instorebotforwarder_direct.py --out-dir "%OUT_DIR%" --apply-mwbots
+)
+goto menu
+
+:do_instore_verify
+echo.
+echo Instorebotforwarder: direct download + MWBots, then full snapshot + file-list compare...
+if defined SERVER_NAME (
+  "%PY_EXE%" %PY_ARGS% scripts\download_instorebotforwarder_direct.py --out-dir "%OUT_DIR%" --apply-mwbots --verify-with-full-snapshot --server-name "%SERVER_NAME%"
+) else (
+  "%PY_EXE%" %PY_ARGS% scripts\download_instorebotforwarder_direct.py --out-dir "%OUT_DIR%" --apply-mwbots --verify-with-full-snapshot
 )
 goto menu
 

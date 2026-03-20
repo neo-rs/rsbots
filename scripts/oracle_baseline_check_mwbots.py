@@ -40,6 +40,8 @@ def _default_local_repo_root() -> Path:
     candidate = ROOT / "MWBots"
     try:
         if candidate.is_dir() and (candidate / ".git").exists():
+            if (candidate / "Instorebotforwarder").is_dir():
+                return candidate.resolve()
             if all((candidate / b).is_dir() for b in MW_BOTS):
                 return candidate.resolve()
     except Exception:

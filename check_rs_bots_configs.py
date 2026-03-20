@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from mirror_world_config import load_config_with_secrets, is_placeholder_secret, mask_secret
+from mirror_world_config import instore_bot_dir, load_config_with_secrets, is_placeholder_secret, mask_secret
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -44,7 +44,7 @@ def run() -> int:
     checks: List[BotCheck] = [
         BotCheck("rsadminbot", REPO_ROOT / "RSAdminBot", "RSAdminBot/admin_bot.py", ["bot_token"]),
         BotCheck("rsforwarder", REPO_ROOT / "RSForwarder", "RSForwarder/rs_forwarder_bot.py", ["bot_token"]),
-        BotCheck("instorebotforwarder", REPO_ROOT / "Instorebotforwarder", "Instorebotforwarder/instore_auto_mirror_bot.py", ["bot_token"]),
+        BotCheck("instorebotforwarder", instore_bot_dir(REPO_ROOT), "instore_auto_mirror_bot.py", ["bot_token"]),
         BotCheck("rscheckerbot", REPO_ROOT / "RSCheckerbot", "RSCheckerbot/main.py", ["bot_token"]),
         BotCheck("rsmentionpinger", REPO_ROOT / "RSMentionPinger", "RSMentionPinger/rs_mention_pinger.py", ["bot_token"]),
         BotCheck("rssuccessbot", REPO_ROOT / "RSuccessBot", "RSuccessBot/bot_runner.py", ["bot_token"]),

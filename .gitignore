@@ -56,14 +56,6 @@
 !RSForwarder/messages.json
 !RSForwarder/vouch_config.json
 
-!Instorebotforwarder/
-!Instorebotforwarder/**/
-!Instorebotforwarder/*.py
-!Instorebotforwarder/**/*.py
-!Instorebotforwarder/COMMANDS.md
-!Instorebotforwarder/config.json
-!Instorebotforwarder/config.secrets.example.json
-
 !RSMentionPinger/
 !RSMentionPinger/**/
 !RSMentionPinger/*.py
@@ -165,17 +157,17 @@ rs-bot-tokens.txt
 RSForwarder/mavely_cookies*.txt
 RSForwarder/mavely_refresh_token*.txt
 RSForwarder/.mavely_profile/**
-Instorebotforwarder/mavely_cookies*.txt
-Instorebotforwarder/mavely_refresh_token*.txt
-Instorebotforwarder/mavely_auth_token*.txt
-Instorebotforwarder/mavely_id_token*.txt
+MWBots/Instorebotforwarder/mavely_cookies*.txt
+MWBots/Instorebotforwarder/mavely_refresh_token*.txt
+MWBots/Instorebotforwarder/mavely_auth_token*.txt
+MWBots/Instorebotforwarder/mavely_id_token*.txt
 
 # Playwright persistent browser profile (never commit)
-Instorebotforwarder/playwright_profile/**
-Instorebotforwarder/.playwright/**
+MWBots/Instorebotforwarder/playwright_profile/**
+MWBots/Instorebotforwarder/.playwright/**
 
 # Instorebotforwarder single-instance lock (runtime artifact)
-Instorebotforwarder/.instorebotforwarder.lock
+MWBots/Instorebotforwarder/.instorebotforwarder.lock
 
 # Virtualenvs
 .venv/

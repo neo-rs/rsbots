@@ -23,6 +23,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from mirror_world_config import instore_bot_dir
+
 
 def _run(args: list[str]) -> int:
     return subprocess.call(args)
@@ -55,10 +61,11 @@ def main() -> int:
         print(f"ERROR: SSH key not found: {key}")
         return 2
 
-    cookies_file = repo_root / "Instorebotforwarder" / "mavely_cookies.txt"
-    refresh_file = repo_root / "Instorebotforwarder" / "mavely_refresh_token.txt"
-    auth_file = repo_root / "Instorebotforwarder" / "mavely_auth_token.txt"
-    id_file = repo_root / "Instorebotforwarder" / "mavely_id_token.txt"
+    instore = instore_bot_dir(repo_root)
+    cookies_file = instore / "mavely_cookies.txt"
+    refresh_file = instore / "mavely_refresh_token.txt"
+    auth_file = instore / "mavely_auth_token.txt"
+    id_file = instore / "mavely_id_token.txt"
 
     # 1) Sync from session
     sync = repo_root / "scripts" / "sync_mavely_session_tokens.py"

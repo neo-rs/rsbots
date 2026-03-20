@@ -24,15 +24,17 @@ from typing import Any, Dict, Optional, Tuple
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
+from mirror_world_config import ensure_mwbots_import_path, instore_bot_dir, load_config_with_secrets
+
+ensure_mwbots_import_path(REPO_ROOT)
+
 
 def _load_cfg() -> Dict[str, Any]:
     """
     Load the same merged config the bot uses (config.json + config.secrets.json).
     This keeps scrape behavior consistent with runtime settings (UA, playwright flags, zip, etc).
     """
-    from mirror_world_config import load_config_with_secrets
-
-    cfg, _cfg_path, _sec_path = load_config_with_secrets(REPO_ROOT / "Instorebotforwarder")
+    cfg, _cfg_path, _sec_path = load_config_with_secrets(instore_bot_dir(REPO_ROOT))
     return cfg or {}
 
 

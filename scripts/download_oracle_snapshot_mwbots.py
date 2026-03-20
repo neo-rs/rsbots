@@ -15,6 +15,11 @@ Scope:
 Default: full backup (includes channel_map.json, tokens.env, config.secrets.json, etc.).
 Use --no-secrets for code-only snapshot (excludes secrets and runtime data).
 
+After the main tar extract, a second remote tar of **only** Instorebotforwarder is
+downloaded with **no** excludes and merged on top, so snapshot Instorebotforwarder
+matches a whole-folder Oracle copy (modulo Windows path-length skips on extract).
+Disable with --skip-instore-full-merge.
+
 After a full backup (default), config files (channel_map.json, source_channels.json, etc.)
 are copied from the snapshot into REPO_ROOT/MWBots/<bot>/config/ so local matches server.
 Use --no-sync-config to skip that. Use --local-mwbots PATH to override the target.
@@ -185,6 +190,42 @@ def _safe_extract(tar_path: Path, dest_dir: Path) -> None:
         print(f"[extract] Skipped {skipped} member(s) (path too long or inaccessible on this OS)")
 
 
+def _merge_instore_full_from_remote(entry: ServerEntry, snap_dir: Path, ts: str, scp_timeout: int) -> None:
+    """Replace Instorebotforwarder in snap_dir with a no-excludes tar of that folder only."""
+    remote_tar = f"/tmp/instorebotforwarder_supp_{ts}.tar.gz"
+    remote_cmd = (
+        "set -euo pipefail; "
+        f"cd {shlex.quote(entry.remote_root)}; "
+        "if [ ! -d Instorebotforwarder ]; then echo 'SKIP=no_instore_dir'; exit 0; fi; "
+        f"rm -f {shlex.quote(remote_tar)} || true; "
+        f"tar --ignore-failed-read -czf {shlex.quote(remote_tar)} Instorebotforwarder; "
+        f"ls -lh {shlex.quote(remote_tar)}"
+    )
+    print("[supp] Instorebotforwarder: remote tar (no excludes) + merge ...")
+    ssh_cmd = _build_ssh_base(entry) + [f"bash -lc {shlex.quote(remote_cmd)}"]
+    res = _run(ssh_cmd, timeout=600)
+    if res.returncode != 0:
+        print(res.stdout)
+        print(res.stderr)
+        raise RuntimeError(f"Instore supplemental tar failed (exit {res.returncode})")
+    if "SKIP=no_instore_dir" in (res.stdout or ""):
+        print("[supp] No Instorebotforwarder on server; skip supplemental.")
+        return
+
+    local_supp = snap_dir / f"instorebotforwarder_supp_{ts}.tar.gz"
+    scp_cmd = _build_scp_base(entry) + [f"{entry.user}@{entry.host}:{remote_tar}", str(local_supp)]
+    res2 = _run(scp_cmd, timeout=scp_timeout)
+    if res2.returncode != 0:
+        print(res2.stdout)
+        print(res2.stderr)
+        raise RuntimeError(f"Instore supplemental SCP failed (exit {res2.returncode})")
+
+    sk = _safe_extract(local_supp, snap_dir)
+    if sk:
+        print(f"[supp] Skipped {sk} member(s) on supplemental extract (path length / OS)")
+    print("[supp] Instorebotforwarder merge done.")
+
+
 def _verify_snapshot(snap_dir: Path, full_backup: bool) -> None:
     """Check that key bot folders and files exist after extract."""
     checks = [
@@ -212,19 +253,35 @@ def _sync_config_to_local_mwbots(snap_dir: Path, local_mwbots_root: Path, full_b
     for bot_name in INCLUDES_DEFAULT:
         snap_config = snap_dir / bot_name / "config"
         local_config = local_mwbots_root / bot_name / "config"
-        if not snap_config.is_dir():
+        if snap_config.is_dir():
+            local_config.mkdir(parents=True, exist_ok=True)
+            for fname in CONFIG_FILES_TO_SYNC:
+                src = snap_config / fname
+                if not src.is_file():
+                    continue
+                dst = local_config / fname
+                try:
+                    shutil.copy2(src, dst)
+                    copied += 1
+                except OSError as e:
+                    print(f"[sync-config] Copy failed {src.name} -> {local_config}: {e}")
             continue
-        local_config.mkdir(parents=True, exist_ok=True)
-        for fname in CONFIG_FILES_TO_SYNC:
-            src = snap_config / fname
-            if not src.is_file():
+        # Instorebotforwarder keeps config.json at bot root (no config/ subfolder on Oracle).
+        if bot_name == "Instorebotforwarder":
+            snap_bot = snap_dir / bot_name
+            local_bot = local_mwbots_root / bot_name
+            if not snap_bot.is_dir() or not local_bot.is_dir():
                 continue
-            dst = local_config / fname
-            try:
-                shutil.copy2(src, dst)
-                copied += 1
-            except OSError as e:
-                print(f"[sync-config] Copy failed {src.name} -> {local_config}: {e}")
+            for fname in ("config.json", "config.secrets.example.json"):
+                src = snap_bot / fname
+                if not src.is_file():
+                    continue
+                dst = local_bot / fname
+                try:
+                    shutil.copy2(src, dst)
+                    copied += 1
+                except OSError as e:
+                    print(f"[sync-config] Copy failed {src} -> {local_bot}: {e}")
     if copied:
         print(f"[sync-config] Copied {copied} config file(s) from snapshot -> {local_mwbots_root}")
     else:
@@ -242,6 +299,11 @@ def main() -> int:
     ap.add_argument("--scp-timeout", type=int, default=900, help="SCP download timeout in seconds (default 900 for full backup)")
     ap.add_argument("--no-sync-config", action="store_true", help="Do not copy snapshot config into local MWBots (default: copy after full backup)")
     ap.add_argument("--local-mwbots", default=None, help="Local MWBots root (default: REPO_ROOT/MWBots)")
+    ap.add_argument(
+        "--skip-instore-full-merge",
+        action="store_true",
+        help="Do not download second no-excludes Instorebotforwarder tar (main tar may omit playwright_profile, etc.).",
+    )
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -285,19 +347,24 @@ def main() -> int:
     excludes = EXCLUDES_NO_SECRETS if args.no_secrets else EXCLUDES_FULL
     mode = "code-only (no secrets)" if args.no_secrets else "full backup"
 
+    # set -f: do not expand * in --exclude=*CacheStorage* (else tar sees bogus Worker* paths).
+    # tar may exit 1 if a file changes while reading; treat 1 as OK for this backup use case.
     remote_cmd = (
-        "set -euo pipefail; "
+        "set -euo pipefail; set -f; "
         f"cd {shlex.quote(entry.remote_root)}; "
         f"rm -f {shlex.quote(remote_tar)} || true; "
+        "set +e; "
         f"tar --ignore-failed-read -czf {shlex.quote(remote_tar)} "
         + " ".join(excludes)
         + " "
         + " ".join(shlex.quote(x) for x in includes)
-        + f"; echo REMOTE_TAR={shlex.quote(remote_tar)}; ls -lh {shlex.quote(remote_tar)}"
+        + "; tarc=$?; set -e; "
+        + "if [ \"$tarc\" -ne 0 ] && [ \"$tarc\" -ne 1 ]; then exit \"$tarc\"; fi; "
+        + f"echo REMOTE_TAR={shlex.quote(remote_tar)}; ls -lh {shlex.quote(remote_tar)}"
     )
 
     print(f"[1/3] Building remote tar on {entry.user}@{entry.host} ({mode}) ...")
-    ssh_cmd = _build_ssh_base(entry) + ["bash", "-c", remote_cmd]
+    ssh_cmd = _build_ssh_base(entry) + [f"bash -lc {shlex.quote(remote_cmd)}"]
     res = _run(ssh_cmd, timeout=300)
     if res.returncode != 0:
         print(res.stdout)
@@ -319,6 +386,12 @@ def main() -> int:
 
     print("[3/3] Extracting ...")
     _safe_extract(local_tar, snap_dir)
+
+    if not args.no_secrets and not args.skip_instore_full_merge:
+        try:
+            _merge_instore_full_from_remote(entry, snap_dir, ts, args.scp_timeout)
+        except RuntimeError as e:
+            print(f"[supp] WARNING: {e} (continuing with main tar Instorebotforwarder only)")
 
     _verify_snapshot(snap_dir, full_backup=not args.no_secrets)
     if not args.no_sync_config and not args.no_secrets:
