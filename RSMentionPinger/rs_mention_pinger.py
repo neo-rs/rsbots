@@ -297,7 +297,7 @@ class _RSMentionPingerImpl:
         
         # Log to terminal
         mentioned_roles = [r.name for r in message.role_mentions if r.id in watched_role_ids]
-        print(f"{Colors.CYAN}[Mention] Role mention detected: {', '.join(mentioned_roles)} in {message.channel.name}{Colors.RESET}")
+        print(f"{Colors.CYAN}[Mention] Role mention detected: {', '.join(mentioned_roles)} in <#{message.channel.id}>{Colors.RESET}")
         
         log_channel_id = self.config.get("log_channel_id")
         if not log_channel_id:
@@ -359,7 +359,7 @@ class _RSMentionPingerImpl:
             "{author_mention} mentioned you {jump_url}"
         )
         
-        print(f"{Colors.CYAN}[DM] Sending mention DMs to {len(unique_users)} user(s) from {message.channel.name}{Colors.RESET}")
+        print(f"{Colors.CYAN}[DM] Sending mention DMs to {len(unique_users)} user(s) from <#{message.channel.id}>{Colors.RESET}")
         for user in unique_users:
             try:
                 dm_text = dm_template.format(
@@ -367,11 +367,11 @@ class _RSMentionPingerImpl:
                     jump_url=message.jump_url
                 )
                 await user.send(dm_text)
-                print(f"{Colors.GREEN}✅ Sent mention DM to {user} ({user.id}){Colors.RESET}")
+                print(f"{Colors.GREEN}✅ Sent mention DM to {user} <@{user.id}>{Colors.RESET}")
             except discord.Forbidden:
-                print(f"{Colors.YELLOW}⚠️ Couldn't DM {user} ({user.id}): User has DMs disabled{Colors.RESET}")
+                print(f"{Colors.YELLOW}⚠️ Couldn't DM {user} <@{user.id}>: User has DMs disabled{Colors.RESET}")
             except Exception as e:
-                print(f"{Colors.RED}❌ Couldn't DM {user} ({user.id}): {e}{Colors.RESET}")
+                print(f"{Colors.RED}❌ Couldn't DM {user} <@{user.id}>: {e}{Colors.RESET}")
     
     def _setup_events(self):
         """Setup bot event handlers"""
@@ -395,16 +395,16 @@ class _RSMentionPingerImpl:
             print(f"{Colors.CYAN}{'-'*60}{Colors.RESET}")
             
             if guild:
-                print(f"{Colors.GREEN}🏠 Guild:{Colors.RESET} {Colors.BOLD}{guild.name}{Colors.RESET} (ID: {guild_id})")
+                print(f"{Colors.GREEN}🏠 Guild:{Colors.RESET} {Colors.BOLD}{guild.name}{Colors.RESET} Guild-ID: {guild_id}")
                 
                 # Log channel
                 log_channel_id = self.config.get("log_channel_id")
                 if log_channel_id:
                     log_channel = guild.get_channel(log_channel_id)
                     if log_channel:
-                        print(f"{Colors.GREEN}📝 Log Channel:{Colors.RESET} {Colors.BOLD}{log_channel.name}{Colors.RESET} (ID: {log_channel_id})")
+                        print(f"{Colors.GREEN}📝 Log Channel:{Colors.RESET} {Colors.BOLD}{log_channel.name}{Colors.RESET} <#{log_channel_id}>")
                     else:
-                        print(f"{Colors.YELLOW}⚠️  Log Channel:{Colors.RESET} Not found (ID: {log_channel_id})")
+                        print(f"{Colors.YELLOW}⚠️  Log Channel:{Colors.RESET} Not found <#{log_channel_id}>")
                 
                 # Watched roles
                 watched_role_ids = self.config.get("watched_role_ids", [])
@@ -413,9 +413,9 @@ class _RSMentionPingerImpl:
                     for role_id in watched_role_ids[:5]:  # Show first 5
                         role = guild.get_role(role_id)
                         if role:
-                            print(f"   • {Colors.BOLD}{role.name}{Colors.RESET} (ID: {role_id})")
+                            print(f"   • {Colors.BOLD}{role.name}{Colors.RESET} <@&{role_id}>")
                         else:
-                            print(f"   • {Colors.RED}❌ Not found{Colors.RESET} (ID: {role_id})")
+                            print(f"   • {Colors.RED}❌ Not found{Colors.RESET} <@&{role_id}>")
                     if len(watched_role_ids) > 5:
                         print(f"   ... and {len(watched_role_ids) - 5} more (use !configinfo to see all)")
                 
@@ -426,9 +426,9 @@ class _RSMentionPingerImpl:
                     for cat_id in excluded_category_ids:
                         category = guild.get_channel(cat_id)
                         if category:
-                            print(f"   • {Colors.BOLD}{category.name}{Colors.RESET} (ID: {cat_id})")
+                            print(f"   • {Colors.BOLD}{category.name}{Colors.RESET} <#{cat_id}>")
                         else:
-                            print(f"   • {Colors.RED}❌ Not found{Colors.RESET} (ID: {cat_id})")
+                            print(f"   • {Colors.RED}❌ Not found{Colors.RESET} <#{cat_id}>")
                 
                 # DM feature info
                 dm_template = self.config.get("dm_message_template", "{author_mention} mentioned you {jump_url}")
@@ -438,7 +438,7 @@ class _RSMentionPingerImpl:
                 print(f"   • Skips DMs in excluded categories")
                 print(f"   • Ignores bot mentions")
             else:
-                print(f"{Colors.YELLOW}⚠️  Guild not found (ID: {guild_id}){Colors.RESET}")
+                print(f"{Colors.YELLOW}⚠️  Guild not found Guild-ID: {guild_id}{Colors.RESET}")
             
             # Register persistent monitor role views so buttons work after restart
             if guild and self._monitor_roles_config():

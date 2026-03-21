@@ -72,7 +72,7 @@ class OptOutButton(discord.ui.Button):
             await interaction.response.send_message("I don't have permission to remove that role.", ephemeral=True)
             return
         except Exception as exc:
-            self._logger.warning("dm_optout_failed user_id=%s error=%s", interaction.user.id, exc)
+            self._logger.warning("dm_optout_failed user=<@%s> error=%s", interaction.user.id, exc)
             await interaction.response.send_message("Something went wrong opting you out.", ephemeral=True)
             return
 
@@ -196,7 +196,7 @@ class PromoSender:
                     "timestamp": iso_now(),
                     "error": str(exc)
                 })
-                self.logger.warning("send_failed campaign_id=%s user_id=%s error=%s", campaign_id, user_id, exc)
+                self.logger.warning("send_failed campaign_id=%s user=<@%s> error=%s", campaign_id, user_id, exc)
             if dm_delay_hi > 0:
                 await asyncio.sleep(random.uniform(max(0.0, dm_delay_lo), dm_delay_hi))
 

@@ -252,8 +252,8 @@ class RSSuccessBot:
         
         # Print to terminal
         sign = "+" if change_amount > 0 else ""
-        admin_info = f" (by admin {admin_user_id})" if admin_user_id else ""
-        print(f"{Colors.CYAN}[Points Movement] User {user_id}: {old_balance} -> {new_balance} ({sign}{change_amount}) - {reason}{admin_info}{Colors.RESET}")
+        admin_info = f" (by admin <@{admin_user_id}>)" if admin_user_id else ""
+        print(f"{Colors.CYAN}[Points Movement] User <@{user_id}>: {old_balance} -> {new_balance} ({sign}{change_amount}) - {reason}{admin_info}{Colors.RESET}")
         
         # Add to point_movements array
         movement = {
@@ -514,22 +514,22 @@ class RSSuccessBot:
                         traceback.print_exc()
                         print(f"{Colors.YELLOW}[Commands] You can manually sync using !sync command{Colors.RESET}")
                 else:
-                    print(f"{Colors.YELLOW}[Bot] Guild not found (ID: {guild_id}){Colors.RESET}")
+                    print(f"{Colors.YELLOW}[Bot] Guild not found Guild-ID: {guild_id}{Colors.RESET}")
             
             # Display config info
             print(f"\n{Colors.CYAN}[Config] Configuration Information:{Colors.RESET}")
             print(f"{Colors.CYAN}{'-'*60}{Colors.RESET}")
             if guild:
-                print(f"{Colors.GREEN}🏠 Guild:{Colors.RESET} {Colors.BOLD}{guild.name}{Colors.RESET} (ID: {guild_id})")
+                print(f"{Colors.GREEN}🏠 Guild:{Colors.RESET} {Colors.BOLD}{guild.name}{Colors.RESET} Guild-ID: {guild_id}")
                 
                 success_channel_ids = self.config.get("success_channel_ids", [])
                 print(f"{Colors.GREEN}📢 Success Channels:{Colors.RESET} {len(success_channel_ids)} channel(s)")
                 for ch_id in success_channel_ids[:3]:
                     ch = guild.get_channel(ch_id)
                     if ch:
-                        print(f"   • {Colors.BOLD}{ch.name}{Colors.RESET} (ID: {ch_id})")
+                        print(f"   • {Colors.BOLD}{ch.name}{Colors.RESET} <#{ch_id}>")
                     else:
-                        print(f"   • {Colors.RED}❌ Not found{Colors.RESET} (ID: {ch_id})")
+                        print(f"   • {Colors.RED}❌ Not found{Colors.RESET} <#{ch_id}>")
                 if len(success_channel_ids) > 3:
                     print(f"   ... and {len(success_channel_ids) - 3} more")
                 
@@ -537,9 +537,9 @@ class RSSuccessBot:
                 if role_id:
                     role = guild.get_role(role_id)
                     if role:
-                        print(f"{Colors.GREEN}👤 Watch Role:{Colors.RESET} {Colors.BOLD}{role.name}{Colors.RESET} (ID: {role_id})")
+                        print(f"{Colors.GREEN}👤 Watch Role:{Colors.RESET} {Colors.BOLD}{role.name}{Colors.RESET} <@&{role_id}>")
                     else:
-                        print(f"{Colors.YELLOW}⚠️  Watch Role:{Colors.RESET} Not found (ID: {role_id})")
+                        print(f"{Colors.YELLOW}⚠️  Watch Role:{Colors.RESET} Not found <@&{role_id}>")
             
             print(f"{Colors.CYAN}{'-'*60}{Colors.RESET}")
         
@@ -674,7 +674,7 @@ class RSSuccessBot:
                 return
             
             # We're in a success channel - process image attachments for points
-            print(f"{Colors.CYAN}[Success Channel] Message in success channel {message.channel.id} from {message.author} (ID: {message.author.id}){Colors.RESET}")
+            print(f"{Colors.CYAN}[Success Channel] Message in success channel <#{message.channel.id}> from {message.author} <@{message.author.id}>{Colors.RESET}")
             print(f"{Colors.CYAN}[Success Channel] Message has {len(message.attachments)} attachment(s){Colors.RESET}")
             
             # Check if message has no attachments
@@ -706,7 +706,7 @@ class RSSuccessBot:
                     await message.delete()
                     print(f"{Colors.GREEN}[Success Channel] Deleted message without attachment{Colors.RESET}")
                 except discord.Forbidden:
-                    print(f"{Colors.RED}[Error] Missing permission to delete messages in channel {message.channel.id}{Colors.RESET}")
+                    print(f"{Colors.RED}[Error] Missing permission to delete messages in channel <#{message.channel.id}>{Colors.RESET}")
                 except Exception as e:
                     print(f"{Colors.RED}[Error] Failed to delete message: {e}{Colors.RESET}")
                 
@@ -779,7 +779,7 @@ class RSSuccessBot:
                             "error",
                             channel=message.channel
                         )
-                        print(f"{Colors.RED}[Error] Missing permissions in channel {message.channel.id}{Colors.RESET}")
+                        print(f"{Colors.RED}[Error] Missing permissions in channel <#{message.channel.id}>{Colors.RESET}")
                     except Exception as e:
                         await self.log_action(
                             message.guild,
@@ -793,7 +793,7 @@ class RSSuccessBot:
                     print(f"{Colors.YELLOW}[Success Channel] Attachment is not an image (type: {attachment.content_type}){Colors.RESET}")
             
             if has_new_success:
-                print(f"{Colors.GREEN}[Success Channel] Awarding point to {message.author} (ID: {message.author.id}){Colors.RESET}")
+                print(f"{Colors.GREEN}[Success Channel] Awarding point to {message.author} <@{message.author.id}>{Colors.RESET}")
                 self.award_point(message.author.id)
                 total_points = self.get_user_points(message.author.id)
                 print(f"{Colors.GREEN}[Success Channel] Point awarded! User now has {total_points} points{Colors.RESET}")
@@ -1213,7 +1213,7 @@ class RSSuccessBot:
             try:
                 await ctx.message.delete()
             except discord.Forbidden:
-                print(f"{Colors.YELLOW}[Warning] Cannot delete message in channel {ctx.channel.id} - missing permissions{Colors.RESET}")
+                print(f"{Colors.YELLOW}[Warning] Cannot delete message in channel <#{ctx.channel.id}> - missing permissions{Colors.RESET}")
             except discord.NotFound:
                 pass  # Message already deleted
             except Exception as e:
@@ -1281,7 +1281,7 @@ class RSSuccessBot:
             try:
                 await ctx.message.delete()
             except discord.Forbidden:
-                print(f"{Colors.YELLOW}[Warning] Cannot delete message in channel {ctx.channel.id} - missing permissions{Colors.RESET}")
+                print(f"{Colors.YELLOW}[Warning] Cannot delete message in channel <#{ctx.channel.id}> - missing permissions{Colors.RESET}")
             except discord.NotFound:
                 pass  # Message already deleted
             except Exception as e:
@@ -1354,7 +1354,7 @@ class RSSuccessBot:
             try:
                 await ctx.message.delete()
             except discord.Forbidden:
-                print(f"{Colors.YELLOW}[Warning] Cannot delete message in channel {ctx.channel.id} - missing permissions{Colors.RESET}")
+                print(f"{Colors.YELLOW}[Warning] Cannot delete message in channel <#{ctx.channel.id}> - missing permissions{Colors.RESET}")
             except discord.NotFound:
                 pass  # Message already deleted
             except Exception as e:
@@ -1385,7 +1385,7 @@ class RSSuccessBot:
             try:
                 await ctx.message.delete()
             except discord.Forbidden:
-                print(f"{Colors.YELLOW}[Warning] Cannot delete message in channel {ctx.channel.id} - missing permissions{Colors.RESET}")
+                print(f"{Colors.YELLOW}[Warning] Cannot delete message in channel <#{ctx.channel.id}> - missing permissions{Colors.RESET}")
             except discord.NotFound:
                 pass  # Message already deleted
             except Exception as e:

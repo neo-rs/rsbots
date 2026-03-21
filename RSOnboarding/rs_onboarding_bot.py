@@ -1594,7 +1594,7 @@ class RSOnboardingBot:
             print(f"{Colors.CYAN}{'-'*60}{Colors.RESET}")
             
             if guild:
-                print(f"{Colors.GREEN}🏠 Guild:{Colors.RESET} {Colors.BOLD}{guild.name}{Colors.RESET} (ID: {guild_id})")
+                print(f"{Colors.GREEN}🏠 Guild:{Colors.RESET} {Colors.BOLD}{guild.name}{Colors.RESET} Guild-ID: {guild_id}")
                 
                 # Roles
                 welcome_role_id = self.config.get("welcome_role_id")
@@ -1602,15 +1602,15 @@ class RSOnboardingBot:
                 if welcome_role_id:
                     welcome_role = guild.get_role(welcome_role_id)
                     if welcome_role:
-                        print(f"{Colors.GREEN}👋 Welcome Role:{Colors.RESET} {Colors.BOLD}{welcome_role.name}{Colors.RESET} (ID: {welcome_role_id})")
+                        print(f"{Colors.GREEN}👋 Welcome Role:{Colors.RESET} {Colors.BOLD}{welcome_role.name}{Colors.RESET} <@&{welcome_role_id}>")
                     else:
-                        print(f"{Colors.YELLOW}⚠️  Welcome Role:{Colors.RESET} Not found (ID: {welcome_role_id})")
+                        print(f"{Colors.YELLOW}⚠️  Welcome Role:{Colors.RESET} Not found <@&{welcome_role_id}>")
                 if member_role_id:
                     member_role = guild.get_role(member_role_id)
                     if member_role:
-                        print(f"{Colors.GREEN}✅ Member Role:{Colors.RESET} {Colors.BOLD}{member_role.name}{Colors.RESET} (ID: {member_role_id})")
+                        print(f"{Colors.GREEN}✅ Member Role:{Colors.RESET} {Colors.BOLD}{member_role.name}{Colors.RESET} <@&{member_role_id}>")
                     else:
-                        print(f"{Colors.YELLOW}⚠️  Member Role:{Colors.RESET} Not found (ID: {member_role_id})")
+                        print(f"{Colors.YELLOW}⚠️  Member Role:{Colors.RESET} Not found <@&{member_role_id}>")
                 
                 cleanup_role_ids = self.config.get("cleanup_role_ids", [])
                 if cleanup_role_ids:
@@ -1618,9 +1618,9 @@ class RSOnboardingBot:
                     for role_id in cleanup_role_ids[:3]:  # Show first 3
                         role = guild.get_role(role_id)
                         if role:
-                            print(f"   • {Colors.BOLD}{role.name}{Colors.RESET} (ID: {role_id})")
+                            print(f"   • {Colors.BOLD}{role.name}{Colors.RESET} <@&{role_id}>")
                         else:
-                            print(f"   • {Colors.RED}❌ Not found{Colors.RESET} (ID: {role_id})")
+                            print(f"   • {Colors.RED}❌ Not found{Colors.RESET} <@&{role_id}>")
                     if len(cleanup_role_ids) > 3:
                         print(f"   ... and {len(cleanup_role_ids) - 3} more")
                 
@@ -1629,44 +1629,44 @@ class RSOnboardingBot:
                 if ticket_category_id:
                     ticket_category = guild.get_channel(ticket_category_id)
                     if ticket_category:
-                        print(f"{Colors.GREEN}🎫 Ticket Category:{Colors.RESET} {Colors.BOLD}{ticket_category.name}{Colors.RESET} (ID: {ticket_category_id})")
+                        print(f"{Colors.GREEN}🎫 Ticket Category:{Colors.RESET} {Colors.BOLD}{ticket_category.name}{Colors.RESET} <#{ticket_category_id}>")
                     else:
-                        print(f"{Colors.YELLOW}⚠️  Ticket Category:{Colors.RESET} Not found (ID: {ticket_category_id})")
+                        print(f"{Colors.YELLOW}⚠️  Ticket Category:{Colors.RESET} Not found <#{ticket_category_id}>")
                 
                 overflow_category_id = self.config.get("overflow_category_id")
                 if overflow_category_id:
                     overflow_category = guild.get_channel(overflow_category_id)
                     if overflow_category:
-                        print(f"{Colors.GREEN}📦 Overflow Category:{Colors.RESET} {Colors.BOLD}{overflow_category.name}{Colors.RESET} (ID: {overflow_category_id})")
+                        print(f"{Colors.GREEN}📦 Overflow Category:{Colors.RESET} {Colors.BOLD}{overflow_category.name}{Colors.RESET} <#{overflow_category_id}>")
                     else:
-                        print(f"{Colors.YELLOW}⚠️  Overflow Category:{Colors.RESET} Not found (ID: {overflow_category_id})")
+                        print(f"{Colors.YELLOW}⚠️  Overflow Category:{Colors.RESET} Not found <#{overflow_category_id}>")
                 
                 log_channel_id = self.config.get("log_channel_id")
                 if log_channel_id:
                     log_channel = guild.get_channel(log_channel_id)
                     if log_channel:
-                        print(f"{Colors.GREEN}📝 Log Channel:{Colors.RESET} {Colors.BOLD}{log_channel.name}{Colors.RESET} (ID: {log_channel_id})")
+                        print(f"{Colors.GREEN}📝 Log Channel:{Colors.RESET} {Colors.BOLD}{log_channel.name}{Colors.RESET} <#{log_channel_id}>")
                     else:
-                        print(f"{Colors.YELLOW}⚠️  Log Channel:{Colors.RESET} Not found (ID: {log_channel_id})")
+                        print(f"{Colors.YELLOW}⚠️  Log Channel:{Colors.RESET} Not found <#{log_channel_id}>")
                 
                 welcome_log_channel_id = self.config.get("welcome_log_channel_id")
                 if welcome_log_channel_id:
                     welcome_log_channel = guild.get_channel(welcome_log_channel_id)
                     if welcome_log_channel:
-                        print(f"{Colors.GREEN}📢 Welcome Log Channel:{Colors.RESET} {Colors.BOLD}{welcome_log_channel.name}{Colors.RESET} (ID: {welcome_log_channel_id})")
+                        print(f"{Colors.GREEN}📢 Welcome Log Channel:{Colors.RESET} {Colors.BOLD}{welcome_log_channel.name}{Colors.RESET} <#{welcome_log_channel_id}>")
                     else:
-                        print(f"{Colors.YELLOW}⚠️  Welcome Log Channel:{Colors.RESET} Not found (ID: {welcome_log_channel_id})")
+                        print(f"{Colors.YELLOW}⚠️  Welcome Log Channel:{Colors.RESET} Not found <#{welcome_log_channel_id}>")
                 
                 # Users
                 staff_user_id = self.config.get("staff_user_id")
                 if staff_user_id:
                     staff_user = guild.get_member(staff_user_id)
                     if staff_user:
-                        print(f"{Colors.GREEN}👤 Staff User:{Colors.RESET} {Colors.BOLD}{staff_user.name}{Colors.RESET} (ID: {staff_user_id})")
+                        print(f"{Colors.GREEN}👤 Staff User:{Colors.RESET} {Colors.BOLD}{staff_user.name}{Colors.RESET} <@{staff_user_id}>")
                     else:
-                        print(f"{Colors.YELLOW}⚠️  Staff User:{Colors.RESET} Not found (ID: {staff_user_id})")
+                        print(f"{Colors.YELLOW}⚠️  Staff User:{Colors.RESET} Not found <@{staff_user_id}>")
             else:
-                print(f"{Colors.YELLOW}⚠️  Guild not found (ID: {guild_id}){Colors.RESET}")
+                print(f"{Colors.YELLOW}⚠️  Guild not found Guild-ID: {guild_id}{Colors.RESET}")
             
             print(f"{Colors.CYAN}{'-'*60}{Colors.RESET}")
             

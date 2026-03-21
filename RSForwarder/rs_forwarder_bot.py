@@ -4512,12 +4512,12 @@ class RSForwarderBot:
                             # Try API as fallback even if guild is found (icon might not be in cache)
                             await self._fetch_guild_icon_via_api(guild_id, save_to_config=True)
                     else:
-                        print(f"{Colors.YELLOW}[Icon] RS Server (ID: {guild_id}) not found in cache - trying API...{Colors.RESET}")
+                        print(f"{Colors.YELLOW}[Icon] RS Server Guild-ID: {guild_id} not found in cache - trying API...{Colors.RESET}")
                         # Try to fetch icon via API as fallback
                         icon_fetched = await self._fetch_guild_icon_via_api(guild_id, save_to_config=True)
                         if not icon_fetched:
                             print(f"{Colors.RED}[Icon] ⚠️ Could not fetch RS Server icon. Check that:{Colors.RESET}")
-                            print(f"{Colors.RED}[Icon]   1. Bot is in RS Server (ID: {guild_id}){Colors.RESET}")
+                            print(f"{Colors.RED}[Icon]   1. Bot is in RS Server Guild-ID: {guild_id}{Colors.RESET}")
                             print(f"{Colors.RED}[Icon]   2. Bot has permission to view server info{Colors.RESET}")
                             print(f"{Colors.RED}[Icon]   3. RS Server has an icon set{Colors.RESET}")
                 else:
@@ -4534,9 +4534,9 @@ class RSForwarderBot:
             print(f"{Colors.CYAN}{'-'*60}{Colors.RESET}")
             
             if self.rs_guild:
-                print(f"{Colors.GREEN}🏠 Guild:{Colors.RESET} {Colors.BOLD}{self.rs_guild.name}{Colors.RESET} (ID: {guild_id})")
+                print(f"{Colors.GREEN}🏠 Guild:{Colors.RESET} {Colors.BOLD}{self.rs_guild.name}{Colors.RESET} Guild-ID: {guild_id}")
             elif guild_id:
-                print(f"{Colors.YELLOW}⚠️  Guild:{Colors.RESET} Not found (ID: {guild_id})")
+                print(f"{Colors.YELLOW}⚠️  Guild:{Colors.RESET} Not found Guild-ID: {guild_id}")
             else:
                 print(f"{Colors.YELLOW}⚠️  Guild:{Colors.RESET} Not configured")
             
@@ -4552,9 +4552,9 @@ class RSForwarderBot:
             if forwarding_logs_channel_id and self.rs_guild:
                 log_channel = self.rs_guild.get_channel(forwarding_logs_channel_id)
                 if log_channel:
-                    print(f"{Colors.GREEN}📝 Forwarding Logs Channel:{Colors.RESET} {Colors.BOLD}{log_channel.name}{Colors.RESET} (ID: {forwarding_logs_channel_id})")
+                    print(f"{Colors.GREEN}📝 Forwarding Logs Channel:{Colors.RESET} {Colors.BOLD}{log_channel.name}{Colors.RESET} <#{forwarding_logs_channel_id}>")
                 else:
-                    print(f"{Colors.YELLOW}⚠️  Forwarding Logs Channel:{Colors.RESET} Not found (ID: {forwarding_logs_channel_id})")
+                    print(f"{Colors.YELLOW}⚠️  Forwarding Logs Channel:{Colors.RESET} Not found <#{forwarding_logs_channel_id}>")
             
             # Channel configurations
             channels = self.config.get("channels", [])
@@ -4562,12 +4562,8 @@ class RSForwarderBot:
             for i, channel_config in enumerate(channels[:5], 1):  # Show first 5
                 source_id = channel_config.get("source_channel_id", "N/A")
                 source_name = channel_config.get("source_channel_name", "N/A")
-                if self.rs_guild and source_id != "N/A":
-                    source_channel = self.rs_guild.get_channel(int(source_id))
-                    if source_channel:
-                        print(f"   {i}. {Colors.BOLD}{source_channel.name}{Colors.RESET} → Webhook")
-                    else:
-                        print(f"   {i}. {Colors.YELLOW}Channel {source_id}{Colors.RESET} → Webhook")
+                if source_id != "N/A" and str(source_id).isdigit():
+                    print(f"   {i}. Source <#{source_id}> → Webhook")
                 else:
                     print(f"   {i}. {Colors.BOLD}{source_name}{Colors.RESET} → Webhook")
             if len(channels) > 5:
@@ -8124,7 +8120,7 @@ class RSForwarderBot:
                 if error:
                     embed.add_field(name="Error", value=error[:1024], inline=False)
             
-            embed.add_field(name="Source Channel", value=f"`{source_channel_name}`\nID: `{source_channel_id}`", inline=True)
+            embed.add_field(name="Source Channel", value=f"<#{source_channel_id}>", inline=True)
             embed.add_field(name="Destination", value=dest_info, inline=True)
             
             # Message info
@@ -8384,7 +8380,7 @@ class RSForwarderBot:
             
             if not webhook_url:
                 if self.stats['messages_forwarded'] == 0:  # Only warn once
-                    print(f"{Colors.YELLOW}[Forward] ⚠️ No webhook configured for channel {source_channel_name} (ID: {channel_id}){Colors.RESET}")
+                    print(f"{Colors.YELLOW}[Forward] ⚠️ No webhook configured for channel {source_channel_name} <#{channel_id}>{Colors.RESET}")
                 return
             
             print(f"{Colors.CYAN}[Forward] Forwarding message from {source_channel_name}...{Colors.RESET}")
@@ -8557,7 +8553,7 @@ class RSForwarderBot:
                 # Log warning if icon still not available
                 if self.stats['messages_forwarded'] == 0:
                     print(f"{Colors.RED}[Warn] RS Server icon not available - webhook will use default avatar{Colors.RESET}")
-                    print(f"{Colors.YELLOW}[Warn] Check that bot is in RS Server (ID: {self._rs_server_guild_id()}){Colors.RESET}")
+                    print(f"{Colors.YELLOW}[Warn] Check that bot is in RS Server Guild-ID: {self._rs_server_guild_id()}{Colors.RESET}")
             
             # Build content with role mention if needed
             # Since we're converting everything to embeds, role mention goes in content before embed

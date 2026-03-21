@@ -2260,7 +2260,7 @@ async def _dm_user(user_id: int, *, embed: discord.Embed, content: str = "") -> 
         await user.send(content=content or None, embed=embed)
         return True
     except Exception as e:
-        log.warning(f"[Reporting] Failed to DM user {user_id}: {e}")
+        log.warning(f"[Reporting] Failed to DM user <@{user_id}>: {e}")
         return False
 
 
@@ -3921,7 +3921,7 @@ async def setup_hook():
         bot.tree.copy_global_to(guild=gobj)
     with suppress(Exception):
         synced = await bot.tree.sync(guild=gobj)
-        log.info("[Slash] synced %s command(s) to guild_id=%s", int(len(synced or [])), gid)
+        log.info("[Slash] synced %s command(s) Guild-ID=%s", int(len(synced or [])), gid)
 
 # -----------------------------
 # Invite Tracking JSON
@@ -7356,7 +7356,7 @@ async def check_onboarding_ticket(user_id: int, guild: discord.Guild, delay_seco
                 f"   📋 Expected: RSOnboarding should create ticket"
             )
     except Exception as e:
-        log.error(f"Error checking onboarding ticket for {user_id}: {e}")
+        log.error(f"Error checking onboarding ticket for <@{user_id}>: {e}")
 
 # -----------------------------
 # 60-second fallback checker
@@ -7380,7 +7380,7 @@ async def check_and_assign_role(member: discord.Member, *, silent: bool = False)
             trigger_role = guild.get_role(ROLE_TO_ASSIGN)
             if trigger_role is None:
                 if silent:
-                    log.warning(f"[RoleCheck] Trigger role missing for {member} ({member.id})")
+                    log.warning(f"[RoleCheck] Trigger role missing for {member} <@{member.id}>")
                 else:
                     err = _make_dyno_embed(
                         member=member,
@@ -7422,7 +7422,7 @@ async def check_and_assign_role(member: discord.Member, *, silent: bool = False)
                     await log_first(embed=enq)
             except Exception as e:
                 if silent:
-                    log.warning(f"[RoleCheck] Failed to assign roles to {member} ({member.id}): {e}")
+                    log.warning(f"[RoleCheck] Failed to assign roles to {member} <@{member.id}>: {e}")
                 else:
                     await log_role_event(f"⚠️ **Failed to assign roles** to {_fmt_user(member)}\n   ❌ Error: `{e}`")
         else:
@@ -8054,7 +8054,7 @@ async def sync_whop_memberships():
                     row_action = "removed_role"
         except Exception as e:
             error_count += 1
-            log.error(f"Error syncing member {member.id}: {e}")
+            log.error(f"Error syncing member <@{member.id}>: {e}")
             continue
 
         if membership_data is None:
@@ -8845,7 +8845,7 @@ async def on_ready():
     log.info("="*60)
     log.info("  🔍 RS Checker Bot")
     log.info("="*60)
-    log.info(f"[Bot] Ready as {bot.user} (ID: {bot.user.id})")
+    log.info(f"[Bot] Ready as {bot.user} <@{bot.user.id}>")
     
     queue_state = load_json(QUEUE_FILE)
     registry = load_json(REGISTRY_FILE)
@@ -9065,31 +9065,31 @@ async def on_ready():
         log.info("")
         log.info("[Config] Configuration Information:")
         log.info("-"*60)
-        log.info(f"🏠 Guild: {guild.name} (ID: {GUILD_ID})")
+        log.info(f"🏠 Guild: {guild.name} Guild-ID: {GUILD_ID}")
         
         # DM Sequence Config
         if ROLE_TRIGGER:
             trigger_role = guild.get_role(ROLE_TRIGGER)
             if trigger_role:
-                log.info(f"🎯 Trigger Role: {trigger_role.name} (ID: {ROLE_TRIGGER})")
+                log.info(f"🎯 Trigger Role: {trigger_role.name} <@&{ROLE_TRIGGER}>")
             else:
-                log.warning(f"⚠️  Trigger Role: Not found (ID: {ROLE_TRIGGER})")
+                log.warning(f"⚠️  Trigger Role: Not found <@&{ROLE_TRIGGER}>")
         
         if WELCOME_ROLE_ID:
             welcome_role = guild.get_role(WELCOME_ROLE_ID)
             if welcome_role:
-                log.info(f"👋 Welcome Role: {welcome_role.name} (ID: {WELCOME_ROLE_ID})")
+                log.info(f"👋 Welcome Role: {welcome_role.name} <@&{WELCOME_ROLE_ID}>")
             else:
-                log.warning(f"⚠️  Welcome Role: Not found (ID: {WELCOME_ROLE_ID})")
+                log.warning(f"⚠️  Welcome Role: Not found <@&{WELCOME_ROLE_ID}>")
         
         if ROLES_TO_CHECK:
             log.info(f"🔍 Roles to Check: {len(ROLES_TO_CHECK)} role(s)")
             for role_id in list(ROLES_TO_CHECK)[:3]:
                 role = guild.get_role(role_id)
                 if role:
-                    log.info(f"   • {role.name} (ID: {role_id})")
+                    log.info(f"   • {role.name} <@&{role_id}>")
                 else:
-                    log.warning(f"   • ❌ Not found (ID: {role_id})")
+                    log.warning(f"   • ❌ Not found <@&{role_id}>")
             if len(ROLES_TO_CHECK) > 3:
                 log.info(f"   ... and {len(ROLES_TO_CHECK) - 3} more")
         
@@ -9097,31 +9097,31 @@ async def on_ready():
         if LOG_FIRST_CHANNEL_ID:
             log_channel = guild.get_channel(LOG_FIRST_CHANNEL_ID)
             if log_channel:
-                log.info(f"📝 Log First Channel: {log_channel.name} (ID: {LOG_FIRST_CHANNEL_ID})")
+                log.info(f"📝 Log First Channel: {log_channel.name} <#{LOG_FIRST_CHANNEL_ID}>")
             else:
-                log.warning(f"⚠️  Log First Channel: Not found (ID: {LOG_FIRST_CHANNEL_ID})")
+                log.warning(f"⚠️  Log First Channel: Not found <#{LOG_FIRST_CHANNEL_ID}>")
         
         if LOG_OTHER_CHANNEL_ID:
             log_channel = guild.get_channel(LOG_OTHER_CHANNEL_ID)
             if log_channel:
-                log.info(f"📝 Log Other Channel: {log_channel.name} (ID: {LOG_OTHER_CHANNEL_ID})")
+                log.info(f"📝 Log Other Channel: {log_channel.name} <#{LOG_OTHER_CHANNEL_ID}>")
             else:
-                log.warning(f"⚠️  Log Other Channel: Not found (ID: {LOG_OTHER_CHANNEL_ID})")
+                log.warning(f"⚠️  Log Other Channel: Not found <#{LOG_OTHER_CHANNEL_ID}>")
         
         if MEMBER_STATUS_LOGS_CHANNEL_ID:
             status_channel = guild.get_channel(MEMBER_STATUS_LOGS_CHANNEL_ID)
             if status_channel:
-                log.info(f"📊 Member Status Channel: {status_channel.name} (ID: {MEMBER_STATUS_LOGS_CHANNEL_ID})")
+                log.info(f"📊 Member Status Channel: {status_channel.name} <#{MEMBER_STATUS_LOGS_CHANNEL_ID}>")
             else:
-                log.warning(f"⚠️  Member Status Channel: Not found (ID: {MEMBER_STATUS_LOGS_CHANNEL_ID})")
+                log.warning(f"⚠️  Member Status Channel: Not found <#{MEMBER_STATUS_LOGS_CHANNEL_ID}>")
         
         # Invite Tracking
         if INVITE_CHANNEL_ID:
             invite_channel = guild.get_channel(INVITE_CHANNEL_ID)
             if invite_channel:
-                log.info(f"🔗 Invite Channel: {invite_channel.name} (ID: {INVITE_CHANNEL_ID})")
+                log.info(f"🔗 Invite Channel: {invite_channel.name} <#{INVITE_CHANNEL_ID}>")
             else:
-                log.warning(f"⚠️  Invite Channel: Not found (ID: {INVITE_CHANNEL_ID})")
+                log.warning(f"⚠️  Invite Channel: Not found <#{INVITE_CHANNEL_ID}>")
         
         log.info("-"*60)
         
@@ -9146,11 +9146,11 @@ async def on_ready():
                     inv2 = await g2.invites()
                     for inv in inv2:
                         invite_usage_cache[inv.code] = inv.uses
-                    log.info(f"[Invites] Cached {len(inv2)} invites for support_tickets guild ({st_gid})")
+                    log.info(f"[Invites] Cached {len(inv2)} invites for support_tickets Guild-ID: {st_gid}")
                 except Exception as e:
-                    log.error(f"[Invites] Error caching invites for support_tickets guild ({st_gid}): {e}")
+                    log.error(f"[Invites] Error caching invites for support_tickets Guild-ID: {st_gid}: {e}")
     else:
-        log.warning(f"⚠️  Guild not found (ID: {GUILD_ID})")
+        log.warning(f"⚠️  Guild not found Guild-ID: {GUILD_ID}")
 
     for uid, payload in queue_state.items():
         iso = payload.get("next_send")
