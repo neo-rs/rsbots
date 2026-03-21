@@ -5166,13 +5166,16 @@ echo "TARGET=$TARGET"
 
     async def _flush_journal_batch(self, bot_key: str, webhook_url: str, lines: List[str]) -> None:
         try:
-            joined = "\n".join(lines)
-            if not joined:
+            if not lines:
                 return
+            joined = "\n".join(lines)
             # Keep Discord-safe size; rely on configured max_chars, but double-guard.
             if len(joined) > 1800:
                 joined = joined[-1800:]
-            content = f"journal: {bot_key}\n```log\n{joined}\n```"
+            parts = joined.split("\n")
+            # Use subtext (-# ) so Discord renders mentions (e.g. <#id>) as clickable links
+            subtext_lines = [f"-# {line}" for line in parts]
+            content = f"journal: {bot_key}\n-# log\n" + "\n".join(subtext_lines)
             await self._send_webhook(webhook_url, content=content)
         except Exception:
             return
