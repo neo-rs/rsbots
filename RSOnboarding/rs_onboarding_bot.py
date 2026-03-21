@@ -1313,7 +1313,7 @@ class RSOnboardingBot:
                 if not channel:
                     self.ticket_data.pop(user_id_str, None)
                     orphaned_count += 1
-                    print(f"{Colors.YELLOW}[Cleanup] Removed orphaned ticket data for user {user_id_str} (channel deleted){Colors.RESET}")
+                    print(f"{Colors.YELLOW}[Cleanup] Removed orphaned ticket data for user <@{user_id_str}> (channel deleted){Colors.RESET}")
                     continue
                 
                 # Case 2: User has Member role - ticket should be closed
@@ -1321,9 +1321,9 @@ class RSOnboardingBot:
                     try:
                         await self.grant_member_and_close(member, channel, source="cleanup_stale")
                         cleaned_count += 1
-                        print(f"{Colors.GREEN}[Cleanup] Closed stale ticket for {member.name} (has Member role){Colors.RESET}")
+                        print(f"{Colors.GREEN}[Cleanup] Closed stale ticket for {member.name} <@{member.id}> channel <#{channel.id}> (has Member role){Colors.RESET}")
                     except Exception as e:
-                        print(f"{Colors.RED}[Cleanup] Error closing ticket for {member.name}: {e}{Colors.RESET}")
+                        print(f"{Colors.RED}[Cleanup] Error closing ticket for {member.name} <@{member.id}> channel <#{channel.id}>: {e}{Colors.RESET}")
                     continue
                 
                 # Case 3: User no longer has Welcome role - ticket should be closed
@@ -1335,9 +1335,9 @@ class RSOnboardingBot:
                         self.ticket_data.pop(user_id_str, None)
                         self.save_tickets()
                         cleaned_count += 1
-                        print(f"{Colors.GREEN}[Cleanup] Closed ticket for {member.name} (no Welcome role){Colors.RESET}")
+                        print(f"{Colors.GREEN}[Cleanup] Closed ticket for {member.name} <@{member.id}> channel <#{channel.id}> (no Welcome role){Colors.RESET}")
                     except Exception as e:
-                        print(f"{Colors.RED}[Cleanup] Error closing ticket for {member.name}: {e}{Colors.RESET}")
+                        print(f"{Colors.RED}[Cleanup] Error closing ticket for {member.name} <@{member.id}> channel <#{channel.id}>: {e}{Colors.RESET}")
                     continue
                 
                 # Case 3.5: Member joined more than 24 hours ago - should have completed onboarding
@@ -1349,9 +1349,9 @@ class RSOnboardingBot:
                             try:
                                 await self.grant_member_and_close(member, channel, source="cleanup_stale_joined_24h")
                                 cleaned_count += 1
-                                print(f"{Colors.GREEN}[Cleanup] Closed stale ticket for {member.name} (joined {member_age_hours:.1f}h ago, should have completed onboarding){Colors.RESET}")
+                                print(f"{Colors.GREEN}[Cleanup] Closed stale ticket for {member.name} <@{member.id}> channel <#{channel.id}> (joined {member_age_hours:.1f}h ago, should have completed onboarding){Colors.RESET}")
                             except Exception as e:
-                                print(f"{Colors.RED}[Cleanup] Error closing stale ticket for {member.name}: {e}{Colors.RESET}")
+                                print(f"{Colors.RED}[Cleanup] Error closing stale ticket for {member.name} <@{member.id}> channel <#{channel.id}>: {e}{Colors.RESET}")
                             continue
                     except Exception as e:
                         # If we can't check join date, continue with other checks
@@ -1369,9 +1369,9 @@ class RSOnboardingBot:
                             await self.grant_member_and_close(member, channel, source="cleanup_stale_24h")
                             cleaned_count += 1
                             age_hours = age_seconds / 3600
-                            print(f"{Colors.GREEN}[Cleanup] Closed stale ticket for {member.name} (opened {age_hours:.1f} hours ago, past {auto_close_seconds/3600:.0f}h limit){Colors.RESET}")
+                            print(f"{Colors.GREEN}[Cleanup] Closed stale ticket for {member.name} <@{member.id}> channel <#{channel.id}> (opened {age_hours:.1f} hours ago, past {auto_close_seconds/3600:.0f}h limit){Colors.RESET}")
                         except Exception as e:
-                            print(f"{Colors.RED}[Cleanup] Error closing stale ticket for {member.name}: {e}{Colors.RESET}")
+                            print(f"{Colors.RED}[Cleanup] Error closing stale ticket for {member.name} <@{member.id}> channel <#{channel.id}>: {e}{Colors.RESET}")
                     else:
                         # Member not found - just clean up storage
                         if channel and channel.permissions_for(guild.me).manage_channels:
@@ -1383,7 +1383,7 @@ class RSOnboardingBot:
                         self.save_tickets()
                         orphaned_count += 1
                         age_hours = age_seconds / 3600
-                        print(f"{Colors.YELLOW}[Cleanup] Removed orphaned ticket for user {user_id_str} (opened {age_hours:.1f} hours ago, member not found){Colors.RESET}")
+                        print(f"{Colors.YELLOW}[Cleanup] Removed orphaned ticket for user <@{user_id_str}> channel <#{channel.id}> (opened {age_hours:.1f} hours ago, member not found){Colors.RESET}")
                     continue
                 
                 # Ticket is valid - user has Welcome role, doesn't have Member role, channel exists, not past 24h
@@ -1393,7 +1393,7 @@ class RSOnboardingBot:
                 # Invalid user_id or missing data - clean up
                 self.ticket_data.pop(user_id_str, None)
                 orphaned_count += 1
-                print(f"{Colors.YELLOW}[Cleanup] Removed invalid ticket data: {user_id_str}{Colors.RESET}")
+                print(f"{Colors.YELLOW}[Cleanup] Removed invalid ticket data: user <@{user_id_str}>{Colors.RESET}")
         
         if checked_count > 0 and cleaned_count == 0 and orphaned_count == 0:
             print(f"{Colors.CYAN}[Cleanup] Checked {checked_count} ticket(s) in storage - all valid (users have Welcome role, no Member role yet, not past 24h){Colors.RESET}")
@@ -1408,12 +1408,14 @@ class RSOnboardingBot:
             cat = guild.get_channel(ticket_category_id)
             if cat:
                 ticket_categories.append(cat)
-                print(f"{Colors.CYAN}[Cleanup] Checking category: {cat.name} ({len(cat.channels) if hasattr(cat, 'channels') else 0} channels){Colors.RESET}")
+                nch = len(cat.channels) if hasattr(cat, "channels") else 0
+                print(f"{Colors.CYAN}[Cleanup] Checking category: {cat.name} <#{cat.id}> ({nch} channels){Colors.RESET}")
         if overflow_category_id:
             cat = guild.get_channel(overflow_category_id)
             if cat:
                 ticket_categories.append(cat)
-                print(f"{Colors.CYAN}[Cleanup] Checking overflow category: {cat.name} ({len(cat.channels) if hasattr(cat, 'channels') else 0} channels){Colors.RESET}")
+                nch_o = len(cat.channels) if hasattr(cat, "channels") else 0
+                print(f"{Colors.CYAN}[Cleanup] Checking overflow category: {cat.name} <#{cat.id}> ({nch_o} channels){Colors.RESET}")
         
         for category in ticket_categories:
             if not hasattr(category, "channels"):
@@ -1456,9 +1458,9 @@ class RSOnboardingBot:
                                 if channel.permissions_for(guild.me).manage_channels:
                                     await channel.delete()
                                     cleaned_count += 1
-                                    print(f"{Colors.GREEN}[Cleanup] Deleted orphaned ticket channel {channel.name} (user {matched_member.name} has Member role){Colors.RESET}")
+                                    print(f"{Colors.GREEN}[Cleanup] Deleted orphaned ticket channel {channel.name} <#{channel.id}> (user {matched_member.name} <@{matched_member.id}> has Member role){Colors.RESET}")
                             except Exception as e:
-                                print(f"{Colors.RED}[Cleanup] Error deleting orphaned channel {channel.name}: {e}{Colors.RESET}")
+                                print(f"{Colors.RED}[Cleanup] Error deleting orphaned channel {channel.name} <#{channel.id}>: {e}{Colors.RESET}")
                         elif has_welcome:
                             # Channel matches member name, member has Welcome but no Member
                             # Check if member joined more than 24 hours ago - if so, this is likely stale
@@ -1472,9 +1474,9 @@ class RSOnboardingBot:
                                         if channel.permissions_for(guild.me).manage_channels:
                                             await channel.delete()
                                             cleaned_count += 1
-                                            print(f"{Colors.GREEN}[Cleanup] Deleted stale orphaned channel {channel.name} (user {matched_member.name} joined {member_age_hours:.1f}h ago, should have completed onboarding){Colors.RESET}")
+                                            print(f"{Colors.GREEN}[Cleanup] Deleted stale orphaned channel {channel.name} <#{channel.id}> (user {matched_member.name} <@{matched_member.id}> joined {member_age_hours:.1f}h ago, should have completed onboarding){Colors.RESET}")
                                         else:
-                                            print(f"{Colors.YELLOW}[Cleanup] Found stale orphaned channel {channel.name} (user {matched_member.name} joined {member_age_hours:.1f}h ago, but no delete permission){Colors.RESET}")
+                                            print(f"{Colors.YELLOW}[Cleanup] Found stale orphaned channel {channel.name} <#{channel.id}> (user {matched_member.name} <@{matched_member.id}> joined {member_age_hours:.1f}h ago, but no delete permission){Colors.RESET}")
                                         continue
                             except Exception as e:
                                 # If we can't check join date, continue with reconciliation logic
@@ -1491,7 +1493,7 @@ class RSOnboardingBot:
                                         if channel.permissions_for(guild.me).manage_channels:
                                             await channel.delete()
                                             cleaned_count += 1
-                                            print(f"{Colors.GREEN}[Cleanup] Deleted duplicate ticket channel {channel.name} (user {matched_member.name} already has ticket in storage){Colors.RESET}")
+                                            print(f"{Colors.GREEN}[Cleanup] Deleted duplicate ticket channel {channel.name} <#{channel.id}> (user {matched_member.name} <@{matched_member.id}> already has ticket in storage){Colors.RESET}")
                                     else:
                                         # Same channel or invalid - update storage
                                         self.ticket_data[str(matched_member.id)] = {
@@ -1500,7 +1502,7 @@ class RSOnboardingBot:
                                         }
                                         self.save_tickets()
                                         orphaned_count += 1
-                                        print(f"{Colors.GREEN}[Cleanup] Reconciled orphaned channel {channel.name} for {matched_member.name} (updated tickets.json){Colors.RESET}")
+                                        print(f"{Colors.GREEN}[Cleanup] Reconciled orphaned channel {channel.name} <#{channel.id}> for {matched_member.name} <@{matched_member.id}> (updated tickets.json){Colors.RESET}")
                                 else:
                                     # No ticket in storage - add this channel to tickets.json
                                     self.ticket_data[str(matched_member.id)] = {
@@ -1509,22 +1511,22 @@ class RSOnboardingBot:
                                     }
                                     self.save_tickets()
                                     orphaned_count += 1
-                                    print(f"{Colors.GREEN}[Cleanup] Reconciled orphaned channel {channel.name} for {matched_member.name} (added to tickets.json){Colors.RESET}")
+                                    print(f"{Colors.GREEN}[Cleanup] Reconciled orphaned channel {channel.name} <#{channel.id}> for {matched_member.name} <@{matched_member.id}> (added to tickets.json){Colors.RESET}")
                             except discord.NotFound:
                                 # Channel was already deleted - skip
                                 pass
                             except Exception as e:
                                 if "10003" not in str(e):  # Ignore Unknown Channel errors
-                                    print(f"{Colors.RED}[Cleanup] Error reconciling orphaned channel {channel.name}: {e}{Colors.RESET}")
+                                    print(f"{Colors.RED}[Cleanup] Error reconciling orphaned channel {channel.name} <#{channel.id}>: {e}{Colors.RESET}")
                         else:
                             # Member doesn't have Welcome role - shouldn't have a ticket channel
                             try:
                                 if channel.permissions_for(guild.me).manage_channels:
                                     await channel.delete()
                                     cleaned_count += 1
-                                    print(f"{Colors.GREEN}[Cleanup] Deleted orphaned ticket channel {channel.name} (user {matched_member.name} doesn't have Welcome role){Colors.RESET}")
+                                    print(f"{Colors.GREEN}[Cleanup] Deleted orphaned ticket channel {channel.name} <#{channel.id}> (user {matched_member.name} <@{matched_member.id}> doesn't have Welcome role){Colors.RESET}")
                             except Exception as e:
-                                print(f"{Colors.RED}[Cleanup] Error deleting orphaned channel {channel.name}: {e}{Colors.RESET}")
+                                print(f"{Colors.RED}[Cleanup] Error deleting orphaned channel {channel.name} <#{channel.id}>: {e}{Colors.RESET}")
                     else:
                         # Channel doesn't match any member's expected ticket name
                         # Could be an old ticket or manually created channel
@@ -1536,13 +1538,13 @@ class RSOnboardingBot:
                                 if channel.permissions_for(guild.me).manage_channels:
                                     await channel.delete()
                                     cleaned_count += 1
-                                    print(f"{Colors.GREEN}[Cleanup] Deleted orphaned channel {channel.name} (doesn't match any member, {channel_age:.1f}h old){Colors.RESET}")
+                                    print(f"{Colors.GREEN}[Cleanup] Deleted orphaned channel {channel.name} <#{channel.id}> (doesn't match any member, {channel_age:.1f}h old){Colors.RESET}")
                                 else:
-                                    print(f"{Colors.YELLOW}[Cleanup] Found orphaned channel {channel.name} (doesn't match any member, {channel_age:.1f}h old, but no delete permission){Colors.RESET}")
+                                    print(f"{Colors.YELLOW}[Cleanup] Found orphaned channel {channel.name} <#{channel.id}> (doesn't match any member, {channel_age:.1f}h old, but no delete permission){Colors.RESET}")
                             else:
-                                print(f"{Colors.YELLOW}[Cleanup] Found orphaned channel {channel.name} (doesn't match any member's ticket name pattern, {channel_age:.1f}h old){Colors.RESET}")
+                                print(f"{Colors.YELLOW}[Cleanup] Found orphaned channel {channel.name} <#{channel.id}> (doesn't match any member's ticket name pattern, {channel_age:.1f}h old){Colors.RESET}")
                         except Exception as e:
-                            print(f"{Colors.YELLOW}[Cleanup] Found orphaned channel {channel.name} (doesn't match any member's ticket name pattern, error checking age: {e}){Colors.RESET}")
+                            print(f"{Colors.YELLOW}[Cleanup] Found orphaned channel {channel.name} <#{channel.id}> (doesn't match any member's ticket name pattern, error checking age: {e}){Colors.RESET}")
         
         if channels_checked > 0:
             print(f"{Colors.CYAN}[Cleanup] Checked {channels_checked} channel(s) in ticket categories{Colors.RESET}")
