@@ -635,6 +635,14 @@ def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
             )
             try:
                 page = ctx.new_page()
+                # Match aiohttp hub fetches (Cookie + browser-ish headers); headless Chromium otherwise often gets a block shell.
+                try:
+                    _ph = _html_fetch_headers_for_hub(u)
+                    _extra = {k: _ph[k] for k in ("User-Agent", "Accept", "Accept-Language", "Cookie", "Referer") if _ph.get(k)}
+                    if _extra:
+                        page.set_extra_http_headers(_extra)
+                except Exception:
+                    pass
                 page.goto(u, wait_until="domcontentloaded", timeout=t_ms)
                 try:
                     page.wait_for_load_state("load", timeout=min(20_000, max(5_000, t_ms // 2)))
