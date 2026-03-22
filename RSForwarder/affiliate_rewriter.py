@@ -1954,38 +1954,61 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                     # influencer hub HTML alone is frequently useless on datacenter IPs (small shell, no __NEXT_DATA__).
                     mavely_short_src = (normalized.get(u) or u).strip()
                     mavely_short_playwright_tried = False
-                    if (
-                        is_mavely_app_short_link(mavely_short_src)
-                        and _mavely_bridge_playwright_enabled()
-                        and resolve_mavely_profile_dir() is not None
-                    ):
-                        mavely_short_playwright_tried = True
-                        async with _playwright_mavely_async_lock():
-                            pw_short_first = await asyncio.to_thread(
-                                _fetch_mavely_html_via_playwright_sync,
-                                mavely_short_src,
-                                int(hub_html_timeout_s),
-                            )
-                        out_sf = (
-                            _first_production_outbound_from_hub_html(pw_short_first)
-                            if pw_short_first
-                            else None
-                        )
-                        if out_sf:
-                            out_abs_sf = out_sf
-                            if out_abs_sf.startswith("/"):
-                                out_abs_sf = urljoin(mavely_short_src, out_abs_sf)
-                            out_abs_sf = unwrap_known_query_redirects(out_abs_sf) or out_abs_sf
-                            candidate = out_abs_sf
+                    if is_mavely_app_short_link(mavely_short_src):
+                        if (not _mavely_bridge_playwright_enabled()) or resolve_mavely_profile_dir() is None:
                             if affiliate_rewrite_debug_verbose_on(cfg):
                                 _aff_dbg_verbose(
                                     cfg,
-                                    "  html_unwrap mavely short-first %r -> %r"
+                                    "  html_unwrap mavely short-first: skipped (%s)"
                                     % (
-                                        _aff_dbg_clip(mavely_short_src, 72),
-                                        _aff_dbg_clip(out_abs_sf, 88),
+                                        "MAVELY_BRIDGE_PLAYWRIGHT off"
+                                        if not _mavely_bridge_playwright_enabled()
+                                        else "no persistent profile (MAVELY_PROFILE_DIR or RSForwarder/.mavely_profile)"
                                     ),
                                 )
+                        else:
+                            mavely_short_playwright_tried = True
+                            if affiliate_rewrite_debug_verbose_on(cfg):
+                                _aff_dbg_verbose(
+                                    cfg,
+                                    "  html_unwrap mavely short-first: playwright starting timeout_s=%s %r (this can take tens of seconds)"
+                                    % (
+                                        int(hub_html_timeout_s),
+                                        _aff_dbg_clip(mavely_short_src, 72),
+                                    ),
+                                )
+                            async with _playwright_mavely_async_lock():
+                                pw_short_first = await asyncio.to_thread(
+                                    _fetch_mavely_html_via_playwright_sync,
+                                    mavely_short_src,
+                                    int(hub_html_timeout_s),
+                                )
+                            out_sf = (
+                                _first_production_outbound_from_hub_html(pw_short_first)
+                                if pw_short_first
+                                else None
+                            )
+                            if affiliate_rewrite_debug_verbose_on(cfg):
+                                _aff_dbg_verbose(
+                                    cfg,
+                                    "  html_unwrap mavely short-first: playwright done len=%s merchant_out=%s"
+                                    % (len(pw_short_first or ""), bool(out_sf)),
+                                )
+                            if out_sf:
+                                out_abs_sf = out_sf
+                                if out_abs_sf.startswith("/"):
+                                    out_abs_sf = urljoin(mavely_short_src, out_abs_sf)
+                                out_abs_sf = unwrap_known_query_redirects(out_abs_sf) or out_abs_sf
+                                candidate = out_abs_sf
+                                if affiliate_rewrite_debug_verbose_on(cfg):
+                                    _aff_dbg_verbose(
+                                        cfg,
+                                        "  html_unwrap mavely short-first %r -> %r"
+                                        % (
+                                            _aff_dbg_clip(mavely_short_src, 72),
+                                            _aff_dbg_clip(out_abs_sf, 88),
+                                        ),
+                                    )
                     for _ in range(3):
                         try:
                             parsed = urlparse(candidate)
@@ -2029,6 +2052,15 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                     or (not have_merchant)
                                 )
                                 if need_pw and resolve_mavely_profile_dir() is not None:
+                                    if affiliate_rewrite_debug_verbose_on(cfg):
+                                        _aff_dbg_verbose(
+                                            cfg,
+                                            "  html_unwrap playwright(bridge): starting timeout_s=%s %r"
+                                            % (
+                                                int(hub_html_timeout_s),
+                                                _aff_dbg_clip(candidate, 72),
+                                            ),
+                                        )
                                     async with _playwright_mavely_async_lock():
                                         pw_html = await asyncio.to_thread(
                                             _fetch_mavely_html_via_playwright_sync,
