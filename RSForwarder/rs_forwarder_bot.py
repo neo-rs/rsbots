@@ -3803,18 +3803,6 @@ class RSForwarderBot:
                         except Exception:
                             pass
                         return
-                    # Send a button that triggers RS-FS Check ephemerally when clicked
-                    out_id_raw = str((self.config or {}).get("rs_fs_sheet_status_channel_id") or "").strip()
-                    out_id = int(out_id_raw) if out_id_raw else int(target_ch)
-                    out_ch2 = await self._resolve_channel_by_id(int(out_id))
-                    if not (out_ch2 and hasattr(out_ch2, "send")):
-                        try:
-                            print(
-                                f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Auto check: cannot resolve sendable channel id={out_id}"
-                            )
-                        except Exception:
-                            pass
-                        return
                     try:
                         print(
                             f"{Colors.CYAN}[RS-FS Sheet]{Colors.RESET} Auto check: sending button to channel_id={out_id} (debounce={self._rsfs_auto_check_debounce_s():.0f}s)"
@@ -3859,6 +3847,40 @@ class RSForwarderBot:
                             pass
             except Exception:
                 text_for_parse = text
+
+            # Several Zephyr chunks can arrive in one burst with the same merged /listreleases snapshot.
+            # Skip redundant sheet + affiliate work (message IDs differ per chunk).
+            try:
+                merge_debounce = float((self.config or {}).get("rs_fs_zephyr_merge_debounce_s", 2.5) or 2.5)
+            except Exception:
+                merge_debounce = 2.5
+            merge_debounce = max(0.5, min(merge_debounce, 30.0))
+            try:
+                hm = hashlib.sha1((text_for_parse or "").encode("utf-8", errors="ignore")).hexdigest()[:16]
+            except Exception:
+                hm = ""
+            now_m = time.time()
+            last_hm = str(getattr(self, "_rs_fs_last_zephyr_merged_hash", "") or "")
+            last_tm = float(getattr(self, "_rs_fs_last_zephyr_merged_ts", 0.0) or 0.0)
+            if hm and hm == last_hm and (now_m - last_tm) < merge_debounce:
+                try:
+                    print(
+                        f"{Colors.CYAN}[RS-FS Sheet]{Colors.RESET} Skip duplicate merged listreleases snapshot "
+                        f"(debounce={merge_debounce:.1f}s)"
+                    )
+                except Exception:
+                    pass
+                if mid:
+                    try:
+                        self._rs_fs_seen_message_ids.add(mid)
+                        if len(self._rs_fs_seen_message_ids) > 2000:
+                            self._rs_fs_seen_message_ids = set(list(self._rs_fs_seen_message_ids)[-1200:])
+                    except Exception:
+                        pass
+                return
+            if hm:
+                self._rs_fs_last_zephyr_merged_hash = hm
+                self._rs_fs_last_zephyr_merged_ts = now_m
 
             # Decide mode early.
             try:
@@ -4172,7 +4194,7 @@ class RSForwarderBot:
                         # - rewrapped mavely link
                         # - resolves to mavely link
                         # - amazon affiliate
-                        aff_map: Dict[str, str] = {}
+                        aff_map = {}
                         for k, v in (mapped or {}).items():
                             k2 = str(k or "").strip()
                             v2 = str(v or "").strip()

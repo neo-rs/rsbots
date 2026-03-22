@@ -227,6 +227,11 @@ def _strip_tracking_params(url: str) -> str:
         "sc_medium",
         "sc_content",
         "sc_outcome",
+        # Commission Junction / affiliate pixels (e.g. Woot tools.woot.com offers)
+        "cjdata",
+        "cjevent",
+        "cjpid",
+        "cjaid",
     }
 
     kept = []
@@ -240,6 +245,8 @@ def _strip_tracking_params(url: str) -> str:
         if kl.startswith("_branch"):
             continue
         if kl.startswith("branch_"):
+            continue
+        if kl.startswith("cj") and len(kl) <= 12:
             continue
         if kl in deny_exact:
             continue
