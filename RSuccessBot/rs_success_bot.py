@@ -476,7 +476,7 @@ class RSSuccessBot:
             return
 
         reg = {c.name for c in self.bot.tree.get_commands()}
-        expected_mp = {"rsmarketplace", "rsmarketview", "rsmarketsearch"}
+        expected_mp = {"rsmarketplace", "rsmarketview", "rsmarketsearch", "rsmarketviewoffers"}
         have = sorted(expected_mp & reg)
         if have:
             print(f"{Colors.GREEN}🛒 Marketplace commands:{Colors.RESET} " + ", ".join(f"/{n}" for n in have))
@@ -1757,7 +1757,7 @@ class RSSuccessBot:
                         f"**Offer log:** {och.mention if och else '❌ not found'} (`{offer_log_id}`)"
                     )
                 reg = {c.name for c in self.bot.tree.get_commands()}
-                mp_cmds = [x for x in ("rsmarketplace", "rsmarketview", "rsmarketsearch") if x in reg]
+                mp_cmds = [x for x in ("rsmarketplace", "rsmarketview", "rsmarketsearch", "rsmarketviewoffers") if x in reg]
                 mp_lines.append(
                     "**Slash:** "
                     + (", ".join(f"`/{n}`" for n in mp_cmds) if mp_cmds else "❌ module not loaded (missing `rs_marketplace_bot.py`?)")

@@ -44,6 +44,10 @@ try:
 except Exception:  # pragma: no cover
     load_config_with_secrets = None
 
+DEFAULT_MARKETPLACE_BANNER_URL = (
+    "https://cdn.discordapp.com/attachments/1381747904846364865/1389885150724227134/banner.png"
+)
+
 
 class Colors:
     GREEN = "\033[92m"
@@ -74,20 +78,30 @@ class MarketplaceStats:
 
 
 class OfferModal(discord.ui.Modal, title="Make an Offer"):
-    def __init__(self, module: "RSMarketplaceBot", target_user_id: int):
+    def __init__(
+        self,
+        module: "RSMarketplaceBot",
+        target_user_id: int,
+        featured_index: Optional[int] = None,
+        preset_title: str = "",
+        preset_price: str = "",
+    ):
         super().__init__(timeout=300)
         self.module = module
         self.target_user_id = target_user_id
+        self.featured_index = featured_index
 
         self.offer_title = discord.ui.TextInput(
             label="Offer Title",
             placeholder="Example: Interested in your Nike pair",
             max_length=80,
+            default=preset_title[:80] if preset_title else "",
         )
         self.offer_price = discord.ui.TextInput(
             label="Offer / Price",
             placeholder="Example: $85 shipped / trade offer / bundle deal",
             max_length=80,
+            default=preset_price[:80] if preset_price else "",
         )
         self.offer_message = discord.ui.TextInput(
             label="Message",
@@ -107,7 +121,233 @@ class OfferModal(discord.ui.Modal, title="Make an Offer"):
             title=str(self.offer_title.value).strip(),
             price=str(self.offer_price.value).strip(),
             message=str(self.offer_message.value).strip(),
+            featured_index=self.featured_index,
         )
+
+
+class OfferTargetSelect(discord.ui.Select):
+    def __init__(self, module: "RSMarketplaceBot", seller_user_id: int, products: List[Dict[str, Any]]):
+        opts: List[discord.SelectOption] = [
+            discord.SelectOption(
+                label="Custom offer",
+                value="custom",
+                description="Your own title and details",
+            )
+        ]
+        for i, p in enumerate(products[:24]):
+            title = (p.get("title") or f"Listing {i + 1}").strip() or f"Listing {i + 1}"
+            opts.append(
+                discord.SelectOption(
+                    label=truncate(title, 100),
+                    value=str(i),
+                    description=truncate((p.get("price") or "")[:80], 100) or None,
+                )
+            )
+        super().__init__(placeholder="Choose a featured listing or custom offer…", min_values=1, max_values=1, options=opts)
+        self.module = module
+        self.seller_user_id = seller_user_id
+        self.products = products
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        choice = self.values[0]
+        if choice == "custom":
+            await interaction.response.send_modal(OfferModal(self.module, self.seller_user_id))
+            return
+        idx = int(choice)
+        p = self.products[idx]
+        await interaction.response.send_modal(
+            OfferModal(
+                self.module,
+                self.seller_user_id,
+                featured_index=idx,
+                preset_title=str(p.get("title") or ""),
+                preset_price=str(p.get("price") or ""),
+            )
+        )
+
+
+class OfferEntryView(discord.ui.View):
+    def __init__(self, module: "RSMarketplaceBot", seller_user_id: int, products: List[Dict[str, Any]]):
+        super().__init__(timeout=180)
+        self.add_item(OfferTargetSelect(module, seller_user_id, products))
+
+
+class FeaturedProductModal(discord.ui.Modal, title="Add featured listing"):
+    def __init__(self, module: "RSMarketplaceBot", user_id: int):
+        super().__init__(timeout=600)
+        self.module = module
+        self.user_id = user_id
+        self.title_in = discord.ui.TextInput(
+            label="Title",
+            placeholder="e.g. Reselling Secrets membership",
+            max_length=120,
+            required=True,
+        )
+        self.price_in = discord.ui.TextInput(
+            label="Price",
+            placeholder="e.g. $60 / month",
+            max_length=80,
+            required=False,
+        )
+        self.note_in = discord.ui.TextInput(
+            label="Note",
+            style=discord.TextStyle.paragraph,
+            placeholder="Extra details (optional)",
+            max_length=300,
+            required=False,
+        )
+        self.url_in = discord.ui.TextInput(
+            label="Link (optional)",
+            placeholder="https://…",
+            max_length=200,
+            required=False,
+        )
+        self.image_in = discord.ui.TextInput(
+            label="Image URL (optional)",
+            placeholder="https://…",
+            max_length=200,
+            required=False,
+        )
+        for x in (self.title_in, self.price_in, self.note_in, self.url_in, self.image_in):
+            self.add_item(x)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.user_id:
+            return
+        profile = self.module.get_or_create_profile(self.user_id)
+        self.module.migrate_profile_fields(profile)
+        products = list(profile.get("featured_products") or [])
+        max_fp = int(self.module.config.get("marketplace_max_featured_products", 10) or 10)
+        if len(products) >= max_fp:
+            await interaction.response.send_message(
+                f"You already have the maximum ({max_fp}) featured listings. Remove some before adding more.",
+                ephemeral=True,
+            )
+            return
+        url = str(self.url_in.value or "").strip()
+        img = str(self.image_in.value or "").strip()
+        products.append(
+            {
+                "title": str(self.title_in.value or "").strip(),
+                "price": str(self.price_in.value or "").strip(),
+                "note": str(self.note_in.value or "").strip(),
+                "url": url if url.startswith(("http://", "https://")) else "",
+                "image_url": img if img.startswith(("http://", "https://")) else "",
+                "created_at": utc_now_iso(),
+            }
+        )
+        profile["featured_products"] = products
+        profile["updated_at"] = utc_now_iso()
+        self.module.save_profiles_data()
+        await interaction.response.send_message(
+            f"Added featured listing **{truncate(products[-1]['title'], 60)}** ({len(products)} total). Use **Publish / Refresh** to update your public card.",
+            ephemeral=True,
+        )
+
+
+class FeaturedProductsBrowseView(discord.ui.View):
+    """Ephemeral prev/next for a seller's featured listings."""
+
+    def __init__(self, module: "RSMarketplaceBot", seller_user_id: int, products: List[Dict[str, Any]], index: int = 0):
+        super().__init__(timeout=300)
+        self.module = module
+        self.seller_user_id = seller_user_id
+        self.products = products
+        self.index = max(0, min(index, len(products) - 1))
+
+    def _embed(self) -> discord.Embed:
+        p = self.products[self.index]
+        embed = discord.Embed(
+            title=f"Featured listing ({self.index + 1}/{len(self.products)})",
+            description=truncate(p.get("note") or "—", 2048),
+            color=self.module.get_embed_color(),
+        )
+        embed.add_field(name="Title", value=truncate(p.get("title") or "—", 256), inline=False)
+        if p.get("price"):
+            embed.add_field(name="Price", value=truncate(p["price"], 128), inline=True)
+        if p.get("url"):
+            embed.add_field(name="Link", value=f"[Open]({p['url']})", inline=True)
+        img = (p.get("image_url") or "").strip()
+        if img.startswith(("http://", "https://")):
+            embed.set_image(url=img)
+        embed.set_footer(text="Use Make Offer on their profile to inquire.")
+        return embed
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_b(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if self.index <= 0:
+            self.index = len(self.products) - 1
+        else:
+            self.index -= 1
+        await interaction.response.edit_message(embed=self._embed(), view=self)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+    async def next_b(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if self.index >= len(self.products) - 1:
+            self.index = 0
+        else:
+            self.index += 1
+        await interaction.response.edit_message(embed=self._embed(), view=self)
+
+
+class OfferPickSelect(discord.ui.Select):
+    def __init__(self, module: "RSMarketplaceBot", seller_id: int, offers: List[Dict[str, Any]]):
+        opts: List[discord.SelectOption] = []
+        for o in offers[:25]:
+            oid = str(o.get("id", ""))
+            title = truncate(str(o.get("title") or "Offer"), 100)
+            opts.append(
+                discord.SelectOption(
+                    label=f"#{oid} {title}"[:100],
+                    value=oid,
+                    description=f"From user {o.get('buyer_id', '')}"[:100],
+                )
+            )
+        super().__init__(placeholder="Select an offer to update…", min_values=1, max_values=1, options=opts)
+        self.module = module
+        self.seller_id = seller_id
+        self.offers = offers
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.seller_id:
+            await interaction.response.send_message("Not your offers.", ephemeral=True)
+            return
+        oid = int(self.values[0])
+        offer = next((x for x in self.offers if int(x.get("id", 0)) == oid), None)
+        if not offer:
+            await interaction.response.send_message("Offer not found.", ephemeral=True)
+            return
+        embed = self.module.offer_summary_embed(offer)
+        await interaction.response.edit_message(
+            embed=embed,
+            view=OfferOutcomeView(self.module, oid, self.seller_id),
+        )
+
+
+class OfferOutcomeView(discord.ui.View):
+    def __init__(self, module: "RSMarketplaceBot", offer_id: int, seller_id: int):
+        super().__init__(timeout=300)
+        self.module = module
+        self.offer_id = offer_id
+        self.seller_id = seller_id
+
+    @discord.ui.button(label="Succeeded", style=discord.ButtonStyle.success, row=0)
+    async def btn_ok(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.module.apply_offer_status(interaction, self.offer_id, "succeeded")
+
+    @discord.ui.button(label="Cancelled", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.module.apply_offer_status(interaction, self.offer_id, "cancelled")
+
+    @discord.ui.button(label="Report", style=discord.ButtonStyle.danger, row=0)
+    async def btn_report(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.module.apply_offer_status(interaction, self.offer_id, "reported")
+
+
+class SellerOffersHubView(discord.ui.View):
+    def __init__(self, module: "RSMarketplaceBot", seller_id: int, offers: List[Dict[str, Any]]):
+        super().__init__(timeout=300)
+        self.add_item(OfferPickSelect(module, seller_id, offers))
 
 
 class ProfileModal(discord.ui.Modal, title="Marketplace Profile Setup"):
@@ -116,9 +356,9 @@ class ProfileModal(discord.ui.Modal, title="Marketplace Profile Setup"):
         self.module = module
         self.user_id = user_id
         existing = existing or {}
-
-        featured = existing.get("featured_product", {})
+        module.migrate_profile_fields(existing)
         interests = existing.get("interests", {})
+        default_banner = str(existing.get("banner_url") or module.config.get("marketplace_default_banner_url") or DEFAULT_MARKETPLACE_BANNER_URL)
 
         self.bio = discord.ui.TextInput(
             label="Bio / Summary",
@@ -134,21 +374,14 @@ class ProfileModal(discord.ui.Modal, title="Marketplace Profile Setup"):
             required=False,
             max_length=700,
             default="\n".join(link.get("url", "") for link in existing.get("store_links", [])),
-            placeholder="https://www.ebay.com/usr/yourname\nhttps://www.mercari.com/u/yourname",
+            placeholder="https://www.ebay.com/...\nhttps://whop.com/...",
         )
-        self.featured_product = discord.ui.TextInput(
-            label="Featured Product",
+        self.banner_url = discord.ui.TextInput(
+            label="Banner image URL",
             required=False,
-            max_length=120,
-            default=featured.get("title", ""),
-            placeholder="Example: Nike Vomero 5 size 10",
-        )
-        self.featured_price = discord.ui.TextInput(
-            label="Featured Product Price / Note",
-            required=False,
-            max_length=120,
-            default=featured.get("price", ""),
-            placeholder="Example: $110 shipped",
+            max_length=200,
+            default=default_banner[:200],
+            placeholder="Leave default or paste image URL",
         )
         self.interests_text = discord.ui.TextInput(
             label="WTB / WTS / WTT / ISO / Services",
@@ -156,22 +389,22 @@ class ProfileModal(discord.ui.Modal, title="Marketplace Profile Setup"):
             required=False,
             max_length=500,
             default=self.module.serialize_interest_lines(interests),
-            placeholder="WTB: Pokemon sealed\nWTS: Ross sneakers\nWTT: toys for shoes\nISO: Needoh variants",
+            placeholder="WTB: Pokemon sealed\nWTS: Ross sneakers",
         )
 
-        for item in [self.bio, self.store_links, self.featured_product, self.featured_price, self.interests_text]:
+        for item in [self.bio, self.store_links, self.banner_url, self.interests_text]:
             self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         profile = self.module.get_or_create_profile(self.user_id)
+        self.module.migrate_profile_fields(profile)
         profile["bio"] = str(self.bio.value).strip()
         profile["store_links"] = self.module.parse_store_links(str(self.store_links.value or ""))
-        profile["featured_product"] = {
-            "title": str(self.featured_product.value or "").strip(),
-            "price": str(self.featured_price.value or "").strip(),
-            "url": profile.get("featured_product", {}).get("url", ""),
-            "note": profile.get("featured_product", {}).get("note", ""),
-        }
+        b = str(self.banner_url.value or "").strip()
+        if b.startswith(("http://", "https://")):
+            profile["banner_url"] = b
+        else:
+            profile["banner_url"] = self.module.config.get("marketplace_default_banner_url") or DEFAULT_MARKETPLACE_BANNER_URL
         profile["interests"] = self.module.parse_interest_lines(str(self.interests_text.value or ""))
         profile["enabled"] = True
         profile["updated_at"] = utc_now_iso()
@@ -186,6 +419,7 @@ class MarketplaceProfileView(discord.ui.View):
         target_user_id: int,
         middleman_available: bool,
         store_url: Optional[str] = None,
+        has_featured_listings: bool = False,
     ):
         super().__init__(timeout=None)
         self.module = module
@@ -207,6 +441,15 @@ class MarketplaceProfileView(discord.ui.View):
         self.vouch_button.callback = self.vouch_callback
         self.add_item(self.vouch_button)
 
+        if has_featured_listings:
+            self.featured_button = discord.ui.Button(
+                label="Featured products",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"rsmarket:featured:{target_user_id}",
+            )
+            self.featured_button.callback = self.featured_callback
+            self.add_item(self.featured_button)
+
         if store_url and store_url.startswith(("http://", "https://")):
             self.add_item(
                 discord.ui.Button(
@@ -225,11 +468,29 @@ class MarketplaceProfileView(discord.ui.View):
             self.middleman_button.callback = self.middleman_callback
             self.add_item(self.middleman_button)
 
+    async def featured_callback(self, interaction: discord.Interaction) -> None:
+        prof = self.module.marketplace_data.get("profiles", {}).get(str(self.target_user_id)) or {}
+        products = self.module.get_featured_products(prof)
+        if not products:
+            await interaction.response.send_message("This member has no featured listings.", ephemeral=True)
+            return
+        view = FeaturedProductsBrowseView(self.module, self.target_user_id, products, 0)
+        await interaction.response.send_message(embed=view._embed(), view=view, ephemeral=True)
+
     async def make_offer_callback(self, interaction: discord.Interaction) -> None:
         if interaction.user.id == self.target_user_id:
             await interaction.response.send_message("You cannot send an offer to yourself.", ephemeral=True)
             return
-        await interaction.response.send_modal(OfferModal(self.module, self.target_user_id))
+        prof = self.module.marketplace_data.get("profiles", {}).get(str(self.target_user_id)) or {}
+        products = self.module.get_featured_products(prof)
+        if products:
+            await interaction.response.send_message(
+                "Choose **custom offer** or pick one of their featured listings:",
+                view=OfferEntryView(self.module, self.target_user_id, products),
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_modal(OfferModal(self.module, self.target_user_id))
 
     async def vouch_callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message(
@@ -250,7 +511,7 @@ class MarketplaceSetupView(discord.ui.View):
         self.module = module
         self.user_id = user_id
 
-    @discord.ui.button(label="Create / Update Profile", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Create / Update Profile", style=discord.ButtonStyle.primary, row=0)
     async def edit_profile(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("This setup panel is only for the member who opened it.", ephemeral=True)
@@ -258,7 +519,32 @@ class MarketplaceSetupView(discord.ui.View):
         profile = self.module.get_or_create_profile(self.user_id)
         await interaction.response.send_modal(ProfileModal(self.module, self.user_id, existing=profile))
 
-    @discord.ui.button(label="Publish / Refresh", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Add featured listing", style=discord.ButtonStyle.primary, row=0)
+    async def add_featured(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This setup panel is only for the member who opened it.", ephemeral=True)
+            return
+        await interaction.response.send_modal(FeaturedProductModal(self.module, self.user_id))
+
+    @discord.ui.button(label="Preview profile", style=discord.ButtonStyle.secondary, row=1)
+    async def preview_profile(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This setup panel is only for the member who opened it.", ephemeral=True)
+            return
+        profile = self.module.get_or_create_profile(self.user_id)
+        self.module.migrate_profile_fields(profile)
+        member = interaction.user
+        if interaction.guild:
+            m = interaction.guild.get_member(self.user_id)
+            if m:
+                member = m
+        stats = self.module.get_member_stats(self.user_id)
+        embed = self.module.build_profile_embed(member, profile, stats)
+        n = len(self.module.get_featured_products(profile))
+        extra = f"\n\n_Public card also shows: Make Offer, Vouch, Open Store (if links), Featured products ({n}), Middleman if eligible._"
+        await interaction.response.send_message(embed=embed, content=f"Preview of how your **public** card looks:{extra}", ephemeral=True)
+
+    @discord.ui.button(label="Publish / Refresh", style=discord.ButtonStyle.success, row=1)
     async def publish(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("This setup panel is only for the member who opened it.", ephemeral=True)
@@ -269,7 +555,7 @@ class MarketplaceSetupView(discord.ui.View):
         self.module.save_profiles_data()
         await self.module.publish_or_update_profile(interaction, profile, announce=True)
 
-    @discord.ui.button(label="Disable Profile", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Disable Profile", style=discord.ButtonStyle.danger, row=1)
     async def disable(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("This setup panel is only for the member who opened it.", ephemeral=True)
@@ -296,6 +582,8 @@ class RSMarketplaceBot:
         self.marketplace_data: Dict[str, Any] = {
             "profiles": {},
             "audit_log": [],
+            "offers": [],
+            "offer_id_seq": 0,
             "migrated_at": utc_now_iso(),
         }
 
@@ -316,6 +604,8 @@ class RSMarketplaceBot:
                 "Reselling Secrets is not responsible for transactions, trades, payments, chargebacks, scams, "
                 "shipping issues, or losses from member-to-member deals. Use at your own risk."
             ),
+            "marketplace_default_banner_url": DEFAULT_MARKETPLACE_BANNER_URL,
+            "marketplace_max_featured_products": 10,
         }
 
         self.profile_cooldowns: Dict[int, float] = {}
@@ -368,6 +658,8 @@ class RSMarketplaceBot:
                     self.marketplace_data = json.load(f)
                 self.marketplace_data.setdefault("profiles", {})
                 self.marketplace_data.setdefault("audit_log", [])
+                self.marketplace_data.setdefault("offers", [])
+                self.marketplace_data.setdefault("offer_id_seq", 0)
                 self.marketplace_data.setdefault("migrated_at", utc_now_iso())
                 print(f"{Colors.GREEN}[Marketplace] Loaded {self.marketplace_path}{Colors.RESET}")
                 return
@@ -407,11 +699,14 @@ class RSMarketplaceBot:
                 "profile_message_id": "",
                 "bio": "",
                 "store_links": [],
+                "banner_url": self.config.get("marketplace_default_banner_url") or DEFAULT_MARKETPLACE_BANNER_URL,
+                "featured_products": [],
                 "featured_product": {
                     "title": "",
                     "price": "",
                     "url": "",
                     "note": "",
+                    "image_url": "",
                 },
                 "interests": {
                     "wtb": [],
@@ -430,6 +725,40 @@ class RSMarketplaceBot:
             }
             self.save_profiles_data()
         return profiles[key]
+
+    def migrate_profile_fields(self, profile: Dict[str, Any]) -> None:
+        """Normalize featured list, banner, legacy single featured_product."""
+        default_b = self.config.get("marketplace_default_banner_url") or DEFAULT_MARKETPLACE_BANNER_URL
+        if not str(profile.get("banner_url") or "").strip():
+            profile["banner_url"] = default_b
+        fps = profile.get("featured_products")
+        if not isinstance(fps, list):
+            profile["featured_products"] = []
+        legacy = profile.get("featured_product")
+        if isinstance(legacy, dict) and (legacy.get("title") or legacy.get("price")):
+            if not profile["featured_products"]:
+                profile["featured_products"] = [
+                    {
+                        "title": str(legacy.get("title") or ""),
+                        "price": str(legacy.get("price") or ""),
+                        "note": str(legacy.get("note") or ""),
+                        "url": str(legacy.get("url") or ""),
+                        "image_url": str(legacy.get("image_url") or ""),
+                        "created_at": utc_now_iso(),
+                    }
+                ]
+                profile["featured_product"] = {
+                    "title": "",
+                    "price": "",
+                    "url": "",
+                    "note": "",
+                    "image_url": "",
+                }
+
+    def get_featured_products(self, profile: Dict[str, Any]) -> List[Dict[str, Any]]:
+        self.migrate_profile_fields(profile)
+        out = profile.get("featured_products") or []
+        return [p for p in out if isinstance(p, dict) and (p.get("title") or p.get("price") or p.get("url"))]
 
     def parse_store_links(self, raw: str) -> List[Dict[str, str]]:
         max_links = int(self.config.get("marketplace_max_links", 6) or 6)
@@ -452,7 +781,9 @@ class RSMarketplaceBot:
 
     def detect_marketplace_label(self, url: str) -> str:
         lowered = url.lower()
-        if "ebay." in lowered:
+        if "whop." in lowered:
+            return "Whop"
+        if "ebay." in lowered or lowered.rstrip("/").endswith("ebay.com"):
             return "eBay"
         if "mercari." in lowered:
             return "Mercari"
@@ -595,19 +926,26 @@ class RSMarketplaceBot:
         )
 
     def build_profile_embed(self, member: discord.abc.User, profile: Dict[str, Any], stats: MarketplaceStats) -> discord.Embed:
+        self.migrate_profile_fields(profile)
         embed = discord.Embed(
             title=f"Marketplace Profile • {member.display_name}",
             description=profile.get("bio", "") or "No marketplace bio set yet.",
             color=self.get_embed_color(),
-            timestamp=datetime.now(timezone.utc),
         )
         embed.set_thumbnail(url=member.display_avatar.url)
+        banner = str(profile.get("banner_url") or "").strip()
+        if banner.startswith(("http://", "https://")):
+            embed.set_image(url=banner)
 
+        joined_line = ""
+        if isinstance(member, discord.Member) and member.joined_at:
+            joined_line = f"RS Member Since: **{member.joined_at.strftime('%b %d, %Y')}**\n"
         score_text = (
-            f"Success Points: **{stats.success_points}**\n"
-            f"Vouch Score: **{stats.vouch_score}**\n"
-            f"Total Vouches: **{stats.vouch_count}**\n"
-            f"Avg Rating: **{stats.avg_rating:.2f}**"
+            joined_line
+            + f"Success Points: **{stats.success_points}**\n"
+            + f"Vouch Score: **{stats.vouch_score}**\n"
+            + f"Total Vouches: **{stats.vouch_count}**\n"
+            + f"Avg Rating: **{stats.avg_rating:.2f}**"
         )
         embed.add_field(name="Trust Metrics", value=score_text, inline=False)
 
@@ -616,18 +954,13 @@ class RSMarketplaceBot:
             lines = [f"• [{truncate(link['label'], 24)}]({link['url']})" for link in links]
             embed.add_field(name="Store Links", value="\n".join(lines), inline=False)
 
-        featured = profile.get("featured_product", {}) or {}
-        if featured.get("title") or featured.get("price"):
-            featured_lines = []
-            if featured.get("title"):
-                featured_lines.append(f"**Item:** {truncate(featured['title'], 120)}")
-            if featured.get("price"):
-                featured_lines.append(f"**Price:** {truncate(featured['price'], 120)}")
-            if featured.get("url"):
-                featured_lines.append(f"[Open Listing]({featured['url']})")
-            if featured.get("note"):
-                featured_lines.append(truncate(featured['note'], 200))
-            embed.add_field(name="Featured Product", value="\n".join(featured_lines), inline=False)
+        products = self.get_featured_products(profile)
+        if products:
+            embed.add_field(
+                name="Featured listings",
+                value=f"**{len(products)}** active — use the **Featured products** button below to browse.",
+                inline=False,
+            )
 
         interests = profile.get("interests", {}) or {}
         interest_parts = []
@@ -714,7 +1047,10 @@ class RSMarketplaceBot:
             else:
                 mm = self.is_middleman_eligible(uid, profile, self.get_member_stats(uid))
             store_url = self.primary_store_url(profile)
-            self.bot.add_view(MarketplaceProfileView(self, uid, mm, store_url))
+            has_feat = bool(profile.get("last_published_has_featured"))
+            if "last_published_has_featured" not in profile:
+                has_feat = len(self.get_featured_products(profile)) > 0
+            self.bot.add_view(MarketplaceProfileView(self, uid, mm, store_url, has_feat))
             registered += 1
         if registered:
             print(f"{Colors.GREEN}[Marketplace] Registered {registered} persistent public profile view(s){Colors.RESET}")
@@ -740,12 +1076,15 @@ class RSMarketplaceBot:
 
         member = interaction.guild.get_member(int(profile["user_id"])) if interaction.guild else None
         member = member or interaction.user
+        self.migrate_profile_fields(profile)
         stats = self.get_member_stats(int(profile["user_id"]))
         embed = self.build_profile_embed(member, profile, stats)
         mm = self.is_middleman_eligible(int(profile["user_id"]), profile, stats)
         store_url = self.primary_store_url(profile)
+        has_feat = len(self.get_featured_products(profile)) > 0
         profile["last_published_middleman"] = mm
-        view = MarketplaceProfileView(self, int(profile["user_id"]), mm, store_url)
+        profile["last_published_has_featured"] = has_feat
+        view = MarketplaceProfileView(self, int(profile["user_id"]), mm, store_url, has_feat)
 
         existing_message_id = str(profile.get("profile_message_id") or "").strip()
         message = None
@@ -773,6 +1112,144 @@ class RSMarketplaceBot:
         else:
             await interaction.response.send_message(response_text, ephemeral=True)
 
+    def _alloc_offer_id(self) -> int:
+        self.marketplace_data.setdefault("offer_id_seq", 0)
+        n = int(self.marketplace_data["offer_id_seq"]) + 1
+        self.marketplace_data["offer_id_seq"] = n
+        return n
+
+    def _append_offer_record(
+        self,
+        seller_id: int,
+        buyer_id: int,
+        title: str,
+        price: str,
+        message: str,
+        featured_index: Optional[int],
+    ) -> int:
+        oid = self._alloc_offer_id()
+        rec: Dict[str, Any] = {
+            "id": oid,
+            "seller_id": str(seller_id),
+            "buyer_id": str(buyer_id),
+            "title": title[:200],
+            "price": price[:200],
+            "message": message[:2000],
+            "featured_index": featured_index,
+            "status": "pending",
+            "created_at": utc_now_iso(),
+            "updated_at": utc_now_iso(),
+        }
+        self.marketplace_data.setdefault("offers", []).append(rec)
+        self.save_profiles_data()
+        return oid
+
+    def get_pending_offers_for_seller(self, seller_user_id: int) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for o in self.marketplace_data.get("offers") or []:
+            if str(o.get("seller_id")) != str(seller_user_id):
+                continue
+            if o.get("status") != "pending":
+                continue
+            out.append(o)
+        return sorted(out, key=lambda x: int(x.get("id", 0)), reverse=True)
+
+    def offer_summary_embed(self, offer: Dict[str, Any]) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"Offer #{offer.get('id')}",
+            description=truncate(str(offer.get("message") or ""), 2048),
+            color=self.get_embed_color(),
+        )
+        embed.add_field(name="Title", value=truncate(str(offer.get("title") or "—"), 256), inline=False)
+        embed.add_field(name="Price / terms", value=truncate(str(offer.get("price") or "—"), 256), inline=False)
+        embed.add_field(name="Buyer", value=f"<@{offer.get('buyer_id')}>", inline=True)
+        embed.add_field(name="Status", value=str(offer.get("status") or "—"), inline=True)
+        fi = offer.get("featured_index")
+        if fi is not None:
+            embed.add_field(name="Listing", value=f"Featured index {fi}", inline=True)
+        return embed
+
+    async def _try_dm_user(self, user_id: int, embed: discord.Embed) -> bool:
+        try:
+            u = await self.bot.fetch_user(user_id)
+            await u.send(embed=embed)
+            return True
+        except Exception:
+            return False
+
+    async def apply_offer_status(self, interaction: discord.Interaction, offer_id: int, new_status: str) -> None:
+        if new_status not in {"succeeded", "cancelled", "reported"}:
+            await interaction.response.send_message("Invalid status.", ephemeral=True)
+            return
+        offers = self.marketplace_data.setdefault("offers", [])
+        offer = next((x for x in offers if int(x.get("id", 0)) == int(offer_id)), None)
+        if not offer:
+            await interaction.response.send_message("Offer not found.", ephemeral=True)
+            return
+        if str(offer.get("seller_id")) != str(interaction.user.id):
+            await interaction.response.send_message("Only the seller can update this offer.", ephemeral=True)
+            return
+        if offer.get("status") != "pending":
+            await interaction.response.send_message("This offer is already closed.", ephemeral=True)
+            return
+        offer["status"] = new_status
+        offer["updated_at"] = utc_now_iso()
+        self.save_profiles_data()
+
+        buyer_id = int(offer["buyer_id"])
+        seller_id = int(offer["seller_id"])
+        labels = {
+            "succeeded": "marked as **succeeded**",
+            "cancelled": "marked as **cancelled**",
+            "reported": "marked as **reported** to staff (you should follow community rules)",
+        }
+        summary = labels.get(new_status, new_status)
+
+        e_buyer = discord.Embed(
+            title="Marketplace offer update",
+            description=f"Your offer **#{offer_id}** was {summary} by <@{seller_id}>.",
+            color=self.get_embed_color(),
+        )
+        e_buyer.add_field(name="Offer", value=truncate(str(offer.get("title")), 200), inline=False)
+
+        e_seller = discord.Embed(
+            title="Marketplace offer update",
+            description=f"You {summary} offer **#{offer_id}**. The buyer was notified.",
+            color=self.get_embed_color(),
+        )
+
+        await self._try_dm_user(buyer_id, e_buyer)
+        await self._try_dm_user(seller_id, e_seller)
+
+        if new_status == "reported":
+            log_id = int(
+                self.config.get("marketplace_offer_log_channel_id")
+                or self.config.get("marketplace_log_channel_id")
+                or 0
+            )
+            if log_id and interaction.guild:
+                ch = interaction.guild.get_channel(log_id)
+                if ch and isinstance(ch, discord.TextChannel):
+                    staff_e = discord.Embed(
+                        title="Marketplace offer reported",
+                        description=f"Offer `#{offer_id}` — seller <@{seller_id}> buyer <@{buyer_id}>",
+                        color=discord.Color.orange(),
+                    )
+                    staff_e.add_field(name="Title", value=truncate(offer.get("title", ""), 256), inline=False)
+                    staff_e.add_field(name="Message", value=truncate(offer.get("message", ""), 1024), inline=False)
+                    try:
+                        await ch.send(embed=staff_e)
+                    except Exception:
+                        pass
+
+        self.atomic_log(f"offer_{new_status}", seller_id, {"offer_id": offer_id, "buyer_id": str(buyer_id)})
+
+        await interaction.response.edit_message(
+            content=f"Offer **#{offer_id}** updated: **{new_status}**. DMs sent where possible.",
+            embed=None,
+            view=None,
+        )
+
     async def handle_offer_submission(
         self,
         interaction: discord.Interaction,
@@ -780,6 +1257,7 @@ class RSMarketplaceBot:
         title: str,
         price: str,
         message: str,
+        featured_index: Optional[int] = None,
     ) -> None:
         if interaction.user.id == target_user_id:
             await interaction.response.send_message("You cannot send an offer to yourself.", ephemeral=True)
@@ -806,27 +1284,43 @@ class RSMarketplaceBot:
 
         disclaimer = self.config.get("marketplace_offer_disclaimer", self.default_marketplace_config["marketplace_offer_disclaimer"])
         disclaimer_on = bool(self.config.get("marketplace_offer_dm_disclaimer_enabled", True))
+        oid = self._append_offer_record(
+            target_user_id,
+            interaction.user.id,
+            title,
+            price,
+            message,
+            featured_index,
+        )
         embed = discord.Embed(
             title="New Marketplace Offer",
             color=self.get_embed_color(),
-            timestamp=datetime.now(timezone.utc),
         )
+        embed.add_field(name="Offer #", value=f"`{oid}` — use `/rsmarketviewoffers` to update status", inline=False)
         embed.add_field(name="From", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
         embed.add_field(name="Offer Title", value=truncate(title, 80), inline=False)
         embed.add_field(name="Offer / Price", value=truncate(price, 80), inline=False)
         embed.add_field(name="Message", value=truncate(message, 500), inline=False)
+        if featured_index is not None:
+            embed.add_field(name="Listing", value=f"Featured slot #{featured_index + 1}", inline=True)
         if disclaimer_on:
             embed.add_field(name="Warning", value=truncate(disclaimer, 1024), inline=False)
         embed.set_footer(text="Reply directly to the member in DMs if you want to continue.")
 
         try:
             await target.send(embed=embed)
-            self.atomic_log("offer_sent", target_user_id, {"from_user_id": str(interaction.user.id)})
-            await self._log_offer_to_staff_channel(interaction, target_user_id, title, price, message, ok=True)
-            await interaction.response.send_message("Offer sent to that member's DMs.", ephemeral=True)
+            self.atomic_log("offer_sent", target_user_id, {"from_user_id": str(interaction.user.id), "offer_id": oid})
+            await self._log_offer_to_staff_channel(interaction, target_user_id, title, price, message, ok=True, offer_id=oid)
+            await interaction.response.send_message(
+                f"Offer sent. Tracking **#{oid}** — manage it anytime with `/rsmarketviewoffers` (seller) or keep this ref for your records.",
+                ephemeral=True,
+            )
         except discord.Forbidden:
-            self.atomic_log("offer_dm_failed", target_user_id, {"from_user_id": str(interaction.user.id)})
-            await self._log_offer_to_staff_channel(interaction, target_user_id, title, price, message, ok=False)
+            offers_list = self.marketplace_data.setdefault("offers", [])
+            self.marketplace_data["offers"] = [x for x in offers_list if int(x.get("id", 0)) != oid]
+            self.save_profiles_data()
+            self.atomic_log("offer_dm_failed", target_user_id, {"from_user_id": str(interaction.user.id), "offer_id": oid})
+            await self._log_offer_to_staff_channel(interaction, target_user_id, title, price, message, ok=False, offer_id=oid)
             await interaction.response.send_message("That member has DMs disabled or blocked. Offer could not be delivered.", ephemeral=True)
 
     async def handle_middleman_request(self, interaction: discord.Interaction, target_user_id: int) -> None:
@@ -864,6 +1358,7 @@ class RSMarketplaceBot:
         price: str,
         message: str,
         ok: bool,
+        offer_id: Optional[int] = None,
     ) -> None:
         log_id = int(
             self.config.get("marketplace_offer_log_channel_id")
@@ -880,6 +1375,8 @@ class RSMarketplaceBot:
             color=self.get_embed_color(),
             timestamp=datetime.now(timezone.utc),
         )
+        if offer_id is not None:
+            log_embed.add_field(name="Offer #", value=str(offer_id), inline=False)
         log_embed.add_field(name="From", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
         log_embed.add_field(name="To user id", value=str(target_user_id), inline=False)
         log_embed.add_field(name="Title", value=truncate(title, 80), inline=False)
@@ -969,8 +1466,13 @@ class RSMarketplaceBot:
             if not profile:
                 await interaction.response.send_message("That member has not created a marketplace profile yet.", ephemeral=True)
                 return
+            member: discord.abc.User = user
+            if interaction.guild:
+                m = interaction.guild.get_member(user.id)
+                if m:
+                    member = m
             stats = self.get_member_stats(user.id)
-            embed = self.build_profile_embed(user, profile, stats)
+            embed = self.build_profile_embed(member, profile, stats)
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
         @self.bot.tree.command(name="rsmarketsearch", description="Search marketplace profiles by keyword")
@@ -983,6 +1485,12 @@ class RSMarketplaceBot:
             matches: List[str] = []
             for user_id, profile in (self.marketplace_data.get("profiles", {}) or {}).items():
                 searchable = [profile.get("bio", "")]
+                self.migrate_profile_fields(profile)
+                for fp in profile.get("featured_products") or []:
+                    if isinstance(fp, dict):
+                        searchable.extend(
+                            [str(fp.get("title", "")), str(fp.get("note", "")), str(fp.get("price", ""))]
+                        )
                 featured = profile.get("featured_product", {}) or {}
                 searchable.append(featured.get("title", ""))
                 interests = profile.get("interests", {}) or {}
@@ -997,6 +1505,29 @@ class RSMarketplaceBot:
                 await interaction.response.send_message("No marketplace profiles matched that keyword.", ephemeral=True)
                 return
             await interaction.response.send_message("\n".join(matches), ephemeral=True)
+
+        @self.bot.tree.command(
+            name="rsmarketviewoffers",
+            description="View pending marketplace offers you received (as seller) and update their status",
+        )
+        async def rsmarketviewoffers(interaction: discord.Interaction) -> None:
+            pending = self.get_pending_offers_for_seller(interaction.user.id)
+            if not pending:
+                await interaction.response.send_message(
+                    "You have no **pending** marketplace offers. (Only the profile owner sees offers sent to them.)",
+                    ephemeral=True,
+                )
+                return
+            embed = discord.Embed(
+                title="Your pending marketplace offers",
+                description=f"You have **{len(pending)}** pending offer(s). Choose one in the menu, then pick **Succeeded**, **Cancelled**, or **Report**.",
+                color=self.get_embed_color(),
+            )
+            await interaction.response.send_message(
+                embed=embed,
+                view=SellerOffersHubView(self, interaction.user.id, pending),
+                ephemeral=True,
+            )
 
         @self.bot.command(name="marketcleanup")
         @commands.has_permissions(manage_messages=True)

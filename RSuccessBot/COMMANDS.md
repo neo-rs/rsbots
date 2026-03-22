@@ -106,6 +106,14 @@ RSSuccessBot manages the success points system for Reselling Secrets. Members ea
 - **Admin Only**: No
 - **Returns**: Ephemeral list of matching member mentions (up to 20)
 
+#### `/rsmarketviewoffers`
+- **Description**: List **pending** marketplace offers sent **to you** (you are the profile owner / seller). Mark an offer succeeded, cancelled, or reported; both parties get a DM when you choose an outcome (report also posts to the marketplace offer log channel if configured).
+- **Aliases**: None
+- **Parameters**: None
+- **Usage**: `/rsmarketviewoffers`
+- **Admin Only**: No
+- **Returns**: Ephemeral menu to pick an offer, then action buttons
+
 ### Configuration Commands (Admin)
 
 #### `!status`
@@ -289,9 +297,9 @@ RSSuccessBot manages the success points system for Reselling Secrets. Members ea
 
 ## Command Summary
 
-- **Total Commands**: 32 (25 prefix + 7 slash)
+- **Total Commands**: 33 (25 prefix + 8 slash)
 - **Admin Commands**: 25 (all prefix commands)
-- **Public Commands**: 7 (all slash commands)
+- **Public Commands**: 8 (all slash commands)
 - **Commands with Aliases**: 4
 - **Command Prefix**: `!` for prefix commands, `/` for slash commands
 
