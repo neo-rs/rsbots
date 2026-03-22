@@ -602,9 +602,12 @@ def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
     Load a Mavely hub URL in Chromium with the cookie-refresher persistent profile.
     When aiohttp/curl only see a Cloudflare challenge, this often returns real HTML/__NEXT_DATA__.
     """
+    global _mavely_playwright_last_error
+    _mavely_playwright_last_error = ""
     try:
         from playwright.sync_api import sync_playwright
-    except Exception:
+    except Exception as ex:
+        _mavely_playwright_last_error = "import: %s" % (ex,)
         return ""
     u = (url or "").strip()
     if not u.startswith("http"):
@@ -674,9 +677,12 @@ def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
                 return page.content() or ""
             finally:
                 ctx.close()
-    except Exception:
+    except Exception as ex:
+        _mavely_playwright_last_error = "launch/run: %s" % (ex,)
         return ""
 
+
+_mavely_playwright_last_error: str = ""
 
 _playwright_mavely_lock: Optional[asyncio.Lock] = None
 
@@ -1914,10 +1920,15 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                             % (_aff_dbg_clip(candidate, 72), len(pw_html)),
                                         )
                                     elif need_pw and affiliate_rewrite_debug_verbose_on(cfg):
+                                        hint = (
+                                            (" (%s)" % _aff_dbg_clip(_mavely_playwright_last_error, 140))
+                                            if (_mavely_playwright_last_error or "").strip()
+                                            else ""
+                                        )
                                         _aff_dbg_verbose(
                                             cfg,
-                                            "  html_unwrap playwright %r -> no usable html (empty or no extract)"
-                                            % (_aff_dbg_clip(candidate, 72),),
+                                            "  html_unwrap playwright %r -> no usable html (empty or no extract)%s"
+                                            % (_aff_dbg_clip(candidate, 72), hint),
                                         )
                             out = _first_production_outbound_from_hub_html(txt)
                             if not out:
