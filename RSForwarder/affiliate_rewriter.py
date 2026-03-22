@@ -597,6 +597,9 @@ def mavely_bridge_playwright_startup_hint() -> str:
     return f"Mavely bridge: Playwright fallback ready (profile={prof})"
 
 
+_mavely_playwright_last_error: str = ""
+
+
 def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
     """
     Load a Mavely hub URL in Chromium with the cookie-refresher persistent profile.
@@ -674,6 +677,36 @@ def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
                         page.wait_for_timeout(500)
                     except Exception:
                         break
+                # Some hubs only navigate after a real click (headless may not auto-redirect).
+                try:
+                    if _url_is_mavely_bridge_surface((page.url or "").strip()):
+                        for js in (
+                            "() => { const a = document.querySelector('a[href*=\"walmart.com\"]'); if (a) { a.click(); return 1; } return 0; }",
+                            "() => { const a = document.querySelector('a[href*=\"amazon.\"]'); if (a) { a.click(); return 1; } return 0; }",
+                            "() => { const a = document.querySelector('a[href*=\"tools.woot.com\"]'); if (a) { a.click(); return 1; } return 0; }",
+                        ):
+                            try:
+                                if int(page.evaluate(js) or 0):
+                                    page.wait_for_timeout(3500)
+                            except Exception:
+                                pass
+                        for _ in range(24):
+                            try:
+                                cur = (page.url or "").strip()
+                            except Exception:
+                                cur = ""
+                            if cur.startswith("http") and (not _url_is_mavely_bridge_surface(cur)):
+                                esc = _html.escape(cur, quote=True)
+                                return (
+                                    '<!DOCTYPE html><html><body>'
+                                    f'<a href="{esc}">outbound</a></body></html>'
+                                )
+                            try:
+                                page.wait_for_timeout(500)
+                            except Exception:
+                                break
+                except Exception:
+                    pass
                 return page.content() or ""
             finally:
                 ctx.close()
@@ -681,8 +714,6 @@ def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
         _mavely_playwright_last_error = "launch/run: %s" % (ex,)
         return ""
 
-
-_mavely_playwright_last_error: str = ""
 
 _playwright_mavely_lock: Optional[asyncio.Lock] = None
 
@@ -1909,27 +1940,27 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                             candidate,
                                             int(hub_html_timeout_s),
                                         )
-                                    if pw_html and (
-                                        "__NEXT_DATA__" in pw_html
-                                        or _extract_first_outbound_url_from_html(pw_html)
-                                    ):
+                                    if pw_html:
                                         txt = pw_html
-                                        _aff_dbg_verbose(
-                                            cfg,
-                                            "  html_unwrap playwright %r -> len=%s"
-                                            % (_aff_dbg_clip(candidate, 72), len(pw_html)),
-                                        )
-                                    elif need_pw and affiliate_rewrite_debug_verbose_on(cfg):
-                                        hint = (
-                                            (" (%s)" % _aff_dbg_clip(_mavely_playwright_last_error, 140))
-                                            if (_mavely_playwright_last_error or "").strip()
-                                            else ""
-                                        )
-                                        _aff_dbg_verbose(
-                                            cfg,
-                                            "  html_unwrap playwright %r -> no usable html (empty or no extract)%s"
-                                            % (_aff_dbg_clip(candidate, 72), hint),
-                                        )
+                                        if "__NEXT_DATA__" in pw_html or _extract_first_outbound_url_from_html(
+                                            pw_html
+                                        ):
+                                            _aff_dbg_verbose(
+                                                cfg,
+                                                "  html_unwrap playwright %r -> len=%s"
+                                                % (_aff_dbg_clip(candidate, 72), len(pw_html)),
+                                            )
+                                        elif affiliate_rewrite_debug_verbose_on(cfg):
+                                            hint = (
+                                                (" (%s)" % _aff_dbg_clip(_mavely_playwright_last_error, 140))
+                                                if (_mavely_playwright_last_error or "").strip()
+                                                else ""
+                                            )
+                                            _aff_dbg_verbose(
+                                                cfg,
+                                                "  html_unwrap playwright %r -> len=%s (no __NEXT_DATA__/extract yet)%s"
+                                                % (_aff_dbg_clip(candidate, 72), len(pw_html), hint),
+                                            )
                             out = _first_production_outbound_from_hub_html(txt)
                             if not out:
                                 break
