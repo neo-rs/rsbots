@@ -600,6 +600,24 @@ def mavely_bridge_playwright_startup_hint() -> str:
 _mavely_playwright_last_error: str = ""
 
 
+def _mavely_playwright_nav_extra_headers(url: str) -> Dict[str, str]:
+    """
+    Extra HTTP headers for Playwright navigations to Mavely hubs.
+
+    Default is **empty**: persistent Chromium already has cookies + realistic client hints
+    in the profile; forcing MAVELY_COOKIES / MAVELY_USER_AGENT / Sec-Fetch-* from aiohttp
+    can invalidate cf_clearance or look unlike a real top-level navigation.
+
+    Set MAVELY_PLAYWRIGHT_MERGE_HUB_HEADERS=1 to restore the old aiohttp-matching set
+    (User-Agent, Accept, Accept-Language, Cookie, Referer) for debugging.
+    """
+    raw = (os.getenv("MAVELY_PLAYWRIGHT_MERGE_HUB_HEADERS", "") or "").strip().lower()
+    if raw not in {"1", "true", "yes", "y", "on"}:
+        return {}
+    h = _html_fetch_headers_for_hub(url)
+    return {k: h[k] for k in ("User-Agent", "Accept", "Accept-Language", "Cookie", "Referer") if h.get(k)}
+
+
 def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
     """
     Load a Mavely hub URL in Chromium with the cookie-refresher persistent profile.
@@ -641,10 +659,8 @@ def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
             )
             try:
                 page = ctx.new_page()
-                # Match aiohttp hub fetches (Cookie + browser-ish headers); headless Chromium otherwise often gets a block shell.
                 try:
-                    _ph = _html_fetch_headers_for_hub(u)
-                    _extra = {k: _ph[k] for k in ("User-Agent", "Accept", "Accept-Language", "Cookie", "Referer") if _ph.get(k)}
+                    _extra = _mavely_playwright_nav_extra_headers(u)
                     if _extra:
                         page.set_extra_http_headers(_extra)
                 except Exception:
@@ -655,13 +671,13 @@ def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
                     )
                 except Exception:
                     pass
-                page.goto(u, wait_until="domcontentloaded", timeout=t_ms)
+                page.goto(u, wait_until="load", timeout=t_ms)
                 try:
-                    page.wait_for_load_state("load", timeout=min(20_000, max(5_000, t_ms // 2)))
+                    page.wait_for_load_state("load", timeout=min(25_000, max(5_000, t_ms // 2)))
                 except Exception:
                     pass
                 try:
-                    page.wait_for_timeout(2000)
+                    page.wait_for_timeout(3500)
                 except Exception:
                     pass
                 # Hubs often client-navigate to Walmart/Amazon after hydration (same as clicking the short link in a browser).
