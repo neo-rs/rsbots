@@ -1224,7 +1224,7 @@ def _extract_first_outbound_url_from_html(html: str) -> Optional[str]:
         r"https?://saveyourdeals\.com/[A-Za-z0-9]+",
         r"https?://(?:www\.)?dealsabove\.com/[^\s\"'<>]+",
         r"https?://(?:www\.)?walmart\.com/[^\s\"'<>]+",
-        r"https?://(?:www\.)?woot\.com/[^\s\"'<>]+",
+        r"https?://(?:www\.|tools\.)woot\.com/[^\s\"'<>]+",
         r"https?://(?:www\.)?samsclub\.com/[^\s\"'<>]+",
         r"https?://(?:www\.)?costco\.com/[^\s\"'<>]+",
         r"https?://(?:www\.)?kohls\.com/[^\s\"'<>]+",
@@ -1674,16 +1674,23 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
     expand_enabled = _bool_or_default((cfg or {}).get("affiliate_expand_redirects"), True)
     max_redirects = int(_cfg_or_env_int(cfg, "affiliate_max_redirects", "AUTO_AFFILIATE_MAX_REDIRECTS") or 8)
     timeout_s = float(_cfg_or_env_int(cfg, "affiliate_expand_timeout_s", "AUTO_AFFILIATE_EXPAND_TIMEOUT_S") or 8)
+    # Hub HTML (Mavely bridge, deal sites) often needs more time than redirect HEAD/GET; Oracle was stuck at 8s.
+    _hub_ht = _cfg_or_env_int(cfg, "affiliate_hub_html_timeout_s", "AUTO_AFFILIATE_HUB_HTML_TIMEOUT_S")
+    if _hub_ht is not None and int(_hub_ht) > 0:
+        hub_html_timeout_s = float(min(int(_hub_ht), 90))
+    else:
+        hub_html_timeout_s = min(max(timeout_s, 22.0), 90.0)
 
     if affiliate_rewrite_debug_on(cfg) and affiliate_rewrite_debug_verbose_on(cfg):
         tag = _cfg_or_env_str(cfg, "amazon_associate_tag", "AMAZON_ASSOCIATE_TAG")
         _aff_dbg_verbose(
             cfg,
-            "compute_affiliate_rewrites: candidates=%d expand_redirects=%s timeout_s=%.1f max_redirects=%d skip_domain_rules=%d amazon_tag_configured=%s"
+            "compute_affiliate_rewrites: candidates=%d expand_redirects=%s timeout_s=%.1f hub_html_timeout_s=%.1f max_redirects=%d skip_domain_rules=%d amazon_tag_configured=%s"
             % (
                 len(candidates),
                 expand_enabled,
                 timeout_s,
+                hub_html_timeout_s,
                 max_redirects,
                 len(skip_domains),
                 bool((tag or "").strip()),
@@ -1793,19 +1800,24 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                             async with session.get(
                                 candidate,
                                 headers=_hub_headers,
-                                timeout=aiohttp.ClientTimeout(total=float(timeout_s)),
+                                timeout=aiohttp.ClientTimeout(total=float(hub_html_timeout_s)),
                             ) as resp:
                                 status = int(resp.status or 0)
                                 txt = await resp.text(errors="ignore")
+                            mv_hub = "mavelyinfluencer.com" in host or "mavely.app.link" in host
                             # Cloudflare often returns 403 to Python/aiohttp even with Mavely cookies; try curl TLS stack.
-                            if (
-                                (status >= 400 or "__NEXT_DATA__" not in (txt or ""))
-                                and ("mavelyinfluencer.com" in host or "mavely.app.link" in host)
-                            ):
+                            if mv_hub and (status >= 400 or "__NEXT_DATA__" not in (txt or "")):
                                 ccode, cbody = await asyncio.to_thread(
-                                    _fetch_html_via_curl, candidate, _hub_headers, int(timeout_s)
+                                    _fetch_html_via_curl, candidate, _hub_headers, int(hub_html_timeout_s)
                                 )
                                 if cbody and ("__NEXT_DATA__" in cbody or _extract_first_outbound_url_from_html(cbody)):
+                                    txt = cbody
+                            # 200 + __NEXT_DATA__ can still fail extraction (truncated HTML, different shape); curl sometimes differs.
+                            elif mv_hub and (not _extract_first_outbound_url_from_html(txt or "")):
+                                ccode, cbody = await asyncio.to_thread(
+                                    _fetch_html_via_curl, candidate, _hub_headers, int(hub_html_timeout_s)
+                                )
+                                if cbody and _extract_first_outbound_url_from_html(cbody):
                                     txt = cbody
                             # Real browser + same profile as mavely_cookie_refresher (cf_clearance / session).
                             if _mavely_bridge_playwright_enabled() and (
@@ -1819,7 +1831,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                         pw_html = await asyncio.to_thread(
                                             _fetch_mavely_html_via_playwright_sync,
                                             candidate,
-                                            int(timeout_s),
+                                            int(hub_html_timeout_s),
                                         )
                                     if pw_html and (
                                         "__NEXT_DATA__" in pw_html
@@ -1931,48 +1943,43 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
             # Unwrapped real merchant URL (not a Mavely bridge surface).
             if target and (not is_mavely_link(target)) and (target != raw):
                 target_for_mavely = _strip_tracking_params(target) or target
+                # Amazon: always use your associate tag (and optional Discord mask) — skip Mavely GraphQL for storefront URLs.
+                if is_amazon_like_url(target):
+                    affiliate_url = build_amazon_affiliate_url(cfg, target)
+                    if affiliate_url:
+                        raw_mask = _env_first_token("AMAZON_DISCORD_MASK_LINK", "1").lower()
+                        mask_enabled = raw_mask in {"1", "true", "yes", "y", "on"}
+                        mask_prefix = _env_first_token("AMAZON_DISCORD_MASK_PREFIX", "amzn.to") or "amzn.to"
+                        try:
+                            mask_len = int(_env_first_token("AMAZON_DISCORD_MASK_LEN", "7") or "7")
+                        except Exception:
+                            mask_len = 7
+                        if mask_enabled:
+                            rep = amazon_mask_cache.get(affiliate_url)
+                            if not rep:
+                                rep = discord_masked_link(mask_prefix, affiliate_url, slug_len=mask_len)
+                                amazon_mask_cache[affiliate_url] = rep
+                            mapped[u] = rep
+                        else:
+                            mapped[u] = affiliate_url
+                        notes[u] = "amazon affiliate (mavely.app.link unwrap)"
+                        continue
                 link, err = await mavely_create_link(cfg, target_for_mavely)
                 if link and not err and link != raw:
                     mapped[u] = link
                     notes[u] = "rewrapped mavely link"
                 else:
-                    # If Mavely auth is down, at least strip "someone else's Mavely link"
-                    # by falling back to the expanded destination. If that destination is
-                    # Amazon, we can still apply our Amazon affiliate tag without Mavely.
-                    if is_amazon_like_url(target):
-                        affiliate_url = build_amazon_affiliate_url(cfg, target)
-                        if affiliate_url:
-                            raw_mask = _env_first_token("AMAZON_DISCORD_MASK_LINK", "1").lower()
-                            mask_enabled = raw_mask in {"1", "true", "yes", "y", "on"}
-                            mask_prefix = _env_first_token("AMAZON_DISCORD_MASK_PREFIX", "amzn.to") or "amzn.to"
-                            try:
-                                mask_len = int(_env_first_token("AMAZON_DISCORD_MASK_LEN", "7") or "7")
-                            except Exception:
-                                mask_len = 7
-                            if mask_enabled:
-                                rep = amazon_mask_cache.get(affiliate_url)
-                                if not rep:
-                                    rep = discord_masked_link(mask_prefix, affiliate_url, slug_len=mask_len)
-                                    amazon_mask_cache[affiliate_url] = rep
-                                mapped[u] = rep
-                            else:
-                                mapped[u] = affiliate_url
-                            reason = _short_err(err)
-                            notes[u] = f"mavely rewrap failed ({reason}); fell back to amazon affiliate" if reason else "mavely rewrap failed; fell back to amazon affiliate"
-                        else:
-                            mapped[u] = _strip_tracking_params(target)
-                            reason = _short_err(err)
-                            if _is_mavely_unsupported(err):
-                                notes[u] = "merchant not supported by Mavely; used expanded destination"
-                            else:
-                                notes[u] = f"mavely rewrap failed ({reason}); fell back to expanded destination (stripped tracking)" if reason else "mavely rewrap failed; fell back to expanded destination (stripped tracking)"
+                    # Non-Amazon: fall back to stripped merchant URL when Mavely cannot rewrap.
+                    mapped[u] = _strip_tracking_params(target)
+                    reason = _short_err(err)
+                    if _is_mavely_unsupported(err):
+                        notes[u] = "merchant not supported by Mavely; used expanded destination"
                     else:
-                        mapped[u] = _strip_tracking_params(target)
-                        reason = _short_err(err)
-                        if _is_mavely_unsupported(err):
-                            notes[u] = "merchant not supported by Mavely; used expanded destination"
-                        else:
-                            notes[u] = f"mavely rewrap failed ({reason}); fell back to expanded destination (stripped tracking)" if reason else "mavely rewrap failed; fell back to expanded destination (stripped tracking)"
+                        notes[u] = (
+                            f"mavely rewrap failed ({reason}); fell back to expanded destination (stripped tracking)"
+                            if reason
+                            else "mavely rewrap failed; fell back to expanded destination (stripped tracking)"
+                        )
             else:
                 # No usable expansion: try short link only.
                 link, err = await mavely_create_link(cfg, raw)

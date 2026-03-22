@@ -8,6 +8,7 @@
   ],
   "brand_name": "Reselling Secrets",
   "affiliate_rewrite_enabled": true,
+  "affiliate_hub_html_timeout_s": 32,
   "affiliate_skip_domains": [
     "ebay.com",
     "stockx.com"
