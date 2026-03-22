@@ -341,7 +341,22 @@ def _mavely_bridge_host(host: str) -> bool:
     return False
 
 
+def is_mavely_app_short_link(url: str) -> bool:
+    """True only for mavely.app.link short URLs (typical Discord affiliate short links)."""
+    try:
+        host = (urlparse(url).netloc or "").lower()
+    except Exception:
+        host = ""
+    if host.startswith("www."):
+        host = host[4:]
+    return (host == "mavely.app.link") or host.endswith(".mavely.app.link")
+
+
 def is_mavely_link(url: str) -> bool:
+    """
+    True for any Mavely tracking surface (app.link short links or mavelyinfluencer.com bridge pages).
+    Use for *target* checks: if still a bridge, we must not treat it as the final merchant URL.
+    """
     try:
         host = (urlparse(url).netloc or "").lower()
     except Exception:
@@ -1158,8 +1173,9 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                 notes[u] = "marketplace skipped"
             continue
 
-        # Re-wrap existing Mavely links into YOUR Mavely link (so forwarded posts always credit you).
-        if is_mavely_link(raw):
+        # Re-wrap mavely.app.link short links into YOUR Mavely link (so forwarded posts always credit you).
+        # Other URLs (bit.ly, etc.) that expand to mavelyinfluencer.com are handled after expansion.
+        if is_mavely_app_short_link(raw):
             # Expand mavely.app.link to destination, then generate our own link for that destination.
             if target and (not is_mavely_link(target)) and (target != raw):
                 target_for_mavely = _strip_tracking_params(target) or target
@@ -1218,10 +1234,20 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                     notes[u] = f"rewrap failed ({reason})" if reason else "rewrap failed (no expanded destination)"
             continue
 
-        # Do not pass through intermediate Mavely URLs (e.g. mavelyinfluencer.com/u/...) — those credit
-        # whoever created the original link. Prefer leaving the message unchanged over substituting them.
+        # Do not pass through another creator's Mavely bridge URL. Always try YOUR link from the *original*
+        # URL in the message first (bit.ly / t.co / etc.); Mavely API often resolves those correctly.
         if is_mavely_link(target) and (target != raw) and (not is_mavely_link(raw)):
-            notes[u] = "expand landed on Mavely bridge; skipped (avoid another creator's tracking URL)"
+            link_bridge, err_bridge = await mavely_create_link(cfg, raw)
+            if link_bridge and not err_bridge and link_bridge != raw:
+                mapped[u] = link_bridge
+                notes[u] = "mavely affiliate (API from original URL; avoided bridge pass-through)"
+                continue
+            notes[u] = (
+                "expand landed on Mavely bridge; API from original failed — left URL unchanged "
+                f"({_short_err(err_bridge, 120)})"
+                if err_bridge
+                else "expand landed on Mavely bridge; API from original failed — left URL unchanged"
+            )
             continue
 
         if is_amazon_like_url(target):
@@ -1258,7 +1284,12 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
             notes[u] = "mavely affiliate"
         elif target and (target != raw):
             if is_mavely_link(target):
-                notes[u] = "mavely failed; not forwarding intermediate Mavely URL as fallback"
+                link_fb, err_fb = await mavely_create_link(cfg, raw)
+                if link_fb and not err_fb and link_fb != raw:
+                    mapped[u] = link_fb
+                    notes[u] = "mavely affiliate (API from original URL; merchant Mavely create failed)"
+                else:
+                    notes[u] = "mavely failed; not forwarding intermediate Mavely URL as fallback"
             else:
                 mapped[u] = target
                 if _is_mavely_unsupported(err):

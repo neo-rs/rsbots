@@ -614,6 +614,13 @@ Any deviation means:
 * Fix deployment or execution first.
 
 ---
+## RSForwarder Discord affiliate rewrite (Canonical)
+
+- **Single owner:** `RSForwarder/affiliate_rewriter.py` (no parallel forwarder affiliate implementation).
+- **`mavely.app.link` short links** in the message use the dedicated rewrap path: expand to merchant when possible, then `mavely_create_link`; otherwise call the API on the short link itself.
+- **`mavelyinfluencer.com` (and similar)** are **bridge/intermediate** targets after expansion, not trusted as the final “merchant” URL for pass-through. If expansion stops on a bridge, the code must try **`mavely_create_link` using the original URL from the message** (e.g. `bit.ly`, `t.co`, `mavely.app.link`) before leaving the text unchanged—never substitute another creator’s influencer URL as the replacement.
+
+---
 ## RSForwarder RS-FS Sheet Flow (Canonical)
 
 This section documents the canonical runtime behavior for the `RSForwarder` RS-FS flow and how to reason about sheet state.
