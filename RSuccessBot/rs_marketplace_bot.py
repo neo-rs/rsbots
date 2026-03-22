@@ -863,7 +863,7 @@ class MarketplaceSetupView(discord.ui.View):
 class RSMarketplaceBot:
     """Marketplace profile module for a shared Discord bot instance."""
 
-    def __init__(self, bot_instance: Optional[commands.Bot] = None):
+    def __init__(self, bot_instance: Optional[commands.Bot] = None, vouch_module: Any = None):
         self.base_path = Path(__file__).parent
         self.config_path = self.base_path / "config.json"
         self.success_points_path = self.base_path / "success_points.json"
