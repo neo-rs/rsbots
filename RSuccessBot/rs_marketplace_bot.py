@@ -1592,6 +1592,33 @@ class RSMarketplaceBot:
                 f"They should run **Publish / Refresh** from `/rsmarketplace` (or use `!marketrepublish @member`) to post a new card."
             )
 
+        @self.bot.command(name="marketlistprofiles")
+        @commands.has_permissions(manage_messages=True)
+        async def marketlistprofiles(ctx: commands.Context) -> None:
+            """List every user id stored in marketplace_profiles.json (staff diagnostic)."""
+            profiles = self.marketplace_data.get("profiles") or {}
+            if not profiles:
+                await ctx.send("No profiles in `marketplace_profiles.json`.")
+                return
+            lines: List[str] = []
+            def _uid_key(k: str) -> int:
+                try:
+                    return int(k)
+                except Exception:
+                    return 0
+
+            for uid_str in sorted(profiles.keys(), key=_uid_key):
+                p = profiles[uid_str]
+                en = p.get("enabled", True)
+                mid = bool(str(p.get("profile_message_id") or "").strip())
+                mem = ctx.guild.get_member(int(uid_str)) if ctx.guild and str(uid_str).isdigit() else None
+                who = f"{mem.display_name} ({mem})" if mem else f"not in server / ID `{uid_str}`"
+                lines.append(f"• `{uid_str}` — {who} — enabled={en} has_msg_id={mid}")
+            body = "\n".join(lines)
+            if len(body) > 1800:
+                body = body[:1800] + "\n… (truncated)"
+            await ctx.send(f"**Marketplace JSON profiles: {len(profiles)}**\n{body}")
+
         @self.bot.command(name="marketrepublish")
         @commands.has_permissions(manage_messages=True)
         async def marketrepublish(ctx: commands.Context, member: discord.Member) -> None:

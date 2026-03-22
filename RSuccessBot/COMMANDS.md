@@ -285,6 +285,14 @@ RSSuccessBot manages the success points system for Reselling Secrets. Members ea
 - **Admin Only**: Yes (requires manage_messages permission)
 - **Returns**: How many pointers were cleared and which members were affected
 
+#### `!marketlistprofiles`
+- **Description**: List every Discord user id stored in `marketplace_profiles.json` with enabled flag and whether a published message id is set (staff diagnostic)
+- **Aliases**: None
+- **Parameters**: None
+- **Usage**: `!marketlistprofiles`
+- **Admin Only**: Yes (requires manage_messages permission)
+- **Returns**: In-channel list of profiles
+
 #### `!marketrepublish`
 - **Description**: Force republish or repair a member's marketplace profile message in the marketplace channel
 - **Aliases**: None
@@ -305,8 +313,8 @@ RSSuccessBot manages the success points system for Reselling Secrets. Members ea
 
 ## Command Summary
 
-- **Total Commands**: 34 (26 prefix + 8 slash)
-- **Admin Commands**: 26 (all prefix commands)
+- **Total Commands**: 35 (27 prefix + 8 slash)
+- **Admin Commands**: 27 (all prefix commands)
 - **Public Commands**: 8 (all slash commands)
 - **Commands with Aliases**: 4
 - **Command Prefix**: `!` for prefix commands, `/` for slash commands
