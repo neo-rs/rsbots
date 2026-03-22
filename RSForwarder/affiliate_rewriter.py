@@ -349,6 +349,29 @@ def is_mavely_link(url: str) -> bool:
     return _mavely_bridge_host(host)
 
 
+def _is_cloudflare_or_cdn_error_landing(url: str) -> bool:
+    """
+    Redirect expansion (e.g. mavely.app.link) can end on Cloudflare's generic 5xx page when the
+    origin is down — not a real merchant URL. Never use this as affiliate target or pass-through.
+    """
+    try:
+        p = urlparse((url or "").strip())
+        host = (p.netloc or "").lower()
+        path = (p.path or "").lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    if "cloudflare.com" in host and (
+        "5xx" in path
+        or "error-landing" in path
+        or "/cdn-cgi/" in path
+        or path.rstrip("/").endswith("/cdn-cgi")
+    ):
+        return True
+    return False
+
+
 def is_amazon_like_url(url: str) -> bool:
     try:
         host = (urlparse(url).netloc or "").lower()
@@ -658,6 +681,8 @@ def _extract_first_outbound_url_from_html(html: str) -> Optional[str]:
         deny_hosts = {
             "howl.link",
             "howl.me",
+            "www.cloudflare.com",
+            "cloudflare.com",
             "www.googletagmanager.com",
             "googletagmanager.com",
             "google-analytics.com",
@@ -1040,12 +1065,16 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                 start_u = (resolved.get(u) or u).strip()
                 if should_expand_url(start_u):
                     final_u = await expand_url(session, start_u, timeout_s=timeout_s, max_redirects=max_redirects)
+                    # Mavely / App Links sometimes 302 to Cloudflare's generic 5xx page when origin fails.
+                    if _is_cloudflare_or_cdn_error_landing(final_u):
+                        final_u = start_u
                     resolved[u] = final_u
 
                     cand2 = unwrap_known_query_redirects(final_u)
                     if cand2:
-                        resolved[u] = cand2
-                        final_u = cand2
+                        if not _is_cloudflare_or_cdn_error_landing(cand2):
+                            resolved[u] = cand2
+                            final_u = cand2
 
                     special_html_hosts = {
                         "deals.pennyexplorer.com",
@@ -1095,11 +1124,16 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                         except Exception:
                             break
 
+                    if _is_cloudflare_or_cdn_error_landing(candidate):
+                        candidate = start_u
                     resolved[u] = candidate
 
     for u in candidates:
         raw = (normalized.get(u) or u).strip()
         target = (resolved.get(u) or raw).strip()
+        if _is_cloudflare_or_cdn_error_landing(target):
+            target = raw
+            resolved[u] = target
 
         def _short_err(s: Optional[str], n: int = 160) -> str:
             t = (s or "").replace("\r", " ").replace("\n", " ").strip()
