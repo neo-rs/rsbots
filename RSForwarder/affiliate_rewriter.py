@@ -13,6 +13,13 @@ AFFILIATE_REWRITE_DEBUG=1 (compact: one compute summary line per batch). Hop-by-
 `affiliate_rewrite_debug_verbose` or AFFILIATE_REWRITE_DEBUG_VERBOSE=1. RSForwarder attaches
 `_affiliate_compute_memo` so identical URLs across content + multiple embeds run the network/Mavely work once per message.
 
+Step timing + outcome lines (stdout, prefix [AffiliateFlow]): config `affiliate_rewrite_flow_log` or env
+AFFILIATE_REWRITE_FLOW_LOG (default on: `1`). Set to `0` to disable. Logs expand/HTML/Playwright/Mavely API phases
+with durations and short results.
+
+Default redirect + hub HTML timeouts are 5s unless overridden (`affiliate_expand_timeout_s` /
+`AUTO_AFFILIATE_EXPAND_TIMEOUT_S`, `affiliate_hub_html_timeout_s` / `AUTO_AFFILIATE_HUB_HTML_TIMEOUT_S`).
+
 Mavely short links (`mavely.app.link`) are not bit.ly-style “pure redirects”: HTTP expand often stops at
 `mavelyinfluencer.com` (bridge). Final merchant URLs are recovered here via hub HTML + optional Playwright
 (profile + cookies); `mavely_client.py` creates new links via GraphQL and does not unwrap HTML.
@@ -110,6 +117,28 @@ def _aff_dbg_verbose(cfg: Optional[dict], msg: str) -> None:
     if not affiliate_rewrite_debug_on(cfg) or not affiliate_rewrite_debug_verbose_on(cfg):
         return
     print(f"[AffiliateDebug] {msg}", flush=True)
+
+
+def affiliate_rewrite_flow_log_on(cfg: Optional[dict]) -> bool:
+    """
+    Structured phase logs ([AffiliateFlow]) with timings and outcomes.
+    Config `affiliate_rewrite_flow_log` or env AFFILIATE_REWRITE_FLOW_LOG (default `1` = on).
+    """
+    try:
+        if cfg is not None and "affiliate_rewrite_flow_log" in cfg:
+            return _bool_or_default(cfg.get("affiliate_rewrite_flow_log"), True)
+    except Exception:
+        pass
+    raw = (os.getenv("AFFILIATE_REWRITE_FLOW_LOG", "1") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    return True
+
+
+def _aff_flow(cfg: Optional[dict], msg: str) -> None:
+    if not affiliate_rewrite_flow_log_on(cfg):
+        return
+    print(f"[AffiliateFlow] {msg}", flush=True)
 
 
 def _aff_dbg_notes_summary(notes: Optional[Dict[str, str]], limit: int = 8) -> str:
@@ -638,25 +667,41 @@ def _mavely_playwright_nav_extra_headers(url: str) -> Dict[str, str]:
     return {k: h[k] for k in ("User-Agent", "Accept", "Accept-Language", "Cookie", "Referer") if h.get(k)}
 
 
-def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
+def _fetch_mavely_html_via_playwright_sync(
+    url: str, timeout_s: int, *, flow_log: bool = False, label: str = ""
+) -> str:
     """
     Load a Mavely hub URL in Chromium with the cookie-refresher persistent profile.
     When aiohttp/curl only see a Cloudflare challenge, this often returns real HTML/__NEXT_DATA__.
     """
     global _mavely_playwright_last_error
     _mavely_playwright_last_error = ""
+    t0 = time.perf_counter()
+
+    def _fl(msg: str) -> None:
+        if flow_log:
+            tag = ("[%s] " % label.strip()) if (label or "").strip() else ""
+            print("[AffiliateFlow] playwright %s%s" % (tag, msg), flush=True)
+
     try:
         from playwright.sync_api import sync_playwright
     except Exception as ex:
         _mavely_playwright_last_error = "import: %s" % (ex,)
+        _fl("aborted import_error=%s (%.2fs)" % (_aff_dbg_clip(str(ex), 80), time.perf_counter() - t0))
         return ""
     u = (url or "").strip()
     if not u.startswith("http"):
+        _fl("aborted bad_url (%.2fs)" % (time.perf_counter() - t0,))
         return ""
     prof = resolve_mavely_profile_dir()
     if prof is None:
+        _fl("aborted no_profile (%.2fs)" % (time.perf_counter() - t0,))
         return ""
-    t_ms = max(10_000, min(int(float(timeout_s) * 1000), 120_000))
+    t_ms = max(1_000, min(int(float(timeout_s) * 1000), 120_000))
+    settle_ms = min(3_500, max(200, int(t_ms * 0.18)))
+    load_wait_ms = min(25_000, max(2_000, t_ms // 2))
+    poll_budget_s = min(55.0, max(1.0, (t_ms / 1000.0) * 0.72))
+    click_poll_rounds = min(24, max(2, int(t_ms / 450)))
     launch_args = ["--disable-session-crashed-bubble", "--disable-dev-shm-usage"]
     # Headless Chromium on Ubuntu (Oracle) typically needs --no-sandbox; don't rely only on systemd env.
     _pw_nosb = (os.getenv("MAVELY_PLAYWRIGHT_NO_SANDBOX", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -669,6 +714,10 @@ def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
         )
     )
     headless = (os.getenv("MAVELY_PLAYWRIGHT_HEADLESS", "1") or "").strip().lower() not in {"0", "false", "no", "n", "off"}
+    _fl(
+        "start url=%r timeout_s=%s t_ms=%s settle_ms=%s poll_budget_s=%.2f"
+        % (_aff_dbg_clip(u, 96), timeout_s, t_ms, settle_ms, poll_budget_s)
+    )
     try:
         with sync_playwright() as p:
             ctx = p.chromium.launch_persistent_context(
@@ -692,17 +741,17 @@ def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
                 except Exception:
                     pass
                 page.goto(u, wait_until="load", timeout=t_ms)
+                _fl("after goto url_bar=%r (%.2fs)" % (_aff_dbg_clip((page.url or "").strip(), 88), time.perf_counter() - t0))
                 try:
-                    page.wait_for_load_state("load", timeout=min(25_000, max(5_000, t_ms // 2)))
+                    page.wait_for_load_state("load", timeout=load_wait_ms)
                 except Exception:
                     pass
                 try:
-                    page.wait_for_timeout(3500)
+                    page.wait_for_timeout(settle_ms)
                 except Exception:
                     pass
                 # Hubs often client-navigate to Walmart/Amazon after hydration (same as clicking the short link in a browser).
                 # aiohttp/curl only see the bridge HTML; wait until the address bar leaves Mavely or timeout.
-                poll_budget_s = min(55.0, max(12.0, (t_ms / 1000.0) - 5.0))
                 deadline = time.time() + poll_budget_s
                 while time.time() < deadline:
                     try:
@@ -711,6 +760,10 @@ def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
                         cur = ""
                     if cur.startswith("http") and (not _url_is_mavely_bridge_surface(cur)):
                         esc = _html.escape(cur, quote=True)
+                        _fl(
+                            "poll left_mavely url=%r (%.2fs)"
+                            % (_aff_dbg_clip(cur, 88), time.perf_counter() - t0)
+                        )
                         return (
                             '<!DOCTYPE html><html><body>'
                             f'<a href="{esc}">outbound</a></body></html>'
@@ -723,6 +776,10 @@ def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
                             and (not _url_is_mavely_bridge_surface(loc))
                         ):
                             esc = _html.escape(loc.strip(), quote=True)
+                            _fl(
+                                "poll left_mavely loc_eval url=%r (%.2fs)"
+                                % (_aff_dbg_clip(loc.strip(), 88), time.perf_counter() - t0)
+                            )
                             return (
                                 '<!DOCTYPE html><html><body>'
                                 f'<a href="{esc}">outbound</a></body></html>'
@@ -743,16 +800,20 @@ def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
                         ):
                             try:
                                 if int(page.evaluate(js) or 0):
-                                    page.wait_for_timeout(3500)
+                                    page.wait_for_timeout(min(3_500, max(400, settle_ms * 2)))
                             except Exception:
                                 pass
-                        for _ in range(24):
+                        for _ in range(click_poll_rounds):
                             try:
                                 cur = (page.url or "").strip()
                             except Exception:
                                 cur = ""
                             if cur.startswith("http") and (not _url_is_mavely_bridge_surface(cur)):
                                 esc = _html.escape(cur, quote=True)
+                                _fl(
+                                    "click_poll left_mavely url=%r (%.2fs)"
+                                    % (_aff_dbg_clip(cur, 88), time.perf_counter() - t0)
+                                )
                                 return (
                                     '<!DOCTYPE html><html><body>'
                                     f'<a href="{esc}">outbound</a></body></html>'
@@ -763,11 +824,37 @@ def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
                                 break
                 except Exception:
                     pass
-                return page.content() or ""
+                html_out = page.content() or ""
+                cur_final = ""
+                try:
+                    cur_final = (page.url or "").strip()
+                except Exception:
+                    pass
+                bridge_tail = (
+                    _url_is_mavely_bridge_surface(cur_final)
+                    if cur_final.startswith("http")
+                    else False
+                )
+                _fl(
+                    "done url_bar=%r html_len=%s still_mavely_bridge=%s (%.2fs)%s"
+                    % (
+                        _aff_dbg_clip(cur_final, 88),
+                        len(html_out),
+                        bridge_tail,
+                        time.perf_counter() - t0,
+                        (
+                            (" err=%s" % _aff_dbg_clip(_mavely_playwright_last_error, 100))
+                            if (_mavely_playwright_last_error or "").strip()
+                            else ""
+                        ),
+                    )
+                )
+                return html_out
             finally:
                 ctx.close()
     except Exception as ex:
         _mavely_playwright_last_error = "launch/run: %s" % (ex,)
+        _fl("exception %s (%.2fs)" % (_aff_dbg_clip(str(ex), 120), time.perf_counter() - t0))
         return ""
 
 
@@ -1645,6 +1732,7 @@ def _apply_env_from_cfg(cfg: dict) -> None:
 async def mavely_create_link(cfg: dict, url: str) -> Tuple[Optional[str], Optional[str]]:
     MavelyClient = _import_mavely_client()
     if MavelyClient is None:
+        _aff_flow(cfg, "mavely_graphql create_link aborted: client not available")
         return None, "Mavely client not available."
 
     _apply_env_from_cfg(cfg)
@@ -1657,6 +1745,7 @@ async def mavely_create_link(cfg: dict, url: str) -> Tuple[Optional[str], Option
     auth_token = _cfg_or_env_str(cfg, "mavely_auth_token", "MAVELY_AUTH_TOKEN")
     graphql_endpoint = _cfg_or_env_str(cfg, "mavely_graphql_endpoint", "MAVELY_GRAPHQL_ENDPOINT")
     if not session_token and not auth_token:
+        _aff_flow(cfg, "mavely_graphql create_link aborted: no MAVELY_COOKIES / MAVELY_AUTH_TOKEN")
         return None, "Missing MAVELY cookies/session (or MAVELY_AUTH_TOKEN)."
 
     timeout_s = int(_cfg_or_env_int(cfg, "mavely_request_timeout", "REQUEST_TIMEOUT") or 20)
@@ -1692,7 +1781,20 @@ async def mavely_create_link(cfg: dict, url: str) -> Tuple[Optional[str], Option
         status = int(getattr(res, "status_code", 0) or 0)
         return link, str(err), status
 
+    t_ml0 = time.perf_counter()
+    _aff_flow(cfg, "mavely_graphql create_link start input=%r" % _aff_dbg_clip((url or "").strip(), 100))
     link, err, status = await asyncio.to_thread(_do)
+    _aff_flow(
+        cfg,
+        "mavely_graphql create_link try1 (%.2fs) ok=%s status=%s link_out=%r err=%r"
+        % (
+            time.perf_counter() - t_ml0,
+            bool(link),
+            status,
+            _aff_dbg_clip(link or "", 88),
+            _aff_dbg_clip(err, 140),
+        ),
+    )
     if link:
         return link, None
 
@@ -1700,7 +1802,20 @@ async def mavely_create_link(cfg: dict, url: str) -> Tuple[Optional[str], Option
     auth_fail = ("token expired" in err_l) or ("not logged in" in err_l) or ("unauthorized" in err_l) or (status == 401)
     if auth_fail:
         if await _maybe_refresh_mavely_cookies(reason=err or "auth"):
+            t_r0 = time.perf_counter()
+            _aff_flow(cfg, "mavely_graphql create_link retry after cookie refresh")
             link2, err2, _status2 = await asyncio.to_thread(_do)
+            _aff_flow(
+                cfg,
+                "mavely_graphql create_link try2 (%.2fs) ok=%s status=%s link_out=%r err=%r"
+                % (
+                    time.perf_counter() - t_r0,
+                    bool(link2),
+                    _status2,
+                    _aff_dbg_clip(link2 or "", 88),
+                    _aff_dbg_clip(err2, 140),
+                ),
+            )
             if link2:
                 return link2, None
             err = err2 or err
@@ -1710,6 +1825,11 @@ async def mavely_create_link(cfg: dict, url: str) -> Tuple[Optional[str], Option
         hint = " (need server login: run RSForwarder/mavely_cookie_refresher.py --interactive on Oracle once)"
     else:
         hint = ""
+    _aff_flow(
+        cfg,
+        "mavely_graphql create_link final_fail (%.2fs) status=%s err=%r"
+        % (time.perf_counter() - t_ml0, status, _aff_dbg_clip(f"{err} (status={status}){hint}", 160)),
+    )
     return None, f"{err} (status={status}){hint}"
 
 
@@ -1768,6 +1888,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
     - mapped: original url -> replacement text
     - notes: original url -> short reason
     """
+    _t_batch0 = time.perf_counter()
     unique = list(dict.fromkeys([(u or "").strip() for u in (urls or []) if (u or "").strip()]))
     if not unique:
         return {}, {}
@@ -1779,6 +1900,11 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
         if hit is not None:
             if affiliate_rewrite_debug_on(cfg) and affiliate_rewrite_debug_verbose_on(cfg):
                 _aff_dbg_verbose(cfg, "compute: memo hit %d url(s) (skipped duplicate work)" % len(unique))
+            _aff_flow(
+                cfg,
+                "batch_memo_hit urls=%d (%.3fs) — skipped network"
+                % (len(unique), time.perf_counter() - _t_batch0),
+            )
             return dict(hit[0]), dict(hit[1])
 
     mapped: Dict[str, str] = {}
@@ -1837,13 +1963,13 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
 
     expand_enabled = _bool_or_default((cfg or {}).get("affiliate_expand_redirects"), True)
     max_redirects = int(_cfg_or_env_int(cfg, "affiliate_max_redirects", "AUTO_AFFILIATE_MAX_REDIRECTS") or 8)
-    timeout_s = float(_cfg_or_env_int(cfg, "affiliate_expand_timeout_s", "AUTO_AFFILIATE_EXPAND_TIMEOUT_S") or 8)
-    # Hub HTML (Mavely bridge, deal sites) often needs more time than redirect HEAD/GET; Oracle was stuck at 8s.
+    timeout_s = float(_cfg_or_env_int(cfg, "affiliate_expand_timeout_s", "AUTO_AFFILIATE_EXPAND_TIMEOUT_S") or 5)
+    # Hub HTML (Mavely bridge, deal sites): default matches expand timeout (5s); raise via config/env if needed.
     _hub_ht = _cfg_or_env_int(cfg, "affiliate_hub_html_timeout_s", "AUTO_AFFILIATE_HUB_HTML_TIMEOUT_S")
     if _hub_ht is not None and int(_hub_ht) > 0:
         hub_html_timeout_s = float(min(int(_hub_ht), 90))
     else:
-        hub_html_timeout_s = min(max(timeout_s, 22.0), 90.0)
+        hub_html_timeout_s = min(max(timeout_s, 5.0), 90.0)
 
     if affiliate_rewrite_debug_on(cfg) and affiliate_rewrite_debug_verbose_on(cfg):
         tag = _cfg_or_env_str(cfg, "amazon_associate_tag", "AMAZON_ASSOCIATE_TAG")
@@ -1860,6 +1986,13 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                 bool((tag or "").strip()),
             ),
         )
+
+    flow_on = affiliate_rewrite_flow_log_on(cfg)
+    _aff_flow(
+        cfg,
+        "batch_start candidates=%d expand_enabled=%s timeout_s=%.1f hub_html_timeout_s=%.1f max_redirects=%d"
+        % (len(candidates), expand_enabled, timeout_s, hub_html_timeout_s, max_redirects),
+    )
 
     resolved: Dict[str, str] = {u: normalized.get(u) or u for u in candidates}
 
@@ -1883,6 +2016,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                     [start_u] if affiliate_rewrite_debug_on(cfg) and affiliate_rewrite_debug_verbose_on(cfg) else None
                 )
                 if should_expand_url(start_u):
+                    t_expand0 = time.perf_counter()
                     final_u = await expand_url(session, start_u, timeout_s=timeout_s, max_redirects=max_redirects)
                     # Mavely / App Links sometimes 302 to Cloudflare's generic 5xx page when origin fails.
                     if _is_cloudflare_or_cdn_error_landing(final_u):
@@ -1907,6 +2041,12 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                         if dbg_chain is not None:
                             dbg_chain.append(final_u)
                     resolved[u] = final_u
+                    if flow_on:
+                        _aff_flow(
+                            cfg,
+                            "expand_redirects %r -> %r (%.2fs)"
+                            % (_aff_dbg_clip(start_u, 88), _aff_dbg_clip(final_u, 88), time.perf_counter() - t_expand0),
+                        )
                     if dbg_chain is not None and len(dbg_chain) > 1:
                         _aff_dbg_verbose(
                             cfg,
@@ -1925,6 +2065,11 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                         if not _is_cloudflare_or_cdn_error_landing(cand2):
                             resolved[u] = cand2
                             final_u = cand2
+                            if flow_on:
+                                _aff_flow(
+                                    cfg,
+                                    "query_unwrap_after_expand %r -> %r" % (_aff_dbg_clip(u, 72), _aff_dbg_clip(final_u, 88)),
+                                )
 
                     special_html_hosts = {
                         "deals.pennyexplorer.com",
@@ -1984,6 +2129,8 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                     _fetch_mavely_html_via_playwright_sync,
                                     mavely_short_src,
                                     int(hub_html_timeout_s),
+                                    flow_log=flow_on,
+                                    label="short-first",
                                 )
                             out_sf = (
                                 _first_production_outbound_from_hub_html(pw_short_first)
@@ -2021,6 +2168,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                             break
                         try:
                             _hub_headers = _html_fetch_headers_for_hub(candidate)
+                            t_hub0 = time.perf_counter()
                             async with session.get(
                                 candidate,
                                 headers=_hub_headers,
@@ -2028,6 +2176,18 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                             ) as resp:
                                 status = int(resp.status or 0)
                                 txt = await resp.text(errors="ignore")
+                            if flow_on:
+                                _aff_flow(
+                                    cfg,
+                                    "hub_aiohttp GET host=%r status=%s len=%s (%.2fs) url=%r"
+                                    % (
+                                        _aff_dbg_clip(host, 48),
+                                        status,
+                                        len(txt or ""),
+                                        time.perf_counter() - t_hub0,
+                                        _aff_dbg_clip(candidate, 88),
+                                    ),
+                                )
                             mv_hub = "mavelyinfluencer.com" in host or "mavely.app.link" in host
                             # Cloudflare often returns 403 to Python/aiohttp even with Mavely cookies; try curl TLS stack.
                             if mv_hub and (status >= 400 or "__NEXT_DATA__" not in (txt or "")):
@@ -2068,6 +2228,8 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                             _fetch_mavely_html_via_playwright_sync,
                                             candidate,
                                             int(hub_html_timeout_s),
+                                            flow_log=flow_on,
+                                            label="bridge",
                                         )
                                     if pw_html:
                                         txt = pw_html
@@ -2105,6 +2267,8 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                         _fetch_mavely_html_via_playwright_sync,
                                         short_u,
                                         int(hub_html_timeout_s),
+                                        flow_log=flow_on,
+                                        label="short-fallback",
                                     )
                                 if pw_short:
                                     txt = pw_short
@@ -2132,12 +2296,28 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                 "  html_unwrap %r: host=%r -> %r"
                                 % (_aff_dbg_clip(u, 72), _aff_dbg_clip(host, 48), _aff_dbg_clip(candidate, 88)),
                             )
+                            if flow_on:
+                                _aff_flow(
+                                    cfg,
+                                    "html_unwrap step original=%r host=%r next_candidate=%r"
+                                    % (
+                                        _aff_dbg_clip(u, 72),
+                                        _aff_dbg_clip(host, 48),
+                                        _aff_dbg_clip(candidate, 96),
+                                    ),
+                                )
                         except Exception:
                             break
 
                     if _is_cloudflare_or_cdn_error_landing(candidate):
                         candidate = start_u
                     resolved[u] = candidate
+                    if flow_on and should_expand_url(start_u):
+                        _aff_flow(
+                            cfg,
+                            "resolve_final original=%r -> %r"
+                            % (_aff_dbg_clip(u, 88), _aff_dbg_clip(candidate, 96)),
+                        )
                 elif affiliate_rewrite_debug_verbose_on(cfg):
                     _aff_dbg_verbose(
                         cfg,
@@ -2362,6 +2542,29 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
 
     if isinstance(memo_lookup, dict) and unique:
         memo_lookup[tuple(sorted(unique))] = (dict(mapped), dict(notes))
+
+    _out_bits: List[str] = []
+    for u in candidates[:8]:
+        tgt = (resolved.get(u) or normalized.get(u) or u).strip()
+        rep = mapped.get(u)
+        _out_bits.append(
+            "%s → %s [%s]"
+            % (
+                _aff_dbg_clip(u, 56),
+                _aff_dbg_clip((rep or tgt), 72),
+                _aff_dbg_clip(notes.get(u, ""), 100),
+            )
+        )
+    _aff_flow(
+        cfg,
+        "batch_done total=%.2fs mapped=%d/%d%s"
+        % (
+            time.perf_counter() - _t_batch0,
+            len(mapped),
+            len(candidates),
+            (": " + " || ".join(_out_bits)) if _out_bits else "",
+        ),
+    )
 
     return mapped, notes
 
