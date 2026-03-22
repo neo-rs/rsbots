@@ -9,22 +9,37 @@ This does NOT run the bundled Playwright Chromium profile (.mavely_profile). It 
 
 REQUIREMENTS
 ------------
-- Close all Chrome windows first (otherwise the profile is locked and launch fails).
-- Playwright installed:  py -3 -m pip install playwright && py -3 -m playwright install chrome
-  (install chrome channel, not only chromium)
+- Playwright:  py -3 -m pip install playwright && py -3 -m playwright install chrome
 
-USAGE (Windows)
----------------
+MODE A — Playwright launches Chrome (often breaks on Chrome 146+ real profiles → exit code 21)
+------------------------------------------------------------------
+- Close ALL Chrome first (SingletonLock). Then run the script as below.
+
+MODE B — You start Chrome, script attaches over CDP (RECOMMENDED when Mode A crashes)
+--------------------------------------------------------------------------------------
+1) Close every Chrome window.
+2) Start Chrome yourself (copy/paste; adjust profile if needed):
+
+     \"C:\\\\Program Files\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe\" ^
+       --remote-debugging-port=9222 ^
+       --user-data-dir=\"%LOCALAPPDATA%\\\\Google\\\\Chrome\\\\User Data\" ^
+       --profile-directory=\"Profile 1\"
+
+3) In another terminal:
+
+     py -3 scripts\\\\mavely_harvest_from_installed_chrome.py --cdp-url http://127.0.0.1:9222 --url \"https://mavely.app.link/xxxx\"
+
+Or:  py -3 scripts\\\\mavely_harvest_from_installed_chrome.py --print-chrome-debug-cmd
+     (prints the exact chrome.exe line for your machine)
+
+Writes RSForwarder/mavely_cookies.txt (override with --out).
+
+USAGE (Windows, Mode A)
+-----------------------
   cd mirror-world
   py -3 scripts/mavely_harvest_from_installed_chrome.py --url \"https://mavely.app.link/4IJZuyvIH1b\"
 
-If you use something other than \"Default\" (Chrome shows Profile Path ...\\\\User Data\\\\Profile 1),
-the script reads User Data\\\\Local State and picks the last-used profile automatically. Override with:
-
-  --profile-directory \"Profile 1\"
-  set CHROME_PROFILE=Profile 1
-
-Writes RSForwarder/mavely_cookies.txt (override with --out).
+Profile: script reads User Data\\\\Local State (last used) or set CHROME_PROFILE / --profile-directory.
 
 USAGE (Edge instead of Chrome)
 ------------------------------
@@ -165,6 +180,16 @@ def main() -> int:
         action="store_true",
         help="Write full cookie jar header (not filtered to Mavely-related domains)",
     )
+    ap.add_argument(
+        "--cdp-url",
+        default="",
+        help="Attach to an already running Chrome (e.g. http://127.0.0.1:9222) instead of Playwright launch",
+    )
+    ap.add_argument(
+        "--print-chrome-debug-cmd",
+        action="store_true",
+        help="Print a chrome.exe command line with --remote-debugging-port=9222 and exit",
+    )
     args = ap.parse_args()
 
     user_data = (args.user_data_dir or os.getenv("CHROME_USER_DATA") or "").strip() or _default_user_data_dir(
@@ -188,7 +213,21 @@ def main() -> int:
         print(f"ERROR: User Data dir not found: {ud}", file=sys.stderr)
         return 2
 
-    if args.browser == "chrome" and _chrome_singleton_locked(ud):
+    cdp = (args.cdp_url or os.getenv("MAVELY_HARVEST_CDP_URL", "") or "").strip()
+
+    if args.print_chrome_debug_cmd:
+        exe = os.environ.get("CHROME_EXE", r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+        ud_q = str(ud)
+        print("Close all Chrome windows, then run this ONE line in cmd.exe (not PowerShell if ^ breaks):\n")
+        print(
+            f'"{exe}" --remote-debugging-port=9222 '
+            f'--user-data-dir="{ud_q}" --profile-directory="{prof}"\n'
+        )
+        print("Leave that Chrome open, then:")
+        print(f'  py -3 scripts\\mavely_harvest_from_installed_chrome.py --cdp-url http://127.0.0.1:9222 --url "<mavely link>"')
+        return 0
+
+    if args.browser == "chrome" and (not cdp) and _chrome_singleton_locked(ud):
         print(
             "ERROR: Chrome still has this User Data directory open (SingletonLock exists).",
             file=sys.stderr,
@@ -202,15 +241,66 @@ def main() -> int:
         print("ERROR: pip install playwright && playwright install chrome", file=sys.stderr)
         return 3
 
-    print(f"Using channel={channel!r} user_data_dir={ud} profile_directory={prof!r}")
-    print("If launch fails, close every Chrome/Edge window and retry (profile must not be in use).")
+    def _probe(ctx, page) -> None:
+        page.goto(u, wait_until="load", timeout=int(args.timeout_ms))
+        try:
+            page.wait_for_timeout(5000)
+        except Exception:
+            pass
+        final_url = (page.url or "").strip()
+        html = page.content() or ""
+        has_next = "__NEXT_DATA__" in html
+        print(f"final_url: {final_url}")
+        print(f"html_len: {len(html)} __NEXT_DATA__: {has_next}")
 
-    launch_args = [
-        f"--profile-directory={prof}",
-        "--disable-session-crashed-bubble",
-    ]
+        all_c = ctx.cookies()
+        header = _cookie_header_from_cookies(all_c) if args.all_cookies else _mavely_related_cookie_header(all_c)
+        print(f"cookies_kept: {len(all_c)} header_len: {len(header)}")
+        if not args.no_write:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+            tmp.write_text(header, encoding="utf-8")
+            os.replace(str(tmp), str(out_path))
+            print(f"OK: wrote {out_path}")
+            print("Oracle: copy this file to the server RSForwarder dir (or sync) and restart the bot.")
 
     with sync_playwright() as p:
+        if cdp:
+            print(f"CDP attach {cdp!r} (Chrome must be running with --remote-debugging-port)")
+            try:
+                browser = p.chromium.connect_over_cdp(cdp)
+            except Exception as e:
+                print(f"ERROR: connect_over_cdp failed: {e}", file=sys.stderr)
+                print("Start Chrome with: py -3 scripts\\mavely_harvest_from_installed_chrome.py --print-chrome-debug-cmd", file=sys.stderr)
+                return 5
+            try:
+                if not browser.contexts:
+                    print("ERROR: connected but no contexts (try opening a normal window in that Chrome)", file=sys.stderr)
+                    return 6
+                ctx = browser.contexts[0]
+                page = ctx.new_page()
+                try:
+                    _probe(ctx, page)
+                finally:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+                return 0
+            finally:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
+        print(f"Using channel={channel!r} user_data_dir={ud} profile_directory={prof!r}")
+        print("If this crashes with exit code 21, use --print-chrome-debug-cmd then --cdp-url.")
+
+        launch_args = [
+            f"--profile-directory={prof}",
+            "--disable-session-crashed-bubble",
+        ]
+
         try:
             ctx = p.chromium.launch_persistent_context(
                 user_data_dir=str(ud),
@@ -218,41 +308,25 @@ def main() -> int:
                 headless=False,
                 args=launch_args,
                 viewport={"width": 1280, "height": 800},
-                # Real profiles often crash immediately if extensions are stripped (Playwright default).
-                ignore_default_args=["--disable-extensions"],
+                ignore_default_args=[
+                    "--disable-extensions",
+                    "--enable-automation",
+                ],
             )
         except Exception as e:
             print(f"ERROR: launch_persistent_context failed: {e}", file=sys.stderr)
             print(
-                "Hint: Quit Chrome fully (including background apps in tray). "
-                "If your Chrome profile is 'Profile 1', pass: --profile-directory \"Profile 1\"",
+                "Chrome often exits immediately when Playwright launches a real profile. Do this instead:\n"
+                "  py -3 scripts\\mavely_harvest_from_installed_chrome.py --print-chrome-debug-cmd\n"
+                "Start Chrome with that line, then:\n"
+                "  py -3 scripts\\mavely_harvest_from_installed_chrome.py --cdp-url http://127.0.0.1:9222 --url \"...\"",
                 file=sys.stderr,
             )
             return 4
 
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
-            page.goto(u, wait_until="load", timeout=int(args.timeout_ms))
-            try:
-                page.wait_for_timeout(5000)
-            except Exception:
-                pass
-            final_url = (page.url or "").strip()
-            html = page.content() or ""
-            has_next = "__NEXT_DATA__" in html
-            print(f"final_url: {final_url}")
-            print(f"html_len: {len(html)} __NEXT_DATA__: {has_next}")
-
-            all_c = ctx.cookies()
-            header = _cookie_header_from_cookies(all_c) if args.all_cookies else _mavely_related_cookie_header(all_c)
-            print(f"cookies_kept: {len(all_c)} header_len: {len(header)}")
-            if not args.no_write:
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = out_path.with_suffix(out_path.suffix + ".tmp")
-                tmp.write_text(header, encoding="utf-8")
-                os.replace(str(tmp), str(out_path))
-                print(f"OK: wrote {out_path}")
-                print("Oracle: copy this file to the server RSForwarder dir (or sync) and restart the bot.")
+            _probe(ctx, page)
         finally:
             ctx.close()
 
