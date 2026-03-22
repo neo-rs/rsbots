@@ -300,6 +300,23 @@ class MavelyClient:
         except Exception:
             pass
 
+    def _oauth_refresh_enabled(self) -> bool:
+        """
+        OAuth refresh (refresh_token -> access_token) for GraphQL.
+
+        - Explicit opt-out: MAVELY_ENABLE_OAUTH_REFRESH=0/false/off
+        - Explicit opt-in: MAVELY_ENABLE_OAUTH_REFRESH=1/true/on
+        - Default: enabled when a refresh token is configured (env, file, or later from session).
+          Oracle deployments often have MAVELY_REFRESH_TOKEN* but forget the env flag; preflight
+          then never mints a bearer before GraphQL.
+        """
+        raw = (_env_str("MAVELY_ENABLE_OAUTH_REFRESH") or "").strip().lower()
+        if raw in {"0", "false", "no", "n", "off"}:
+            return False
+        if raw in {"1", "true", "yes", "y", "on"}:
+            return True
+        return bool(self.refresh_token)
+
     def _maybe_persist_refresh_token(self) -> None:
         rt_file = _env_str("MAVELY_REFRESH_TOKEN_FILE")
         if not rt_file:
@@ -476,8 +493,12 @@ class MavelyClient:
         """
         sess = requests.Session()
 
-        enable_oauth_refresh = (_env_str("MAVELY_ENABLE_OAUTH_REFRESH") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-        if enable_oauth_refresh and self.refresh_token:
+        # Pull idToken / refreshToken / access token from cookies BEFORE OAuth refresh.
+        # Stale on-disk refresh token is a common Oracle footgun; session JSON has the current one.
+        if self.cookie_header:
+            self._ensure_auth_token_from_session(sess, force=True)
+
+        if self._oauth_refresh_enabled() and self.refresh_token:
             new_token = self._refresh_access_token(sess)
             if new_token:
                 self.auth_token = new_token
@@ -608,6 +629,9 @@ class MavelyClient:
                     self._refresh_len = len(self.refresh_token or "")
                     self.log.debug("Updated refreshToken from session JSON (len=%s)", self._refresh_len)
                     self._maybe_persist_refresh_token()
+                    # Session carried a new rotation; allow OAuth token endpoint again.
+                    self._oauth_refresh_disabled = False
+                    self._oauth_refresh_disabled_reason = None
         except Exception:
             pass
 
@@ -702,10 +726,12 @@ class MavelyClient:
         if not self.auth_token and not self.cookie_header:
             return None
 
-        self._ensure_auth_token_from_session(sess)
+        if self.cookie_header:
+            self._ensure_auth_token_from_session(sess, force=True)
+        else:
+            self._ensure_auth_token_from_session(sess)
         # Preemptive refresh: if we have a bearer token that is near expiry, refresh before making the GraphQL call.
-        enable_oauth_refresh = (_env_str("MAVELY_ENABLE_OAUTH_REFRESH") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-        if enable_oauth_refresh and self.auth_token and self._auth_token_expiring_soon():
+        if self._oauth_refresh_enabled() and self.auth_token and self._auth_token_expiring_soon():
             refreshed = self._refresh_access_token(sess)
             if refreshed:
                 self.auth_token = refreshed
@@ -773,8 +799,7 @@ mutation CreateAffiliateLink($url: String!) {
                     last_err = MavelyResult(ok=False, status_code=0, error=str(e))
 
             if resp.status_code == 401 or (last_err and last_err.status_code == 401):
-                enable_oauth_refresh = (_env_str("MAVELY_ENABLE_OAUTH_REFRESH") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-                if enable_oauth_refresh:
+                if self._oauth_refresh_enabled():
                     refreshed = self._refresh_access_token(sess)
                     if refreshed:
                         self.log.debug("GraphQL 401; retrying with refreshed access token")
@@ -887,8 +912,7 @@ mutation CreateAffiliateLink($url: String!) {
                     except requests.RequestException as e:
                         return MavelyResult(ok=False, status_code=0, error=str(e))
 
-                enable_oauth_refresh = (_env_str("MAVELY_ENABLE_OAUTH_REFRESH") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-                if enable_oauth_refresh:
+                if self._oauth_refresh_enabled():
                     refreshed = self._refresh_access_token(sess)
                     if refreshed:
                         try:
@@ -916,7 +940,7 @@ mutation CreateAffiliateLink($url: String!) {
                             return MavelyResult(ok=False, status_code=0, error=str(e))
 
                 reason = "token expired; could not refresh from session/idToken"
-                if enable_oauth_refresh:
+                if self._oauth_refresh_enabled():
                     reason = self._last_refresh_error or ("no MAVELY_REFRESH_TOKEN configured" if not self.refresh_token else "refresh failed")
                 return MavelyResult(ok=False, status_code=200, error=f"Mavely token expired. {reason}.", raw_snippet=snippet)
 
@@ -934,8 +958,7 @@ mutation CreateAffiliateLink($url: String!) {
     def create_link(self, url: str) -> MavelyResult:
         # Allow "refresh-token-only" mode: if no cookies/bearer are present but OAuth refresh is enabled,
         # try minting a bearer token up-front.
-        enable_oauth_refresh = (_env_str("MAVELY_ENABLE_OAUTH_REFRESH") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-        if enable_oauth_refresh and (not self.auth_token) and self.refresh_token:
+        if self._oauth_refresh_enabled() and (not self.auth_token) and self.refresh_token:
             try:
                 minted = self._refresh_access_token(requests.Session())
                 if minted:
