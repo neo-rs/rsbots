@@ -507,6 +507,23 @@ def _html_fetch_headers_for_hub(url: str) -> Dict[str, str]:
     return h
 
 
+def _expand_redirect_headers(url: str) -> Dict[str, str]:
+    """
+    Headers for short-link redirect expansion (expand_url).
+
+    dealshacks / hiddendealsociety: plain HEAD/GET + */* is usually enough (302 chain).
+
+    mavely.app.link / mavelyinfluencer.com: use the same browser + Cookie profile as hub HTML GETs
+    so Branch / Cloudflare see a document navigation, not a script probe — often yields longer 302 chains
+    or the same HTML shell we then unwrap (parity with special_html_hosts handling).
+    """
+    u = (url or "").strip()
+    if _url_is_mavely_bridge_surface(u):
+        return dict(_html_fetch_headers_for_hub(u))
+    ua = (os.getenv("MAVELY_USER_AGENT", "") or "").strip() or "Mozilla/5.0"
+    return {"User-Agent": ua, "Accept": "*/*"}
+
+
 def _fetch_html_via_curl(url: str, headers: Dict[str, str], timeout_s: int) -> Tuple[int, str]:
     """
     Cloudflare often serves 403 to aiohttp/Python TLS; system curl sometimes gets real HTML.
@@ -1466,20 +1483,22 @@ async def expand_url(session: aiohttp.ClientSession, url: str, *, timeout_s: flo
     if not (u.startswith("http://") or u.startswith("https://")):
         return u
     timeout = aiohttp.ClientTimeout(total=timeout_s)
-    ua = (os.getenv("MAVELY_USER_AGENT", "") or "").strip() or "Mozilla/5.0"
-    headers = {"User-Agent": ua, "Accept": "*/*"}
-    try:
-        async with session.request(
-            "HEAD",
-            u,
-            allow_redirects=True,
-            max_redirects=max_redirects,
-            timeout=timeout,
-            headers=headers,
-        ) as resp:
-            return _normalize_expanded_url(str(resp.url) or u)
-    except Exception:
-        pass
+    headers = _expand_redirect_headers(u)
+    # Branch / Mavely often omit or mishandle HEAD; follow with GET + document headers (same idea as hub GET).
+    mavely_like = _url_is_mavely_bridge_surface(u)
+    if not mavely_like:
+        try:
+            async with session.request(
+                "HEAD",
+                u,
+                allow_redirects=True,
+                max_redirects=max_redirects,
+                timeout=timeout,
+                headers=headers,
+            ) as resp:
+                return _normalize_expanded_url(str(resp.url) or u)
+        except Exception:
+            pass
     try:
         async with session.get(
             u,
@@ -1499,7 +1518,7 @@ async def expand_url(session: aiohttp.ClientSession, url: str, *, timeout_s: flo
         import requests
 
         def _do() -> str:
-            r = requests.get(u, allow_redirects=True, timeout=max(5, int(timeout_s)), headers={"User-Agent": ua})
+            r = requests.get(u, allow_redirects=True, timeout=max(5, int(timeout_s)), headers=dict(headers))
             return r.url or u
 
         final = await asyncio.to_thread(_do)
