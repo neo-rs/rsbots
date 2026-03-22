@@ -555,8 +555,8 @@ class RSSuccessBot:
                 return
 
             # Suggestions workflow:
-            # - Parent channel messages: validate length + cooldown, react ✅/❌, create a thread and post "Suggestion Comments".
-            # - Thread messages: no cooldown/delay validation; reactions can still be applied.
+            # - Parent channel messages: validate length + cooldown, react ✅/❌ (no auto thread).
+            # - Thread messages (if any): no cooldown/delay validation; optional reactions.
             suggestions_parent_channel_ids = set(self.config.get("suggestions_reaction_channel_ids", []))
             parent_id = getattr(message.channel, "parent_id", None)
             is_suggestions_parent_message = message.channel.id in suggestions_parent_channel_ids
@@ -623,34 +623,13 @@ class RSSuccessBot:
                         # If timestamp parsing fails, fall through and allow the message.
                         pass
 
-                # Accept suggestion: update cooldown, react, then create thread
+                # Accept suggestion: update cooldown, react
                 self.json_data.setdefault("suggestions_last_post", {})[user_id_str] = now.isoformat()
                 self.save_json_data()
 
                 for emoji in reaction_emojis:
                     try:
                         await message.add_reaction(emoji)
-                    except Exception:
-                        pass
-
-                thread = getattr(message, "thread", None)
-                created_new_thread = False
-                if thread is None:
-                    thread_name = self.config.get("suggestions_thread_name", "Suggestion Comments")
-                    auto_archive_duration = int(self.config.get("suggestions_thread_auto_archive_duration_minutes", 1440))
-                    try:
-                        thread = await message.create_thread(
-                            name=thread_name,
-                            auto_archive_duration=auto_archive_duration
-                        )
-                        created_new_thread = True
-                    except Exception:
-                        thread = None
-
-                if thread and created_new_thread:
-                    try:
-                        title_message = self.config.get("suggestions_thread_title_message", "Suggestion Comments")
-                        await thread.send(content=title_message)
                     except Exception:
                         pass
 
