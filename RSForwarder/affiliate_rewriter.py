@@ -908,6 +908,7 @@ def _score_merchant_outbound_url(url: str) -> int:
             "macys.com",
             "nordstrom.com",
             "ebay.com",
+            "timberland.com",
         )
     ):
         score += 120
@@ -1380,6 +1381,7 @@ def _extract_first_outbound_url_from_html(html: str) -> Optional[str]:
         r"https?://walmrt\.us/[A-Za-z0-9]+",
         r"https?://(?:www\.)?target\.com/[^\s\"'<>]+",
         r"https?://(?:www\.)?urbanoutfitters\.[^\s\"'<>]+",
+        r"https?://(?:www\.)?timberland\.com/[^\s\"'<>]+",
         r"https?://bit\.ly/[A-Za-z0-9]+",
     ]
     for pat in patterns:
