@@ -228,6 +228,16 @@ When you need to run compound commands remotely, prefer a single `bash -lc`:
 - **Automation (SCP + SSH):** `py -3 scripts/run_oracle_mavely_bridge_test.py [--url ...] [--skip-scp]` uploads current `RSForwarder/affiliate_rewriter.py` and `scripts/test_mavely_app_links.py`, then runs the test remotely. Use `--skip-scp` only when you know the remote tree already matches what you intend to validate.
 - **Agents and humans:** When reporting test results for this path, **state whether the run was Oracle SSH or local-only**. Local-only results must be labeled **non-authoritative** for production behavior.
 
+### RSForwarder affiliate / Mavely: push → Oracle deploy → SSH test loop (mandatory for agents)
+
+When changing `RSForwarder/affiliate_rewriter.py` (unwrap, Playwright bridge, Mavely order, etc.), **do not stop at local edits**. Follow this loop until an **Oracle** run shows the expected `mapped:` / repost URL (e.g. `https://mavely.app.link/UHNDYofgG1b` → Walmart or your Mavely link, not a stuck `mavelyinfluencer.com` bridge).
+
+1. **Edit locally** in `mirror-world` (this repo).
+2. **Push to GitHub:** run **`push_rsbots_py_only.bat`** from the repo root, review staged files, confirm at the prompt so it **commit + push**es tracked changes. (Non-interactive equivalent: `git add -u`, `git commit`, `git push` to `main` — only for tracked paths; never commit runtime junk like `RSCheckerbot/member_history.json`.)
+3. **Update the Oracle server tree** so `/home/rsadmin/bots/mirror-world` matches what you pushed. Use **your** canonical deploy step (examples: a local batch such as **`update_rs_bots.bat`**, RSAdminBot **`!botupdate RSForwarder`** / **`!botsync`**, or server **`botctl.sh deploy_apply`** — whichever this environment actually uses). **Restart** `mirror-world-rsforwarder.service` when the running bot must load new Python.
+4. **Test on Oracle over SSH:** `py -3 scripts/run_oracle_mavely_bridge_test.py --skip-scp --url "https://mavely.app.link/UHNDYofgG1b" --timeout-s 200` (omit `--skip-scp` if you need to SCP the current `affiliate_rewriter.py` + `test_mavely_app_links.py` without a full deploy). Inspect **`mapped:`** and debug lines; if wrong, return to step 1.
+5. **Playwright note:** bridge unwrap uses **Chromium** (real browser engine) via Playwright; Oracle needs **`MAVELY_PROFILE_DIR`** (or default `RSForwarder/.mavely_profile`), **`MAVELY_PLAYWRIGHT_NO_SANDBOX=1`**, and Playwright installed in the server venv — or client-side navigation to Walmart/Amazon will never be observed.
+
 ### Baseline sync rule (MANDATORY - prevents "Cursor edited the wrong code")
 
 Before ANY debugging, refactor, cleanup, or feature work on RS bots, you MUST prove that the local workspace matches what is actually running on Oracle.
