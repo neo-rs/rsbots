@@ -14,17 +14,15 @@ AFFILIATE_REWRITE_DEBUG=1 (compact: one compute summary line per batch). Hop-by-
 `_affiliate_compute_memo` so identical URLs across content + multiple embeds run the network/Mavely work once per message.
 
 Step timing + outcome lines (stdout, prefix [AffiliateFlow]): config `affiliate_rewrite_flow_log` or env
-AFFILIATE_REWRITE_FLOW_LOG (default on: `1`). Set to `0` to disable. Logs expand/HTML/Playwright/Mavely API phases
-with durations and short results.
+AFFILIATE_REWRITE_FLOW_LOG (default off). Set to `1` to enable batch summaries and Mavely API failures.
 
 Default redirect + hub HTML timeouts are 5s unless overridden (`affiliate_expand_timeout_s` /
 `AUTO_AFFILIATE_EXPAND_TIMEOUT_S`, `affiliate_hub_html_timeout_s` / `AUTO_AFFILIATE_HUB_HTML_TIMEOUT_S`).
 
 Mavely short links (`mavely.app.link`) are not bit.ly-style “pure redirects”: HTTP expand often stops at
 `mavelyinfluencer.com` or `mavelylife.com` (bridge). Shared Branch/query helpers and no-profile headless Chromium live in
-`mavely_link_resolve.py` (single source of truth with `Mavelytest/mavely_link_tester.py`). Final destinations
-are still recovered here via hub HTML + Playwright (persistent profile when present); `mavely_client.py`
-creates new links via GraphQL and does not unwrap HTML.
+`mavely_link_resolve.py` (same headless Chromium path as `Mavelytest/mavely_link_tester.py`). Deal hubs still use
+aiohttp HTML unwrap here; `mavely_client.py` creates new links via GraphQL and does not unwrap HTML.
 If GraphQL rejects the app.link host, we optionally call create_link once with the expanded hub URL
 (`MAVELY_GRAPHQL_BRIDGE_FALLBACK`, default on).
 """
@@ -128,17 +126,17 @@ def _aff_dbg_verbose(cfg: Optional[dict], msg: str) -> None:
 def affiliate_rewrite_flow_log_on(cfg: Optional[dict]) -> bool:
     """
     Structured phase logs ([AffiliateFlow]) with timings and outcomes.
-    Config `affiliate_rewrite_flow_log` or env AFFILIATE_REWRITE_FLOW_LOG (default `1` = on).
+    Config `affiliate_rewrite_flow_log` or env AFFILIATE_REWRITE_FLOW_LOG (default off; set `1` to enable).
     """
     try:
         if cfg is not None and "affiliate_rewrite_flow_log" in cfg:
-            return _bool_or_default(cfg.get("affiliate_rewrite_flow_log"), True)
+            return _bool_or_default(cfg.get("affiliate_rewrite_flow_log"), False)
     except Exception:
         pass
-    raw = (os.getenv("AFFILIATE_REWRITE_FLOW_LOG", "1") or "").strip().lower()
-    if raw in {"0", "false", "no", "n", "off"}:
-        return False
-    return True
+    raw = (os.getenv("AFFILIATE_REWRITE_FLOW_LOG", "") or "").strip().lower()
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    return False
 
 
 def _aff_flow(cfg: Optional[dict], msg: str) -> None:
@@ -601,7 +599,7 @@ def _fetch_html_via_curl(url: str, headers: Dict[str, str], timeout_s: int) -> T
 def resolve_mavely_profile_dir() -> Optional[Path]:
     """
     Persistent Chromium user-data dir used by mavely_cookie_refresher (MAVELY_PROFILE_DIR).
-    Playwright bridge unwrap reuses this so Cloudflare sees the same logged-in browser.
+    Mavely URL unwrap uses headless `mavely_link_resolve` only (same as the local tester), not this profile.
     """
     repo_root = Path(__file__).resolve().parents[1]
     profile_raw = (os.getenv("MAVELY_PROFILE_DIR", "") or "").strip()
@@ -642,231 +640,52 @@ def mavely_bridge_playwright_startup_hint() -> str:
     try:
         import playwright.sync_api  # noqa: F401
     except Exception:
-        return "Mavely bridge: Playwright not installed (pip install playwright && playwright install chromium)"
-    prof = resolve_mavely_profile_dir()
-    if prof is None:
-        return (
-            "Mavely bridge: no profile dir (headless resolve: mavely_link_resolve.py; "
-            "set MAVELY_PROFILE_DIR for persistent cf_clearance)"
-        )
-    return f"Mavely bridge: Playwright fallback ready (profile={prof})"
+        return "Mavely: Playwright not installed (pip install playwright && playwright install chromium)"
+    return "Mavely: headless unwrap via mavely_link_resolve.py (same as Mavelytest)"
 
 
 _mavely_playwright_last_error: str = ""
-
-
-def _mavely_playwright_nav_extra_headers(url: str) -> Dict[str, str]:
-    """
-    Extra HTTP headers for Playwright navigations to Mavely hubs.
-
-    Default is **empty**: persistent Chromium already has cookies + realistic client hints
-    in the profile; forcing MAVELY_COOKIES / MAVELY_USER_AGENT / Sec-Fetch-* from aiohttp
-    can invalidate cf_clearance or look unlike a real top-level navigation.
-
-    Set MAVELY_PLAYWRIGHT_MERGE_HUB_HEADERS=1 to restore the old aiohttp-matching set
-    (User-Agent, Accept, Accept-Language, Cookie, Referer) for debugging.
-    """
-    raw = (os.getenv("MAVELY_PLAYWRIGHT_MERGE_HUB_HEADERS", "") or "").strip().lower()
-    if raw not in {"1", "true", "yes", "y", "on"}:
-        return {}
-    h = _html_fetch_headers_for_hub(url)
-    return {k: h[k] for k in ("User-Agent", "Accept", "Accept-Language", "Cookie", "Referer") if h.get(k)}
 
 
 def _fetch_mavely_html_via_playwright_sync(
     url: str, timeout_s: int, *, flow_log: bool = False, label: str = ""
 ) -> str:
     """
-    Load a Mavely hub URL in Chromium: persistent profile when available; otherwise delegate to
-    `mavely_link_resolve.playwright_resolve_mavely_to_merchant_url` (same behavior as Mavelytest).
+    Headless Chromium only: `mavely_link_resolve.playwright_resolve_mavely_to_merchant_url`
+    (parity with Mavelytest). Returns a tiny HTML document with an `<a href>` to the merchant when successful.
     """
     global _mavely_playwright_last_error
     _mavely_playwright_last_error = ""
     t0 = time.perf_counter()
-
-    def _fl(msg: str) -> None:
-        if flow_log:
-            tag = ("[%s] " % label.strip()) if (label or "").strip() else ""
-            print("[AffiliateFlow] playwright %s%s" % (tag, msg), flush=True)
-
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception as ex:
-        _mavely_playwright_last_error = "import: %s" % (ex,)
-        _fl("aborted import_error=%s (%.2fs)" % (_aff_dbg_clip(str(ex), 80), time.perf_counter() - t0))
-        return ""
     u = (url or "").strip()
     if not u.startswith("http"):
-        _fl("aborted bad_url (%.2fs)" % (time.perf_counter() - t0,))
         return ""
     t_ms = max(1_000, min(int(float(timeout_s) * 1000), 120_000))
-    prof = resolve_mavely_profile_dir()
-    if prof is None:
-        _fl(
-            "no_profile mavely_link_resolve.playwright_resolve (%.2fs)"
-            % (time.perf_counter() - t0,)
-        )
-        mer = _mavely_resolve.playwright_resolve_mavely_to_merchant_url(u, t_ms)
-        if mer:
-            esc = _html.escape(mer, quote=True)
-            _fl("resolved merchant url_bar=%r (%.2fs)" % (_aff_dbg_clip(mer, 88), time.perf_counter() - t0))
-            return '<!DOCTYPE html><html><body><a href="%s">outbound</a></body></html>' % esc
-        _fl("aborted no_profile (%.2fs)" % (time.perf_counter() - t0,))
-        return ""
-    settle_ms = min(3_500, max(200, int(t_ms * 0.18)))
-    load_wait_ms = min(25_000, max(2_000, t_ms // 2))
-    poll_budget_s = min(55.0, max(1.0, (t_ms / 1000.0) * 0.72))
-    click_poll_rounds = min(24, max(2, int(t_ms / 450)))
-    launch_args = ["--disable-session-crashed-bubble", "--disable-dev-shm-usage"]
-    _pw_nosb = (os.getenv("MAVELY_PLAYWRIGHT_NO_SANDBOX", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-    if _pw_nosb or sys.platform.startswith("linux"):
-        launch_args.append("--no-sandbox")
-    launch_args.extend(
-        (
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=IsolateOrigins,site-per-process",
-        )
-    )
-    headless = (os.getenv("MAVELY_PLAYWRIGHT_HEADLESS", "1") or "").strip().lower() not in {"0", "false", "no", "n", "off"}
-    _fl(
-        "start url=%r timeout_s=%s t_ms=%s settle_ms=%s poll_budget_s=%.2f"
-        % (_aff_dbg_clip(u, 96), timeout_s, t_ms, settle_ms, poll_budget_s)
-    )
     try:
-        with sync_playwright() as p:
-            ctx = p.chromium.launch_persistent_context(
-                user_data_dir=str(prof),
-                headless=headless,
-                args=launch_args,
-                viewport={"width": 1280, "height": 720},
-            )
-            try:
-                page = ctx.new_page()
-                try:
-                    _extra = _mavely_playwright_nav_extra_headers(u)
-                    if _extra:
-                        page.set_extra_http_headers(_extra)
-                except Exception:
-                    pass
-                try:
-                    page.add_init_script(
-                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-                    )
-                except Exception:
-                    pass
-                page.goto(u, wait_until="load", timeout=t_ms)
-                _fl("after goto url_bar=%r (%.2fs)" % (_aff_dbg_clip((page.url or "").strip(), 88), time.perf_counter() - t0))
-                try:
-                    page.wait_for_load_state("load", timeout=load_wait_ms)
-                except Exception:
-                    pass
-                try:
-                    page.wait_for_timeout(settle_ms)
-                except Exception:
-                    pass
-                deadline = time.time() + poll_budget_s
-                while time.time() < deadline:
-                    try:
-                        cur = (page.url or "").strip()
-                    except Exception:
-                        cur = ""
-                    if cur.startswith("http") and (not _url_is_mavely_bridge_surface(cur)):
-                        esc = _html.escape(cur, quote=True)
-                        _fl(
-                            "poll left_mavely url=%r (%.2fs)"
-                            % (_aff_dbg_clip(cur, 88), time.perf_counter() - t0)
-                        )
-                        return (
-                            '<!DOCTYPE html><html><body>'
-                            f'<a href="{esc}">outbound</a></body></html>'
-                        )
-                    try:
-                        loc = page.evaluate("() => String(location && location.href ? location.href : '')")
-                        if (
-                            isinstance(loc, str)
-                            and loc.startswith("http")
-                            and (not _url_is_mavely_bridge_surface(loc))
-                        ):
-                            esc = _html.escape(loc.strip(), quote=True)
-                            _fl(
-                                "poll left_mavely loc_eval url=%r (%.2fs)"
-                                % (_aff_dbg_clip(loc.strip(), 88), time.perf_counter() - t0)
-                            )
-                            return (
-                                '<!DOCTYPE html><html><body>'
-                                f'<a href="{esc}">outbound</a></body></html>'
-                            )
-                    except Exception:
-                        pass
-                    try:
-                        page.wait_for_timeout(500)
-                    except Exception:
-                        break
-                try:
-                    if _url_is_mavely_bridge_surface((page.url or "").strip()):
-                        for js in (
-                            "() => { const a = document.querySelector('a[href*=\"walmart.com\"]'); if (a) { a.click(); return 1; } return 0; }",
-                            "() => { const a = document.querySelector('a[href*=\"amazon.\"]'); if (a) { a.click(); return 1; } return 0; }",
-                            "() => { const a = document.querySelector('a[href*=\"tools.woot.com\"]'); if (a) { a.click(); return 1; } return 0; }",
-                        ):
-                            try:
-                                if int(page.evaluate(js) or 0):
-                                    page.wait_for_timeout(min(3_500, max(400, settle_ms * 2)))
-                            except Exception:
-                                pass
-                        for _ in range(click_poll_rounds):
-                            try:
-                                cur = (page.url or "").strip()
-                            except Exception:
-                                cur = ""
-                            if cur.startswith("http") and (not _url_is_mavely_bridge_surface(cur)):
-                                esc = _html.escape(cur, quote=True)
-                                _fl(
-                                    "click_poll left_mavely url=%r (%.2fs)"
-                                    % (_aff_dbg_clip(cur, 88), time.perf_counter() - t0)
-                                )
-                                return (
-                                    '<!DOCTYPE html><html><body>'
-                                    f'<a href="{esc}">outbound</a></body></html>'
-                                )
-                            try:
-                                page.wait_for_timeout(500)
-                            except Exception:
-                                break
-                except Exception:
-                    pass
-                html_out = page.content() or ""
-                cur_final = ""
-                try:
-                    cur_final = (page.url or "").strip()
-                except Exception:
-                    pass
-                bridge_tail = (
-                    _url_is_mavely_bridge_surface(cur_final)
-                    if cur_final.startswith("http")
-                    else False
-                )
-                _fl(
-                    "done url_bar=%r html_len=%s still_mavely_bridge=%s (%.2fs)%s"
-                    % (
-                        _aff_dbg_clip(cur_final, 88),
-                        len(html_out),
-                        bridge_tail,
-                        time.perf_counter() - t0,
-                        (
-                            (" err=%s" % _aff_dbg_clip(_mavely_playwright_last_error, 100))
-                            if (_mavely_playwright_last_error or "").strip()
-                            else ""
-                        ),
-                    )
-                )
-                return html_out
-            finally:
-                ctx.close()
+        mer = _mavely_resolve.playwright_resolve_mavely_to_merchant_url(u, t_ms)
     except Exception as ex:
-        _mavely_playwright_last_error = "launch/run: %s" % (ex,)
-        _fl("exception %s (%.2fs)" % (_aff_dbg_clip(str(ex), 120), time.perf_counter() - t0))
-        return ""
+        _mavely_playwright_last_error = "resolve: %s" % (ex,)
+        mer = None
+    elapsed = time.perf_counter() - t0
+    if flow_log:
+        tag = ("[%s] " % label.strip()) if (label or "").strip() else ""
+        if mer:
+            print(
+                "[AffiliateFlow] mavely_playwright %sok url_out=%r (%.2fs)"
+                % (tag, _aff_dbg_clip(mer, 96), elapsed),
+                flush=True,
+            )
+        else:
+            hint = _aff_dbg_clip(_mavely_playwright_last_error or "no merchant URL", 100)
+            print(
+                "[AffiliateFlow] mavely_playwright %sfail url_in=%r (%.2fs) %s"
+                % (tag, _aff_dbg_clip(u, 96), elapsed, hint),
+                flush=True,
+            )
+    if mer:
+        esc = _html.escape(mer, quote=True)
+        return '<!DOCTYPE html><html><body><a href="%s">outbound</a></body></html>' % esc
+    return ""
 
 
 _playwright_mavely_lock: Optional[asyncio.Lock] = None
@@ -1803,19 +1622,7 @@ async def mavely_create_link(cfg: dict, url: str) -> Tuple[Optional[str], Option
         return link, str(err), status
 
     t_ml0 = time.perf_counter()
-    _aff_flow(cfg, "mavely_graphql create_link start input=%r" % _aff_dbg_clip((url or "").strip(), 100))
     link, err, status = await asyncio.to_thread(_do)
-    _aff_flow(
-        cfg,
-        "mavely_graphql create_link try1 (%.2fs) ok=%s status=%s link_out=%r err=%r"
-        % (
-            time.perf_counter() - t_ml0,
-            bool(link),
-            status,
-            _aff_dbg_clip(link or "", 88),
-            _aff_dbg_clip(err, 140),
-        ),
-    )
     if link:
         return link, None
 
@@ -1823,35 +1630,30 @@ async def mavely_create_link(cfg: dict, url: str) -> Tuple[Optional[str], Option
     auth_fail = ("token expired" in err_l) or ("not logged in" in err_l) or ("unauthorized" in err_l) or (status == 401)
     if auth_fail:
         if await _maybe_refresh_mavely_cookies(reason=err or "auth"):
-            t_r0 = time.perf_counter()
-            _aff_flow(cfg, "mavely_graphql create_link retry after cookie refresh")
-            link2, err2, _status2 = await asyncio.to_thread(_do)
-            _aff_flow(
-                cfg,
-                "mavely_graphql create_link try2 (%.2fs) ok=%s status=%s link_out=%r err=%r"
-                % (
-                    time.perf_counter() - t_r0,
-                    bool(link2),
-                    _status2,
-                    _aff_dbg_clip(link2 or "", 88),
-                    _aff_dbg_clip(err2, 140),
-                ),
-            )
+            link2, err2, status2 = await asyncio.to_thread(_do)
             if link2:
                 return link2, None
             err = err2 or err
+            try:
+                status = int(status2 or status)
+            except Exception:
+                pass
 
-    # If we still got a 401, call out the one-time server login requirement explicitly.
     if status == 401:
         hint = " (need server login: run RSForwarder/mavely_cookie_refresher.py --interactive on Oracle once)"
     else:
         hint = ""
+    err_out = f"{err} (status={status}){hint}"
     _aff_flow(
         cfg,
-        "mavely_graphql create_link final_fail (%.2fs) status=%s err=%r"
-        % (time.perf_counter() - t_ml0, status, _aff_dbg_clip(f"{err} (status={status}){hint}", 160)),
+        "mavely_graphql failed input=%r (%.2fs) %r"
+        % (
+            _aff_dbg_clip((url or "").strip(), 88),
+            time.perf_counter() - t_ml0,
+            _aff_dbg_clip(err_out, 200),
+        ),
     )
-    return None, f"{err} (status={status}){hint}"
+    return None, err_out
 
 
 async def mavely_preflight(cfg: dict) -> Tuple[bool, int, Optional[str]]:
@@ -2037,7 +1839,6 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                     [start_u] if affiliate_rewrite_debug_on(cfg) and affiliate_rewrite_debug_verbose_on(cfg) else None
                 )
                 if should_expand_url(start_u):
-                    t_expand0 = time.perf_counter()
                     final_u = await expand_url(session, start_u, timeout_s=timeout_s, max_redirects=max_redirects)
                     # Mavely / App Links sometimes 302 to Cloudflare's generic 5xx page when origin fails.
                     if _is_cloudflare_or_cdn_error_landing(final_u):
@@ -2062,12 +1863,6 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                         if dbg_chain is not None:
                             dbg_chain.append(final_u)
                     resolved[u] = final_u
-                    if flow_on:
-                        _aff_flow(
-                            cfg,
-                            "expand_redirects %r -> %r (%.2fs)"
-                            % (_aff_dbg_clip(start_u, 88), _aff_dbg_clip(final_u, 88), time.perf_counter() - t_expand0),
-                        )
                     if dbg_chain is not None and len(dbg_chain) > 1:
                         _aff_dbg_verbose(
                             cfg,
@@ -2086,11 +1881,6 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                         if not _is_cloudflare_or_cdn_error_landing(cand2):
                             resolved[u] = cand2
                             final_u = cand2
-                            if flow_on:
-                                _aff_flow(
-                                    cfg,
-                                    "query_unwrap_after_expand %r -> %r" % (_aff_dbg_clip(u, 72), _aff_dbg_clip(final_u, 88)),
-                                )
 
                     special_html_hosts = {
                         "deals.pennyexplorer.com",
@@ -2101,11 +1891,6 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                         "fkd.deals",
                         "pricedoffers.com",
                         "saveyourdeals.com",
-                        "mavely.app.link",
-                        "mavelyinfluencer.com",
-                        "www.mavelyinfluencer.com",
-                        "mavelylife.com",
-                        "www.mavelylife.com",
                         "go.sylikes.com",
                         "rd.bizrate.com",
                         "go.skimresources.com",
@@ -2119,63 +1904,51 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                     # Some hubs require 2 steps:
                     # pricedoffers.com -> saveyourdeals.com -> amazon.com (Go to Deal)
                     candidate = final_u
-                    # mavely.app.link: HTTP expand usually lands on mavelyinfluencer.com (tracking shell), not the store.
-                    # Branch often completes the hop to the merchant when Playwright opens the *short* URL first; the
-                    # influencer hub HTML alone is frequently useless on datacenter IPs (small shell, no __NEXT_DATA__).
-                    mavely_short_src = (normalized.get(u) or u).strip()
-                    mavely_short_playwright_tried = False
-                    if is_mavely_app_short_link(mavely_short_src):
-                        if not _mavely_bridge_playwright_enabled():
+                    # Mavely: same as Mavelytest — headless Chromium only (no aiohttp hub fetch / persistent browser).
+                    short_norm = (normalized.get(u) or u).strip()
+                    if _mavely_bridge_playwright_enabled():
+                        try_urls: List[str] = []
+                        if is_mavely_app_short_link(short_norm):
+                            try_urls.append(short_norm)
+                        try:
+                            _cand_host = (urlparse(candidate).netloc or "").lower()
+                        except Exception:
+                            _cand_host = ""
+                        if _mavely_bridge_host(_cand_host) and candidate not in try_urls:
+                            try_urls.append(candidate)
+                        for try_u in try_urls:
                             if affiliate_rewrite_debug_verbose_on(cfg):
                                 _aff_dbg_verbose(
                                     cfg,
-                                    "  html_unwrap mavely short-first: skipped (MAVELY_BRIDGE_PLAYWRIGHT off)",
-                                )
-                        else:
-                            mavely_short_playwright_tried = True
-                            if affiliate_rewrite_debug_verbose_on(cfg):
-                                _aff_dbg_verbose(
-                                    cfg,
-                                    "  html_unwrap mavely short-first: playwright starting timeout_s=%s %r (this can take tens of seconds)"
-                                    % (
-                                        int(hub_html_timeout_s),
-                                        _aff_dbg_clip(mavely_short_src, 72),
-                                    ),
+                                    "  mavely_playwright try %r timeout_s=%s"
+                                    % (_aff_dbg_clip(try_u, 72), int(hub_html_timeout_s)),
                                 )
                             async with _playwright_mavely_async_lock():
-                                pw_short_first = await asyncio.to_thread(
+                                pw_html = await asyncio.to_thread(
                                     _fetch_mavely_html_via_playwright_sync,
-                                    mavely_short_src,
+                                    try_u,
                                     int(hub_html_timeout_s),
                                     flow_log=flow_on,
-                                    label="short-first",
+                                    label="unwrap",
                                 )
-                            out_sf = (
-                                _first_production_outbound_from_hub_html(pw_short_first)
-                                if pw_short_first
+                            out_m = (
+                                _first_production_outbound_from_hub_html(pw_html)
+                                if pw_html
                                 else None
                             )
-                            if affiliate_rewrite_debug_verbose_on(cfg):
-                                _aff_dbg_verbose(
-                                    cfg,
-                                    "  html_unwrap mavely short-first: playwright done len=%s merchant_out=%s"
-                                    % (len(pw_short_first or ""), bool(out_sf)),
-                                )
-                            if out_sf:
-                                out_abs_sf = out_sf
-                                if out_abs_sf.startswith("/"):
-                                    out_abs_sf = urljoin(mavely_short_src, out_abs_sf)
-                                out_abs_sf = unwrap_known_query_redirects(out_abs_sf) or out_abs_sf
-                                candidate = out_abs_sf
+                            if out_m:
+                                out_abs_m = out_m
+                                if out_abs_m.startswith("/"):
+                                    out_abs_m = urljoin(try_u, out_abs_m)
+                                out_abs_m = unwrap_known_query_redirects(out_abs_m) or out_abs_m
+                                candidate = out_abs_m
                                 if affiliate_rewrite_debug_verbose_on(cfg):
                                     _aff_dbg_verbose(
                                         cfg,
-                                        "  html_unwrap mavely short-first %r -> %r"
-                                        % (
-                                            _aff_dbg_clip(mavely_short_src, 72),
-                                            _aff_dbg_clip(out_abs_sf, 88),
-                                        ),
+                                        "  mavely_playwright ok %r -> %r"
+                                        % (_aff_dbg_clip(try_u, 72), _aff_dbg_clip(candidate, 88)),
                                     )
+                                break
                     for _ in range(3):
                         try:
                             parsed = urlparse(candidate)
@@ -2186,7 +1959,6 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                             break
                         try:
                             _hub_headers = _html_fetch_headers_for_hub(candidate)
-                            t_hub0 = time.perf_counter()
                             async with session.get(
                                 candidate,
                                 headers=_hub_headers,
@@ -2194,111 +1966,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                             ) as resp:
                                 status = int(resp.status or 0)
                                 txt = await resp.text(errors="ignore")
-                            if flow_on:
-                                _aff_flow(
-                                    cfg,
-                                    "hub_aiohttp GET host=%r status=%s len=%s (%.2fs) url=%r"
-                                    % (
-                                        _aff_dbg_clip(host, 48),
-                                        status,
-                                        len(txt or ""),
-                                        time.perf_counter() - t_hub0,
-                                        _aff_dbg_clip(candidate, 88),
-                                    ),
-                                )
-                            mv_hub = _mavely_bridge_host(host)
-                            # Cloudflare often returns 403 to Python/aiohttp even with Mavely cookies; try curl TLS stack.
-                            if mv_hub and (status >= 400 or "__NEXT_DATA__" not in (txt or "")):
-                                ccode, cbody = await asyncio.to_thread(
-                                    _fetch_html_via_curl, candidate, _hub_headers, int(hub_html_timeout_s)
-                                )
-                                if cbody and ("__NEXT_DATA__" in cbody or _extract_first_outbound_url_from_html(cbody)):
-                                    txt = cbody
-                            # 200 + __NEXT_DATA__ can still fail extraction (truncated HTML, different shape); curl sometimes differs.
-                            elif mv_hub and (not _first_production_outbound_from_hub_html(txt or "")):
-                                ccode, cbody = await asyncio.to_thread(
-                                    _fetch_html_via_curl, candidate, _hub_headers, int(hub_html_timeout_s)
-                                )
-                                if cbody and _first_production_outbound_from_hub_html(cbody):
-                                    txt = cbody
-                            # Real browser + same profile as mavely_cookie_refresher (cf_clearance / session).
-                            if _mavely_bridge_playwright_enabled() and _mavely_bridge_host(host):
-                                have_merchant = bool(_first_production_outbound_from_hub_html(txt or ""))
-                                need_pw = (
-                                    (status >= 400)
-                                    or ("__NEXT_DATA__" not in (txt or ""))
-                                    or (not have_merchant)
-                                )
-                                if need_pw and _mavely_bridge_playwright_enabled():
-                                    if affiliate_rewrite_debug_verbose_on(cfg):
-                                        _aff_dbg_verbose(
-                                            cfg,
-                                            "  html_unwrap playwright(bridge): starting timeout_s=%s %r"
-                                            % (
-                                                int(hub_html_timeout_s),
-                                                _aff_dbg_clip(candidate, 72),
-                                            ),
-                                        )
-                                    async with _playwright_mavely_async_lock():
-                                        pw_html = await asyncio.to_thread(
-                                            _fetch_mavely_html_via_playwright_sync,
-                                            candidate,
-                                            int(hub_html_timeout_s),
-                                            flow_log=flow_on,
-                                            label="bridge",
-                                        )
-                                    if pw_html:
-                                        txt = pw_html
-                                        if "__NEXT_DATA__" in pw_html or _extract_first_outbound_url_from_html(
-                                            pw_html
-                                        ):
-                                            _aff_dbg_verbose(
-                                                cfg,
-                                                "  html_unwrap playwright %r -> len=%s"
-                                                % (_aff_dbg_clip(candidate, 72), len(pw_html)),
-                                            )
-                                        elif affiliate_rewrite_debug_verbose_on(cfg):
-                                            hint = (
-                                                (" (%s)" % _aff_dbg_clip(_mavely_playwright_last_error, 140))
-                                                if (_mavely_playwright_last_error or "").strip()
-                                                else ""
-                                            )
-                                            _aff_dbg_verbose(
-                                                cfg,
-                                                "  html_unwrap playwright %r -> len=%s (no __NEXT_DATA__/extract yet)%s"
-                                                % (_aff_dbg_clip(candidate, 72), len(pw_html), hint),
-                                            )
                             out = _first_production_outbound_from_hub_html(txt)
-                            if (
-                                not out
-                                and mv_hub
-                                and is_mavely_app_short_link((normalized.get(u) or u).strip())
-                                and (not mavely_short_playwright_tried)
-                                and _mavely_bridge_playwright_enabled()
-                                and _mavely_bridge_playwright_enabled()
-                            ):
-                                short_u = (normalized.get(u) or u).strip()
-                                async with _playwright_mavely_async_lock():
-                                    pw_short = await asyncio.to_thread(
-                                        _fetch_mavely_html_via_playwright_sync,
-                                        short_u,
-                                        int(hub_html_timeout_s),
-                                        flow_log=flow_on,
-                                        label="short-fallback",
-                                    )
-                                if pw_short:
-                                    txt = pw_short
-                                    out = _first_production_outbound_from_hub_html(txt)
-                                    if affiliate_rewrite_debug_verbose_on(cfg):
-                                        _aff_dbg_verbose(
-                                            cfg,
-                                            "  html_unwrap playwright(short) %r -> len=%s merchant=%r"
-                                            % (
-                                                _aff_dbg_clip(short_u, 72),
-                                                len(pw_short),
-                                                _aff_dbg_clip(out or "", 72),
-                                            ),
-                                        )
                             if not out:
                                 break
                             # Resolve relative links found in HTML against the current page.
@@ -2312,28 +1980,12 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                 "  html_unwrap %r: host=%r -> %r"
                                 % (_aff_dbg_clip(u, 72), _aff_dbg_clip(host, 48), _aff_dbg_clip(candidate, 88)),
                             )
-                            if flow_on:
-                                _aff_flow(
-                                    cfg,
-                                    "html_unwrap step original=%r host=%r next_candidate=%r"
-                                    % (
-                                        _aff_dbg_clip(u, 72),
-                                        _aff_dbg_clip(host, 48),
-                                        _aff_dbg_clip(candidate, 96),
-                                    ),
-                                )
                         except Exception:
                             break
 
                     if _is_cloudflare_or_cdn_error_landing(candidate):
                         candidate = start_u
                     resolved[u] = candidate
-                    if flow_on and should_expand_url(start_u):
-                        _aff_flow(
-                            cfg,
-                            "resolve_final original=%r -> %r"
-                            % (_aff_dbg_clip(u, 88), _aff_dbg_clip(candidate, 96)),
-                        )
                 elif affiliate_rewrite_debug_verbose_on(cfg):
                     _aff_dbg_verbose(
                         cfg,
@@ -2444,21 +2096,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                     and is_mavely_link(target)
                     and short_rejected
                 ):
-                    _aff_flow(
-                        cfg,
-                        "mavely_graphql create_link bridge_fallback start input=%r (short_err=%r)"
-                        % (_aff_dbg_clip(bridge_u, 100), _aff_dbg_clip(err, 100)),
-                    )
                     link_b, err_b = await mavely_create_link(cfg, bridge_u)
-                    _aff_flow(
-                        cfg,
-                        "mavely_graphql create_link bridge_fallback done ok=%s err=%r link=%r"
-                        % (
-                            bool(link_b and not err_b),
-                            _aff_dbg_clip(err_b or "", 120),
-                            _aff_dbg_clip(link_b or "", 88),
-                        ),
-                    )
                 if link_b and not err_b and link_b != raw:
                     mapped[u] = link_b
                     notes[u] = "rewrapped mavely link (hub GraphQL fallback; app.link rejected by API)"
