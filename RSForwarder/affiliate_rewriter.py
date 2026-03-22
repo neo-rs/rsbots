@@ -23,6 +23,8 @@ Default redirect + hub HTML timeouts are 5s unless overridden (`affiliate_expand
 Mavely short links (`mavely.app.link`) are not bit.ly-style “pure redirects”: HTTP expand often stops at
 `mavelyinfluencer.com` (bridge). Final merchant URLs are recovered here via hub HTML + optional Playwright
 (profile + cookies); `mavely_client.py` creates new links via GraphQL and does not unwrap HTML.
+If GraphQL rejects the app.link host, we optionally call create_link once with the expanded hub URL
+(`MAVELY_GRAPHQL_BRIDGE_FALLBACK`, default on).
 """
 
 from __future__ import annotations
@@ -627,6 +629,20 @@ def resolve_mavely_profile_dir() -> Optional[Path]:
 
 def _mavely_bridge_playwright_enabled() -> bool:
     raw = (os.getenv("MAVELY_BRIDGE_PLAYWRIGHT", "") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    return True
+
+
+def _mavely_graphql_bridge_fallback_enabled() -> bool:
+    """
+    If createAffiliateLink(mavely.app.link/...) fails (GraphQL often returns "not supported" for that host),
+    try once with the HTTP-expanded mavelyinfluencer.com hub URL — the API commonly accepts that input and
+    still returns YOUR tracking link. Disable with MAVELY_GRAPHQL_BRIDGE_FALLBACK=0.
+    """
+    raw = (os.getenv("MAVELY_GRAPHQL_BRIDGE_FALLBACK", "") or "").strip().lower()
     if raw in {"0", "false", "no", "n", "off"}:
         return False
     if raw in {"1", "true", "yes", "y", "on"}:
@@ -2363,9 +2379,9 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
         # Re-wrap mavely.app.link short links into YOUR Mavely link (so forwarded posts always credit you).
         # Other URLs (bit.ly, etc.) that expand to mavelyinfluencer.com are handled after expansion.
         if is_mavely_app_short_link(raw):
-            # Prefer merchant when unwrap succeeded. Never pass influencer bridge URLs into
-            # createAffiliateLink — that is Mavely→Mavely (wrong input / wrong attribution). Only the
-            # final store URL or the app.link short URL are valid API inputs here.
+            # Prefer merchant when unwrap succeeded. Try app.link short URL first for GraphQL; if the API
+            # rejects that host (common), optionally retry once with the expanded hub URL (see
+            # MAVELY_GRAPHQL_BRIDGE_FALLBACK).
             if target and (not is_mavely_link(target)) and (target != raw):
                 target_for_mavely = _strip_tracking_params(target) or target
                 # Amazon: always use your associate tag (and optional Discord mask) — skip Mavely GraphQL for storefront URLs.
@@ -2406,13 +2422,60 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                             else "mavely rewrap failed; fell back to expanded destination (stripped tracking)"
                         )
             else:
-                # No usable expansion: try short link only.
+                # On bridge (or no merchant): GraphQL often rejects createAffiliateLink(mavely.app.link/...).
                 link, err = await mavely_create_link(cfg, raw)
                 if link and not err and link != raw:
                     mapped[u] = link
                     notes[u] = "rewrapped mavely link (direct)"
+                    continue
+                reason = _short_err(err)
+                bridge_u = (_strip_tracking_params(target) or target or "").strip()
+                link_b: Optional[str] = None
+                err_b: Optional[str] = None
+                short_rejected = (
+                    "(mavely.app.link)" in (err or "").lower()
+                    or "mavely.app.link" in (err or "").lower()
+                    or _is_mavely_unsupported(err)
+                )
+                if (
+                    _mavely_graphql_bridge_fallback_enabled()
+                    and bridge_u
+                    and target != raw
+                    and is_mavely_link(target)
+                    and short_rejected
+                ):
+                    _aff_flow(
+                        cfg,
+                        "mavely_graphql create_link bridge_fallback start input=%r (short_err=%r)"
+                        % (_aff_dbg_clip(bridge_u, 100), _aff_dbg_clip(err, 100)),
+                    )
+                    link_b, err_b = await mavely_create_link(cfg, bridge_u)
+                    _aff_flow(
+                        cfg,
+                        "mavely_graphql create_link bridge_fallback done ok=%s err=%r link=%r"
+                        % (
+                            bool(link_b and not err_b),
+                            _aff_dbg_clip(err_b or "", 120),
+                            _aff_dbg_clip(link_b or "", 88),
+                        ),
+                    )
+                if link_b and not err_b and link_b != raw:
+                    mapped[u] = link_b
+                    notes[u] = "rewrapped mavely link (hub GraphQL fallback; app.link rejected by API)"
+                    continue
+                # Repost must still change something: use expanded bridge when we have it (was mapped=0 → no rewrite).
+                if target and target != raw:
+                    mapped[u] = _strip_tracking_params(target) or target
+                    extra = ""
+                    if err_b:
+                        extra = "; hub fallback failed: %s" % _short_err(err_b)
+                    notes[u] = (
+                        (f"rewrap failed ({reason}); expanded to bridge (stripped){extra}")
+                        if reason
+                        else f"rewrap failed; expanded to bridge (stripped){extra}"
+                    )
                 else:
-                    reason = _short_err(err)
+                    mapped[u] = _strip_tracking_params(raw) or raw
                     notes[u] = f"rewrap failed ({reason})" if reason else "rewrap failed (no expanded destination)"
             continue
 
