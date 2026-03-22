@@ -24,8 +24,10 @@ import json
 import os
 import re
 import secrets
+import shutil
 import string
 import subprocess
+import tempfile
 import sys
 import time
 from pathlib import Path
@@ -432,6 +434,348 @@ def is_mavely_link(url: str) -> bool:
     return _mavely_bridge_host(host)
 
 
+def _is_mavely_or_join_host(host: str) -> bool:
+    h = (host or "").strip().lower()
+    if h.startswith("www."):
+        h = h[4:]
+    if not h:
+        return False
+    if _mavely_bridge_host(h):
+        return True
+    if h == "joinmavely.com" or h.endswith(".joinmavely.com"):
+        return True
+    return False
+
+
+def _html_fetch_headers_for_hub(url: str) -> Dict[str, str]:
+    """
+    Mavely bridge pages often sit behind Cloudflare; */* + script UA can yield 403 or a shell
+    without __NEXT_DATA__. Use browser-like Accept (and light Sec-Fetch hints) for HTML unwrap GETs.
+    """
+    ua = (os.getenv("MAVELY_USER_AGENT", "") or "").strip() or (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    )
+    h: Dict[str, str] = {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        host = (urlparse((url or "").strip()).netloc or "").lower()
+    except Exception:
+        host = ""
+    if _is_mavely_or_join_host(host) or "mavely" in host:
+        h["Sec-Fetch-Dest"] = "document"
+        h["Sec-Fetch-Mode"] = "navigate"
+        h["Sec-Fetch-Site"] = "cross-site"
+        h["Upgrade-Insecure-Requests"] = "1"
+        # Cloudflare often blocks datacenter IPs without a real session; reuse Mavely login cookies.
+        ck = (os.getenv("MAVELY_COOKIES", "") or "").strip()
+        if ck:
+            h["Cookie"] = ck
+        base = (os.getenv("MAVELY_BASE_URL", "") or "").strip().rstrip("/") or "https://www.joinmavely.com"
+        h.setdefault("Referer", f"{base}/tools")
+    return h
+
+
+def _fetch_html_via_curl(url: str, headers: Dict[str, str], timeout_s: int) -> Tuple[int, str]:
+    """
+    Cloudflare often serves 403 to aiohttp/Python TLS; system curl sometimes gets real HTML.
+    Used only as a fallback for Mavely bridge unwrap on Linux servers (Oracle).
+    """
+    if not shutil.which("curl"):
+        return 0, ""
+    t = max(5, min(int(timeout_s or 8), 60))
+    path = ""
+    try:
+        fd, path = tempfile.mkstemp(suffix=".html")
+        os.close(fd)
+        cmd: List[str] = [
+            "curl",
+            "-sS",
+            "-L",
+            "--compressed",
+            "-o",
+            path,
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            str(t),
+            "-A",
+            (headers.get("User-Agent") or "Mozilla/5.0").strip(),
+            "-H",
+            (headers.get("Accept") or "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+        ]
+        if headers.get("Cookie"):
+            cmd.extend(["-H", f"Cookie: {headers['Cookie']}"])
+        if headers.get("Referer"):
+            cmd.extend(["-H", f"Referer: {headers['Referer']}"])
+        if headers.get("Accept-Language"):
+            cmd.extend(["-H", f"Accept-Language: {headers['Accept-Language']}"])
+        for k in ("Sec-Fetch-Dest", "Sec-Fetch-Mode", "Sec-Fetch-Site", "Upgrade-Insecure-Requests"):
+            v = headers.get(k)
+            if v:
+                cmd.extend(["-H", f"{k}: {v}"])
+        cmd.append((url or "").strip())
+        cp = subprocess.run(cmd, capture_output=True, text=True, timeout=t + 5, errors="ignore")
+        code_s = (cp.stdout or "").strip()
+        try:
+            code = int(code_s) if code_s.isdigit() else 0
+        except Exception:
+            code = 0
+        body = Path(path).read_text(encoding="utf-8", errors="ignore") if path else ""
+        return code, body
+    except Exception:
+        return 0, ""
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def resolve_mavely_profile_dir() -> Optional[Path]:
+    """
+    Persistent Chromium user-data dir used by mavely_cookie_refresher (MAVELY_PROFILE_DIR).
+    Playwright bridge unwrap reuses this so Cloudflare sees the same logged-in browser.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    profile_raw = (os.getenv("MAVELY_PROFILE_DIR", "") or "").strip()
+    if profile_raw:
+        p = Path(profile_raw)
+        if not p.is_absolute():
+            p = repo_root / p
+    else:
+        p = Path(__file__).resolve().parent / ".mavely_profile"
+    return p if p.is_dir() else None
+
+
+def _mavely_bridge_playwright_enabled() -> bool:
+    raw = (os.getenv("MAVELY_BRIDGE_PLAYWRIGHT", "") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    return True
+
+
+def mavely_bridge_playwright_startup_hint() -> str:
+    """Short status string for optional startup logging (see MAVELY_STARTUP_BRIDGE_HINT)."""
+    try:
+        import playwright.sync_api  # noqa: F401
+    except Exception:
+        return "Mavely bridge: Playwright not installed (pip install playwright && playwright install chromium)"
+    prof = resolve_mavely_profile_dir()
+    if prof is None:
+        return "Mavely bridge: no profile dir (set MAVELY_PROFILE_DIR or run mavely_cookie_refresher to create .mavely_profile)"
+    return f"Mavely bridge: Playwright fallback ready (profile={prof})"
+
+
+def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
+    """
+    Load a Mavely hub URL in Chromium with the cookie-refresher persistent profile.
+    When aiohttp/curl only see a Cloudflare challenge, this often returns real HTML/__NEXT_DATA__.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return ""
+    u = (url or "").strip()
+    if not u.startswith("http"):
+        return ""
+    prof = resolve_mavely_profile_dir()
+    if prof is None:
+        return ""
+    t_ms = max(10_000, min(int(float(timeout_s) * 1000), 120_000))
+    launch_args = ["--disable-session-crashed-bubble", "--disable-dev-shm-usage"]
+    if (os.getenv("MAVELY_PLAYWRIGHT_NO_SANDBOX", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}:
+        launch_args.append("--no-sandbox")
+    headless = (os.getenv("MAVELY_PLAYWRIGHT_HEADLESS", "1") or "").strip().lower() not in {"0", "false", "no", "n", "off"}
+    try:
+        with sync_playwright() as p:
+            ctx = p.chromium.launch_persistent_context(
+                user_data_dir=str(prof),
+                headless=headless,
+                args=launch_args,
+                viewport={"width": 1280, "height": 720},
+            )
+            try:
+                page = ctx.new_page()
+                page.goto(u, wait_until="domcontentloaded", timeout=t_ms)
+                try:
+                    page.wait_for_timeout(2000)
+                except Exception:
+                    pass
+                return page.content() or ""
+            finally:
+                ctx.close()
+    except Exception:
+        return ""
+
+
+_playwright_mavely_lock: Optional[asyncio.Lock] = None
+
+
+def _playwright_mavely_async_lock() -> asyncio.Lock:
+    global _playwright_mavely_lock
+    if _playwright_mavely_lock is None:
+        _playwright_mavely_lock = asyncio.Lock()
+    return _playwright_mavely_lock
+
+
+def _extract_meta_canonical_urls(html: str) -> List[str]:
+    t = html or ""
+    out: List[str] = []
+    for pat in (
+        r'<link[^>]+rel=["\']canonical["\'][^>]*href=["\']([^"\']+)',
+        r'<link[^>]+href=["\']([^"\']+)[^>]*rel=["\']canonical["\']',
+        r'<meta[^>]+property=["\']og:url["\'][^>]*content=["\']([^"\']+)',
+        r'<meta[^>]+content=["\']([^"\']+)[^>]*property=["\']og:url["\']',
+    ):
+        try:
+            for m in re.finditer(pat, t[:500_000], re.IGNORECASE):
+                u = _html.unescape((m.group(1) or "").strip())
+                if u.startswith("http://") or u.startswith("https://"):
+                    out.append(u)
+        except Exception:
+            pass
+    return out
+
+
+def _walk_json_collect_http_urls(obj: Any, acc: List[str], *, max_strings: int = 4000) -> None:
+    if len(acc) >= max_strings:
+        return
+    if isinstance(obj, str):
+        s = obj.strip()
+        if len(s) > 11 and (s.startswith("https://") or s.startswith("http://")):
+            acc.append(s)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _walk_json_collect_http_urls(v, acc, max_strings=max_strings)
+    elif isinstance(obj, list):
+        for v in obj:
+            _walk_json_collect_http_urls(v, acc, max_strings=max_strings)
+
+
+def _extract_next_data_http_urls(html: str) -> List[str]:
+    t = (html or "")[:900_000]
+    try:
+        m = re.search(
+            r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>([\s\S]*?)</script>',
+            t,
+            re.IGNORECASE,
+        )
+    except Exception:
+        m = None
+    if not m:
+        return []
+    raw = (m.group(1) or "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    acc: List[str] = []
+    _walk_json_collect_http_urls(data, acc)
+    return acc
+
+
+_HTML_OUTBOUND_DENY_HOSTS = {
+    "howl.link",
+    "howl.me",
+    "www.cloudflare.com",
+    "cloudflare.com",
+    "www.googletagmanager.com",
+    "googletagmanager.com",
+    "google-analytics.com",
+    "www.google-analytics.com",
+    "doubleclick.net",
+    "facebook.com",
+    "www.facebook.com",
+    "tiktok.com",
+    "www.tiktok.com",
+    "mavelyinfluencer.com",
+    "www.mavelyinfluencer.com",
+    "mavely.app.link",
+    "joinmavely.com",
+    "www.joinmavely.com",
+}
+
+
+def _host_matches_deny_outbound(host: str) -> bool:
+    h = (host or "").strip().lower()
+    if h.startswith("www."):
+        h = h[4:]
+    if not h:
+        return True
+    if h in _HTML_OUTBOUND_DENY_HOSTS:
+        return True
+    if _is_mavely_or_join_host(h):
+        return True
+    return False
+
+
+def _score_merchant_outbound_url(url: str) -> int:
+    """Higher = more likely the real product/deal destination."""
+    u = (url or "").strip()
+    if not u:
+        return -1
+    try:
+        p = urlparse(u)
+        host = (p.netloc or "").lower()
+        path = (p.path or "").lower()
+    except Exception:
+        return -1
+    if _host_matches_deny_outbound(host):
+        return -1
+    if path.endswith((".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".woff", ".woff2")):
+        return -1
+    score = min(len(path) + len(p.query or ""), 500)
+    hl = host.lower()
+    if "amazon." in hl or hl.endswith("amazon.com") or "amzn.to" in hl:
+        score += 130
+    elif any(
+        x in hl
+        for x in (
+            "walmart.com",
+            "woot.com",
+            "target.com",
+            "samsclub.com",
+            "costco.com",
+            "kohls.com",
+            "bestbuy.com",
+            "lowes.com",
+            "homedepot.com",
+            "macys.com",
+            "nordstrom.com",
+            "ebay.com",
+        )
+    ):
+        score += 120
+    if "/offers/" in path or "/product" in path or "/dp/" in path or "/join/" in path:
+        score += 40
+    return score
+
+
+def _pick_best_merchant_url_from_candidates(urls: List[str]) -> Optional[str]:
+    best_u = ""
+    best_s = -1
+    seen: set = set()
+    for u in urls or []:
+        u2 = (u or "").strip()
+        if not u2 or u2 in seen:
+            continue
+        seen.add(u2)
+        s = _score_merchant_outbound_url(u2)
+        if s > best_s:
+            best_s = s
+            best_u = u2
+    return best_u if best_s > 0 else None
+
+
 def _is_cloudflare_or_cdn_error_landing(url: str) -> bool:
     """
     Redirect expansion (e.g. mavely.app.link) can end on Cloudflare's generic 5xx page when the
@@ -727,12 +1071,17 @@ def unwrap_known_query_redirects(url: str) -> Optional[str]:
 
 
 def _extract_first_outbound_url_from_html(html: str) -> Optional[str]:
-    t = (html or "")[:200_000]
+    """
+    Pull the real merchant/deal URL from hub HTML (Mavely bridge, deal sites, etc.).
+    Mavely often serves Next.js: destination lives in __NEXT_DATA__ JSON, not visible <a> tags.
+    """
+    t = (html or "")[:900_000]
     if not t:
         return None
 
+    candidates: List[str] = []
+
     # PerimeterX/other bot challenges often embed the real destination URL as base64 (b=...).
-    # Example seen via howl.link: b=aHR0cHM6Ly93d3cudXJiYW5vdXRmaXR0ZXJzLmNvbS9zaG9w...
     try:
         m_b = re.search(r"[?&]b=([A-Za-z0-9+/=_-]{40,})", t)
     except Exception:
@@ -742,67 +1091,79 @@ def _extract_first_outbound_url_from_html(html: str) -> Optional[str]:
         if decoded:
             decoded = decoded.strip()
             if decoded.startswith("http://") or decoded.startswith("https://"):
-                return decoded
-    # Prefer explicit button links when present.
-    for label in ("Go to Deal", "Continue to Amazon", "Claim Amazon Deal", "Claim Deal"):
-        m_btn = re.search(rf'href="([^"]+)"[^>]*>\s*{re.escape(label)}', t, re.IGNORECASE)
+                candidates.append(decoded)
+
+    candidates.extend(_extract_meta_canonical_urls(t))
+    candidates.extend(_extract_next_data_http_urls(t))
+
+    for label in (
+        "Go to Deal",
+        "Continue to Amazon",
+        "Claim Amazon Deal",
+        "Claim Deal",
+        "Shop Now",
+        "Shop now",
+        "View Deal",
+        "Get deal",
+        "Continue",
+    ):
+        try:
+            m_btn = re.search(rf'href=["\']([^"\']+)["\'][^>]*>\s*{re.escape(label)}', t, re.IGNORECASE)
+        except Exception:
+            m_btn = None
         if m_btn:
-            return _html.unescape((m_btn.group(1) or "").strip()) or None
+            u = _html.unescape((m_btn.group(1) or "").strip())
+            if u.startswith("http://") or u.startswith("https://"):
+                candidates.append(u)
+
     patterns = [
-        # Prefer direct Amazon URLs found in deal pages.
         r"https?://(?:www\.)?amazon\.[^\s\"'<>]+",
         r"https?://amzn\.to/[A-Za-z0-9]+",
         r"https?://saveyourdeals\.com/[A-Za-z0-9]+",
         r"https?://(?:www\.)?dealsabove\.com/[^\s\"'<>]+",
         r"https?://(?:www\.)?walmart\.com/[^\s\"'<>]+",
         r"https?://(?:www\.)?woot\.com/[^\s\"'<>]+",
+        r"https?://(?:www\.)?samsclub\.com/[^\s\"'<>]+",
+        r"https?://(?:www\.)?costco\.com/[^\s\"'<>]+",
+        r"https?://(?:www\.)?kohls\.com/[^\s\"'<>]+",
+        r"https?://(?:www\.)?bestbuy\.com/[^\s\"'<>]+",
+        r"https?://(?:www\.)?lowes\.com/[^\s\"'<>]+",
+        r"https?://(?:www\.)?homedepot\.com/[^\s\"'<>]+",
         r"https?://walmrt\.us/[A-Za-z0-9]+",
         r"https?://(?:www\.)?target\.com/[^\s\"'<>]+",
         r"https?://(?:www\.)?urbanoutfitters\.[^\s\"'<>]+",
         r"https?://bit\.ly/[A-Za-z0-9]+",
     ]
     for pat in patterns:
-        m = re.search(pat, t, re.IGNORECASE)
+        try:
+            m = re.search(pat, t, re.IGNORECASE)
+        except Exception:
+            m = None
         if m:
-            return _html.unescape((m.group(0) or "").strip()) or None
+            u = _html.unescape((m.group(0) or "").strip())
+            if u.startswith("http://") or u.startswith("https://"):
+                candidates.append(u)
 
-    # Fallback: first outbound-looking https link from an anchor tag.
-    # This helps for hubs like howl.link that may render a "continue" page instead of a redirect.
     try:
-        hrefs = re.findall(r'href="(https?://[^"]+)"', t, re.IGNORECASE)
+        hrefs = re.findall(r'href=["\'](https?://[^"\']+)["\']', t, re.IGNORECASE)
     except Exception:
         hrefs = []
-    if hrefs:
-        deny_hosts = {
-            "howl.link",
-            "howl.me",
-            "www.cloudflare.com",
-            "cloudflare.com",
-            "www.googletagmanager.com",
-            "googletagmanager.com",
-            "google-analytics.com",
-            "www.google-analytics.com",
-            "doubleclick.net",
-            "facebook.com",
-            "www.facebook.com",
-            "tiktok.com",
-            "www.tiktok.com",
-        }
-        deny_exts = (".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".woff", ".woff2", ".ttf")
-        for h in hrefs[:60]:
-            cand = _html.unescape((h or "").strip())
-            if not (cand.startswith("http://") or cand.startswith("https://")):
-                continue
-            try:
-                host = (urlparse(cand).netloc or "").lower()
-            except Exception:
-                host = ""
-            if host in deny_hosts:
-                continue
-            if cand.lower().split("?", 1)[0].endswith(deny_exts):
-                continue
-            return cand
-    return None
+    deny_exts = (".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".woff", ".woff2", ".ttf")
+    for h in hrefs[:100]:
+        cand = _html.unescape((h or "").strip())
+        if not (cand.startswith("http://") or cand.startswith("https://")):
+            continue
+        try:
+            host = (urlparse(cand).netloc or "").lower()
+        except Exception:
+            host = ""
+        if _host_matches_deny_outbound(host):
+            continue
+        if cand.lower().split("?", 1)[0].endswith(deny_exts):
+            continue
+        candidates.append(cand)
+
+    return _pick_best_merchant_url_from_candidates(candidates)
 
 
 async def expand_url(session: aiohttp.ClientSession, url: str, *, timeout_s: float = 8.0, max_redirects: int = 8) -> str:
@@ -1191,6 +1552,8 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
             resolved[u] = cand
 
     if expand_enabled:
+        _apply_env_from_cfg(cfg)
+        _reload_mavely_cookies_from_file(force=False)
         async with aiohttp.ClientSession() as session:
             for u in candidates:
                 start_u = (resolved.get(u) or u).strip()
@@ -1275,8 +1638,48 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                         if host not in special_html_hosts:
                             break
                         try:
-                            async with session.get(candidate, timeout=aiohttp.ClientTimeout(total=float(timeout_s))) as resp:
+                            _hub_headers = _html_fetch_headers_for_hub(candidate)
+                            async with session.get(
+                                candidate,
+                                headers=_hub_headers,
+                                timeout=aiohttp.ClientTimeout(total=float(timeout_s)),
+                            ) as resp:
+                                status = int(resp.status or 0)
                                 txt = await resp.text(errors="ignore")
+                            # Cloudflare often returns 403 to Python/aiohttp even with Mavely cookies; try curl TLS stack.
+                            if (
+                                (status >= 400 or "__NEXT_DATA__" not in (txt or ""))
+                                and ("mavelyinfluencer.com" in host or "mavely.app.link" in host)
+                            ):
+                                ccode, cbody = await asyncio.to_thread(
+                                    _fetch_html_via_curl, candidate, _hub_headers, int(timeout_s)
+                                )
+                                if cbody and ("__NEXT_DATA__" in cbody or _extract_first_outbound_url_from_html(cbody)):
+                                    txt = cbody
+                            # Real browser + same profile as mavely_cookie_refresher (cf_clearance / session).
+                            if _mavely_bridge_playwright_enabled() and (
+                                "mavelyinfluencer.com" in host or "mavely.app.link" in host
+                            ):
+                                need_pw = status >= 400 or "__NEXT_DATA__" not in (txt or "")
+                                if not need_pw:
+                                    need_pw = not bool(_extract_first_outbound_url_from_html(txt or ""))
+                                if need_pw and resolve_mavely_profile_dir() is not None:
+                                    async with _playwright_mavely_async_lock():
+                                        pw_html = await asyncio.to_thread(
+                                            _fetch_mavely_html_via_playwright_sync,
+                                            candidate,
+                                            int(timeout_s),
+                                        )
+                                    if pw_html and (
+                                        "__NEXT_DATA__" in pw_html
+                                        or _extract_first_outbound_url_from_html(pw_html)
+                                    ):
+                                        txt = pw_html
+                                        _aff_dbg_verbose(
+                                            cfg,
+                                            "  html_unwrap playwright %r -> len=%s"
+                                            % (_aff_dbg_clip(candidate, 72), len(pw_html)),
+                                        )
                             out = _extract_first_outbound_url_from_html(txt)
                             if not out:
                                 break
@@ -1397,6 +1800,12 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                     notes[u] = "rewrapped mavely link (direct)"
                 else:
                     reason = _short_err(err)
+                    if target and target != raw and is_mavely_link(target):
+                        link_b, err_b = await mavely_create_link(cfg, target)
+                        if link_b and not err_b and link_b != raw:
+                            mapped[u] = link_b
+                            notes[u] = "rewrapped mavely link (GraphQL from influencer bridge URL)"
+                            continue
                     notes[u] = f"rewrap failed ({reason})" if reason else "rewrap failed (no expanded destination)"
             continue
 
@@ -1407,6 +1816,11 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
             if link_bridge and not err_bridge and link_bridge != raw:
                 mapped[u] = link_bridge
                 notes[u] = "mavely affiliate (API from original URL; avoided bridge pass-through)"
+                continue
+            link_from_bridge, err_br2 = await mavely_create_link(cfg, target)
+            if link_from_bridge and not err_br2 and link_from_bridge != raw:
+                mapped[u] = link_from_bridge
+                notes[u] = "mavely affiliate (GraphQL from influencer bridge; original URL rejected)"
                 continue
             notes[u] = (
                 "expand landed on Mavely bridge; API from original failed — left URL unchanged "
@@ -1509,7 +1923,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                 )
             _aff_dbg(
                 cfg,
-                "compute: %d url(s) expand=%s amazon_tag=%s | %s"
+                "compute: %d url(s) expand=%s amazon_assoc_configured=%s | %s"
                 % (
                     len(candidates),
                     expand_enabled,

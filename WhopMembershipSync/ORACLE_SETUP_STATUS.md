@@ -6,7 +6,7 @@ Get WhopMembershipSync **live and running on Oracle** (Ubuntu server at `/home/r
 
 ## Full setup from your PC (recommended)
 
-1. **Ensure Oracle is in `oraclekeys/servers.json`** (name, user, host, key, remote_root). Same config as other Oracle tools.
+1. **Ensure Oracle is in `oraclekeys/servers.json`** (name, user, host, key, remote_root). Same config as other Oracle tools. SSH private keys on this workspace live under **`oracleserverkeys/`** (see **`CANONICAL_RULES.md`** → Ubuntu access).
 2. **Run the full-setup script** (syncs code + systemd unit, then runs on-Oracle install and enable):
    ```bat
    python scripts/setup_whopmembershipsync_on_oracle.py

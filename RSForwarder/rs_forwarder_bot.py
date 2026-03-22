@@ -4622,6 +4622,18 @@ class RSForwarderBot:
                         ok, status, err = await affiliate_rewriter.mavely_preflight(self.config)
                         if ok:
                             print(f"{Colors.GREEN}[Affiliate] ✅ Mavely preflight OK{Colors.RESET} (status={status})")
+                            if (os.getenv("MAVELY_STARTUP_BRIDGE_HINT", "") or "").strip().lower() in {
+                                "1",
+                                "true",
+                                "yes",
+                                "y",
+                                "on",
+                            }:
+                                bh = affiliate_rewriter.mavely_bridge_playwright_startup_hint()
+                                if "ready" in bh.lower():
+                                    print(f"{Colors.GREEN}[Affiliate] ✅ {bh}{Colors.RESET}")
+                                else:
+                                    print(f"{Colors.YELLOW}[Affiliate] ⚠️  {bh}{Colors.RESET}")
                         else:
                             # Keep error short (never print cookies/tokens)
                             msg = (err or "unknown error").replace("\n", " ").strip()

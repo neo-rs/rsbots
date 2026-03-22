@@ -26,6 +26,11 @@
 !oraclekeys/
 !oraclekeys/servers.json
 
+# Local Oracle SSH keys folder (override blanket * so Cursor/git see files here).
+# Still override **/*.key below so keys are not globally ignored under this path.
+!oracleserverkeys/
+!oracleserverkeys/**
+
 # Only allow python from the RS bot folders
 !RSAdminBot/
 !RSAdminBot/**/

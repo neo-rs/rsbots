@@ -118,7 +118,7 @@ Example (MWBots /discum): `_format_channel_mention(channel_id)` in `MWDiscumBot/
   - **MWDiscumBot/config/** must contain: `settings.json` (with `destination_guild_ids`, `fetchall_*`, `fetchsync_*`, `use_webhooks_for_forwarding`, etc.), `fetchall_mappings.json` (and optionally `fetchall_mappings.runtime.json`, `destination_webhooks.json`). These are the canonical fetchall config files.
   - **MWDataManagerBot** must not run fetchall or use the user token. Its `config/` may still contain an old `fetchall_mappings.json` from before migration; that file is not used by DataManagerBot and can be removed or left for reference.
 - **Instorebotforwarder (local vs Oracle):** Canonical **source tree** for Instore is **`MWBots/Instorebotforwarder`** (the nested **MWBots** git repo that becomes **`mwbots-code`** on Oracle). **`/mwupdate instorebotforwarder`** copies tracked files from that checkout into the live **`/home/rsadmin/bots/mirror-world/Instorebotforwarder`** tree. Publish code with **`push_mwbots_py_only.bat`** (same as other MW bots). The mirror-world repo root no longer carries a duplicate **`Instorebotforwarder/`** folder; scripts use **`mirror_world_config.instore_bot_dir()`** and **`ensure_mwbots_import_path()`** when they need to load config or `import Instorebotforwarder`.
-- **Whole-folder Instore download from Oracle:** `py -3 scripts/download_instorebotforwarder_direct.py --apply-mwbots` (or **`oracle_tools_menu_mwbots.bat`** → **[7]** / **[8]**). That uses **`oraclekeys/servers.json`** + your **`oraclekeys/ssh-key-*.key`** (see **Ubuntu access** below). The multi-bot snapshot **`download_oracle_snapshot_mwbots.py`** still uses excludes on the *main* tar; after extract it downloads a **second** tar of **only** `Instorebotforwarder` with **no** excludes and merges it so snapshot Instore matches the direct script (modulo Windows path-length skips on extract). Pass **`--skip-instore-full-merge`** to skip that second tar.
+- **Whole-folder Instore download from Oracle:** `py -3 scripts/download_instorebotforwarder_direct.py --apply-mwbots` (or **`oracle_tools_menu_mwbots.bat`** → **[7]** / **[8]**). That uses **`oraclekeys/servers.json`** + your SSH private key (see **Ubuntu access** — keys live under **`oracleserverkeys/`** on this workspace). The multi-bot snapshot **`download_oracle_snapshot_mwbots.py`** still uses excludes on the *main* tar; after extract it downloads a **second** tar of **only** `Instorebotforwarder` with **no** excludes and merges it so snapshot Instore matches the direct script (modulo Windows path-length skips on extract). Pass **`--skip-instore-full-merge`** to skip that second tar.
 - **Baseline check (MWBots):** Use `oracle_baseline_check_mwbots.bat --download` to download a fresh Oracle snapshot and compare. If your local bot folders live under `MWBots/` (not at repo root), run with `--local-root MWBots` so the manifest compares the same structure:
   - `py -3 scripts/oracle_baseline_check_mwbots.py --download --local-root MWBots`
 - **Config sync:** `download_oracle_snapshot_mwbots.py` copies from the snapshot into local `MWBots/<bot>/config/` for: `channel_map.json`, `source_channels.json`, `destination_channels.json`, `settings.json`, `fetchall_mappings.json`. So after a full download, local config (including fetchall_mappings.json for DiscumBot) matches the server snapshot. Re-apply any local-only settings (e.g. fetchall keys in DiscumBot `settings.json`) if the server snapshot did not yet include them.
@@ -134,11 +134,12 @@ This section documents the canonical operational workflow for managing RS bots o
 ### Source of truth: server target and key
 
 - **Server list (non-secret, tracked in git)**: `oraclekeys/servers.json`
-- **SSH private key (secret, NEVER committed)**: `oraclekeys/ssh-key-*.key` (or `oraclekey/` — scripts check both).
-  - Example absolute path (Windows): `C:\Users\apaap\OneDrive\Desktop\mirror-world\oraclekeys\ssh-key-2025-12-15.key`
-  - The `key` field in `oraclekeys/servers.json` is typically a **filename**, e.g. `"ssh-key-2025-12-15.key"`.
-  - After a Windows reinstall/clone, you must restore the `.key` file from your private backup into `oraclekeys/` (or `oraclekey/`).
-  - **Example (Windows)**: `ssh -i oraclekeys/ssh-key-2025-12-15.key rsadmin@137.131.14.157`
+- **SSH private key (secret, NEVER committed)** — where to put it on this machine:
+  - **Primary (this workspace)**: **`oracleserverkeys/`** at the repo root, e.g. `mirror-world/oracleserverkeys/ssh-key-2025-12-15.key` (full path example: `C:\Users\apaap\OneDrive\Desktop\mirror-world\oracleserverkeys\ssh-key-2025-12-15.key`). The repo root **`.gitignore`** un-ignores `oracleserverkeys/` so the folder shows up in `git status`; **`oracleserverkeys/.gitignore`** lists `*.key` / `*.pem` / `*.ppk` so private key files stay **untrackable**—do not `git add` keys. You may commit a duplicate **`servers.json`** here only if it contains no secrets.
+  - **Also used by some automation**: `oraclekeys/<same-filename>` or `oraclekey/<same-filename>` — several scripts resolve the key relative to `oraclekeys/` first; if a script cannot find the key, **copy or symlink** the file from `oracleserverkeys/` into `oraclekeys/`, or pass an **absolute** `-i` path to `ssh`.
+  - The `key` field in `oraclekeys/servers.json` is typically a **filename only**, e.g. `"ssh-key-2025-12-15.key"` (not a full path).
+  - After a Windows reinstall/clone, restore `.key` files from your private backup into **`oracleserverkeys/`** (and into `oraclekeys/` if a given script still expects that layout).
+  - **Example (Windows, absolute key path)**: `ssh -i "C:\Users\apaap\OneDrive\Desktop\mirror-world\oracleserverkeys\ssh-key-2025-12-15.key" rsadmin@137.131.14.157`
 - **Ubuntu repo root**: `/home/<user>/bots/mirror-world` (usually `/home/rsadmin/bots/mirror-world`)
   - **Note (Ubuntu local-exec mode)**: when you are already on Oracle Ubuntu and `local_exec=yes`, no SSH key is needed.
 
@@ -148,7 +149,7 @@ If you are on Windows, treat SSH invocation as **canonical infrastructure**, not
 
 #### Absolute path rule (prevents System32 issues)
 
-- If you run SSH from `C:\Windows\System32`, relative paths like `oraclekeys/ssh-key-*.key` **will not resolve**.
+- If you run SSH from `C:\Windows\System32`, relative paths like `oracleserverkeys\ssh-key-*.key` or `oraclekeys\ssh-key-*.key` **will not resolve**.
 - Canonical rule: either
   - `cd` to the repo root first, OR
   - use an **absolute** key path.
@@ -164,13 +165,13 @@ PowerShell can sometimes mis-parse remote command strings (especially with `&&`,
 
 #### Key permissions (fixes "UNPROTECTED PRIVATE KEY FILE" / "bad permissions")
 
-If OpenSSH refuses the key due to Windows ACLs, run (Windows, repo root):
+If OpenSSH refuses the key due to Windows ACLs, run (Windows, use the path where your `.key` actually lives — **`oracleserverkeys`** is canonical on this machine):
 
-- `icacls "oraclekeys\ssh-key-2025-12-15.key" /reset`
-- `icacls "oraclekeys\ssh-key-2025-12-15.key" /inheritance:r`
-- `icacls "oraclekeys\ssh-key-2025-12-15.key" /grant:r "%USERDOMAIN%\%USERNAME%:R"`
+- `icacls "oracleserverkeys\ssh-key-2025-12-15.key" /reset`
+- `icacls "oracleserverkeys\ssh-key-2025-12-15.key" /inheritance:r`
+- `icacls "oracleserverkeys\ssh-key-2025-12-15.key" /grant:r "%USERDOMAIN%\%USERNAME%:R"`
 
-Then retry SSH.
+Then retry SSH. (If the key is only under `oraclekeys\`, run the same three commands with that path instead.)
 
 #### Canonical SSH options (stable tunnels / no prompts)
 
