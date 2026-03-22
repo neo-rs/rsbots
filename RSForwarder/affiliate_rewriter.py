@@ -21,7 +21,7 @@ Default redirect + hub HTML timeouts are 5s unless overridden (`affiliate_expand
 `AUTO_AFFILIATE_EXPAND_TIMEOUT_S`, `affiliate_hub_html_timeout_s` / `AUTO_AFFILIATE_HUB_HTML_TIMEOUT_S`).
 
 Mavely short links (`mavely.app.link`) are not bit.ly-style “pure redirects”: HTTP expand often stops at
-`mavelyinfluencer.com` (bridge). Shared Branch/query helpers and no-profile headless Chromium live in
+`mavelyinfluencer.com` or `mavelylife.com` (bridge). Shared Branch/query helpers and no-profile headless Chromium live in
 `mavely_link_resolve.py` (single source of truth with `Mavelytest/mavely_link_tester.py`). Final destinations
 are still recovered here via hub HTML + Playwright (persistent profile when present); `mavely_client.py`
 creates new links via GraphQL and does not unwrap HTML.
@@ -447,30 +447,13 @@ def _is_markdown_link_target_context(text: str, start: int, end: int) -> bool:
 
 
 def _mavely_bridge_host(host: str) -> bool:
-    """
-    True if this host is still on Mavely's tracking layer (not the final merchant).
-    Expanding mavely.app.link often lands on mavelyinfluencer.com/u/<creator> — that URL
-    credits whoever created the original link, not us. We must unwrap further or rewrap via API.
-    """
-    h = (host or "").strip().lower()
-    if h.startswith("www."):
-        h = h[4:]
-    if not h:
-        return False
-    if h == "mavelyinfluencer.com" or h.endswith(".mavelyinfluencer.com"):
-        return True
-    if h == "mavely.app.link" or h.endswith(".mavely.app.link"):
-        return True
-    return False
+    """Delegate to mavely_link_resolve (single list of Branch / Mavely hub hosts)."""
+    return _mavely_resolve.host_is_mavely_bridge_surface(host or "")
 
 
 def _url_is_mavely_bridge_surface(url: str) -> bool:
-    """True if URL is still mavely.app.link / mavelyinfluencer.com (real browsers often SPA-redirect to the merchant)."""
-    try:
-        h = (urlparse((url or "").strip()).netloc or "").lower()
-    except Exception:
-        return True
-    return _mavely_bridge_host(h)
+    """True while the address bar is still on a Mavely hub (SPA may still redirect to the merchant)."""
+    return _mavely_resolve.url_is_mavely_bridge_surface(url or "")
 
 
 def is_mavely_app_short_link(url: str) -> bool:
@@ -486,7 +469,7 @@ def is_mavely_app_short_link(url: str) -> bool:
 
 def is_mavely_link(url: str) -> bool:
     """
-    True for any Mavely tracking surface (app.link short links or mavelyinfluencer.com bridge pages).
+    True for any Mavely tracking surface (app.link shorts and hub domains such as mavelyinfluencer.com / mavelylife.com).
     Use for *target* checks: if still a bridge, we must not treat it as the final merchant URL.
     """
     try:
@@ -547,7 +530,7 @@ def _expand_redirect_headers(url: str) -> Dict[str, str]:
 
     dealshacks / hiddendealsociety: plain HEAD/GET + */* is usually enough (302 chain).
 
-    mavely.app.link / mavelyinfluencer.com: use the same browser + Cookie profile as hub HTML GETs
+    Mavely hub hosts (app.link, mavelyinfluencer.com, mavelylife.com): use the same browser + Cookie profile as hub HTML GETs
     so Branch / Cloudflare see a document navigation, not a script probe — often yields longer 302 chains
     or the same HTML shell we then unwrap (parity with special_html_hosts handling).
     """
@@ -643,7 +626,7 @@ def _mavely_bridge_playwright_enabled() -> bool:
 def _mavely_graphql_bridge_fallback_enabled() -> bool:
     """
     If createAffiliateLink(mavely.app.link/...) fails (GraphQL often returns "not supported" for that host),
-    try once with the HTTP-expanded mavelyinfluencer.com hub URL — the API commonly accepts that input and
+    try once with the HTTP-expanded Mavely hub URL (mavelyinfluencer.com / mavelylife.com) — the API commonly accepts that input and
     still returns YOUR tracking link. Disable with MAVELY_GRAPHQL_BRIDGE_FALLBACK=0.
     """
     raw = (os.getenv("MAVELY_GRAPHQL_BRIDGE_FALLBACK", "") or "").strip().lower()
@@ -970,6 +953,8 @@ _HTML_OUTBOUND_DENY_HOSTS = {
     "www.tiktok.com",
     "mavelyinfluencer.com",
     "www.mavelyinfluencer.com",
+    "mavelylife.com",
+    "www.mavelylife.com",
     "mavely.app.link",
     "joinmavely.com",
     "www.joinmavely.com",
@@ -1352,6 +1337,8 @@ def should_expand_url(url: str) -> bool:
         "mavely.app.link",
         "mavelyinfluencer.com",
         "www.mavelyinfluencer.com",
+        "mavelylife.com",
+        "www.mavelylife.com",
         # Redirect chains seen from go.sylikes.com -> rd.bizrate.com -> go.skimresources.com -> merchant
         "go.sylikes.com",
         "rd.bizrate.com",
@@ -2117,6 +2104,8 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                         "mavely.app.link",
                         "mavelyinfluencer.com",
                         "www.mavelyinfluencer.com",
+                        "mavelylife.com",
+                        "www.mavelylife.com",
                         "go.sylikes.com",
                         "rd.bizrate.com",
                         "go.skimresources.com",
@@ -2217,7 +2206,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                         _aff_dbg_clip(candidate, 88),
                                     ),
                                 )
-                            mv_hub = "mavelyinfluencer.com" in host or "mavely.app.link" in host
+                            mv_hub = _mavely_bridge_host(host)
                             # Cloudflare often returns 403 to Python/aiohttp even with Mavely cookies; try curl TLS stack.
                             if mv_hub and (status >= 400 or "__NEXT_DATA__" not in (txt or "")):
                                 ccode, cbody = await asyncio.to_thread(
@@ -2233,9 +2222,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                 if cbody and _first_production_outbound_from_hub_html(cbody):
                                     txt = cbody
                             # Real browser + same profile as mavely_cookie_refresher (cf_clearance / session).
-                            if _mavely_bridge_playwright_enabled() and (
-                                "mavelyinfluencer.com" in host or "mavely.app.link" in host
-                            ):
+                            if _mavely_bridge_playwright_enabled() and _mavely_bridge_host(host):
                                 have_merchant = bool(_first_production_outbound_from_hub_html(txt or ""))
                                 need_pw = (
                                     (status >= 400)

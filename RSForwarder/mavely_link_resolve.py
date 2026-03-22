@@ -47,18 +47,40 @@ def decode_query_value(raw: str) -> str:
     return s.strip()
 
 
-def url_is_mavely_bridge_surface(url: str) -> bool:
-    try:
-        h = (urlparse((url or "").strip()).netloc or "").lower()
-    except Exception:
-        return True
+def _strip_www_and_port(netloc: str) -> str:
+    h = (netloc or "").strip().lower()
     if h.startswith("www."):
         h = h[4:]
-    if h == "mavelyinfluencer.com" or h.endswith(".mavelyinfluencer.com"):
-        return True
+    if ":" in h and not h.startswith("["):
+        left, _, right = h.rpartition(":")
+        if right.isdigit():
+            h = left
+    return h
+
+
+def host_is_mavely_bridge_surface(netloc: str) -> bool:
+    """
+    True if host (urlparse netloc) is still Mavely / Branch tracking, not the merchant.
+    Covers app.link shorts, mavelyinfluencer.com, and mavelylife.com hub pages (/u/...).
+    """
+    h = _strip_www_and_port(netloc)
+    if not h:
+        return False
     if h == "mavely.app.link" or h.endswith(".mavely.app.link"):
         return True
+    if h == "mavelyinfluencer.com" or h.endswith(".mavelyinfluencer.com"):
+        return True
+    if h == "mavelylife.com" or h.endswith(".mavelylife.com"):
+        return True
     return False
+
+
+def url_is_mavely_bridge_surface(url: str) -> bool:
+    try:
+        netloc = (urlparse((url or "").strip()).netloc or "").lower()
+    except Exception:
+        return True
+    return host_is_mavely_bridge_surface(netloc)
 
 
 def iter_embedded_https_urls_from_query(url: str) -> Iterator[str]:
