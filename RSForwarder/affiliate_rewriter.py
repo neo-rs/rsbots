@@ -757,7 +757,50 @@ def _score_merchant_outbound_url(url: str) -> int:
         score += 120
     if "/offers/" in path or "/product" in path or "/dp/" in path or "/join/" in path:
         score += 40
+    if "woot.com" in hl:
+        if hl.startswith("account.") or hl.startswith("auth."):
+            score -= 220
+        if "/welcome" in path or "/signin" in path or "/signup" in path or "/authorize" in path:
+            score -= 140
     return score
+
+
+def _expand_woot_gatekeeper_url(url: str) -> Optional[str]:
+    """
+    Woot often links via account.woot.com/welcome?...&returnUrl=https%3A%2F%2Fwww.woot.com%2Foffers%2F...
+    Prefer the decoded returnUrl (real offer) over the signup gate page.
+    """
+    u = (url or "").strip()
+    if not u:
+        return None
+    try:
+        p = urlparse(u)
+        host = (p.netloc or "").lower()
+        path = (p.path or "").lower()
+    except Exception:
+        return None
+    if "woot.com" not in host:
+        return None
+    is_gate = host.startswith("account.") or host.startswith("auth.")
+    if not is_gate and "/welcome" not in path and "/signin" not in path and "/signup" not in path:
+        return None
+    q = {k.lower(): v for k, v in parse_qsl(p.query or "", keep_blank_values=True)}
+    for key in ("returnurl", "redirect", "redirect_uri", "redirecturi", "next", "destination", "continue"):
+        v = (q.get(key) or "").strip()
+        if not v:
+            continue
+        v2 = unquote(v)
+        if "%" in v2:
+            v2 = unquote(v2)
+        if not (v2.startswith("http://") or v2.startswith("https://")):
+            continue
+        try:
+            h2 = (urlparse(v2).netloc or "").lower()
+        except Exception:
+            continue
+        if "woot.com" in h2:
+            return v2
+    return None
 
 
 def _pick_best_merchant_url_from_candidates(urls: List[str]) -> Optional[str]:
@@ -1163,7 +1206,40 @@ def _extract_first_outbound_url_from_html(html: str) -> Optional[str]:
             continue
         candidates.append(cand)
 
-    return _pick_best_merchant_url_from_candidates(candidates)
+    # Woot: peel returnUrl=... from gatekeeper pages into real www.woot.com/offers/... links.
+    peeled: List[str] = []
+    for u in list(candidates):
+        g = _expand_woot_gatekeeper_url(u)
+        if g:
+            peeled.append(g)
+    candidates.extend(peeled)
+    try:
+        for m in re.finditer(r"(?:returnUrl|return_url)=([^&\s\"'<>]+)", t[:400_000], re.IGNORECASE):
+            raw = (m.group(1) or "").strip()
+            cand = unquote(raw)
+            if "%" in cand:
+                cand = unquote(cand)
+            if not (cand.startswith("http://") or cand.startswith("https://")):
+                continue
+            try:
+                ph = (urlparse(cand).path or "").lower()
+                hh = (urlparse(cand).netloc or "").lower()
+            except Exception:
+                continue
+            if "woot.com" in hh and "/offers/" in ph:
+                candidates.append(cand)
+    except Exception:
+        pass
+
+    best = _pick_best_merchant_url_from_candidates(candidates)
+    if best:
+        for _ in range(3):
+            nxt = _expand_woot_gatekeeper_url(best)
+            if nxt and nxt != best:
+                best = nxt
+            else:
+                break
+    return best
 
 
 async def expand_url(session: aiohttp.ClientSession, url: str, *, timeout_s: float = 8.0, max_redirects: int = 8) -> str:
