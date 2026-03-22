@@ -80,6 +80,32 @@ RSSuccessBot manages the success points system for Reselling Secrets. Members ea
 - **Admin Only**: No
 - **Returns**: Private embed with redemption tiers and interactive buttons
 
+#### `/rsmarketplace`
+- **Description**: Open your marketplace profile setup panel (create, update, publish, or disable your public marketplace card)
+- **Aliases**: None
+- **Parameters**: None
+- **Usage**: `/rsmarketplace`
+- **Admin Only**: No
+- **Returns**: Ephemeral panel with buttons; public card is posted to the configured marketplace channel when you publish
+
+#### `/rsmarketview`
+- **Description**: View a member's saved marketplace profile privately (embed preview)
+- **Aliases**: None
+- **Parameters**:
+  - `user`: Discord user (required)
+- **Usage**: `/rsmarketview user:@member`
+- **Admin Only**: No
+- **Returns**: Ephemeral marketplace profile embed
+
+#### `/rsmarketsearch`
+- **Description**: Search marketplace profiles by a keyword (matches bio, featured title, and interest tags)
+- **Aliases**: None
+- **Parameters**:
+  - `keyword`: Search text (required)
+- **Usage**: `/rsmarketsearch keyword:sneakers`
+- **Admin Only**: No
+- **Returns**: Ephemeral list of matching member mentions (up to 20)
+
 ### Configuration Commands (Admin)
 
 #### `!status`
@@ -235,6 +261,23 @@ RSSuccessBot manages the success points system for Reselling Secrets. Members ea
 - **Admin Only**: Yes (requires manage_messages permission)
 - **Returns**: Import statistics (new users, updated users, errors)
 
+#### `!marketcleanup`
+- **Description**: Audit marketplace profile records (missing messages, bad channels, etc.) and print a summary
+- **Aliases**: None
+- **Parameters**: None
+- **Usage**: `!marketcleanup`
+- **Admin Only**: Yes (requires manage_messages permission)
+- **Returns**: Code block summary in-channel
+
+#### `!marketrepublish`
+- **Description**: Force republish or repair a member's marketplace profile message in the marketplace channel
+- **Aliases**: None
+- **Parameters**:
+  - `member`: Discord member mention (required)
+- **Usage**: `!marketrepublish @member`
+- **Admin Only**: Yes (requires manage_messages permission)
+- **Returns**: Confirmation in-channel after republish attempt
+
 #### `!postpointsguide`
 - **Description**: Post the points guide to a channel
 - **Aliases**: None
@@ -246,9 +289,9 @@ RSSuccessBot manages the success points system for Reselling Secrets. Members ea
 
 ## Command Summary
 
-- **Total Commands**: 27 (23 prefix + 4 slash)
-- **Admin Commands**: 23 (all prefix commands)
-- **Public Commands**: 4 (all slash commands)
+- **Total Commands**: 32 (25 prefix + 7 slash)
+- **Admin Commands**: 25 (all prefix commands)
+- **Public Commands**: 7 (all slash commands)
 - **Commands with Aliases**: 4
 - **Command Prefix**: `!` for prefix commands, `/` for slash commands
 
@@ -263,3 +306,4 @@ RSSuccessBot manages the success points system for Reselling Secrets. Members ea
 - Redemption requires staff approval (points are not auto-deducted)
 - All point movements are logged to a points log channel if configured
 - Tier names must be unique (case-insensitive check)
+- Marketplace profiles are stored in `marketplace_profiles.json`. Set `marketplace_channel_id` (and optionally `marketplace_offer_log_channel_id`) in `config.json` to enable publishing and staff offer logs. Set `marketplace_enabled` to `false` to disable marketplace slash commands and persistent view registration.

@@ -531,7 +531,7 @@ Out-of-scope for RSCheckerbot reporting (do not use unless explicitly required):
 Each bot has its own COMMANDS.md file:
 - `RSAdminBot/COMMANDS.md` - RSAdminBot commands (43 commands)
 - `RSForwarder/COMMANDS.md` - RSForwarder commands (12 commands)
-- `RSuccessBot/COMMANDS.md` - RSSuccessBot commands (27 commands: 23 prefix + 4 slash)
+- `RSuccessBot/COMMANDS.md` - RSSuccessBot commands (32 commands: 25 prefix + 7 slash)
 - `RSMentionPinger/COMMANDS.md` - RSMentionPinger commands (5 commands)
 - `RSOnboarding/COMMANDS.md` - RSOnboarding commands (10 commands)
 - `RSCheckerbot/COMMANDS.md` - RSCheckerbot commands (12 commands)

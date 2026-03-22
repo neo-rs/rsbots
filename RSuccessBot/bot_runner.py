@@ -27,6 +27,7 @@ from mirror_world_config import is_placeholder_secret, mask_secret
 # Import bot modules
 from rs_success_bot import RSSuccessBot
 from rs_vouch_bot import RSVouchBot
+from rs_marketplace_bot import RSMarketplaceBot
 
 # Colors for terminal
 class Colors:
@@ -50,6 +51,7 @@ class RSBotRunner:
         self.bot: Optional[commands.Bot] = None
         self.success_bot: Optional[RSSuccessBot] = None
         self.vouch_bot: Optional[RSVouchBot] = None
+        self.marketplace_bot: Optional[RSMarketplaceBot] = None
         
         self.load_config()
         self.create_shared_bot()
@@ -104,6 +106,16 @@ class RSBotRunner:
             print(f"{Colors.GREEN}[Runner] ✅ Vouch Bot module initialized{Colors.RESET}")
         except Exception as e:
             print(f"{Colors.RED}[Runner] ❌ Failed to initialize Vouch Bot: {e}{Colors.RESET}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+
+        # Marketplace Profiler (slash + prefix commands on same tree / bot)
+        try:
+            self.marketplace_bot = RSMarketplaceBot(bot_instance=self.bot)
+            print(f"{Colors.GREEN}[Runner] ✅ Marketplace module initialized{Colors.RESET}")
+        except Exception as e:
+            print(f"{Colors.RED}[Runner] ❌ Failed to initialize Marketplace module: {e}{Colors.RESET}")
             import traceback
             traceback.print_exc()
             sys.exit(1)
