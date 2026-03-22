@@ -279,25 +279,28 @@ class FeaturedProductModal(discord.ui.Modal):
 
 
 class FeaturedListingPickSelect(discord.ui.Select):
-    def __init__(self, parent: "FeaturedListManageView", options: List[discord.SelectOption]):
+    """References the owning view via manage_view — do not use name `parent` (reserved on discord.ui.Item)."""
+
+    def __init__(self, manage_view: "FeaturedListManageView", options: List[discord.SelectOption]):
         super().__init__(placeholder="Choose a listing to edit or remove…", options=options, row=0)
-        self.parent = parent
+        self.manage_view = manage_view
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.parent.user_id:
+        mv = self.manage_view
+        if interaction.user.id != mv.user_id:
             await interaction.response.send_message("This panel is only for the member who opened it.", ephemeral=True)
             return
-        self.parent.selected_raw_index = int(self.values[0])
-        profile = self.parent.module.get_or_create_profile(self.parent.user_id)
+        mv.selected_raw_index = int(self.values[0])
+        profile = mv.module.get_or_create_profile(mv.user_id)
         full = profile.get("featured_products") or []
-        j = self.parent.selected_raw_index
+        j = mv.selected_raw_index
         if j < 0 or j >= len(full):
             await interaction.response.send_message("That listing was removed. Open **Manage featured** again.", ephemeral=True)
             return
         t = str(full[j].get("title") or "Listing")
         await interaction.response.edit_message(
             content=f"Selected **{truncate(t, 100)}** — click **Edit** or **Remove**.",
-            view=self.parent,
+            view=mv,
         )
 
 
