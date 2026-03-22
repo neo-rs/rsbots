@@ -624,6 +624,12 @@ def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
     _pw_nosb = (os.getenv("MAVELY_PLAYWRIGHT_NO_SANDBOX", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
     if _pw_nosb or sys.platform.startswith("linux"):
         launch_args.append("--no-sandbox")
+    launch_args.extend(
+        (
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+        )
+    )
     headless = (os.getenv("MAVELY_PLAYWRIGHT_HEADLESS", "1") or "").strip().lower() not in {"0", "false", "no", "n", "off"}
     try:
         with sync_playwright() as p:
@@ -641,6 +647,12 @@ def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
                     _extra = {k: _ph[k] for k in ("User-Agent", "Accept", "Accept-Language", "Cookie", "Referer") if _ph.get(k)}
                     if _extra:
                         page.set_extra_http_headers(_extra)
+                except Exception:
+                    pass
+                try:
+                    page.add_init_script(
+                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                    )
                 except Exception:
                     pass
                 page.goto(u, wait_until="domcontentloaded", timeout=t_ms)
