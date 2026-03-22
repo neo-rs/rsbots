@@ -9,6 +9,16 @@ import discord
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
+def format_log_user_id(user_id: int | str | None) -> str:
+    """Log segment for user references: numeric User-ID (grep-friendly, matches Guild-ID: style elsewhere)."""
+    if user_id is None:
+        return "User-ID:?"
+    try:
+        return f"User-ID:{int(user_id)}"
+    except (TypeError, ValueError):
+        return f"User-ID:{user_id!s}"
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 

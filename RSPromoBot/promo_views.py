@@ -5,7 +5,7 @@ from typing import Any
 import discord
 from discord import app_commands
 
-from utils import build_cta_view, build_dm_embeds, has_any_allowed_role, human_rate, iso_now
+from utils import build_cta_view, build_dm_embeds, format_log_user_id, has_any_allowed_role, human_rate, iso_now
 
 
 def _session_dict_from_campaign(campaign: dict[str, Any]) -> dict[str, Any]:
@@ -344,7 +344,7 @@ class LaunchConfirmView(discord.ui.View):
         }
         self.bot_ref.queue_store.save(queue_payload)
         self.bot_ref.session_store.delete(interaction.guild_id, interaction.user.id)
-        self.bot_ref.logger.info("campaign_started campaign_id=%s user=<@%s> Guild-ID=%s recipients=%d", campaign["campaign_id"], interaction.user.id, interaction.guild_id, len(self.recipients))
+        self.bot_ref.logger.info("campaign_started campaign_id=%s %s Guild-ID=%s recipients=%d", campaign["campaign_id"], format_log_user_id(interaction.user.id), interaction.guild_id, len(self.recipients))
         self.bot_ref.sender.start()
         status_embed = self.bot_ref.build_status_embed(interaction.guild, campaign, queue_payload)
         status_view = CampaignControlView(self.bot_ref, campaign["campaign_id"])
@@ -374,7 +374,7 @@ class CampaignControlView(discord.ui.View):
         if not campaign:
             await interaction.response.send_message(self.bot_ref.messages["campaign_not_found"], ephemeral=True)
             return
-        self.bot_ref.logger.info("campaign_paused campaign_id=%s user=<@%s> Guild-ID=%s", self.campaign_id, interaction.user.id, interaction.guild_id)
+        self.bot_ref.logger.info("campaign_paused campaign_id=%s %s Guild-ID=%s", self.campaign_id, format_log_user_id(interaction.user.id), interaction.guild_id)
         queue["status"] = "paused"
         self.bot_ref.queue_store.save(queue)
         campaign["status"] = "paused"
@@ -394,7 +394,7 @@ class CampaignControlView(discord.ui.View):
         if not campaign:
             await interaction.response.send_message(self.bot_ref.messages["campaign_not_found"], ephemeral=True)
             return
-        self.bot_ref.logger.info("campaign_resumed campaign_id=%s user=<@%s> Guild-ID=%s", self.campaign_id, interaction.user.id, interaction.guild_id)
+        self.bot_ref.logger.info("campaign_resumed campaign_id=%s %s Guild-ID=%s", self.campaign_id, format_log_user_id(interaction.user.id), interaction.guild_id)
         queue["status"] = "running"
         queue["next_run_at"] = ""
         self.bot_ref.queue_store.save(queue)
@@ -463,7 +463,7 @@ class CampaignControlView(discord.ui.View):
         if not campaign:
             await interaction.response.send_message(self.bot_ref.messages["campaign_not_found"], ephemeral=True)
             return
-        self.bot_ref.logger.info("campaign_cancelled campaign_id=%s user=<@%s> Guild-ID=%s", self.campaign_id, interaction.user.id, interaction.guild_id)
+        self.bot_ref.logger.info("campaign_cancelled campaign_id=%s %s Guild-ID=%s", self.campaign_id, format_log_user_id(interaction.user.id), interaction.guild_id)
         queue["status"] = "cancelled"
         queue["next_run_at"] = ""
         self.bot_ref.queue_store.save(queue)

@@ -9,7 +9,7 @@ import discord
 from promo_campaigns import PromoCampaignStore
 from promo_queue import PromoQueueStore
 from send_log_store import SendLogStore
-from utils import build_dm_embeds, iso_now, next_run_iso, utc_now
+from utils import build_dm_embeds, format_log_user_id, iso_now, next_run_iso, utc_now
 
 
 class OptOutButton(discord.ui.Button):
@@ -72,7 +72,7 @@ class OptOutButton(discord.ui.Button):
             await interaction.response.send_message("I don't have permission to remove that role.", ephemeral=True)
             return
         except Exception as exc:
-            self._logger.warning("dm_optout_failed user=<@%s> error=%s", interaction.user.id, exc)
+            self._logger.warning("dm_optout_failed %s error=%s", format_log_user_id(interaction.user.id), exc)
             await interaction.response.send_message("Something went wrong opting you out.", ephemeral=True)
             return
 
@@ -182,7 +182,7 @@ class PromoSender:
                     "timestamp": iso_now(),
                     "error": ""
                 })
-                self.logger.info("send_ok campaign_id=%s user_id=%s", campaign_id, user_id)
+                self.logger.info("send_ok campaign_id=%s %s", campaign_id, format_log_user_id(user_id))
             except Exception as exc:
                 recipient["status"] = "failed"
                 recipient["sent_at"] = iso_now()
@@ -196,7 +196,7 @@ class PromoSender:
                     "timestamp": iso_now(),
                     "error": str(exc)
                 })
-                self.logger.warning("send_failed campaign_id=%s user=<@%s> error=%s", campaign_id, user_id, exc)
+                self.logger.warning("send_failed campaign_id=%s %s error=%s", campaign_id, format_log_user_id(user_id), exc)
             if dm_delay_hi > 0:
                 await asyncio.sleep(random.uniform(max(0.0, dm_delay_lo), dm_delay_hi))
 

@@ -19,7 +19,7 @@ from promo_sessions import PromoSessionStore
 from promo_views import CampaignControlView, CampaignReuseView, PromoBuilderView
 from send_log_store import SendLogStore
 from storage import JSONStorage
-from utils import estimated_duration_str, has_any_allowed_role, human_rate, iso_now, parse_iso, utc_now
+from utils import estimated_duration_str, format_log_user_id, has_any_allowed_role, human_rate, iso_now, parse_iso, utc_now
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -60,7 +60,7 @@ class PromoBot(discord.Client):
         self.sender.start()
 
     async def on_ready(self) -> None:
-        self.logger.info("bot_ready user=<@%s> Guild-ID=%s", self.user.id, self.config["guild_id"])
+        self.logger.info("bot_ready %s Guild-ID=%s", format_log_user_id(self.user.id), self.config["guild_id"])
 
     def register_commands(self) -> None:
         guild_obj = discord.Object(id=int(self.config["guild_id"]))
@@ -68,10 +68,10 @@ class PromoBot(discord.Client):
         @self.tree.command(name="promo_dm", description="Open the promo DM builder.", guild=guild_obj)
         async def promo_dm(interaction: discord.Interaction) -> None:
             if not self.user_can_manage(interaction):
-                self.logger.info("command=promo_dm denied user=<@%s> username=%s Guild-ID=%s", interaction.user.id, getattr(interaction.user, "name", ""), interaction.guild_id)
+                self.logger.info("command=promo_dm denied %s username=%s Guild-ID=%s", format_log_user_id(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id)
                 await interaction.response.send_message(self.messages["permission_error"], ephemeral=True)
                 return
-            self.logger.info("command=promo_dm user=<@%s> username=%s Guild-ID=%s", interaction.user.id, getattr(interaction.user, "name", ""), interaction.guild_id)
+            self.logger.info("command=promo_dm %s username=%s Guild-ID=%s", format_log_user_id(interaction.user.id), getattr(interaction.user, "name", ""), interaction.guild_id)
             session = self.session_store.get(interaction.guild_id, interaction.user.id)
             if not session:
                 session = self.session_store.build_default(interaction.guild_id, interaction.user.id, self.config)
@@ -82,10 +82,10 @@ class PromoBot(discord.Client):
         @self.tree.command(name="promo_status", description="Show the current promo campaign status.", guild=guild_obj)
         async def promo_status(interaction: discord.Interaction) -> None:
             if not self.user_can_manage(interaction):
-                self.logger.info("command=promo_status denied user=<@%s> Guild-ID=%s", interaction.user.id, interaction.guild_id)
+                self.logger.info("command=promo_status denied %s Guild-ID=%s", format_log_user_id(interaction.user.id), interaction.guild_id)
                 await interaction.response.send_message(self.messages["permission_error"], ephemeral=True)
                 return
-            self.logger.info("command=promo_status user=<@%s> Guild-ID=%s", interaction.user.id, interaction.guild_id)
+            self.logger.info("command=promo_status %s Guild-ID=%s", format_log_user_id(interaction.user.id), interaction.guild_id)
             queue = self.queue_store.get()
             campaign_id = queue.get("campaign_id", "")
             campaign = self.campaign_store.get(campaign_id) if campaign_id else None
@@ -103,10 +103,10 @@ class PromoBot(discord.Client):
         @self.tree.command(name="promo_history", description="Show recent promo campaigns.", guild=guild_obj)
         async def promo_history(interaction: discord.Interaction) -> None:
             if not self.user_can_manage(interaction):
-                self.logger.info("command=promo_history denied user=<@%s> Guild-ID=%s", interaction.user.id, interaction.guild_id)
+                self.logger.info("command=promo_history denied %s Guild-ID=%s", format_log_user_id(interaction.user.id), interaction.guild_id)
                 await interaction.response.send_message(self.messages["permission_error"], ephemeral=True)
                 return
-            self.logger.info("command=promo_history user=<@%s> Guild-ID=%s", interaction.user.id, interaction.guild_id)
+            self.logger.info("command=promo_history %s Guild-ID=%s", format_log_user_id(interaction.user.id), interaction.guild_id)
             campaigns = self.campaign_store.list_recent(limit=10)
             if not campaigns:
                 await interaction.response.send_message(self.messages.get("history_empty", "No campaign history yet."), ephemeral=True)
@@ -152,7 +152,7 @@ class PromoBot(discord.Client):
                 await interaction.response.send_message("I don't have permission to add that role.", ephemeral=True)
                 return
             except Exception as exc:
-                self.logger.warning("notify_on failed user=<@%s> error=%s", interaction.user.id, exc)
+                self.logger.warning("notify_on failed %s error=%s", format_log_user_id(interaction.user.id), exc)
                 await interaction.response.send_message("Something went wrong enabling notifications.", ephemeral=True)
                 return
             await interaction.response.send_message("Notifications enabled. You'll receive promo DMs from this server.", ephemeral=True)
@@ -182,17 +182,17 @@ class PromoBot(discord.Client):
                 await interaction.response.send_message("I don't have permission to remove that role.", ephemeral=True)
                 return
             except Exception as exc:
-                self.logger.warning("notify_off failed user=<@%s> error=%s", interaction.user.id, exc)
+                self.logger.warning("notify_off failed %s error=%s", format_log_user_id(interaction.user.id), exc)
                 await interaction.response.send_message("Something went wrong disabling notifications.", ephemeral=True)
                 return
             await interaction.response.send_message("Notifications disabled. You will no longer receive promo DMs.", ephemeral=True)
 
         async def _do_campaign_control(interaction: discord.Interaction, action: str) -> None:
             if not self.user_can_manage(interaction):
-                self.logger.info("command=promo_%s denied user=<@%s> Guild-ID=%s", action, interaction.user.id, interaction.guild_id)
+                self.logger.info("command=promo_%s denied %s Guild-ID=%s", action, format_log_user_id(interaction.user.id), interaction.guild_id)
                 await interaction.response.send_message(self.messages["permission_error"], ephemeral=True)
                 return
-            self.logger.info("command=promo_%s user=<@%s> Guild-ID=%s", action, interaction.user.id, interaction.guild_id)
+            self.logger.info("command=promo_%s %s Guild-ID=%s", action, format_log_user_id(interaction.user.id), interaction.guild_id)
             queue = self.queue_store.get()
             campaign_id = queue.get("campaign_id", "")
             campaign = self.campaign_store.get(campaign_id) if campaign_id else None
