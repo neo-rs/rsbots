@@ -225,17 +225,17 @@ When you need to run compound commands remotely, prefer a single `bash -lc`:
 - **Do not treat local runs as production proof.** Running `py -3 scripts/test_mavely_app_links.py` (or similar) **only on your PC** is fine for quick iteration, but it is **not authoritative** for Oracle: missing or different **`mavely_cookies.txt` / env**, **datacenter IP vs home IP (Cloudflare / Walmart / Mavely)**, **systemd Environment=**, and **`MAVELY_PROFILE_DIR` + Playwright** routinely change outcomes.
 - **Authoritative validation** for “does unwrap / affiliate behave on the live bot host?” means: run the harness **on the Oracle server** over **SSH**, in the **deployed repo root** from `oraclekeys/servers.json` (typically `/home/rsadmin/bots/mirror-world`), using the **server venv** (e.g. `.venv/bin/python` or `venv/bin/python`).
 - **Canonical harness:** `scripts/test_mavely_app_links.py` (remote `cd` to `remote_root`, then invoke with the test URL(s) and `--timeout-s` as needed). On the server it loads `RSForwarder/config` and `RSForwarder/mavely_cookies.txt` like the bot.
-- **Automation (SCP + SSH):** `py -3 scripts/run_oracle_mavely_bridge_test.py [--url ...] [--skip-scp]` uploads current `RSForwarder/affiliate_rewriter.py` and `scripts/test_mavely_app_links.py`, then runs the test remotely. Use `--skip-scp` only when you know the remote tree already matches what you intend to validate.
+- **Automation (SCP + SSH):** `py -3 scripts/run_oracle_mavely_bridge_test.py [--url ...] [--skip-scp]` uploads `RSForwarder/affiliate_rewriter.py`, **`RSForwarder/mavely_link_resolve.py`** (shared Mavely query + headless resolve), and `scripts/test_mavely_app_links.py`, then runs the test remotely. Use `--skip-scp` only when you know the remote tree already matches what you intend to validate.
 - **Agents and humans:** When reporting test results for this path, **state whether the run was Oracle SSH or local-only**. Local-only results must be labeled **non-authoritative** for production behavior.
 
 ### RSForwarder affiliate / Mavely: push → Oracle deploy → SSH test loop (mandatory for agents)
 
-When changing `RSForwarder/affiliate_rewriter.py` (unwrap, Playwright bridge, Mavely order, etc.), **do not stop at local edits**. Follow this loop until an **Oracle** run shows the expected `mapped:` / repost URL (e.g. `https://mavely.app.link/UHNDYofgG1b` → Walmart or your Mavely link, not a stuck `mavelyinfluencer.com` bridge).
+When changing `RSForwarder/affiliate_rewriter.py` or **`RSForwarder/mavely_link_resolve.py`** (unwrap, Playwright bridge, Mavely query embeds, etc.), **do not stop at local edits**. Follow this loop until an **Oracle** run shows the expected `mapped:` / repost URL (e.g. `https://mavely.app.link/UHNDYofgG1b` → Walmart or your Mavely link, not a stuck `mavelyinfluencer.com` bridge).
 
 1. **Edit locally** in `mirror-world` (this repo).
 2. **Push to GitHub:** run **`push_rsbots_py_only.bat`** from the repo root, review staged files, confirm at the prompt so it **commit + push**es tracked changes. (Non-interactive equivalent: `git add -u`, `git commit`, `git push` to `main` — only for tracked paths; never commit runtime junk like `RSCheckerbot/member_history.json`.)
 3. **Update the Oracle server tree** so `/home/rsadmin/bots/mirror-world` matches what you pushed. Canonical on this workspace: run **`update_rs_bots.bat`** from the repo root (it runs `py -3 scripts/run_oracle_update_bots.py --group rs`). Alternatives if needed: RSAdminBot **`!botupdate RSForwarder`** / **`!botsync`**, or server **`botctl.sh deploy_apply`**. **Restart** `mirror-world-rsforwarder.service` when the running bot must load new Python.
-4. **Test on Oracle over SSH:** `py -3 scripts/run_oracle_mavely_bridge_test.py --skip-scp --url "https://mavely.app.link/UHNDYofgG1b" --timeout-s 200` (omit `--skip-scp` if you need to SCP the current `affiliate_rewriter.py` + `test_mavely_app_links.py` without a full deploy). Inspect **`mapped:`** and debug lines; if wrong, return to step 1.
+4. **Test on Oracle over SSH:** `py -3 scripts/run_oracle_mavely_bridge_test.py --skip-scp --url "https://mavely.app.link/UHNDYofgG1b" --timeout-s 200` (omit `--skip-scp` if you need to SCP the current `affiliate_rewriter.py` + **`mavely_link_resolve.py`** + `test_mavely_app_links.py` without a full deploy). Inspect **`mapped:`** and debug lines; if wrong, return to step 1.
 5. **Playwright note:** bridge unwrap uses **Chromium** (real browser engine) via Playwright; Oracle needs **`MAVELY_PROFILE_DIR`** (or default `RSForwarder/.mavely_profile`), **`MAVELY_PLAYWRIGHT_NO_SANDBOX=1`**, and Playwright installed in the server venv — or client-side navigation to Walmart/Amazon will never be observed.
 
 ### Baseline sync rule (MANDATORY - prevents "Cursor edited the wrong code")
@@ -635,7 +635,8 @@ Any deviation means:
 ---
 ## RSForwarder Discord affiliate rewrite (Canonical)
 
-- **Single owner:** `RSForwarder/affiliate_rewriter.py` (no parallel forwarder affiliate implementation).
+- **Single owner:** `RSForwarder/affiliate_rewriter.py` orchestrates affiliate behavior (no parallel forwarder affiliate implementation).
+- **Shared Mavely helpers:** `RSForwarder/mavely_link_resolve.py` — Branch-style query embeds + headless Chromium when no `MAVELY_PROFILE_DIR`; imported by `affiliate_rewriter.py` and by `Mavelytest/mavely_link_tester.py`. Deploy and SCP **together** with `affiliate_rewriter.py`.
 - **`mavely.app.link` short links** in the message use the dedicated rewrap path: expand to merchant when possible, then `mavely_create_link`; otherwise call the API on the short link itself.
 - **`mavelyinfluencer.com` (and similar)** are **bridge/intermediate** targets after expansion, not trusted as the final “merchant” URL for pass-through. If expansion stops on a bridge, the code must try **`mavely_create_link` using the original URL from the message** (e.g. `bit.ly`, `t.co`, `mavely.app.link`) before leaving the text unchanged—never substitute another creator’s influencer URL as the replacement.
 

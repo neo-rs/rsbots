@@ -21,8 +21,10 @@ Default redirect + hub HTML timeouts are 5s unless overridden (`affiliate_expand
 `AUTO_AFFILIATE_EXPAND_TIMEOUT_S`, `affiliate_hub_html_timeout_s` / `AUTO_AFFILIATE_HUB_HTML_TIMEOUT_S`).
 
 Mavely short links (`mavely.app.link`) are not bit.ly-style “pure redirects”: HTTP expand often stops at
-`mavelyinfluencer.com` (bridge). Final merchant URLs are recovered here via hub HTML + optional Playwright
-(profile + cookies); `mavely_client.py` creates new links via GraphQL and does not unwrap HTML.
+`mavelyinfluencer.com` (bridge). Shared Branch/query helpers and no-profile headless Chromium live in
+`mavely_link_resolve.py` (single source of truth with `Mavelytest/mavely_link_tester.py`). Final destinations
+are still recovered here via hub HTML + Playwright (persistent profile when present); `mavely_client.py`
+creates new links via GraphQL and does not unwrap HTML.
 If GraphQL rejects the app.link host, we optionally call create_link once with the expanded hub URL
 (`MAVELY_GRAPHQL_BRIDGE_FALLBACK`, default on).
 """
@@ -43,10 +45,12 @@ import tempfile
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl, urljoin, unquote
 
 import aiohttp
+
+from . import mavely_link_resolve as _mavely_resolve
 
 
 def _env_first_token(name: str, default: str = "") -> str:
@@ -658,7 +662,10 @@ def mavely_bridge_playwright_startup_hint() -> str:
         return "Mavely bridge: Playwright not installed (pip install playwright && playwright install chromium)"
     prof = resolve_mavely_profile_dir()
     if prof is None:
-        return "Mavely bridge: no profile dir (set MAVELY_PROFILE_DIR or run mavely_cookie_refresher to create .mavely_profile)"
+        return (
+            "Mavely bridge: no profile dir (headless resolve: mavely_link_resolve.py; "
+            "set MAVELY_PROFILE_DIR for persistent cf_clearance)"
+        )
     return f"Mavely bridge: Playwright fallback ready (profile={prof})"
 
 
@@ -687,8 +694,8 @@ def _fetch_mavely_html_via_playwright_sync(
     url: str, timeout_s: int, *, flow_log: bool = False, label: str = ""
 ) -> str:
     """
-    Load a Mavely hub URL in Chromium with the cookie-refresher persistent profile.
-    When aiohttp/curl only see a Cloudflare challenge, this often returns real HTML/__NEXT_DATA__.
+    Load a Mavely hub URL in Chromium: persistent profile when available; otherwise delegate to
+    `mavely_link_resolve.playwright_resolve_mavely_to_merchant_url` (same behavior as Mavelytest).
     """
     global _mavely_playwright_last_error
     _mavely_playwright_last_error = ""
@@ -709,17 +716,25 @@ def _fetch_mavely_html_via_playwright_sync(
     if not u.startswith("http"):
         _fl("aborted bad_url (%.2fs)" % (time.perf_counter() - t0,))
         return ""
+    t_ms = max(1_000, min(int(float(timeout_s) * 1000), 120_000))
     prof = resolve_mavely_profile_dir()
     if prof is None:
+        _fl(
+            "no_profile mavely_link_resolve.playwright_resolve (%.2fs)"
+            % (time.perf_counter() - t0,)
+        )
+        mer = _mavely_resolve.playwright_resolve_mavely_to_merchant_url(u, t_ms)
+        if mer:
+            esc = _html.escape(mer, quote=True)
+            _fl("resolved merchant url_bar=%r (%.2fs)" % (_aff_dbg_clip(mer, 88), time.perf_counter() - t0))
+            return '<!DOCTYPE html><html><body><a href="%s">outbound</a></body></html>' % esc
         _fl("aborted no_profile (%.2fs)" % (time.perf_counter() - t0,))
         return ""
-    t_ms = max(1_000, min(int(float(timeout_s) * 1000), 120_000))
     settle_ms = min(3_500, max(200, int(t_ms * 0.18)))
     load_wait_ms = min(25_000, max(2_000, t_ms // 2))
     poll_budget_s = min(55.0, max(1.0, (t_ms / 1000.0) * 0.72))
     click_poll_rounds = min(24, max(2, int(t_ms / 450)))
     launch_args = ["--disable-session-crashed-bubble", "--disable-dev-shm-usage"]
-    # Headless Chromium on Ubuntu (Oracle) typically needs --no-sandbox; don't rely only on systemd env.
     _pw_nosb = (os.getenv("MAVELY_PLAYWRIGHT_NO_SANDBOX", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
     if _pw_nosb or sys.platform.startswith("linux"):
         launch_args.append("--no-sandbox")
@@ -766,8 +781,6 @@ def _fetch_mavely_html_via_playwright_sync(
                     page.wait_for_timeout(settle_ms)
                 except Exception:
                     pass
-                # Hubs often client-navigate to Walmart/Amazon after hydration (same as clicking the short link in a browser).
-                # aiohttp/curl only see the bridge HTML; wait until the address bar leaves Mavely or timeout.
                 deadline = time.time() + poll_budget_s
                 while time.time() < deadline:
                     try:
@@ -806,7 +819,6 @@ def _fetch_mavely_html_via_playwright_sync(
                         page.wait_for_timeout(500)
                     except Exception:
                         break
-                # Some hubs only navigate after a real click (headless may not auto-redirect).
                 try:
                     if _url_is_mavely_bridge_surface((page.url or "").strip()):
                         for js in (
@@ -1419,6 +1431,12 @@ def unwrap_known_query_redirects(url: str) -> Optional[str]:
             cand = unquote(cand)
             if cand.startswith("http://") or cand.startswith("https://"):
                 return cand
+    for cand in _mavely_resolve.iter_embedded_https_urls_from_query(u):
+        if _url_is_mavely_bridge_surface(cand):
+            continue
+        if _score_merchant_outbound_url(cand) < 0:
+            continue
+        return cand
     return None
 
 
@@ -2118,16 +2136,11 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                     mavely_short_src = (normalized.get(u) or u).strip()
                     mavely_short_playwright_tried = False
                     if is_mavely_app_short_link(mavely_short_src):
-                        if (not _mavely_bridge_playwright_enabled()) or resolve_mavely_profile_dir() is None:
+                        if not _mavely_bridge_playwright_enabled():
                             if affiliate_rewrite_debug_verbose_on(cfg):
                                 _aff_dbg_verbose(
                                     cfg,
-                                    "  html_unwrap mavely short-first: skipped (%s)"
-                                    % (
-                                        "MAVELY_BRIDGE_PLAYWRIGHT off"
-                                        if not _mavely_bridge_playwright_enabled()
-                                        else "no persistent profile (MAVELY_PROFILE_DIR or RSForwarder/.mavely_profile)"
-                                    ),
+                                    "  html_unwrap mavely short-first: skipped (MAVELY_BRIDGE_PLAYWRIGHT off)",
                                 )
                         else:
                             mavely_short_playwright_tried = True
@@ -2229,7 +2242,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                     or ("__NEXT_DATA__" not in (txt or ""))
                                     or (not have_merchant)
                                 )
-                                if need_pw and resolve_mavely_profile_dir() is not None:
+                                if need_pw and _mavely_bridge_playwright_enabled():
                                     if affiliate_rewrite_debug_verbose_on(cfg):
                                         _aff_dbg_verbose(
                                             cfg,
@@ -2275,7 +2288,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                 and is_mavely_app_short_link((normalized.get(u) or u).strip())
                                 and (not mavely_short_playwright_tried)
                                 and _mavely_bridge_playwright_enabled()
-                                and resolve_mavely_profile_dir() is not None
+                                and _mavely_bridge_playwright_enabled()
                             ):
                                 short_u = (normalized.get(u) or u).strip()
                                 async with _playwright_mavely_async_lock():
@@ -2584,7 +2597,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                     th = ""
                 mv = mapped.get(u)
                 bits.append(
-                    "%s→host=%s %s: %s"
+                    "%s->host=%s %s: %s"
                     % (
                         _aff_dbg_clip(u, 48),
                         _aff_dbg_clip(th, 28) if th else "?",
@@ -2611,7 +2624,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
         tgt = (resolved.get(u) or normalized.get(u) or u).strip()
         rep = mapped.get(u)
         _out_bits.append(
-            "%s → %s [%s]"
+            "%s -> %s [%s]"
             % (
                 _aff_dbg_clip(u, 56),
                 _aff_dbg_clip((rep or tgt), 72),
