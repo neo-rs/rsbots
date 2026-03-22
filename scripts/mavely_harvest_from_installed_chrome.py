@@ -13,10 +13,16 @@ REQUIREMENTS
 - Playwright installed:  py -3 -m pip install playwright && py -3 -m playwright install chrome
   (install chrome channel, not only chromium)
 
-USAGE (Windows, default profile)
---------------------------------
+USAGE (Windows)
+---------------
   cd mirror-world
   py -3 scripts/mavely_harvest_from_installed_chrome.py --url \"https://mavely.app.link/4IJZuyvIH1b\"
+
+If you use something other than \"Default\" (Chrome shows Profile Path ...\\\\User Data\\\\Profile 1),
+the script reads User Data\\\\Local State and picks the last-used profile automatically. Override with:
+
+  --profile-directory \"Profile 1\"
+  set CHROME_PROFILE=Profile 1
 
 Writes RSForwarder/mavely_cookies.txt (override with --out).
 
@@ -32,9 +38,11 @@ ENV
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RSF = REPO_ROOT / "RSForwarder"
@@ -57,6 +65,38 @@ def _default_user_data_dir(browser: str) -> str:
     if b == "edge":
         return str(home / ".config/microsoft-edge")
     return str(home / ".config/google-chrome")
+
+
+def _last_used_profile_from_local_state(user_data: Path) -> Optional[str]:
+    """
+    Chrome/Edge store the last profile in User Data/Local State (e.g. Profile 1, not Default).
+    """
+    p = user_data / "Local State"
+    if not p.is_file():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8", errors="replace") or "{}")
+    except Exception:
+        return None
+    prof = data.get("profile")
+    if not isinstance(prof, dict):
+        return None
+    lap = prof.get("last_active_profiles")
+    if isinstance(lap, list) and lap:
+        name = str(lap[0]).strip()
+        if name:
+            return name
+    lu = str(prof.get("last_used") or "").strip()
+    return lu or None
+
+
+def _chrome_singleton_locked(user_data: Path) -> bool:
+    """True if Chrome likely still has this User Data dir open."""
+    lock = user_data / "SingletonLock"
+    try:
+        return lock.exists()
+    except OSError:
+        return False
 
 
 def _cookie_header_from_cookies(cookies: list) -> str:
@@ -102,7 +142,7 @@ def main() -> int:
     ap.add_argument(
         "--profile-directory",
         default="",
-        help="Profile inside User Data (default: env CHROME_PROFILE or 'Default')",
+        help="Profile inside User Data (default: CHROME_PROFILE, else last-used from Local State, else Default)",
     )
     ap.add_argument(
         "--url",
@@ -130,7 +170,10 @@ def main() -> int:
     user_data = (args.user_data_dir or os.getenv("CHROME_USER_DATA") or "").strip() or _default_user_data_dir(
         args.browser
     )
-    prof = (args.profile_directory or os.getenv("CHROME_PROFILE") or "Default").strip() or "Default"
+    ud = Path(user_data)
+    prof = (args.profile_directory or os.getenv("CHROME_PROFILE") or "").strip()
+    if not prof:
+        prof = _last_used_profile_from_local_state(ud) or "Default"
     out_path = Path(args.out)
     if not out_path.is_absolute():
         out_path = REPO_ROOT / out_path
@@ -141,10 +184,17 @@ def main() -> int:
         print("ERROR: --url must be an http(s) URL", file=sys.stderr)
         return 2
 
-    ud = Path(user_data)
     if not ud.is_dir():
         print(f"ERROR: User Data dir not found: {ud}", file=sys.stderr)
         return 2
+
+    if args.browser == "chrome" and _chrome_singleton_locked(ud):
+        print(
+            "ERROR: Chrome still has this User Data directory open (SingletonLock exists).",
+            file=sys.stderr,
+        )
+        print("Exit all Chrome windows (check tray), then run again.", file=sys.stderr)
+        return 4
 
     try:
         from playwright.sync_api import sync_playwright
@@ -153,7 +203,7 @@ def main() -> int:
         return 3
 
     print(f"Using channel={channel!r} user_data_dir={ud} profile_directory={prof!r}")
-    print("If launch fails with profile-in-use, close every Chrome/Edge window and retry.")
+    print("If launch fails, close every Chrome/Edge window and retry (profile must not be in use).")
 
     launch_args = [
         f"--profile-directory={prof}",
@@ -168,10 +218,16 @@ def main() -> int:
                 headless=False,
                 args=launch_args,
                 viewport={"width": 1280, "height": 800},
+                # Real profiles often crash immediately if extensions are stripped (Playwright default).
+                ignore_default_args=["--disable-extensions"],
             )
         except Exception as e:
             print(f"ERROR: launch_persistent_context failed: {e}", file=sys.stderr)
-            print("Hint: Close Chrome/Edge completely, or try --profile-directory Profile 1", file=sys.stderr)
+            print(
+                "Hint: Quit Chrome fully (including background apps in tray). "
+                "If your Chrome profile is 'Profile 1', pass: --profile-directory \"Profile 1\"",
+                file=sys.stderr,
+            )
             return 4
 
         try:
