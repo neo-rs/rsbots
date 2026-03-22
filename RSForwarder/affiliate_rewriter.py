@@ -7,6 +7,9 @@ Implements the same rewrite behavior as Instorebotforwarder:
 - Amazon: add your affiliate tag and optionally mask as [amzn.to/xxxx](<real_url>)
 - Other stores: generate a Mavely affiliate link (when possible)
 - Markdown-safe: do not inject markdown links inside existing markdown link targets.
+
+Debug logging (stdout, prefix [AffiliateDebug]): set config `affiliate_rewrite_debug` true or env
+AFFILIATE_REWRITE_DEBUG=1. RSForwarder also forces this when a channel has `repost_debug` enabled.
 """
 
 from __future__ import annotations
@@ -49,6 +52,46 @@ def _bool_or_default(value: Any, default: bool) -> bool:
     if s in {"0", "false", "no", "n", "off"}:
         return False
     return default
+
+
+def affiliate_rewrite_debug_on(cfg: Optional[dict]) -> bool:
+    """
+    Verbose affiliate pipeline logging.
+    Enable with config `affiliate_rewrite_debug`: true or env AFFILIATE_REWRITE_DEBUG=1.
+    RSForwarder also turns this on per-route when channel `repost_debug` is true.
+    """
+    try:
+        if _bool_or_default((cfg or {}).get("affiliate_rewrite_debug"), False):
+            return True
+    except Exception:
+        pass
+    raw = (os.getenv("AFFILIATE_REWRITE_DEBUG", "") or "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _aff_dbg_clip(s: str, n: int = 100) -> str:
+    t = (s or "").replace("\r", " ").replace("\n", " ")
+    if len(t) <= n:
+        return t
+    return t[: max(0, n - 3)] + "..."
+
+
+def _aff_dbg(cfg: Optional[dict], msg: str) -> None:
+    if not affiliate_rewrite_debug_on(cfg):
+        return
+    print(f"[AffiliateDebug] {msg}", flush=True)
+
+
+def _aff_dbg_notes_summary(notes: Optional[Dict[str, str]], limit: int = 8) -> str:
+    if not notes:
+        return "(no notes)"
+    parts: List[str] = []
+    for i, (k, v) in enumerate(notes.items()):
+        if i >= limit:
+            parts.append(f"... +{len(notes) - limit} more")
+            break
+        parts.append(f"{_aff_dbg_clip(k, 72)!r} => {_aff_dbg_clip(str(v), 96)!r}")
+    return "; ".join(parts)
 
 
 def _cfg_or_env_str(cfg: dict, cfg_key: str, env_key: str) -> str:
@@ -392,7 +435,14 @@ def is_amazon_like_url(url: str) -> bool:
         host = (urlparse(url).netloc or "").lower()
     except Exception:
         host = ""
-    return ("amazon." in host) or host.endswith("amazon.com") or host.endswith("amazon.co.uk") or ("amzn.to" in host)
+    return (
+        ("amazon." in host)
+        or host.endswith("amazon.com")
+        or host.endswith("amazon.co.uk")
+        or ("amzn.to" in host)
+        or host == "a.co"
+        or host.endswith(".a.co")
+    )
 
 
 def extract_asin(text_or_url: str) -> Optional[str]:
@@ -441,6 +491,9 @@ def build_amazon_affiliate_url(cfg: dict, raw_url: str) -> Optional[str]:
             host = ""
         if ("amazon." in host) or host.endswith("amazon.com") or host.endswith("amazon.co.uk"):
             return _add_query_param(u, "tag", associate_tag)
+        # a.co is Amazon's shortener; without expansion we cannot tag reliably.
+        if host == "a.co" or host.endswith(".a.co"):
+            return None
         return None
 
     marketplace = _cfg_or_env_str(cfg, "amazon_api_marketplace", "AMAZON_API_MARKETPLACE").rstrip("/")
@@ -561,6 +614,8 @@ def should_expand_url(url: str) -> bool:
         "trackcm.com",
         "walmrt.us",
         "amzn.to",
+        "a.co",
+        "www.a.co",
         "mavely.app.link",
         "mavelyinfluencer.com",
         "www.mavelyinfluencer.com",
@@ -1031,6 +1086,13 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
             notes[u] = "not a url"
 
     if not candidates:
+        if affiliate_rewrite_debug_on(cfg):
+            bad = [x for x in unique if x not in candidates]
+            _aff_dbg(
+                cfg,
+                "compute_affiliate_rewrites: 0 candidates (all not_a_url or empty); samples=%s"
+                % ", ".join(_aff_dbg_clip(x, 72) for x in bad[:6]),
+            )
         return {}, notes
 
     # Stable amazon masks per destination within a message
@@ -1067,23 +1129,73 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
     max_redirects = int(_cfg_or_env_int(cfg, "affiliate_max_redirects", "AUTO_AFFILIATE_MAX_REDIRECTS") or 8)
     timeout_s = float(_cfg_or_env_int(cfg, "affiliate_expand_timeout_s", "AUTO_AFFILIATE_EXPAND_TIMEOUT_S") or 8)
 
+    if affiliate_rewrite_debug_on(cfg):
+        tag = _cfg_or_env_str(cfg, "amazon_associate_tag", "AMAZON_ASSOCIATE_TAG")
+        _aff_dbg(
+            cfg,
+            "compute_affiliate_rewrites: candidates=%d expand_redirects=%s timeout_s=%.1f max_redirects=%d skip_domain_rules=%d amazon_tag_configured=%s"
+            % (
+                len(candidates),
+                expand_enabled,
+                timeout_s,
+                max_redirects,
+                len(skip_domains),
+                bool((tag or "").strip()),
+            ),
+        )
+
     resolved: Dict[str, str] = {u: normalized.get(u) or u for u in candidates}
 
     for u in candidates:
         cand = unwrap_known_query_redirects(resolved.get(u) or u)
         if cand:
+            if affiliate_rewrite_debug_on(cfg):
+                _aff_dbg(
+                    cfg,
+                    "  query_unwrap %r -> %r"
+                    % (_aff_dbg_clip(resolved.get(u) or u, 88), _aff_dbg_clip(cand, 88)),
+                )
             resolved[u] = cand
 
     if expand_enabled:
         async with aiohttp.ClientSession() as session:
             for u in candidates:
                 start_u = (resolved.get(u) or u).strip()
+                dbg_chain: Optional[List[str]] = [start_u] if affiliate_rewrite_debug_on(cfg) else None
                 if should_expand_url(start_u):
                     final_u = await expand_url(session, start_u, timeout_s=timeout_s, max_redirects=max_redirects)
                     # Mavely / App Links sometimes 302 to Cloudflare's generic 5xx page when origin fails.
                     if _is_cloudflare_or_cdn_error_landing(final_u):
+                        if dbg_chain is not None:
+                            _aff_dbg(cfg, "  expand %r: cloudflare/cdn error landing; reverting to pre-expand" % _aff_dbg_clip(u, 72))
                         final_u = start_u
+                    if dbg_chain is not None and final_u != dbg_chain[-1]:
+                        dbg_chain.append(final_u)
+                    # Chain-expand: redirect stacks often land on another shortener first (e.g. bit.ly -> amzn.to).
+                    for _chain in range(4):
+                        if not should_expand_url(final_u):
+                            break
+                        nxt = await expand_url(session, final_u, timeout_s=timeout_s, max_redirects=max_redirects)
+                        if _is_cloudflare_or_cdn_error_landing(nxt):
+                            break
+                        if not nxt or nxt == final_u:
+                            break
+                        final_u = nxt
+                        if dbg_chain is not None:
+                            dbg_chain.append(final_u)
                     resolved[u] = final_u
+                    if dbg_chain is not None and len(dbg_chain) > 1:
+                        _aff_dbg(
+                            cfg,
+                            "  expand %r: %s"
+                            % (_aff_dbg_clip(u, 72), " -> ".join(_aff_dbg_clip(x, 88) for x in dbg_chain)),
+                        )
+                    elif dbg_chain is not None:
+                        _aff_dbg(
+                            cfg,
+                            "  expand %r: single hop (no further shortener chain) -> %r"
+                            % (_aff_dbg_clip(u, 72), _aff_dbg_clip(final_u, 88)),
+                        )
 
                     cand2 = unwrap_known_query_redirects(final_u)
                     if cand2:
@@ -1136,12 +1248,26 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                 out_abs = urljoin(candidate, out_abs)
                             out_abs = unwrap_known_query_redirects(out_abs) or out_abs
                             candidate = out_abs
+                            if affiliate_rewrite_debug_on(cfg):
+                                _aff_dbg(
+                                    cfg,
+                                    "  html_unwrap %r: host=%r -> %r"
+                                    % (_aff_dbg_clip(u, 72), _aff_dbg_clip(host, 48), _aff_dbg_clip(candidate, 88)),
+                                )
                         except Exception:
                             break
 
                     if _is_cloudflare_or_cdn_error_landing(candidate):
                         candidate = start_u
                     resolved[u] = candidate
+                elif affiliate_rewrite_debug_on(cfg):
+                    _aff_dbg(
+                        cfg,
+                        "  expand skip %r: host not in shortener/env list (still may affiliate if already merchant URL)"
+                        % _aff_dbg_clip(start_u, 100),
+                    )
+    elif affiliate_rewrite_debug_on(cfg):
+        _aff_dbg(cfg, "compute_affiliate_rewrites: affiliate_expand_redirects disabled (no HTTP expand; query/HTML unwrap may still apply)")
 
     for u in candidates:
         raw = (normalized.get(u) or u).strip()
@@ -1303,6 +1429,25 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
             else:
                 notes[u] = _short_err(err, 220) or "no change"
 
+    if affiliate_rewrite_debug_on(cfg):
+        for u in candidates:
+            tgt = (resolved.get(u) or normalized.get(u) or u).strip()
+            try:
+                th = (urlparse(tgt).netloc or "").lower()
+            except Exception:
+                th = ""
+            mv = mapped.get(u)
+            _aff_dbg(
+                cfg,
+                "  outcome %r host=%r replaced=%s note=%r"
+                % (
+                    _aff_dbg_clip(u, 72),
+                    _aff_dbg_clip(th, 56) if th else "?",
+                    _aff_dbg_clip(mv, 96) if mv else "(none)",
+                    _aff_dbg_clip(notes.get(u, ""), 140),
+                ),
+            )
+
     return mapped, notes
 
 
@@ -1310,17 +1455,34 @@ async def rewrite_text(cfg: dict, text: str) -> Tuple[str, bool, Dict[str, str]]
     original = text or ""
     spans = extract_urls_with_spans(original)
     if not spans:
+        _aff_dbg(
+            cfg,
+            "rewrite_text: no URLs matched by extract_urls_with_spans (text_len=%d sample=%r)"
+            % (len(original), _aff_dbg_clip(original, 120)),
+        )
         return original, False, {}
     urls = [u for (u, _, _) in spans]
+    _aff_dbg(
+        cfg,
+        "rewrite_text: detected %d URL(s): %s"
+        % (len(urls), ", ".join(_aff_dbg_clip(x, 88) for x in urls[:14]) + (" ..." if len(urls) > 14 else "")),
+    )
     mapped, notes = await compute_affiliate_rewrites(cfg, urls)
     if not mapped:
+        _aff_dbg(
+            cfg,
+            "rewrite_text: compute_affiliate_rewrites returned no replacements; notes=%s" % _aff_dbg_notes_summary(notes),
+        )
         return original, False, notes or {}
 
     changed = False
     out = original
+    skipped_same = 0
     for (u, start, end) in sorted(spans, key=lambda t: t[1], reverse=True):
         rep = mapped.get(u)
         if not rep or rep == u:
+            if rep == u and affiliate_rewrite_debug_on(cfg):
+                skipped_same += 1
             continue
         rep_out = rep
 
@@ -1352,6 +1514,24 @@ async def rewrite_text(cfg: dict, text: str) -> Tuple[str, bool, Dict[str, str]]
         except Exception:
             pass
 
+    if affiliate_rewrite_debug_on(cfg):
+        if skipped_same:
+            _aff_dbg(cfg, "rewrite_text: %d span(s) had mapped value identical to original (no substitution)" % skipped_same)
+        missing_rep = sum(1 for x in urls if x not in mapped)
+        if missing_rep:
+            _aff_dbg(cfg, "rewrite_text: %d detected URL(s) had no entry in mapped (unexpected)" % missing_rep)
+        if not changed and mapped:
+            _aff_dbg(
+                cfg,
+                "rewrite_text: compute returned %d replacement(s) but no span edits (check span key match vs mapped keys)"
+                % len(mapped),
+            )
+        _aff_dbg(
+            cfg,
+            "rewrite_text: done changed=%s applied=%d/%d spans"
+            % (changed, sum(1 for x in urls if mapped.get(x) and mapped.get(x) != x), len(urls)),
+        )
+
     return out, changed, notes or {}
 
 
@@ -1364,6 +1544,19 @@ async def rewrite_embed_dict(cfg: dict, embed: dict) -> Tuple[dict, bool, Dict[s
     notes_out: Dict[str, str] = {}
     e = dict(embed or {})
 
+    if affiliate_rewrite_debug_on(cfg):
+        eu = (e.get("url") or "").strip()
+        _aff_dbg(
+            cfg,
+            "rewrite_embed_dict: title_len=%d desc_len=%d url=%r fields=%d"
+            % (
+                len((e.get("title") or "")),
+                len((e.get("description") or "")),
+                _aff_dbg_clip(eu, 96) if eu else "",
+                len(e.get("fields") or []) if isinstance(e.get("fields"), list) else 0,
+            ),
+        )
+
     for key in ("title", "description"):
         if isinstance(e.get(key), str) and e.get(key).strip():
             new_v, ch, notes = await rewrite_text(cfg, e.get(key))
@@ -1372,14 +1565,30 @@ async def rewrite_embed_dict(cfg: dict, embed: dict) -> Tuple[dict, bool, Dict[s
                 changed = True
             notes_out.update(notes or {})
 
-    # url field must remain a URL, not markdown
+    # url field must remain a plain URL (no Discord markdown). Run full expand + affiliate pipeline
+    # so amzn.to / a.co / mavely.app.link in embed.url behave like links in message content.
     if isinstance(e.get("url"), str) and e.get("url").strip():
-        raw = normalize_input_url(e.get("url"))
-        if is_amazon_like_url(raw):
-            aff = build_amazon_affiliate_url(cfg, raw)
-            if aff and aff != raw:
-                e["url"] = aff
-                changed = True
+        raw_u = (e.get("url") or "").strip()
+        mapped_u, notes_u = await compute_affiliate_rewrites_plain(cfg, [raw_u])
+        nu = normalize_input_url(raw_u) or raw_u
+        rep = (mapped_u.get(raw_u) or mapped_u.get(nu) or "").strip()
+        if rep and rep != raw_u:
+            e["url"] = rep
+            changed = True
+            k_note = (notes_u or {}).get(raw_u) or (notes_u or {}).get(nu) or "embed url rewritten"
+            notes_out[raw_u] = str(k_note)
+            _aff_dbg(
+                cfg,
+                "rewrite_embed_dict: embed.url rewritten %r -> %r (%s)"
+                % (_aff_dbg_clip(raw_u, 88), _aff_dbg_clip(rep, 88), _aff_dbg_clip(str(k_note), 80)),
+            )
+        elif affiliate_rewrite_debug_on(cfg):
+            n0 = (notes_u or {}).get(raw_u) or (notes_u or {}).get(nu) or ""
+            _aff_dbg(
+                cfg,
+                "rewrite_embed_dict: embed.url unchanged %r note=%r"
+                % (_aff_dbg_clip(raw_u, 96), _aff_dbg_clip(str(n0), 120)),
+            )
 
     if isinstance(e.get("fields"), list):
         new_fields = []

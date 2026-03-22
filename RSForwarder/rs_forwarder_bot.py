@@ -1118,6 +1118,16 @@ class RSForwarderBot:
             v = 300
         return max(60, min(v, 3600))
 
+    def _affiliate_cfg(self, channel_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Shallow copy of config for affiliate_rewriter; enables verbose logs when repost_debug is on."""
+        base = dict(self.config or {})
+        try:
+            if channel_config and bool((channel_config or {}).get("repost_debug")):
+                base["affiliate_rewrite_debug"] = True
+        except Exception:
+            pass
+        return base
+
     def _rs_server_guild_id(self) -> int:
         """
         RS Server guild ID (used for branding/icon fetch). Canonical config keys:
@@ -7852,8 +7862,8 @@ class RSForwarderBot:
             return  # Only needed on Windows
         
         try:
-            import win32security
-            import ntsecuritycon as con
+            import win32security  # type: ignore[import-not-found]
+            import ntsecuritycon as con  # type: ignore[import-not-found]
             
             # Get current file security descriptor
             sd = win32security.GetFileSecurity(str(key_path), win32security.DACL_SECURITY_INFORMATION)
@@ -8241,7 +8251,7 @@ class RSForwarderBot:
 
                     if hit:
                         where_matched += 1
-                        new_ln, changed, notes = await affiliate_rewriter.rewrite_text(self.config, ln)
+                        new_ln, changed, notes = await affiliate_rewriter.rewrite_text(self._affiliate_cfg(channel_config), ln)
                         if changed:
                             any_changed = True
                         if debug and isinstance(notes, dict) and notes:
@@ -8273,7 +8283,7 @@ class RSForwarderBot:
                     except Exception:
                         pass
             elif content:
-                content2, changed, _notes = await affiliate_rewriter.rewrite_text(self.config, content)
+                content2, changed, _notes = await affiliate_rewriter.rewrite_text(self._affiliate_cfg(channel_config), content)
                 if changed:
                     any_changed = True
                 content = content2
@@ -8284,7 +8294,7 @@ class RSForwarderBot:
             if embeds_raw and (not where_only):
                 rewritten = []
                 for e in embeds_raw:
-                    ee, ch, _notes = await affiliate_rewriter.rewrite_embed_dict(self.config, e)
+                    ee, ch, _notes = await affiliate_rewriter.rewrite_embed_dict(self._affiliate_cfg(channel_config), e)
                     if ch:
                         any_changed = True
                     rewritten.append(ee)
@@ -8393,7 +8403,7 @@ class RSForwarderBot:
             affiliate_changed = False
             affiliate_notes: Dict[str, str] = {}
             if rewrite_enabled and content:
-                content, _changed, _notes = await affiliate_rewriter.rewrite_text(self.config, content)
+                content, _changed, _notes = await affiliate_rewriter.rewrite_text(self._affiliate_cfg(channel_config), content)
                 if _changed:
                     affiliate_changed = True
                 if isinstance(_notes, dict):
@@ -8414,7 +8424,7 @@ class RSForwarderBot:
             if rewrite_enabled and embeds_raw:
                 rewritten_embeds = []
                 for e in embeds_raw:
-                    ee, _ch, _notes = await affiliate_rewriter.rewrite_embed_dict(self.config, e)
+                    ee, _ch, _notes = await affiliate_rewriter.rewrite_embed_dict(self._affiliate_cfg(channel_config), e)
                     if _ch:
                         affiliate_changed = True
                     if isinstance(_notes, dict):
