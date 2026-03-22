@@ -1087,6 +1087,8 @@ class RSForwarderBot:
         self._rs_fs_seen_message_ids: Set[int] = set()
         # Best-effort: avoid running the Live-list affiliate recovery repeatedly on reconnect.
         self._rs_fs_live_affiliate_recovery_done: bool = False
+        # Discord on_ready can fire again after reconnect; skip full startup banner/self-tests.
+        self._rs_forwarder_on_ready_once: bool = False
         # Guard to prevent concurrent sheet syncs during manual runs (avoids partial-chunk thrash)
         self._rs_fs_manual_run_in_progress: bool = False
         # Debounce for auto check/status messages (avoid spamming on multi-chunk listreleases).
@@ -4492,6 +4494,19 @@ class RSForwarderBot:
         
         @self.bot.event
         async def on_ready():
+            if self._rs_forwarder_on_ready_once:
+                try:
+                    gid = self._rs_server_guild_id()
+                    if gid:
+                        g = self.bot.get_guild(gid)
+                        if g:
+                            self.rs_guild = g
+                    print(f"{Colors.CYAN}[Bot]{Colors.RESET} on_ready again (reconnect) as {self.bot.user}")
+                except Exception:
+                    pass
+                return
+            self._rs_forwarder_on_ready_once = True
+
             print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
             print(f"{Colors.BOLD}  📤 RS Forwarder Bot{Colors.RESET}")
             print(f"{Colors.CYAN}{'='*60}{Colors.RESET}")
@@ -4659,17 +4674,10 @@ class RSForwarderBot:
                     self._mavely_monitor_task = asyncio.create_task(self._mavely_monitor_loop())
             except Exception:
                 pass
-            
-            print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
-            print(f"{Colors.BOLD}  🔄 RS Forwarder Bot{Colors.RESET}")
-            print(f"{Colors.CYAN}{'='*60}{Colors.RESET}")
-            print(f"{Colors.GREEN}[Bot] Ready as {self.bot.user}{Colors.RESET}")
-            
+
             channels = self.config.get("channels", [])
-            print(f"{Colors.GREEN}[Bot] Monitoring {len(channels)} channel(s){Colors.RESET}")
-            
+            print(f"\n{Colors.GREEN}[Bot] Monitoring {len(channels)} channel(s){Colors.RESET}")
             if channels:
-                # List monitored channels
                 for channel in channels:
                     source_id = channel.get("source_channel_id", "unknown")
                     source_name = channel.get("source_channel_name", "unknown")
@@ -4683,9 +4691,8 @@ class RSForwarderBot:
                     print(f"  {webhook_set} {source_name} ({source_id}){role_mention}")
             else:
                 print(f"  {Colors.YELLOW}No channels configured. Use !add command to add channels.{Colors.RESET}")
-            
+
             print(f"{Colors.CYAN}{'='*60}{Colors.RESET}\n")
-            self.stats['started_at'] = datetime.now().isoformat()
         
         @self.bot.event
         async def on_message(message: discord.Message):

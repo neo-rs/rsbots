@@ -762,7 +762,48 @@ def _score_merchant_outbound_url(url: str) -> int:
             score -= 220
         if "/welcome" in path or "/signin" in path or "/signup" in path or "/authorize" in path:
             score -= 140
+    if ("amazon." in hl or hl.endswith("amazon.com")) and ("/ap/signin" in path or "/ap/register" in path):
+        score -= 220
     return score
+
+
+def _expand_amazon_signin_return_url(url: str) -> Optional[str]:
+    """
+    Mavely/Amazon HTML sometimes surfaces www.amazon.com/ap/signin?...&openid.return_to=https%3A%2F%2Fwww.amazon.com%2Fdp%2F...
+    Prefer the decoded return_to (product/browse destination) over the sign-in interstitial.
+    """
+    u = (url or "").strip()
+    if not u:
+        return None
+    try:
+        p = urlparse(u)
+        host = (p.netloc or "").lower()
+        path = (p.path or "").lower()
+    except Exception:
+        return None
+    if not (("amazon." in host) or host.endswith("amazon.com")):
+        return None
+    if "/ap/signin" not in path:
+        return None
+    v = ""
+    for k, val in parse_qsl(p.query or "", keep_blank_values=True):
+        if (k or "").strip().lower() == "openid.return_to":
+            v = (val or "").strip()
+            break
+    if not v:
+        return None
+    v2 = unquote(v)
+    if "%" in v2:
+        v2 = unquote(v2)
+    if not (v2.startswith("http://") or v2.startswith("https://")):
+        return None
+    try:
+        h2 = (urlparse(v2).netloc or "").lower()
+    except Exception:
+        return None
+    if ("amazon." in h2) or h2.endswith("amazon.com"):
+        return v2
+    return None
 
 
 def _expand_woot_gatekeeper_url(url: str) -> Optional[str]:
@@ -801,6 +842,14 @@ def _expand_woot_gatekeeper_url(url: str) -> Optional[str]:
         if "woot.com" in h2:
             return v2
     return None
+
+
+def _expand_gatekeeper_url(url: str) -> Optional[str]:
+    """Peel merchant destination out of Woot welcome or Amazon sign-in interstitials."""
+    a = _expand_amazon_signin_return_url(url)
+    if a:
+        return a
+    return _expand_woot_gatekeeper_url(url)
 
 
 def _pick_best_merchant_url_from_candidates(urls: List[str]) -> Optional[str]:
@@ -1206,10 +1255,10 @@ def _extract_first_outbound_url_from_html(html: str) -> Optional[str]:
             continue
         candidates.append(cand)
 
-    # Woot: peel returnUrl=... from gatekeeper pages into real www.woot.com/offers/... links.
+    # Peel gatekeeper interstitials (Woot welcome returnUrl, Amazon ap/signin openid.return_to).
     peeled: List[str] = []
     for u in list(candidates):
-        g = _expand_woot_gatekeeper_url(u)
+        g = _expand_gatekeeper_url(u)
         if g:
             peeled.append(g)
     candidates.extend(peeled)
@@ -1228,13 +1277,29 @@ def _extract_first_outbound_url_from_html(html: str) -> Optional[str]:
                 continue
             if "woot.com" in hh and "/offers/" in ph:
                 candidates.append(cand)
+        for m in re.finditer(r"openid\.return_to=([^&\s\"'<>]+)", t[:400_000], re.IGNORECASE):
+            raw = (m.group(1) or "").strip()
+            cand = unquote(raw)
+            if "%" in cand:
+                cand = unquote(cand)
+            if not (cand.startswith("http://") or cand.startswith("https://")):
+                continue
+            try:
+                ph = (urlparse(cand).path or "").lower()
+                hh = (urlparse(cand).netloc or "").lower()
+            except Exception:
+                continue
+            if ("amazon." in hh or hh.endswith("amazon.com")) and (
+                "/dp/" in ph or "/gp/" in ph or "/d/" in ph or "/deal/" in ph
+            ):
+                candidates.append(cand)
     except Exception:
         pass
 
     best = _pick_best_merchant_url_from_candidates(candidates)
     if best:
-        for _ in range(3):
-            nxt = _expand_woot_gatekeeper_url(best)
+        for _ in range(4):
+            nxt = _expand_gatekeeper_url(best)
             if nxt and nxt != best:
                 best = nxt
             else:
