@@ -8,6 +8,19 @@ from discord import app_commands
 from utils import build_cta_view, build_dm_embeds, has_any_allowed_role, human_rate, iso_now
 
 
+def _session_dict_from_campaign(campaign: dict[str, Any]) -> dict[str, Any]:
+    """Subset of session-shaped fields for reusing builder modals on an active campaign."""
+    return {
+        "campaign_name": campaign.get("campaign_name", ""),
+        "message_body": campaign.get("message_body", ""),
+        "cta_label": campaign.get("cta_label", ""),
+        "cta_url": campaign.get("cta_url", ""),
+        "banner_url": campaign.get("banner_url", ""),
+        "batch_size": int(campaign.get("batch_size", 5)),
+        "batch_interval_minutes": int(campaign.get("batch_interval_minutes", 5)),
+    }
+
+
 class CampaignReuseSelect(discord.ui.Select):
     """Select menu to load a past campaign into the builder for reuse."""
 
@@ -115,10 +128,11 @@ class CampaignReuseView(discord.ui.View):
 
 
 class MessageModal(discord.ui.Modal, title="Edit Promo Message"):
-    def __init__(self, bot_ref, session: dict[str, Any]) -> None:
+    def __init__(self, bot_ref, session: dict[str, Any], status_campaign_id: str | None = None) -> None:
         super().__init__(timeout=None)
         self.bot_ref = bot_ref
         self.session = session
+        self.status_campaign_id = status_campaign_id
 
         self.campaign_name = discord.ui.TextInput(
             label="Campaign Name",
@@ -156,6 +170,34 @@ class MessageModal(discord.ui.Modal, title="Edit Promo Message"):
         self.session["message_body"] = str(self.message_body.value).strip()
         self.session["cta_label"] = str(self.cta_label.value).strip()
         self.session["cta_url"] = str(self.cta_url.value).strip()
+
+        if self.status_campaign_id:
+            campaign = self.bot_ref.campaign_store.get(self.status_campaign_id)
+            queue = self.bot_ref.queue_store.get()
+            if not campaign or queue.get("campaign_id") != self.status_campaign_id or queue.get("status") != "paused":
+                await interaction.response.send_message(
+                    self.bot_ref.messages.get("status_edit_only_when_paused", "Pause the campaign before editing."),
+                    ephemeral=True,
+                )
+                return
+            merged = dict(campaign)
+            merged["campaign_name"] = self.session["campaign_name"]
+            merged["message_body"] = self.session["message_body"]
+            merged["cta_label"] = self.session["cta_label"]
+            merged["cta_url"] = self.session["cta_url"]
+            validation_error = self.bot_ref.validate_session(merged)
+            if validation_error:
+                await interaction.response.send_message(validation_error, ephemeral=True)
+                return
+            campaign["campaign_name"] = self.session["campaign_name"]
+            campaign["message_body"] = self.session["message_body"]
+            campaign["cta_label"] = self.session["cta_label"]
+            campaign["cta_url"] = self.session["cta_url"]
+            self.bot_ref.campaign_store.upsert(campaign)
+            embed = self.bot_ref.build_status_embed(interaction.guild, campaign, queue)
+            await interaction.response.edit_message(embed=embed, view=CampaignControlView(self.bot_ref, self.status_campaign_id))
+            return
+
         self.session["status"] = "draft"
         self.bot_ref.session_store.upsert(interaction.guild_id, interaction.user.id, self.session)
         embed = self.bot_ref.build_builder_embed(interaction.guild, self.session)
@@ -164,10 +206,11 @@ class MessageModal(discord.ui.Modal, title="Edit Promo Message"):
 
 
 class SettingsModal(discord.ui.Modal, title="Edit Campaign Settings"):
-    def __init__(self, bot_ref, session: dict[str, Any]) -> None:
+    def __init__(self, bot_ref, session: dict[str, Any], status_campaign_id: str | None = None) -> None:
         super().__init__(timeout=None)
         self.bot_ref = bot_ref
         self.session = session
+        self.status_campaign_id = status_campaign_id
 
         self.batch_size = discord.ui.TextInput(
             label="Batch Size",
@@ -217,6 +260,24 @@ class SettingsModal(discord.ui.Modal, title="Edit Campaign Settings"):
         self.session["batch_size"] = batch_size
         self.session["batch_interval_minutes"] = interval
         self.session["banner_url"] = str(self.banner_url.value).strip()
+
+        if self.status_campaign_id:
+            campaign = self.bot_ref.campaign_store.get(self.status_campaign_id)
+            queue = self.bot_ref.queue_store.get()
+            if not campaign or queue.get("campaign_id") != self.status_campaign_id or queue.get("status") != "paused":
+                await interaction.response.send_message(
+                    self.bot_ref.messages.get("status_edit_only_when_paused", "Pause the campaign before editing."),
+                    ephemeral=True,
+                )
+                return
+            campaign["batch_size"] = batch_size
+            campaign["batch_interval_minutes"] = interval
+            campaign["banner_url"] = self.session["banner_url"]
+            self.bot_ref.campaign_store.upsert(campaign)
+            embed = self.bot_ref.build_status_embed(interaction.guild, campaign, queue)
+            await interaction.response.edit_message(embed=embed, view=CampaignControlView(self.bot_ref, self.status_campaign_id))
+            return
+
         self.bot_ref.session_store.upsert(interaction.guild_id, interaction.user.id, self.session)
         embed = self.bot_ref.build_builder_embed(interaction.guild, self.session)
         view = PromoBuilderView(self.bot_ref, self.session)
@@ -303,7 +364,7 @@ class CampaignControlView(discord.ui.View):
         self.bot_ref = bot_ref
         self.campaign_id = campaign_id
 
-    @discord.ui.button(label="Pause", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Pause", style=discord.ButtonStyle.secondary, row=0)
     async def pause(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if not self.bot_ref.user_can_manage(interaction):
             await interaction.response.send_message(self.bot_ref.messages["permission_error"], ephemeral=True)
@@ -323,7 +384,7 @@ class CampaignControlView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=CampaignControlView(self.bot_ref, self.campaign_id))
         await self.bot_ref.sender._log_to_channel(self.bot_ref.messages["log_paused"], campaign)
 
-    @discord.ui.button(label="Resume", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Resume", style=discord.ButtonStyle.success, row=0)
     async def resume(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if not self.bot_ref.user_can_manage(interaction):
             await interaction.response.send_message(self.bot_ref.messages["permission_error"], ephemeral=True)
@@ -344,7 +405,7 @@ class CampaignControlView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=CampaignControlView(self.bot_ref, self.campaign_id))
         await self.bot_ref.sender._log_to_channel(self.bot_ref.messages["log_resumed"], campaign)
 
-    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, row=0)
     async def refresh(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         campaign = self.bot_ref.campaign_store.get(self.campaign_id)
         queue = self.bot_ref.queue_store.get()
@@ -354,7 +415,45 @@ class CampaignControlView(discord.ui.View):
         embed = self.bot_ref.build_status_embed(interaction.guild, campaign, queue)
         await interaction.response.edit_message(embed=embed, view=CampaignControlView(self.bot_ref, self.campaign_id))
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Edit Message", style=discord.ButtonStyle.secondary, row=0)
+    async def edit_message(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not self.bot_ref.user_can_manage(interaction):
+            await interaction.response.send_message(self.bot_ref.messages["permission_error"], ephemeral=True)
+            return
+        queue = self.bot_ref.queue_store.get()
+        if queue.get("campaign_id") != self.campaign_id or queue.get("status") != "paused":
+            await interaction.response.send_message(
+                self.bot_ref.messages.get("status_edit_only_when_paused", "Pause the campaign before editing."),
+                ephemeral=True,
+            )
+            return
+        campaign = self.bot_ref.campaign_store.get(self.campaign_id)
+        if not campaign:
+            await interaction.response.send_message(self.bot_ref.messages["campaign_not_found"], ephemeral=True)
+            return
+        session = _session_dict_from_campaign(campaign)
+        await interaction.response.send_modal(MessageModal(self.bot_ref, session, status_campaign_id=self.campaign_id))
+
+    @discord.ui.button(label="Edit Settings", style=discord.ButtonStyle.secondary, row=0)
+    async def edit_settings(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not self.bot_ref.user_can_manage(interaction):
+            await interaction.response.send_message(self.bot_ref.messages["permission_error"], ephemeral=True)
+            return
+        queue = self.bot_ref.queue_store.get()
+        if queue.get("campaign_id") != self.campaign_id or queue.get("status") != "paused":
+            await interaction.response.send_message(
+                self.bot_ref.messages.get("status_edit_only_when_paused", "Pause the campaign before editing."),
+                ephemeral=True,
+            )
+            return
+        campaign = self.bot_ref.campaign_store.get(self.campaign_id)
+        if not campaign:
+            await interaction.response.send_message(self.bot_ref.messages["campaign_not_found"], ephemeral=True)
+            return
+        session = _session_dict_from_campaign(campaign)
+        await interaction.response.send_modal(SettingsModal(self.bot_ref, session, status_campaign_id=self.campaign_id))
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, row=1)
     async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if not self.bot_ref.user_can_manage(interaction):
             await interaction.response.send_message(self.bot_ref.messages["permission_error"], ephemeral=True)

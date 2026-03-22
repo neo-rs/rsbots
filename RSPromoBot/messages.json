@@ -60,5 +60,6 @@
   "validation_interval_range": "Batch interval must be between 1 and {max_batch_interval_minutes} minutes.",
   "max_recipients_exceeded": "Recipient count exceeds max ({max_campaign_recipients}).",
   "control_not_running": "Campaign is not running.",
-  "control_not_paused": "Campaign is not paused."
+  "control_not_paused": "Campaign is not paused.",
+  "status_edit_only_when_paused": "Pause the campaign first, then use Edit Message or Edit Settings."
 }

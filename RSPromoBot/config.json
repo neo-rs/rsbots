@@ -9,7 +9,7 @@
   "default_batch_size": 5,
   "default_batch_interval_minutes": 5,
   "default_banner_url": "https://cdn.discordapp.com/attachments/1381747904846364865/1389885150724227134/banner.png",
-  "max_batch_size": 10,
+  "max_batch_size": 50,
   "max_batch_interval_minutes": 60,
   "max_campaign_recipients": 5000,
   "preview_recipient_user_id": "",
