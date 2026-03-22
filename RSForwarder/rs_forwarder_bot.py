@@ -53,6 +53,90 @@ def _discord_channel_mention(channel_id: Any) -> str:
     return f"<#{s}>" if s.isdigit() else (s or "?")
 
 
+def _discord_message_url_normalize(url: str) -> str:
+    u = (url or "").strip()
+    if not u:
+        return u
+    return (
+        u.replace("https://ptb.discord.com/", "https://discord.com/")
+        .replace("http://ptb.discord.com/", "https://discord.com/")
+        .replace("https://canary.discord.com/", "https://discord.com/")
+    )
+
+
+def _message_jump_url_for_log(message: discord.Message) -> str:
+    try:
+        return _discord_message_url_normalize(str(getattr(message, "jump_url", "") or ""))
+    except Exception:
+        return ""
+
+
+def _webhook_post_url_with_wait(webhook_url: str) -> str:
+    u = (webhook_url or "").strip()
+    if not u:
+        return u
+    if re.search(r"[?&]wait=(?:true|1)\b", u, re.I):
+        return u
+    return u + ("&" if "?" in u else "?") + "wait=true"
+
+
+def _webhook_lookup_guild_channel_ids(webhook_url: str) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        import requests
+
+        m = re.search(r"/webhooks/(\d+)/([^/?\s]+)", webhook_url)
+        if not m:
+            return None, None
+        wid, token = m.group(1), m.group(2)
+        r = requests.get(
+            f"https://discord.com/api/v10/webhooks/{wid}/{token}",
+            timeout=5,
+        )
+        if r.status_code != 200:
+            return None, None
+        j = r.json()
+        gid = str((j or {}).get("guild_id") or "").strip() or None
+        cid = str((j or {}).get("channel_id") or "").strip() or None
+        return gid, cid
+    except Exception:
+        return None, None
+
+
+def _posted_message_url_from_webhook_response(
+    response: Any, webhook_url: str
+) -> Tuple[Optional[str], str]:
+    """
+    Parse Execute Webhook response (wait=true) into a discord.com message URL and destination <#channel>.
+    """
+    dest_mention = ""
+    try:
+        code = int(getattr(response, "status_code", 0) or 0)
+        if code != 200:
+            return None, ""
+        text = (getattr(response, "text", None) or "").strip()
+        if not text:
+            return None, ""
+        data = response.json()
+        if not isinstance(data, dict):
+            return None, ""
+        mid = str(data.get("id") or "").strip()
+        dcid = str(data.get("channel_id") or "").strip()
+        gid = str(data.get("guild_id") or "").strip()
+        if dcid:
+            dest_mention = _discord_channel_mention(dcid)
+        if not mid or not dcid:
+            return None, dest_mention
+        if not gid:
+            gid2, _dc = _webhook_lookup_guild_channel_ids(webhook_url)
+            gid = (gid2 or "").strip()
+        if gid:
+            url = _discord_message_url_normalize(f"https://discord.com/channels/{gid}/{dcid}/{mid}")
+            return url, dest_mention
+    except Exception:
+        pass
+    return None, dest_mention
+
+
 def _repost_log_clip(s: str, n: int = 96) -> str:
     t = (s or "").replace("\r", " ").replace("\n", " ").strip()
     return t if len(t) <= n else t[: max(0, n - 3)] + "..."
@@ -8623,13 +8707,25 @@ class RSForwarderBot:
 
             webhook_url = channel_config.get("destination_webhook_url", "").strip()
             source_channel_name = channel_config.get("source_channel_name", f"Channel {channel_id}")
-            
+            src_ch_ref = _discord_channel_mention(channel_id)
+            src_jump = _message_jump_url_for_log(message)
+
             if not webhook_url:
                 if self.stats['messages_forwarded'] == 0:  # Only warn once
-                    print(f"{Colors.YELLOW}[Forward] ⚠️ No webhook configured for channel {source_channel_name} <#{channel_id}>{Colors.RESET}")
+                    print(
+                        f"{Colors.YELLOW}[Forward] ⚠️ No webhook configured for {src_ch_ref} ({source_channel_name}){Colors.RESET}",
+                        flush=True,
+                    )
                 return
-            
-            print(f"{Colors.CYAN}[Forward] Forwarding message from {source_channel_name}...{Colors.RESET}")
+
+            print(
+                f"{Colors.CYAN}[Forward] Message detected from {src_ch_ref} - {src_jump or '(no jump_url)'}{Colors.RESET}",
+                flush=True,
+            )
+            print(
+                f"{Colors.CYAN}[Forward] Forwarding from {src_ch_ref}...{Colors.RESET}",
+                flush=True,
+            )
             
             # Prepare message content
             content = message.content or ""
@@ -8639,7 +8735,7 @@ class RSForwarderBot:
             affiliate_changed = False
             affiliate_notes: Dict[str, str] = {}
             aff_cfg = self._affiliate_cfg(channel_config)
-            aff_cfg["_affiliate_log_channel_ref"] = _discord_channel_mention(channel_id)
+            aff_cfg["_affiliate_log_channel_ref"] = src_ch_ref
             if rewrite_enabled and content:
                 content, _changed, _notes = await affiliate_rewriter.rewrite_text(aff_cfg, content)
                 if _changed:
@@ -8676,9 +8772,15 @@ class RSForwarderBot:
             if rewrite_enabled and affiliate_notes:
                 try:
                     if affiliate_changed:
-                        print(f"{Colors.GREEN}[Affiliate] ✅ Rewrote affiliate links ({len(affiliate_notes)} url(s)) {Colors.RESET}")
+                        print(
+                            f"{Colors.GREEN}[Affiliate] {src_ch_ref} ✅ Rewrote affiliate links ({len(affiliate_notes)} url(s)){Colors.RESET}",
+                            flush=True,
+                        )
                     else:
-                        print(f"{Colors.YELLOW}[Affiliate] ↩ No affiliate rewrite ({len(affiliate_notes)} url(s)) {Colors.RESET}")
+                        print(
+                            f"{Colors.YELLOW}[Affiliate] {src_ch_ref} ↩ No affiliate rewrite ({len(affiliate_notes)} url(s)){Colors.RESET}",
+                            flush=True,
+                        )
 
                     shown = 0
                     limit = 4 if affiliate_changed else 2
@@ -8686,7 +8788,10 @@ class RSForwarderBot:
                         if shown >= limit:
                             break
                         # `note` may include "reason -> replacement" from affiliate_rewriter.rewrite_text
-                        print(f"{Colors.CYAN}[Affiliate] - {u} ({note}){Colors.RESET}")
+                        print(
+                            f"{Colors.CYAN}[Affiliate] {src_ch_ref} - {u} ({note}){Colors.RESET}",
+                            flush=True,
+                        )
                         shown += 1
                 except Exception:
                     pass
@@ -8854,22 +8959,35 @@ class RSForwarderBot:
                 print(f"{Colors.CYAN}[Debug] Payload username: {payload.get('username')}{Colors.RESET}")
                 print(f"{Colors.CYAN}[Debug] Payload avatar_url: {payload.get('avatar_url', 'NOT SET')[:50] if payload.get('avatar_url') else 'NOT SET'}{Colors.RESET}")
             
-            # Send to webhook
-            response = requests.post(webhook_url, json=payload, timeout=10)
-            
+            # Send to webhook (wait=true so we can log the posted message jump link)
+            webhook_exec = _webhook_post_url_with_wait(webhook_url)
+            response = requests.post(webhook_exec, json=payload, timeout=10)
+
             if response.status_code in [200, 204]:
                 self.stats['messages_forwarded'] += 1
-                channel_name = channel_config.get("source_channel_name", channel_id)
                 embed_count = len(embeds)
                 role_mention = " (with role mention)" if role_mention_text else ""
-                print(f"{Colors.GREEN}[Forward] ✓ {channel_name} → {len(content)} chars, {embed_count} embed(s){role_mention}{Colors.RESET}")
-                
+                posted_url, dest_ch_ref = _posted_message_url_from_webhook_response(response, webhook_url)
+                dest_part = dest_ch_ref or "(unknown dest channel)"
+                posted_part = posted_url or "(no message id; webhook wait=true response empty)"
+                print(
+                    f"{Colors.GREEN}[Forward] Posted to {dest_part} - {posted_part}{Colors.RESET}",
+                    flush=True,
+                )
+                print(
+                    f"{Colors.GREEN}[Forward] ✓ {src_ch_ref} → {len(content)} chars, {embed_count} embed(s){role_mention}{Colors.RESET}",
+                    flush=True,
+                )
+
                 # Send forwarding log
                 await self._send_forwarding_log(message, channel_config, success=True)
             else:
                 self.stats['errors'] += 1
                 error_msg = f"{response.status_code}: {response.text[:200]}"
-                print(f"{Colors.RED}[Forward] ✗ Error {error_msg}{Colors.RESET}")
+                print(
+                    f"{Colors.RED}[Forward] ✗ {src_ch_ref} Error {error_msg}{Colors.RESET}",
+                    flush=True,
+                )
                 
                 # Send forwarding log with error
                 await self._send_forwarding_log(message, channel_config, success=False, error=error_msg)
@@ -8877,8 +8995,12 @@ class RSForwarderBot:
         except Exception as e:
             self.stats['errors'] += 1
             error_msg = str(e)
-            print(f"{Colors.RED}[Forward] Exception: {error_msg}{Colors.RESET}")
-            
+            _fref = _discord_channel_mention(channel_id)
+            print(
+                f"{Colors.RED}[Forward] {_fref} Exception: {error_msg}{Colors.RESET}",
+                flush=True,
+            )
+
             # Send forwarding log with exception
             await self._send_forwarding_log(message, channel_config, success=False, error=error_msg)
             
