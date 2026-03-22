@@ -16,7 +16,7 @@ import json
 import time
 import hashlib
 import asyncio
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional, Tuple
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
@@ -447,7 +447,78 @@ class RSSuccessBot:
             await log_channel.send(embed=embed)
         except Exception as e:
             print(f"{Colors.RED}[Log] Failed to log action: {e}{Colors.RESET}")
-    
+
+    def _marketplace_profile_counts(self) -> Tuple[int, int, int]:
+        """Return (total_profiles, enabled_profiles, with_message_id) from marketplace_profiles.json."""
+        path = self.base_path / "marketplace_profiles.json"
+        if not path.exists():
+            return (0, 0, 0)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            profiles = data.get("profiles") or {}
+            total = len(profiles)
+            enabled = 0
+            published = 0
+            for p in profiles.values():
+                if p.get("enabled", True):
+                    enabled += 1
+                if str(p.get("profile_message_id") or "").strip():
+                    published += 1
+            return (total, enabled, published)
+        except Exception:
+            return (0, 0, 0)
+
+    def _print_marketplace_startup_block(self, guild: Optional[discord.Guild]) -> None:
+        """Console summary: marketplace channels, JSON profile counts, whether slash commands registered."""
+        if self.config.get("marketplace_enabled") is False:
+            print(f"{Colors.YELLOW}🛒 Marketplace:{Colors.RESET} disabled (`marketplace_enabled: false`)")
+            return
+
+        reg = {c.name for c in self.bot.tree.get_commands()}
+        expected_mp = {"rsmarketplace", "rsmarketview", "rsmarketsearch"}
+        have = sorted(expected_mp & reg)
+        if have:
+            print(f"{Colors.GREEN}🛒 Marketplace commands:{Colors.RESET} " + ", ".join(f"/{n}" for n in have))
+        else:
+            print(
+                f"{Colors.YELLOW}🛒 Marketplace commands:{Colors.RESET} none registered — "
+                f"ensure `rs_marketplace_bot.py` is on the server and restart (file must be committed & deployed)"
+            )
+
+        mc_id = int(self.config.get("marketplace_channel_id") or 0)
+        log_id = int(
+            self.config.get("marketplace_offer_log_channel_id")
+            or self.config.get("marketplace_log_channel_id")
+            or 0
+        )
+        if guild:
+            if mc_id:
+                ch = guild.get_channel(mc_id)
+                if ch:
+                    print(f"{Colors.GREEN}   • Marketplace channel:{Colors.RESET} #{ch.name} <#{mc_id}>")
+                else:
+                    print(f"{Colors.RED}   • Marketplace channel:{Colors.RESET} not found in guild <#{mc_id}>")
+            else:
+                print(f"{Colors.YELLOW}   • Marketplace channel:{Colors.RESET} not configured (`marketplace_channel_id`)")
+            if log_id:
+                och = guild.get_channel(log_id)
+                if och:
+                    print(f"{Colors.GREEN}   • Marketplace offer log:{Colors.RESET} #{och.name} <#{log_id}>")
+                else:
+                    print(f"{Colors.RED}   • Marketplace offer log:{Colors.RESET} not found <#{log_id}>")
+        else:
+            if mc_id:
+                print(f"{Colors.GREEN}   • Marketplace channel ID:{Colors.RESET} {mc_id}")
+            if log_id:
+                print(f"{Colors.GREEN}   • Marketplace offer log ID:{Colors.RESET} {log_id}")
+
+        total, enabled, published = self._marketplace_profile_counts()
+        print(
+            f"{Colors.GREEN}   • Marketplace profiles (JSON):{Colors.RESET} "
+            f"{total} total, {enabled} enabled, {published} with published message id"
+        )
+
     def _setup_events(self):
         """Setup Discord event handlers"""
         
@@ -465,6 +536,7 @@ class RSSuccessBot:
             self.stats['started_at'] = datetime.now(timezone.utc)
             
             guild_id = self.config.get("guild_id")
+            guild: Optional[discord.Guild] = None
             if guild_id:
                 guild = self.bot.get_guild(guild_id)
                 if guild:
@@ -540,6 +612,8 @@ class RSSuccessBot:
                         print(f"{Colors.GREEN}👤 Watch Role:{Colors.RESET} {Colors.BOLD}{role.name}{Colors.RESET} <@&{role_id}>")
                     else:
                         print(f"{Colors.YELLOW}⚠️  Watch Role:{Colors.RESET} Not found <@&{role_id}>")
+            
+            self._print_marketplace_startup_block(guild)
             
             print(f"{Colors.CYAN}{'-'*60}{Colors.RESET}")
         
@@ -1660,6 +1734,40 @@ class RSSuccessBot:
                     name="📝 Log Channel",
                     value="Not configured",
                     inline=True
+                )
+
+            if self.config.get("marketplace_enabled") is not False:
+                mc_id = int(self.config.get("marketplace_channel_id") or 0)
+                offer_log_id = int(
+                    self.config.get("marketplace_offer_log_channel_id")
+                    or self.config.get("marketplace_log_channel_id")
+                    or 0
+                )
+                mp_lines = []
+                if mc_id:
+                    mch = guild.get_channel(mc_id)
+                    mp_lines.append(
+                        f"**Public cards:** {mch.mention if mch else '❌ not found'} (`{mc_id}`)"
+                    )
+                else:
+                    mp_lines.append("**Public cards:** not configured")
+                if offer_log_id:
+                    och = guild.get_channel(offer_log_id)
+                    mp_lines.append(
+                        f"**Offer log:** {och.mention if och else '❌ not found'} (`{offer_log_id}`)"
+                    )
+                reg = {c.name for c in self.bot.tree.get_commands()}
+                mp_cmds = [x for x in ("rsmarketplace", "rsmarketview", "rsmarketsearch") if x in reg]
+                mp_lines.append(
+                    "**Slash:** "
+                    + (", ".join(f"`/{n}`" for n in mp_cmds) if mp_cmds else "❌ module not loaded (missing `rs_marketplace_bot.py`?)")
+                )
+                total, en, pub = self._marketplace_profile_counts()
+                mp_lines.append(f"**Profiles (JSON):** {total} total · {en} enabled · {pub} published msg id")
+                embed.add_field(
+                    name="🛒 Marketplace",
+                    value="\n".join(mp_lines),
+                    inline=False,
                 )
             
             await ctx.send(embed=embed)
