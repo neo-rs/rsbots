@@ -246,6 +246,9 @@ def _strip_tracking_params(url: str) -> str:
             continue
         if kl.startswith("branch_"):
             continue
+        # Mavely web-only deep link flag (harmless for users; API/unwrap sometimes leaves it on bridge URLs)
+        if kl == "$web_only" or kl == "web_only" or kl.lstrip("$") == "web_only":
+            continue
         if kl.startswith("cj") and len(kl) <= 12:
             continue
         if kl in deny_exact:
@@ -1908,7 +1911,15 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                     mapped[u] = link2
                     notes[u] = "rewrapped mavely link (short link fallback)"
                     continue
-                err_combined = _short_err(err2) or _short_err(err)
+                # Log both failures when they differ (bridge tried first; short often repeats app.link wording).
+                eb, es = _short_err(err), _short_err(err2)
+                _parts: List[str] = []
+                for p in (eb, es):
+                    if p and p not in _parts:
+                        _parts.append(p)
+                err_combined = "; ".join(_parts)[:200]
+                if len(err_combined) == 200:
+                    err_combined = err_combined[:197] + "..."
                 mapped[u] = _strip_tracking_params(target) or _strip_tracking_params(raw) or raw
                 notes[u] = (
                     f"mavely rewrap failed ({err_combined}); fell back to expanded destination (stripped tracking)"
@@ -2035,7 +2046,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                 else:
                     notes[u] = "mavely failed; not forwarding intermediate Mavely URL as fallback"
             else:
-                mapped[u] = target
+                mapped[u] = _strip_tracking_params(target) or target
                 if _is_mavely_unsupported(err):
                     notes[u] = "expanded only (merchant not supported by Mavely)"
                 else:
