@@ -232,6 +232,11 @@ def _strip_tracking_params(url: str) -> str:
         "cjevent",
         "cjpid",
         "cjaid",
+        # Walmart affiliate / impact-style tracking on /ip/... landers
+        "clickid",
+        "wmlspartner",
+        "affiliates_ad_id",
+        "sharedid",
     }
 
     kept = []
@@ -419,6 +424,15 @@ def _mavely_bridge_host(host: str) -> bool:
     if h == "mavely.app.link" or h.endswith(".mavely.app.link"):
         return True
     return False
+
+
+def _url_is_mavely_bridge_surface(url: str) -> bool:
+    """True if URL is still mavely.app.link / mavelyinfluencer.com (real browsers often SPA-redirect to the merchant)."""
+    try:
+        h = (urlparse((url or "").strip()).netloc or "").lower()
+    except Exception:
+        return True
+    return _mavely_bridge_host(h)
 
 
 def is_mavely_app_short_link(url: str) -> bool:
@@ -618,6 +632,25 @@ def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
                     page.wait_for_timeout(2000)
                 except Exception:
                     pass
+                # Hubs often client-navigate to Walmart/Amazon after hydration (same as clicking the short link in a browser).
+                # aiohttp/curl only see the bridge HTML; wait until the address bar leaves Mavely or timeout.
+                poll_budget_s = min(28.0, max(5.0, (t_ms / 1000.0) - 3.0))
+                deadline = time.time() + poll_budget_s
+                while time.time() < deadline:
+                    try:
+                        cur = (page.url or "").strip()
+                    except Exception:
+                        cur = ""
+                    if cur.startswith("http") and (not _url_is_mavely_bridge_surface(cur)):
+                        esc = _html.escape(cur, quote=True)
+                        return (
+                            '<!DOCTYPE html><html><body>'
+                            f'<a href="{esc}">outbound</a></body></html>'
+                        )
+                    try:
+                        page.wait_for_timeout(500)
+                    except Exception:
+                        break
                 return page.content() or ""
             finally:
                 ctx.close()

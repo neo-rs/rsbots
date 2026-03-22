@@ -220,6 +220,14 @@ When you need to run compound commands remotely, prefer a single `bash -lc`:
   - On Windows: `py -3 scripts/rsbots_manifest.py --normalize-text-eol --out Oraclserver-files/rsbots_manifest_local.json`
   - Compare: `py -3 scripts/compare_rsbots_python_only.py`
 
+### Oracle-side integration tests (canonical — RSForwarder / affiliate / Mavely)
+
+- **Do not treat local runs as production proof.** Running `py -3 scripts/test_mavely_app_links.py` (or similar) **only on your PC** is fine for quick iteration, but it is **not authoritative** for Oracle: missing or different **`mavely_cookies.txt` / env**, **datacenter IP vs home IP (Cloudflare / Walmart / Mavely)**, **systemd Environment=**, and **`MAVELY_PROFILE_DIR` + Playwright** routinely change outcomes.
+- **Authoritative validation** for “does unwrap / affiliate behave on the live bot host?” means: run the harness **on the Oracle server** over **SSH**, in the **deployed repo root** from `oraclekeys/servers.json` (typically `/home/rsadmin/bots/mirror-world`), using the **server venv** (e.g. `.venv/bin/python` or `venv/bin/python`).
+- **Canonical harness:** `scripts/test_mavely_app_links.py` (remote `cd` to `remote_root`, then invoke with the test URL(s) and `--timeout-s` as needed). On the server it loads `RSForwarder/config` and `RSForwarder/mavely_cookies.txt` like the bot.
+- **Automation (SCP + SSH):** `py -3 scripts/run_oracle_mavely_bridge_test.py [--url ...] [--skip-scp]` uploads current `RSForwarder/affiliate_rewriter.py` and `scripts/test_mavely_app_links.py`, then runs the test remotely. Use `--skip-scp` only when you know the remote tree already matches what you intend to validate.
+- **Agents and humans:** When reporting test results for this path, **state whether the run was Oracle SSH or local-only**. Local-only results must be labeled **non-authoritative** for production behavior.
+
 ### Baseline sync rule (MANDATORY - prevents "Cursor edited the wrong code")
 
 Before ANY debugging, refactor, cleanup, or feature work on RS bots, you MUST prove that the local workspace matches what is actually running on Oracle.
