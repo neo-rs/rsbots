@@ -1982,6 +1982,33 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                                 % (_aff_dbg_clip(candidate, 72), len(pw_html), hint),
                                             )
                             out = _first_production_outbound_from_hub_html(txt)
+                            if (
+                                not out
+                                and mv_hub
+                                and is_mavely_app_short_link((normalized.get(u) or u).strip())
+                                and _mavely_bridge_playwright_enabled()
+                                and resolve_mavely_profile_dir() is not None
+                            ):
+                                short_u = (normalized.get(u) or u).strip()
+                                async with _playwright_mavely_async_lock():
+                                    pw_short = await asyncio.to_thread(
+                                        _fetch_mavely_html_via_playwright_sync,
+                                        short_u,
+                                        int(hub_html_timeout_s),
+                                    )
+                                if pw_short:
+                                    txt = pw_short
+                                    out = _first_production_outbound_from_hub_html(txt)
+                                    if affiliate_rewrite_debug_verbose_on(cfg):
+                                        _aff_dbg_verbose(
+                                            cfg,
+                                            "  html_unwrap playwright(short) %r -> len=%s merchant=%r"
+                                            % (
+                                                _aff_dbg_clip(short_u, 72),
+                                                len(pw_short),
+                                                _aff_dbg_clip(out or "", 72),
+                                            ),
+                                        )
                             if not out:
                                 break
                             # Resolve relative links found in HTML against the current page.
