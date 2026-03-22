@@ -1019,6 +1019,36 @@ class RSMarketplaceBot:
         except Exception:
             pass
 
+    async def repair_stale_profile_message_pointers(self, guild: discord.Guild) -> Tuple[int, List[str]]:
+        """
+        Clear profile_message_id when the message no longer exists (e.g. manually deleted).
+        Uses profile_channel_id or configured marketplace_channel_id.
+        """
+        default_ch = int(self.config.get("marketplace_channel_id", 0) or 0)
+        cleared_ids: List[str] = []
+        for uid_str, profile in (self.marketplace_data.get("profiles") or {}).items():
+            msg_id = str(profile.get("profile_message_id") or "").strip()
+            if not msg_id:
+                continue
+            ch_id = int(profile.get("profile_channel_id") or default_ch or 0)
+            channel = guild.get_channel(ch_id) if ch_id else None
+            remove = False
+            if channel is None:
+                remove = True
+            else:
+                try:
+                    await channel.fetch_message(int(msg_id))
+                except Exception:
+                    remove = True
+            if remove:
+                profile["profile_message_id"] = ""
+                cleared_ids.append(uid_str)
+        if cleared_ids:
+            self.save_profiles_data()
+            for uid_str in cleared_ids:
+                self.atomic_log("profile_message_orphan_cleared", int(uid_str), {})
+        return len(cleared_ids), cleared_ids
+
     async def register_persistent_views(self) -> None:
         if not self.config.get("marketplace_enabled", True):
             return
@@ -1026,6 +1056,12 @@ class RSMarketplaceBot:
         guild = self.bot.get_guild(guild_id) if guild_id else None
         if guild is None:
             return
+        n_clear, _ = await self.repair_stale_profile_message_pointers(guild)
+        if n_clear:
+            print(
+                f"{Colors.YELLOW}[Marketplace] Cleared {n_clear} stale profile_message_id pointer(s) "
+                f"(messages missing or channel unreachable){Colors.RESET}"
+            )
         registered = 0
         for uid_str, profile in (self.marketplace_data.get("profiles") or {}).items():
             if not profile.get("enabled", True):
@@ -1033,7 +1069,7 @@ class RSMarketplaceBot:
             msg_id = str(profile.get("profile_message_id") or "").strip()
             if not msg_id:
                 continue
-            ch_id = int(profile.get("profile_channel_id") or 0)
+            ch_id = int(profile.get("profile_channel_id") or self.config.get("marketplace_channel_id", 0) or 0)
             channel = guild.get_channel(ch_id) if ch_id else None
             if channel is None:
                 continue
@@ -1399,6 +1435,7 @@ class RSMarketplaceBot:
         }
         guild_id = int(self.config.get("guild_id", 0) or 0)
         guild = self.bot.get_guild(guild_id) if guild_id else None
+        default_mc = int(self.config.get("marketplace_channel_id", 0) or 0)
 
         for user_id, profile in profiles.items():
             report["total_profiles"] += 1
@@ -1407,7 +1444,7 @@ class RSMarketplaceBot:
             else:
                 report["disabled_profiles"] += 1
 
-            channel_id = int(profile.get("profile_channel_id") or 0)
+            channel_id = int(profile.get("profile_channel_id") or default_mc or 0)
             message_id = str(profile.get("profile_message_id") or "").strip()
 
             channel = guild.get_channel(channel_id) if guild and channel_id else None
@@ -1534,6 +1571,26 @@ class RSMarketplaceBot:
         async def marketcleanup(ctx: commands.Context) -> None:
             report = await self.cleanup_report()
             await ctx.send(f"```\n{self.format_cleanup_report(report)}\n```")
+
+        @self.bot.command(name="marketrepair")
+        @commands.has_permissions(manage_messages=True)
+        async def marketrepair(ctx: commands.Context) -> None:
+            """Clear stored profile_message_id when the Discord message was deleted (fixes JSON vs channel)."""
+            guild_id = int(self.config.get("guild_id", 0) or 0)
+            guild = self.bot.get_guild(guild_id) if guild_id else None
+            if guild is None or ctx.guild is None:
+                await ctx.send("Guild not available.")
+                return
+            n, ids = await self.repair_stale_profile_message_pointers(guild)
+            if not n:
+                await ctx.send("No stale marketplace message pointers found — JSON already matches Discord.")
+                return
+            mentions = " ".join(f"<@{u}>" for u in ids[:20])
+            extra = f" (+{len(ids) - 20} more)" if len(ids) > 20 else ""
+            await ctx.send(
+                f"Cleared **{n}** orphaned `profile_message_id` value(s). Affected members: {mentions}{extra}\n"
+                f"They should run **Publish / Refresh** from `/rsmarketplace` (or use `!marketrepublish @member`) to post a new card."
+            )
 
         @self.bot.command(name="marketrepublish")
         @commands.has_permissions(manage_messages=True)
