@@ -24,6 +24,8 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -112,7 +114,20 @@ def _build_ssh_base(entry: ServerEntry) -> List[str]:
 
 
 def _build_scp_base(entry: ServerEntry) -> List[str]:
-    cmd: List[str] = ["scp", "-i", _resolve_key_path(entry.key), "-o", "StrictHostKeyChecking=no"]
+    # Keepalives help when large SCP transfers sit idle on slow links.
+    cmd: List[str] = [
+        "scp",
+        "-i",
+        _resolve_key_path(entry.key),
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=240",
+        "-o",
+        "ConnectTimeout=60",
+    ]
     if entry.ssh_options:
         cmd.extend(shlex.split(entry.ssh_options))
     return cmd
@@ -120,6 +135,27 @@ def _build_scp_base(entry: ServerEntry) -> List[str]:
 
 def _run(cmd: List[str], timeout: int) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def _run_scp_download(cmd: List[str], timeout: int) -> subprocess.CompletedProcess:
+    """
+    Run SCP without capturing stdout/stderr so OpenSSH can print to the console.
+    Also emit a heartbeat line every 15s because scp often prints nothing until the end.
+    """
+    done = threading.Event()
+
+    def _heartbeat() -> None:
+        start = time.monotonic()
+        while not done.wait(15):
+            elapsed = int(time.monotonic() - start)
+            print(f"      ... still downloading ({elapsed}s elapsed — large file or slow network / OneDrive)", flush=True)
+
+    hb = threading.Thread(target=_heartbeat, daemon=True)
+    hb.start()
+    try:
+        return subprocess.run(cmd, timeout=timeout)
+    finally:
+        done.set()
 
 
 def _safe_extract(tar_path: Path, dest_dir: Path) -> None:
@@ -383,12 +419,15 @@ def main() -> int:
     print(res.stdout.strip())
 
     print("[2/3] Downloading tar via scp ...")
+    print(
+        "      Tip: OpenSSH scp often shows no byte progress; if OUT_DIR is under OneDrive, "
+        "writes can be slow. Heartbeat lines every 15s mean it is still running.",
+        flush=True,
+    )
     local_tar = snap_dir / f"rsbots_full_snapshot_{ts}.tar.gz"
     scp_cmd = _build_scp_base(entry) + [f"{entry.user}@{entry.host}:{remote_tar}", str(local_tar)]
-    res2 = _run(scp_cmd, timeout=args.scp_timeout)
+    res2 = _run_scp_download(scp_cmd, timeout=args.scp_timeout)
     if res2.returncode != 0:
-        print(res2.stdout)
-        print(res2.stderr)
         raise RuntimeError(f"SCP download failed (exit {res2.returncode})")
 
     print("[3/3] Extracting ...")

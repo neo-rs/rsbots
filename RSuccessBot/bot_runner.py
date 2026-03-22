@@ -11,7 +11,7 @@ import sys
 import json
 import asyncio
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 # Ensure repo root is importable when executed as a script (matches Ubuntu run_bot.sh PYTHONPATH).
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -27,7 +27,11 @@ from mirror_world_config import is_placeholder_secret, mask_secret
 # Import bot modules
 from rs_success_bot import RSSuccessBot
 from rs_vouch_bot import RSVouchBot
-from rs_marketplace_bot import RSMarketplaceBot
+
+try:
+    from rs_marketplace_bot import RSMarketplaceBot
+except ModuleNotFoundError:
+    RSMarketplaceBot = None  # type: ignore[misc, assignment]
 
 # Colors for terminal
 class Colors:
@@ -51,7 +55,7 @@ class RSBotRunner:
         self.bot: Optional[commands.Bot] = None
         self.success_bot: Optional[RSSuccessBot] = None
         self.vouch_bot: Optional[RSVouchBot] = None
-        self.marketplace_bot: Optional[RSMarketplaceBot] = None
+        self.marketplace_bot: Optional[Any] = None
         
         self.load_config()
         self.create_shared_bot()
@@ -110,15 +114,21 @@ class RSBotRunner:
             traceback.print_exc()
             sys.exit(1)
 
-        # Marketplace Profiler (slash + prefix commands on same tree / bot)
-        try:
-            self.marketplace_bot = RSMarketplaceBot(bot_instance=self.bot)
-            print(f"{Colors.GREEN}[Runner] ✅ Marketplace module initialized{Colors.RESET}")
-        except Exception as e:
-            print(f"{Colors.RED}[Runner] ❌ Failed to initialize Marketplace module: {e}{Colors.RESET}")
-            import traceback
-            traceback.print_exc()
-            sys.exit(1)
+        # Marketplace Profiler (optional: file must exist on server — commit rs_marketplace_bot.py)
+        if RSMarketplaceBot is None:
+            print(
+                f"{Colors.YELLOW}[Runner] ⚠️  rs_marketplace_bot.py missing — marketplace disabled. "
+                f"Commit/sync RSuccessBot/rs_marketplace_bot.py to the server and restart.{Colors.RESET}"
+            )
+        else:
+            try:
+                self.marketplace_bot = RSMarketplaceBot(bot_instance=self.bot)
+                print(f"{Colors.GREEN}[Runner] ✅ Marketplace module initialized{Colors.RESET}")
+            except Exception as e:
+                print(f"{Colors.RED}[Runner] ❌ Failed to initialize Marketplace module: {e}{Colors.RESET}")
+                import traceback
+                traceback.print_exc()
+                sys.exit(1)
         
         print(f"{Colors.GREEN}[Runner] ✅ All modules initialized successfully{Colors.RESET}")
     
