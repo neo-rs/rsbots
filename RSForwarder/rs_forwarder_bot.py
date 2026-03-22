@@ -48,6 +48,73 @@ class Colors:
     RESET = '\033[0m'
 
 
+def _discord_channel_mention(channel_id: Any) -> str:
+    s = str(channel_id or "").strip()
+    return f"<#{s}>" if s.isdigit() else (s or "?")
+
+
+def _repost_log_clip(s: str, n: int = 96) -> str:
+    t = (s or "").replace("\r", " ").replace("\n", " ").strip()
+    return t if len(t) <= n else t[: max(0, n - 3)] + "..."
+
+
+def _repost_collect_http_urls(message: discord.Message, text: str) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+
+    def add(u: str) -> None:
+        u = (u or "").strip()
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+
+    try:
+        for u, _, _ in affiliate_rewriter.extract_urls_with_spans(text or ""):
+            add(u)
+    except Exception:
+        pass
+    try:
+        for emb in message.embeds or []:
+            d = emb.to_dict()
+            u0 = (d.get("url") or "").strip()
+            if u0.startswith(("http://", "https://")):
+                add(u0)
+            for key in ("title", "description"):
+                sub = d.get(key)
+                if isinstance(sub, str):
+                    for u, _, _ in affiliate_rewriter.extract_urls_with_spans(sub):
+                        add(u)
+            foot = d.get("footer")
+            if isinstance(foot, dict):
+                ft = foot.get("text")
+                if isinstance(ft, str):
+                    for u, _, _ in affiliate_rewriter.extract_urls_with_spans(ft):
+                        add(u)
+            for fld in d.get("fields") or []:
+                if not isinstance(fld, dict):
+                    continue
+                for k in ("name", "value"):
+                    v = fld.get(k)
+                    if isinstance(v, str):
+                        for u, _, _ in affiliate_rewriter.extract_urls_with_spans(v):
+                            add(u)
+    except Exception:
+        pass
+    return out
+
+
+def _repost_format_notes(notes: Optional[Dict[str, str]], limit: int = 8) -> str:
+    if not notes:
+        return "(no note entries)"
+    parts: List[str] = []
+    for i, (k, v) in enumerate(notes.items()):
+        if i >= limit:
+            parts.append(f"+{len(notes) - limit} more")
+            break
+        parts.append("%s => %s" % (_repost_log_clip(k, 72), _repost_log_clip(str(v), 100)))
+    return " | ".join(parts)
+
+
 def _rsfs_is_valid_affiliate_url(url: str) -> bool:
     """
     True only for affiliate-looking URLs we are willing to persist into sheets.
@@ -1121,9 +1188,9 @@ class RSForwarderBot:
         return max(60, min(v, 3600))
 
     def _affiliate_cfg(self, channel_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Shallow copy for affiliate_rewriter. Affiliate stdout (`[AffiliateDebug]`) uses config
-        `affiliate_rewrite_debug` or env AFFILIATE_REWRITE_DEBUG — not `repost_debug` (repost_debug is
-        only for `[Repost] ...` channel diagnostics)."""
+        """Shallow copy for affiliate_rewriter. Optional `_affiliate_log_channel_ref` (e.g. '<#id>')
+        is set by repost/forward so `[AffiliateFlow]` lines include the channel mention. Affiliate stdout
+        (`[AffiliateDebug]`) uses `affiliate_rewrite_debug` / AFFILIATE_REWRITE_DEBUG — not `repost_debug`."""
         base = dict(self.config or {})
         base["_affiliate_compute_memo"] = {}
         return base
@@ -8270,25 +8337,43 @@ class RSForwarderBot:
 
         NOTE: This only triggers when a rewrite actually changes something, to avoid
         pointless churn for plain text messages.
+
+        With `repost_debug` on the channel config, logs use `<#channel_id>` and step=1..5 lines
+        (links seen, content/embed rewrites, post, delete).
         """
         try:
             rewrite_enabled = bool(self.config.get("affiliate_rewrite_enabled", True))
             if not rewrite_enabled:
                 return
             debug = bool((channel_config or {}).get("repost_debug"))
+            ch_ref = _discord_channel_mention(channel_id)
+            aff_cfg = self._affiliate_cfg(channel_config)
+            aff_cfg["_affiliate_log_channel_ref"] = ch_ref
+
+            any_changed = False
+            content_changed = False
+            embed_changed = False
+            content = message.content or ""
+            repost_notes_acc: Dict[str, str] = {}
+
             if debug:
                 try:
                     mid = int(getattr(message, "id", 0) or 0)
                     aid = int(getattr(getattr(message, "author", None), "id", 0) or 0)
-                    print(f"{Colors.CYAN}[Repost] saw message id={mid} author={aid} channel={channel_id}{Colors.RESET}")
+                    saw_urls = _repost_collect_http_urls(message, content)
+                    jump = getattr(message, "jump_url", "") or ""
+                    u_show = " | ".join(_repost_log_clip(u, 88) for u in saw_urls[:12])
+                    if len(saw_urls) > 12:
+                        u_show += " | ..."
+                    print(
+                        f"{Colors.CYAN}[Repost] {ch_ref} step=1 saw message_id={mid} author_id={aid} "
+                        f"link_count={len(saw_urls)} links={u_show or '(none)'} jump={jump}{Colors.RESET}",
+                        flush=True,
+                    )
                 except Exception:
                     pass
 
-            any_changed = False
-            aff_cfg = self._affiliate_cfg(channel_config)
-
             # Content rewrite
-            content = message.content or ""
 
             where_only = bool((channel_config or {}).get("repost_affiliate_where_only"))
             where_marker = str((channel_config or {}).get("repost_affiliate_where_marker") or "`Where:`").strip()
@@ -8327,7 +8412,6 @@ class RSForwarderBot:
                     lines = [content]
                 out_lines: List[str] = []
                 where_matched = 0
-                where_notes: List[str] = []
                 for ln in lines:
                     # Only affiliate-rewrite URLs in the `Where:` line.
                     ln_norm = _lstrip_invisible_prefix(ln)
@@ -8341,17 +8425,9 @@ class RSForwarderBot:
                         new_ln, changed, notes = await affiliate_rewriter.rewrite_text(aff_cfg, ln)
                         if changed:
                             any_changed = True
-                        if debug and isinstance(notes, dict) and notes:
-                            shown = 0
-                            for u, note in list(notes.items()):
-                                if shown >= 2:
-                                    break
-                                nu = (str(u or "").strip() or "?")[:140]
-                                nn = (str(note or "").replace("\r", " ").replace("\n", " ").strip() or "?")
-                                if len(nn) > 200:
-                                    nn = nn[:200] + "..."
-                                where_notes.append(f"{nu} ({nn})")
-                                shown += 1
+                            content_changed = True
+                        if isinstance(notes, dict) and notes:
+                            repost_notes_acc.update(notes)
                         out_lines.append(new_ln)
                     else:
                         out_lines.append(ln)
@@ -8362,18 +8438,30 @@ class RSForwarderBot:
                             first = lines[0] if lines else ""
                             cp = _codepoints_prefix(str(first or ""), limit=16)
                             print(
-                                f"{Colors.YELLOW}[Repost] where-only enabled but no lines matched marker={where_marker!r}. "
-                                f"first_line_prefix={cp}{Colors.RESET}"
+                                f"{Colors.YELLOW}[Repost] {ch_ref} where-only enabled but no lines matched "
+                                f"marker={where_marker!r}. first_line_prefix={cp}{Colors.RESET}",
+                                flush=True,
                             )
-                        elif where_notes:
-                            print(f"{Colors.CYAN}[Repost] where rewrite notes: { ' | '.join(where_notes) }{Colors.RESET}")
                     except Exception:
                         pass
             elif content:
                 content2, changed, _notes = await affiliate_rewriter.rewrite_text(aff_cfg, content)
                 if changed:
                     any_changed = True
+                    content_changed = True
                 content = content2
+                if isinstance(_notes, dict) and _notes:
+                    repost_notes_acc.update(_notes)
+
+            if debug:
+                try:
+                    print(
+                        f"{Colors.CYAN}[Repost] {ch_ref} step=2 content_rewrite "
+                        f"content_changed={content_changed} {_repost_format_notes(repost_notes_acc)}{Colors.RESET}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
 
             # Embed rewrite (rich embeds only)
             embeds_raw_all = [e.to_dict() for e in message.embeds] if message.embeds else []
@@ -8381,16 +8469,31 @@ class RSForwarderBot:
             if embeds_raw and (not where_only):
                 rewritten = []
                 for e in embeds_raw:
-                    ee, ch, _notes = await affiliate_rewriter.rewrite_embed_dict(aff_cfg, e)
+                    ee, ch, enotes = await affiliate_rewriter.rewrite_embed_dict(aff_cfg, e)
                     if ch:
                         any_changed = True
+                        embed_changed = True
+                    if isinstance(enotes, dict) and enotes:
+                        repost_notes_acc.update(enotes)
                     rewritten.append(ee)
                 embeds_raw = rewritten
+                if debug:
+                    try:
+                        print(
+                            f"{Colors.CYAN}[Repost] {ch_ref} step=3 embed_rewrite "
+                            f"rich_embeds={len(embeds_raw)} embed_changed={embed_changed}{Colors.RESET}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
 
             if not any_changed:
                 if debug:
                     try:
-                        print(f"{Colors.YELLOW}[Repost] no affiliate rewrite for message in channel={channel_id}{Colors.RESET}")
+                        print(
+                            f"{Colors.YELLOW}[Repost] {ch_ref} step=done no_affiliate_rewrite (nothing to post){Colors.RESET}",
+                            flush=True,
+                        )
                     except Exception:
                         pass
                 return
@@ -8426,6 +8529,21 @@ class RSForwarderBot:
             if not send_kwargs.get("content") and not send_kwargs.get("embeds") and not send_kwargs.get("files"):
                 return
 
+            if debug:
+                try:
+                    has_reply = bool(
+                        message.reference and getattr(message.reference, "message_id", None)
+                    )
+                    print(
+                        f"{Colors.CYAN}[Repost] {ch_ref} step=4 posting "
+                        f"content_len={len(send_kwargs.get('content') or '')} "
+                        f"embeds={len(send_kwargs.get('embeds') or [])} files={len(send_kwargs.get('files') or [])} "
+                        f"reply_chain={has_reply} outcome={_repost_format_notes(repost_notes_acc)}{Colors.RESET}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+
             # Preserve reply chain (reply to the same referenced message, not to the original).
             try:
                 if message.reference and getattr(message.reference, "message_id", None):
@@ -8438,11 +8556,17 @@ class RSForwarderBot:
             try:
                 await message.channel.send(**send_kwargs)
             except Exception as e:
-                print(f"{Colors.RED}[Repost] Failed to repost in-place for channel {channel_id}: {e}{Colors.RESET}")
+                print(
+                    f"{Colors.RED}[Repost] {ch_ref} step=4 failed repost_send: {e}{Colors.RESET}",
+                    flush=True,
+                )
                 return
             if debug:
                 try:
-                    print(f"{Colors.GREEN}[Repost] reposted affiliate-updated message in channel={channel_id}{Colors.RESET}")
+                    print(
+                        f"{Colors.GREEN}[Repost] {ch_ref} step=4 done posted affiliate-updated message{Colors.RESET}",
+                        flush=True,
+                    )
                 except Exception:
                     pass
 
@@ -8451,18 +8575,43 @@ class RSForwarderBot:
             if delete_original is None:
                 delete_original = True
             if bool(delete_original):
+                if debug:
+                    try:
+                        print(
+                            f"{Colors.CYAN}[Repost] {ch_ref} step=5 deleting original message_id={getattr(message, 'id', '')}{Colors.RESET}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
                 try:
                     await message.delete()
                 except Exception as e:
-                    print(f"{Colors.YELLOW}[Repost] Reposted but could not delete original: {e}{Colors.RESET}")
+                    print(
+                        f"{Colors.YELLOW}[Repost] {ch_ref} step=5 delete_original failed: {e}{Colors.RESET}",
+                        flush=True,
+                    )
                 else:
                     if debug:
                         try:
-                            print(f"{Colors.GREEN}[Repost] deleted original message in channel={channel_id}{Colors.RESET}")
+                            print(
+                                f"{Colors.GREEN}[Repost] {ch_ref} step=5 done original deleted{Colors.RESET}",
+                                flush=True,
+                            )
                         except Exception:
                             pass
+            elif debug:
+                try:
+                    print(
+                        f"{Colors.CYAN}[Repost] {ch_ref} step=5 skipped (repost_delete_original=false){Colors.RESET}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
         except Exception as e:
-            print(f"{Colors.RED}[Repost] Exception: {e}{Colors.RESET}")
+            print(
+                f"{Colors.RED}[Repost] {_discord_channel_mention(channel_id)} exception: {e}{Colors.RESET}",
+                flush=True,
+            )
     
     async def forward_message(self, message: discord.Message, channel_id: str, channel_config: Dict[str, Any]):
         """Forward a message to the configured webhook"""
@@ -8490,6 +8639,7 @@ class RSForwarderBot:
             affiliate_changed = False
             affiliate_notes: Dict[str, str] = {}
             aff_cfg = self._affiliate_cfg(channel_config)
+            aff_cfg["_affiliate_log_channel_ref"] = _discord_channel_mention(channel_id)
             if rewrite_enabled and content:
                 content, _changed, _notes = await affiliate_rewriter.rewrite_text(aff_cfg, content)
                 if _changed:

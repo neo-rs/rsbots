@@ -139,10 +139,21 @@ def affiliate_rewrite_flow_log_on(cfg: Optional[dict]) -> bool:
     return False
 
 
+def _aff_flow_channel_prefix(cfg: Optional[dict]) -> str:
+    """Optional Discord channel mention for stdout (set by RSForwarder repost/forward), e.g. '<#123>'."""
+    try:
+        ref = str((cfg or {}).get("_affiliate_log_channel_ref") or "").strip()
+        if ref:
+            return f"{ref} "
+    except Exception:
+        pass
+    return ""
+
+
 def _aff_flow(cfg: Optional[dict], msg: str) -> None:
     if not affiliate_rewrite_flow_log_on(cfg):
         return
-    print(f"[AffiliateFlow] {msg}", flush=True)
+    print(f"[AffiliateFlow] {_aff_flow_channel_prefix(cfg)}{msg}", flush=True)
 
 
 def _aff_dbg_notes_summary(notes: Optional[Dict[str, str]], limit: int = 8) -> str:
@@ -648,7 +659,12 @@ _mavely_playwright_last_error: str = ""
 
 
 def _fetch_mavely_html_via_playwright_sync(
-    url: str, timeout_s: int, *, flow_log: bool = False, label: str = ""
+    url: str,
+    timeout_s: int,
+    *,
+    flow_log: bool = False,
+    label: str = "",
+    flow_cfg: Optional[dict] = None,
 ) -> str:
     """
     Headless Chromium only: `mavely_link_resolve.playwright_resolve_mavely_to_merchant_url`
@@ -669,17 +685,18 @@ def _fetch_mavely_html_via_playwright_sync(
     elapsed = time.perf_counter() - t0
     if flow_log:
         tag = ("[%s] " % label.strip()) if (label or "").strip() else ""
+        chp = _aff_flow_channel_prefix(flow_cfg)
         if mer:
             print(
-                "[AffiliateFlow] mavely_playwright %sok url_out=%r (%.2fs)"
-                % (tag, _aff_dbg_clip(mer, 96), elapsed),
+                "[AffiliateFlow] %smavely_playwright %sok url_out=%r (%.2fs)"
+                % (chp, tag, _aff_dbg_clip(mer, 96), elapsed),
                 flush=True,
             )
         else:
             hint = _aff_dbg_clip(_mavely_playwright_last_error or "no merchant URL", 100)
             print(
-                "[AffiliateFlow] mavely_playwright %sfail url_in=%r (%.2fs) %s"
-                % (tag, _aff_dbg_clip(u, 96), elapsed, hint),
+                "[AffiliateFlow] %smavely_playwright %sfail url_in=%r (%.2fs) %s"
+                % (chp, tag, _aff_dbg_clip(u, 96), elapsed, hint),
                 flush=True,
             )
     if mer:
@@ -1930,6 +1947,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                     int(hub_html_timeout_s),
                                     flow_log=flow_on,
                                     label="unwrap",
+                                    flow_cfg=cfg,
                                 )
                             out_m = (
                                 _first_production_outbound_from_hub_html(pw_html)
