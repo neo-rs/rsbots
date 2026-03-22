@@ -10,11 +10,12 @@ ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 def format_log_user_id(user_id: int | str | None) -> str:
-    """Log segment for user references: numeric User-ID (grep-friendly, matches Guild-ID: style elsewhere)."""
+    """Log segment: numeric User-ID (grep) plus Discord mention <@id> so journal/log channels resolve the user."""
     if user_id is None:
         return "User-ID:?"
     try:
-        return f"User-ID:{int(user_id)}"
+        uid = int(user_id)
+        return f"User-ID:{uid} <@{uid}>"
     except (TypeError, ValueError):
         return f"User-ID:{user_id!s}"
 

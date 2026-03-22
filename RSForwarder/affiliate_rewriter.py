@@ -323,12 +323,30 @@ def _is_markdown_link_target_context(text: str, start: int, end: int) -> bool:
         return False
 
 
+def _mavely_bridge_host(host: str) -> bool:
+    """
+    True if this host is still on Mavely's tracking layer (not the final merchant).
+    Expanding mavely.app.link often lands on mavelyinfluencer.com/u/<creator> — that URL
+    credits whoever created the original link, not us. We must unwrap further or rewrap via API.
+    """
+    h = (host or "").strip().lower()
+    if h.startswith("www."):
+        h = h[4:]
+    if not h:
+        return False
+    if h == "mavelyinfluencer.com" or h.endswith(".mavelyinfluencer.com"):
+        return True
+    if h == "mavely.app.link" or h.endswith(".mavely.app.link"):
+        return True
+    return False
+
+
 def is_mavely_link(url: str) -> bool:
     try:
         host = (urlparse(url).netloc or "").lower()
     except Exception:
         host = ""
-    return "mavely.app.link" in host
+    return _mavely_bridge_host(host)
 
 
 def is_amazon_like_url(url: str) -> bool:
@@ -506,6 +524,8 @@ def should_expand_url(url: str) -> bool:
         "walmrt.us",
         "amzn.to",
         "mavely.app.link",
+        "mavelyinfluencer.com",
+        "www.mavelyinfluencer.com",
         # Redirect chains seen from go.sylikes.com -> rd.bizrate.com -> go.skimresources.com -> merchant
         "go.sylikes.com",
         "rd.bizrate.com",
@@ -617,6 +637,7 @@ def _extract_first_outbound_url_from_html(html: str) -> Optional[str]:
         r"https?://saveyourdeals\.com/[A-Za-z0-9]+",
         r"https?://(?:www\.)?dealsabove\.com/[^\s\"'<>]+",
         r"https?://(?:www\.)?walmart\.com/[^\s\"'<>]+",
+        r"https?://(?:www\.)?woot\.com/[^\s\"'<>]+",
         r"https?://walmrt\.us/[A-Za-z0-9]+",
         r"https?://(?:www\.)?target\.com/[^\s\"'<>]+",
         r"https?://(?:www\.)?urbanoutfitters\.[^\s\"'<>]+",
@@ -1036,6 +1057,8 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                         "pricedoffers.com",
                         "saveyourdeals.com",
                         "mavely.app.link",
+                        "mavelyinfluencer.com",
+                        "www.mavelyinfluencer.com",
                         "go.sylikes.com",
                         "rd.bizrate.com",
                         "go.skimresources.com",
@@ -1161,10 +1184,10 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                     notes[u] = f"rewrap failed ({reason})" if reason else "rewrap failed (no expanded destination)"
             continue
 
-        # If it expands to a Mavely link, keep that final mavely link (rare but happens).
-        if is_mavely_link(target) and (target != raw):
-            mapped[u] = target
-            notes[u] = "resolves to mavely link"
+        # Do not pass through intermediate Mavely URLs (e.g. mavelyinfluencer.com/u/...) — those credit
+        # whoever created the original link. Prefer leaving the message unchanged over substituting them.
+        if is_mavely_link(target) and (target != raw) and (not is_mavely_link(raw)):
+            notes[u] = "expand landed on Mavely bridge; skipped (avoid another creator's tracking URL)"
             continue
 
         if is_amazon_like_url(target):
@@ -1200,12 +1223,15 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
             mapped[u] = link
             notes[u] = "mavely affiliate"
         elif target and (target != raw):
-            mapped[u] = target
-            if _is_mavely_unsupported(err):
-                notes[u] = "expanded only (merchant not supported by Mavely)"
+            if is_mavely_link(target):
+                notes[u] = "mavely failed; not forwarding intermediate Mavely URL as fallback"
             else:
-                reason = _short_err(err)
-                notes[u] = f"expanded only (mavely failed: {reason})" if reason else "expanded only"
+                mapped[u] = target
+                if _is_mavely_unsupported(err):
+                    notes[u] = "expanded only (merchant not supported by Mavely)"
+                else:
+                    reason = _short_err(err)
+                    notes[u] = f"expanded only (mavely failed: {reason})" if reason else "expanded only"
         else:
             if _is_mavely_unsupported(err):
                 notes[u] = "merchant not supported by Mavely"
