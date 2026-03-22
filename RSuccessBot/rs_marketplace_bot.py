@@ -10,7 +10,7 @@ What this module includes
 - one public marketplace profile message per member
 - edit flow via modal + buttons
 - offer button that DMs the profile owner with disclaimer
-- vouch button that points members to /rsvouch
+- vouch button opens a modal (same flow as /rsvouch) and refreshes the public card when wired
 - middleman eligibility gate using vouch score >= configured threshold
 - helper admin commands for cleanup reporting and republish
 
@@ -28,6 +28,7 @@ Integration
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import unicodedata
@@ -76,6 +77,10 @@ class MarketplaceStats:
     vouch_score: int = 0
     vouch_count: int = 0
     avg_rating: float = 0.0
+    # Closed marketplace offers where this user was the seller (from marketplace_profiles.json offers[])
+    offers_succeeded: int = 0
+    offers_cancelled: int = 0
+    offers_reported: int = 0
 
 
 class OfferModal(discord.ui.Modal, title="Make an Offer"):
@@ -1208,6 +1213,21 @@ class RSMarketplaceBot:
         except Exception:
             return {"vouches": []}
 
+    def seller_offer_outcome_counts(self, seller_user_id: int) -> Tuple[int, int, int]:
+        """Counts closed offers for this seller: succeeded, cancelled, reported (staff-flagged)."""
+        succeeded = cancelled = reported = 0
+        for o in self.marketplace_data.get("offers") or []:
+            if str(o.get("seller_id")) != str(seller_user_id):
+                continue
+            st = str(o.get("status") or "").strip().lower()
+            if st == "succeeded":
+                succeeded += 1
+            elif st == "cancelled":
+                cancelled += 1
+            elif st == "reported":
+                reported += 1
+        return succeeded, cancelled, reported
+
     def get_member_stats(self, user_id: int) -> MarketplaceStats:
         success = self.load_success_points()
         success_points = int(success.get("points", {}).get(str(user_id), {}).get("points", 0) or 0)
@@ -1226,11 +1246,16 @@ class RSMarketplaceBot:
         vouch_score = sum(ratings)
         avg_rating = (sum(ratings) / len(ratings)) if ratings else 0.0
 
+        osucc, ocancel, orep = self.seller_offer_outcome_counts(user_id)
+
         return MarketplaceStats(
             success_points=success_points,
             vouch_score=vouch_score,
             vouch_count=vouch_count,
             avg_rating=avg_rating,
+            offers_succeeded=osucc,
+            offers_cancelled=ocancel,
+            offers_reported=orep,
         )
 
     def is_middleman_eligible(self, user_id: int, profile: Dict[str, Any], stats: Optional[MarketplaceStats] = None) -> bool:
@@ -1275,7 +1300,11 @@ class RSMarketplaceBot:
             + f"Success Points: **{stats.success_points}**\n"
             + f"Vouch Score: **{stats.vouch_score}**\n"
             + f"Total Vouches: **{stats.vouch_count}**\n"
-            + f"Avg Rating: **{stats.avg_rating:.2f}**"
+            + f"Avg Rating: **{stats.avg_rating:.2f}**\n"
+            + "\n"
+            + "**Marketplace offers** (you as seller)\n"
+            + f"Completed: **{stats.offers_succeeded}** · Cancelled: **{stats.offers_cancelled}** · "
+            + f"Flagged for staff: **{stats.offers_reported}**"
         )
         embed.add_field(name="Trust Metrics", value=score_text, inline=False)
 
@@ -1479,6 +1508,47 @@ class RSMarketplaceBot:
         else:
             await interaction.response.send_message(response_text, ephemeral=True)
 
+    async def refresh_public_profile_card(self, user_id: int) -> None:
+        """Re-render the published marketplace message if one exists (e.g. after a new vouch or offer status change)."""
+        profile = (self.marketplace_data.get("profiles") or {}).get(str(user_id))
+        if not profile or not profile.get("enabled", True):
+            return
+        msg_id = str(profile.get("profile_message_id") or "").strip()
+        if not msg_id:
+            return
+        channel_id = int(profile.get("profile_channel_id") or self.config.get("marketplace_channel_id", 0) or 0)
+        if not channel_id:
+            return
+        guild_id = int(self.config.get("guild_id", 0) or 0)
+        guild = self.bot.get_guild(guild_id) if guild_id else None
+        channel = guild.get_channel(channel_id) if guild else self.bot.get_channel(channel_id)
+        if channel is None:
+            return
+        try:
+            message = await channel.fetch_message(int(msg_id))
+        except Exception:
+            return
+        member = guild.get_member(user_id) if guild else None
+        try:
+            user_obj: discord.abc.User = member or await self.bot.fetch_user(user_id)
+        except Exception:
+            return
+        self.migrate_profile_fields(profile)
+        stats = self.get_member_stats(user_id)
+        embed = self.build_profile_embed(user_obj, profile, stats)
+        mm = self.is_middleman_eligible(user_id, profile, stats)
+        store_url = self.primary_store_url(profile)
+        has_feat = len(self.get_featured_products(profile)) > 0
+        profile["last_published_middleman"] = mm
+        profile["last_published_has_featured"] = has_feat
+        view = MarketplaceProfileView(self, user_id, mm, store_url, has_feat)
+        try:
+            await message.edit(embed=embed, view=view)
+        except Exception:
+            return
+        profile["updated_at"] = utc_now_iso()
+        self.save_profiles_data()
+
     def _alloc_offer_id(self) -> int:
         self.marketplace_data.setdefault("offer_id_seq", 0)
         n = int(self.marketplace_data["offer_id_seq"]) + 1
@@ -1588,6 +1658,8 @@ class RSMarketplaceBot:
         await self._try_dm_user(buyer_id, e_buyer)
         await self._try_dm_user(seller_id, e_seller)
 
+        # Staff notification: seller clicked **Report** on a pending offer. Configure
+        # `marketplace_offer_log_channel_id` (or legacy `marketplace_log_channel_id`) in config.json.
         if new_status == "reported":
             log_id = int(
                 self.config.get("marketplace_offer_log_channel_id")
@@ -1596,20 +1668,36 @@ class RSMarketplaceBot:
             )
             if log_id and interaction.guild:
                 ch = interaction.guild.get_channel(log_id)
-                if ch and isinstance(ch, discord.TextChannel):
+                if ch and isinstance(ch, discord.abc.Messageable):
                     staff_e = discord.Embed(
                         title="Marketplace offer reported",
-                        description=f"Offer `#{offer_id}` — seller <@{seller_id}> buyer <@{buyer_id}>",
+                        description=(
+                            f"Seller <@{seller_id}> flagged offer `#{offer_id}` for staff review.\n"
+                            f"Buyer: <@{buyer_id}>"
+                        ),
                         color=discord.Color.orange(),
                     )
-                    staff_e.add_field(name="Title", value=truncate(offer.get("title", ""), 256), inline=False)
-                    staff_e.add_field(name="Message", value=truncate(offer.get("message", ""), 1024), inline=False)
+                    staff_e.add_field(
+                        name="Action",
+                        value="Seller used **Report** in `/rsmarketviewoffers` (offer closed as reported).",
+                        inline=False,
+                    )
+                    staff_e.add_field(name="Title", value=truncate(str(offer.get("title", "")), 256), inline=False)
+                    staff_e.add_field(
+                        name="Price / terms",
+                        value=truncate(str(offer.get("price", "") or "—"), 256),
+                        inline=False,
+                    )
+                    staff_e.add_field(name="Buyer message", value=truncate(str(offer.get("message", "")), 1024), inline=False)
+                    staff_e.set_footer(text=f"Offer id {offer_id} · {utc_now_iso()}")
                     try:
                         await ch.send(embed=staff_e)
                     except Exception:
                         pass
 
         self.atomic_log(f"offer_{new_status}", seller_id, {"offer_id": offer_id, "buyer_id": str(buyer_id)})
+
+        asyncio.create_task(self.refresh_public_profile_card(seller_id))
 
         await interaction.response.edit_message(
             content=f"Offer **#{offer_id}** updated: **{new_status}**. DMs sent where possible.",

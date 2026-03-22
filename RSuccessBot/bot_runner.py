@@ -129,7 +129,10 @@ class RSBotRunner:
                 import traceback
                 traceback.print_exc()
                 sys.exit(1)
-        
+
+        if self.marketplace_bot is not None and self.vouch_bot is not None:
+            self.vouch_bot._marketplace_bot = self.marketplace_bot
+
         print(f"{Colors.GREEN}[Runner] ✅ All modules initialized successfully{Colors.RESET}")
     
     def run(self):

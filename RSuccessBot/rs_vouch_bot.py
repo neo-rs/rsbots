@@ -295,6 +295,10 @@ class RSVouchBot:
 
         await interaction.response.send_message("✅ Successfully vouched for the user!", ephemeral=True)
 
+        mp = getattr(self, "_marketplace_bot", None)
+        if mp is not None:
+            asyncio.create_task(mp.refresh_public_profile_card(int(user.id)))
+
     def _setup_commands(self):
         """Setup slash commands"""
 
