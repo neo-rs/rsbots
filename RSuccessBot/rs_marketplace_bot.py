@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import sys
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -172,22 +173,33 @@ class OfferEntryView(discord.ui.View):
         self.add_item(OfferTargetSelect(module, seller_user_id, products))
 
 
-class FeaturedProductModal(discord.ui.Modal, title="Add featured listing"):
-    def __init__(self, module: "RSMarketplaceBot", user_id: int):
-        super().__init__(timeout=600)
+class FeaturedProductModal(discord.ui.Modal):
+    def __init__(
+        self,
+        module: "RSMarketplaceBot",
+        user_id: int,
+        existing: Optional[Dict[str, Any]] = None,
+        edit_index: Optional[int] = None,
+    ):
+        ex = existing or {}
+        title = "Edit featured listing" if edit_index is not None else "Add featured listing"
+        super().__init__(title=title, timeout=600)
         self.module = module
         self.user_id = user_id
+        self.edit_index = edit_index
         self.title_in = discord.ui.TextInput(
             label="Title",
             placeholder="e.g. Reselling Secrets membership",
             max_length=120,
             required=True,
+            default=str(ex.get("title") or "")[:120],
         )
         self.price_in = discord.ui.TextInput(
             label="Price",
             placeholder="e.g. $60 / month",
             max_length=80,
             required=False,
+            default=str(ex.get("price") or "")[:80],
         )
         self.note_in = discord.ui.TextInput(
             label="Note",
@@ -195,18 +207,21 @@ class FeaturedProductModal(discord.ui.Modal, title="Add featured listing"):
             placeholder="Extra details (optional)",
             max_length=300,
             required=False,
+            default=str(ex.get("note") or "")[:300],
         )
         self.url_in = discord.ui.TextInput(
             label="Link (optional)",
             placeholder="https://…",
             max_length=200,
             required=False,
+            default=str(ex.get("url") or "")[:200],
         )
         self.image_in = discord.ui.TextInput(
             label="Image URL (optional)",
             placeholder="https://…",
             max_length=200,
             required=False,
+            default=str(ex.get("image_url") or "")[:200],
         )
         for x in (self.title_in, self.price_in, self.note_in, self.url_in, self.image_in):
             self.add_item(x)
@@ -218,30 +233,157 @@ class FeaturedProductModal(discord.ui.Modal, title="Add featured listing"):
         self.module.migrate_profile_fields(profile)
         products = list(profile.get("featured_products") or [])
         max_fp = int(self.module.config.get("marketplace_max_featured_products", 10) or 10)
+        url = str(self.url_in.value or "").strip()
+        img = str(self.image_in.value or "").strip()
+        new_row = {
+            "title": str(self.title_in.value or "").strip(),
+            "price": str(self.price_in.value or "").strip(),
+            "note": str(self.note_in.value or "").strip(),
+            "url": url if url.startswith(("http://", "https://")) else "",
+            "image_url": img if img.startswith(("http://", "https://")) else "",
+            "created_at": utc_now_iso(),
+        }
+        if self.edit_index is not None:
+            idx = self.edit_index
+            if idx < 0 or idx >= len(products):
+                await interaction.response.send_message(
+                    "That listing is no longer there. Open **Manage featured** again.",
+                    ephemeral=True,
+                )
+                return
+            old = products[idx]
+            new_row["created_at"] = str(old.get("created_at") or utc_now_iso())
+            products[idx] = new_row
+            profile["featured_products"] = products
+            profile["updated_at"] = utc_now_iso()
+            self.module.save_profiles_data()
+            await interaction.response.send_message(
+                f"Updated **{truncate(new_row['title'], 60)}**. Use **Publish / Refresh** to update your public card.",
+                ephemeral=True,
+            )
+            return
         if len(products) >= max_fp:
             await interaction.response.send_message(
                 f"You already have the maximum ({max_fp}) featured listings. Remove some before adding more.",
                 ephemeral=True,
             )
             return
-        url = str(self.url_in.value or "").strip()
-        img = str(self.image_in.value or "").strip()
-        products.append(
-            {
-                "title": str(self.title_in.value or "").strip(),
-                "price": str(self.price_in.value or "").strip(),
-                "note": str(self.note_in.value or "").strip(),
-                "url": url if url.startswith(("http://", "https://")) else "",
-                "image_url": img if img.startswith(("http://", "https://")) else "",
-                "created_at": utc_now_iso(),
-            }
-        )
+        products.append(new_row)
         profile["featured_products"] = products
         profile["updated_at"] = utc_now_iso()
         self.module.save_profiles_data()
         await interaction.response.send_message(
             f"Added featured listing **{truncate(products[-1]['title'], 60)}** ({len(products)} total). Use **Publish / Refresh** to update your public card.",
             ephemeral=True,
+        )
+
+
+class FeaturedListingPickSelect(discord.ui.Select):
+    def __init__(self, parent: "FeaturedListManageView", options: List[discord.SelectOption]):
+        super().__init__(placeholder="Choose a listing to edit or remove…", options=options, row=0)
+        self.parent = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.parent.user_id:
+            await interaction.response.send_message("This panel is only for the member who opened it.", ephemeral=True)
+            return
+        self.parent.selected_raw_index = int(self.values[0])
+        profile = self.parent.module.get_or_create_profile(self.parent.user_id)
+        full = profile.get("featured_products") or []
+        j = self.parent.selected_raw_index
+        if j < 0 or j >= len(full):
+            await interaction.response.send_message("That listing was removed. Open **Manage featured** again.", ephemeral=True)
+            return
+        t = str(full[j].get("title") or "Listing")
+        await interaction.response.edit_message(
+            content=f"Selected **{truncate(t, 100)}** — click **Edit** or **Remove**.",
+            view=self.parent,
+        )
+
+
+class FeaturedListManageView(discord.ui.View):
+    """Pick a featured row by index in profile['featured_products'], then edit or remove."""
+
+    def __init__(self, module: "RSMarketplaceBot", user_id: int):
+        super().__init__(timeout=300)
+        self.module = module
+        self.user_id = user_id
+        self.selected_raw_index: Optional[int] = None
+        profile = module.get_or_create_profile(user_id)
+        module.migrate_profile_fields(profile)
+        full = profile.get("featured_products") or []
+        opts: List[discord.SelectOption] = []
+        shown = 0
+        for j, p in enumerate(full):
+            if not isinstance(p, dict):
+                continue
+            if not (p.get("title") or p.get("price") or p.get("url")):
+                continue
+            shown += 1
+            if len(opts) >= 25:
+                break
+            t = (p.get("title") or f"Listing {shown}").strip() or f"Listing {shown}"
+            opts.append(
+                discord.SelectOption(
+                    label=truncate(f"{shown}. {t}", 100),
+                    value=str(j),
+                    description=truncate(str(p.get("price") or ""), 100) or None,
+                )
+            )
+        if opts:
+            self.add_item(FeaturedListingPickSelect(self, opts))
+
+    @discord.ui.button(label="Edit", style=discord.ButtonStyle.primary, row=1)
+    async def edit_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This panel is only for the member who opened it.", ephemeral=True)
+            return
+        if self.selected_raw_index is None:
+            await interaction.response.send_message("Choose a listing from the dropdown first.", ephemeral=True)
+            return
+        profile = self.module.get_or_create_profile(self.user_id)
+        full = profile.get("featured_products") or []
+        j = self.selected_raw_index
+        if j < 0 or j >= len(full):
+            await interaction.response.send_message("That listing was removed. Open **Manage featured** again.", ephemeral=True)
+            return
+        await interaction.response.send_modal(
+            FeaturedProductModal(self.module, self.user_id, existing=full[j], edit_index=j)
+        )
+
+    @discord.ui.button(label="Remove", style=discord.ButtonStyle.danger, row=1)
+    async def remove_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This panel is only for the member who opened it.", ephemeral=True)
+            return
+        if self.selected_raw_index is None:
+            await interaction.response.send_message("Choose a listing from the dropdown first.", ephemeral=True)
+            return
+        profile = self.module.get_or_create_profile(self.user_id)
+        self.module.migrate_profile_fields(profile)
+        products = list(profile.get("featured_products") or [])
+        j = self.selected_raw_index
+        if j < 0 or j >= len(products):
+            await interaction.response.send_message("That listing was already removed.", ephemeral=True)
+            return
+        removed_title = str(products[j].get("title") or "Listing")
+        products.pop(j)
+        profile["featured_products"] = products
+        profile["updated_at"] = utc_now_iso()
+        self.module.save_profiles_data()
+        fresh = FeaturedListManageView(self.module, self.user_id)
+        if not any(
+            isinstance(p, dict) and (p.get("title") or p.get("price") or p.get("url"))
+            for p in (profile.get("featured_products") or [])
+        ):
+            await interaction.response.edit_message(
+                content=f"Removed **{truncate(removed_title, 80)}**. No listings left — use **Add featured listing** to add one. **Publish / Refresh** updates your public card.",
+                view=None,
+            )
+            return
+        await interaction.response.edit_message(
+            content=f"Removed **{truncate(removed_title, 80)}**. Pick another listing below or close this message. **Publish / Refresh** updates your public card.",
+            view=fresh,
         )
 
 
@@ -357,7 +499,6 @@ class ProfileModal(discord.ui.Modal, title="Marketplace Profile Setup"):
         self.user_id = user_id
         existing = existing or {}
         module.migrate_profile_fields(existing)
-        interests = existing.get("interests", {})
         default_banner = str(existing.get("banner_url") or module.config.get("marketplace_default_banner_url") or DEFAULT_MARKETPLACE_BANNER_URL)
 
         self.bio = discord.ui.TextInput(
@@ -383,16 +524,8 @@ class ProfileModal(discord.ui.Modal, title="Marketplace Profile Setup"):
             default=default_banner[:200],
             placeholder="Leave default or paste image URL",
         )
-        self.interests_text = discord.ui.TextInput(
-            label="WTB / WTS / WTT / ISO / Services",
-            style=discord.TextStyle.paragraph,
-            required=False,
-            max_length=500,
-            default=self.module.serialize_interest_lines(interests),
-            placeholder="WTB: Pokemon sealed\nWTS: Ross sneakers",
-        )
 
-        for item in [self.bio, self.store_links, self.banner_url, self.interests_text]:
+        for item in [self.bio, self.store_links, self.banner_url]:
             self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
@@ -405,7 +538,83 @@ class ProfileModal(discord.ui.Modal, title="Marketplace Profile Setup"):
             profile["banner_url"] = b
         else:
             profile["banner_url"] = self.module.config.get("marketplace_default_banner_url") or DEFAULT_MARKETPLACE_BANNER_URL
-        profile["interests"] = self.module.parse_interest_lines(str(self.interests_text.value or ""))
+        profile["enabled"] = True
+        profile["updated_at"] = utc_now_iso()
+        self.module.save_profiles_data()
+        await self.module.publish_or_update_profile(interaction, profile, announce=True)
+
+
+class InterestsModal(discord.ui.Modal, title="Buying & selling"):
+    """Five labeled fields (Discord modal limit). No WTB:/WTS: prefixes needed."""
+
+    def __init__(self, module: "RSMarketplaceBot", user_id: int, existing: Optional[Dict[str, Any]] = None):
+        super().__init__(timeout=600)
+        self.module = module
+        self.user_id = user_id
+        existing = existing or {}
+        interests = existing.get("interests") or {}
+
+        def join_vals(key: str) -> str:
+            v = interests.get(key) or []
+            if isinstance(v, list):
+                return ", ".join(str(x) for x in v if str(x).strip())[:400]
+            return ""
+
+        self.wtb = discord.ui.TextInput(
+            label="WTB (want to buy)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=400,
+            default=join_vals("wtb"),
+            placeholder="e.g. Pokemon sealed, vintage tees (commas or new lines)",
+        )
+        self.wts = discord.ui.TextInput(
+            label="WTS (want to sell)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=400,
+            default=join_vals("wts"),
+            placeholder="e.g. Ross sneakers",
+        )
+        self.wtt = discord.ui.TextInput(
+            label="WTT (want to trade)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=400,
+            default=join_vals("wtt"),
+            placeholder="Optional — items you want to trade",
+        )
+        self.iso = discord.ui.TextInput(
+            label="ISO (in search of)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=400,
+            default=join_vals("iso"),
+            placeholder="Optional",
+        )
+        self.services = discord.ui.TextInput(
+            label="Services you offer",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=400,
+            default=join_vals("services"),
+            placeholder="Optional",
+        )
+        for item in (self.wtb, self.wts, self.wtt, self.iso, self.services):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        profile = self.module.get_or_create_profile(self.user_id)
+        self.module.migrate_profile_fields(profile)
+        old_i = profile.get("interests") or {}
+        profile["interests"] = self.module.interests_from_labeled_fields(
+            str(self.wtb.value or ""),
+            str(self.wts.value or ""),
+            str(self.wtt.value or ""),
+            str(self.iso.value or ""),
+            str(self.services.value or ""),
+            preserve_flags_from=old_i if isinstance(old_i, dict) else None,
+        )
         profile["enabled"] = True
         profile["updated_at"] = utc_now_iso()
         self.module.save_profiles_data()
@@ -525,6 +734,33 @@ class MarketplaceSetupView(discord.ui.View):
             await interaction.response.send_message("This setup panel is only for the member who opened it.", ephemeral=True)
             return
         await interaction.response.send_modal(FeaturedProductModal(self.module, self.user_id))
+
+    @discord.ui.button(label="Manage featured", style=discord.ButtonStyle.secondary, row=0)
+    async def manage_featured(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This setup panel is only for the member who opened it.", ephemeral=True)
+            return
+        profile = self.module.get_or_create_profile(self.user_id)
+        self.module.migrate_profile_fields(profile)
+        if not self.module.get_featured_products(profile):
+            await interaction.response.send_message(
+                "You don't have any featured listings yet. Use **Add featured listing** first.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            "Choose a listing from the menu, then **Edit** or **Remove**.",
+            view=FeaturedListManageView(self.module, self.user_id),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Buying & selling", style=discord.ButtonStyle.secondary, row=0)
+    async def edit_interests(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This setup panel is only for the member who opened it.", ephemeral=True)
+            return
+        profile = self.module.get_or_create_profile(self.user_id)
+        await interaction.response.send_modal(InterestsModal(self.module, self.user_id, existing=profile))
 
     @discord.ui.button(label="Preview profile", style=discord.ButtonStyle.secondary, row=1)
     async def preview_profile(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -803,6 +1039,13 @@ class RSMarketplaceBot:
             return "Grailed"
         return "Store"
 
+    def _normalize_interest_raw(self, raw: str) -> str:
+        """NFKC + map Unicode colons so lines like WTB：item still parse."""
+        s = unicodedata.normalize("NFKC", raw or "")
+        for ch in ("\uFF1A", "\uFE55", "\u2236"):  # fullwidth, small, ratio
+            s = s.replace(ch, ":")
+        return s
+
     def parse_interest_lines(self, raw: str) -> Dict[str, Any]:
         interests = {
             "wtb": [],
@@ -814,7 +1057,7 @@ class RSMarketplaceBot:
             "bulk_seller": False,
             "middleman_enabled": False,
         }
-        for line in raw.splitlines():
+        for line in self._normalize_interest_raw(raw).splitlines():
             clean = line.strip()
             if not clean or ":" not in clean:
                 continue
@@ -859,6 +1102,35 @@ class RSMarketplaceBot:
         if interests.get("middleman_enabled"):
             lines.append("Middleman: yes")
         return "\n".join(lines)
+
+    def split_interest_field_values(self, raw: str) -> List[str]:
+        out: List[str] = []
+        for token in self._normalize_interest_raw(raw).replace("\n", ",").split(","):
+            s = token.strip()
+            if s:
+                out.append(s)
+        return out
+
+    def interests_from_labeled_fields(
+        self,
+        wtb: str,
+        wts: str,
+        wtt: str,
+        iso: str,
+        services: str,
+        preserve_flags_from: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        old = preserve_flags_from or {}
+        return {
+            "wtb": self.split_interest_field_values(wtb),
+            "wts": self.split_interest_field_values(wts),
+            "wtt": self.split_interest_field_values(wtt),
+            "iso": self.split_interest_field_values(iso),
+            "services": self.split_interest_field_values(services),
+            "bulk_buyer": bool(old.get("bulk_buyer")),
+            "bulk_seller": bool(old.get("bulk_seller")),
+            "middleman_enabled": bool(old.get("middleman_enabled")),
+        }
 
     def load_success_points(self) -> Dict[str, Any]:
         if not self.success_points_path.exists():
@@ -963,7 +1235,6 @@ class RSMarketplaceBot:
             )
 
         interests = profile.get("interests", {}) or {}
-        interest_parts = []
         mapping = [
             ("wtb", "WTB"),
             ("wts", "WTS"),
@@ -974,7 +1245,9 @@ class RSMarketplaceBot:
         for key, label in mapping:
             values = interests.get(key, []) or []
             if values:
-                interest_parts.append(f"**{label}:** {truncate(', '.join(values), 250)}")
+                embed.add_field(name=label, value=truncate(", ".join(values), 1024), inline=False)
+
+        interest_parts: List[str] = []
         if interests.get("bulk_buyer"):
             interest_parts.append("**Bulk Buyer:** Yes")
         if interests.get("bulk_seller"):
