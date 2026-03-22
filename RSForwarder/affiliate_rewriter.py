@@ -1893,7 +1893,31 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
         # Re-wrap mavely.app.link short links into YOUR Mavely link (so forwarded posts always credit you).
         # Other URLs (bit.ly, etc.) that expand to mavelyinfluencer.com are handled after expansion.
         if is_mavely_app_short_link(raw):
-            # Expand mavely.app.link to destination, then generate our own link for that destination.
+            # When expansion lands on mavelyinfluencer.com, is_mavely_link(target) is True — GraphQL often
+            # rejects createAffiliateLink for the *short* mavely.app.link host but accepts the bridge URL.
+            # Try bridge first, then the short link, then merchant-only path below.
+            if target and target != raw and is_mavely_link(target):
+                bridge_u = _strip_tracking_params(target) or target
+                link, err = await mavely_create_link(cfg, bridge_u)
+                if link and not err and link != raw:
+                    mapped[u] = link
+                    notes[u] = "rewrapped mavely link (influencer bridge)"
+                    continue
+                link2, err2 = await mavely_create_link(cfg, raw)
+                if link2 and not err2 and link2 != raw:
+                    mapped[u] = link2
+                    notes[u] = "rewrapped mavely link (short link fallback)"
+                    continue
+                err_combined = _short_err(err2) or _short_err(err)
+                mapped[u] = _strip_tracking_params(target) or _strip_tracking_params(raw) or raw
+                notes[u] = (
+                    f"mavely rewrap failed ({err_combined}); fell back to expanded destination (stripped tracking)"
+                    if err_combined
+                    else "mavely rewrap failed; fell back to expanded destination (stripped tracking)"
+                )
+                continue
+
+            # Unwrapped real merchant URL (not a Mavely bridge surface).
             if target and (not is_mavely_link(target)) and (target != raw):
                 target_for_mavely = _strip_tracking_params(target) or target
                 link, err = await mavely_create_link(cfg, target_for_mavely)
@@ -1939,21 +1963,13 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                         else:
                             notes[u] = f"mavely rewrap failed ({reason}); fell back to expanded destination (stripped tracking)" if reason else "mavely rewrap failed; fell back to expanded destination (stripped tracking)"
             else:
-                # Some mavely.app.link pages don't redirect cleanly (HTML/JS). As a fallback, try
-                # generating a link from the Mavely URL itself; if Mavely accepts it, this still
-                # converts "someone else's Mavely link" into your own tracking.
+                # No usable expansion: try short link only.
                 link, err = await mavely_create_link(cfg, raw)
                 if link and not err and link != raw:
                     mapped[u] = link
                     notes[u] = "rewrapped mavely link (direct)"
                 else:
                     reason = _short_err(err)
-                    if target and target != raw and is_mavely_link(target):
-                        link_b, err_b = await mavely_create_link(cfg, target)
-                        if link_b and not err_b and link_b != raw:
-                            mapped[u] = link_b
-                            notes[u] = "rewrapped mavely link (GraphQL from influencer bridge URL)"
-                            continue
                     notes[u] = f"rewrap failed ({reason})" if reason else "rewrap failed (no expanded destination)"
             continue
 
