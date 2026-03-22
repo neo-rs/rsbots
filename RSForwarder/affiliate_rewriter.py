@@ -614,7 +614,9 @@ def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
         return ""
     t_ms = max(10_000, min(int(float(timeout_s) * 1000), 120_000))
     launch_args = ["--disable-session-crashed-bubble", "--disable-dev-shm-usage"]
-    if (os.getenv("MAVELY_PLAYWRIGHT_NO_SANDBOX", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}:
+    # Headless Chromium on Ubuntu (Oracle) typically needs --no-sandbox; don't rely only on systemd env.
+    _pw_nosb = (os.getenv("MAVELY_PLAYWRIGHT_NO_SANDBOX", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    if _pw_nosb or sys.platform.startswith("linux"):
         launch_args.append("--no-sandbox")
     headless = (os.getenv("MAVELY_PLAYWRIGHT_HEADLESS", "1") or "").strip().lower() not in {"0", "false", "no", "n", "off"}
     try:
@@ -629,12 +631,16 @@ def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
                 page = ctx.new_page()
                 page.goto(u, wait_until="domcontentloaded", timeout=t_ms)
                 try:
+                    page.wait_for_load_state("load", timeout=min(20_000, max(5_000, t_ms // 2)))
+                except Exception:
+                    pass
+                try:
                     page.wait_for_timeout(2000)
                 except Exception:
                     pass
                 # Hubs often client-navigate to Walmart/Amazon after hydration (same as clicking the short link in a browser).
                 # aiohttp/curl only see the bridge HTML; wait until the address bar leaves Mavely or timeout.
-                poll_budget_s = min(28.0, max(5.0, (t_ms / 1000.0) - 3.0))
+                poll_budget_s = min(55.0, max(12.0, (t_ms / 1000.0) - 5.0))
                 deadline = time.time() + poll_budget_s
                 while time.time() < deadline:
                     try:
@@ -647,6 +653,20 @@ def _fetch_mavely_html_via_playwright_sync(url: str, timeout_s: int) -> str:
                             '<!DOCTYPE html><html><body>'
                             f'<a href="{esc}">outbound</a></body></html>'
                         )
+                    try:
+                        loc = page.evaluate("() => String(location && location.href ? location.href : '')")
+                        if (
+                            isinstance(loc, str)
+                            and loc.startswith("http")
+                            and (not _url_is_mavely_bridge_surface(loc))
+                        ):
+                            esc = _html.escape(loc.strip(), quote=True)
+                            return (
+                                '<!DOCTYPE html><html><body>'
+                                f'<a href="{esc}">outbound</a></body></html>'
+                            )
+                    except Exception:
+                        pass
                     try:
                         page.wait_for_timeout(500)
                     except Exception:
@@ -1350,6 +1370,20 @@ def _extract_first_outbound_url_from_html(html: str) -> Optional[str]:
     return best
 
 
+def _first_production_outbound_from_hub_html(html: str) -> Optional[str]:
+    """
+    First merchant-looking URL from hub HTML, or None if the extractor only finds another Mavely surface.
+    Without this, Oracle often gets a 200 + __NEXT_DATA__ page whose *first* match is still mavelyinfluencer.com,
+    which incorrectly skipped Playwright (truthy extract → need_pw False).
+    """
+    o = _extract_first_outbound_url_from_html(html or "")
+    if not o:
+        return None
+    if _url_is_mavely_bridge_surface(o):
+        return None
+    return o
+
+
 async def expand_url(session: aiohttp.ClientSession, url: str, *, timeout_s: float = 8.0, max_redirects: int = 8) -> str:
     u = (url or "").strip()
     if not (u.startswith("http://") or u.startswith("https://")):
@@ -1846,19 +1880,22 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                 if cbody and ("__NEXT_DATA__" in cbody or _extract_first_outbound_url_from_html(cbody)):
                                     txt = cbody
                             # 200 + __NEXT_DATA__ can still fail extraction (truncated HTML, different shape); curl sometimes differs.
-                            elif mv_hub and (not _extract_first_outbound_url_from_html(txt or "")):
+                            elif mv_hub and (not _first_production_outbound_from_hub_html(txt or "")):
                                 ccode, cbody = await asyncio.to_thread(
                                     _fetch_html_via_curl, candidate, _hub_headers, int(hub_html_timeout_s)
                                 )
-                                if cbody and _extract_first_outbound_url_from_html(cbody):
+                                if cbody and _first_production_outbound_from_hub_html(cbody):
                                     txt = cbody
                             # Real browser + same profile as mavely_cookie_refresher (cf_clearance / session).
                             if _mavely_bridge_playwright_enabled() and (
                                 "mavelyinfluencer.com" in host or "mavely.app.link" in host
                             ):
-                                need_pw = status >= 400 or "__NEXT_DATA__" not in (txt or "")
-                                if not need_pw:
-                                    need_pw = not bool(_extract_first_outbound_url_from_html(txt or ""))
+                                have_merchant = bool(_first_production_outbound_from_hub_html(txt or ""))
+                                need_pw = (
+                                    (status >= 400)
+                                    or ("__NEXT_DATA__" not in (txt or ""))
+                                    or (not have_merchant)
+                                )
                                 if need_pw and resolve_mavely_profile_dir() is not None:
                                     async with _playwright_mavely_async_lock():
                                         pw_html = await asyncio.to_thread(
@@ -1876,7 +1913,13 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                             "  html_unwrap playwright %r -> len=%s"
                                             % (_aff_dbg_clip(candidate, 72), len(pw_html)),
                                         )
-                            out = _extract_first_outbound_url_from_html(txt)
+                                    elif need_pw and affiliate_rewrite_debug_verbose_on(cfg):
+                                        _aff_dbg_verbose(
+                                            cfg,
+                                            "  html_unwrap playwright %r -> no usable html (empty or no extract)"
+                                            % (_aff_dbg_clip(candidate, 72),),
+                                        )
+                            out = _first_production_outbound_from_hub_html(txt)
                             if not out:
                                 break
                             # Resolve relative links found in HTML against the current page.
