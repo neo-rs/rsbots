@@ -1121,14 +1121,10 @@ class RSForwarderBot:
         return max(60, min(v, 3600))
 
     def _affiliate_cfg(self, channel_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Shallow copy of config for affiliate_rewriter; enables debug when repost_debug is on.
-        `_affiliate_compute_memo` dedupes identical URLs across content + multiple embeds in one message."""
+        """Shallow copy for affiliate_rewriter. Affiliate stdout (`[AffiliateDebug]`) uses config
+        `affiliate_rewrite_debug` or env AFFILIATE_REWRITE_DEBUG — not `repost_debug` (repost_debug is
+        only for `[Repost] ...` channel diagnostics)."""
         base = dict(self.config or {})
-        try:
-            if channel_config and bool((channel_config or {}).get("repost_debug")):
-                base["affiliate_rewrite_debug"] = True
-        except Exception:
-            pass
         base["_affiliate_compute_memo"] = {}
         return base
 
@@ -1618,7 +1614,11 @@ class RSForwarderBot:
 
         now_iso = rs_fs_sheet_sync.RsFsSheetSync._utc_now_iso()  # type: ignore[attr-defined]
 
-        print(f"{Colors.CYAN}[RS-FS Recovery]{Colors.RESET} Starting Live affiliate recovery on startup (max_rows={max_rows}, rewrite_enabled={rewrite_enabled})")
+        verbose_rsfs = (os.getenv("RS_FS_RECOVERY_VERBOSE", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+        if verbose_rsfs:
+            print(
+                f"{Colors.CYAN}[RS-FS Recovery]{Colors.RESET} Starting Live affiliate recovery on startup (max_rows={max_rows}, rewrite_enabled={rewrite_enabled})"
+            )
 
         try:
             live_rows = await self._rs_fs_sheet.fetch_live_list_rows()
@@ -1657,7 +1657,10 @@ class RSForwarderBot:
                 seen_monitor_urls.add(mon)
                 unique_monitor_urls.append(mon)
 
-        print(f"{Colors.CYAN}[RS-FS Recovery]{Colors.RESET} Live rows={len(live_rows)} candidates_affiliate_missing_or_invalid={len(candidates)} unique_monitor_urls={len(unique_monitor_urls)}")
+        if verbose_rsfs:
+            print(
+                f"{Colors.CYAN}[RS-FS Recovery]{Colors.RESET} Live rows={len(live_rows)} candidates_affiliate_missing_or_invalid={len(candidates)} unique_monitor_urls={len(unique_monitor_urls)}"
+            )
         if not candidates:
             return
 
@@ -1695,13 +1698,18 @@ class RSForwarderBot:
             history_cache = {}
 
         rewritten = 0
+        skipped_no_affiliate = 0
         for (ri, store, sku, title, mon) in candidates:
             key = self._rsfs_key_store_sku(store, sku)
             affiliate_url = aff_map.get(mon) or ""
 
             # If we still couldn't derive an affiliate, don't blank out existing data.
             if not _rsfs_is_valid_affiliate_url(affiliate_url):
-                print(f"{Colors.YELLOW}[RS-FS Recovery]{Colors.RESET} skip store={store} sku={sku}: cannot derive affiliate from monitor_url")
+                skipped_no_affiliate += 1
+                if verbose_rsfs:
+                    print(
+                        f"{Colors.YELLOW}[RS-FS Recovery]{Colors.RESET} skip store={store} sku={sku}: cannot derive affiliate from monitor_url"
+                    )
                 continue
 
             rewritten += 1
@@ -1716,10 +1724,18 @@ class RSForwarderBot:
             last_release_id = str(hrec.get("last_release_id") or "").strip()
             history_update_rows.append([store, sku, title or str(hrec.get("title") or "").strip(), url, affiliate_url, first_seen, last_seen, last_release_id, src])
 
-            print(f"{Colors.CYAN}[RS-FS Recovery]{Colors.RESET} FILLED store={store} sku={sku} monitor_url_short={mon[:60]!r} affiliate_url_short={affiliate_url[:60]!r}")
+            if verbose_rsfs:
+                print(
+                    f"{Colors.CYAN}[RS-FS Recovery]{Colors.RESET} FILLED store={store} sku={sku} monitor_url_short={mon[:60]!r} affiliate_url_short={affiliate_url[:60]!r}"
+                )
 
+        if skipped_no_affiliate and verbose_rsfs:
+            print(
+                f"{Colors.YELLOW}[RS-FS Recovery]{Colors.RESET} skipped {skipped_no_affiliate} row(s): could not derive affiliate from monitor_url"
+            )
         if not live_update_rows:
-            print(f"{Colors.YELLOW}[RS-FS Recovery]{Colors.RESET} No live rows were filled; recovery stops")
+            if verbose_rsfs:
+                print(f"{Colors.YELLOW}[RS-FS Recovery]{Colors.RESET} No live rows were filled; recovery stops")
             return
 
         # Upsert Live without deleting stale rows
@@ -2125,7 +2141,19 @@ class RSForwarderBot:
         try:
             ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
             line = f"[{ts}] {msg}".rstrip()
-            print(f"{Colors.CYAN}[Mavely]{Colors.RESET} {line}")
+            # Routine preflight OK is noisy on stdout/journal; keep it in the log file only.
+            echo = True
+            m0 = (msg or "").strip()
+            if m0.startswith("preflight OK (status="):
+                echo = (os.getenv("MAVELY_MONITOR_LOG_PREFLIGHT_OK", "") or "").strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "y",
+                    "on",
+                }
+            if echo:
+                print(f"{Colors.CYAN}[Mavely]{Colors.RESET} {line}")
             try:
                 p = self._mavely_monitor_log_path()
                 with open(p, "a", encoding="utf-8", errors="replace") as f:
@@ -2336,7 +2364,8 @@ class RSForwarderBot:
                 self._mavely_last_preflight_err = (err or "").strip() if not ok else ""
                 self._mavely_write_status()
                 if ok:
-                    if prev_ok is not True:
+                    # Log transition to OK (recovery); skip first-startup OK line (file still gets status via writes below if needed)
+                    if prev_ok is False:
                         self._mavely_append_log(f"preflight OK (status={status})")
                     await asyncio.sleep(interval)
                     continue
@@ -4653,32 +4682,46 @@ class RSForwarderBot:
                     except Exception as e:
                         print(f"{Colors.RED}[Affiliate] ❌ Amazon FAIL{Colors.RESET} ({e})")
 
-                    # Mavely startup check (NON-mutating):
-                    # Use a preflight/session check instead of creating an affiliate link (prevents dashboard spam).
+                    # Mavely startup check (NON-mutating). Stdout is opt-in — set RS_MAVELY_STARTUP_LOG=1 to print OK/FAIL.
                     try:
+                        mavely_startup_log = (os.getenv("RS_MAVELY_STARTUP_LOG", "") or "").strip().lower() in {
+                            "1",
+                            "true",
+                            "yes",
+                            "y",
+                            "on",
+                        }
                         ok, status, err = await affiliate_rewriter.mavely_preflight(self.config)
                         if ok:
-                            print(f"{Colors.GREEN}[Affiliate] ✅ Mavely preflight OK{Colors.RESET} (status={status})")
-                            if (os.getenv("MAVELY_STARTUP_BRIDGE_HINT", "") or "").strip().lower() in {
-                                "1",
-                                "true",
-                                "yes",
-                                "y",
-                                "on",
-                            }:
-                                bh = affiliate_rewriter.mavely_bridge_playwright_startup_hint()
-                                if "ready" in bh.lower():
-                                    print(f"{Colors.GREEN}[Affiliate] ✅ {bh}{Colors.RESET}")
-                                else:
-                                    print(f"{Colors.YELLOW}[Affiliate] ⚠️  {bh}{Colors.RESET}")
+                            if mavely_startup_log:
+                                print(f"{Colors.GREEN}[Affiliate] ✅ Mavely preflight OK{Colors.RESET} (status={status})")
+                                if (os.getenv("MAVELY_STARTUP_BRIDGE_HINT", "") or "").strip().lower() in {
+                                    "1",
+                                    "true",
+                                    "yes",
+                                    "y",
+                                    "on",
+                                }:
+                                    bh = affiliate_rewriter.mavely_bridge_playwright_startup_hint()
+                                    if "ready" in bh.lower():
+                                        print(f"{Colors.GREEN}[Affiliate] ✅ {bh}{Colors.RESET}")
+                                    else:
+                                        print(f"{Colors.YELLOW}[Affiliate] ⚠️  {bh}{Colors.RESET}")
                         else:
-                            # Keep error short (never print cookies/tokens)
                             msg = (err or "unknown error").replace("\n", " ").strip()
                             if len(msg) > 180:
                                 msg = msg[:180] + "..."
-                            print(f"{Colors.RED}[Affiliate] ❌ Mavely preflight FAIL{Colors.RESET} (status={status}) {msg}")
+                            if mavely_startup_log:
+                                print(f"{Colors.RED}[Affiliate] ❌ Mavely preflight FAIL{Colors.RESET} (status={status}) {msg}")
                     except Exception as e:
-                        print(f"{Colors.RED}[Affiliate] ❌ Mavely preflight FAIL{Colors.RESET} ({e})")
+                        if (os.getenv("RS_MAVELY_STARTUP_LOG", "") or "").strip().lower() in {
+                            "1",
+                            "true",
+                            "yes",
+                            "y",
+                            "on",
+                        }:
+                            print(f"{Colors.RED}[Affiliate] ❌ Mavely preflight FAIL{Colors.RESET} ({e})")
             except Exception:
                 pass
 

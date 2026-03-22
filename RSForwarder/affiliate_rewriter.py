@@ -10,9 +10,8 @@ Implements the same rewrite behavior as Instorebotforwarder:
 
 Debug logging (stdout, prefix [AffiliateDebug]): config `affiliate_rewrite_debug` or env
 AFFILIATE_REWRITE_DEBUG=1 (compact: one compute summary line per batch). Hop-by-hop noise:
-`affiliate_rewrite_debug_verbose` or AFFILIATE_REWRITE_DEBUG_VERBOSE=1. RSForwarder enables debug when
-a channel has `repost_debug`; it also attaches `_affiliate_compute_memo` so identical URLs across multiple
-embeds run the network/Mavely work once per message.
+`affiliate_rewrite_debug_verbose` or AFFILIATE_REWRITE_DEBUG_VERBOSE=1. RSForwarder attaches
+`_affiliate_compute_memo` so identical URLs across content + multiple embeds run the network/Mavely work once per message.
 
 Mavely short links (`mavely.app.link`) are not bit.ly-style “pure redirects”: HTTP expand often stops at
 `mavelyinfluencer.com` (bridge). Final merchant URLs are recovered here via hub HTML + optional Playwright
