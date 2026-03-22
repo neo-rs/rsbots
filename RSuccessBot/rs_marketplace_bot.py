@@ -624,6 +624,52 @@ class InterestsModal(discord.ui.Modal, title="Buying & selling"):
         await self.module.publish_or_update_profile(interaction, profile, announce=True)
 
 
+class MarketplaceVouchModal(discord.ui.Modal, title="Leave a vouch"):
+    """Collect rating + comment; submits through RSVouchBot.process_vouch_submission (same as /rsvouch)."""
+
+    def __init__(self, vouch_module: Any, target_user_id: int):
+        super().__init__(timeout=600)
+        self.vouch_module = vouch_module
+        self.target_user_id = target_user_id
+        self.rating_in = discord.ui.TextInput(
+            label="Rating (1 to 5)",
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=2,
+            placeholder="e.g. 5",
+        )
+        self.comment_in = discord.ui.TextInput(
+            label="Comment",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=500,
+            placeholder="Your vouch for this member",
+        )
+        self.add_item(self.rating_in)
+        self.add_item(self.comment_in)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        raw = str(self.rating_in.value or "").strip()
+        try:
+            rating = int(raw)
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ Rating must be a whole number from **1** to **5**.",
+                ephemeral=True,
+            )
+            return
+        comment = str(self.comment_in.value or "").strip()
+        if not comment:
+            await interaction.response.send_message("❌ Please enter a comment.", ephemeral=True)
+            return
+        try:
+            target = await interaction.client.fetch_user(self.target_user_id)
+        except discord.NotFound:
+            await interaction.response.send_message("❌ Could not find that user.", ephemeral=True)
+            return
+        await self.vouch_module.process_vouch_submission(interaction, target, rating, comment)
+
+
 class MarketplaceProfileView(discord.ui.View):
     def __init__(
         self,
@@ -705,10 +751,17 @@ class MarketplaceProfileView(discord.ui.View):
             await interaction.response.send_modal(OfferModal(self.module, self.target_user_id))
 
     async def vouch_callback(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(
-            f"Use `/rsvouch user:@member rating:5 comment:...` for <@{self.target_user_id}>.",
-            ephemeral=True,
-        )
+        if interaction.user.id == self.target_user_id:
+            await interaction.response.send_message("You cannot vouch for yourself.", ephemeral=True)
+            return
+        vm = getattr(self.module, "vouch_module", None)
+        if vm is None:
+            await interaction.response.send_message(
+                f"Vouch UI is not wired on this bot instance. Use `/rsvouch` for <@{self.target_user_id}>.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(MarketplaceVouchModal(vm, self.target_user_id))
 
     async def middleman_callback(self, interaction: discord.Interaction) -> None:
         if interaction.user.id == self.target_user_id:
@@ -863,6 +916,8 @@ class RSMarketplaceBot:
         else:
             self.bot = bot_instance
             self._is_shared_bot = True
+
+        self.vouch_module: Any = vouch_module
 
         self._setup_commands()
 

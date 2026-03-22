@@ -201,104 +201,106 @@ class RSVouchBot:
             color_cfg.get("g", 152),
             color_cfg.get("b", 219)
         )
-    
+
+    async def process_vouch_submission(
+        self,
+        interaction: discord.Interaction,
+        user: discord.User,
+        rating: int,
+        comment: str,
+    ) -> None:
+        """Shared by `/rsvouch` and marketplace profile Vouch modal."""
+        cooldown_seconds = self.vouch_config.get("cooldown_seconds", 15)
+        user_id = interaction.user.id
+        current_time = datetime.utcnow().timestamp()
+
+        if user_id in self.vouch_cooldowns:
+            time_since_last_use = current_time - self.vouch_cooldowns[user_id]
+            if time_since_last_use < cooldown_seconds:
+                remaining = cooldown_seconds - time_since_last_use
+                await interaction.response.send_message(
+                    f"❌ You're on cooldown. Try again in {remaining:.1f} seconds.",
+                    ephemeral=True,
+                )
+                return
+
+        self.vouch_cooldowns[user_id] = current_time
+
+        if user.id == interaction.user.id:
+            await interaction.response.send_message("❌ You cannot vouch for yourself.", ephemeral=True)
+            return
+
+        if rating < 1 or rating > 5:
+            await interaction.response.send_message("❌ Rating must be between 1 and 5 stars.", ephemeral=True)
+            return
+
+        vouch_channel_id = self.vouch_config.get("vouch_channel_id")
+        guild_id = self.vouch_config.get("guild_id")
+
+        if not vouch_channel_id:
+            await interaction.response.send_message("❌ Vouch channel is not configured.", ephemeral=True)
+            return
+
+        if not guild_id:
+            await interaction.response.send_message("❌ Guild ID is not configured.", ephemeral=True)
+            return
+
+        now = datetime.now(timezone.utc).isoformat()
+        next_id = max([v.get("id", 0) for v in self.vouches_data["vouches"]], default=0) + 1
+
+        vouch_entry = {
+            "id": next_id,
+            "vouched_user_id": str(user.id),
+            "voucher_user_id": str(interaction.user.id),
+            "rating": rating,
+            "comment": comment,
+            "timestamp": now,
+        }
+        self.vouches_data["vouches"].append(vouch_entry)
+        self.save_vouches_data()
+
+        color = self.get_embed_color(rating)
+        embed = discord.Embed(
+            title="New Vouch Received",
+            color=color,
+            timestamp=datetime.utcnow(),
+        )
+        embed.add_field(name="Vouch for:", value=user.name, inline=True)
+        embed.add_field(name="Author:", value=interaction.user.name, inline=True)
+        embed.add_field(name="Stars:", value=f"{'⭐' * rating} ({rating})", inline=True)
+        embed.add_field(name="Comment:", value=comment, inline=False)
+        embed.set_thumbnail(url=user.display_avatar.url)
+        embed.set_footer(text=self.vouch_config.get("footer_text", "Reselling Secrets Vouch System"))
+
+        channel = self.bot.get_channel(vouch_channel_id)
+        if not channel:
+            await interaction.response.send_message("❌ Vouch channel not found.", ephemeral=True)
+            return
+
+        public_msg = await channel.send(embed=embed, view=VouchView(user, self))
+        message_link = f"https://discord.com/channels/{guild_id}/{vouch_channel_id}/{public_msg.id}"
+
+        try:
+            dm_embed = discord.Embed(
+                title="📬 You Received a New Vouch!",
+                description=f"**{interaction.user.name}** vouched for you [here]({message_link}).",
+                color=color,
+                timestamp=datetime.utcnow(),
+            )
+            dm_embed.add_field(name="⭐ Rating", value=f"{rating}/5")
+            dm_embed.add_field(name="💬 Comment", value=comment, inline=False)
+            await user.send(embed=dm_embed)
+        except discord.Forbidden:
+            print(f"{Colors.YELLOW}[Vouch] Could not DM user {user}{Colors.RESET}")
+
+        await interaction.response.send_message("✅ Successfully vouched for the user!", ephemeral=True)
+
     def _setup_commands(self):
         """Setup slash commands"""
-        
+
         @self.bot.tree.command(name="rsvouch", description="Leave a vouch for someone")
         async def vouch_command(interaction: discord.Interaction, user: discord.User, rating: int, comment: str):
-            # Check cooldown
-            cooldown_seconds = self.vouch_config.get("cooldown_seconds", 15)
-            user_id = interaction.user.id
-            current_time = datetime.utcnow().timestamp()
-            
-            if user_id in self.vouch_cooldowns:
-                time_since_last_use = current_time - self.vouch_cooldowns[user_id]
-                if time_since_last_use < cooldown_seconds:
-                    remaining = cooldown_seconds - time_since_last_use
-                    await interaction.response.send_message(
-                        f"❌ You're on cooldown. Try again in {remaining:.1f} seconds.",
-                        ephemeral=True
-                    )
-                    return
-            
-            # Update cooldown
-            self.vouch_cooldowns[user_id] = current_time
-            
-            if user.id == interaction.user.id:
-                await interaction.response.send_message("❌ You cannot vouch for yourself.", ephemeral=True)
-                return
-            
-            if rating < 1 or rating > 5:
-                await interaction.response.send_message("❌ Rating must be between 1 and 5 stars.", ephemeral=True)
-                return
-            
-            # Get config values
-            vouch_channel_id = self.vouch_config.get("vouch_channel_id")
-            guild_id = self.vouch_config.get("guild_id")
-            
-            if not vouch_channel_id:
-                await interaction.response.send_message("❌ Vouch channel is not configured.", ephemeral=True)
-                return
-            
-            if not guild_id:
-                await interaction.response.send_message("❌ Guild ID is not configured.", ephemeral=True)
-                return
-            
-            # Save vouch to JSON
-            now = datetime.now(timezone.utc).isoformat()
-            # Generate next ID (max existing ID + 1, or 1 if empty)
-            next_id = max([v.get("id", 0) for v in self.vouches_data["vouches"]], default=0) + 1
-            
-            vouch_entry = {
-                "id": next_id,
-                "vouched_user_id": str(user.id),
-                "voucher_user_id": str(interaction.user.id),
-                "rating": rating,
-                "comment": comment,
-                "timestamp": now
-            }
-            self.vouches_data["vouches"].append(vouch_entry)
-            self.save_vouches_data()
-            
-            # Create embed
-            color = self.get_embed_color(rating)
-            embed = discord.Embed(
-                title="New Vouch Received",
-                color=color,
-                timestamp=datetime.utcnow()
-            )
-            embed.add_field(name="Vouch for:", value=user.name, inline=True)
-            embed.add_field(name="Author:", value=interaction.user.name, inline=True)
-            embed.add_field(name="Stars:", value=f"{'⭐' * rating} ({rating})", inline=True)
-            embed.add_field(name="Comment:", value=comment, inline=False)
-            embed.set_thumbnail(url=user.display_avatar.url)
-            embed.set_footer(text=self.vouch_config.get("footer_text", "Reselling Secrets Vouch System"))
-            
-            # Post to vouch channel
-            channel = self.bot.get_channel(vouch_channel_id)
-            if not channel:
-                await interaction.response.send_message("❌ Vouch channel not found.", ephemeral=True)
-                return
-            
-            public_msg = await channel.send(embed=embed, view=VouchView(user, self))
-            message_link = f"https://discord.com/channels/{guild_id}/{vouch_channel_id}/{public_msg.id}"
-            
-            # Send DM to vouched user
-            try:
-                dm_embed = discord.Embed(
-                    title="📬 You Received a New Vouch!",
-                    description=f"**{interaction.user.name}** vouched for you [here]({message_link}).",
-                    color=color,
-                    timestamp=datetime.utcnow()
-                )
-                dm_embed.add_field(name="⭐ Rating", value=f"{rating}/5")
-                dm_embed.add_field(name="💬 Comment", value=comment, inline=False)
-                await user.send(embed=dm_embed)
-            except discord.Forbidden:
-                print(f"{Colors.YELLOW}[Vouch] Could not DM user {user}{Colors.RESET}")
-            
-            await interaction.response.send_message("✅ Successfully vouched for the user!", ephemeral=True)
+            await self.process_vouch_submission(interaction, user, rating, comment)
         
         @self.bot.tree.command(name="rsvouches", description="View vouches for a user")
         async def vouches_command(interaction: discord.Interaction, user: discord.User = None):

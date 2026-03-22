@@ -122,7 +122,7 @@ class RSBotRunner:
             )
         else:
             try:
-                self.marketplace_bot = RSMarketplaceBot(bot_instance=self.bot)
+                self.marketplace_bot = RSMarketplaceBot(bot_instance=self.bot, vouch_module=self.vouch_bot)
                 print(f"{Colors.GREEN}[Runner] ✅ Marketplace module initialized{Colors.RESET}")
             except Exception as e:
                 print(f"{Colors.RED}[Runner] ❌ Failed to initialize Marketplace module: {e}{Colors.RESET}")

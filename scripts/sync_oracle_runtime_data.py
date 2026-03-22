@@ -82,6 +82,8 @@ BOT_RUNTIME_FILES = {
     ],
     "RSuccessBot": [
         "success_points.json",
+        "vouches.json",
+        "marketplace_profiles.json",
     ],
 }
 
