@@ -120,6 +120,15 @@
 !scripts/*.py
 !scripts/**/*.py
 
+# Mavelytest (Instore flow tester, Mavely helpers; no secrets here)
+!Mavelytest/
+!Mavelytest/**/
+!Mavelytest/*.py
+!Mavelytest/**/*.py
+!Mavelytest/*.bat
+Mavelytest/audit_logs/
+Mavelytest/*_report.json
+
 # Kit (GHL and other integration tools)
 !kit/
 !kit/**/
