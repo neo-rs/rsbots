@@ -353,13 +353,11 @@ def main() -> int:
         "set -euo pipefail; set -f; "
         f"cd {shlex.quote(entry.remote_root)}; "
         f"rm -f {shlex.quote(remote_tar)} || true; "
-        "set +e; "
         f"tar --ignore-failed-read -czf {shlex.quote(remote_tar)} "
         + " ".join(excludes)
         + " "
         + " ".join(shlex.quote(x) for x in includes)
-        + "; tarc=$?; set -e; "
-        + "if [ \"$tarc\" -ne 0 ] && [ \"$tarc\" -ne 1 ]; then exit \"$tarc\"; fi; "
+        + f"; tarc=$?; if [ \"$tarc\" -ne 0 ] && [ \"$tarc\" -ne 1 ]; then exit \"$tarc\"; fi; "
         + f"echo REMOTE_TAR={shlex.quote(remote_tar)}; ls -lh {shlex.quote(remote_tar)}"
     )
 

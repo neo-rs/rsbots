@@ -61,6 +61,80 @@ CAPTURED_SENDS: List[Dict[str, Any]] = []
 
 AUDIT_SCHEMA_VERSION = 2
 
+_SOURCE_CHANNEL_PROFILES: Dict[int, Dict[str, str]] = {
+    # Promo Deal (Gemini deals structured rewrite + embed rebuild)
+    1438970053352751215: {"name": "Promo Deal", "mode": "gemini_rephrase_amz_deals"},
+    # Mavely Leads (affiliate leads forward as an embed with original text)
+    1435308472639160522: {"name": "Mavely Leads", "mode": "affiliated_leads"},
+    # Amazon Lowkey Flips (full Amazon-card pipeline)
+    1435066421133443174: {"name": "Amazon Lowkey Flips", "mode": "full_amazon_card"},
+    # Price Error Glitched (full Amazon-card pipeline + stricter filtering)
+    1435985494356918333: {"name": "Price Error Glitched", "mode": "full_amazon_card_price_error_glitched"},
+}
+
+
+def _profile_for_source_channel(src_channel_id: int) -> Dict[str, str]:
+    p = _SOURCE_CHANNEL_PROFILES.get(int(src_channel_id))
+    if p:
+        return p
+    return {"name": f"Unknown Source {src_channel_id}", "mode": "unknown"}
+
+
+def _source_channels_for_profile(app: Any, *, expected_mode: str, fallback_src_id: int) -> List[int]:
+    """
+    Uses bot config to find all source channels that use the same simple_forward mode.
+    For non-simple-forward pipelines, it falls back to the one channel we tested.
+    """
+    mode = (expected_mode or "").strip().lower()
+    if not mode:
+        return [int(fallback_src_id)]
+
+    cfg = getattr(app, "config", None) or {}
+    sfm = cfg.get("simple_forward_mappings") or {}
+    if not isinstance(sfm, dict) or not sfm:
+        return [int(fallback_src_id)]
+
+    out: List[int] = []
+    for k, v in sfm.items():
+        if not isinstance(v, dict):
+            continue
+        vm = str(v.get("mode") or "").strip().lower()
+        if vm and vm == mode:
+            try:
+                out.append(int(k))
+            except Exception:
+                continue
+
+    return out or [int(fallback_src_id)]
+
+
+def _fmt_channels(channel_ids: List[int]) -> str:
+    # Keep it readable in terminals: "<#id1>, <#id2>".
+    uniq = []
+    for cid in channel_ids:
+        try:
+            i = int(cid)
+        except Exception:
+            continue
+        if i not in uniq:
+            uniq.append(i)
+    return ", ".join(f"<#{i}>" for i in uniq)
+
+
+def _format_captured_send_summaries() -> str:
+    if not CAPTURED_SENDS:
+        return ""
+    lines: List[str] = []
+    for i, cap in enumerate(CAPTURED_SENDS, 1):
+        ch_id = cap.get("channel_id")
+        embeds = cap.get("embeds") or []
+        if embeds:
+            title = (embeds[0].get("title") or "")[:80]
+        else:
+            title = ""
+        lines.append(f"  {i}) <#{ch_id}> {title!r}".rstrip())
+    return "\n".join(lines)
+
 
 def _audit_pre_flight(audit: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Mutable pre_flight bucket; no-op sink when audit is None."""
@@ -1111,6 +1185,29 @@ async def run_once(
     async def on_ready() -> None:
         nonlocal exit_code
         try:
+            # Capture only the key bot decision points so the output ends with a crisp PASS/FAIL.
+            flow_trace: List[str] = []
+
+            class _FlowTraceHandler(logging.Handler):
+                def emit(self, record: logging.LogRecord) -> None:
+                    try:
+                        msg = record.getMessage()
+                    except Exception:
+                        return
+                    # Example: "[FLOW:SKIP] reason=new_deal_found_card_top channel_id=<#...> message_id=..."
+                    if not isinstance(msg, str):
+                        return
+                    if not msg.startswith("[FLOW:"):
+                        return
+                    if any(tag in msg for tag in ["[FLOW:MAPPING]", "[FLOW:ROUTE]", "[FLOW:SKIP]", "[FLOW:FILTER_SKIP]", "[FLOW:SEND_OK]", "[FLOW:SEND_FAIL]", "[FLOW:DUP_ASIN_SKIP]", "[FLOW:SKIP_OOS]", "[FLOW:EBAY_PW_FAIL]"]):
+                        flow_trace.append(msg)
+                # noinspection PyMethodMayBeStatic
+
+            bot_logger = logging.getLogger("instorebotforwarder")
+            flow_handler = _FlowTraceHandler()
+            flow_handler.setLevel(logging.INFO)
+            bot_logger.addHandler(flow_handler)
+
             app._gemini_usage_accumulator = {
                 "prompt_token_count": 0,
                 "candidates_token_count": 0,
@@ -1143,21 +1240,101 @@ async def run_once(
                     "bot will ignore this message in production.",
                     src_id,
                 )
+
+            profile = _profile_for_source_channel(src_id)
             if not brief:
                 print()
                 _print_section("PRE-FLIGHT (read this for gates, patterns, preview)")
-                await print_pre_flight_report(
-                    app, msg, skip_gemini_api=skip_gemini_api, audit=audit
-                )
+                await print_pre_flight_report(app, msg, skip_gemini_api=skip_gemini_api, audit=audit)
                 _audit_mark(audit, "pre_flight_report_complete")
             else:
-                audit["pre_flight"] = {"skipped": True, "reason": "brief"}
-                _audit_mark(audit, "pre_flight_skipped_brief")
+                # Still run the same pre-flight logic in brief mode so we can compute
+                # a meaningful PASS/FAIL reason from the audit object; hide noisy prints.
+                import contextlib
+                import io
+
+                with contextlib.redirect_stdout(io.StringIO()):
+                    await print_pre_flight_report(app, msg, skip_gemini_api=skip_gemini_api, audit=audit)
+                _audit_mark(audit, "pre_flight_report_complete_silent_brief")
             await app._maybe_forward_message(msg)  # noqa: SLF001
             _audit_mark(audit, "maybe_forward_message_returned")
             await _await_simple_forward_tasks(app)
             _audit_mark(audit, "simple_forward_flush_tasks_settled")
+
+            # PASS/FAIL summary (based on whether bot actually posted in this run).
+            sent = bool(CAPTURED_SENDS)
+            # Live-send mode may not populate CAPTURED_SENDS; fall back to flow trace.
+            if not sent and not dry_run:
+                sent = any("[FLOW:SEND_OK]" in line for line in flow_trace)
+
+            pf = (audit.get("pre_flight") or {}) if isinstance(audit, dict) else {}
+            src_gates = (pf.get("source_gates") or {}) if isinstance(pf, dict) else {}
+            skip_new_deal = bool(src_gates.get("skip_new_deal_found_card_top"))
+
+            forward_assembly = (pf.get("forward_assembly") or {}) if isinstance(pf, dict) else {}
+            early_exits: List[Tuple[str, str]] = []
+            if isinstance(forward_assembly, dict):
+                for k, v in forward_assembly.items():
+                    if isinstance(v, dict) and v.get("early_exit"):
+                        early_exits.append((str(k), str(v.get("early_exit") or "")))
+
+            # PASS logic (what "PASS" means):
+            # - if it actually posted -> PASS
+            # - OR if it correctly hit the explicit "New Deal Found!" rebroadcast skip gate -> PASS
+            # - otherwise it was gated out -> FAIL
+            passed = sent or skip_new_deal
+            # Exit code: 1 when it fails criteria/gates, so multi-link runs can be automated.
+            exit_code = 0 if passed else 1
+
+            # Build tags (supports "multiple category" by allowing multiple tags).
+            tags: List[str] = []
+            tags.append(f"profile:{profile.get('name') or src_id}")
+            tags.append(f"route_mode:{(pf.get('route') or {}).get('mode') or 'unknown'}")
+            tags.append(f"sent:{str(sent).lower()}")
+            if skip_new_deal:
+                tags.append("gate:new_deal_found_skip")
+            for cat, reason in early_exits:
+                if reason:
+                    tags.append(f"early_exit:{cat}:{reason}")
+
+            if passed and sent:
+                headline = "PASS: bot posted for this input."
+            elif passed and skip_new_deal and not sent:
+                headline = "PASS: correctly skipped rebroadcast card ('New Deal Found!')."
+            else:
+                headline = "FAIL: bot did not post (criteria/gates blocked forwarding)."
+
+            # “Where did it read from?” for this profile: list all configured source channels
+            # that use the same forward-mode when applicable.
+            profile_mode = profile.get("mode") or ""
+            profile_srcs = _source_channels_for_profile(
+                app,
+                expected_mode=str(profile_mode),
+                fallback_src_id=int(src_id),
+            )
+
+            print()
+            _print_section("RESULT (PASS/FAIL)")
+            print(f"  Source channel: <#{src_id}>")
+            print(f"  Profile: {profile.get('name')!r}  |  expected mode: {profile.get('mode')!r}")
+            print(f"  {headline}")
+            print(f"  Source channels for this profile: {_fmt_channels(profile_srcs)}")
+            print(f"  Tags: {', '.join(tags)}")
+
             if not brief:
+                if sent:
+                    print("  Sent captures:")
+                    if CAPTURED_SENDS:
+                        print(_format_captured_send_summaries())
+                    else:
+                        print("  (No dry-run captures; using log trace.)")
+                else:
+                    if early_exit_v:
+                        print(f"  FAIL reason: forward early_exit={early_exit_k}:{early_exit_v}")
+                    if flow_trace:
+                        print("  Key decision trace (last few):")
+                        for line in flow_trace[-5:]:
+                            print(f"    {line}")
                 if dry_run:
                     print_captured_sends_summary()
                 else:
@@ -1165,6 +1342,10 @@ async def run_once(
                     _print_section("8) Outbound")
                     print("  Live send was enabled - check the destination channel in Discord.")
             log.info("[TESTER] done.")
+            try:
+                bot_logger.removeHandler(flow_handler)
+            except Exception:
+                pass
         except Exception as e:
             exit_code = 2
             log.exception("[TESTER] probe failed: %s", e)
@@ -1235,12 +1416,23 @@ async def run_once(
 def main() -> int:
     _configure_stdio_utf8()
     ap = argparse.ArgumentParser(
-        description="Replay Instorebotforwarder flow for one Discord message link."
+        description="Replay Instorebotforwarder flow for one or more Discord message links."
     )
     ap.add_argument(
         "--link",
+        action="append",
+        default=[],
+        help="Discord message URL. Provide multiple times to test multiple links (one per profile).",
+    )
+    ap.add_argument(
+        "--links",
         default="",
-        help="Discord message URL, or set env INSTORE_FLOW_TEST_LINK (safer for URLs with &).",
+        help="Comma-separated Discord message links (alternative to repeated --link).",
+    )
+    ap.add_argument(
+        "--links-env",
+        default="INSTORE_FLOW_TEST_LINKS",
+        help="Env var holding multiple links (newline or comma separated). Default: INSTORE_FLOW_TEST_LINKS",
     )
     ap.add_argument(
         "--live-send",
@@ -1279,19 +1471,40 @@ def main() -> int:
         ),
     )
     args = ap.parse_args()
-    link = (args.link or "").strip() or (os.environ.get("INSTORE_FLOW_TEST_LINK") or "").strip()
-    if not link:
-        print(
-            "Provide --link or set environment variable INSTORE_FLOW_TEST_LINK to the message URL.",
-            file=sys.stderr,
-        )
+
+    links: List[str] = []
+    # 1) repeated --link
+    if isinstance(args.link, list):
+        links.extend([str(x).strip() for x in args.link if str(x).strip()])
+    # 2) --links comma-separated
+    if str(args.links or "").strip():
+        links.extend([x.strip() for x in str(args.links).split(",") if x.strip()])
+    # 3) env var multiple links
+    env_name = str(args.links_env or "").strip()
+    if env_name:
+        raw_env = os.environ.get(env_name) or ""
+        if str(raw_env).strip():
+            parts = re.split(r"[\n,]+", raw_env)
+            links.extend([x.strip() for x in parts if x.strip()])
+    # 4) legacy single env
+    if not links:
+        legacy = (os.environ.get("INSTORE_FLOW_TEST_LINK") or "").strip()
+        if legacy:
+            links.append(legacy)
+
+    if not links:
+        print("Provide --link/--links, or set INSTORE_FLOW_TEST_LINK(_S) env var.", file=sys.stderr)
         return 2
 
-    try:
-        gid, cid, mid = parse_discord_message_link(link)
-    except ValueError as e:
-        print(e, file=sys.stderr)
-        return 2
+    # Parse and validate all links first, so we fail early.
+    parsed_links: List[Tuple[int, int, int, str]] = []
+    for link in links:
+        try:
+            gid, cid, mid = parse_discord_message_link(link)
+            parsed_links.append((gid, cid, mid, link))
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            return 2
 
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), logging.INFO),
@@ -1309,27 +1522,47 @@ def main() -> int:
     print("  dry_run:", not bool(args.live_send))
     print("=" * 72)
 
-    if args.no_audit_json:
-        audit_path: Optional[Path] = None
-    elif args.audit_json is None:
-        audit_path = _default_audit_json_path(mid)
-    elif args.audit_json is True:
-        audit_path = _default_audit_json_path(mid)
-    else:
-        audit_path = Path(str(args.audit_json))
+    # Run each link in sequence so token usage + output is easy to read.
+    # Overall exit code: 1 if any link resulted in a FAIL (exit_code=1), else 0.
+    overall_exit = 0
+    for gid, cid, mid, link in parsed_links:
+        if args.no_audit_json:
+            audit_path: Optional[Path] = None
+        elif args.audit_json is None or args.audit_json is True:
+            audit_path = _default_audit_json_path(mid)
+        else:
+            # If user passed an explicit path, try to do something sensible with multi-link runs.
+            audit_path_str = str(args.audit_json)
+            p = Path(audit_path_str)
+            if len(parsed_links) == 1:
+                audit_path = p
+            else:
+                # If PATH looks like a dir, put the per-message audit file inside it.
+                if str(audit_path_str).endswith(("/", "\\")) or (p.exists() and p.is_dir()):
+                    audit_path = p / f"instore_flow_{mid}.json"
+                else:
+                    # Otherwise treat it as a prefix or full filename and append _<mid>.json
+                    # (keep extension if any, otherwise default to .json).
+                    stem = p.stem
+                    ext = p.suffix or ".json"
+                    audit_path = p.with_name(f"{stem}_{mid}{ext}")
 
-    return asyncio.run(
-        run_once(
-            guild_id=gid,
-            channel_id=cid,
-            message_id=mid,
-            message_link=link,
-            dry_run=not bool(args.live_send),
-            brief=bool(args.brief),
-            skip_gemini_api=bool(args.skip_gemini_api),
-            audit_json_path=audit_path,
+        overall_exit = max(
+            overall_exit,
+            asyncio.run(
+                run_once(
+                    guild_id=gid,
+                    channel_id=cid,
+                    message_id=mid,
+                    message_link=link,
+                    dry_run=not bool(args.live_send),
+                    brief=bool(args.brief),
+                    skip_gemini_api=bool(args.skip_gemini_api),
+                    audit_json_path=audit_path,
+                )
+            ),
         )
-    )
+    return overall_exit
 
 
 if __name__ == "__main__":
