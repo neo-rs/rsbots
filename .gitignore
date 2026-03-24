@@ -103,6 +103,17 @@
 !RSPromoBot/README.md
 !RSPromoBot/requirements.txt
 
+!RSCashoutBot/
+!RSCashoutBot/**/
+!RSCashoutBot/*.py
+!RSCashoutBot/**/*.py
+!RSCashoutBot/COMMANDS.md
+!RSCashoutBot/README.md
+!RSCashoutBot/messages.json
+!RSCashoutBot/config.example.json
+!RSCashoutBot/requirements.txt
+!RSCashoutBot/google_apps_script_example.js
+
 # WhopMembershipSync service (lives in this repo; deployed to Oracle)
 !WhopMembershipSync/
 !WhopMembershipSync/**/
@@ -227,3 +238,8 @@ RSOnboarding/completion_sent.json
 # RSPromoBot runtime (server-owned)
 RSPromoBot/data/
 RSPromoBot/logs/
+
+# RSCashoutBot secrets + runtime (never commit)
+RSCashoutBot/config.json
+RSCashoutBot/tickets.json
+RSCashoutBot/bot.log

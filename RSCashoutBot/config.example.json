@@ -1,0 +1,163 @@
+{
+  "discord_bot_token": "PASTE_BOT_TOKEN_HERE",
+  "ticket_system": {
+    "guild_id": 876528050081251379,
+    "panel_channel_id": 1486089732763942922,
+    "ticket_category_id": 1486081310517624903,
+    "transcript_channel_id": 0,
+    "support_role_ids": [
+      0
+    ],
+    "admin_role_ids": [
+      0
+    ],
+    "close_delay_seconds": 10,
+    "topic_template": "ticket_type={ticket_type};owner={user_id};username={username}",
+    "panel_embed_color": "0x57F287",
+    "ticket_embed_color": "0x5865F2",
+    "buttons": [
+      {
+        "key": "request_custom_quote",
+        "label": "Request Custom Quote",
+        "style": "green",
+        "emoji": "<a:rslrocket:1247632438252011550>",
+        "ticket_name_prefix": "quote",
+        "sheet_route": null,
+        "max_open_per_user": 1,
+        "modal": {
+          "fields": [
+            {
+              "key": "item_name",
+              "label": "Item Name",
+              "placeholder": "What item do you need quoted?",
+              "required": true,
+              "paragraph": false,
+              "max_length": 120
+            },
+            {
+              "key": "quantity",
+              "label": "Quantity",
+              "placeholder": "How many units?",
+              "required": true,
+              "paragraph": false,
+              "max_length": 40
+            },
+            {
+              "key": "competitor_price",
+              "label": "Competitor Price / Link",
+              "placeholder": "Paste the price or reputable competitor link",
+              "required": false,
+              "paragraph": true,
+              "max_length": 500
+            },
+            {
+              "key": "notes",
+              "label": "Extra Notes",
+              "placeholder": "Anything staff should know before quoting",
+              "required": false,
+              "paragraph": true,
+              "max_length": 800
+            }
+          ]
+        }
+      },
+      {
+        "key": "signup_form",
+        "label": "Signup Form",
+        "style": "blurple",
+        "emoji": "<a:rslrocket:1247632438252011550>",
+        "ticket_name_prefix": "signup",
+        "sheet_route": "signup_form",
+        "max_open_per_user": 1,
+        "modal": {
+          "fields": [
+            {
+              "key": "full_name",
+              "label": "Full Name",
+              "placeholder": "Your full name",
+              "required": true,
+              "paragraph": false,
+              "max_length": 120
+            },
+            {
+              "key": "email",
+              "label": "Email",
+              "placeholder": "Best email for payout/contact",
+              "required": true,
+              "paragraph": false,
+              "max_length": 120
+            },
+            {
+              "key": "phone",
+              "label": "Phone Number",
+              "placeholder": "Optional but recommended",
+              "required": false,
+              "paragraph": false,
+              "max_length": 40
+            },
+            {
+              "key": "shipping_region",
+              "label": "Shipping Region",
+              "placeholder": "City / State / Country",
+              "required": true,
+              "paragraph": false,
+              "max_length": 120
+            },
+            {
+              "key": "main_categories",
+              "label": "Main Categories",
+              "placeholder": "Cards, sneakers, toys, collectibles, etc.",
+              "required": true,
+              "paragraph": true,
+              "max_length": 400
+            }
+          ]
+        }
+      },
+      {
+        "key": "need_help",
+        "label": "Need Help?",
+        "style": "gray",
+        "emoji": "<a:rslrocket:1247632438252011550>",
+        "ticket_name_prefix": "help",
+        "sheet_route": null,
+        "max_open_per_user": 1,
+        "modal": {
+          "fields": [
+            {
+              "key": "help_topic",
+              "label": "What do you need help with?",
+              "placeholder": "Payout status, shipping issue, portal access, general question",
+              "required": true,
+              "paragraph": false,
+              "max_length": 120
+            },
+            {
+              "key": "order_or_reference",
+              "label": "Order / Reference",
+              "placeholder": "Optional order number, SKU, or payout reference",
+              "required": false,
+              "paragraph": false,
+              "max_length": 120
+            },
+            {
+              "key": "details",
+              "label": "Details",
+              "placeholder": "Give staff enough context so they can help fast",
+              "required": true,
+              "paragraph": true,
+              "max_length": 1000
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "google_sheet": {
+    "enabled": false,
+    "endpoint_url": "https://script.google.com/macros/s/YOUR_APPS_SCRIPT_ID/exec",
+    "auth_header_name": "X-API-Key",
+    "auth_token": "CHANGE_ME",
+    "timeout_seconds": 15
+  }
+}

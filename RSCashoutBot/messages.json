@@ -1,0 +1,21 @@
+{
+  "ticket_system": {
+    "panel_title": "<a:rslrocket:1247632438252011550> RS Cashout Center",
+    "panel_description": "Need a quote, onboarding help, or support with a cashout-related issue? Pick the option that matches what you need below and the bot will open a private ticket for you.\n\n**Custom price quotes must be shipped within 48 hours.**",
+    "footer_text": "RS Cashout • Fastest help comes from clear details",
+    "buttons": {
+      "request_custom_quote": {
+        "intro_title": "<a:rslrocket:1247632438252011550> Request Custom Quote",
+        "intro_body": "Request a quote for items that are not posted yet, or ask us to price match / beat a reputable competitor. Include the item, quantity, and any competitor info you already have.\n\n**Custom price quotes must be shipped within 48 hours.**"
+      },
+      "signup_form": {
+        "intro_title": "<a:rslrocket:1247632438252011550> Signup Form",
+        "intro_body": "Fill out your cashout onboarding info so staff can review your profile faster, verify what you ship, and keep your payout setup organized. Once submitted, your details can be forwarded to your Google Sheet intake flow if you enable it in config."
+      },
+      "need_help": {
+        "intro_title": "<a:rslrocket:1247632438252011550> Need Help?",
+        "intro_body": "Open a private help ticket for payout questions, shipping issues, missing updates, account access problems, or anything else you need staff to review. The more context you give in the form, the faster the team can help."
+      }
+    }
+  }
+}
