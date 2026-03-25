@@ -238,7 +238,7 @@
     "webhook_secret": "",
     "_comment_repeat_trial_guard": "When Member role is added: if member had a trial before (ever_trialing/ever_had_trial_days) and total_spent <= max_total_spent_usd, remove Member role and post staff alert.",
     "repeat_trial_guard": {
-      "enabled": true,
+      "enabled": false,
       "max_total_spent_usd": 0
     }
   }
