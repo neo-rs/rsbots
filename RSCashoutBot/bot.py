@@ -941,18 +941,34 @@ class RSTicketBot(commands.Bot):
             extra_lines.append(f'**Sheet Copy:** {sheet_result["sheet_url"]}')
         await self._maybe_log_ticket_opened(guild, channel, user, button_def, form_values, extra_lines=extra_lines)
 
-        if button_def.key == 'request_submit' and sheet_result.get('sheet_url'):
+        if button_def.key == 'request_submit':
+            # Always DM so the member isn't left waiting silently, even if the
+            # Apps Script copy fails (permissions, Drive errors, etc.).
             try:
+                sheet_url = sheet_result.get('sheet_url')
+                dm_description: str
                 dm_embed = discord.Embed(
                     title='RS Cashout Submission Received',
-                    description='Your personal cashout sheet copy is ready. Keep this link for reference and send the completed version back in your ticket when finished.',
                     color=self.runtime.ticket.ticket_embed_color,
                 )
-                dm_embed.add_field(name='Sheet Link', value=sheet_result['sheet_url'][:1024], inline=False)
+                if sheet_url:
+                    dm_description = (
+                        'Your personal cashout sheet copy is ready. Keep this link for reference and '
+                        'send the completed version back in your ticket when finished.'
+                    )
+                    dm_embed.description = dm_description
+                    dm_embed.add_field(name='Sheet Link', value=str(sheet_url)[:1024], inline=False)
+                else:
+                    dm_description = (
+                        'Your ticket is ready. The Google Sheets auto-copy failed, so staff will handle the sheet.'
+                    )
+                    dm_embed.description = dm_description
+                    err = sheet_result.get('error') or sheet_result.get('raw') or 'unknown_error'
+                    dm_embed.add_field(name='Sheet Error', value=str(err)[:1024], inline=False)
                 dm_embed.add_field(name='Ticket', value=channel.mention, inline=False)
                 await user.send(embed=dm_embed)
             except discord.HTTPException:
-                LOG.warning('Could not DM user %s with sheet link', user.id)
+                LOG.warning('Could not DM user %s for cashout ticket', user.id)
 
         msg = f'Your ticket is ready: {channel.mention}'
         if sheet_result.get('sheet_url'):
