@@ -799,6 +799,12 @@ class RSTicketBot(commands.Bot):
                 await interaction.response.send_message('This can only be used inside the server.', ephemeral=True)
             return
 
+        # Modal submissions (and slash command interactions) must receive an acknowledgment
+        # quickly; the Google Sheets call can take longer than Discord's interaction window.
+        # Deferring here guarantees we can still respond later without getting "Unknown interaction".
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+
         FLOW.section('TICKET — OPEN REQUEST')
         FLOW.kv('Flow key', button_def.key)
         FLOW.kv('Button label', button_def.label)
