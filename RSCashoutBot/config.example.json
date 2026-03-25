@@ -134,8 +134,8 @@
     ]
   },
   "google_sheet": {
-    "enabled": true,
-    "endpoint_url": "https://script.google.com/macros/s/AKfycbzL4ZJoGkygy7tZh15itpsEPqqqyeJt4ShnJfkZJiZcH1PHQLQEIxDFHkh5X-1m_IM3/exec",
+    "enabled": false,
+    "endpoint_url": "https://script.google.com/macros/s/YOUR_APPS_SCRIPT_ID/exec",
     "auth_header_name": "X-API-Key",
     "auth_token": "CHANGE_ME",
     "timeout_seconds": 20
