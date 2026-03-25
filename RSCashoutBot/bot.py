@@ -201,6 +201,44 @@ def format_form_key(key: str) -> str:
     return mapping.get(key, key.replace('_', ' ').title())
 
 
+def normalize_condition_(raw: Any) -> str:
+    """
+    Normalize arbitrary modal input into the exact dropdown values expected
+    by the template spreadsheet (cell C3 validation).
+    """
+    s = str(raw or '').strip()
+    low = s.lower()
+
+    allowed = ['Brand New', 'Brand New (Flawed)', 'Used - Like New', 'Used - Worn']
+    for opt in allowed:
+        if low == opt.lower():
+            return opt
+
+    def has(t: str) -> bool:
+        return t in low
+
+    # Brand new + flawed/defect/damage => Brand New (Flawed)
+    if (has('new') or has('brand')) and (has('flaw') or has('defect') or has('damage') or has('flawed')):
+        return 'Brand New (Flawed)'
+    if has('flaw') or has('defect') or has('damage') or has('flawed'):
+        return 'Brand New (Flawed)'
+
+    # Used
+    if has('used') or has('worn'):
+        # Like new hints => Used - Like New
+        if has('like') or has('clean') or has('good') or has('excellent') or has('near'):
+            return 'Used - Like New'
+        return 'Used - Worn'
+
+    if has('worn'):
+        return 'Used - Worn'
+    if has('like'):
+        return 'Used - Like New'
+
+    # Default: treat as Brand New (avoids spreadsheet validation crashes)
+    return 'Brand New'
+
+
 def configure_logging() -> None:
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
@@ -720,7 +758,34 @@ class RSTicketBot(commands.Bot):
         return embed
 
     async def send_panel_card(self, channel: discord.TextChannel) -> None:
+        await self._maybe_delete_previous_panel_card(channel)
         await channel.send(embed=self._build_panel_embed(), view=self.panel_view)
+
+    async def _maybe_delete_previous_panel_card(self, channel: discord.TextChannel) -> None:
+        """
+        Best-effort: delete the previous panel message card from this bot so
+        restarts don't spam multiple cards.
+        """
+        if not self.user:
+            return
+        panel_title = (self.runtime.ticket.panel_title or '').strip()
+        if not panel_title:
+            return
+
+        try:
+            async for msg in channel.history(limit=30):
+                if msg.author.id != self.user.id:
+                    continue
+                if not msg.embeds:
+                    continue
+                if any((e.title or '').strip() == panel_title for e in msg.embeds):
+                    # Delete only one most-recent match.
+                    await msg.delete()
+                    return
+        except discord.Forbidden:
+            LOG.warning('No permission to delete old panel cards in %s', channel.id)
+        except Exception as exc:
+            LOG.warning('Could not delete old panel cards in %s: %s', channel.id, exc)
 
     async def _ensure_panel_channel(self, interaction: discord.Interaction) -> bool:
         if interaction.channel_id != self.runtime.ticket.panel_channel_id:
@@ -855,6 +920,11 @@ class RSTicketBot(commands.Bot):
             reason=f'{button_def.label} ticket opened by {user}',
         )
 
+        # Normalize condition to match spreadsheet dropdown validation exactly.
+        norm_form_values = dict(form_values)
+        if 'condition' in norm_form_values:
+            norm_form_values['condition'] = normalize_condition_(norm_form_values.get('condition'))
+
         sheet_result: Dict[str, Any] = {}
         if button_def.sheet_route and self.runtime.sheet.enabled:
             payload = {
@@ -866,7 +936,7 @@ class RSTicketBot(commands.Bot):
                 'ticket_type': button_def.key,
                 'ticket_label': button_def.label,
                 'created_at': discord.utils.utcnow().isoformat(),
-                'values': form_values,
+                'values': norm_form_values,
             }
             try:
                 sheet_result = await self.sheet_client.submit(button_def.sheet_route, payload)
@@ -878,7 +948,7 @@ class RSTicketBot(commands.Bot):
         if form_values.get('email'):
             profile_patch['email'] = form_values['email']
         if button_def.key == 'request_submit':
-            profile_patch['last_request_values'] = form_values
+            profile_patch['last_request_values'] = norm_form_values
             if sheet_result.get('sheet_url'):
                 profile_patch['last_sheet_url'] = sheet_result['sheet_url']
         await self.profile_store.upsert_profile(user.id, profile_patch)
@@ -891,8 +961,8 @@ class RSTicketBot(commands.Bot):
         embed.add_field(name='Opened By', value=user.mention, inline=True)
         embed.add_field(name='Ticket Type', value=button_def.label, inline=True)
 
-        if form_values:
-            lines = [f'**{format_form_key(k)}:** {v}' for k, v in form_values.items() if str(v).strip()]
+        if norm_form_values:
+            lines = [f'**{format_form_key(k)}:** {v}' for k, v in norm_form_values.items() if str(v).strip()]
             if lines:
                 embed.add_field(name='Submitted Info', value='\n'.join(lines)[:1024], inline=False)
 
