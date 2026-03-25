@@ -6,7 +6,7 @@
 - Description: Posts the RS cashout ticket panel in the configured panel channel.
 - Admin Only: Yes
 - Usage: `/ticketpanel`
-- Notes: The command refuses to run outside the configured panel channel.
+- Notes: The command refuses to run outside the configured panel channel. By default the same panel is also sent automatically when the bot finishes logging in (`auto_post_panel_on_ready` in `config.json`).
 
 #### `/ticketclose`
 - Description: Closes the current ticket channel after the configured delay.

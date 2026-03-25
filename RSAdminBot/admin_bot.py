@@ -3293,6 +3293,12 @@ class RSAdminBot:
             "folder": "RSPromoBot",
             "script": "promo_bot.py"
         },
+        "rscashoutbot": {
+            "name": "RS Cashout Bot",
+            "service": "mirror-world-rscashoutbot.service",
+            "folder": "RSCashoutBot",
+            "script": "bot.py"
+        },
         "rsadminbot": {
             "name": "RSAdminBot",
             "service": "mirror-world-rsadminbot.service",
@@ -6843,7 +6849,7 @@ echo "CHANGED_END"
             # RS Bots group
             rs_bots = bot_groups.get("rs_bots", [])
             if rs_bots:
-                await channel.send("**RS Bots** (rsforwarder, rsonboarding, rsmentionpinger, rscheckerbot, rssuccessbot)")
+                await channel.send("**RS Bots** (rsforwarder, rsonboarding, rsmentionpinger, rscheckerbot, rssuccessbot, rspromobot, rscashoutbot, whopmembershipsync)")
                 await channel.send("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh status all\n```")
                 await channel.send("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh start all\n```")
                 await channel.send("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh stop all\n```")

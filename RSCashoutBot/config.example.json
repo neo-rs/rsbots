@@ -5,6 +5,7 @@
     "panel_channel_id": 1486089732763942922,
     "ticket_category_id": 1486081310517624903,
     "transcript_channel_id": 0,
+    "auto_post_panel_on_ready": true,
     "support_role_ids": [
       0
     ],
@@ -13,23 +14,23 @@
     ],
     "close_delay_seconds": 10,
     "topic_template": "ticket_type={ticket_type};owner={user_id};username={username}",
-    "panel_embed_color": "0x57F287",
+    "panel_embed_color": "0x5865F2",
     "ticket_embed_color": "0x5865F2",
     "buttons": [
       {
-        "key": "request_custom_quote",
-        "label": "Request Custom Quote",
+        "key": "request_submit",
+        "label": "Request/Submit",
         "style": "green",
-        "emoji": "<a:rslrocket:1247632438252011550>",
-        "ticket_name_prefix": "quote",
+        "emoji": "<a:rssalute:1350272389908267049>",
+        "ticket_name_prefix": "req-submit",
         "sheet_route": null,
         "max_open_per_user": 1,
         "modal": {
           "fields": [
             {
               "key": "item_name",
-              "label": "Item Name",
-              "placeholder": "What item do you need quoted?",
+              "label": "Item / product",
+              "placeholder": "What you want priced or what you're submitting (SKU, title, link)",
               "required": true,
               "paragraph": false,
               "max_length": 120
@@ -37,23 +38,23 @@
             {
               "key": "quantity",
               "label": "Quantity",
-              "placeholder": "How many units?",
+              "placeholder": "How many units (or N/A if not applicable)",
               "required": true,
               "paragraph": false,
               "max_length": 40
             },
             {
               "key": "competitor_price",
-              "label": "Competitor Price / Link",
-              "placeholder": "Paste the price or reputable competitor link",
+              "label": "Price / competitor link",
+              "placeholder": "For quotes: paste price or reputable competitor link. For submissions: reference or expected payout if known",
               "required": false,
               "paragraph": true,
               "max_length": 500
             },
             {
               "key": "notes",
-              "label": "Extra Notes",
-              "placeholder": "Anything staff should know before quoting",
+              "label": "Details",
+              "placeholder": "Anything staff needs: condition, timeline, ship-from, or other context",
               "required": false,
               "paragraph": true,
               "max_length": 800
@@ -65,7 +66,7 @@
         "key": "signup_form",
         "label": "Signup Form",
         "style": "blurple",
-        "emoji": "<a:rslrocket:1247632438252011550>",
+        "emoji": "<a:rslknock:1247632729948946472>",
         "ticket_name_prefix": "signup",
         "sheet_route": "signup_form",
         "max_open_per_user": 1,
@@ -118,7 +119,7 @@
         "key": "need_help",
         "label": "Need Help?",
         "style": "gray",
-        "emoji": "<a:rslrocket:1247632438252011550>",
+        "emoji": "<:askyourcookgroup:910339530136109077>",
         "ticket_name_prefix": "help",
         "sheet_route": null,
         "max_open_per_user": 1,

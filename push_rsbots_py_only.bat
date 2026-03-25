@@ -6,12 +6,14 @@ REM - Assumes this repo is already configured with origin pointing to neo-rs/rsb
 REM - The repo .gitignore enforces python-only tracking for RS bot folders
 
 cd /d "%~dp0"
+set "EC=0"
 
 REM Basic sanity checks
 git rev-parse --is-inside-work-tree >nul 2>&1
 if errorlevel 1 (
   echo ERROR: Not inside a git repository. Run this from the mirror-world repo root.
-  exit /b 1
+  set EC=1
+  goto :pause_exit
 )
 
 REM Make sure we're on main (best effort; do not fail if already correct)
@@ -28,13 +30,15 @@ del /f /q ".git\index.lock" >nul 2>&1
 
 REM Update tracked files (faster + avoids scanning for new untracked files).
 git add -u
-REM New RSForwarder modules must be staged explicitly (git add -u skips untracked).
+REM New bot folders / modules (git add -u skips untracked paths).
+git add RSCashoutBot >nul 2>&1
 git add RSForwarder\mavely_link_resolve.py >nul 2>&1
 REM Also stage RSForwarder manual override json (was previously git-ignored).
 git add RSForwarder\rs_fs_manual_overrides.json >nul 2>&1
 if errorlevel 1 (
   echo ERROR: git add failed.
-  exit /b 1
+  set EC=1
+  goto :pause_exit
 )
 REM Never push runtime data (server-owned)
 git reset HEAD -- RSCheckerbot/member_history.json 2>nul
@@ -43,7 +47,8 @@ REM If nothing is staged, exit cleanly
 git diff --cached --quiet
 if not errorlevel 1 (
   echo No tracked changes staged. Nothing to push.
-  exit /b 0
+  set EC=0
+  goto :pause_exit
 )
 
 echo.
@@ -62,7 +67,8 @@ choice /C YN /N /M "Proceed to COMMIT + PUSH these staged changes? [Y/N] "
 if errorlevel 2 (
   echo.
   echo Aborted. Nothing committed or pushed.
-  exit /b 0
+  set EC=0
+  goto :pause_exit
 )
 
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set TS=%%i
@@ -72,7 +78,8 @@ echo Changes staged. Committing...
 git commit -m "rsbots py update: %TS%"
 if errorlevel 1 (
   echo ERROR: git commit failed.
-  exit /b 1
+  set EC=1
+  goto :pause_exit
 )
 
 for /f %%i in ('git rev-parse --short HEAD') do set SHA=%%i
@@ -88,7 +95,8 @@ echo Pushing to origin/main...
 git push
 if errorlevel 1 (
   echo ERROR: git push failed.
-  exit /b 1
+  set EC=1
+  goto :pause_exit
 )
 
 echo.
@@ -97,6 +105,11 @@ echo Pushed commit: %SHA% to origin/main
 
 echo.
 echo DONE.
-exit /b 0
+set EC=0
+goto :pause_exit
 
+:pause_exit
+echo.
+pause
+exit /b %EC%
 

@@ -154,6 +154,8 @@ rs_folders=(
   "RSMentionPinger"
   "RSuccessBot"
   "RSOnboarding"
+  "RSPromoBot"
+  "RSCashoutBot"
 )
 
 for d in "${rs_folders[@]}"; do

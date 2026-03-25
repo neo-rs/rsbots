@@ -20,6 +20,8 @@ BOTS[rscheckerbot]="RSCheckerbot:mirror-world-rscheckerbot.service:main.py"
 BOTS[rsforwarder]="RSForwarder:mirror-world-rsforwarder.service:rs_forwarder_bot.py"
 BOTS[rsmentionpinger]="RSMentionPinger:mirror-world-rsmentionpinger.service:rs_mention_pinger.py"
 BOTS[rsuccessbot]="RSuccessBot:mirror-world-rsuccessbot.service:rs_success_bot.py"
+BOTS[rspromobot]="RSPromoBot:mirror-world-rspromobot.service:promo_bot.py"
+BOTS[rscashoutbot]="RSCashoutBot:mirror-world-rscashoutbot.service:bot.py"
 BOTS[rsadminbot]="RSAdminBot:mirror-world-rsadminbot.service:admin_bot.py"
 
 # Get bot name from argument or default to rsadminbot

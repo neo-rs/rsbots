@@ -63,11 +63,11 @@
     "repo_dir": "/home/rsadmin/bots/oraclefiles",
     "repo_url": "git@github.com:neo-rs/oraclefiles.git",
     "branch": "main",
-    "include_folders": ["RSAdminBot", "RSForwarder", "RSCheckerbot", "RSMentionPinger", "RSOnboarding", "RSuccessBot", "RSPromoBot"]
+    "include_folders": ["RSAdminBot", "RSForwarder", "RSCheckerbot", "RSMentionPinger", "RSOnboarding", "RSuccessBot", "RSPromoBot", "RSCashoutBot"]
   },
     "bot_groups": {
       "rsadminbot": ["rsadminbot"],
-      "rs_bots": ["rsforwarder", "rsonboarding", "rsmentionpinger", "rscheckerbot", "rssuccessbot", "rspromobot", "whopmembershipsync"],
+      "rs_bots": ["rsforwarder", "rsonboarding", "rsmentionpinger", "rscheckerbot", "rssuccessbot", "rspromobot", "rscashoutbot", "whopmembershipsync"],
       "mirror_bots": ["dailyschedulereminder", "datamanagerbot", "discumbot", "instorebotforwarder", "pingbot"]
     },
   "ssh_server_name": "instance-enhance (rsadmin)",

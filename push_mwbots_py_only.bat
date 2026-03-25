@@ -7,11 +7,13 @@ REM - Assumes MWBots repo has origin pointing to neo-rs/MWBots
 REM - MWBots/.gitignore must exclude secrets + runtime files
 
 cd /d "%~dp0MWBots"
+set "EC=0"
 REM Basic sanity checks
 git rev-parse --is-inside-work-tree >nul 2>&1
 if errorlevel 1 (
   echo ERROR: Not inside a git repository. Expected: %~dp0MWBots
-  exit /b 1
+  set EC=1
+  goto :pause_exit
 )
 
 REM Make sure we're on main (best effort; do not fail if already correct)
@@ -28,14 +30,16 @@ echo Staging only safe tracked files (skip secrets/env/playwright caches).
 powershell -NoProfile -Command "$ErrorActionPreference='Stop'; $safe=(git ls-files | Where-Object {($_ -match '\.(py|md|json|txt)$') -or ($_ -eq 'requirements.txt')}); $safe=$safe | Where-Object { $_ -notmatch '(^|/)config\.secrets\.json$' -and $_ -notmatch '(^|/)tokens\.env$' -and $_ -notmatch '\.env$' -and $_ -notmatch 'member_history\.json$' -and $_ -notmatch 'playwright_profile/' -and $_ -notmatch '(^|/)\.playwright/' -and $_ -notmatch 'api-token\.env$' -and $_ -notmatch 'mavely_(cookies|refresh_token|auth_token|id_token)\.txt$' }; git reset > $null; if($safe.Count -gt 0){ git add -u -- $safe > $null }"
 if errorlevel 1 (
   echo ERROR: staging safe files failed.
-  exit /b 1
+  set EC=1
+  goto :pause_exit
 )
 
 REM If nothing is staged, exit cleanly
 git diff --cached --quiet
 if not errorlevel 1 (
   echo No tracked changes staged. Nothing to push.
-  exit /b 0
+  set EC=0
+  goto :pause_exit
 )
 
 echo.
@@ -54,7 +58,8 @@ git commit -m "mwbots py update: %TS%"
 if errorlevel 1 (
   echo ERROR: git commit failed.
   echo NOTE: If this is your first commit on this machine, set git user.name/user.email.
-  exit /b 1
+  set EC=1
+  goto :pause_exit
 )
 
 for /f %%i in ('git rev-parse --short HEAD') do set SHA=%%i
@@ -70,7 +75,8 @@ echo Pushing to origin/main...
 git push
 if errorlevel 1 (
   echo ERROR: git push failed.
-  exit /b 1
+  set EC=1
+  goto :pause_exit
 )
 
 echo.
@@ -79,5 +85,10 @@ echo Pushed commit %SHA% to GitHub (origin/main)
 echo NOTE: This pushes to GitHub only. To deploy to Oracle: use RSAdminBot /mwupdate or /botsync.
 echo.
 echo DONE.
-exit /b 0
+set EC=0
+goto :pause_exit
 
+:pause_exit
+echo.
+pause
+exit /b %EC%

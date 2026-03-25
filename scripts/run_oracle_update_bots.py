@@ -25,6 +25,7 @@ BOT_KEY_TO_FOLDER: Dict[str, str] = {
     "rscheckerbot": "RSCheckerbot",
     "rssuccessbot": "RSuccessBot",
     "rspromobot": "RSPromoBot",
+    "rscashoutbot": "RSCashoutBot",
     "whopmembershipsync": "WhopMembershipSync",
     # Mirror-world bots
     "dailyschedulereminder": "DailyScheduleReminder",

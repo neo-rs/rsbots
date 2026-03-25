@@ -5,7 +5,7 @@
 # Special bot_name: "all" or "allbots" to operate on all RS bots
 #
 # This script manages all RS bots:
-# - rsforwarder, rsonboarding, rsmentionpinger, rscheckerbot, rssuccessbot
+# - rsforwarder, rsonboarding, rsmentionpinger, rscheckerbot, rssuccessbot, rspromobot, rscashoutbot
 
 set -e  # Exit on error
 
@@ -20,6 +20,7 @@ declare -A SERVICES=(
     ["rscheckerbot"]="mirror-world-rscheckerbot.service"
     ["rssuccessbot"]="mirror-world-rssuccessbot.service"
     ["rspromobot"]="mirror-world-rspromobot.service"
+    ["rscashoutbot"]="mirror-world-rscashoutbot.service"
 )
 
 # Handle "all" or "allbots" case

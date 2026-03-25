@@ -39,6 +39,7 @@ declare -A SERVICES=(
   ["rsforwarder"]="mirror-world-rsforwarder.service"
   ["rssuccessbot"]="mirror-world-rssuccessbot.service"
   ["rspromobot"]="mirror-world-rspromobot.service"
+  ["rscashoutbot"]="mirror-world-rscashoutbot.service"
   ["rsmentionpinger"]="mirror-world-rsmentionpinger.service"
   ["datamanagerbot"]="mirror-world-datamanagerbot.service"
   ["dailyschedulereminder"]="mirror-world-dailyschedulereminder.service"
