@@ -7,7 +7,7 @@
     "transcript_channel_id": 0,
     "auto_post_panel_on_ready": true,
     "support_role_ids": [
-      0
+      1337919015992954881
     ],
     "admin_role_ids": [
       0
@@ -22,95 +22,74 @@
         "label": "Request/Submit",
         "style": "green",
         "emoji": "<a:rssalute:1350272389908267049>",
-        "ticket_name_prefix": "req-submit",
-        "sheet_route": null,
-        "max_open_per_user": 1,
+        "ticket_name_prefix": "cashout",
+        "sheet_route": "cashout_submit",
+        "max_open_per_user": 0,
         "modal": {
           "fields": [
-            {
-              "key": "item_name",
-              "label": "Item / product",
-              "placeholder": "What you want priced or what you're submitting (SKU, title, link)",
-              "required": true,
-              "paragraph": false,
-              "max_length": 120
-            },
-            {
-              "key": "quantity",
-              "label": "Quantity",
-              "placeholder": "How many units (or N/A if not applicable)",
-              "required": true,
-              "paragraph": false,
-              "max_length": 40
-            },
-            {
-              "key": "competitor_price",
-              "label": "Price / competitor link",
-              "placeholder": "For quotes: paste price or reputable competitor link. For submissions: reference or expected payout if known",
-              "required": false,
-              "paragraph": true,
-              "max_length": 500
-            },
-            {
-              "key": "notes",
-              "label": "Details",
-              "placeholder": "Anything staff needs: condition, timeline, ship-from, or other context",
-              "required": false,
-              "paragraph": true,
-              "max_length": 800
-            }
-          ]
-        }
-      },
-      {
-        "key": "signup_form",
-        "label": "Signup Form",
-        "style": "blurple",
-        "emoji": "<a:rslknock:1247632729948946472>",
-        "ticket_name_prefix": "signup",
-        "sheet_route": "signup_form",
-        "max_open_per_user": 1,
-        "modal": {
-          "fields": [
-            {
-              "key": "full_name",
-              "label": "Full Name",
-              "placeholder": "Your full name",
-              "required": true,
-              "paragraph": false,
-              "max_length": 120
-            },
             {
               "key": "email",
               "label": "Email",
-              "placeholder": "Best email for payout/contact",
+              "placeholder": "Email to give editor access to your cashout sheet",
               "required": true,
               "paragraph": false,
               "max_length": 120
             },
             {
-              "key": "phone",
-              "label": "Phone Number",
-              "placeholder": "Optional but recommended",
-              "required": false,
+              "key": "name_of_shoe",
+              "label": "Name of Shoe",
+              "placeholder": "Exact shoe / item name",
+              "required": true,
+              "paragraph": false,
+              "max_length": 120
+            },
+            {
+              "key": "sku",
+              "label": "SKU",
+              "placeholder": "SKU / style code / product id",
+              "required": true,
+              "paragraph": false,
+              "max_length": 120
+            },
+            {
+              "key": "condition",
+              "label": "Condition",
+              "placeholder": "New / Used / Defects / Box condition",
+              "required": true,
+              "paragraph": false,
+              "max_length": 120
+            },
+            {
+              "key": "size",
+              "label": "Size",
+              "placeholder": "Size or N/A",
+              "required": true,
               "paragraph": false,
               "max_length": 40
             },
             {
-              "key": "shipping_region",
-              "label": "Shipping Region",
-              "placeholder": "City / State / Country",
+              "key": "qty",
+              "label": "QTY",
+              "placeholder": "How many pairs / units",
               "required": true,
               "paragraph": false,
-              "max_length": 120
+              "max_length": 40
             },
             {
-              "key": "main_categories",
-              "label": "Main Categories",
-              "placeholder": "Cards, sneakers, toys, collectibles, etc.",
+              "key": "price",
+              "label": "Price",
+              "placeholder": "Expected payout / ask / known comp",
               "required": true,
+              "paragraph": false,
+              "max_length": 80
+            },
+            {
+              "key": "notes",
+              "label": "Notes",
+              "placeholder": "Flaws, missing accessories, damaged box, replacement box, etc.",
+              "required": false,
               "paragraph": true,
-              "max_length": 400
+              "max_length": 800
             }
           ]
         }
@@ -155,10 +134,10 @@
     ]
   },
   "google_sheet": {
-    "enabled": false,
-    "endpoint_url": "https://script.google.com/macros/s/YOUR_APPS_SCRIPT_ID/exec",
+    "enabled": true,
+    "endpoint_url": "https://script.google.com/macros/s/AKfycbzL4ZJoGkygy7tZh15itpsEPqqqyeJt4ShnJfkZJiZcH1PHQLQEIxDFHkh5X-1m_IM3/exec",
     "auth_header_name": "X-API-Key",
     "auth_token": "CHANGE_ME",
-    "timeout_seconds": 15
+    "timeout_seconds": 20
   }
 }

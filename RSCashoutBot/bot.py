@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -16,16 +17,14 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / 'config.json'
 MESSAGES_PATH = BASE_DIR / 'messages.json'
 LOG_PATH = BASE_DIR / 'bot.log'
+TICKETS_PATH = BASE_DIR / 'tickets.json'
+PROFILES_PATH = BASE_DIR / 'profiles.json'
 
 LOG = logging.getLogger('rscashoutbot')
-
-# Aligned key column (matches datamanager_message_flow_tester-style terminal output)
 _FLOW_KV_COL = 13
 
 
 class FlowReporter:
-    """Human-readable console blocks: [HH:MM:SS], rules, sections, aligned KV lines."""
-
     SEP = '=' * 78
 
     @staticmethod
@@ -88,68 +87,10 @@ class FlowReporter:
 FLOW = FlowReporter()
 
 
-def fmt_ch(channel_id: Optional[int]) -> str:
-    if channel_id is None or channel_id == 0:
-        return '(none)'
-    return f'<#{channel_id}>'
-
-
-def fmt_user(user_id: int) -> str:
-    return f'<@{user_id}>'
-
-
-def fmt_role(role_id: int) -> str:
-    return f'<@&{role_id}>'
-
-
-def fmt_channel_named(ch: discord.abc.GuildChannel) -> str:
-    return f'#{ch.name} {fmt_ch(ch.id)}'
-
-
-def fmt_member(user: Union[discord.User, discord.Member]) -> str:
-    name = getattr(user, 'display_name', None) or user.name
-    return f'{name} {fmt_user(user.id)}'
-
-
-def fmt_channel_resolve(guild: Optional[discord.Guild], channel_id: int) -> str:
-    if guild:
-        ch = guild.get_channel(channel_id)
-        if isinstance(ch, discord.abc.GuildChannel):
-            return fmt_channel_named(ch)
-    return fmt_ch(channel_id)
-
-
-def configure_logging() -> None:
-    """File gets full INFO trail; console is FlowReporter (startup + events). Discord HTTP stays quiet."""
-    root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
-
-    file_fmt = logging.Formatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s')
-    fh = logging.FileHandler(LOG_PATH, encoding='utf-8')
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(file_fmt)
-
-    term_fmt = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setLevel(logging.WARNING)
-    sh.setFormatter(term_fmt)
-
-    root.handlers.clear()
-    root.addHandler(fh)
-    root.addHandler(sh)
-
-    for name in ('discord', 'discord.client', 'discord.http', 'discord.gateway', 'discord.state'):
-        logging.getLogger(name).setLevel(logging.WARNING)
-
-    aiohttp_l = logging.getLogger('aiohttp')
-    aiohttp_l.setLevel(logging.WARNING)
-
-
 class ConfigError(RuntimeError):
     pass
 
 
-# Treat legacy ticket_type as the same slot when checking max_open_per_user (config rename request_custom_quote → request_submit).
 TICKET_TYPE_OPEN_EQUIV: Dict[str, frozenset[str]] = {
     'request_submit': frozenset({'request_submit', 'request_custom_quote'}),
 }
@@ -204,6 +145,83 @@ class RuntimeConfig:
     sheet: SheetIntegration
 
 
+def fmt_ch(channel_id: Optional[int]) -> str:
+    if channel_id in (None, 0):
+        return '(none)'
+    return f'<#{channel_id}>'
+
+
+def fmt_user(user_id: int) -> str:
+    return f'<@{user_id}>'
+
+
+def fmt_role(role_id: int) -> str:
+    return f'<@&{role_id}>'
+
+
+def fmt_channel_named(ch: discord.abc.GuildChannel) -> str:
+    return f'#{ch.name} {fmt_ch(ch.id)}'
+
+
+def fmt_member(user: Union[discord.User, discord.Member]) -> str:
+    name = getattr(user, 'display_name', None) or user.name
+    return f'{name} {fmt_user(user.id)}'
+
+
+def fmt_channel_resolve(guild: Optional[discord.Guild], channel_id: int) -> str:
+    if guild:
+        ch = guild.get_channel(channel_id)
+        if isinstance(ch, discord.abc.GuildChannel):
+            return fmt_channel_named(ch)
+    return fmt_ch(channel_id)
+
+
+def sanitize_channel_name(value: str) -> str:
+    cleaned = re.sub(r'[^a-zA-Z0-9]+', '-', value.lower()).strip('-')
+    return cleaned or 'user'
+
+
+def chunk_modal_fields(fields: List[Dict[str, Any]], size: int = 5) -> List[List[Dict[str, Any]]]:
+    return [fields[i:i + size] for i in range(0, len(fields), size)]
+
+
+def format_form_key(key: str) -> str:
+    mapping = {
+        'email': 'Email',
+        'name_of_shoe': 'Name of Shoe',
+        'sku': 'SKU',
+        'condition': 'Condition',
+        'size': 'Size',
+        'qty': 'QTY',
+        'price': 'Price',
+        'notes': 'Notes',
+    }
+    return mapping.get(key, key.replace('_', ' ').title())
+
+
+def configure_logging() -> None:
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    file_fmt = logging.Formatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s')
+    fh = logging.FileHandler(LOG_PATH, encoding='utf-8')
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(file_fmt)
+
+    term_fmt = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(logging.WARNING)
+    sh.setFormatter(term_fmt)
+
+    root.handlers.clear()
+    root.addHandler(fh)
+    root.addHandler(sh)
+
+    for name in ('discord', 'discord.client', 'discord.http', 'discord.gateway', 'discord.state'):
+        logging.getLogger(name).setLevel(logging.WARNING)
+    logging.getLogger('aiohttp').setLevel(logging.WARNING)
+
+
 class ConfigLoader:
     @staticmethod
     def _read_json(path: Path) -> Dict[str, Any]:
@@ -228,25 +246,23 @@ class ConfigLoader:
 
         buttons: List[ButtonDefinition] = []
         for raw_button in ticket_cfg.get('buttons', []):
-            key = raw_button['key']
+            key = str(raw_button['key'])
             message_def = dict(button_msgs.get(key, {}))
             if key == 'request_submit' and 'intro_title' not in message_def:
                 legacy = button_msgs.get('request_custom_quote')
                 if isinstance(legacy, dict):
                     message_def = {**legacy, **message_def}
             if 'intro_title' not in message_def or 'intro_body' not in message_def:
-                raise ConfigError(
-                    f'messages.json -> ticket_system.buttons[{key!r}] must define intro_title and intro_body'
-                )
+                raise ConfigError(f'messages.json -> ticket_system.buttons[{key!r}] must define intro_title and intro_body')
             buttons.append(
                 ButtonDefinition(
                     key=key,
-                    label=raw_button['label'],
-                    style=raw_button.get('style', 'blurple'),
+                    label=str(raw_button['label']),
+                    style=str(raw_button.get('style', 'blurple')),
                     emoji=raw_button.get('emoji'),
-                    ticket_name_prefix=raw_button['ticket_name_prefix'],
-                    intro_title=message_def['intro_title'],
-                    intro_body=message_def['intro_body'],
+                    ticket_name_prefix=str(raw_button['ticket_name_prefix']),
+                    intro_title=str(message_def['intro_title']),
+                    intro_body=str(message_def['intro_body']),
                     modal=raw_button.get('modal'),
                     sheet_route=raw_button.get('sheet_route'),
                     max_open_per_user=int(raw_button.get('max_open_per_user', 1)),
@@ -257,17 +273,15 @@ class ConfigLoader:
             guild_id=int(ticket_cfg['guild_id']),
             panel_channel_id=int(ticket_cfg['panel_channel_id']),
             ticket_category_id=int(ticket_cfg['ticket_category_id']),
-            transcript_channel_id=(
-                int(ticket_cfg['transcript_channel_id']) if ticket_cfg.get('transcript_channel_id') else None
-            ),
+            transcript_channel_id=(int(ticket_cfg['transcript_channel_id']) if ticket_cfg.get('transcript_channel_id') else None),
             auto_post_panel_on_ready=bool(ticket_cfg.get('auto_post_panel_on_ready', True)),
             support_role_ids=[int(x) for x in ticket_cfg.get('support_role_ids', [])],
             admin_role_ids=[int(x) for x in ticket_cfg.get('admin_role_ids', [])],
             close_delay_seconds=int(ticket_cfg.get('close_delay_seconds', 10)),
-            topic_template=str(ticket_cfg.get('topic_template', 'type={ticket_type};owner={user_id}')),
+            topic_template=str(ticket_cfg.get('topic_template', 'ticket_type={ticket_type};owner={user_id};username={username}')),
             panel_embed_color=int(str(ticket_cfg.get('panel_embed_color', '0x5865F2')), 16),
             ticket_embed_color=int(str(ticket_cfg.get('ticket_embed_color', '0x5865F2')), 16),
-            panel_title=msg_cfg['panel_title'],
+            panel_title=str(msg_cfg['panel_title']),
             panel_description=str(msg_cfg.get('panel_description', '') or ''),
             footer_text=str(msg_cfg.get('footer_text', '') or ''),
             buttons=buttons,
@@ -278,9 +292,8 @@ class ConfigLoader:
             endpoint_url=str(sheet_cfg.get('endpoint_url', '')).strip(),
             auth_header_name=str(sheet_cfg.get('auth_header_name', 'X-API-Key')).strip(),
             auth_token=str(sheet_cfg.get('auth_token', '')).strip(),
-            timeout_seconds=int(sheet_cfg.get('timeout_seconds', 15)),
+            timeout_seconds=int(sheet_cfg.get('timeout_seconds', 20)),
         )
-
         if sheet.enabled and not sheet.endpoint_url:
             raise ConfigError('google_sheet.enabled is true but endpoint_url is empty')
 
@@ -288,11 +301,12 @@ class ConfigLoader:
 
 
 class JsonStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, default_payload: Dict[str, Any]) -> None:
         self.path = path
+        self.default_payload = default_payload
         self._lock = asyncio.Lock()
         if not self.path.exists():
-            self.path.write_text(json.dumps({'tickets': {}}, indent=2), encoding='utf-8')
+            self.path.write_text(json.dumps(default_payload, indent=2), encoding='utf-8')
 
     async def read(self) -> Dict[str, Any]:
         async with self._lock:
@@ -301,6 +315,11 @@ class JsonStore:
     async def write(self, payload: Dict[str, Any]) -> None:
         async with self._lock:
             self.path.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+
+
+class TicketStore(JsonStore):
+    def __init__(self, path: Path) -> None:
+        super().__init__(path, {'tickets': {}})
 
     async def upsert_ticket(self, channel_id: int, record: Dict[str, Any]) -> None:
         data = await self.read()
@@ -312,6 +331,20 @@ class JsonStore:
         removed = data.setdefault('tickets', {}).pop(str(channel_id), None)
         await self.write(data)
         return removed
+
+    async def count_open_tickets(self, guild_id: int, user_id: int, ticket_type: str) -> int:
+        equiv = TICKET_TYPE_OPEN_EQUIV.get(ticket_type, frozenset({ticket_type}))
+        data = await self.read()
+        count = 0
+        for _, record in data.get('tickets', {}).items():
+            if (
+                int(record.get('guild_id', 0)) == guild_id
+                and int(record.get('owner_id', 0)) == user_id
+                and str(record.get('ticket_type')) in equiv
+                and bool(record.get('is_open', False))
+            ):
+                count += 1
+        return count
 
     async def find_open_ticket(self, guild_id: int, user_id: int, ticket_type: str) -> Optional[Dict[str, Any]]:
         equiv = TICKET_TYPE_OPEN_EQUIV.get(ticket_type, frozenset({ticket_type}))
@@ -329,13 +362,32 @@ class JsonStore:
         return None
 
 
+class ProfileStore(JsonStore):
+    def __init__(self, path: Path) -> None:
+        super().__init__(path, {'profiles': {}})
+
+    async def get_profile(self, user_id: int) -> Dict[str, Any]:
+        data = await self.read()
+        return dict(data.get('profiles', {}).get(str(user_id), {}))
+
+    async def upsert_profile(self, user_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
+        data = await self.read()
+        profiles = data.setdefault('profiles', {})
+        existing = dict(profiles.get(str(user_id), {}))
+        existing.update(patch)
+        profiles[str(user_id)] = existing
+        await self.write(data)
+        return existing
+
+
 class SheetClient:
     def __init__(self, config: SheetIntegration) -> None:
         self.config = config
 
-    async def submit(self, route: str, payload: Dict[str, Any]) -> None:
+    async def submit(self, route: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         if not self.config.enabled:
-            return
+            return {'ok': False, 'disabled': True}
+
         headers = {'Content-Type': 'application/json'}
         if self.config.auth_token:
             headers[self.config.auth_header_name] = self.config.auth_token
@@ -343,9 +395,14 @@ class SheetClient:
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(self.config.endpoint_url, json=body, headers=headers) as resp:
+                raw = await resp.text()
                 if resp.status >= 300:
-                    text = await resp.text()
-                    raise RuntimeError(f'Sheet submission failed ({resp.status}): {text[:500]}')
+                    raise RuntimeError(f'Sheet submission failed ({resp.status}): {raw[:500]}')
+        try:
+            parsed = json.loads(raw or '{}')
+        except json.JSONDecodeError:
+            parsed = {'ok': True, 'raw': raw}
+
         cid = payload.get('channel_id')
         uid = int(payload.get('user_id') or 0)
         FLOW.event_block(
@@ -356,31 +413,58 @@ class SheetClient:
                 ('User', fmt_user(uid) if uid else '(?)'),
             ],
         )
+        return parsed
 
 
-class TicketModal(discord.ui.Modal):
-    def __init__(self, bot: 'RSTicketBot', button_def: ButtonDefinition) -> None:
-        super().__init__(title=button_def.label[:45])
+class DynamicModal(discord.ui.Modal):
+    def __init__(self, bot: 'RSTicketBot', button_def: ButtonDefinition, title: str, fields: List[Dict[str, Any]], defaults: Optional[Dict[str, str]] = None, prior_values: Optional[Dict[str, str]] = None, step_index: int = 1, total_steps: int = 1) -> None:
+        super().__init__(title=title[:45])
         self.bot_ref = bot
         self.button_def = button_def
+        self.fields = fields
+        self.defaults = defaults or {}
+        self.prior_values = prior_values or {}
+        self.step_index = step_index
+        self.total_steps = total_steps
         self.field_keys: List[str] = []
-        for field in button_def.modal.get('fields', []):
-            text_input = discord.ui.TextInput(
-                label=field['label'][:45],
-                placeholder=field.get('placeholder', '')[:100],
-                default=field.get('default', '')[:4000],
+        for field in fields:
+            key = str(field['key'])
+            default_value = self.defaults.get(key)
+            if default_value is None:
+                default_value = str(field.get('default', ''))
+            input_widget = discord.ui.TextInput(
+                label=str(field['label'])[:45],
+                placeholder=str(field.get('placeholder', ''))[:100],
+                default=str(default_value)[:4000],
                 required=bool(field.get('required', True)),
-                style=(discord.TextStyle.paragraph if field.get('paragraph', False) else discord.TextStyle.short),
+                style=discord.TextStyle.paragraph if field.get('paragraph', False) else discord.TextStyle.short,
                 max_length=int(field.get('max_length', 400)),
             )
-            self.field_keys.append(field['key'])
-            self.add_item(text_input)
+            self.field_keys.append(key)
+            self.add_item(input_widget)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        values: Dict[str, str] = {}
+        values = dict(self.prior_values)
         for key, child in zip(self.field_keys, self.children):
             if isinstance(child, discord.ui.TextInput):
                 values[key] = child.value.strip()
+
+        all_fields = list(self.button_def.modal.get('fields', [])) if self.button_def.modal else []
+        chunks = chunk_modal_fields(all_fields)
+        if self.step_index < len(chunks):
+            next_modal = DynamicModal(
+                self.bot_ref,
+                self.button_def,
+                f'{self.button_def.label} ({self.step_index + 1}/{len(chunks)})',
+                chunks[self.step_index],
+                defaults=self.defaults,
+                prior_values=values,
+                step_index=self.step_index + 1,
+                total_steps=len(chunks),
+            )
+            await interaction.response.send_modal(next_modal)
+            return
+
         await self.bot_ref.create_ticket_from_request(interaction, self.button_def, values)
 
 
@@ -392,14 +476,6 @@ class CloseTicketView(discord.ui.View):
     @discord.ui.button(label='Close Ticket', style=discord.ButtonStyle.danger, custom_id='rs_ticket:close')
     async def close_ticket(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self.bot_ref.close_ticket(interaction)
-
-
-class TicketPanelView(discord.ui.View):
-    def __init__(self, bot: 'RSTicketBot') -> None:
-        super().__init__(timeout=None)
-        self.bot_ref = bot
-        for button_def in bot.runtime.ticket.buttons:
-            self.add_item(TicketActionButton(button_def))
 
 
 class TicketActionButton(discord.ui.Button):
@@ -421,12 +497,14 @@ class TicketActionButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction) -> None:
         bot = interaction.client
         assert isinstance(bot, RSTicketBot)
-        if self.button_def.modal and self.button_def.modal.get('fields'):
-            await interaction.response.send_modal(TicketModal(bot, self.button_def))
-            return
-        await bot.create_ticket_from_request(interaction, self.button_def, {})
+        await bot.launch_button_flow(interaction, self.button_def)
 
 
+class TicketPanelView(discord.ui.View):
+    def __init__(self, bot: 'RSTicketBot') -> None:
+        super().__init__(timeout=None)
+        for button_def in bot.runtime.ticket.buttons:
+            self.add_item(TicketActionButton(button_def))
 
 
 def has_any_configured_role(member: discord.Member, role_ids: List[int]) -> bool:
@@ -434,13 +512,28 @@ def has_any_configured_role(member: discord.Member, role_ids: List[int]) -> bool
     return any(role_id in member_role_ids for role_id in role_ids if role_id)
 
 
-def is_ticket_admin(interaction: discord.Interaction) -> bool:
-    if not isinstance(interaction.user, discord.Member):
-        return False
-    if interaction.user.guild_permissions.administrator:
-        return True
+async def is_ticket_admin(interaction: discord.Interaction) -> bool:
     runtime_cfg = interaction.client.runtime if isinstance(interaction.client, RSTicketBot) else runtime
-    return has_any_configured_role(interaction.user, runtime_cfg.ticket.admin_role_ids)
+    admin_role_ids = runtime_cfg.ticket.admin_role_ids
+
+    member: Optional[discord.Member] = None
+    if isinstance(interaction.user, discord.Member):
+        member = interaction.user
+    else:
+        if interaction.guild is None or not interaction.user:
+            return False
+        try:
+            member = interaction.guild.get_member(interaction.user.id)
+            if member is None:
+                member = await interaction.guild.fetch_member(interaction.user.id)
+        except discord.HTTPException:
+            return False
+
+    if member is None:
+        return False
+    if member.guild_permissions.administrator:
+        return True
+    return has_any_configured_role(member, admin_role_ids)
 
 
 class RSTicketBot(commands.Bot):
@@ -451,146 +544,131 @@ class RSTicketBot(commands.Bot):
         intents.messages = True
         super().__init__(command_prefix='!', intents=intents)
         self.runtime = runtime
-        self.store = JsonStore(BASE_DIR / 'tickets.json')
+        self.store = TicketStore(TICKETS_PATH)
+        self.profile_store = ProfileStore(PROFILES_PATH)
         self.sheet_client = SheetClient(runtime.sheet)
         self._auto_panel_posted_once = False
 
+    def get_button(self, key: str) -> Optional[ButtonDefinition]:
+        for button in self.runtime.ticket.buttons:
+            if button.key == key:
+                return button
+        return None
+
     async def setup_hook(self) -> None:
-        # Views must be built here: discord.py uses asyncio.get_running_loop() in View.__init__.
         self.close_view = CloseTicketView(self)
         self.panel_view = TicketPanelView(self)
         self.add_view(self.close_view)
         self.add_view(self.panel_view)
+
         guild = discord.Object(id=self.runtime.ticket.guild_id)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
         FLOW.section('2) SLASH COMMANDS — SYNC')
         FLOW.kv('Guild ID', self.runtime.ticket.guild_id)
         FLOW.note(
-            'What happened: app commands were copied to this guild and synced with Discord.',
-            'Staff can use /ticketpanel, /ticketadd, /ticketremove, /ticketclose as configured.',
-        )
-        FLOW.explain(
-            'Guild-scoped sync keeps command registration fast (no global propagation wait).',
+            'App commands were copied to this guild and synced with Discord.',
+            'Primary panel command is now /cashout. Members can use /cashoutnew for another cashout submission.',
         )
         FLOW.rule()
 
     async def on_ready(self) -> None:
         if not self.user:
             return
-        me = fmt_member(self.user)
-        g = self.get_guild(self.runtime.ticket.guild_id)
+        guild = self.get_guild(self.runtime.ticket.guild_id)
         FLOW.section('3) LOGIN — BOT ONLINE')
-        FLOW.kv('Bot', me)
-        if g:
-            panel = fmt_channel_resolve(g, self.runtime.ticket.panel_channel_id)
-            cat = fmt_channel_resolve(g, self.runtime.ticket.ticket_category_id)
-            trans = (
-                fmt_channel_resolve(g, self.runtime.ticket.transcript_channel_id)
-                if self.runtime.ticket.transcript_channel_id
-                else '(transcript logging off)'
-            )
-            FLOW.kv('Guild', f'{g.name} ({g.id})')
-            FLOW.kv('Panel channel', panel)
-            FLOW.kv('Ticket category', cat)
-            FLOW.kv('Transcript channel', trans)
-            FLOW.note(
-                'What this means: the bot sees your server and resolved channel/category names.',
-                'Users open tickets from the panel channel; new channels appear under the ticket category.',
-            )
+        FLOW.kv('Bot', fmt_member(self.user))
+        if guild:
+            FLOW.kv('Guild', f'{guild.name} ({guild.id})')
+            FLOW.kv('Panel channel', fmt_channel_resolve(guild, self.runtime.ticket.panel_channel_id))
+            FLOW.kv('Ticket category', fmt_channel_resolve(guild, self.runtime.ticket.ticket_category_id))
+            FLOW.kv('Transcript channel', fmt_channel_resolve(guild, self.runtime.ticket.transcript_channel_id) if self.runtime.ticket.transcript_channel_id else '(off)')
         else:
-            FLOW.kv('Guild ID', self.runtime.ticket.guild_id)
-            FLOW.kv('Panel channel', fmt_ch(self.runtime.ticket.panel_channel_id))
-            FLOW.kv('Ticket category', fmt_ch(self.runtime.ticket.ticket_category_id))
-            FLOW.warn_note(
-                'WARNING: This bot is online but the configured guild is not visible.',
-                'Check: bot invite, guild_id in config, and that the bot process uses the right token.',
-                'Members intent is required for some permission checks.',
-            )
+            FLOW.warn_note('Configured guild is not visible to this bot session.')
         FLOW.rule()
 
-        if (
-            g
-            and self.runtime.ticket.auto_post_panel_on_ready
-            and not self._auto_panel_posted_once
-        ):
+        if guild and self.runtime.ticket.auto_post_panel_on_ready and not self._auto_panel_posted_once:
             self._auto_panel_posted_once = True
-            pch = g.get_channel(self.runtime.ticket.panel_channel_id)
-            if isinstance(pch, discord.TextChannel):
+            panel_ch = guild.get_channel(self.runtime.ticket.panel_channel_id)
+            if isinstance(panel_ch, discord.TextChannel):
                 try:
-                    await self.send_panel_card(pch)
-                    FLOW.section('4) TICKET PANEL CARD — SENT TO SERVER')
-                    FLOW.kv('Channel', fmt_channel_named(pch))
-                    FLOW.note(
-                        'What was sent: the same embed + button row as /ticketpanel.',
-                        'Disable duplicate posts on restart: set ticket_system.auto_post_panel_on_ready to false in config.json.',
-                    )
-                    FLOW.rule()
-                except discord.Forbidden:
-                    FLOW.warn_note(
-                        'WARNING: Could not auto-post the panel (403 Forbidden).',
-                        'Give the bot Send Messages + Embed Links + Attach Files in the panel channel (and View Channel).',
-                    )
-                    FLOW.rule()
+                    await self.send_panel_card(panel_ch)
+                    FLOW.event_block('PANEL — AUTO POSTED', [('Channel', fmt_channel_named(panel_ch))])
                 except discord.HTTPException as exc:
-                    FLOW.warn_note(
-                        f'WARNING: Could not auto-post the panel ({exc}).',
-                        'Check bot permissions and channel exists; you can still use /ticketpanel in that channel.',
-                    )
-                    FLOW.rule()
-            else:
-                FLOW.warn_note(
-                    'WARNING: auto_post_panel_on_ready is on but panel_channel_id is not a text channel.',
-                    'Fix ticket_system.panel_channel_id in config.json.',
-                )
-                FLOW.rule()
+                    FLOW.warn_note(f'Could not auto-post panel: {exc}')
 
     async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
         cmd = interaction.command.name if interaction.command else '?'
-        actor = fmt_member(interaction.user) if interaction.user else '?'
-        where = fmt_ch(interaction.channel_id) if interaction.channel_id else '(no channel)'
         FLOW.section('ERROR — SLASH COMMAND')
         FLOW.kv('Command', f'/{cmd}')
-        FLOW.kv('Channel', where)
-        FLOW.kv('Actor', actor)
-        if isinstance(error, app_commands.CommandInvokeError):
-            FLOW.kv('Exception', repr(error.original))
-            FLOW.note('Full traceback is in bot.log (file handler).')
-            LOG.error(
-                'Slash /%s failed | %s | actor=%s',
-                cmd,
-                where,
-                actor,
-                exc_info=error.original,
-            )
-        else:
-            FLOW.kv('Problem', str(error))
-            LOG.warning('Slash /%s | %s | actor=%s | %s', cmd, where, actor, error)
+        FLOW.kv('Channel', fmt_ch(interaction.channel_id) if interaction.channel_id else '(none)')
+        FLOW.kv('Actor', fmt_member(interaction.user) if interaction.user else '?')
+        FLOW.kv('Error', repr(error))
         FLOW.rule()
+        if interaction.response.is_done():
+            await interaction.followup.send('Something went wrong. Check bot.log.', ephemeral=True)
+        else:
+            await interaction.response.send_message('Something went wrong. Check bot.log.', ephemeral=True)
+        LOG.exception('App command error: %s', cmd, exc_info=error)
 
     def _build_panel_embed(self) -> discord.Embed:
         ticket = self.runtime.ticket
-        desc = ticket.panel_description.strip()
         embed = discord.Embed(
             title=ticket.panel_title,
-            description=desc if desc else None,
+            description=ticket.panel_description.strip() or None,
             color=ticket.panel_embed_color,
         )
+        footer = ticket.footer_text.strip()
+        if footer:
+            embed.set_footer(text=footer)
         return embed
 
     async def send_panel_card(self, channel: discord.TextChannel) -> None:
-        """Post the ticket panel embed + buttons (same card as /ticketpanel)."""
         await channel.send(embed=self._build_panel_embed(), view=self.panel_view)
 
-    async def _maybe_log_ticket_opened(
-        self,
-        guild: discord.Guild,
-        ticket_channel: discord.TextChannel,
-        opener: discord.abc.User,
-        button_def: ButtonDefinition,
-        form_values: Dict[str, str],
-    ) -> None:
-        """Post to transcript_channel_id when any ticket flow opens (request/signup/help)."""
+    async def _ensure_panel_channel(self, interaction: discord.Interaction) -> bool:
+        if interaction.channel_id != self.runtime.ticket.panel_channel_id:
+            await interaction.response.send_message(f'This panel only works in <#{self.runtime.ticket.panel_channel_id}>.', ephemeral=True)
+            return False
+        return True
+
+    async def get_modal_defaults(self, user_id: int, button_def: ButtonDefinition) -> Dict[str, str]:
+        profile = await self.profile_store.get_profile(user_id)
+        defaults: Dict[str, str] = {}
+        last_values = profile.get('last_request_values', {}) if isinstance(profile.get('last_request_values'), dict) else {}
+        for field in button_def.modal.get('fields', []) if button_def.modal else []:
+            key = str(field['key'])
+            if key == 'email' and profile.get('email'):
+                defaults[key] = str(profile['email'])
+            elif key in last_values and last_values.get(key):
+                defaults[key] = str(last_values[key])
+        return defaults
+
+    async def launch_button_flow(self, interaction: discord.Interaction, button_def: ButtonDefinition) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message('This can only be used inside the server.', ephemeral=True)
+            return
+
+        defaults = await self.get_modal_defaults(interaction.user.id, button_def)
+        fields = list(button_def.modal.get('fields', [])) if button_def.modal else []
+        if fields:
+            chunks = chunk_modal_fields(fields)
+            modal = DynamicModal(
+                self,
+                button_def,
+                f'{button_def.label} (1/{len(chunks)})' if len(chunks) > 1 else button_def.label,
+                chunks[0],
+                defaults=defaults,
+                prior_values={},
+                step_index=1,
+                total_steps=len(chunks),
+            )
+            await interaction.response.send_modal(modal)
+            return
+
+        await self.create_ticket_from_request(interaction, button_def, {})
+
+    async def _maybe_log_ticket_opened(self, guild: discord.Guild, ticket_channel: discord.TextChannel, opener: discord.abc.User, button_def: ButtonDefinition, form_values: Dict[str, str], extra_lines: Optional[List[str]] = None) -> None:
         tid = self.runtime.ticket.transcript_channel_id
         if not tid:
             return
@@ -602,131 +680,70 @@ class RSTicketBot(commands.Bot):
             f'**Owner:** {opener.mention} ({opener.id})',
             f'**Type:** {button_def.label}',
         ]
+        if extra_lines:
+            lines.extend(extra_lines)
         filled = [(k, v) for k, v in form_values.items() if str(v).strip()]
         if filled:
             lines.append('')
             for k, v in filled:
-                label = k.replace('_', ' ').title()
-                lines.append(f'**{label}:** {str(v)[:800]}')
-        body = '\n'.join(lines)[:4096]
-        emb = discord.Embed(
-            title='Ticket opened',
-            description=body,
-            color=self.runtime.ticket.ticket_embed_color,
-        )
+                lines.append(f'**{format_form_key(k)}:** {str(v)[:700]}')
+        emb = discord.Embed(title='Ticket opened', description='\n'.join(lines)[:4096], color=self.runtime.ticket.ticket_embed_color)
         try:
             await log_ch.send(embed=emb)
-            FLOW.event_block(
-                'TRANSCRIPT — OPEN LOGGED',
-                [
-                    ('Log channel', fmt_channel_named(log_ch)),
-                    ('Ticket', fmt_ch(ticket_channel.id)),
-                ],
-            )
         except discord.HTTPException as exc:
-            LOG.warning('Could not post ticket-open log to transcript channel: %s', exc)
+            LOG.warning('Could not post ticket-open log: %s', exc)
 
-    async def _ensure_panel_channel(self, interaction: discord.Interaction) -> bool:
-        if interaction.channel_id != self.runtime.ticket.panel_channel_id:
-            await interaction.response.send_message(
-                f'This panel only works in <#{self.runtime.ticket.panel_channel_id}>.', ephemeral=True
-            )
-            return False
-        return True
-
-    async def create_ticket_from_request(
-        self,
-        interaction: discord.Interaction,
-        button_def: ButtonDefinition,
-        form_values: Dict[str, str],
-    ) -> None:
+    async def create_ticket_from_request(self, interaction: discord.Interaction, button_def: ButtonDefinition, form_values: Dict[str, str]) -> None:
         guild = interaction.guild
         user = interaction.user
         if guild is None:
-            FLOW.event_block(
-                'TICKET — REJECTED (NOT IN SERVER)',
-                [
-                    ('Flow key', button_def.key),
-                    ('Button label', button_def.label),
-                    ('User', fmt_member(user)),
-                ],
-            )
-            FLOW.note('Why: interactions must run inside a guild for this ticket system.')
-            await interaction.response.send_message('This can only be used inside the server.', ephemeral=True)
+            if interaction.response.is_done():
+                await interaction.followup.send('This can only be used inside the server.', ephemeral=True)
+            else:
+                await interaction.response.send_message('This can only be used inside the server.', ephemeral=True)
             return
 
         FLOW.section('TICKET — OPEN REQUEST')
         FLOW.kv('Flow key', button_def.key)
         FLOW.kv('Button label', button_def.label)
         FLOW.kv('User', fmt_member(user))
-        FLOW.kv('Clicked in', fmt_ch(interaction.channel_id))
-        FLOW.note(
-            'What happens next: bot checks for an existing open ticket of this type,',
-            'then creates a private text channel under the configured category.',
-        )
         FLOW.rule()
 
-        existing = await self.store.find_open_ticket(guild.id, user.id, button_def.key)
-        if existing:
-            ex_id = int(existing['channel_id'])
-            FLOW.section('TICKET — ALREADY OPEN (STOPPED)')
-            FLOW.kv('User', fmt_member(user))
-            FLOW.kv('Flow key', button_def.key)
-            FLOW.kv('Existing channel', fmt_ch(ex_id))
-            FLOW.note(
-                'Why: config limits one open ticket per user per flow (max_open_per_user).',
-                'User was told in Discord to use the existing channel.',
-            )
-            FLOW.rule()
-            await interaction.response.send_message(
-                f'You already have an open {button_def.label} ticket: <#{existing["channel_id"]}>',
-                ephemeral=True,
-            )
-            return
+        open_limit = button_def.max_open_per_user
+        if open_limit > 0:
+            open_count = await self.store.count_open_tickets(guild.id, user.id, button_def.key)
+            if open_count >= open_limit:
+                existing = await self.store.find_open_ticket(guild.id, user.id, button_def.key)
+                target = fmt_ch(existing['channel_id']) if existing else 'your existing ticket'
+                msg = f'You already have the max number of open {button_def.label} tickets. Use {target} first.'
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+                return
 
         category = guild.get_channel(self.runtime.ticket.ticket_category_id)
         if not isinstance(category, discord.CategoryChannel):
-            FLOW.section('TICKET — CONFIG ERROR')
-            FLOW.kv('ticket_category_id', fmt_ch(self.runtime.ticket.ticket_category_id))
-            FLOW.warn_note(
-                'ERROR: ticket_category_id is not a category (or ID is wrong).',
-                'Fix config.json: set ticket_category_id to a real category the bot can manage.',
-            )
-            FLOW.rule()
-            LOG.error('Invalid ticket_category_id %s', self.runtime.ticket.ticket_category_id)
-            await interaction.response.send_message('Ticket category is not configured correctly.', ephemeral=True)
+            msg = 'Ticket category is not configured correctly.'
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
             return
 
         overwrite_map: Dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            user: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                attach_files=True,
-                embed_links=True,
-            ),
-            guild.me: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                manage_channels=True,
-                manage_messages=True,
-                read_message_history=True,
-            ),
+            user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True, read_message_history=True),
         }
-
         for role_id in self.runtime.ticket.support_role_ids + self.runtime.ticket.admin_role_ids:
             role = guild.get_role(role_id)
             if role:
-                overwrite_map[role] = discord.PermissionOverwrite(
-                    view_channel=True,
-                    send_messages=True,
-                    read_message_history=True,
-                    manage_messages=True,
-                )
+                overwrite_map[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
 
-        safe_name = ''.join(c.lower() if c.isalnum() else '-' for c in user.display_name).strip('-') or f'user-{user.id}'
-        channel_name = f'{button_def.ticket_name_prefix}-{safe_name}'[:95]
+        suffix = datetime.utcnow().strftime('%m%d-%H%M%S') if button_def.max_open_per_user == 0 else ''
+        base_name = sanitize_channel_name(getattr(user, 'display_name', user.name))
+        channel_name = f"{button_def.ticket_name_prefix}-{base_name}{('-' + suffix) if suffix else ''}"[:95]
         topic = self.runtime.ticket.topic_template.format(ticket_type=button_def.key, user_id=user.id, username=user.name)
         channel = await guild.create_text_channel(
             name=channel_name,
@@ -736,24 +753,73 @@ class RSTicketBot(commands.Bot):
             reason=f'{button_def.label} ticket opened by {user}',
         )
 
-        body = (button_def.intro_body or '').strip()
+        sheet_result: Dict[str, Any] = {}
+        if button_def.sheet_route and self.runtime.sheet.enabled:
+            payload = {
+                'channel_id': channel.id,
+                'guild_id': guild.id,
+                'user_id': user.id,
+                'username': user.name,
+                'display_name': getattr(user, 'display_name', user.name),
+                'ticket_type': button_def.key,
+                'ticket_label': button_def.label,
+                'created_at': discord.utils.utcnow().isoformat(),
+                'values': form_values,
+            }
+            try:
+                sheet_result = await self.sheet_client.submit(button_def.sheet_route, payload)
+            except Exception as exc:
+                LOG.exception('Sheet submission failed for %s', button_def.key)
+                sheet_result = {'ok': False, 'error': str(exc)}
+
+        profile_patch: Dict[str, Any] = {'last_used_at': discord.utils.utcnow().isoformat()}
+        if form_values.get('email'):
+            profile_patch['email'] = form_values['email']
+        if button_def.key == 'request_submit':
+            profile_patch['last_request_values'] = form_values
+            if sheet_result.get('sheet_url'):
+                profile_patch['last_sheet_url'] = sheet_result['sheet_url']
+        await self.profile_store.upsert_profile(user.id, profile_patch)
+
         embed = discord.Embed(
             title=button_def.intro_title,
-            description=body if body else None,
+            description=button_def.intro_body.strip() or None,
             color=self.runtime.ticket.ticket_embed_color,
         )
         embed.add_field(name='Opened By', value=user.mention, inline=True)
         embed.add_field(name='Ticket Type', value=button_def.label, inline=True)
-        if form_values:
-            lines = [f'**{key.replace("_", " ").title()}:** {value}' for key, value in form_values.items() if value]
-            if lines:
-                embed.add_field(name='Form Details', value='\n'.join(lines)[:1024], inline=False)
-        ft = (self.runtime.ticket.footer_text or '').strip()
-        if ft:
-            embed.set_footer(text=ft)
 
-        mentions = ' '.join(f'<@&{role_id}>' for role_id in self.runtime.ticket.support_role_ids)
+        if form_values:
+            lines = [f'**{format_form_key(k)}:** {v}' for k, v in form_values.items() if str(v).strip()]
+            if lines:
+                embed.add_field(name='Submitted Info', value='\n'.join(lines)[:1024], inline=False)
+
+        if sheet_result.get('sheet_url'):
+            embed.add_field(name='Cashout Sheet Copy', value=sheet_result['sheet_url'][:1024], inline=False)
+            instructions = []
+            if sheet_result.get('sheet_name'):
+                instructions.append(f'**Sheet Name:** {sheet_result["sheet_name"]}')
+            instructions.append('Fill out the sheet fully, then send the completed link back in this ticket when ready.')
+            if sheet_result.get('view_url') and sheet_result.get('view_url') != sheet_result.get('sheet_url'):
+                instructions.append(f'View link: {sheet_result["view_url"]}')
+            embed.add_field(name='Next Step', value='\n'.join(instructions)[:1024], inline=False)
+        elif button_def.key == 'request_submit':
+            embed.add_field(name='Next Step', value='Staff will review your details here. If sheet integration is enabled later, your personal cashout sheet link will also appear here.', inline=False)
+
+        footer = self.runtime.ticket.footer_text.strip()
+        if footer:
+            embed.set_footer(text=footer)
+
+        mentions = ' '.join(f'<@&{role_id}>' for role_id in self.runtime.ticket.support_role_ids if role_id)
         await channel.send(content=(f'{mentions} {user.mention}'.strip()), embed=embed, view=self.close_view)
+
+        if sheet_result.get('sheet_url'):
+            await channel.send(
+                f'Your personal cashout sheet is ready: {sheet_result["sheet_url"]}\n'
+                'Please complete it using the required format, then drop the filled-out link back in this ticket.'
+            )
+        elif button_def.key == 'request_submit' and sheet_result.get('error'):
+            await channel.send('Note: the Google Sheet copy could not be created automatically. Staff can still handle this ticket here.')
 
         record = {
             'guild_id': guild.id,
@@ -764,215 +830,113 @@ class RSTicketBot(commands.Bot):
             'is_open': True,
             'created_at': discord.utils.utcnow().isoformat(),
             'form_values': form_values,
+            'sheet_result': sheet_result,
         }
         await self.store.upsert_ticket(channel.id, record)
-        await self._maybe_log_ticket_opened(guild, channel, user, button_def, form_values)
 
-        form_preview = ', '.join(f'{k}={v!r}' for k, v in form_values.items()) if form_values else '(no modal fields)'
-        FLOW.section('TICKET — CREATED')
-        FLOW.kv('New channel', fmt_channel_named(channel))
-        FLOW.kv('Channel topic', topic[:200] + ('…' if len(topic) > 200 else ''))
-        FLOW.kv('Owner', fmt_member(user))
-        FLOW.kv('Flow key', button_def.key)
-        FLOW.kv('Form snapshot', form_preview[:500] + ('…' if len(form_preview) > 500 else ''))
-        FLOW.explain(
-            'Support/admin roles were granted channel access; @everyone cannot see the channel.',
-            'First message pings support roles (if configured) and the opener.',
-            'Ticket record saved to tickets.json so close/delete can run cleanly.',
-        )
-        FLOW.rule()
+        extra_lines = []
+        if sheet_result.get('sheet_url'):
+            extra_lines.append(f'**Sheet Copy:** {sheet_result["sheet_url"]}')
+        await self._maybe_log_ticket_opened(guild, channel, user, button_def, form_values, extra_lines=extra_lines)
 
-        if button_def.sheet_route:
+        if button_def.key == 'request_submit' and sheet_result.get('sheet_url'):
             try:
-                await self.sheet_client.submit(
-                    button_def.sheet_route,
-                    {
-                        'channel_id': channel.id,
-                        'guild_id': guild.id,
-                        'user_id': user.id,
-                        'username': user.name,
-                        'display_name': user.display_name,
-                        'ticket_type': button_def.key,
-                        'ticket_label': button_def.label,
-                        'created_at': record['created_at'],
-                        'values': form_values,
-                    },
+                dm_embed = discord.Embed(
+                    title='RS Cashout Submission Received',
+                    description='Your personal cashout sheet copy is ready. Keep this link for reference and send the completed version back in your ticket when finished.',
+                    color=self.runtime.ticket.ticket_embed_color,
                 )
-            except Exception:
-                FLOW.section('GOOGLE SHEET — SUBMIT FAILED')
-                FLOW.kv('Route', button_def.sheet_route)
-                FLOW.kv('Ticket channel', fmt_ch(channel.id))
-                FLOW.kv('User', fmt_user(user.id))
-                FLOW.warn_note(
-                    'The ticket still exists in Discord; staff saw a short notice in the channel.',
-                    'See bot.log for the HTTP error / traceback.',
-                )
-                FLOW.rule()
-                LOG.exception(
-                    'Sheet FAIL | route=%s | ticket=%s | user=%s',
-                    button_def.sheet_route,
-                    fmt_ch(channel.id),
-                    fmt_user(user.id),
-                )
-                await channel.send('Note: form data could not be forwarded to the sheet endpoint. Staff can still handle this ticket here.')
+                dm_embed.add_field(name='Sheet Link', value=sheet_result['sheet_url'][:1024], inline=False)
+                dm_embed.add_field(name='Ticket', value=channel.mention, inline=False)
+                await user.send(embed=dm_embed)
+            except discord.HTTPException:
+                LOG.warning('Could not DM user %s with sheet link', user.id)
 
+        msg = f'Your ticket is ready: {channel.mention}'
+        if sheet_result.get('sheet_url'):
+            msg += f'\nSheet copy: {sheet_result["sheet_url"]}'
         if interaction.response.is_done():
-            await interaction.followup.send(f'Your ticket is ready: {channel.mention}', ephemeral=True)
+            await interaction.followup.send(msg, ephemeral=True)
         else:
-            await interaction.response.send_message(f'Your ticket is ready: {channel.mention}', ephemeral=True)
+            await interaction.response.send_message(msg, ephemeral=True)
 
     async def close_ticket(self, interaction: discord.Interaction) -> None:
         channel = interaction.channel
         if not isinstance(channel, discord.TextChannel):
-            FLOW.event_block(
-                'TICKET — CLOSE REJECTED',
-                [
-                    ('Reason', 'Not a server text channel (e.g. DMs or wrong context)'),
-                    ('Channel ref', fmt_ch(interaction.channel_id) if interaction.channel_id else '(?)'),
-                    ('Actor', fmt_member(interaction.user) if interaction.user else '?'),
-                ],
-            )
             await interaction.response.send_message('This is not a ticket channel.', ephemeral=True)
             return
 
         record = await self.store.delete_ticket(channel.id)
         if not record:
-            FLOW.event_block(
-                'TICKET — CLOSE IGNORED (NOT TRACKED)',
-                [
-                    ('Channel', fmt_channel_named(channel)),
-                    ('Actor', fmt_member(interaction.user) if interaction.user else '?'),
-                ],
-            )
-            FLOW.note(
-                'Why: tickets.json had no open record for this channel.',
-                'It may be a normal channel, or the store was reset while the channel stayed open.',
-            )
-            FLOW.rule()
             await interaction.response.send_message('This channel is not tracked as an open ticket.', ephemeral=True)
             return
 
-        closer = fmt_member(interaction.user) if interaction.user else '?'
-        FLOW.section('TICKET — CLOSING')
-        FLOW.kv('Channel', fmt_channel_named(channel))
-        FLOW.kv('Original owner', fmt_user(int(record['owner_id'])))
-        FLOW.kv('Ticket type', record.get('button_label', '?'))
-        FLOW.kv('Closed by', closer)
-        FLOW.kv('Delay seconds', self.runtime.ticket.close_delay_seconds)
-        FLOW.note(
-            'What happens: optional transcript embed, ephemeral countdown to the closer,',
-            'wait, then channel delete. Record already removed from tickets.json.',
-        )
-        FLOW.rule()
-
-        if self.runtime.ticket.transcript_channel_id:
-            transcript_channel = interaction.guild.get_channel(self.runtime.ticket.transcript_channel_id) if interaction.guild else None
+        if self.runtime.ticket.transcript_channel_id and interaction.guild:
+            transcript_channel = interaction.guild.get_channel(self.runtime.ticket.transcript_channel_id)
             if isinstance(transcript_channel, discord.TextChannel):
                 summary = discord.Embed(
-                    title='Ticket Closed',
+                    title='Ticket closed',
                     color=self.runtime.ticket.ticket_embed_color,
-                    description=f'Channel: {channel.mention}\nOwner: <@{record["owner_id"]}>\nType: {record["button_label"]}',
+                    description=f'Channel: {channel.mention}\nOwner: <@{record["owner_id"]}>\nType: {record.get("button_label", "?")}',
                 )
                 summary.set_footer(text=f'Closed by {interaction.user}')
                 await transcript_channel.send(embed=summary)
-                FLOW.event_block(
-                    'TRANSCRIPT — POSTED',
-                    [
-                        ('Log channel', fmt_channel_named(transcript_channel)),
-                        ('Ticket was', fmt_ch(channel.id)),
-                    ],
-                )
 
-        await interaction.response.send_message(
-            f'Ticket will close in {self.runtime.ticket.close_delay_seconds} seconds.', ephemeral=True
-        )
+        await interaction.response.send_message(f'Ticket will close in {self.runtime.ticket.close_delay_seconds} seconds.', ephemeral=True)
         await asyncio.sleep(self.runtime.ticket.close_delay_seconds)
         await channel.delete(reason=f'Ticket closed by {interaction.user}')
-        FLOW.event_block('TICKET — CHANNEL DELETED', [('Was', fmt_ch(channel.id))])
 
 
 runtime = ConfigLoader.load()
 bot = RSTicketBot(runtime)
 
 
-@bot.tree.command(name='ticketpanel', description='Post or refresh the cashout ticket panel.')
-async def ticketpanel(interaction: discord.Interaction) -> None:
+@bot.tree.command(name='cashout', description='Post or refresh the RS cashout panel.')
+async def cashout(interaction: discord.Interaction) -> None:
     assert isinstance(interaction.client, RSTicketBot)
     bot_ref = interaction.client
-    if not is_ticket_admin(interaction):
-        FLOW.event_block(
-            'COMMAND — /ticketpanel DENIED',
-            [
-                ('Actor', fmt_member(interaction.user)),
-                ('Channel', fmt_ch(interaction.channel_id)),
-            ],
-        )
-        FLOW.note('Why: user is not administrator and has no configured admin_role_ids match.')
-        FLOW.rule()
+    if not await is_ticket_admin(interaction):
         await interaction.response.send_message('You do not have permission to use this command.', ephemeral=True)
         return
     if not await bot_ref._ensure_panel_channel(interaction):
-        FLOW.event_block(
-            'COMMAND — /ticketpanel WRONG CHANNEL',
-            [
-                ('Actor', fmt_member(interaction.user)),
-                ('Current channel', fmt_ch(interaction.channel_id)),
-                ('Required panel', fmt_ch(bot_ref.runtime.ticket.panel_channel_id)),
-            ],
-        )
-        FLOW.note('Why: panel must only be posted from the configured panel channel (prevents stray panels).')
-        FLOW.rule()
         return
-
     panel_ch = interaction.channel
     if not isinstance(panel_ch, discord.TextChannel):
-        await interaction.response.send_message('Use /ticketpanel in a text channel.', ephemeral=True)
+        await interaction.response.send_message('Use /cashout in a text channel.', ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     await bot_ref.send_panel_card(panel_ch)
-    await interaction.followup.send('Ticket panel posted.', ephemeral=True)
-    FLOW.section('COMMAND — /ticketpanel POSTED')
-    FLOW.kv('Actor', fmt_member(interaction.user))
-    FLOW.kv('Channel', fmt_ch(interaction.channel_id))
-    FLOW.note(
-        'What was sent: embed + button row (persistent views) so users can open ticket flows.',
-    )
-    FLOW.rule()
+    await interaction.followup.send('Cashout panel posted.', ephemeral=True)
+
+
+@bot.tree.command(name='cashoutnew', description='Open a new cashout submission form.')
+async def cashoutnew(interaction: discord.Interaction) -> None:
+    assert isinstance(interaction.client, RSTicketBot)
+    button = interaction.client.get_button('request_submit')
+    if not button:
+        await interaction.response.send_message('Request/Submit is not configured right now.', ephemeral=True)
+        return
+    await interaction.client.launch_button_flow(interaction, button)
 
 
 @bot.tree.command(name='ticketadd', description='Add a member to the current ticket.')
 @app_commands.describe(member='Member to add to this ticket channel')
 async def ticketadd(interaction: discord.Interaction, member: discord.Member) -> None:
-    if not is_ticket_admin(interaction):
+    if not await is_ticket_admin(interaction):
         await interaction.response.send_message('You do not have permission to use this command.', ephemeral=True)
         return
     channel = interaction.channel
     if not isinstance(channel, discord.TextChannel):
         await interaction.response.send_message('Use this inside a ticket channel.', ephemeral=True)
         return
-    await channel.set_permissions(
-        member,
-        view_channel=True,
-        send_messages=True,
-        read_message_history=True,
-        attach_files=True,
-        embed_links=True,
-    )
+    await channel.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True)
     await interaction.response.send_message(f'Added {member.mention} to {channel.mention}.', ephemeral=True)
-    FLOW.event_block(
-        'COMMAND — /ticketadd',
-        [
-            ('Actor', fmt_member(interaction.user)),
-            ('Added member', fmt_member(member)),
-            ('Ticket channel', fmt_channel_named(channel)),
-        ],
-    )
 
 
 @bot.tree.command(name='ticketremove', description='Remove a member from the current ticket.')
 @app_commands.describe(member='Member to remove from this ticket channel')
 async def ticketremove(interaction: discord.Interaction, member: discord.Member) -> None:
-    if not is_ticket_admin(interaction):
+    if not await is_ticket_admin(interaction):
         await interaction.response.send_message('You do not have permission to use this command.', ephemeral=True)
         return
     channel = interaction.channel
@@ -981,14 +945,6 @@ async def ticketremove(interaction: discord.Interaction, member: discord.Member)
         return
     await channel.set_permissions(member, overwrite=None)
     await interaction.response.send_message(f'Removed {member.mention} from {channel.mention}.', ephemeral=True)
-    FLOW.event_block(
-        'COMMAND — /ticketremove',
-        [
-            ('Actor', fmt_member(interaction.user)),
-            ('Removed member', fmt_member(member)),
-            ('Ticket channel', fmt_channel_named(channel)),
-        ],
-    )
 
 
 @bot.tree.command(name='ticketclose', description='Close the current ticket channel.')
@@ -1005,7 +961,7 @@ if __name__ == '__main__':
     FLOW.title('RS CASHOUT TICKET BOT')
     FLOW.note(
         'Mode: live bot — connects to Discord and handles real interactions.',
-        'Logs below explain what the process is doing in plain language.',
+        'Primary member flow is Request/Submit -> personal sheet copy -> private ticket.',
     )
     FLOW.rule()
     FLOW.section('1) CONFIG LOADED (config.json + messages.json)')
@@ -1018,18 +974,5 @@ if __name__ == '__main__':
     FLOW.kv('Admin roles', admin_roles)
     FLOW.kv('Google Sheet', 'enabled' if bot.runtime.sheet.enabled else 'disabled')
     FLOW.kv('Ticket flows', ', '.join(f'{b.key} ({b.label})' for b in tk.buttons))
-    FLOW.explain(
-        'Panel channel: only place /ticketpanel is allowed to run.',
-        'Ticket category: new private ticket channels are created here.',
-        'Support roles: get pinged on new tickets when IDs are non-zero.',
-    )
-    if not tk.support_role_ids or all(x == 0 for x in tk.support_role_ids):
-        FLOW.warn_note(
-            'WARNING: support_role_ids look unset (0).',
-            'Staff will not be pinged on new tickets until real role IDs are in config.',
-        )
-    FLOW.rule()
-    FLOW.section('CONNECTING')
-    FLOW.kv('Next step', 'Open Discord gateway session and run setup_hook (slash sync) then on_ready.')
     FLOW.rule()
     bot.run(runtime.token)

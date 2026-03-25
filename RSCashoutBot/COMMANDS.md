@@ -2,17 +2,21 @@
 
 ## Slash Commands
 
-#### `/ticketpanel`
-- Description: Posts the RS cashout ticket panel in the configured panel channel.
+#### `/cashout`
+- Description: Posts or refreshes the RS cashout panel in the configured panel channel.
 - Admin Only: Yes
-- Usage: `/ticketpanel`
-- Notes: The command refuses to run outside the configured panel channel. By default the same panel is also sent automatically when the bot finishes logging in (`auto_post_panel_on_ready` in `config.json`).
+- Usage: `/cashout`
+
+#### `/cashoutnew`
+- Description: Opens a new Request/Submit flow for the member.
+- Admin Only: No
+- Usage: `/cashoutnew`
+- Notes: Good for repeat sellers who need another cashout sheet copy without hunting for the panel message.
 
 #### `/ticketclose`
 - Description: Closes the current ticket channel after the configured delay.
 - Admin Only: No
 - Usage: `/ticketclose`
-- Notes: Also available through the Close Ticket button inside each ticket.
 
 #### `/ticketadd`
 - Description: Adds a member to the current ticket channel.
@@ -25,6 +29,6 @@
 - Usage: `/ticketremove member:@user`
 
 ## Summary
-- Total Commands: 4
+- Total Commands: 5
 - Admin Commands: 3
-- Public Commands: 1
+- Public Commands: 2
