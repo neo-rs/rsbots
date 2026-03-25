@@ -3,6 +3,8 @@ import json
 import logging
 import re
 import sys
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -452,20 +454,40 @@ class DynamicModal(discord.ui.Modal):
         all_fields = list(self.button_def.modal.get('fields', [])) if self.button_def.modal else []
         chunks = chunk_modal_fields(all_fields)
         if self.step_index < len(chunks):
-            next_modal = DynamicModal(
-                self.bot_ref,
-                self.button_def,
-                f'{self.button_def.label} ({self.step_index + 1}/{len(chunks)})',
-                chunks[self.step_index],
+            # Discord may reject `send_modal()` when replying to a modal submit interaction.
+            # Safer approach: respond with an ephemeral "Continue" button; the button callback
+            # then opens the next modal.
+            nonce = self.bot_ref.create_modal_next_session(
+                button_key=self.button_def.key,
+                next_step_index=self.step_index + 1,
                 defaults=self.defaults,
                 prior_values=values,
-                step_index=self.step_index + 1,
-                total_steps=len(chunks),
             )
-            await interaction.response.send_modal(next_modal)
+            view = discord.ui.View(timeout=180)
+            view.add_item(ModalNextButton(nonce=nonce))
+            await interaction.response.send_message(
+                f'Next step ({self.step_index + 1}/{len(chunks)}). Click Continue.',
+                ephemeral=True,
+                view=view,
+            )
             return
 
         await self.bot_ref.create_ticket_from_request(interaction, self.button_def, values)
+
+
+class ModalNextButton(discord.ui.Button):
+    def __init__(self, *, nonce: str) -> None:
+        super().__init__(
+            label='Continue',
+            style=discord.ButtonStyle.primary,
+            custom_id=f'rs_ticket:modal_next:{nonce}',
+        )
+        self.nonce = nonce
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        bot = interaction.client
+        assert isinstance(bot, RSTicketBot)
+        await bot._open_modal_next_step(interaction, nonce=self.nonce)
 
 
 class CloseTicketView(discord.ui.View):
@@ -553,6 +575,75 @@ class RSTicketBot(commands.Bot):
         self.profile_store = ProfileStore(PROFILES_PATH)
         self.sheet_client = SheetClient(runtime.sheet)
         self._auto_panel_posted_once = False
+        # Used to bridge multi-step modal state across modal submit -> button click.
+        # Key is a nonce embedded in the Continue button custom_id.
+        self._modal_next_sessions: Dict[str, Dict[str, Any]] = {}
+
+    def create_modal_next_session(
+        self,
+        *,
+        button_key: str,
+        next_step_index: int,
+        defaults: Dict[str, str],
+        prior_values: Dict[str, str],
+        ttl_seconds: int = 180,
+    ) -> str:
+        nonce = uuid.uuid4().hex[:16]
+        self._modal_next_sessions[nonce] = {
+            'button_key': button_key,
+            'next_step_index': next_step_index,
+            'defaults': defaults,
+            'prior_values': prior_values,
+            'expires_at': time.time() + ttl_seconds,
+        }
+        return nonce
+
+    def consume_modal_next_session(self, nonce: str) -> Optional[Dict[str, Any]]:
+        sess = self._modal_next_sessions.pop(nonce, None)
+        if not sess:
+            return None
+        if float(sess.get('expires_at', 0)) < time.time():
+            return None
+        return sess
+
+    async def _open_modal_next_step(
+        self,
+        interaction: discord.Interaction,
+        *,
+        nonce: str,
+    ) -> None:
+        sess = self.consume_modal_next_session(nonce)
+        if not sess:
+            await interaction.response.send_message('This step expired. Please try again.', ephemeral=True)
+            return
+
+        button_key = sess['button_key']
+        button_def = self.get_button(button_key)
+        if button_def is None or not button_def.modal:
+            await interaction.response.send_message('This flow is no longer available.', ephemeral=True)
+            return
+
+        all_fields = list(button_def.modal.get('fields', [])) if button_def.modal else []
+        chunks = chunk_modal_fields(all_fields)
+        next_step_index = int(sess['next_step_index'])
+        if next_step_index < 1 or next_step_index > len(chunks):
+            await interaction.response.send_message('This step is invalid. Please try again.', ephemeral=True)
+            return
+
+        # DynamicModal expects `fields` to be chunks[step_index - 1]
+        fields = chunks[next_step_index - 1]
+        title = f'{button_def.label} ({next_step_index}/{len(chunks)})' if len(chunks) > 1 else button_def.label
+        modal = DynamicModal(
+            self,
+            button_def,
+            title,
+            fields,
+            defaults=sess.get('defaults') or {},
+            prior_values=sess.get('prior_values') or {},
+            step_index=next_step_index,
+            total_steps=len(chunks),
+        )
+        await interaction.response.send_modal(modal)
 
     def get_button(self, key: str) -> Optional[ButtonDefinition]:
         for button in self.runtime.ticket.buttons:

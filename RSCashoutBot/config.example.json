@@ -63,7 +63,7 @@
               "key": "size",
               "label": "Size",
               "placeholder": "Size or N/A",
-              "required": true,
+              "required": false,
               "paragraph": false,
               "max_length": 40
             },
