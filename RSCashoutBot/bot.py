@@ -975,21 +975,14 @@ class RSTicketBot(commands.Bot):
         embed.add_field(name='Opened By', value=user.mention, inline=True)
         embed.add_field(name='Ticket Type', value=button_def.label, inline=True)
 
-        if norm_form_values:
-            lines = [f'**{format_form_key(k)}:** {v}' for k, v in norm_form_values.items() if str(v).strip()]
-            if lines:
-                embed.add_field(name='Submitted Info', value='\n'.join(lines)[:1024], inline=False)
-
         if sheet_result.get('sheet_url'):
-            embed.add_field(name='Cashout Sheet Copy', value=sheet_result['sheet_url'][:1024], inline=False)
-            instructions = []
-            if sheet_result.get('sheet_name'):
-                instructions.append(f'**Sheet Name:** {sheet_result["sheet_name"]}')
-            instructions.append('Fill out the sheet fully, then send the completed link back in this ticket when ready.')
-            instructions.append('If you have multiple products, add additional rows in the same sheet (row 4+).')
-            if sheet_result.get('view_url') and sheet_result.get('view_url') != sheet_result.get('sheet_url'):
-                instructions.append(f'View link: {sheet_result["view_url"]}')
-            embed.add_field(name='Next Step', value='\n'.join(instructions)[:1024], inline=False)
+            view = sheet_result.get('view_url') or sheet_result['sheet_url']
+            next_step = (
+                'Fill out the sheet fully, then send the completed link back in this ticket when ready.\n'
+                'If you have multiple products, add additional rows in the same sheet (row 4+).\n'
+                f'View link: {view}'
+            )
+            embed.add_field(name='Next Step', value=next_step[:1024], inline=False)
         elif button_def.key == 'request_submit':
             embed.add_field(name='Next Step', value='Staff will review your details here. If sheet integration is enabled later, your personal cashout sheet link will also appear here.', inline=False)
 
@@ -1000,13 +993,7 @@ class RSTicketBot(commands.Bot):
         mentions = ' '.join(f'<@&{role_id}>' for role_id in self.runtime.ticket.support_role_ids if role_id)
         await channel.send(content=(f'{mentions} {user.mention}'.strip()), embed=embed, view=self.close_view)
 
-        if sheet_result.get('sheet_url'):
-            await channel.send(
-                f'Your personal cashout sheet is ready: {sheet_result["sheet_url"]}\n'
-                'Please complete it using the required format, then drop the filled-out link back in this ticket.\n'
-                'Multiple products? Add additional rows in the same sheet (row 4+).'
-            )
-        elif button_def.key == 'request_submit' and sheet_result.get('error'):
+        if button_def.key == 'request_submit' and sheet_result.get('error'):
             await channel.send('Note: the Google Sheet copy could not be created automatically. Staff can still handle this ticket here.')
 
         record = {
@@ -1058,8 +1045,6 @@ class RSTicketBot(commands.Bot):
                 LOG.warning('Could not DM user %s for cashout ticket', user.id)
 
         msg = f'Your ticket is ready: {channel.mention}'
-        if sheet_result.get('sheet_url'):
-            msg += f'\nSheet copy: {sheet_result["sheet_url"]}'
         if interaction.response.is_done():
             await interaction.followup.send(msg, ephemeral=True)
         else:
