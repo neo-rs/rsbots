@@ -431,7 +431,11 @@ class SheetClient:
         headers = {'Content-Type': 'application/json'}
         if self.config.auth_token:
             headers[self.config.auth_header_name] = self.config.auth_token
-        body = {'route': route, 'payload': payload}
+        # Apps Script Web Apps do not reliably expose request headers to `doPost(e)`.
+        # To support simple shared-secret auth, we also include the apiKey in the JSON body.
+        body: Dict[str, Any] = {'route': route, 'payload': payload}
+        if self.config.auth_token:
+            body['apiKey'] = self.config.auth_token
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(self.config.endpoint_url, json=body, headers=headers) as resp:
