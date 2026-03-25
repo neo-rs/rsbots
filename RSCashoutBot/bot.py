@@ -920,6 +920,12 @@ class RSTicketBot(commands.Bot):
             reason=f'{button_def.label} ticket opened by {user}',
         )
 
+        # Load profile early so we can reuse one sheet per member if configured.
+        profile = await self.profile_store.get_profile(user.id)
+        existing_sheet_file_id = ''
+        if button_def.key == 'request_submit':
+            existing_sheet_file_id = str(profile.get('cashout_sheet_file_id') or '').strip()
+
         # Normalize condition to match spreadsheet dropdown validation exactly.
         norm_form_values = dict(form_values)
         if 'condition' in norm_form_values:
@@ -938,6 +944,8 @@ class RSTicketBot(commands.Bot):
                 'created_at': discord.utils.utcnow().isoformat(),
                 'values': norm_form_values,
             }
+            if existing_sheet_file_id:
+                payload['existing_file_id'] = existing_sheet_file_id
             try:
                 sheet_result = await self.sheet_client.submit(button_def.sheet_route, payload)
             except Exception as exc:
@@ -951,6 +959,8 @@ class RSTicketBot(commands.Bot):
             profile_patch['last_request_values'] = norm_form_values
             if sheet_result.get('sheet_url'):
                 profile_patch['last_sheet_url'] = sheet_result['sheet_url']
+            if sheet_result.get('file_id'):
+                profile_patch['cashout_sheet_file_id'] = str(sheet_result['file_id'])
         await self.profile_store.upsert_profile(user.id, profile_patch)
 
         embed = discord.Embed(
@@ -972,6 +982,7 @@ class RSTicketBot(commands.Bot):
             if sheet_result.get('sheet_name'):
                 instructions.append(f'**Sheet Name:** {sheet_result["sheet_name"]}')
             instructions.append('Fill out the sheet fully, then send the completed link back in this ticket when ready.')
+            instructions.append('If you have multiple products, add additional rows in the same sheet (row 4+).')
             if sheet_result.get('view_url') and sheet_result.get('view_url') != sheet_result.get('sheet_url'):
                 instructions.append(f'View link: {sheet_result["view_url"]}')
             embed.add_field(name='Next Step', value='\n'.join(instructions)[:1024], inline=False)
@@ -988,7 +999,8 @@ class RSTicketBot(commands.Bot):
         if sheet_result.get('sheet_url'):
             await channel.send(
                 f'Your personal cashout sheet is ready: {sheet_result["sheet_url"]}\n'
-                'Please complete it using the required format, then drop the filled-out link back in this ticket.'
+                'Please complete it using the required format, then drop the filled-out link back in this ticket.\n'
+                'Multiple products? Add additional rows in the same sheet (row 4+).'
             )
         elif button_def.key == 'request_submit' and sheet_result.get('error'):
             await channel.send('Note: the Google Sheet copy could not be created automatically. Staff can still handle this ticket here.')
@@ -1028,6 +1040,7 @@ class RSTicketBot(commands.Bot):
                     )
                     dm_embed.description = dm_description
                     dm_embed.add_field(name='Sheet Link', value=str(sheet_url)[:1024], inline=False)
+                    dm_embed.add_field(name='Multiple products?', value='Add additional rows in the same sheet (row 4+).', inline=False)
                 else:
                     dm_description = (
                         'Your ticket is ready. The Google Sheets auto-copy failed, so staff will handle the sheet.'
