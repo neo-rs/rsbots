@@ -540,8 +540,13 @@ class RSTicketBot(commands.Bot):
     def __init__(self, runtime: RuntimeConfig) -> None:
         intents = discord.Intents.default()
         intents.guilds = True
-        intents.members = True
+        # Privileged intents (members/message_content) must be disabled unless
+        # they are enabled in the Discord Developer Portal. We fetch members
+        # on-demand via REST in `is_ticket_admin(...)`.
+        intents.members = False
         intents.messages = True
+        intents.message_content = False
+        intents.presences = False
         super().__init__(command_prefix='!', intents=intents)
         self.runtime = runtime
         self.store = TicketStore(TICKETS_PATH)
