@@ -207,7 +207,18 @@ class PromoSender:
         attachment_files_payload = await self.build_attachment_files_payload(campaign)
 
         self.logger.info("send_batch_start campaign_id=%s batch_size=%d pending_total=%d", campaign_id, len(batch), len(pending))
+        quarantine_tripped = False
         for recipient in batch:
+            # If an operator paused/cancelled mid-batch, stop promptly.
+            live_queue = self.queue_store.get()
+            if live_queue.get("campaign_id") == campaign_id and live_queue.get("status") != "running":
+                self.logger.info(
+                    "send_halted campaign_id=%s reason=queue_status_changed status=%s",
+                    campaign_id,
+                    live_queue.get("status"),
+                )
+                break
+
             user_id = int(recipient["user_id"])
             try:
                 user = await asyncio.wait_for(self.bot.fetch_user(user_id), timeout=timeout_seconds)
@@ -225,6 +236,27 @@ class PromoSender:
                     "error": ""
                 })
                 self.logger.info("send_ok campaign_id=%s %s", campaign_id, format_log_user_id(user_id))
+            except discord.Forbidden as exc:
+                # 20026 = Discord app quarantine (anti-spam). Stop future sends immediately.
+                code = getattr(exc, "code", None)
+                if code == 20026:
+                    quarantine_tripped = True
+                recipient["status"] = "failed"
+                recipient["sent_at"] = iso_now()
+                recipient["error"] = str(exc)
+                queue["failed_count"] = int(queue.get("failed_count", 0)) + 1
+                campaign["failed_count"] = int(campaign.get("failed_count", 0)) + 1
+                self.send_log_store.append({
+                    "campaign_id": campaign_id,
+                    "user_id": str(user_id),
+                    "status": "failed",
+                    "timestamp": iso_now(),
+                    "error": str(exc)
+                })
+                self.logger.warning("send_failed campaign_id=%s %s error=%s", campaign_id, format_log_user_id(user_id), exc)
+                if quarantine_tripped:
+                    self.logger.error("quarantine_detected campaign_id=%s code=20026 action=auto_pause", campaign_id)
+                    break
             except Exception as exc:
                 recipient["status"] = "failed"
                 recipient["sent_at"] = iso_now()
@@ -242,19 +274,33 @@ class PromoSender:
             if dm_delay_hi > 0:
                 await asyncio.sleep(random.uniform(max(0.0, dm_delay_lo), dm_delay_hi))
 
+        # If quarantine hit, flip queue/campaign to paused and clear next run.
+        if quarantine_tripped:
+            queue["status"] = "paused"
+            queue["next_run_at"] = ""
+            campaign["status"] = "paused"
+
         queue["recipients"] = recipient_records
         queue["pending_count"] = len([item for item in recipient_records if item.get("status") == "pending"])
         queue["last_run_at"] = iso_now()
-        if queue["pending_count"] > 0:
+        if queue.get("status") == "running" and queue["pending_count"] > 0:
             queue["next_run_at"] = next_run_iso(int(campaign["batch_interval_minutes"]))
             self.logger.info("send_batch_done campaign_id=%s next_batch_at=%s pending=%d", campaign_id, queue["next_run_at"], queue["pending_count"])
         else:
             queue["next_run_at"] = ""
-            queue["status"] = "completed"
-            campaign["status"] = "completed"
-            campaign["completed_at"] = iso_now()
-            self.logger.info("campaign_completed campaign_id=%s sent=%s failed=%s", campaign_id, queue.get("sent_count", 0), queue.get("failed_count", 0))
-            await self._log_to_channel(self.messages.get("log_completed", "Campaign completed."), campaign)
+            if queue["pending_count"] <= 0:
+                queue["status"] = "completed"
+                campaign["status"] = "completed"
+                campaign["completed_at"] = iso_now()
+                self.logger.info("campaign_completed campaign_id=%s sent=%s failed=%s", campaign_id, queue.get("sent_count", 0), queue.get("failed_count", 0))
+                await self._log_to_channel(self.messages.get("log_completed", "Campaign completed."), campaign)
+
+        # Operator pause/cancel must win over in-memory queue snapshot.
+        live_queue = self.queue_store.get()
+        if live_queue.get("campaign_id") == campaign_id and live_queue.get("status") != queue.get("status"):
+            queue["status"] = live_queue.get("status")
+            if queue["status"] != "running":
+                queue["next_run_at"] = ""
 
         self.queue_store.save(queue)
         self.campaign_store.upsert(campaign)
