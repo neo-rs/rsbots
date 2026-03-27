@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import discord
 from discord import app_commands
 
-from utils import build_cta_view, build_dm_embeds, format_log_user_id, has_any_allowed_role, human_rate, iso_now
+from utils import build_cta_view, build_dm_embeds, format_log_user_id, has_any_allowed_role, human_rate, iso_now, normalize_discord_image_url
 
 
 def _session_dict_from_campaign(campaign: dict[str, Any]) -> dict[str, Any]:
@@ -259,7 +260,7 @@ class SettingsModal(discord.ui.Modal, title="Edit Campaign Settings"):
 
         self.session["batch_size"] = batch_size
         self.session["batch_interval_minutes"] = interval
-        self.session["banner_url"] = str(self.banner_url.value).strip()
+        self.session["banner_url"] = normalize_discord_image_url(str(self.banner_url.value).strip())
 
         if self.status_campaign_id:
             campaign = self.bot_ref.campaign_store.get(self.status_campaign_id)
@@ -344,7 +345,30 @@ class LaunchConfirmView(discord.ui.View):
         }
         self.bot_ref.queue_store.save(queue_payload)
         self.bot_ref.session_store.delete(interaction.guild_id, interaction.user.id)
-        self.bot_ref.logger.info("campaign_started campaign_id=%s %s Guild-ID=%s recipients=%d", campaign["campaign_id"], format_log_user_id(interaction.user.id), interaction.guild_id, len(self.recipients))
+        self.bot_ref.explain_log.flow(
+            name="RSPromoBot / Start Campaign",
+            message_info=[
+                f"command=promo_start_campaign {format_log_user_id(interaction.user.id)}",
+                f"Guild-ID={interaction.guild_id}",
+                f"campaign_id={campaign['campaign_id']}",
+            ],
+            eli5_bottom_line=f"Campaign launched to {len(self.recipients)} recipients.",
+            eli5_points=[
+                "Bot froze current recipient snapshot.",
+                "Queue status set to running.",
+                "Sender loop started.",
+            ],
+            human_summary="Campaign is active and queued for delivery batches.",
+            human_yes=[
+                "user_can_manage=True",
+                "session validation passed",
+                "recipient snapshot created",
+            ],
+            human_no=[],
+            decision_tag="SINGLE ROUTE",
+            destination="campaign_queue",
+            destination_id=campaign["campaign_id"],
+        )
         self.bot_ref.sender.start()
         status_embed = self.bot_ref.build_status_embed(interaction.guild, campaign, queue_payload)
         status_view = CampaignControlView(self.bot_ref, campaign["campaign_id"])
@@ -505,17 +529,106 @@ class PromoBuilderView(discord.ui.View):
     @discord.ui.button(label="Preview", style=discord.ButtonStyle.success)
     async def preview(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if not self.bot_ref.user_can_manage(interaction):
+            self.bot_ref.explain_log.flow(
+                name="RSPromoBot / Preview",
+                message_info=[
+                    f"command=promo_preview {format_log_user_id(interaction.user.id)}",
+                    f"Guild-ID={interaction.guild_id}",
+                ],
+                eli5_bottom_line="Preview blocked: user lacks permission.",
+                eli5_points=[
+                    "Bot saw a preview request.",
+                    "Permission check failed.",
+                    "No preview was sent.",
+                ],
+                human_summary="Blocked at permission gate.",
+                human_yes=[],
+                human_no=["user_can_manage=False"],
+                decision_tag="BLOCKED / NO ROUTE",
+                destination="none",
+                destination_id="-",
+                failure_hints=["Grant launcher/admin role before using Preview."],
+                dry_send_preview="capture only - not posted to Discord",
+            )
             await interaction.response.send_message(self.bot_ref.messages["permission_error"], ephemeral=True)
             return
         error = self.bot_ref.validate_session(self.session)
         if error:
+            self.bot_ref.explain_log.flow(
+                name="RSPromoBot / Preview",
+                message_info=[
+                    f"command=promo_preview {format_log_user_id(interaction.user.id)}",
+                    f"Guild-ID={interaction.guild_id}",
+                ],
+                eli5_bottom_line="Preview blocked: campaign draft failed validation.",
+                eli5_points=[
+                    "Bot saw a preview request.",
+                    f"Validation failed: {error}",
+                    "No preview was sent.",
+                ],
+                human_summary="Required campaign fields/URLs were not valid.",
+                human_yes=[],
+                human_no=[error],
+                decision_tag="BLOCKED / NO ROUTE",
+                destination="none",
+                destination_id="-",
+                failure_hints=[error],
+                dry_send_preview="capture only - not posted to Discord",
+            )
             await interaction.response.send_message(error, ephemeral=True)
             return
         color = int(self.bot_ref.config["embed_color"])
         embeds = build_dm_embeds(self.session, color)
         preview_content = self.bot_ref.messages.get("preview_label", "**Preview:**")
         preview_view = self.bot_ref.sender._build_send_view(self.session)
-        await interaction.response.send_message(content=preview_content, embeds=embeds, view=preview_view, ephemeral=True)
+        try:
+            await interaction.response.send_message(content=preview_content, embeds=embeds, view=preview_view, ephemeral=True)
+        except discord.HTTPException as exc:
+            self.bot_ref.explain_log.flow(
+                name="RSPromoBot / Preview",
+                message_info=[
+                    f"command=promo_preview {format_log_user_id(interaction.user.id)}",
+                    f"Guild-ID={interaction.guild_id}",
+                ],
+                eli5_bottom_line="Preview failed while Discord validated message payload.",
+                eli5_points=[
+                    "Bot assembled the preview embed.",
+                    "Discord rejected the payload format.",
+                    "Nothing was posted.",
+                ],
+                human_summary="Payload was rejected by Discord API.",
+                human_yes=["user_can_manage=True", "session validation passed"],
+                human_no=[f"discord_http_exception={exc}"],
+                decision_tag="BLOCKED / NO ROUTE",
+                destination="ephemeral preview",
+                destination_id=str(interaction.user.id),
+                failure_hints=["Check banner and CTA URLs for malformed values."],
+                dry_send_preview="capture only - not posted to Discord",
+                technical_trace={"exception": str(exc), "banner_url": self.session.get("banner_url", ""), "cta_url": self.session.get("cta_url", "")},
+                level=logging.ERROR,
+            )
+            await interaction.response.send_message(f"Preview failed: {exc}", ephemeral=True)
+            return
+        self.bot_ref.explain_log.flow(
+            name="RSPromoBot / Preview",
+            message_info=[
+                f"command=promo_preview {format_log_user_id(interaction.user.id)}",
+                f"Guild-ID={interaction.guild_id}",
+            ],
+            eli5_bottom_line="Preview generated successfully.",
+            eli5_points=[
+                "Bot validated campaign input.",
+                "Built embed and optional CTA/opt-out buttons.",
+                "Preview shown only to the requester.",
+            ],
+            human_summary="Dry preview path succeeded.",
+            human_yes=["user_can_manage=True", "session validation passed"],
+            human_no=[],
+            decision_tag="DRY SEND PREVIEW",
+            destination="ephemeral preview",
+            destination_id=str(interaction.user.id),
+            dry_send_preview="capture only - not posted to Discord",
+        )
 
     @discord.ui.button(label="Test Send", style=discord.ButtonStyle.primary)
     async def test_send(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -524,6 +637,26 @@ class PromoBuilderView(discord.ui.View):
             return
         error = self.bot_ref.validate_session(self.session)
         if error:
+            self.bot_ref.explain_log.flow(
+                name="RSPromoBot / Test Send",
+                message_info=[
+                    f"command=promo_test_send {format_log_user_id(interaction.user.id)}",
+                    f"Guild-ID={interaction.guild_id}",
+                ],
+                eli5_bottom_line="Test send blocked: campaign draft failed validation.",
+                eli5_points=[
+                    "Bot saw a test-send request.",
+                    f"Validation failed: {error}",
+                    "No DM was sent.",
+                ],
+                human_summary="Required campaign fields/URLs were not valid.",
+                human_yes=[],
+                human_no=[error],
+                decision_tag="BLOCKED / NO ROUTE",
+                destination="none",
+                destination_id="-",
+                failure_hints=[error],
+            )
             await interaction.response.send_message(error, ephemeral=True)
             return
         try:
@@ -532,7 +665,48 @@ class PromoBuilderView(discord.ui.View):
             view = self.bot_ref.sender._build_send_view(self.session)
             await interaction.user.send(embeds=embeds, view=view)
             await interaction.response.send_message(self.bot_ref.messages["test_send_success"], ephemeral=True)
+            self.bot_ref.explain_log.flow(
+                name="RSPromoBot / Test Send",
+                message_info=[
+                    f"command=promo_test_send {format_log_user_id(interaction.user.id)}",
+                    f"Guild-ID={interaction.guild_id}",
+                ],
+                eli5_bottom_line="Test DM sent to requester.",
+                eli5_points=[
+                    "Bot validated campaign input.",
+                    "Built DM embed and controls.",
+                    "Delivered test DM to requesting user only.",
+                ],
+                human_summary="Live test-send path succeeded.",
+                human_yes=["user_can_manage=True", "session validation passed"],
+                human_no=[],
+                decision_tag="SINGLE ROUTE",
+                destination="requester_dm",
+                destination_id=str(interaction.user.id),
+            )
         except Exception as exc:
+            self.bot_ref.explain_log.flow(
+                name="RSPromoBot / Test Send",
+                message_info=[
+                    f"command=promo_test_send {format_log_user_id(interaction.user.id)}",
+                    f"Guild-ID={interaction.guild_id}",
+                ],
+                eli5_bottom_line="Test DM failed before delivery.",
+                eli5_points=[
+                    "Bot attempted to send test DM.",
+                    f"Send failed with error: {exc}",
+                    "No test DM was delivered.",
+                ],
+                human_summary="DM delivery failed for requesting user.",
+                human_yes=["user_can_manage=True", "session validation passed"],
+                human_no=[str(exc)],
+                decision_tag="BLOCKED / NO ROUTE",
+                destination="requester_dm",
+                destination_id=str(interaction.user.id),
+                failure_hints=["Verify user DMs are open and embed URLs are valid."],
+                technical_trace={"exception": str(exc), "banner_url": self.session.get("banner_url", ""), "cta_url": self.session.get("cta_url", "")},
+                level=logging.ERROR,
+            )
             await interaction.response.send_message(f"{self.bot_ref.messages['test_send_failed']} Error: {exc}", ephemeral=True)
 
     @discord.ui.button(label="Start Campaign", style=discord.ButtonStyle.danger)

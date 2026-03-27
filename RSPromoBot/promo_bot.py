@@ -12,14 +12,14 @@ import os
 
 from config_loader import load_config, load_json_file
 from promo_campaigns import PromoCampaignStore
-from promo_logging import configure_logging
+from promo_logging import ExplainableLog, configure_logging
 from promo_queue import PromoQueueStore
 from promo_sender import PromoSender
 from promo_sessions import PromoSessionStore
 from promo_views import CampaignControlView, CampaignReuseView, PromoBuilderView
 from send_log_store import SendLogStore
 from storage import JSONStorage
-from utils import estimated_duration_str, format_log_user_id, has_any_allowed_role, human_rate, iso_now, parse_iso, utc_now
+from utils import estimated_duration_str, format_log_user_id, has_any_allowed_role, human_rate, is_well_formed_http_url, iso_now, normalize_discord_image_url, parse_iso, utc_now
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -41,6 +41,10 @@ class PromoBot(discord.Client):
         self.campaign_store = PromoCampaignStore(self.storage)
         self.send_log_store = SendLogStore(self.storage)
         self.logger = configure_logging(BASE_DIR / self.config["logs_dir"])
+        self.explain_log = ExplainableLog(
+            self.logger,
+            show_technical=bool(self.config.get("show_technical_logs", False)),
+        )
         self.sender = PromoSender(
             self,
             self.config,
@@ -257,6 +261,18 @@ class PromoBot(discord.Client):
             return self.messages["validation_missing_campaign_name"]
         if not session.get("message_body", "").strip():
             return self.messages["validation_missing_message"]
+        banner_url = normalize_discord_image_url(session.get("banner_url"))
+        session["banner_url"] = banner_url
+        if banner_url and not is_well_formed_http_url(banner_url):
+            return "Banner Image URL must be a valid http/https URL."
+        cta_label = (session.get("cta_label") or "").strip()
+        cta_url = (session.get("cta_url") or "").strip()
+        if cta_label and not cta_url:
+            return "CTA URL is required when CTA Button Label is set."
+        if cta_url and not cta_label:
+            return "CTA Button Label is required when CTA URL is set."
+        if cta_url and not is_well_formed_http_url(cta_url):
+            return "CTA URL must be a valid http/https URL."
         return None
 
     def resolve_recipient_ids(self, guild: discord.Guild, session: dict[str, Any]) -> list[int]:

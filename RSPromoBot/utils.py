@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
+from urllib.parse import urlparse, urlunparse
 
 import discord
 
@@ -85,9 +86,32 @@ def build_cta_view(label: str | None, url: str | None) -> discord.ui.View | None
     return view
 
 
+def is_well_formed_http_url(value: str | None) -> bool:
+    raw = (value or "").strip()
+    if not raw:
+        return False
+    parsed = urlparse(raw)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def normalize_discord_image_url(value: str | None) -> str:
+    """Normalize Discord CDN/media image URLs to stable embed-safe form."""
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return raw
+    host = parsed.netloc.lower()
+    if host == "media.discordapp.net":
+        # media.discordapp.net links often include expiring query params.
+        return urlunparse((parsed.scheme, "cdn.discordapp.com", parsed.path, "", "", ""))
+    return raw
+
+
 def build_dm_embeds(data: dict[str, Any], embed_color: int) -> list[discord.Embed]:
     """Build a single embed (banner + body) with one color so banner and message align. Campaign name is not shown in output."""
-    banner_url = (data.get("banner_url") or "").strip()
+    banner_url = normalize_discord_image_url(data.get("banner_url"))
     description = (data.get("message_body") or "").strip()
 
     # Single embed: one color, image on top then description, no title (campaign name stays internal only)
