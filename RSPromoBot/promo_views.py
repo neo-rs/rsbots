@@ -228,6 +228,8 @@ class SettingsModal(discord.ui.Modal, title="Edit Campaign Settings"):
         self.banner_url = discord.ui.TextInput(
             label="Banner Image URL(s) (optional)",
             default=session.get("banner_url", "") or (self.bot_ref.config.get("default_banner_url") or ""),
+            style=discord.TextStyle.paragraph,
+            placeholder="Up to 2 URLs. Put one URL per line.",
             max_length=500,
             required=False,
         )
