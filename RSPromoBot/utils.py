@@ -126,6 +126,16 @@ def parse_banner_urls(value: str | None, max_urls: int = 2) -> list[str]:
     return urls
 
 
+def parse_attachment_urls(value: str | None, max_urls: int = 2) -> list[str]:
+    """Parse up to max_urls attachment-style image links."""
+    return parse_banner_urls(value, max_urls=max_urls)
+
+
+def build_attachment_content(value: str | None, max_urls: int = 2) -> str:
+    urls = parse_attachment_urls(value, max_urls=max_urls)
+    return "\n".join(urls)
+
+
 def build_dm_embeds(data: dict[str, Any], embed_color: int) -> list[discord.Embed]:
     """Build embeds for body + up to two banner images."""
     banner_urls = parse_banner_urls(data.get("banner_url"), max_urls=2)

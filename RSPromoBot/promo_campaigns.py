@@ -40,6 +40,7 @@ class PromoCampaignStore:
             "message_body": session["message_body"],
             "embed_title": session.get("embed_title", ""),
             "banner_url": session.get("banner_url", ""),
+            "attachment_urls": session.get("attachment_urls", ""),
             "cta_label": session.get("cta_label", ""),
             "cta_url": session.get("cta_url", ""),
             "batch_size": int(session["batch_size"]),

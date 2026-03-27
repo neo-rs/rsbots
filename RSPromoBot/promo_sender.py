@@ -9,7 +9,7 @@ import discord
 from promo_campaigns import PromoCampaignStore
 from promo_queue import PromoQueueStore
 from send_log_store import SendLogStore
-from utils import build_dm_embeds, format_log_user_id, iso_now, next_run_iso, utc_now
+from utils import build_attachment_content, build_dm_embeds, format_log_user_id, iso_now, next_run_iso, utc_now
 
 
 class OptOutButton(discord.ui.Button):
@@ -164,13 +164,17 @@ class PromoSender:
         send_view = self._build_send_view(campaign)
         embed_color = int(self.config["embed_color"])
         dm_embeds = build_dm_embeds(campaign, embed_color)
+        attachment_content = build_attachment_content(campaign.get("attachment_urls"), max_urls=2)
 
         self.logger.info("send_batch_start campaign_id=%s batch_size=%d pending_total=%d", campaign_id, len(batch), len(pending))
         for recipient in batch:
             user_id = int(recipient["user_id"])
             try:
                 user = await asyncio.wait_for(self.bot.fetch_user(user_id), timeout=timeout_seconds)
-                await asyncio.wait_for(user.send(embeds=dm_embeds, view=send_view), timeout=timeout_seconds)
+                await asyncio.wait_for(
+                    user.send(content=attachment_content or None, embeds=dm_embeds, view=send_view),
+                    timeout=timeout_seconds,
+                )
                 recipient["status"] = "sent"
                 recipient["sent_at"] = iso_now()
                 queue["sent_count"] = int(queue.get("sent_count", 0)) + 1

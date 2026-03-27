@@ -19,7 +19,7 @@ from promo_sessions import PromoSessionStore
 from promo_views import CampaignControlView, CampaignReuseView, PromoBuilderView
 from send_log_store import SendLogStore
 from storage import JSONStorage
-from utils import estimated_duration_str, format_log_user_id, has_any_allowed_role, human_rate, is_well_formed_http_url, iso_now, parse_banner_urls, parse_iso, utc_now
+from utils import build_attachment_content, estimated_duration_str, format_log_user_id, has_any_allowed_role, human_rate, is_well_formed_http_url, iso_now, parse_attachment_urls, parse_banner_urls, parse_iso, utc_now
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -268,6 +268,13 @@ class PromoBot(discord.Client):
             if not is_well_formed_http_url(banner_url):
                 return "Banner Image URL must be a valid http/https URL."
         session["banner_url"] = "\n".join(banner_urls)
+        attachment_urls = parse_attachment_urls(session.get("attachment_urls"), max_urls=2)
+        if (session.get("attachment_urls") or "").strip() and not attachment_urls:
+            return "Attachment Image URL(s) must be valid http/https URL(s)."
+        for attachment_url in attachment_urls:
+            if not is_well_formed_http_url(attachment_url):
+                return "Attachment Image URL(s) must be valid http/https URL(s)."
+        session["attachment_urls"] = "\n".join(attachment_urls)
         cta_label = (session.get("cta_label") or "").strip()
         cta_url = (session.get("cta_url") or "").strip()
         if cta_label and not cta_url:
@@ -318,6 +325,10 @@ class PromoBot(discord.Client):
         if len(banner_url) > 60:
             banner_url = banner_url[:57] + "..."
         embed.add_field(name="Banner URL", value=banner_url, inline=False)
+        attachment_urls = build_attachment_content(session.get("attachment_urls"), max_urls=2) or self.messages["panel_not_selected"]
+        if len(attachment_urls) > 120:
+            attachment_urls = attachment_urls[:117] + "..."
+        embed.add_field(name="Attachment URL(s)", value=attachment_urls, inline=False)
         cta_label = session.get("cta_label", "").strip() or "None"
         cta_url = session.get("cta_url", "").strip() or "None"
         embed.add_field(name="CTA Button", value=f"Label: {cta_label}\nURL: {cta_url}", inline=False)

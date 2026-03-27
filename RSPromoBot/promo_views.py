@@ -6,7 +6,7 @@ from typing import Any
 import discord
 from discord import app_commands
 
-from utils import build_cta_view, build_dm_embeds, format_log_user_id, has_any_allowed_role, human_rate, iso_now, parse_banner_urls
+from utils import build_attachment_content, build_cta_view, build_dm_embeds, format_log_user_id, has_any_allowed_role, human_rate, iso_now, parse_attachment_urls, parse_banner_urls
 
 
 def _session_dict_from_campaign(campaign: dict[str, Any]) -> dict[str, Any]:
@@ -17,6 +17,7 @@ def _session_dict_from_campaign(campaign: dict[str, Any]) -> dict[str, Any]:
         "cta_label": campaign.get("cta_label", ""),
         "cta_url": campaign.get("cta_url", ""),
         "banner_url": campaign.get("banner_url", ""),
+        "attachment_urls": campaign.get("attachment_urls", ""),
         "batch_size": int(campaign.get("batch_size", 5)),
         "batch_interval_minutes": int(campaign.get("batch_interval_minutes", 5)),
     }
@@ -55,6 +56,7 @@ class CampaignReuseSelect(discord.ui.Select):
             "message_body": campaign.get("message_body", ""),
             "embed_title": campaign.get("embed_title", ""),
             "banner_url": campaign.get("banner_url", ""),
+            "attachment_urls": campaign.get("attachment_urls", ""),
             "cta_label": campaign.get("cta_label", ""),
             "cta_url": campaign.get("cta_url", ""),
             "batch_size": int(campaign.get("batch_size", self.bot_ref.config["default_batch_size"])),
@@ -233,9 +235,18 @@ class SettingsModal(discord.ui.Modal, title="Edit Campaign Settings"):
             max_length=500,
             required=False,
         )
+        self.attachment_urls = discord.ui.TextInput(
+            label="Attachment Image URL(s) (optional)",
+            default=session.get("attachment_urls", ""),
+            style=discord.TextStyle.paragraph,
+            placeholder="Up to 2 URLs. Put one URL per line.",
+            max_length=500,
+            required=False,
+        )
         self.add_item(self.batch_size)
         self.add_item(self.batch_interval_minutes)
         self.add_item(self.banner_url)
+        self.add_item(self.attachment_urls)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         try:
@@ -264,6 +275,8 @@ class SettingsModal(discord.ui.Modal, title="Edit Campaign Settings"):
         self.session["batch_interval_minutes"] = interval
         banner_urls = parse_banner_urls(str(self.banner_url.value).strip(), max_urls=2)
         self.session["banner_url"] = "\n".join(banner_urls)
+        attachment_urls = parse_attachment_urls(str(self.attachment_urls.value).strip(), max_urls=2)
+        self.session["attachment_urls"] = "\n".join(attachment_urls)
 
         if self.status_campaign_id:
             campaign = self.bot_ref.campaign_store.get(self.status_campaign_id)
@@ -277,6 +290,7 @@ class SettingsModal(discord.ui.Modal, title="Edit Campaign Settings"):
             campaign["batch_size"] = batch_size
             campaign["batch_interval_minutes"] = interval
             campaign["banner_url"] = self.session["banner_url"]
+            campaign["attachment_urls"] = self.session["attachment_urls"]
             self.bot_ref.campaign_store.upsert(campaign)
             embed = self.bot_ref.build_status_embed(interaction.guild, campaign, queue)
             await interaction.response.edit_message(embed=embed, view=CampaignControlView(self.bot_ref, self.status_campaign_id))
@@ -583,6 +597,9 @@ class PromoBuilderView(discord.ui.View):
         color = int(self.bot_ref.config["embed_color"])
         embeds = build_dm_embeds(self.session, color)
         preview_content = self.bot_ref.messages.get("preview_label", "**Preview:**")
+        attachment_content = build_attachment_content(self.session.get("attachment_urls"), max_urls=2)
+        if attachment_content:
+            preview_content = f"{preview_content}\n{attachment_content}"
         preview_view = self.bot_ref.sender._build_send_view(self.session)
         try:
             await interaction.response.send_message(content=preview_content, embeds=embeds, view=preview_view, ephemeral=True)
@@ -665,8 +682,9 @@ class PromoBuilderView(discord.ui.View):
         try:
             color = int(self.bot_ref.config["embed_color"])
             embeds = build_dm_embeds(self.session, color)
+            attachment_content = build_attachment_content(self.session.get("attachment_urls"), max_urls=2)
             view = self.bot_ref.sender._build_send_view(self.session)
-            await interaction.user.send(embeds=embeds, view=view)
+            await interaction.user.send(content=attachment_content or None, embeds=embeds, view=view)
             await interaction.response.send_message(self.bot_ref.messages["test_send_success"], ephemeral=True)
             self.bot_ref.explain_log.flow(
                 name="RSPromoBot / Test Send",

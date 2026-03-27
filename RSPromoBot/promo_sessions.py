@@ -43,6 +43,7 @@ class PromoSessionStore:
             "message_body": "",
             "embed_title": "",
             "banner_url": (config.get("default_banner_url") or "").strip(),
+            "attachment_urls": "",
             "cta_label": "",
             "cta_url": "",
             "batch_size": int(config["default_batch_size"]),
