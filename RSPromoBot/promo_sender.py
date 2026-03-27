@@ -295,12 +295,19 @@ class PromoSender:
                 self.logger.info("campaign_completed campaign_id=%s sent=%s failed=%s", campaign_id, queue.get("sent_count", 0), queue.get("failed_count", 0))
                 await self._log_to_channel(self.messages.get("log_completed", "Campaign completed."), campaign)
 
-        # Operator pause/cancel must win over in-memory queue snapshot.
+        # Status reconciliation:
+        # - quarantine-triggered auto_pause must be sticky (never revert to running)
+        # - operator non-running statuses (paused/cancelled/completed/idle) should win
         live_queue = self.queue_store.get()
-        if live_queue.get("campaign_id") == campaign_id and live_queue.get("status") != queue.get("status"):
-            queue["status"] = live_queue.get("status")
-            if queue["status"] != "running":
+        if live_queue.get("campaign_id") == campaign_id:
+            live_status = live_queue.get("status")
+            if quarantine_tripped:
+                queue["status"] = "paused"
                 queue["next_run_at"] = ""
+            elif live_status in {"paused", "cancelled", "completed", "idle"} and live_status != queue.get("status"):
+                queue["status"] = live_status
+                if queue["status"] != "running":
+                    queue["next_run_at"] = ""
 
         self.queue_store.save(queue)
         self.campaign_store.upsert(campaign)
