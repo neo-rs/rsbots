@@ -312,6 +312,12 @@ class PromoSender:
         self.queue_store.save(queue)
         self.campaign_store.upsert(campaign)
 
+        if quarantine_tripped:
+            await self._log_to_channel(
+                "Campaign auto-paused: Discord app quarantine detected (error 20026).",
+                campaign,
+            )
+
         try:
             await self.bot.update_live_status(campaign_id)
         except Exception as exc:
