@@ -597,12 +597,11 @@ class PromoBuilderView(discord.ui.View):
         color = int(self.bot_ref.config["embed_color"])
         embeds = build_dm_embeds(self.session, color)
         preview_content = self.bot_ref.messages.get("preview_label", "**Preview:**")
-        attachment_embeds, attachment_files_payload = await self.bot_ref.sender.build_attachment_embed_payload(self.session)
-        all_embeds = embeds + attachment_embeds
+        attachment_files_payload = await self.bot_ref.sender.build_attachment_files_payload(self.session)
         files = self.bot_ref.sender.build_discord_files(attachment_files_payload)
         preview_view = self.bot_ref.sender._build_send_view(self.session)
         try:
-            await interaction.response.send_message(content=preview_content, embeds=all_embeds, files=files, view=preview_view, ephemeral=True)
+            await interaction.response.send_message(content=preview_content, embeds=embeds, files=files, view=preview_view, ephemeral=True)
         except discord.HTTPException as exc:
             self.bot_ref.explain_log.flow(
                 name="RSPromoBot / Preview",
@@ -682,11 +681,10 @@ class PromoBuilderView(discord.ui.View):
         try:
             color = int(self.bot_ref.config["embed_color"])
             embeds = build_dm_embeds(self.session, color)
-            attachment_embeds, attachment_files_payload = await self.bot_ref.sender.build_attachment_embed_payload(self.session)
-            all_embeds = embeds + attachment_embeds
+            attachment_files_payload = await self.bot_ref.sender.build_attachment_files_payload(self.session)
             files = self.bot_ref.sender.build_discord_files(attachment_files_payload)
             view = self.bot_ref.sender._build_send_view(self.session)
-            await interaction.user.send(embeds=all_embeds, files=files, view=view)
+            await interaction.user.send(embeds=embeds, files=files, view=view)
             await interaction.response.send_message(self.bot_ref.messages["test_send_success"], ephemeral=True)
             self.bot_ref.explain_log.flow(
                 name="RSPromoBot / Test Send",

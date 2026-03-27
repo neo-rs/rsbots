@@ -107,17 +107,13 @@ class PromoSender:
         self.logger = logger
         self._loop_task: asyncio.Task | None = None
 
-    async def build_attachment_embed_payload(
-        self, campaign: dict[str, Any]
-    ) -> tuple[list[discord.Embed], list[tuple[str, bytes]]]:
+    async def build_attachment_files_payload(self, campaign: dict[str, Any]) -> list[tuple[str, bytes]]:
         attachment_urls = parse_attachment_urls(campaign.get("attachment_urls"), max_urls=2)
         if not attachment_urls:
-            return [], []
+            return []
 
-        embeds: list[discord.Embed] = []
         files_payload: list[tuple[str, bytes]] = []
         timeout_seconds = max(5, int(self.config.get("send_timeout_seconds", 30)))
-        embed_color = int(self.config["embed_color"])
 
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_seconds)) as session:
             for index, url in enumerate(attachment_urls, start=1):
@@ -141,11 +137,8 @@ class PromoSender:
                 file_name = f"promo_attachment_{index}_{file_name}"
 
                 files_payload.append((file_name, payload))
-                image_embed = discord.Embed(color=embed_color)
-                image_embed.set_image(url=f"attachment://{file_name}")
-                embeds.append(image_embed)
 
-        return embeds, files_payload
+        return files_payload
 
     @staticmethod
     def build_discord_files(files_payload: list[tuple[str, bytes]]) -> list[discord.File]:
@@ -211,8 +204,7 @@ class PromoSender:
         send_view = self._build_send_view(campaign)
         embed_color = int(self.config["embed_color"])
         dm_embeds = build_dm_embeds(campaign, embed_color)
-        attachment_embeds, attachment_files_payload = await self.build_attachment_embed_payload(campaign)
-        all_embeds = dm_embeds + attachment_embeds
+        attachment_files_payload = await self.build_attachment_files_payload(campaign)
 
         self.logger.info("send_batch_start campaign_id=%s batch_size=%d pending_total=%d", campaign_id, len(batch), len(pending))
         for recipient in batch:
@@ -220,7 +212,7 @@ class PromoSender:
             try:
                 user = await asyncio.wait_for(self.bot.fetch_user(user_id), timeout=timeout_seconds)
                 files = self.build_discord_files(attachment_files_payload)
-                await asyncio.wait_for(user.send(embeds=all_embeds, files=files, view=send_view), timeout=timeout_seconds)
+                await asyncio.wait_for(user.send(embeds=dm_embeds, files=files, view=send_view), timeout=timeout_seconds)
                 recipient["status"] = "sent"
                 recipient["sent_at"] = iso_now()
                 queue["sent_count"] = int(queue.get("sent_count", 0)) + 1
