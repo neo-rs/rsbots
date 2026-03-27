@@ -598,11 +598,11 @@ class PromoBuilderView(discord.ui.View):
         embeds = build_dm_embeds(self.session, color)
         preview_content = self.bot_ref.messages.get("preview_label", "**Preview:**")
         attachment_content = build_attachment_content(self.session.get("attachment_urls"), max_urls=2)
-        if attachment_content:
-            preview_content = f"{preview_content}\n{attachment_content}"
         preview_view = self.bot_ref.sender._build_send_view(self.session)
         try:
             await interaction.response.send_message(content=preview_content, embeds=embeds, view=preview_view, ephemeral=True)
+            if attachment_content:
+                await interaction.followup.send(content=attachment_content, ephemeral=True)
         except discord.HTTPException as exc:
             self.bot_ref.explain_log.flow(
                 name="RSPromoBot / Preview",
@@ -684,7 +684,9 @@ class PromoBuilderView(discord.ui.View):
             embeds = build_dm_embeds(self.session, color)
             attachment_content = build_attachment_content(self.session.get("attachment_urls"), max_urls=2)
             view = self.bot_ref.sender._build_send_view(self.session)
-            await interaction.user.send(content=attachment_content or None, embeds=embeds, view=view)
+            await interaction.user.send(embeds=embeds, view=view)
+            if attachment_content:
+                await interaction.user.send(content=attachment_content)
             await interaction.response.send_message(self.bot_ref.messages["test_send_success"], ephemeral=True)
             self.bot_ref.explain_log.flow(
                 name="RSPromoBot / Test Send",

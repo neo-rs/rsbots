@@ -171,10 +171,9 @@ class PromoSender:
             user_id = int(recipient["user_id"])
             try:
                 user = await asyncio.wait_for(self.bot.fetch_user(user_id), timeout=timeout_seconds)
-                await asyncio.wait_for(
-                    user.send(content=attachment_content or None, embeds=dm_embeds, view=send_view),
-                    timeout=timeout_seconds,
-                )
+                await asyncio.wait_for(user.send(embeds=dm_embeds, view=send_view), timeout=timeout_seconds)
+                if attachment_content:
+                    await asyncio.wait_for(user.send(content=attachment_content), timeout=timeout_seconds)
                 recipient["status"] = "sent"
                 recipient["sent_at"] = iso_now()
                 queue["sent_count"] = int(queue.get("sent_count", 0)) + 1
