@@ -110,14 +110,32 @@ def normalize_discord_image_url(value: str | None) -> str:
 
 
 def parse_banner_urls(value: str | None, max_urls: int = 2) -> list[str]:
-    """Parse up to max_urls banner links from newline/comma-separated input."""
+    """Parse up to max_urls URLs, repairing wrapped/multiline URL fragments."""
     raw = (value or "").strip()
     if not raw:
         return []
-    parts = raw.replace(",", "\n").splitlines()
+    pieces = [piece.strip() for piece in raw.replace(",", "\n").splitlines() if piece.strip()]
+    stitched: list[str] = []
+    current = ""
+
+    for piece in pieces:
+        if piece.startswith(("http://", "https://")):
+            if current:
+                stitched.append(current)
+            current = piece
+            continue
+        if current:
+            # Discord modal wrapping can split URL text across lines.
+            current += piece
+            continue
+        # Ignore orphan fragments until we hit a URL start.
+
+    if current:
+        stitched.append(current)
+
     urls: list[str] = []
-    for part in parts:
-        normalized = normalize_discord_image_url(part.strip())
+    for candidate in stitched:
+        normalized = normalize_discord_image_url(candidate)
         if not normalized:
             continue
         urls.append(normalized)
