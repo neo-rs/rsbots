@@ -6,7 +6,7 @@ from typing import Any
 import discord
 from discord import app_commands
 
-from utils import build_cta_view, build_dm_embeds, format_log_user_id, has_any_allowed_role, human_rate, iso_now, normalize_discord_image_url
+from utils import build_cta_view, build_dm_embeds, format_log_user_id, has_any_allowed_role, human_rate, iso_now, parse_banner_urls
 
 
 def _session_dict_from_campaign(campaign: dict[str, Any]) -> dict[str, Any]:
@@ -226,7 +226,7 @@ class SettingsModal(discord.ui.Modal, title="Edit Campaign Settings"):
             required=True,
         )
         self.banner_url = discord.ui.TextInput(
-            label="Banner Image URL (optional)",
+            label="Banner Image URL(s) (optional)",
             default=session.get("banner_url", "") or (self.bot_ref.config.get("default_banner_url") or ""),
             max_length=500,
             required=False,
@@ -260,7 +260,8 @@ class SettingsModal(discord.ui.Modal, title="Edit Campaign Settings"):
 
         self.session["batch_size"] = batch_size
         self.session["batch_interval_minutes"] = interval
-        self.session["banner_url"] = normalize_discord_image_url(str(self.banner_url.value).strip())
+        banner_urls = parse_banner_urls(str(self.banner_url.value).strip(), max_urls=2)
+        self.session["banner_url"] = "\n".join(banner_urls)
 
         if self.status_campaign_id:
             campaign = self.bot_ref.campaign_store.get(self.status_campaign_id)

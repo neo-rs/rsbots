@@ -109,13 +109,37 @@ def normalize_discord_image_url(value: str | None) -> str:
     return raw
 
 
+def parse_banner_urls(value: str | None, max_urls: int = 2) -> list[str]:
+    """Parse up to max_urls banner links from newline/comma-separated input."""
+    raw = (value or "").strip()
+    if not raw:
+        return []
+    parts = raw.replace(",", "\n").splitlines()
+    urls: list[str] = []
+    for part in parts:
+        normalized = normalize_discord_image_url(part.strip())
+        if not normalized:
+            continue
+        urls.append(normalized)
+        if len(urls) >= max_urls:
+            break
+    return urls
+
+
 def build_dm_embeds(data: dict[str, Any], embed_color: int) -> list[discord.Embed]:
-    """Build a single embed (banner + body) with one color so banner and message align. Campaign name is not shown in output."""
-    banner_url = normalize_discord_image_url(data.get("banner_url"))
+    """Build embeds for body + up to two banner images."""
+    banner_urls = parse_banner_urls(data.get("banner_url"), max_urls=2)
     description = (data.get("message_body") or "").strip()
 
-    # Single embed: one color, image on top then description, no title (campaign name stays internal only)
-    embed = discord.Embed(description=description or "\u200b", color=embed_color)
-    if banner_url:
-        embed.set_image(url=banner_url)
-    return [embed]
+    embeds: list[discord.Embed] = []
+    first = discord.Embed(description=description or "\u200b", color=embed_color)
+    if banner_urls:
+        first.set_image(url=banner_urls[0])
+    embeds.append(first)
+
+    # Discord allows one image per embed; use a second embed for the second image.
+    for extra_url in banner_urls[1:]:
+        extra = discord.Embed(color=embed_color)
+        extra.set_image(url=extra_url)
+        embeds.append(extra)
+    return embeds
