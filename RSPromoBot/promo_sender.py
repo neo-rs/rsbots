@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import random
 from typing import Any
+from urllib.parse import urlparse
 
+import aiohttp
 import discord
 
 from promo_campaigns import PromoCampaignStore
 from promo_queue import PromoQueueStore
 from send_log_store import SendLogStore
-from utils import build_attachment_content, build_dm_embeds, format_log_user_id, iso_now, next_run_iso, utc_now
+from utils import build_dm_embeds, format_log_user_id, iso_now, next_run_iso, parse_attachment_urls, utc_now
 
 
 class OptOutButton(discord.ui.Button):
@@ -104,6 +107,50 @@ class PromoSender:
         self.logger = logger
         self._loop_task: asyncio.Task | None = None
 
+    async def build_attachment_embed_payload(
+        self, campaign: dict[str, Any]
+    ) -> tuple[list[discord.Embed], list[tuple[str, bytes]]]:
+        attachment_urls = parse_attachment_urls(campaign.get("attachment_urls"), max_urls=2)
+        if not attachment_urls:
+            return [], []
+
+        embeds: list[discord.Embed] = []
+        files_payload: list[tuple[str, bytes]] = []
+        timeout_seconds = max(5, int(self.config.get("send_timeout_seconds", 30)))
+        embed_color = int(self.config["embed_color"])
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_seconds)) as session:
+            for index, url in enumerate(attachment_urls, start=1):
+                try:
+                    async with session.get(url) as resp:
+                        if resp.status != 200:
+                            self.logger.warning("attachment_fetch_failed url=%s status=%s", url, resp.status)
+                            continue
+                        payload = await resp.read()
+                        if not payload:
+                            self.logger.warning("attachment_fetch_failed url=%s reason=empty_payload", url)
+                            continue
+                except Exception as exc:
+                    self.logger.warning("attachment_fetch_failed url=%s error=%s", url, exc)
+                    continue
+
+                parsed = urlparse(url)
+                file_name = (parsed.path.rsplit("/", 1)[-1] or f"attachment_{index}.png").split("?", 1)[0]
+                if "." not in file_name:
+                    file_name = f"{file_name}.png"
+                file_name = f"promo_attachment_{index}_{file_name}"
+
+                files_payload.append((file_name, payload))
+                image_embed = discord.Embed(color=embed_color)
+                image_embed.set_image(url=f"attachment://{file_name}")
+                embeds.append(image_embed)
+
+        return embeds, files_payload
+
+    @staticmethod
+    def build_discord_files(files_payload: list[tuple[str, bytes]]) -> list[discord.File]:
+        return [discord.File(io.BytesIO(content), filename=name) for name, content in files_payload]
+
     def start(self) -> None:
         if self._loop_task is None or self._loop_task.done():
             self._loop_task = asyncio.create_task(self._runner_loop())
@@ -164,16 +211,16 @@ class PromoSender:
         send_view = self._build_send_view(campaign)
         embed_color = int(self.config["embed_color"])
         dm_embeds = build_dm_embeds(campaign, embed_color)
-        attachment_content = build_attachment_content(campaign.get("attachment_urls"), max_urls=2)
+        attachment_embeds, attachment_files_payload = await self.build_attachment_embed_payload(campaign)
+        all_embeds = dm_embeds + attachment_embeds
 
         self.logger.info("send_batch_start campaign_id=%s batch_size=%d pending_total=%d", campaign_id, len(batch), len(pending))
         for recipient in batch:
             user_id = int(recipient["user_id"])
             try:
                 user = await asyncio.wait_for(self.bot.fetch_user(user_id), timeout=timeout_seconds)
-                await asyncio.wait_for(user.send(embeds=dm_embeds, view=send_view), timeout=timeout_seconds)
-                if attachment_content:
-                    await asyncio.wait_for(user.send(content=attachment_content), timeout=timeout_seconds)
+                files = self.build_discord_files(attachment_files_payload)
+                await asyncio.wait_for(user.send(embeds=all_embeds, files=files, view=send_view), timeout=timeout_seconds)
                 recipient["status"] = "sent"
                 recipient["sent_at"] = iso_now()
                 queue["sent_count"] = int(queue.get("sent_count", 0)) + 1

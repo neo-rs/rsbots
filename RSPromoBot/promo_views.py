@@ -6,7 +6,7 @@ from typing import Any
 import discord
 from discord import app_commands
 
-from utils import build_attachment_content, build_cta_view, build_dm_embeds, format_log_user_id, has_any_allowed_role, human_rate, iso_now, parse_attachment_urls, parse_banner_urls
+from utils import build_cta_view, build_dm_embeds, format_log_user_id, has_any_allowed_role, human_rate, iso_now, parse_attachment_urls, parse_banner_urls
 
 
 def _session_dict_from_campaign(campaign: dict[str, Any]) -> dict[str, Any]:
@@ -597,12 +597,12 @@ class PromoBuilderView(discord.ui.View):
         color = int(self.bot_ref.config["embed_color"])
         embeds = build_dm_embeds(self.session, color)
         preview_content = self.bot_ref.messages.get("preview_label", "**Preview:**")
-        attachment_content = build_attachment_content(self.session.get("attachment_urls"), max_urls=2)
+        attachment_embeds, attachment_files_payload = await self.bot_ref.sender.build_attachment_embed_payload(self.session)
+        all_embeds = embeds + attachment_embeds
+        files = self.bot_ref.sender.build_discord_files(attachment_files_payload)
         preview_view = self.bot_ref.sender._build_send_view(self.session)
         try:
-            await interaction.response.send_message(content=preview_content, embeds=embeds, view=preview_view, ephemeral=True)
-            if attachment_content:
-                await interaction.followup.send(content=attachment_content, ephemeral=True)
+            await interaction.response.send_message(content=preview_content, embeds=all_embeds, files=files, view=preview_view, ephemeral=True)
         except discord.HTTPException as exc:
             self.bot_ref.explain_log.flow(
                 name="RSPromoBot / Preview",
@@ -682,11 +682,11 @@ class PromoBuilderView(discord.ui.View):
         try:
             color = int(self.bot_ref.config["embed_color"])
             embeds = build_dm_embeds(self.session, color)
-            attachment_content = build_attachment_content(self.session.get("attachment_urls"), max_urls=2)
+            attachment_embeds, attachment_files_payload = await self.bot_ref.sender.build_attachment_embed_payload(self.session)
+            all_embeds = embeds + attachment_embeds
+            files = self.bot_ref.sender.build_discord_files(attachment_files_payload)
             view = self.bot_ref.sender._build_send_view(self.session)
-            await interaction.user.send(embeds=embeds, view=view)
-            if attachment_content:
-                await interaction.user.send(content=attachment_content)
+            await interaction.user.send(embeds=all_embeds, files=files, view=view)
             await interaction.response.send_message(self.bot_ref.messages["test_send_success"], ephemeral=True)
             self.bot_ref.explain_log.flow(
                 name="RSPromoBot / Test Send",
