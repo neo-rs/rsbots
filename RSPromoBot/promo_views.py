@@ -181,10 +181,16 @@ class MessageModal(discord.ui.Modal, title="Edit Promo Message"):
             queue_paused = queue.get("status") == "paused"
             campaign_paused = bool(campaign and campaign.get("status") == "paused")
             if not campaign or not ((queue_matches and queue_paused) or campaign_paused):
-                await interaction.response.send_message(
-                    self.bot_ref.messages.get("status_edit_only_when_paused", "Pause the campaign before editing."),
-                    ephemeral=True,
+                base = self.bot_ref.messages.get(
+                    "status_edit_only_when_paused",
+                    "Pause the campaign before editing.",
                 )
+                queue_status = queue.get("status", "?")
+                queue_cid = queue.get("campaign_id", "?")
+                campaign_status = campaign.get("status", "?") if campaign else "missing"
+                campaign_cid = campaign.get("campaign_id", "?") if campaign else self.status_campaign_id
+                details = f"Current: queue_status={queue_status} queue_campaign_id={queue_cid}; campaign_status={campaign_status} campaign_id={campaign_cid}"
+                await interaction.response.send_message(f"{base}\n{details}", ephemeral=True)
                 return
             merged = dict(campaign)
             merged["campaign_name"] = self.session["campaign_name"]
@@ -288,10 +294,16 @@ class SettingsModal(discord.ui.Modal, title="Edit Campaign Settings"):
             queue_paused = queue.get("status") == "paused"
             campaign_paused = bool(campaign and campaign.get("status") == "paused")
             if not campaign or not ((queue_matches and queue_paused) or campaign_paused):
-                await interaction.response.send_message(
-                    self.bot_ref.messages.get("status_edit_only_when_paused", "Pause the campaign before editing."),
-                    ephemeral=True,
+                base = self.bot_ref.messages.get(
+                    "status_edit_only_when_paused",
+                    "Pause the campaign before editing.",
                 )
+                queue_status = queue.get("status", "?")
+                queue_cid = queue.get("campaign_id", "?")
+                campaign_status = campaign.get("status", "?") if campaign else "missing"
+                campaign_cid = campaign.get("campaign_id", "?") if campaign else self.status_campaign_id
+                details = f"Current: queue_status={queue_status} queue_campaign_id={queue_cid}; campaign_status={campaign_status} campaign_id={campaign_cid}"
+                await interaction.response.send_message(f"{base}\n{details}", ephemeral=True)
                 return
             campaign["batch_size"] = batch_size
             campaign["batch_interval_minutes"] = interval
@@ -476,10 +488,14 @@ class CampaignControlView(discord.ui.View):
         queue_paused = queue.get("status") == "paused"
         campaign_paused = campaign.get("status") == "paused"
         if not ((queue_matches and queue_paused) or campaign_paused):
-            await interaction.response.send_message(
-                self.bot_ref.messages.get("status_edit_only_when_paused", "Pause the campaign before editing."),
-                ephemeral=True,
+            base = self.bot_ref.messages.get(
+                "status_edit_only_when_paused",
+                "Pause the campaign before editing.",
             )
+            queue_status = queue.get("status", "?")
+            queue_cid = queue.get("campaign_id", "?")
+            details = f"Current: queue_status={queue_status} queue_campaign_id={queue_cid}; campaign_status={campaign.get('status', '?')} campaign_id={campaign.get('campaign_id', '?')}"
+            await interaction.response.send_message(f"{base}\n{details}", ephemeral=True)
             return
         session = _session_dict_from_campaign(campaign)
         await interaction.response.send_modal(MessageModal(self.bot_ref, session, status_campaign_id=self.campaign_id))
@@ -498,10 +514,14 @@ class CampaignControlView(discord.ui.View):
         queue_paused = queue.get("status") == "paused"
         campaign_paused = campaign.get("status") == "paused"
         if not ((queue_matches and queue_paused) or campaign_paused):
-            await interaction.response.send_message(
-                self.bot_ref.messages.get("status_edit_only_when_paused", "Pause the campaign before editing."),
-                ephemeral=True,
+            base = self.bot_ref.messages.get(
+                "status_edit_only_when_paused",
+                "Pause the campaign before editing.",
             )
+            queue_status = queue.get("status", "?")
+            queue_cid = queue.get("campaign_id", "?")
+            details = f"Current: queue_status={queue_status} queue_campaign_id={queue_cid}; campaign_status={campaign.get('status', '?')} campaign_id={campaign.get('campaign_id', '?')}"
+            await interaction.response.send_message(f"{base}\n{details}", ephemeral=True)
             return
         session = _session_dict_from_campaign(campaign)
         await interaction.response.send_modal(SettingsModal(self.bot_ref, session, status_campaign_id=self.campaign_id))
