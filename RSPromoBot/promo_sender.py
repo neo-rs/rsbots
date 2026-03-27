@@ -354,4 +354,20 @@ class PromoSender:
         embed.add_field(name="Recipients", value=str(campaign.get("recipient_count", 0)), inline=True)
         embed.add_field(name="Sent", value=str(campaign.get("sent_count", 0)), inline=True)
         embed.add_field(name="Failed", value=str(campaign.get("failed_count", 0)), inline=True)
-        await channel.send(embed=embed)
+        msg_id_raw = str(campaign.get("log_message_id", "")).strip()
+        if msg_id_raw.isdigit() and hasattr(channel, "fetch_message"):
+            try:
+                prior = await channel.fetch_message(int(msg_id_raw))
+                await prior.edit(embed=embed)
+                return
+            except Exception:
+                # If missing/deleted/forbidden, fall back to posting a new status card.
+                pass
+
+        sent = await channel.send(embed=embed)
+        campaign["log_message_id"] = str(sent.id)
+        try:
+            self.campaign_store.upsert(campaign)
+        except Exception:
+            # Logging should not break campaign flow.
+            pass
