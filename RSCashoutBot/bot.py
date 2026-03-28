@@ -1104,7 +1104,7 @@ async def cashoutnew(interaction: discord.Interaction) -> None:
     assert isinstance(interaction.client, RSTicketBot)
     button = interaction.client.get_button('request_submit')
     if not button:
-        await interaction.response.send_message('Request/Submit is not configured right now.', ephemeral=True)
+        await interaction.response.send_message('Submit Cashout is not configured right now.', ephemeral=True)
         return
     await interaction.client.launch_button_flow(interaction, button)
 
@@ -1151,7 +1151,7 @@ if __name__ == '__main__':
     FLOW.title('RS CASHOUT TICKET BOT')
     FLOW.note(
         'Mode: live bot — connects to Discord and handles real interactions.',
-        'Primary member flow is Request/Submit -> personal sheet copy -> private ticket.',
+        'Primary member flow is Submit Cashout -> personal sheet copy -> private ticket.',
     )
     FLOW.rule()
     FLOW.section('1) CONFIG LOADED (config.json + messages.json)')
