@@ -3397,7 +3397,13 @@ class RSAdminBot:
         self._systemd_events_webhook_url: str = ""
         self._journal_tasks: Dict[str, asyncio.Task] = {}
         self._journal_last_alert_ts: Dict[str, float] = {}
-        
+        # MWDataManagerBot journal-live: optional `stream=` routing (see journal_live.datamanager_* config).
+        self._journal_datamanager_split: bool = False
+        self._journal_datamanager_stream_webhooks: Dict[str, str] = {}
+        self._journal_datamanager_buf_max_chars: int = 0
+        self._journal_datamanager_flush_seconds: float = 0.0
+        self._journal_dm_active_stream: str = "default"
+
         # Setup bot with required intents
         intents = discord.Intents.default()
         # Prefix commands are normally disabled; however we keep a small, RS-guild-only
@@ -4712,6 +4718,12 @@ echo "TARGET=$TARGET"
                 "max_chars": int(cfg.get("max_chars") or 1800),
                 # When true, MWDiscumBot stdout lines containing [FETCHALL] go to journal-discumbot-fetch; rest stay on journal-discumbot (D2D).
                 "discumbot_split_fetch_journal": bool(cfg.get("discumbot_split_fetch_journal", False)),
+                "datamanager_split_stream_journals": bool(cfg.get("datamanager_split_stream_journals", False)),
+                "datamanager_journal_streams": list(cfg.get("datamanager_journal_streams") or [])
+                if isinstance(cfg.get("datamanager_journal_streams"), list)
+                else [],
+                "datamanager_journal_max_chars": int(cfg.get("datamanager_journal_max_chars") or 0),
+                "datamanager_journal_flush_seconds": float(cfg.get("datamanager_journal_flush_seconds") or 0),
             }
         except Exception:
             return {
@@ -4722,6 +4734,10 @@ echo "TARGET=$TARGET"
                 "flush_seconds": 1,
                 "max_chars": 1800,
                 "discumbot_split_fetch_journal": False,
+                "datamanager_split_stream_journals": False,
+                "datamanager_journal_streams": [],
+                "datamanager_journal_max_chars": 0,
+                "datamanager_journal_flush_seconds": 0.0,
             }
 
     def _get_webhooks_config(self) -> Dict[str, Any]:
@@ -5086,6 +5102,91 @@ echo "TARGET=$TARGET"
         """True if line is from MWDiscumBot fetchall/fetchsync path ([FETCHALL] prefix after ANSI strip)."""
         return "[fetchall]" in (line or "").lower()
 
+    @staticmethod
+    def _chunk_journal_lines_for_discord(lines: List[str], *, max_body_chars: int = 1650) -> List[List[str]]:
+        """Split stdout lines so each chunk stays under ~Discord content limits after RSAdmin wrapping."""
+        cap = max(400, min(int(max_body_chars or 1650), 1800))
+        chunks: List[List[str]] = []
+        cur: List[str] = []
+        cur_len = 0
+        for ln in lines:
+            piece = (ln or "") + "\n"
+            plen = len(piece)
+            if cur and cur_len + plen > cap:
+                chunks.append(cur)
+                cur = []
+                cur_len = 0
+            cur.append(ln)
+            cur_len += plen
+        if cur:
+            chunks.append(cur)
+        return chunks
+
+    def _partition_datamanager_journal_lines(self, lines: List[str]) -> Dict[str, List[str]]:
+        """Assign each line to a bucket using MWDataManagerBot `stream=` markers; carry state across flushes."""
+        buckets: Dict[str, List[str]] = {}
+        cur = getattr(self, "_journal_dm_active_stream", "") or "default"
+        if not isinstance(cur, str):
+            cur = "default"
+        cur = cur.strip().lower() or "default"
+        for ln in lines:
+            m = re.search(r"\bstream=([a-zA-Z0-9_]+)\b", ln or "")
+            if m:
+                cur = m.group(1).lower()
+                self._journal_dm_active_stream = cur
+            buckets.setdefault(cur, []).append(ln)
+        return buckets
+
+    async def _flush_datamanager_journal_split(
+        self,
+        bot_key: str,
+        main_webhook_url: str,
+        stream_webhooks: Dict[str, str],
+        lines: List[str],
+    ) -> None:
+        partitions = self._partition_datamanager_journal_lines(lines)
+        if not partitions:
+            return
+        preferred = (
+            "amazon",
+            "affiliate",
+            "instore",
+            "flip",
+            "upcoming",
+            "keyword",
+            "clearance",
+            "price_error",
+            "multi",
+            "default",
+            "other",
+            "unknown",
+            "smartfilter",
+        )
+
+        def _sort_key(item: Tuple[str, List[str]]) -> Tuple[int, str]:
+            k = item[0]
+            try:
+                return (preferred.index(k), k)
+            except ValueError:
+                return (len(preferred), k)
+
+        for stream_slug, sublines in sorted(partitions.items(), key=_sort_key):
+            if not sublines:
+                continue
+            target_url = str(stream_webhooks.get(stream_slug) or "").strip() or main_webhook_url
+            out_stream = stream_slug if stream_slug and stream_slug != "default" else "log"
+            for chunk in self._chunk_journal_lines_for_discord(sublines, max_body_chars=1650):
+                if not chunk:
+                    continue
+                await self._flush_journal_batch_plain(
+                    bot_key,
+                    target_url,
+                    chunk,
+                    stream=out_stream,
+                    prefer_head_truncation=True,
+                    content_max=1900,
+                )
+
     async def _journal_follow_loop(
         self,
         bot_key: str,
@@ -5102,6 +5203,13 @@ echo "TARGET=$TARGET"
         backfill = max(0, min(int(cfg.get("startup_backfill_lines") or 20), 200))
         flush_seconds = max(0.5, min(float(cfg.get("flush_seconds") or 1), 10))
         max_chars = max(400, min(int(cfg.get("max_chars") or 1800), 1900))
+        if bot_key == "datamanagerbot" and getattr(self, "_journal_datamanager_split", False):
+            dm_mc = int(getattr(self, "_journal_datamanager_buf_max_chars", 0) or cfg.get("datamanager_journal_max_chars") or 0)
+            if dm_mc > 0:
+                max_chars = max(800, min(dm_mc, 12000))
+            dm_fs = float(getattr(self, "_journal_datamanager_flush_seconds", 0) or cfg.get("datamanager_journal_flush_seconds") or 0)
+            if dm_fs > 0:
+                flush_seconds = max(0.5, min(dm_fs, 15.0))
 
         # Context window for high-signal extraction
         ctx_window = deque(maxlen=6)
@@ -5205,6 +5313,14 @@ echo "TARGET=$TARGET"
         try:
             if not lines:
                 return
+            if (
+                bot_key == "datamanagerbot"
+                and getattr(self, "_journal_datamanager_split", False)
+            ):
+                sw = getattr(self, "_journal_datamanager_stream_webhooks", None) or {}
+                if isinstance(sw, dict) and sw:
+                    await self._flush_datamanager_journal_split(bot_key, webhook_url, sw, lines)
+                    return
             fw = str(fetch_webhook_url or "").strip()
             if bot_key == "discumbot" and fw:
                 d2d_lines: List[str] = []
@@ -5230,19 +5346,27 @@ echo "TARGET=$TARGET"
         lines: List[str],
         *,
         stream: str = "log",
+        prefer_head_truncation: bool = False,
+        content_max: int = 0,
     ) -> None:
         try:
             if not lines:
                 return
             joined = "\n".join(lines)
-            # Keep Discord-safe size; rely on configured max_chars, but double-guard.
-            if len(joined) > 1800:
-                joined = joined[-1800:]
+            cap = int(content_max or 1800)
+            cap = max(400, min(cap, 1950))
+            if len(joined) > cap:
+                if prefer_head_truncation:
+                    joined = joined[: max(0, cap - 60)].rstrip() + "\n-# ...(truncated)"
+                else:
+                    joined = joined[-cap:]
             parts = joined.split("\n")
             # Use subtext (-# ) so Discord renders mentions (e.g. <#id>) as clickable links
             subtext_lines = [f"-# {line}" for line in parts]
-            stream_note = f"-# stream={stream}\n" if stream != "log" else ""
+            stream_note = f"-# stream={stream}\n" if stream and str(stream) != "log" else ""
             content = f"journal: {bot_key}\n{stream_note}-# log\n" + "\n".join(subtext_lines)
+            if len(content) > 2000:
+                content = content[:1990] + "\n-# ...(truncated)"
             await self._send_webhook(webhook_url, content=content)
         except Exception:
             return
@@ -5538,6 +5662,13 @@ echo "TARGET=$TARGET"
             extra = ""
             if cfg.get("discumbot_split_fetch_journal") and channel_map.get("discumbot_fetch"):
                 extra = " | MWDiscumBot fetch lines -> #journal-discumbot-fetch"
+            dm_stream_ch = sum(
+                1
+                for _k in channel_map.keys()
+                if str(_k).startswith("datamanagerbot_") and str(_k) != "datamanagerbot"
+            )
+            if cfg.get("datamanager_split_stream_journals") and dm_stream_ch:
+                extra += f" | MWDataManagerBot `stream=` split -> {dm_stream_ch} extra channel(s)"
             print(
                 f"{Colors.GREEN}[Journal Live] Enabled. Channels: {len(channel_map)} "
                 f"(category_id={cfg.get('category_id')}){extra}{Colors.RESET}"
@@ -5581,6 +5712,33 @@ echo "TARGET=$TARGET"
                         created_any = True
             except Exception:
                 continue
+
+        # MWDataManagerBot: stream slug -> webhook (stdout carries `stream=amazon` etc.)
+        try:
+            dm_split = bool(cfg.get("datamanager_split_stream_journals", False))
+            self._journal_datamanager_split = dm_split
+            self._journal_datamanager_stream_webhooks = {}
+            try:
+                self._journal_datamanager_buf_max_chars = int(cfg.get("datamanager_journal_max_chars") or 0)
+            except Exception:
+                self._journal_datamanager_buf_max_chars = 0
+            try:
+                self._journal_datamanager_flush_seconds = float(cfg.get("datamanager_journal_flush_seconds") or 0)
+            except Exception:
+                self._journal_datamanager_flush_seconds = 0.0
+            if dm_split and isinstance(journal_by_bot, dict):
+                for k, v in journal_by_bot.items():
+                    ks = str(k or "")
+                    if ks.startswith("datamanagerbot_") and ks != "datamanagerbot":
+                        part = ks[len("datamanagerbot_") :].strip().lower()
+                        url = str(v or "").strip()
+                        if part and url:
+                            self._journal_datamanager_stream_webhooks[part] = url
+        except Exception:
+            self._journal_datamanager_split = False
+            self._journal_datamanager_stream_webhooks = {}
+            self._journal_datamanager_buf_max_chars = 0
+            self._journal_datamanager_flush_seconds = 0.0
 
         # Systemd events webhook (single shared channel)
         sys_cfg = self._get_systemd_events_config()

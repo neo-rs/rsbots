@@ -96,7 +96,21 @@
     "startup_backfill_lines": 20,
     "flush_seconds": 1,
     "max_chars": 1800,
-    "discumbot_split_fetch_journal": true
+    "discumbot_split_fetch_journal": true,
+    "datamanager_split_stream_journals": true,
+    "datamanager_journal_streams": [
+      "amazon",
+      "affiliate",
+      "instore",
+      "flip",
+      "upcoming",
+      "keyword",
+      "clearance",
+      "price_error",
+      "multi"
+    ],
+    "datamanager_journal_max_chars": 8000,
+    "datamanager_journal_flush_seconds": 2.5
   },
   "whop_webhook": {
     "enabled": true,
