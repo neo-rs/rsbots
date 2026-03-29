@@ -331,6 +331,9 @@ class TestServerOrganizer:
 
             # 2) Search by name within the category
             found = discord.utils.get(guild.text_channels, name=channel_name, category=category)
+            # 3) Same name anywhere in guild (channel was moved out of the journal category)
+            if not found:
+                found = discord.utils.get(guild.text_channels, name=channel_name)
             if not found:
                 try:
                     found = await guild.create_text_channel(
@@ -363,6 +366,8 @@ class TestServerOrganizer:
 
                 if not have_fetch:
                     found = discord.utils.get(guild.text_channels, name=fetch_name, category=category)
+                    if not found:
+                        found = discord.utils.get(guild.text_channels, name=fetch_name)
                     if not found:
                         try:
                             found = await guild.create_text_channel(
