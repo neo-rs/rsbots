@@ -4710,6 +4710,8 @@ echo "TARGET=$TARGET"
                 "startup_backfill_lines": int(cfg.get("startup_backfill_lines") or 20),
                 "flush_seconds": float(cfg.get("flush_seconds") or 1),
                 "max_chars": int(cfg.get("max_chars") or 1800),
+                # When true, MWDiscumBot stdout lines containing [FETCHALL] go to journal-discumbot-fetch; rest stay on journal-discumbot (D2D).
+                "discumbot_split_fetch_journal": bool(cfg.get("discumbot_split_fetch_journal", False)),
             }
         except Exception:
             return {
@@ -4719,6 +4721,7 @@ echo "TARGET=$TARGET"
                 "startup_backfill_lines": 20,
                 "flush_seconds": 1,
                 "max_chars": 1800,
+                "discumbot_split_fetch_journal": False,
             }
 
     def _get_webhooks_config(self) -> Dict[str, Any]:
@@ -5078,8 +5081,23 @@ echo "TARGET=$TARGET"
         )
         return any(n in s for n in needles)
 
-    async def _journal_follow_loop(self, bot_key: str, unit_name: str, webhook_url: str) -> None:
-        """Follow journald for a unit and stream batched lines to the bot's journal channel webhook."""
+    @staticmethod
+    def _journal_line_is_mwdiscumbot_fetchall(line: str) -> bool:
+        """True if line is from MWDiscumBot fetchall/fetchsync path ([FETCHALL] prefix after ANSI strip)."""
+        return "[fetchall]" in (line or "").lower()
+
+    async def _journal_follow_loop(
+        self,
+        bot_key: str,
+        unit_name: str,
+        webhook_url: str,
+        *,
+        fetch_webhook_url: Optional[str] = None,
+    ) -> None:
+        """Follow journald for a unit and stream batched lines to the bot's journal channel webhook(s).
+
+        For discumbot with fetch_webhook_url set, lines containing [FETCHALL] go to the fetch webhook; others to the primary (D2D).
+        """
         cfg = self._get_journal_live_config()
         backfill = max(0, min(int(cfg.get("startup_backfill_lines") or 20), 200))
         flush_seconds = max(0.5, min(float(cfg.get("flush_seconds") or 1), 10))
@@ -5117,7 +5135,9 @@ echo "TARGET=$TARGET"
                         raw = await asyncio.wait_for(proc.stdout.readline(), timeout=flush_seconds)
                     except asyncio.TimeoutError:
                         if buf:
-                            await self._flush_journal_batch(bot_key, webhook_url, buf)
+                            await self._flush_journal_batch(
+                                bot_key, webhook_url, buf, fetch_webhook_url=fetch_webhook_url
+                            )
                             buf = []
                             buf_chars = 0
                             last_flush = time.time()
@@ -5149,14 +5169,18 @@ echo "TARGET=$TARGET"
 
                     now = time.time()
                     if buf and (buf_chars >= max_chars or (now - last_flush) >= flush_seconds):
-                        await self._flush_journal_batch(bot_key, webhook_url, buf)
+                        await self._flush_journal_batch(
+                            bot_key, webhook_url, buf, fetch_webhook_url=fetch_webhook_url
+                        )
                         buf = []
                         buf_chars = 0
                         last_flush = now
 
                 # Process ended; flush any remaining buffer
                 if buf:
-                    await self._flush_journal_batch(bot_key, webhook_url, buf)
+                    await self._flush_journal_batch(
+                        bot_key, webhook_url, buf, fetch_webhook_url=fetch_webhook_url
+                    )
                     buf = []
                     buf_chars = 0
                 try:
@@ -5170,7 +5194,43 @@ echo "TARGET=$TARGET"
                 # Backoff on unexpected errors
                 await asyncio.sleep(3)
 
-    async def _flush_journal_batch(self, bot_key: str, webhook_url: str, lines: List[str]) -> None:
+    async def _flush_journal_batch(
+        self,
+        bot_key: str,
+        webhook_url: str,
+        lines: List[str],
+        *,
+        fetch_webhook_url: Optional[str] = None,
+    ) -> None:
+        try:
+            if not lines:
+                return
+            fw = str(fetch_webhook_url or "").strip()
+            if bot_key == "discumbot" and fw:
+                d2d_lines: List[str] = []
+                fetch_lines: List[str] = []
+                for ln in lines:
+                    if self._journal_line_is_mwdiscumbot_fetchall(ln):
+                        fetch_lines.append(ln)
+                    else:
+                        d2d_lines.append(ln)
+                if d2d_lines:
+                    await self._flush_journal_batch_plain(bot_key, webhook_url, d2d_lines, stream="d2d")
+                if fetch_lines:
+                    await self._flush_journal_batch_plain(bot_key, fw, fetch_lines, stream="fetchall")
+                return
+            await self._flush_journal_batch_plain(bot_key, webhook_url, lines, stream="log")
+        except Exception:
+            return
+
+    async def _flush_journal_batch_plain(
+        self,
+        bot_key: str,
+        webhook_url: str,
+        lines: List[str],
+        *,
+        stream: str = "log",
+    ) -> None:
         try:
             if not lines:
                 return
@@ -5181,7 +5241,8 @@ echo "TARGET=$TARGET"
             parts = joined.split("\n")
             # Use subtext (-# ) so Discord renders mentions (e.g. <#id>) as clickable links
             subtext_lines = [f"-# {line}" for line in parts]
-            content = f"journal: {bot_key}\n-# log\n" + "\n".join(subtext_lines)
+            stream_note = f"-# stream={stream}\n" if stream != "log" else ""
+            content = f"journal: {bot_key}\n{stream_note}-# log\n" + "\n".join(subtext_lines)
             await self._send_webhook(webhook_url, content=content)
         except Exception:
             return
@@ -5474,7 +5535,13 @@ echo "TARGET=$TARGET"
         channel_map = await self.test_server_organizer.ensure_journal_channels_in_category(all_keys)
         self._journal_channel_ids = channel_map
         try:
-            print(f"{Colors.GREEN}[Journal Live] Enabled. Channels: {len(channel_map)} (category_id={cfg.get('category_id')}){Colors.RESET}")
+            extra = ""
+            if cfg.get("discumbot_split_fetch_journal") and channel_map.get("discumbot_fetch"):
+                extra = " | MWDiscumBot fetch lines -> #journal-discumbot-fetch"
+            print(
+                f"{Colors.GREEN}[Journal Live] Enabled. Channels: {len(channel_map)} "
+                f"(category_id={cfg.get('category_id')}){extra}{Colors.RESET}"
+            )
         except Exception:
             pass
 
@@ -5563,6 +5630,10 @@ echo "TARGET=$TARGET"
         # Cache webhook URLs for runtime
         self._journal_webhook_urls_by_bot = {k: str(v) for k, v in journal_by_bot.items() if v}
         self._systemd_events_webhook_url = systemd_url
+        try:
+            self._journal_discumbot_split_fetch = bool(cfg.get("discumbot_split_fetch_journal", False))
+        except Exception:
+            self._journal_discumbot_split_fetch = False
 
         # Start per-bot journal follow tasks
         self._start_journal_follow_tasks(all_keys)
@@ -5587,7 +5658,20 @@ echo "TARGET=$TARGET"
             url = str(self._journal_webhook_urls_by_bot.get(bot_key) or "").strip()
             if not url:
                 continue
-            self._journal_tasks[bot_key] = asyncio.create_task(self._journal_follow_loop(bot_key, svc, url))
+            fetch_wh = ""
+            if (
+                bot_key == "discumbot"
+                and getattr(self, "_journal_discumbot_split_fetch", False)
+            ):
+                fetch_wh = str(self._journal_webhook_urls_by_bot.get("discumbot_fetch") or "").strip()
+            self._journal_tasks[bot_key] = asyncio.create_task(
+                self._journal_follow_loop(
+                    bot_key,
+                    svc,
+                    url,
+                    fetch_webhook_url=fetch_wh or None,
+                )
+            )
     
     def _get_bot_monitor_channel(self, bot_key: str) -> Optional[discord.TextChannel]:
         """Get the monitor channel for a bot key."""

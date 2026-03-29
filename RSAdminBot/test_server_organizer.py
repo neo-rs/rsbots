@@ -347,5 +347,38 @@ class TestServerOrganizer:
             self.channels_data["journal_channels"][bot_key] = found.id
             self._save_channels_data()
 
+        # Optional second journal channel for MWDiscumBot: fetchall/fetchsync lines only (D2D stays on journal-discumbot).
+        if isinstance(cfg, dict) and cfg.get("discumbot_split_fetch_journal"):
+            if "discumbot" in result:
+                fetch_key = "discumbot_fetch"
+                fetch_name = f"{channel_prefix}discumbot-fetch".lower()
+
+                have_fetch = False
+                existing_fetch_id = self.channels_data["journal_channels"].get(fetch_key)
+                if existing_fetch_id:
+                    ch = guild.get_channel(int(existing_fetch_id))
+                    if ch and isinstance(ch, discord.TextChannel):
+                        result[fetch_key] = ch.id
+                        have_fetch = True
+
+                if not have_fetch:
+                    found = discord.utils.get(guild.text_channels, name=fetch_name, category=category)
+                    if not found:
+                        try:
+                            found = await guild.create_text_channel(
+                                fetch_name,
+                                category=category,
+                                reason="RSAdminBot MWDiscumBot fetch journal (test server only)",
+                            )
+                        except discord.Forbidden:
+                            found = None
+                        except Exception:
+                            found = None
+
+                    if found:
+                        result[fetch_key] = found.id
+                        self.channels_data["journal_channels"][fetch_key] = found.id
+                        self._save_channels_data()
+
         return result
 

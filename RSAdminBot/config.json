@@ -95,7 +95,8 @@
     "channel_prefix": "journal-",
     "startup_backfill_lines": 20,
     "flush_seconds": 1,
-    "max_chars": 1800
+    "max_chars": 1800,
+    "discumbot_split_fetch_journal": true
   },
   "whop_webhook": {
     "enabled": true,
