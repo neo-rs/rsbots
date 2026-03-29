@@ -297,6 +297,47 @@ class RSOnboardingBot:
         
         return embed
     
+    def build_member_granted_dm_embed(self, member: discord.abc.User) -> discord.Embed:
+        """Build the Member Granted DM embed (same shape as send path)."""
+        dm_data = self.messages.get("dms", {}).get("member_granted", {})
+        description = dm_data.get("description", "").format(member=member)
+        footer_text = dm_data.get("footer_text", self.config.get("footer_text", ""))
+        embed = discord.Embed(
+            description=description,
+            color=self.get_embed_color(),
+        )
+        banner_url = self.config.get("banner_url", "")
+        if banner_url:
+            embed.set_image(url=banner_url)
+        if footer_text:
+            embed.set_footer(text=footer_text)
+        return embed
+    
+    def build_ticket_open_dm_embed(
+        self, member: discord.abc.User, ticket: Any
+    ) -> discord.Embed:
+        """Build the ticket-open DM embed (same shape as send path). `ticket` must have `.jump_url`."""
+        staff_user_id = self.config.get("staff_user_id")
+        ticket_open_dm = self.messages.get("dms", {}).get("ticket_open", {})
+        dm_title = ticket_open_dm.get("title", "📩 Message Sent from Staff")
+        dm_desc = ticket_open_dm.get("description", "").format(
+            staff_user_id=staff_user_id,
+            member=member,
+            ticket=ticket,
+        )
+        dm_footer = ticket_open_dm.get("footer_text", self.config.get("footer_text", ""))
+        dm = discord.Embed(
+            title=dm_title,
+            description=dm_desc,
+            color=self.get_embed_color(),
+        )
+        if dm_footer:
+            dm.set_footer(text=dm_footer)
+        banner_url = self.config.get("banner_url", "")
+        if banner_url:
+            dm.set_image(url=banner_url)
+        return dm
+    
     async def send_member_granted_dm(self, member: discord.Member, source: str = "role_update"):
         """Send DM when Member role is granted"""
         guild = member.guild
@@ -318,22 +359,7 @@ class RSOnboardingBot:
         self._recent_member_dm[member.id] = now
         
         try:
-            dm_data = self.messages.get("dms", {}).get("member_granted", {})
-            description = dm_data.get("description", "").format(member=member)
-            footer_text = dm_data.get("footer_text", self.config.get("footer_text", ""))
-            
-            embed = discord.Embed(
-                description=description,
-                color=self.get_embed_color()
-            )
-            
-            banner_url = self.config.get("banner_url", "")
-            if banner_url:
-                embed.set_image(url=banner_url)
-            
-            if footer_text:
-                embed.set_footer(text=footer_text)
-            
+            embed = self.build_member_granted_dm_embed(member)
             await member.send(embed=embed)
             await self.log_action(
                 guild, 
@@ -1139,27 +1165,7 @@ class RSOnboardingBot:
 
                 # DM the user (on ticket open)
                 try:
-                    staff_user_id = self.config.get("staff_user_id")
-                    ticket_open_dm = self.messages.get("dms", {}).get("ticket_open", {})
-
-                    dm_title = ticket_open_dm.get("title", "📩 Message Sent from Staff")
-                    dm_desc = ticket_open_dm.get("description", "").format(
-                        staff_user_id=staff_user_id,
-                        member=member,
-                        ticket=ticket
-                    )
-                    dm_footer = ticket_open_dm.get("footer_text", self.config.get("footer_text", ""))
-
-                    dm = discord.Embed(
-                        title=dm_title,
-                        description=dm_desc,
-                        color=self.get_embed_color(),
-                    )
-                    if dm_footer:
-                        dm.set_footer(text=dm_footer)
-                    banner_url = self.config.get("banner_url", "")
-                    if banner_url:
-                        dm.set_image(url=banner_url)
+                    dm = self.build_ticket_open_dm_embed(member, ticket)
                     await member.send(embed=dm)
                 except Exception:
                     await self.log_error(

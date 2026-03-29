@@ -276,7 +276,7 @@ class DMEditorView(ui.View):
         """Get main DM editor embed"""
         embed = discord.Embed(
             title="💬 DM Message Editor",
-            description="Select a DM message to edit:",
+            description="Select a DM to edit, or use **Preview** to see the rendered embed (ephemeral, only to you).",
             color=discord.Color.blue()
         )
         
@@ -304,13 +304,63 @@ class DMEditorView(ui.View):
         modal = MemberGrantedModal(self.bot_instance)
         await interaction.response.send_modal(modal)
     
-    @ui.button(label="Edit Ticket Open DM", style=discord.ButtonStyle.primary, row=0)
+    @ui.button(label="Preview Member DM", style=discord.ButtonStyle.success, row=0)
+    async def preview_member_granted(self, interaction: discord.Interaction, button: ui.Button):
+        """Ephemeral embed preview using the same builder as the live DM."""
+        try:
+            embed = self.bot_instance.build_member_granted_dm_embed(interaction.user)
+        except Exception as e:
+            await interaction.response.send_message(
+                "Could not render preview — check `messages.json` placeholders "
+                f"(`{{member.mention}}`, etc.).\n— {e}",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            "**Preview** — ephemeral only. You are standing in for the member; banner/footer match config.",
+            embed=embed,
+            ephemeral=True,
+        )
+    
+    @ui.button(label="Edit Ticket Open DM", style=discord.ButtonStyle.primary, row=1)
     async def edit_ticket_open(self, interaction: discord.Interaction, button: ui.Button):
         """Edit ticket open DM"""
         modal = TicketOpenModal(self.bot_instance)
         await interaction.response.send_modal(modal)
     
-    @ui.button(label="Back", style=discord.ButtonStyle.danger, row=1)
+    @ui.button(label="Preview Ticket DM", style=discord.ButtonStyle.success, row=1)
+    async def preview_ticket_open(self, interaction: discord.Interaction, button: ui.Button):
+        """Ephemeral embed preview; ticket link uses current channel as a sample jump URL."""
+        class _PreviewTicket:
+            __slots__ = ("jump_url",)
+            def __init__(self, url: str):
+                self.jump_url = url
+        
+        ch = interaction.channel
+        if isinstance(ch, discord.TextChannel) and ch.guild:
+            sample_url = ch.jump_url
+        elif interaction.guild:
+            sample_url = f"https://discord.com/channels/{interaction.guild.id}/0"
+        else:
+            sample_url = "https://discord.com/channels/0/0"
+        ticket = _PreviewTicket(sample_url)
+        try:
+            embed = self.bot_instance.build_ticket_open_dm_embed(interaction.user, ticket)
+        except Exception as e:
+            await interaction.response.send_message(
+                "Could not render preview — check placeholders "
+                f"(`{{member.mention}}`, `{{staff_user_id}}`, `{{ticket.jump_url}}`).\n— {e}",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            "**Preview** — ephemeral only. Ticket link is a sample (this channel or placeholder); "
+            "the live DM uses the real onboarding ticket channel.",
+            embed=embed,
+            ephemeral=True,
+        )
+    
+    @ui.button(label="Back", style=discord.ButtonStyle.danger, row=2)
     async def back(self, interaction: discord.Interaction, button: ui.Button):
         """Go back to main menu"""
         view = MessageEditorView(self.bot_instance)
