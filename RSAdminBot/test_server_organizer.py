@@ -428,5 +428,48 @@ class TestServerOrganizer:
                         self.channels_data["journal_channels"][map_key] = found.id
                         self._save_channels_data()
 
+        # Instorebotforwarder: optional per-watched-source journals (RSAdmin maps source_channel_id -> slug).
+        if isinstance(cfg, dict) and cfg.get("instorebotforwarder_split_source_journals") and "instorebotforwarder" in result:
+            raw_sources = cfg.get("instorebotforwarder_journal_sources")
+            if not isinstance(raw_sources, list):
+                raw_sources = []
+            for stream_slug in raw_sources:
+                s = str(stream_slug or "").strip().lower()
+                if not s or not all(c.isalnum() or c in "-_" for c in s):
+                    continue
+                s = s.replace("-", "_")
+                map_key = f"instorebotforwarder_{s}"
+                ch_slug = s.replace("_", "-")
+                channel_name = f"{channel_prefix}instorebotforwarder-{ch_slug}".lower()
+
+                have = False
+                existing_id = self.channels_data["journal_channels"].get(map_key)
+                if existing_id:
+                    ch = guild.get_channel(int(existing_id))
+                    if ch and isinstance(ch, discord.TextChannel):
+                        result[map_key] = ch.id
+                        have = True
+
+                if not have:
+                    found = discord.utils.get(guild.text_channels, name=channel_name, category=category)
+                    if not found:
+                        found = discord.utils.get(guild.text_channels, name=channel_name)
+                    if not found:
+                        try:
+                            found = await guild.create_text_channel(
+                                channel_name,
+                                category=category,
+                                reason="RSAdminBot Instorebotforwarder source journal (test server only)",
+                            )
+                        except discord.Forbidden:
+                            found = None
+                        except Exception:
+                            found = None
+
+                    if found:
+                        result[map_key] = found.id
+                        self.channels_data["journal_channels"][map_key] = found.id
+                        self._save_channels_data()
+
         return result
 

@@ -110,7 +110,24 @@
       "multi"
     ],
     "datamanager_journal_max_chars": 8000,
-    "datamanager_journal_flush_seconds": 2.5
+    "datamanager_journal_flush_seconds": 2.5,
+    "instorebotforwarder_split_source_journals": true,
+    "instorebotforwarder_journal_sources": [
+      "deals",
+      "amazon_leads",
+      "price_error_glitched",
+      "sneaker",
+      "affiliated_leads",
+      "conversational_deals"
+    ],
+    "instorebotforwarder_journal_source_ids": {
+      "1438969997178306661": "deals",
+      "1435066421133443174": "amazon_leads",
+      "1435985494356918333": "price_error_glitched",
+      "1435268379521847369": "sneaker",
+      "1435308472639160522": "affiliated_leads",
+      "1438970053352751215": "conversational_deals"
+    }
   },
   "whop_webhook": {
     "enabled": true,

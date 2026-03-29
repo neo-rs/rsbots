@@ -3403,6 +3403,11 @@ class RSAdminBot:
         self._journal_datamanager_buf_max_chars: int = 0
         self._journal_datamanager_flush_seconds: float = 0.0
         self._journal_dm_active_stream: str = "default"
+        # Instorebotforwarder journal-live: optional per-watched-source routing (see journal_live.instorebotforwarder_*).
+        self._journal_instore_split: bool = False
+        self._journal_instore_stream_webhooks: Dict[str, str] = {}
+        self._journal_instore_id_to_slug: Dict[str, str] = {}
+        self._journal_instore_active_stream: str = "default"
 
         # Setup bot with required intents
         intents = discord.Intents.default()
@@ -4724,6 +4729,16 @@ echo "TARGET=$TARGET"
                 else [],
                 "datamanager_journal_max_chars": int(cfg.get("datamanager_journal_max_chars") or 0),
                 "datamanager_journal_flush_seconds": float(cfg.get("datamanager_journal_flush_seconds") or 0),
+                # Instorebotforwarder: map watched source_channel_id -> stream slug; lines carry source ids / mentions.
+                "instorebotforwarder_split_source_journals": bool(
+                    cfg.get("instorebotforwarder_split_source_journals", False)
+                ),
+                "instorebotforwarder_journal_sources": list(cfg.get("instorebotforwarder_journal_sources") or [])
+                if isinstance(cfg.get("instorebotforwarder_journal_sources"), list)
+                else [],
+                "instorebotforwarder_journal_source_ids": dict(cfg.get("instorebotforwarder_journal_source_ids") or {})
+                if isinstance(cfg.get("instorebotforwarder_journal_source_ids"), dict)
+                else {},
             }
         except Exception:
             return {
@@ -4738,6 +4753,9 @@ echo "TARGET=$TARGET"
                 "datamanager_journal_streams": [],
                 "datamanager_journal_max_chars": 0,
                 "datamanager_journal_flush_seconds": 0.0,
+                "instorebotforwarder_split_source_journals": False,
+                "instorebotforwarder_journal_sources": [],
+                "instorebotforwarder_journal_source_ids": {},
             }
 
     def _get_webhooks_config(self) -> Dict[str, Any]:
@@ -5187,6 +5205,123 @@ echo "TARGET=$TARGET"
                     content_max=1900,
                 )
 
+    @staticmethod
+    def _instore_journal_extract_source_channel_id(line: str) -> Optional[int]:
+        """Parse a watched source channel id from Instorebotforwarder stdout (journald line)."""
+        s = line or ""
+        for pat in (
+            r"\bsource_channel_id=<#(\d+)>",
+            r"\bsource_channel_id=(\d+)\b",
+            r"\[FORWARD\]\s+posted\s+<#(\d+)>",
+            r"\bWatched source <#(\d+)>",
+            r"\bSource channel <#(\d+)>",
+            r"\bSource message \d+ on <#(\d+)>",
+            r"\bsource=<#(\d+)>",
+            r"\bsrc_channel_id=(\d+)\b",
+        ):
+            m = re.search(pat, s)
+            if m:
+                try:
+                    return int(m.group(1))
+                except Exception:
+                    continue
+        return None
+
+    def _instore_journal_resolve_slug(self, line: str) -> Optional[str]:
+        """If this line identifies a source channel, return bucket slug; unmapped id -> default; no id -> None."""
+        id_map = getattr(self, "_journal_instore_id_to_slug", None) or {}
+        cid = self._instore_journal_extract_source_channel_id(line)
+        if cid is None:
+            return None
+        key = str(int(cid))
+        raw = id_map.get(key) or id_map.get(str(cid))
+        if raw is None:
+            try:
+                raw = id_map.get(int(cid))  # type: ignore[arg-type]
+            except Exception:
+                raw = None
+        if not raw:
+            return "default"
+        slug = str(raw).strip().lower().replace("-", "_")
+        return slug or "default"
+
+    def _partition_instore_journal_lines(self, lines: List[str]) -> Dict[str, List[str]]:
+        """Assign lines to buckets using Instore stdout `stream=` (same contract as MWDataManagerBot), then id-map fallback."""
+        buckets: Dict[str, List[str]] = {}
+        cur = getattr(self, "_journal_instore_active_stream", "") or "default"
+        if not isinstance(cur, str):
+            cur = "default"
+        cur = cur.strip().lower().replace("-", "_") or "default"
+        for ln in lines:
+            line = ln or ""
+            m_stream = re.search(r"\bstream=([a-zA-Z0-9_]+)\b", line)
+            if m_stream:
+                cur = m_stream.group(1).lower()
+                self._journal_instore_active_stream = cur
+                buckets.setdefault(cur, []).append(ln)
+                continue
+            if "[BOOT]" in line:
+                cur = "default"
+                self._journal_instore_active_stream = "default"
+                buckets.setdefault("default", []).append(ln)
+                continue
+            resolved = self._instore_journal_resolve_slug(line)
+            if resolved is not None:
+                cur = resolved
+                self._journal_instore_active_stream = cur
+            buckets.setdefault(cur, []).append(ln)
+        return buckets
+
+    async def _flush_instore_journal_split(
+        self,
+        bot_key: str,
+        main_webhook_url: str,
+        stream_webhooks: Dict[str, str],
+        lines: List[str],
+    ) -> None:
+        partitions = self._partition_instore_journal_lines(lines)
+        if not partitions:
+            return
+        preferred = (
+            "deals",
+            "amazon_leads",
+            "amz_profitable_leads",
+            "price_error",
+            "price_error_glitched",
+            "sneaker",
+            "bricks_flip",
+            "affiliate",
+            "affiliated_leads",
+            "promo",
+            "conversational_deals",
+            "gemini_rephrase",
+            "default",
+        )
+
+        def _sort_key(item: Tuple[str, List[str]]) -> Tuple[int, str]:
+            k = item[0]
+            try:
+                return (preferred.index(k), k)
+            except ValueError:
+                return (len(preferred), k)
+
+        for stream_slug, sublines in sorted(partitions.items(), key=_sort_key):
+            if not sublines:
+                continue
+            target_url = str(stream_webhooks.get(stream_slug) or "").strip() or main_webhook_url
+            out_stream = stream_slug if stream_slug and stream_slug != "default" else "log"
+            for chunk in self._chunk_journal_lines_for_discord(sublines, max_body_chars=1650):
+                if not chunk:
+                    continue
+                await self._flush_journal_batch_plain(
+                    bot_key,
+                    target_url,
+                    chunk,
+                    stream=out_stream,
+                    prefer_head_truncation=True,
+                    content_max=1900,
+                )
+
     async def _journal_follow_loop(
         self,
         bot_key: str,
@@ -5320,6 +5455,11 @@ echo "TARGET=$TARGET"
                 sw = getattr(self, "_journal_datamanager_stream_webhooks", None) or {}
                 if isinstance(sw, dict) and sw:
                     await self._flush_datamanager_journal_split(bot_key, webhook_url, sw, lines)
+                    return
+            if bot_key == "instorebotforwarder" and getattr(self, "_journal_instore_split", False):
+                sw = getattr(self, "_journal_instore_stream_webhooks", None) or {}
+                if isinstance(sw, dict):
+                    await self._flush_instore_journal_split(bot_key, webhook_url, sw, lines)
                     return
             fw = str(fetch_webhook_url or "").strip()
             if bot_key == "discumbot" and fw:
@@ -5669,6 +5809,13 @@ echo "TARGET=$TARGET"
             )
             if cfg.get("datamanager_split_stream_journals") and dm_stream_ch:
                 extra += f" | MWDataManagerBot `stream=` split -> {dm_stream_ch} extra channel(s)"
+            instore_split_ch = sum(
+                1
+                for _k in channel_map.keys()
+                if str(_k).startswith("instorebotforwarder_") and str(_k) != "instorebotforwarder"
+            )
+            if cfg.get("instorebotforwarder_split_source_journals") and instore_split_ch:
+                extra += f" | Instorebotforwarder source split -> {instore_split_ch} extra channel(s)"
             print(
                 f"{Colors.GREEN}[Journal Live] Enabled. Channels: {len(channel_map)} "
                 f"(category_id={cfg.get('category_id')}){extra}{Colors.RESET}"
@@ -5739,6 +5886,33 @@ echo "TARGET=$TARGET"
             self._journal_datamanager_stream_webhooks = {}
             self._journal_datamanager_buf_max_chars = 0
             self._journal_datamanager_flush_seconds = 0.0
+
+        # Instorebotforwarder: watched source_channel_id -> stream slug (stdout uses <#id> and key=value).
+        try:
+            ins_split = bool(cfg.get("instorebotforwarder_split_source_journals", False))
+            self._journal_instore_split = ins_split
+            self._journal_instore_stream_webhooks = {}
+            idmap: Dict[str, str] = {}
+            raw_ins_ids = cfg.get("instorebotforwarder_journal_source_ids") or {}
+            if isinstance(raw_ins_ids, dict):
+                for k, v in raw_ins_ids.items():
+                    ks = str(k).strip()
+                    vs = str(v or "").strip().lower().replace("-", "_")
+                    if ks.isdigit() and vs:
+                        idmap[ks] = vs
+            self._journal_instore_id_to_slug = idmap
+            if ins_split and isinstance(journal_by_bot, dict):
+                for k, v in journal_by_bot.items():
+                    ks = str(k or "")
+                    if ks.startswith("instorebotforwarder_") and ks != "instorebotforwarder":
+                        part = ks[len("instorebotforwarder_") :].strip().lower().replace("-", "_")
+                        url = str(v or "").strip()
+                        if part and url:
+                            self._journal_instore_stream_webhooks[part] = url
+        except Exception:
+            self._journal_instore_split = False
+            self._journal_instore_stream_webhooks = {}
+            self._journal_instore_id_to_slug = {}
 
         # Systemd events webhook (single shared channel)
         sys_cfg = self._get_systemd_events_config()
