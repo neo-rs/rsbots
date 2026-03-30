@@ -2742,6 +2742,14 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
     did_i = int(did)
     member = guild.get_member(int(did_i))
     if not isinstance(member, discord.Member):
+        rj.tlog(
+            log,
+            "info",
+            rj.TICKETS,
+            "[TICKETS][DISCORD_MEMBER_FETCH] guild_id=%s discord_user_id=%s api=GET /guilds/{guild.id}/members/{user.id} reason=member_status_ticket_triggers_cache_miss",
+            guild.id,
+            int(did_i),
+        )
         with suppress(Exception):
             member = await guild.fetch_member(int(did_i))
     if not isinstance(member, discord.Member):
@@ -6826,6 +6834,59 @@ def _normalize_whop_std_event_type(evt: str) -> str:
     return mapping.get(e, e)
 
 
+def _whop_webhook_inbound_summary_line(payload: dict, headers: dict | None) -> str:
+    """One greppable line for operators: what Whop sent before async processing."""
+    hdrs = headers if isinstance(headers, dict) else {}
+    evt_raw = _whop_std_event_type(payload)
+    evt = _normalize_whop_std_event_type(evt_raw)
+    typ_display = evt or evt_raw or "unknown"
+    mid = _whop_std_membership_id(payload)
+    pay = _whop_std_payment_id(payload)
+    dspt = _whop_std_dispute_id(payload)
+    uid = _whop_std_user_id(payload)
+    wh_id = str(hdrs.get("webhook-id") or payload.get("id") or "").strip()
+    try:
+        msl = int(MEMBER_STATUS_LOGS_CHANNEL_ID or 0)
+    except Exception:
+        msl = 0
+    msl_txt = f"<#{msl}>" if msl else "member_status_logs_not_configured"
+    parts: list[str] = ["[WHOP][INBOUND]", f"type={typ_display}"]
+    if mid:
+        parts.append(f"membership_id={mid}")
+    if pay:
+        parts.append(f"payment_id={pay}")
+    if dspt:
+        parts.append(f"dispute_id={dspt}")
+    if uid:
+        parts.append(f"whop_user={uid}")
+    if wh_id:
+        parts.append(f"delivery_id={wh_id[:48]}")
+    parts.append(f"staff_card_destination={msl_txt}")
+    parts.append(
+        "eli5=HTTP_webhook_posts_staff_embed_to_member_status_then_on_message_applies_CRM_rules"
+    )
+    return " ".join(parts)
+
+
+def _whop_crm_effect_eli5(kind: str, evt_l: str) -> str:
+    """What support-ticket automation may do after the member-status card is posted (not on raw POST)."""
+    k = str(kind or "").strip()
+    el = str(evt_l or "").strip().lower()
+    if not k:
+        return "crm=no_movement_kind → ledger/state update only; no staff movement card → no ticket triggers from this hop"
+    if k == "payment_failed":
+        return "crm=may_open_billing_ticket_when_card_ingested (fingerprint membership|billing|day; billing_ticket_current_month_only)"
+    if k in {"cancellation_scheduled", "deactivated"}:
+        return "crm=may_open_cancellation_ticket_when_card_ingested (skips Lite product)"
+    if k == "payment_created":
+        return "crm=staff_movement_card_only; billing_CRM_not_from_payment.created (needs payment_failed / past_due / billing_issue style classification)"
+    if el.startswith("dispute."):
+        return "crm=dispute_resolution_case_flow (separate from billing/cancellation ticket categories)"
+    if k == "member_joined":
+        return "crm=member_status_rules_apply (e.g. free_pass on join if no membership id — see ticket handler)"
+    return f"crm=staff_card_then_member_status_rules (classified_kind={k})"
+
+
 async def _resolve_membership_id_for_std_webhook(evt: str, payload: dict) -> tuple[str, dict]:
     """Resolve membership_id for webhook types that don't include `membership` directly."""
     mid = _whop_std_membership_id(payload)
@@ -6926,6 +6987,14 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
     # Many webhook types (withdrawals, payout methods, invoices, etc.) have no membership context.
     # We still log them above; staff-card output only happens when we can resolve a membership.
     if not mid:
+        rj.tlog(
+            log,
+            "info",
+            rj.WHOP_WEBHOOK,
+            "[WHOP][SKIP_NO_MEMBERSHIP] type=%s delivery_id=%s shallow_mid_empty_after_resolve → no_staff_card no_crm_from_http",
+            evt,
+            str((headers or {}).get("webhook-id") or "")[:48],
+        )
         return
 
     now = datetime.now(timezone.utc)
@@ -6955,6 +7024,14 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
         # Fetch authoritative state via API (totals + dashboard). Discord linkage is enriched via whop-logs fallback.
         brief = await _fetch_whop_brief_by_membership_id(mid)
         if not isinstance(brief, dict) or not brief:
+            rj.tlog(
+                log,
+                "warning",
+                rj.WHOP_WEBHOOK,
+                "[WHOP][SKIP_NO_BRIEF] mid=%s type=%s → Whop_API_brief_empty_no_staff_card",
+                mid,
+                evt,
+            )
             return
 
         # Whop API sometimes omits user.email in membership payload; use webhook payload as fallback so
@@ -7048,9 +7125,28 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
             state["sent"] = sent
             state["cases"] = cases
             _save_whop_api_events_state(state)
+            rj.tlog(
+                log,
+                "info",
+                rj.WHOP_WEBHOOK,
+                "[WHOP][STATE_ONLY] type=%s mid=%s → no_classified_movement_kind; no_staff_embed_this_delivery",
+                evt_l,
+                mid2,
+            )
             return
 
         title, color, embed_kind = _title_for_event(kind)
+        rj.tlog(
+            log,
+            "info",
+            rj.WHOP_WEBHOOK,
+            "[WHOP][CLASSIFIED] type=%s kind=%s mid=%s embed_kind=%s | %s",
+            evt_l,
+            kind,
+            mid2,
+            embed_kind,
+            _whop_crm_effect_eli5(kind, evt_l),
+        )
         # Fill missing Whop fields from membership-log baseline (no extra API calls).
         try:
             if not isinstance(brief, dict):
@@ -7154,6 +7250,14 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
         if did:
             member_obj = guild.get_member(int(did))
             if member_obj is None:
+                rj.tlog(
+                    log,
+                    "info",
+                    rj.WHOP_WEBHOOK,
+                    "[WHOP][DISCORD_MEMBER_FETCH] guild_id=%s discord_user_id=%s api=GET /guilds/{guild.id}/members/{user.id} reason=cache_miss_whop_webhook (429=Discord_rate_limit_same_endpoint)",
+                    guild.id,
+                    int(did),
+                )
                 with suppress(Exception):
                     member_obj = await guild.fetch_member(int(did))
 
@@ -7221,6 +7325,14 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                 if did:
                     member_obj = guild.get_member(int(did))
                     if member_obj is None:
+                        rj.tlog(
+                            log,
+                            "info",
+                            rj.WHOP_WEBHOOK,
+                            "[WHOP][DISCORD_MEMBER_FETCH] guild_id=%s discord_user_id=%s api=GET /guilds/{guild.id}/members/{user.id} reason=after_unlinked_delay_cache_miss",
+                            guild.id,
+                            int(did),
+                        )
                         with suppress(Exception):
                             member_obj = await guild.fetch_member(int(did))
 
@@ -7413,7 +7525,8 @@ async def handle_whop_webhook_receiver(request):
             log,
             "info",
             rj.WHOP_WEBHOOK,
-            "Received Whop webhook payload (saved to %s)",
+            "%s | raw_saved=%s",
+            _whop_webhook_inbound_summary_line(payload, headers),
             WHOP_WEBHOOK_RAW_LOG_FILE.name,
         )
 
