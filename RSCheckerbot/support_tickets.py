@@ -179,6 +179,156 @@ async def _log(msg: str) -> None:
             await fn(str(msg)[:1800])
 
 
+def _crm_fmt(action: str, **kv: object) -> str:
+    """Single-line CRM trace for bot logs / journal (channel and user ids as Discord mentions)."""
+    action_u = str(action or "").strip().upper() or "EVENT"
+    parts: list[str] = [f"[CRM][{action_u}]"]
+    for k, v in kv.items():
+        if v is None:
+            continue
+        vs = str(v).strip()
+        if not vs:
+            continue
+        key = str(k).strip().lower()
+        if key in {"channel_id", "last_channel_id", "existing_channel_id", "category_id"}:
+            with suppress(Exception):
+                iv = int(vs)
+                if iv > 0:
+                    vs = f"<#{iv}>"
+        elif key == "user_id":
+            with suppress(Exception):
+                iv = int(vs)
+                if iv > 0:
+                    vs = f"<@{iv}>"
+        elif key == "fingerprint":
+            vs = vs[:120] + ("…" if len(vs) > 120 else "")
+        parts.append(f"{key}={vs}")
+    return " ".join(parts)
+
+
+async def _crm_log(action: str, **kv: object) -> None:
+    await _log(_crm_fmt(action, **kv))
+
+
+def _crm_collect_config_issues() -> list[str]:
+    """Structural + guild-resolution checks (call only when _ensure_cfg_loaded())."""
+    issues: list[str] = []
+    cfg = _CFG
+    bot = _BOT
+    if not cfg:
+        return ["cfg_missing"]
+    if int(cfg.guild_id or 0) <= 0:
+        issues.append("guild_id_missing")
+    guild = bot.get_guild(int(cfg.guild_id)) if bot and cfg.guild_id else None
+    if cfg.guild_id > 0 and not guild:
+        issues.append(f"guild_not_visible id={cfg.guild_id}")
+
+    def check_cat(label: str, cid: int) -> None:
+        if int(cid or 0) <= 0:
+            issues.append(f"{label}_category_missing")
+        elif guild:
+            ch = guild.get_channel(int(cid))
+            if not isinstance(ch, discord.CategoryChannel):
+                issues.append(f"{label}_category_invalid id={cid}")
+
+    check_cat("billing", cfg.billing_category_id)
+    check_cat("cancellation", cfg.cancellation_category_id)
+    check_cat("free_pass", cfg.free_pass_category_id)
+    check_cat("member_welcome", cfg.member_welcome_category_id)
+    check_cat("no_whop_link", cfg.no_whop_link_category_id)
+    check_cat("transcript", cfg.transcript_category_id)
+
+    def check_text(label: str, cid: int, required: bool) -> None:
+        if not required:
+            return
+        if int(cid or 0) <= 0:
+            issues.append(f"{label}_channel_missing")
+        elif guild:
+            ch = guild.get_channel(int(cid))
+            if not isinstance(ch, discord.TextChannel):
+                issues.append(f"{label}_channel_invalid id={cid}")
+
+    check_text("cancellation_transcript", cfg.cancellation_transcript_channel_id, True)
+    check_text("billing_transcript", cfg.billing_transcript_channel_id, True)
+    check_text("free_pass_transcript", cfg.free_pass_transcript_channel_id, True)
+    check_text("what_you_missed", cfg.what_you_missed_channel_id, True)
+    if cfg.audit_enabled:
+        check_text("audit_logs", cfg.audit_channel_id, True)
+    if cfg.member_lookup_enabled:
+        check_text("member_lookup_panel", cfg.member_lookup_channel_id, True)
+    if int(cfg.member_status_logs_channel_id or 0) <= 0:
+        issues.append("member_status_logs_channel_missing")
+
+    if cfg.no_whop_link_enabled and int(cfg.no_whop_link_members_role_id or 0) <= 0:
+        issues.append("no_whop_link_members_role_missing")
+
+    if guild:
+        for rid in cfg.staff_role_ids:
+            if not guild.get_role(int(rid)):
+                issues.append(f"staff_role_missing id={rid}")
+        for rid in cfg.admin_role_ids:
+            if not guild.get_role(int(rid)):
+                issues.append(f"admin_role_missing id={rid}")
+
+    role_pairs = [
+        ("billing_role", cfg.billing_role_id),
+        ("cancellation_role", cfg.cancellation_role_id),
+        ("free_pass_no_whop_role", cfg.free_pass_no_whop_role_id),
+        ("no_whop_link_role", cfg.no_whop_link_role_id),
+    ]
+    for label, rid in role_pairs:
+        if int(rid or 0) <= 0:
+            issues.append(f"{label}_missing")
+        elif guild and not guild.get_role(int(rid)):
+            issues.append(f"{label}_invalid id={rid}")
+
+    return issues
+
+
+async def run_crm_startup_audit() -> None:
+    """Post-ready: log misconfiguration and open-ticket index summary to the ticket log sink."""
+    if not _ensure_cfg_loaded():
+        await _log("[CRM][CONFIG_AUDIT] skipped_not_initialized")
+        return
+    cfg = _cfg()
+    if not cfg:
+        return
+    issues = _crm_collect_config_issues()
+    guild = _BOT.get_guild(int(cfg.guild_id)) if _BOT else None
+
+    open_by_type: dict[str, int] = {}
+    orphan_lines: list[str] = []
+    try:
+        db = _index_load()
+        for tid_key, rec in _ticket_iter(db):
+            if not _ticket_is_open(rec):
+                continue
+            t = str(rec.get("ticket_type") or "").strip().lower() or "unknown"
+            open_by_type[t] = open_by_type.get(t, 0) + 1
+            chid = _as_int(rec.get("channel_id"))
+            if guild and chid:
+                ch = guild.get_channel(int(chid))
+                if not isinstance(ch, discord.TextChannel):
+                    tid_str = str(rec.get("ticket_id") or tid_key or "").strip()
+                    orphan_lines.append(f"type={t} ticket_id={tid_str} channel_id={chid}")
+    except Exception:
+        pass
+
+    iss_joined = "; ".join(issues) if issues else "none"
+    if len(iss_joined) > 1600:
+        iss_joined = iss_joined[:1600] + "…"
+    await _crm_log("CONFIG_AUDIT", guild_id=cfg.guild_id, issues=iss_joined)
+
+    summary = " ".join(f"{k}={v}" for k, v in sorted(open_by_type.items()))
+    await _log(f"[CRM][OPEN_INDEX] {summary if summary else 'none'}")
+
+    if orphan_lines:
+        oj = "; ".join(orphan_lines[:10])
+        if len(orphan_lines) > 10:
+            oj += f" …(+{len(orphan_lines) - 10} more)"
+        await _log(f"[CRM][OPEN_INDEX_ORPHAN] {oj}")
+
+
 def initialize(
     *,
     bot: commands.Bot,
@@ -3586,11 +3736,13 @@ async def _open_or_update_ticket(
         return None
     if int(category_id or 0) <= 0:
         await _log(f"⚠️ support_tickets: category_id is not configured for type={ticket_type}")
+        await _crm_log("OPEN_ABORT", reason="category_id_missing", ticket_type=ticket_type, user_id=int(owner.id))
         return None
 
     guild = _BOT.get_guild(int(cfg.guild_id))
     if not guild:
         await _log(f"⚠️ support_tickets: guild not found (guild_id={cfg.guild_id})")
+        await _crm_log("OPEN_ABORT", reason="guild_not_found", ticket_type=ticket_type, user_id=int(owner.id), guild_id=cfg.guild_id)
         return None
 
     # Preflight: category existence + bot perms (this is the #1 reason tickets "stop" after role/category changes).
@@ -3600,6 +3752,13 @@ async def _open_or_update_ticket(
         cat = None
     if not isinstance(cat, discord.CategoryChannel):
         await _log(f"❌ support_tickets: category not found type={ticket_type} category_id={int(category_id)}")
+        await _crm_log(
+            "CONFIG_FAIL",
+            reason="category_not_found",
+            ticket_type=ticket_type,
+            user_id=int(owner.id),
+            category_id=int(category_id),
+        )
     else:
         me = getattr(guild, "me", None) or guild.get_member(int(getattr(getattr(_BOT, "user", None), "id", 0) or 0))
         if isinstance(me, discord.Member):
@@ -3668,6 +3827,14 @@ async def _open_or_update_ticket(
                         fingerprint=fingerprint,
                         reference_jump_url=reference_jump_url,
                     )
+                await _crm_log(
+                    "DEDUP_REUSE",
+                    ticket_type=ticket_type,
+                    user_id=int(owner.id),
+                    channel_id=int(ch.id),
+                    ticket_id=existing_ticket_id,
+                    fingerprint=str(fingerprint or ""),
+                )
                 # Important: do NOT bump last_activity for bot messages.
                 return ch
 
@@ -3708,6 +3875,15 @@ async def _open_or_update_ticket(
                         fingerprint=fingerprint,
                         reference_jump_url=reference_jump_url,
                     )
+                await _crm_log(
+                    "OPEN_SUPPRESSED_COOLDOWN",
+                    ticket_type=ticket_type,
+                    user_id=int(owner.id),
+                    last_ticket_id=str(last_rec.get("ticket_id") or last_tid or "").strip(),
+                    last_channel_id=int(_as_int(last_rec.get("channel_id"))),
+                    cooldown_seconds=int(cd_s),
+                    fingerprint=str(fingerprint or ""),
+                )
                 # Return a truthy sentinel so callers don't log this as a "failed open".
                 return discord.Object(id=int(_as_int(last_rec.get("channel_id")) or owner.id))
 
@@ -3735,6 +3911,13 @@ async def _open_or_update_ticket(
         )
         if not isinstance(ch, discord.TextChannel):
             await _log(f"❌ support_tickets: failed to create ticket channel type={ticket_type} user_id={owner.id}")
+            await _crm_log(
+                "OPEN_FAIL",
+                reason="channel_create_failed",
+                ticket_type=ticket_type,
+                user_id=int(owner.id),
+                category_id=int(category_id),
+            )
             return None
 
         # Safety: ensure configured staff roles can view the channel (especially if a channel was found pre-existing).
@@ -3800,6 +3983,14 @@ async def _open_or_update_ticket(
 
         db["tickets"][ticket_id] = rec  # type: ignore[index]
         _index_save(db)
+        await _crm_log(
+            "OPEN",
+            ticket_type=ticket_type,
+            user_id=int(owner.id),
+            channel_id=int(ch.id),
+            ticket_id=ticket_id,
+            category_id=int(category_id),
+        )
         return ch
 
 
@@ -5415,6 +5606,7 @@ async def close_ticket_by_channel_id(
     # Capture ticket metadata up-front (for role removal / fallback close).
     ticket_type = ""
     ticket_user_id = 0
+    ticket_id_meta = ""
     async with _INDEX_LOCK:
         db0 = _index_load()
         found0 = _ticket_by_channel_id(db0, int(channel_id))
@@ -5422,6 +5614,7 @@ async def close_ticket_by_channel_id(
             _tid0, rec0 = found0
             ticket_type = str(rec0.get("ticket_type") or "").strip().lower()
             ticket_user_id = _as_int(rec0.get("user_id"))
+            ticket_id_meta = str(rec0.get("ticket_id") or _tid0 or "").strip()
 
     ch = guild.get_channel(int(channel_id))
     if not isinstance(ch, discord.TextChannel):
@@ -5437,6 +5630,17 @@ async def close_ticket_by_channel_id(
                     rec["closed_at_iso"] = _now_iso()
                     db["tickets"][tid] = rec  # type: ignore[index]
                     _index_save(db)
+        _crm_close_kw: dict[str, object] = {
+            "outcome": "index_closed_channel_gone",
+            "channel_id": int(channel_id),
+            "ticket_type": ticket_type or "unknown",
+            "close_reason": str(close_reason or "channel_missing"),
+        }
+        if ticket_id_meta:
+            _crm_close_kw["ticket_id"] = ticket_id_meta
+        if ticket_user_id:
+            _crm_close_kw["user_id"] = int(ticket_user_id)
+        await _crm_log("CLOSE", **_crm_close_kw)
         # Auto-remove the role tied to this ticket type.
         if ticket_user_id and ticket_type:
             mobj = guild.get_member(int(ticket_user_id))
@@ -5452,6 +5656,17 @@ async def close_ticket_by_channel_id(
         ok = await export_transcript_for_channel_id(int(channel_id), close_reason=close_reason)
         if not ok:
             await _log(f"❌ support_tickets: transcript failed; refusing to delete ticket channel_id={channel_id}")
+            _crm_abort: dict[str, object] = {
+                "reason": "transcript_failed",
+                "channel_id": int(channel_id),
+                "close_reason": str(close_reason or ""),
+                "ticket_type": ticket_type or "unknown",
+            }
+            if ticket_id_meta:
+                _crm_abort["ticket_id"] = ticket_id_meta
+            if ticket_user_id:
+                _crm_abort["user_id"] = int(ticket_user_id)
+            await _crm_log("CLOSE_ABORT", **_crm_abort)
             return False
     else:
         # No transcript requested: still mark closed (keeps index + role state consistent).
@@ -5480,6 +5695,19 @@ async def close_ticket_by_channel_id(
     if delete_channel:
         with suppress(Exception):
             await ch.delete(reason=f"RSCheckerbot: close ticket ({close_reason})")
+    _crm_done: dict[str, object] = {
+        "outcome": "deleted" if delete_channel else "closed_kept_channel",
+        "channel_id": int(channel_id),
+        "do_transcript": bool(do_transcript),
+        "delete_channel": bool(delete_channel),
+        "close_reason": str(close_reason or ""),
+        "ticket_type": ticket_type or "unknown",
+    }
+    if ticket_id_meta:
+        _crm_done["ticket_id"] = ticket_id_meta
+    if ticket_user_id:
+        _crm_done["user_id"] = int(ticket_user_id)
+    await _crm_log("CLOSE", **_crm_done)
     return True
 
 
@@ -5512,6 +5740,14 @@ async def close_open_ticket_for_user(
                 ch_id = _as_int(rec.get("channel_id"))
     if not ch_id:
         return False
+    await _crm_log(
+        "CLOSE_REQUEST",
+        scope="by_user_open_ticket",
+        ticket_type=t,
+        user_id=uid,
+        channel_id=int(ch_id),
+        close_reason=str(close_reason or ""),
+    )
     return bool(
         await close_ticket_by_channel_id(
             int(ch_id),
@@ -5557,6 +5793,13 @@ async def close_free_pass_if_whop_linked(
             break
     if not ch_id:
         return
+    await _crm_log(
+        "RESOLUTION_TRIGGER",
+        ticket_type="free_pass",
+        user_id=int(uid),
+        channel_id=int(ch_id),
+        resolution_event=str(resolution_event or "whop_linked"),
+    )
     # Prefer follow-up + role removal, then let the sweeper auto-close after grace.
     with suppress(Exception):
         await post_resolution_followup_and_remove_role(
@@ -5598,6 +5841,13 @@ async def close_no_whop_link_if_linked(
     if not ch_id:
         return
 
+    await _crm_log(
+        "RESOLUTION_TRIGGER",
+        ticket_type="no_whop_link",
+        user_id=int(uid),
+        channel_id=int(ch_id),
+        resolution_event=str(resolution_event or "whop_linked"),
+    )
     # Close (this also removes the no-whop role). We still post a small update into transcript.
     with suppress(Exception):
         await post_resolution_followup_and_remove_role(
@@ -5698,6 +5948,8 @@ async def sweep_no_whop_link_cleanup(*, force: bool = False) -> str:
     if closed > 0 or role_removed > 0:
         with suppress(Exception):
             await _log(f"🧹 support_tickets: no_whop_link cleanup {summary}")
+        with suppress(Exception):
+            await _crm_log("SWEEP", scope="no_whop_link_cleanup", summary=summary)
     return summary
 
 

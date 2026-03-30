@@ -9316,6 +9316,10 @@ async def on_ready():
         # Don't silently disable the whole ticket system.
         with suppress(Exception):
             await log_other(f"❌ support_tickets.initialize failed: `{str(e)[:400]}`", flow=rj.TICKETS)
+    else:
+        # CRM: config + open-index audit (categories, transcripts, roles, orphan channels).
+        with suppress(Exception):
+            asyncio.create_task(support_tickets.run_crm_startup_audit())
 
     # Run nowhop cleanup immediately on startup (restart-safe).
     # This closes resolved `no_whop_link` tickets + removes stale No-Whop roles once linkage is confirmed.
