@@ -127,7 +127,20 @@
       "1435268379521847369": "sneaker",
       "1435308472639160522": "affiliated_leads",
       "1438970053352751215": "conversational_deals"
-    }
+    },
+    "rscheckerbot_split_flow_journals": true,
+    "rscheckerbot_journal_flows": [
+      "whop_http_inbound",
+      "whop_http_process",
+      "whop_logs_scan",
+      "member_status_crm",
+      "tickets",
+      "persist",
+      "http",
+      "startup"
+    ],
+    "rscheckerbot_journal_max_chars": 6000,
+    "rscheckerbot_journal_flush_seconds": 2
   },
   "whop_webhook": {
     "enabled": true,

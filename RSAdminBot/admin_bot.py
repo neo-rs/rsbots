@@ -27,7 +27,7 @@ import time
 import re
 from collections import deque
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable, Union
+from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable, Union, Set
 from datetime import datetime, timezone, timedelta
 from contextlib import suppress
 
@@ -3408,6 +3408,13 @@ class RSAdminBot:
         self._journal_instore_stream_webhooks: Dict[str, str] = {}
         self._journal_instore_id_to_slug: Dict[str, str] = {}
         self._journal_instore_active_stream: str = "default"
+        # RSCheckerbot journal-live: optional per-flow routing (stdout `[RSCheckerbot][FLOW]`).
+        self._journal_rscheckerbot_split: bool = False
+        self._journal_rscheckerbot_stream_webhooks: Dict[str, str] = {}
+        self._journal_rscheckerbot_flow_slugs: Set[str] = set()
+        self._journal_rschecker_active_flow: str = "default"
+        self._journal_rscheckerbot_buf_max_chars: int = 0
+        self._journal_rscheckerbot_flush_seconds: float = 0.0
 
         # Setup bot with required intents
         intents = discord.Intents.default()
@@ -4739,6 +4746,13 @@ echo "TARGET=$TARGET"
                 "instorebotforwarder_journal_source_ids": dict(cfg.get("instorebotforwarder_journal_source_ids") or {})
                 if isinstance(cfg.get("instorebotforwarder_journal_source_ids"), dict)
                 else {},
+                # RSCheckerbot: split journald lines by `[RSCheckerbot][FLOW]` (matches RSCheckerbot rschecker_journal flow keys).
+                "rscheckerbot_split_flow_journals": bool(cfg.get("rscheckerbot_split_flow_journals", False)),
+                "rscheckerbot_journal_flows": list(cfg.get("rscheckerbot_journal_flows") or [])
+                if isinstance(cfg.get("rscheckerbot_journal_flows"), list)
+                else [],
+                "rscheckerbot_journal_max_chars": int(cfg.get("rscheckerbot_journal_max_chars") or 0),
+                "rscheckerbot_journal_flush_seconds": float(cfg.get("rscheckerbot_journal_flush_seconds") or 0),
             }
         except Exception:
             return {
@@ -4756,6 +4770,10 @@ echo "TARGET=$TARGET"
                 "instorebotforwarder_split_source_journals": False,
                 "instorebotforwarder_journal_sources": [],
                 "instorebotforwarder_journal_source_ids": {},
+                "rscheckerbot_split_flow_journals": False,
+                "rscheckerbot_journal_flows": [],
+                "rscheckerbot_journal_max_chars": 0,
+                "rscheckerbot_journal_flush_seconds": 0.0,
             }
 
     def _get_webhooks_config(self) -> Dict[str, Any]:
@@ -5322,6 +5340,76 @@ echo "TARGET=$TARGET"
                     content_max=1900,
                 )
 
+    def _partition_rscheckerbot_journal_lines(self, lines: List[str]) -> Dict[str, List[str]]:
+        """Assign RSCheckerbot journald lines to buckets using `[RSCheckerbot][FLOW]` (FLOW upper snake)."""
+        buckets: Dict[str, List[str]] = {}
+        streams: Set[str] = getattr(self, "_journal_rscheckerbot_flow_slugs", set()) or set()
+        cur = getattr(self, "_journal_rschecker_active_flow", "default") or "default"
+        for ln in lines:
+            m = re.search(r"\[RSCheckerbot\]\[([A-Z0-9_]+)\]", ln or "")
+            if m:
+                slug = m.group(1).lower()
+                if slug in streams:
+                    cur = slug
+                else:
+                    cur = "default"
+                self._journal_rschecker_active_flow = cur
+            buckets.setdefault(cur, []).append(ln)
+        return buckets
+
+    async def _flush_rscheckerbot_journal_split(
+        self,
+        bot_key: str,
+        main_webhook_url: str,
+        stream_webhooks: Dict[str, str],
+        lines: List[str],
+    ) -> None:
+        partitions = self._partition_rscheckerbot_journal_lines(lines)
+        if not partitions:
+            return
+        preferred = (
+            "whop_http_inbound",
+            "whop_http_process",
+            "whop_logs_scan",
+            "member_status_crm",
+            "whop_webhook",
+            "tickets",
+            "persist",
+            "http",
+            "startup",
+            "whop_api",
+            "whop_sync",
+            "whop_discord",
+            "staff_embeds",
+            "member_history",
+            "support_sweep",
+            "default",
+        )
+
+        def _sort_key(item: Tuple[str, List[str]]) -> Tuple[int, str]:
+            k = item[0]
+            try:
+                return (preferred.index(k), k)
+            except ValueError:
+                return (len(preferred), k)
+
+        for stream_slug, sublines in sorted(partitions.items(), key=_sort_key):
+            if not sublines:
+                continue
+            target_url = str(stream_webhooks.get(stream_slug) or "").strip() or main_webhook_url
+            out_stream = stream_slug if stream_slug and stream_slug != "default" else "log"
+            for chunk in self._chunk_journal_lines_for_discord(sublines, max_body_chars=1650):
+                if not chunk:
+                    continue
+                await self._flush_journal_batch_plain(
+                    bot_key,
+                    target_url,
+                    chunk,
+                    stream=out_stream,
+                    prefer_head_truncation=True,
+                    content_max=1900,
+                )
+
     async def _journal_follow_loop(
         self,
         bot_key: str,
@@ -5345,6 +5433,13 @@ echo "TARGET=$TARGET"
             dm_fs = float(getattr(self, "_journal_datamanager_flush_seconds", 0) or cfg.get("datamanager_journal_flush_seconds") or 0)
             if dm_fs > 0:
                 flush_seconds = max(0.5, min(dm_fs, 15.0))
+        if bot_key == "rscheckerbot" and getattr(self, "_journal_rscheckerbot_split", False):
+            rc_mc = int(getattr(self, "_journal_rscheckerbot_buf_max_chars", 0) or cfg.get("rscheckerbot_journal_max_chars") or 0)
+            if rc_mc > 0:
+                max_chars = max(800, min(rc_mc, 12000))
+            rc_fs = float(getattr(self, "_journal_rscheckerbot_flush_seconds", 0) or cfg.get("rscheckerbot_journal_flush_seconds") or 0)
+            if rc_fs > 0:
+                flush_seconds = max(0.5, min(rc_fs, 15.0))
 
         # Context window for high-signal extraction
         ctx_window = deque(maxlen=6)
@@ -5460,6 +5555,11 @@ echo "TARGET=$TARGET"
                 sw = getattr(self, "_journal_instore_stream_webhooks", None) or {}
                 if isinstance(sw, dict):
                     await self._flush_instore_journal_split(bot_key, webhook_url, sw, lines)
+                    return
+            if bot_key == "rscheckerbot" and getattr(self, "_journal_rscheckerbot_split", False):
+                sw = getattr(self, "_journal_rscheckerbot_stream_webhooks", None) or {}
+                if isinstance(sw, dict):
+                    await self._flush_rscheckerbot_journal_split(bot_key, webhook_url, sw, lines)
                     return
             fw = str(fetch_webhook_url or "").strip()
             if bot_key == "discumbot" and fw:
@@ -5816,6 +5916,13 @@ echo "TARGET=$TARGET"
             )
             if cfg.get("instorebotforwarder_split_source_journals") and instore_split_ch:
                 extra += f" | Instorebotforwarder source split -> {instore_split_ch} extra channel(s)"
+            rc_split_ch = sum(
+                1
+                for _k in channel_map.keys()
+                if str(_k).startswith("rscheckerbot_") and str(_k) != "rscheckerbot"
+            )
+            if cfg.get("rscheckerbot_split_flow_journals") and rc_split_ch:
+                extra += f" | RSCheckerbot `[RSCheckerbot][FLOW]` split -> {rc_split_ch} extra channel(s)"
             print(
                 f"{Colors.GREEN}[Journal Live] Enabled. Channels: {len(channel_map)} "
                 f"(category_id={cfg.get('category_id')}){extra}{Colors.RESET}"
@@ -5913,6 +6020,43 @@ echo "TARGET=$TARGET"
             self._journal_instore_split = False
             self._journal_instore_stream_webhooks = {}
             self._journal_instore_id_to_slug = {}
+
+        # RSCheckerbot: flow slug -> webhook (`journal_by_bot` keys like `rscheckerbot_whop_http_process`).
+        try:
+            rc_split = bool(cfg.get("rscheckerbot_split_flow_journals", False))
+            self._journal_rscheckerbot_split = rc_split
+            self._journal_rscheckerbot_stream_webhooks = {}
+            self._journal_rscheckerbot_flow_slugs = set()
+            self._journal_rschecker_active_flow = "default"
+            try:
+                self._journal_rscheckerbot_buf_max_chars = int(cfg.get("rscheckerbot_journal_max_chars") or 0)
+            except Exception:
+                self._journal_rscheckerbot_buf_max_chars = 0
+            try:
+                self._journal_rscheckerbot_flush_seconds = float(cfg.get("rscheckerbot_journal_flush_seconds") or 0)
+            except Exception:
+                self._journal_rscheckerbot_flush_seconds = 0.0
+            raw_rc = cfg.get("rscheckerbot_journal_flows") or []
+            if isinstance(raw_rc, list):
+                for x in raw_rc:
+                    s = str(x or "").strip().lower().replace("-", "_")
+                    if s and all(c.isalnum() or c == "_" for c in s):
+                        self._journal_rscheckerbot_flow_slugs.add(s)
+            if rc_split and isinstance(journal_by_bot, dict):
+                for k, v in journal_by_bot.items():
+                    ks = str(k or "")
+                    if ks.startswith("rscheckerbot_") and ks != "rscheckerbot":
+                        part = ks[len("rscheckerbot_") :].strip().lower().replace("-", "_")
+                        url = str(v or "").strip()
+                        if part and url:
+                            self._journal_rscheckerbot_stream_webhooks[part] = url
+        except Exception:
+            self._journal_rscheckerbot_split = False
+            self._journal_rscheckerbot_stream_webhooks = {}
+            self._journal_rscheckerbot_flow_slugs = set()
+            self._journal_rschecker_active_flow = "default"
+            self._journal_rscheckerbot_buf_max_chars = 0
+            self._journal_rscheckerbot_flush_seconds = 0.0
 
         # Systemd events webhook (single shared channel)
         sys_cfg = self._get_systemd_events_config()

@@ -471,5 +471,48 @@ class TestServerOrganizer:
                         self.channels_data["journal_channels"][map_key] = found.id
                         self._save_channels_data()
 
+        # RSCheckerbot: optional per-flow journals (matches stdout `[RSCheckerbot][FLOW]` from rschecker_journal).
+        if isinstance(cfg, dict) and cfg.get("rscheckerbot_split_flow_journals") and "rscheckerbot" in result:
+            raw_flows = cfg.get("rscheckerbot_journal_flows")
+            if not isinstance(raw_flows, list):
+                raw_flows = []
+            for flow_slug in raw_flows:
+                s = str(flow_slug or "").strip().lower()
+                if not s or not all(c.isalnum() or c in "-_" for c in s):
+                    continue
+                s = s.replace("-", "_")
+                map_key = f"rscheckerbot_{s}"
+                ch_slug = s.replace("_", "-")
+                channel_name = f"{channel_prefix}rscheckerbot-{ch_slug}".lower()
+
+                have = False
+                existing_id = self.channels_data["journal_channels"].get(map_key)
+                if existing_id:
+                    ch = guild.get_channel(int(existing_id))
+                    if ch and isinstance(ch, discord.TextChannel):
+                        result[map_key] = ch.id
+                        have = True
+
+                if not have:
+                    found = discord.utils.get(guild.text_channels, name=channel_name, category=category)
+                    if not found:
+                        found = discord.utils.get(guild.text_channels, name=channel_name)
+                    if not found:
+                        try:
+                            found = await guild.create_text_channel(
+                                channel_name,
+                                category=category,
+                                reason="RSAdminBot RSCheckerbot flow journal (test server only)",
+                            )
+                        except discord.Forbidden:
+                            found = None
+                        except Exception:
+                            found = None
+
+                    if found:
+                        result[map_key] = found.id
+                        self.channels_data["journal_channels"][map_key] = found.id
+                        self._save_channels_data()
+
         return result
 
