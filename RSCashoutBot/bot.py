@@ -1009,13 +1009,28 @@ class RSTicketBot(commands.Bot):
             open_count = await self.store.count_open_tickets(guild.id, user.id, button_def.key)
             if open_count >= open_limit:
                 existing = await self.store.find_open_ticket(guild.id, user.id, button_def.key)
-                target = fmt_ch(existing['channel_id']) if existing else 'your existing ticket'
-                msg = f'You already have the max number of open {button_def.label} tickets. Use {target} first.'
-                if interaction.response.is_done():
-                    await interaction.followup.send(msg, ephemeral=True)
-                else:
-                    await interaction.response.send_message(msg, ephemeral=True)
-                return
+                # If Discord deleted the ticket channel but our tickets.json still marks it open,
+                # we would block forever and show "#unknown". Purge stale records and retry.
+                if existing and existing.get('channel_id'):
+                    ch_id = int(existing['channel_id'])
+                    ch = guild.get_channel(ch_id) if ch_id else None
+                    if ch is None or not isinstance(ch, discord.TextChannel):
+                        FLOW.warn_note(
+                            f'Purged stale open ticket record for channel_id={ch_id} (channel missing).'
+                        )
+                        await self.store.delete_ticket(ch_id)
+                        open_count = await self.store.count_open_tickets(guild.id, user.id, button_def.key)
+                    else:
+                        ch_id = int(existing['channel_id'])
+
+                if open_count >= open_limit:
+                    target = fmt_ch(existing['channel_id']) if existing else 'your existing ticket'
+                    msg = f'You already have the max number of open {button_def.label} tickets. Use {target} first.'
+                    if interaction.response.is_done():
+                        await interaction.followup.send(msg, ephemeral=True)
+                    else:
+                        await interaction.response.send_message(msg, ephemeral=True)
+                    return
 
         category = guild.get_channel(self.runtime.ticket.ticket_category_id)
         if not isinstance(category, discord.CategoryChannel):
