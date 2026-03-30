@@ -474,6 +474,10 @@ class SheetClient:
                 ('Route', route),
                 ('Ticket channel', fmt_ch(int(cid)) if cid is not None else '(?)'),
                 ('User', fmt_user(uid) if uid else '(?)'),
+                ('Result ok', parsed.get('ok', True)),
+                ('Reused existing', parsed.get('reused_existing', '(?)')),
+                ('Created new copy', parsed.get('created_new_copy', '(?)')),
+                ('File ID', str(parsed.get('file_id') or '')[:40] or '(none)'),
             ],
         )
         return parsed
@@ -1068,6 +1072,7 @@ class RSTicketBot(commands.Bot):
         existing_sheet_file_id = ''
         if button_def.key == 'request_submit':
             existing_sheet_file_id = str(profile.get('cashout_sheet_file_id') or '').strip()
+            FLOW.kv('Existing sheet file_id', existing_sheet_file_id[:40] if existing_sheet_file_id else '(none)')
 
         # Normalize condition to match spreadsheet dropdown validation exactly.
         norm_form_values = dict(form_values)
@@ -1178,8 +1183,8 @@ class RSTicketBot(commands.Bot):
                     dm_embed.add_field(name=dm['field_error'], value=str(err)[:1024], inline=False)
                 dm_embed.add_field(name=dm['field_ticket'], value=channel.jump_url, inline=False)
                 await user.send(embed=dm_embed)
-            except discord.HTTPException:
-                LOG.warning('Could not DM user %s for cashout ticket', user.id)
+            except discord.HTTPException as exc:
+                LOG.warning('Could not DM user %s for cashout ticket: %s', user.id, exc)
 
         msg = f'Your ticket is ready: {channel.mention}'
         if interaction.response.is_done():
@@ -1240,12 +1245,24 @@ async def cashout(interaction: discord.Interaction) -> None:
 async def cashoutpanel(interaction: discord.Interaction) -> None:
     assert isinstance(interaction.client, RSTicketBot)
     bot_ref = interaction.client
-    if not await is_ticket_admin(interaction):
-        await interaction.response.send_message('You do not have permission to use this command.', ephemeral=True)
-        return
-    snap = await bot_ref.panel_presentation_snapshot()
-    emb = build_cashout_admin_hub_embed(snap)
-    await interaction.response.send_message(embed=emb, view=PanelAdminView(bot_ref), ephemeral=True)
+    try:
+        # Defer immediately so Discord doesn't time out while we read JSON and build embeds.
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        if not await is_ticket_admin(interaction):
+            await interaction.followup.send('You do not have permission to use this command.', ephemeral=True)
+            return
+        FLOW.section('ADMIN — CASHOUTPANEL')
+        FLOW.kv('Actor', fmt_member(interaction.user) if interaction.user else '?')
+        snap = await bot_ref.panel_presentation_snapshot()
+        emb = build_cashout_admin_hub_embed(snap)
+        await interaction.followup.send(embed=emb, view=PanelAdminView(bot_ref), ephemeral=True)
+    except Exception as exc:
+        LOG.exception('cashoutpanel failed: %s', exc)
+        if interaction.response.is_done():
+            await interaction.followup.send(f'cashoutpanel failed: {exc}', ephemeral=True)
+        else:
+            await interaction.response.send_message(f'cashoutpanel failed: {exc}', ephemeral=True)
 
 
 @bot.tree.command(name='cashoutnew', description='Open a new cashout submission form.')
