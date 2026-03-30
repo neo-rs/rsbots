@@ -15,12 +15,20 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from panel_builder import (
+    PanelAdminView,
+    build_panel_admin_summary_embed,
+    resolve_panel_presentation,
+    resolve_ticket_banner_url,
+)
+
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / 'config.json'
 MESSAGES_PATH = BASE_DIR / 'messages.json'
 LOG_PATH = BASE_DIR / 'bot.log'
 TICKETS_PATH = BASE_DIR / 'tickets.json'
 PROFILES_PATH = BASE_DIR / 'profiles.json'
+PANEL_OVERRIDES_PATH = BASE_DIR / 'panel_overrides.json'
 
 LOG = logging.getLogger('rscashoutbot')
 _FLOW_KV_COL = 13
@@ -615,6 +623,7 @@ class RSTicketBot(commands.Bot):
         self.runtime = runtime
         self.store = TicketStore(TICKETS_PATH)
         self.profile_store = ProfileStore(PROFILES_PATH)
+        self.panel_overrides = JsonStore(PANEL_OVERRIDES_PATH, {})
         self.sheet_client = SheetClient(runtime.sheet)
         self._auto_panel_posted_once = False
         # Used to bridge multi-step modal state across modal submit -> button click.
@@ -749,21 +758,36 @@ class RSTicketBot(commands.Bot):
             await interaction.response.send_message('Something went wrong. Check bot.log.', ephemeral=True)
         LOG.exception('App command error: %s', cmd, exc_info=error)
 
-    def _build_panel_embed(self) -> discord.Embed:
-        ticket = self.runtime.ticket
+    async def build_panel_embed_async(self) -> discord.Embed:
+        title, description, footer_text, color = await resolve_panel_presentation(self)
         embed = discord.Embed(
-            title=ticket.panel_title,
-            description=ticket.panel_description.strip() or None,
-            color=ticket.panel_embed_color,
+            title=title,
+            description=description.strip() or None,
+            color=color,
         )
-        footer = ticket.footer_text.strip()
+        footer = footer_text.strip()
         if footer:
             embed.set_footer(text=footer)
         return embed
 
+    async def panel_presentation_snapshot(self) -> Dict[str, Any]:
+        title, desc, footer, color = await resolve_panel_presentation(self)
+        o = await self.panel_overrides.read()
+        settings_banner_input = '' if 'ticket_banner_url' not in o else str(o.get('ticket_banner_url', ''))[:500]
+        eff = await resolve_ticket_banner_url(self)
+        ticket_banner_effective_display = eff if eff else '(disabled / none)'
+        return {
+            'panel_title': title,
+            'panel_description': desc,
+            'footer_text': footer,
+            'panel_embed_color': color,
+            'settings_banner_input': settings_banner_input,
+            'ticket_banner_effective_display': ticket_banner_effective_display,
+        }
+
     async def send_panel_card(self, channel: discord.TextChannel) -> None:
         await self._maybe_delete_previous_panel_card(channel)
-        await channel.send(embed=self._build_panel_embed(), view=self.panel_view)
+        await channel.send(embed=await self.build_panel_embed_async(), view=self.panel_view)
 
     async def _maybe_delete_previous_panel_card(self, channel: discord.TextChannel) -> None:
         """
@@ -772,7 +796,8 @@ class RSTicketBot(commands.Bot):
         """
         if not self.user:
             return
-        panel_title = (self.runtime.ticket.panel_title or '').strip()
+        merged_title, _, _, _ = await resolve_panel_presentation(self)
+        panel_title = (merged_title or '').strip()
         if not panel_title:
             return
 
@@ -990,6 +1015,10 @@ class RSTicketBot(commands.Bot):
         if footer:
             embed.set_footer(text=footer)
 
+        banner_url = await resolve_ticket_banner_url(self)
+        if banner_url:
+            embed.set_image(url=banner_url)
+
         mentions = ' '.join(f'<@&{role_id}>' for role_id in self.runtime.ticket.support_role_ids if role_id)
         await channel.send(content=(f'{mentions} {user.mention}'.strip()), embed=embed, view=self.close_view)
 
@@ -1097,6 +1126,18 @@ async def cashout(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     await bot_ref.send_panel_card(panel_ch)
     await interaction.followup.send('Cashout panel posted.', ephemeral=True)
+
+
+@bot.tree.command(name='cashoutpanel', description='Edit panel text and settings, preview, and post to the panel channel.')
+async def cashoutpanel(interaction: discord.Interaction) -> None:
+    assert isinstance(interaction.client, RSTicketBot)
+    bot_ref = interaction.client
+    if not await is_ticket_admin(interaction):
+        await interaction.response.send_message('You do not have permission to use this command.', ephemeral=True)
+        return
+    snap = await bot_ref.panel_presentation_snapshot()
+    emb = build_panel_admin_summary_embed(snap)
+    await interaction.response.send_message(embed=emb, view=PanelAdminView(bot_ref), ephemeral=True)
 
 
 @bot.tree.command(name='cashoutnew', description='Open a new cashout submission form.')

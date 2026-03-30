@@ -6,7 +6,11 @@
     "buttons": {
       "request_submit": {
         "intro_title": "<a:rssalute:1350272389908267049> Request/Submit",
-        "intro_body": "Your submission is in. A personal cashout sheet copy should appear below if Google Sheet integration is enabled. Fill it out fully using the required format, then send the completed link back in this ticket for review."
+        "intro_body": "Your ticket is open. We have your email on file from the form. If Google Sheet integration is enabled, your personal cashout sheet link will appear below — fill it out and send the completed link back here for review."
+      },
+      "signup_form": {
+        "intro_title": "Signup Form",
+        "intro_body": "Thanks — staff will review your signup details in this ticket."
       },
       "need_help": {
         "intro_title": "<:askyourcookgroup:910339530136109077> Need Help?",

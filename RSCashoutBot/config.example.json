@@ -30,66 +30,10 @@
             {
               "key": "email",
               "label": "Email",
-              "placeholder": "Email to give editor access to your cashout sheet",
+              "placeholder": "Best email for payout and sheet access",
               "required": true,
               "paragraph": false,
               "max_length": 120
-            },
-            {
-              "key": "name_of_shoe",
-              "label": "Name of Shoe",
-              "placeholder": "Exact shoe / item name",
-              "required": true,
-              "paragraph": false,
-              "max_length": 120
-            },
-            {
-              "key": "sku",
-              "label": "SKU",
-              "placeholder": "SKU / style code / product id",
-              "required": true,
-              "paragraph": false,
-              "max_length": 120
-            },
-            {
-              "key": "condition",
-              "label": "Condition",
-              "placeholder": "New / Used / Defects / Box condition",
-              "required": true,
-              "paragraph": false,
-              "max_length": 120
-            },
-            {
-              "key": "size",
-              "label": "Size",
-              "placeholder": "Size or N/A",
-              "required": false,
-              "paragraph": false,
-              "max_length": 40
-            },
-            {
-              "key": "qty",
-              "label": "QTY",
-              "placeholder": "How many pairs / units",
-              "required": true,
-              "paragraph": false,
-              "max_length": 40
-            },
-            {
-              "key": "price",
-              "label": "Price",
-              "placeholder": "Expected payout / ask / known comp",
-              "required": true,
-              "paragraph": false,
-              "max_length": 80
-            },
-            {
-              "key": "notes",
-              "label": "Notes",
-              "placeholder": "Flaws, missing accessories, damaged box, replacement box, etc.",
-              "required": false,
-              "paragraph": true,
-              "max_length": 800
             }
           ]
         }

@@ -7,6 +7,12 @@
 - Admin Only: Yes
 - Usage: `/cashout`
 
+#### `/cashoutpanel`
+- Description: Opens an ephemeral panel editor (edit title/description/footer, embed color, ticket banner URL), preview the panel embed, and post to the panel channel — similar to RSPromoBot’s builder flow.
+- Admin Only: Yes
+- Usage: `/cashoutpanel`
+- Notes: Overrides are stored in `panel_overrides.json` on the bot host (merged with `messages.json` / `config.json` defaults).
+
 #### `/cashoutnew`
 - Description: Opens a new Request/Submit flow for the member.
 - Admin Only: No
@@ -29,6 +35,6 @@
 - Usage: `/ticketremove member:@user`
 
 ## Summary
-- Total Commands: 5
-- Admin Commands: 3
+- Total Commands: 6
+- Admin Commands: 4
 - Public Commands: 2
