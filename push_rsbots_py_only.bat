@@ -29,9 +29,11 @@ REM If a previous git command crashed, an index.lock can remain and break future
 del /f /q ".git\index.lock" >nul 2>&1
 
 REM Update tracked files (faster + avoids scanning for new untracked files).
+REM NOTE: git add -u does NOT stage brand-new untracked files — add explicit lines below for new modules.
 git add -u
 REM New bot folders / modules (git add -u skips untracked paths).
 git add RSCashoutBot >nul 2>&1
+git add RSCheckerbot\rschecker_journal.py >nul 2>&1
 git add RSForwarder\mavely_link_resolve.py >nul 2>&1
 REM Also stage RSForwarder manual override json (was previously git-ignored).
 git add RSForwarder\rs_fs_manual_overrides.json >nul 2>&1

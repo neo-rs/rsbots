@@ -52,6 +52,33 @@
     "_comment_log_other": "bot-logs - Everything else (days 2-7b, errors, role events, system events)",
     "member_status_logs_channel_id": 1452835008170426368
   },
+  "journal_logs": {
+    "_comment": "FLOW labels on Discord embed footers (flow_labels_enabled). Optional journal channels: set route_to_journal_channels true and create #journal-rscheckerbot-* in output guild (see channel_names keys).",
+    "flow_labels_enabled": true,
+    "route_to_journal_channels": false,
+    "category_id": 0,
+    "channel_names": {
+      "general": "journal-rscheckerbot-general",
+      "startup": "journal-rscheckerbot-boot",
+      "http": "journal-rscheckerbot-http",
+      "whop_webhook": "journal-rscheckerbot-whop-webhook",
+      "whop_discord": "journal-rscheckerbot-whop-discord",
+      "whop_api": "journal-rscheckerbot-whop-api",
+      "whop_sync": "journal-rscheckerbot-whop-sync",
+      "persist": "journal-rscheckerbot-persist",
+      "staff_embeds": "journal-rscheckerbot-staff-embeds",
+      "tickets": "journal-rscheckerbot-tickets",
+      "discord_dm": "journal-rscheckerbot-dm-sequence",
+      "roles": "journal-rscheckerbot-roles",
+      "role_audit": "journal-rscheckerbot-role-audit",
+      "reporting": "journal-rscheckerbot-reporting",
+      "member_history": "journal-rscheckerbot-member-history",
+      "support_sweep": "journal-rscheckerbot-support-sweep",
+      "invite_ghl": "journal-rscheckerbot-invite-ghl",
+      "channel_limits": "journal-rscheckerbot-channel-limits",
+      "whop_text": "journal-rscheckerbot-whop-text"
+    }
+  },
   "log_controls": {
     "boot_post_min_hours": 6,
     "role_update_batch_seconds": 2,

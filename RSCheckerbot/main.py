@@ -150,6 +150,8 @@ from discord.ext import commands, tasks
 from aiohttp import web
 import aiohttp
 
+import rschecker_journal as rj
+
 from rschecker_utils import (
     load_json,
     save_json,
@@ -1765,9 +1767,13 @@ async def _startup_canceling_members_snapshot() -> None:
         if (not post_to_channels) and create_tickets:
             with suppress(Exception):
                 await log_other(
-                    f"📌 [BOOT][Canceling] tickets_mode rows={len(rows)} opened={tickets_opened} skipped_existing={tickets_skipped} failed={tickets_failed}"
+                    f"📌 [BOOT][Canceling] tickets_mode rows={len(rows)} opened={tickets_opened} skipped_existing={tickets_skipped} failed={tickets_failed}",
+                    flow=rj.REPORTING,
                 )
-            log.info(
+            rj.tlog(
+                log,
+                "info",
+                rj.WHOP_API,
                 "[BOOT][Canceling] tickets_mode rows=%s opened=%s skipped_existing=%s failed=%s",
                 len(rows),
                 tickets_opened,
@@ -2856,7 +2862,10 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                     reference_jump_url=ref_url,
                 )
             except Exception as ex:
-                await log_other(f"❌ SupportTickets: exception opening free_pass_welcome for `{did_i}` err=`{str(ex)[:240]}`")
+                await log_other(
+                    f"❌ SupportTickets: exception opening free_pass_welcome for `{did_i}` err=`{str(ex)[:240]}`",
+                    flow=rj.TICKETS,
+                )
         elif is_full and has_member_role(member):
             # Upgrade path: if they previously had a Free Pass ticket (direct-invite / no-whop), close it and open Member Welcome.
             try:
@@ -2868,7 +2877,10 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                     delete_channel=True,
                 )
             except Exception as ex:
-                await log_other(f"⚠️ SupportTickets: exception closing free_pass on upgrade for `{did_i}` err=`{str(ex)[:240]}`")
+                await log_other(
+                    f"⚠️ SupportTickets: exception closing free_pass on upgrade for `{did_i}` err=`{str(ex)[:240]}`",
+                    flow=rj.TICKETS,
+                )
             fp = f"{mid or int(did_i)}|member_welcome|{occurred_at.date().isoformat()}"
             try:
                 await support_tickets.open_member_welcome_ticket(
@@ -2878,7 +2890,10 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                     reference_jump_url=ref_url,
                 )
             except Exception as ex:
-                await log_other(f"❌ SupportTickets: exception opening member_welcome for `{did_i}` err=`{str(ex)[:240]}`")
+                await log_other(
+                    f"❌ SupportTickets: exception opening member_welcome for `{did_i}` err=`{str(ex)[:240]}`",
+                    flow=rj.TICKETS,
+                )
 
     # Open tickets based on canonical kinds/titles.
     if kind == "member_joined":
@@ -2888,9 +2903,15 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
             try:
                 ch_created = await support_tickets.open_free_pass_ticket(member=member, fingerprint=fp, reference_jump_url=ref_url)
                 if not ch_created:
-                    await log_other(f"❌ SupportTickets: failed to open free-pass ticket for `{did_i}` (member_joined)")
+                    await log_other(
+                        f"❌ SupportTickets: failed to open free-pass ticket for `{did_i}` (member_joined)",
+                        flow=rj.TICKETS,
+                    )
             except Exception as ex:
-                await log_other(f"❌ SupportTickets: exception opening free-pass ticket for `{did_i}` (member_joined) err=`{str(ex)[:240]}`")
+                await log_other(
+                    f"❌ SupportTickets: exception opening free-pass ticket for `{did_i}` (member_joined) err=`{str(ex)[:240]}`",
+                    flow=rj.TICKETS,
+                )
         return
 
     # Billing (payment failed / billing issue)
@@ -2909,9 +2930,15 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                 reference_jump_url=ref_url,
             )
             if not ch_created:
-                await log_other(f"❌ SupportTickets: failed to open billing ticket for `{did_i}` (kind={kind})")
+                await log_other(
+                    f"❌ SupportTickets: failed to open billing ticket for `{did_i}` (kind={kind})",
+                    flow=rj.TICKETS,
+                )
         except Exception as ex:
-            await log_other(f"❌ SupportTickets: exception opening billing ticket for `{did_i}` (kind={kind}) err=`{str(ex)[:240]}`")
+            await log_other(
+                f"❌ SupportTickets: exception opening billing ticket for `{did_i}` (kind={kind}) err=`{str(ex)[:240]}`",
+                flow=rj.TICKETS,
+            )
         return
 
     # Cancellation
@@ -2935,9 +2962,15 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                 reference_jump_url=ref_url,
             )
             if not ch_created:
-                await log_other(f"❌ SupportTickets: failed to open cancellation ticket for `{did_i}` (kind={kind})")
+                await log_other(
+                    f"❌ SupportTickets: failed to open cancellation ticket for `{did_i}` (kind={kind})",
+                    flow=rj.TICKETS,
+                )
         except Exception as ex:
-            await log_other(f"❌ SupportTickets: exception opening cancellation ticket for `{did_i}` (kind={kind}) err=`{str(ex)[:240]}`")
+            await log_other(
+                f"❌ SupportTickets: exception opening cancellation ticket for `{did_i}` (kind={kind}) err=`{str(ex)[:240]}`",
+                flow=rj.TICKETS,
+            )
         return
 
 
@@ -3325,6 +3358,7 @@ except Exception:
 
 # Logging controls (spam reduction + correlation)
 LOG_CONTROLS = config.get("log_controls", {}) if isinstance(config, dict) else {}
+JOURNAL_LOGS = rj.parse_journal_config(config if isinstance(config, dict) else {})
 try:
     BOOT_POST_MIN_HOURS = float(LOG_CONTROLS.get("boot_post_min_hours", 6))
 except Exception:
@@ -4139,9 +4173,9 @@ def _save_raw_webhook_payload(payload: dict, headers: dict = None):
         with open(WHOP_WEBHOOK_RAW_LOG_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
         
-        log.info(f"Saved raw webhook payload to {WHOP_WEBHOOK_RAW_LOG_FILE.name}")
+        rj.tlog(log, "info", rj.PERSIST, "Saved raw webhook payload to %s", WHOP_WEBHOOK_RAW_LOG_FILE.name)
     except Exception as e:
-        log.error(f"Failed to save raw webhook payload: {e}")
+        rj.tlog(log, "error", rj.PERSIST, "Failed to save raw webhook payload: %s", e)
 
 # -----------------------------
 # Member History Helpers
@@ -4727,10 +4761,10 @@ async def member_history_ingest_loop() -> None:
             _save_member_history(db)
             _ingest_state_save(st)
             with suppress(Exception):
-                await log_other(f"🧾 member_history_ingest: whop_logs={p1} whop_membership_logs={p2}")
+                await log_other(f"🧾 member_history_ingest: whop_logs={p1} whop_membership_logs={p2}", flow=rj.MEMBER_HISTORY)
     except Exception as e:
         with suppress(Exception):
-            await log_other(f"⚠️ member_history_ingest_loop error: `{str(e)[:200]}`")
+            await log_other(f"⚠️ member_history_ingest_loop error: `{str(e)[:200]}`", flow=rj.MEMBER_HISTORY)
 
 
 
@@ -5599,36 +5633,95 @@ def _make_dyno_embed(
             e.set_footer(text=str(footer)[:2048])
     return e
 
-async def log_first(msg: str | None = None, *, embed: discord.Embed | None = None):
-    ch = bot.get_channel(LOG_FIRST_CHANNEL_ID)
-    if ch:
-        with suppress(Exception):
-            e = embed
-            if e is None:
-                e = discord.Embed(
-                    description=str(msg or "").strip() or "—",
-                    color=0x5865F2,
-                    timestamp=datetime.now(timezone.utc),
-                )
-                # Prefer the runtime channel name (no hardcoded labels).
-                nm = str(getattr(ch, "name", "") or "").strip()
-                e.set_footer(text=f"RSCheckerbot • {nm}" if nm else "RSCheckerbot")
-            await ch.send(embed=e, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+async def _resolve_bot_log_channel(guild: discord.Guild, flow: str | None) -> tuple[discord.TextChannel | None, str]:
+    """Pick bot-logs destination; optional #journal-rscheckerbot-* override (config journal_logs)."""
+    fk = rj.normalize_flow(flow)
+    if bool(JOURNAL_LOGS.get("route_to_journal_channels")):
+        jname = rj.journal_channel_name_for_flow(JOURNAL_LOGS, fk)
+        if jname:
+            ch0 = _find_text_channel_by_name(guild, jname)
+            if ch0 is None:
+                try:
+                    cat_raw = int(JOURNAL_LOGS.get("category_id") or 0)
+                except Exception:
+                    cat_raw = 0
+                cat = cat_raw if cat_raw > 0 else None
+                ch0 = await _get_or_create_text_channel(guild, name=jname, category_id=cat)
+            if isinstance(ch0, discord.TextChannel):
+                return ch0, str(getattr(ch0, "name", "") or jname).strip()
 
-async def log_other(msg: str | None = None, *, embed: discord.Embed | None = None):
+    ch: discord.TextChannel | None = None
+    if (not OUTPUT_GUILD_ID) or int(getattr(guild, "id", 0) or 0) == int(GUILD_ID or 0):
+        base = bot.get_channel(LOG_OTHER_CHANNEL_ID) if LOG_OTHER_CHANNEL_ID else None
+        ch = base if isinstance(base, discord.TextChannel) else None
+    if ch is None:
+        name = OUTPUT_LOG_OTHER_CHANNEL_NAME or "bot-logs"
+        ch = await _get_or_create_text_channel(guild, name=name)
+    if isinstance(ch, discord.TextChannel):
+        return ch, str(getattr(ch, "name", "") or "").strip()
+    return None, ""
+
+
+async def _resolve_log_first_channel(guild: discord.Guild) -> tuple[discord.TextChannel | None, str]:
+    """Join / day-1 log channel; optional journal_logs.channel_names.discord_dm."""
+    if bool(JOURNAL_LOGS.get("route_to_journal_channels")):
+        jname = rj.journal_channel_name_for_flow(JOURNAL_LOGS, rj.DISCORD_DM)
+        if jname:
+            ch0 = _find_text_channel_by_name(guild, jname)
+            if ch0 is None:
+                try:
+                    cat_raw = int(JOURNAL_LOGS.get("category_id") or 0)
+                except Exception:
+                    cat_raw = 0
+                cat = cat_raw if cat_raw > 0 else None
+                ch0 = await _get_or_create_text_channel(guild, name=jname, category_id=cat)
+            if isinstance(ch0, discord.TextChannel):
+                return ch0, str(getattr(ch0, "name", "") or jname).strip()
+    base = bot.get_channel(LOG_FIRST_CHANNEL_ID) if LOG_FIRST_CHANNEL_ID else None
+    ch = base if isinstance(base, discord.TextChannel) else None
+    if isinstance(ch, discord.TextChannel):
+        return ch, str(getattr(ch, "name", "") or "").strip()
+    return None, ""
+
+
+def _apply_flow_footer(embed: discord.Embed, flow: str | None, *, channel_hint: str) -> None:
+    labels = bool(JOURNAL_LOGS.get("flow_labels_enabled", True))
+    if labels:
+        rj.enrich_embed_footer(embed, flow, channel_name=channel_hint, labels_enabled=True)
+        return
+    nm = str(channel_hint or "").strip()
+    embed.set_footer(text=f"RSCheckerbot • {nm}" if nm else "RSCheckerbot")
+
+
+async def log_first(msg: str | None = None, *, embed: discord.Embed | None = None):
+    guild = _output_guild()
+    if not guild:
+        return
+    ch, nm = await _resolve_log_first_channel(guild)
+    if not ch:
+        return
+    fk = rj.DISCORD_DM
+    with suppress(Exception):
+        e = embed
+        if e is None:
+            e = discord.Embed(
+                description=str(msg or "").strip() or "—",
+                color=0x5865F2,
+                timestamp=datetime.now(timezone.utc),
+            )
+            _apply_flow_footer(e, fk, channel_hint=nm)
+        else:
+            _apply_flow_footer(e, fk, channel_hint=nm)
+        await ch.send(embed=e, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+
+
+async def log_other(msg: str | None = None, *, embed: discord.Embed | None = None, flow: str | None = None):
     guild = _output_guild()
     if not guild:
         return
 
-    ch: discord.TextChannel | None = None
-    # If output guild is the main guild, prefer configured channel ID.
-    if (not OUTPUT_GUILD_ID) or int(getattr(guild, "id", 0) or 0) == int(GUILD_ID or 0):
-        base = bot.get_channel(LOG_OTHER_CHANNEL_ID) if LOG_OTHER_CHANNEL_ID else None
-        ch = base if isinstance(base, discord.TextChannel) else None
-    # Otherwise (or if missing), use channel name override.
-    if ch is None:
-        name = OUTPUT_LOG_OTHER_CHANNEL_NAME or "bot-logs"
-        ch = await _get_or_create_text_channel(guild, name=name)
+    fk = rj.normalize_flow(flow)
+    ch, nm = await _resolve_bot_log_channel(guild, fk)
     if not ch:
         return
 
@@ -5640,13 +5733,20 @@ async def log_other(msg: str | None = None, *, embed: discord.Embed | None = Non
                 color=0x5865F2,
                 timestamp=datetime.now(timezone.utc),
             )
-            nm = str(getattr(ch, "name", "") or "").strip()
-            e.set_footer(text=f"RSCheckerbot • {nm}" if nm else "RSCheckerbot")
+            _apply_flow_footer(e, fk, channel_hint=nm)
+        else:
+            _apply_flow_footer(e, fk, channel_hint=nm)
         allow = discord.AllowedMentions.none() if int(getattr(guild, "id", 0) or 0) != int(GUILD_ID or 0) else discord.AllowedMentions(users=True, roles=False, everyone=False)
         await ch.send(embed=e, allowed_mentions=allow)
 
+
 async def log_role_event(message: str | None = None, *, embed: discord.Embed | None = None):
-    await log_other(message, embed=embed)
+    await log_other(message, embed=embed, flow=rj.ROLES)
+
+
+async def _support_tickets_journal_log(msg: str) -> None:
+    """Route support_tickets module string logs into bot-logs with FLOW=tickets."""
+    await log_other(msg, flow=rj.TICKETS)
 
 
 def _find_onboarding_ticket_channel(member: discord.Member) -> discord.TextChannel | None:
@@ -5735,6 +5835,7 @@ async def log_role_audit(
                 value=f"Correlate by ID in [#{getattr(ob_ch, 'name', 'onboarding-logs')}](https://discord.com/channels/{guild.id}/{ob_ch.id})",
                 inline=False,
             )
+    _apply_flow_footer(e, rj.ROLE_AUDIT, channel_hint=str(getattr(ch, "name", "") or "").strip())
     with suppress(Exception):
         await ch.send(embed=e, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
 
@@ -5753,8 +5854,11 @@ async def log_whop(msg: str):
         ch = await _get_or_create_text_channel(guild, name=name)
     if not ch:
         return
+    body = str(msg or "")
+    if bool(JOURNAL_LOGS.get("flow_labels_enabled", True)):
+        body = rj.prefix_message(body, rj.WHOP_TEXT)
     with suppress(Exception):
-        await ch.send(str(msg or "")[:1900], allowed_mentions=discord.AllowedMentions.none())
+        await ch.send(body[:1900], allowed_mentions=discord.AllowedMentions.none())
 
 def _find_text_channel_by_name(guild: discord.Guild, name: str) -> discord.TextChannel | None:
     nm = (name or "").strip().lower()
@@ -5882,7 +5986,13 @@ async def _ensure_alert_channels(guild: discord.Guild) -> None:
                 await guild.create_text_channel(name=name, reason="RSCheckerbot: staff alert channel (fallback)")
 
 
-async def log_member_status(msg: str, embed: discord.Embed = None, *, channel_name: str | None = None):
+async def log_member_status(
+    msg: str,
+    embed: discord.Embed = None,
+    *,
+    channel_name: str | None = None,
+    flow: str | None = None,
+):
     """Log staff embeds. Defaults to member status logs channel, but can route by channel name."""
     guild = _output_guild()
     if not guild:
@@ -5910,6 +6020,8 @@ async def log_member_status(msg: str, embed: discord.Embed = None, *, channel_na
 
     if not ch:
         return
+
+    flow_k = rj.normalize_flow(flow or rj.STAFF_EMBEDS)
 
     async def _maybe_capture_for_reporting(sent_embed: discord.Embed, *, is_member_status: bool) -> None:
         """Persist only member-status-logs output into the reporting store (bounded)."""
@@ -5957,6 +6069,7 @@ async def log_member_status(msg: str, embed: discord.Embed = None, *, channel_na
                 timestamp=datetime.now(timezone.utc),
             )
             embed.set_footer(text="RSCheckerbot • Member Status Tracking")
+        _apply_flow_footer(embed, flow_k, channel_hint=str(getattr(ch, "name", "") or "").strip())
 
         # Ensure member is always clickable by putting the user mention in message content.
         # Embed mentions are unreliable across clients. We also keep Neo output non-mention to avoid "unknown-user".
@@ -6258,13 +6371,13 @@ async def send_day(member: discord.Member, day_key: str):
             cancel_roles.append(_fmt_role(ROLE_CANCEL_B, member.guild))
         cancel_info = ", ".join(cancel_roles) if cancel_roles else "cancel role"
         mark_cancelled(member.id, "cancel_role_present_pre_send")
-        await log_other(f"🛑 Cancelled pre-send for {_fmt_user(member)} — {cancel_info} present (DM not sent)")
+        await log_other(f"🛑 Cancelled pre-send for {_fmt_user(member)} — {cancel_info} present (DM not sent)", flow=rj.DISCORD_DM)
         return
 
     join_url = UTM_LINKS.get(day_key)
     if not join_url:
         mark_cancelled(member.id, "missing_utm")
-        await log_other(f"❌ Missing UTM for `{day_key}` on {_fmt_user(member)} — sequence cancelled")
+        await log_other(f"❌ Missing UTM for `{day_key}` on {_fmt_user(member)} — sequence cancelled", flow=rj.DISCORD_DM)
         return
 
     try:
@@ -6291,7 +6404,7 @@ async def send_day(member: discord.Member, day_key: str):
         embeds = [banner_embed, content_embed]
     except Exception as e:
         mark_cancelled(member.id, "embed_build_error")
-        await log_other(f"❌ build_embed error `{day_key}` for {_fmt_user(member)}: `{e}` — sequence cancelled")
+        await log_other(f"❌ build_embed error `{day_key}` for {_fmt_user(member)}: `{e}` — sequence cancelled", flow=rj.DISCORD_DM)
         return
 
     try:
@@ -6306,12 +6419,12 @@ async def send_day(member: discord.Member, day_key: str):
         if day_key == "day_1":
             await log_first(embed=sent_embed)
         else:
-            await log_other(embed=sent_embed)
+            await log_other(embed=sent_embed, flow=rj.DISCORD_DM)
     except discord.Forbidden:
         mark_cancelled(member.id, "dm_forbidden")
-        await log_other(f"🚫 DM forbidden for {_fmt_user(member)} — sequence cancelled (user blocked DMs)")
+        await log_other(f"🚫 DM forbidden for {_fmt_user(member)} — sequence cancelled (user blocked DMs)", flow=rj.DISCORD_DM)
     except Exception as e:
-        await log_other(f"⚠️ Failed to send **{day_key}** to {_fmt_user(member)}: `{e}`")
+        await log_other(f"⚠️ Failed to send **{day_key}** to {_fmt_user(member)}: `{e}`", flow=rj.DISCORD_DM)
 
 # -----------------------------
 # Invite Tracking Functions
@@ -7125,7 +7238,7 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                 note = WHOP_UNLINKED_NOTE
                 discord_value = "Not linked"
             e_unlinked = _linked_hint_embed(title=title2, color=color, brief=brief, note=note, discord_value=discord_value)
-            await log_member_status("", embed=e_unlinked)
+            await log_member_status("", embed=e_unlinked, flow=rj.WHOP_WEBHOOK)
             with suppress(Exception):
                 await _whop_api_events_log(f"[Whop Webhook][detected] kind={kind} linked=no mid={mid2} type={evt or '—'}")
             with suppress(Exception):
@@ -7181,7 +7294,7 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                 member_kv=[("membership_id", mid2)],
                 whop_brief=brief,
             )
-            await log_member_status("", embed=detailed)
+            await log_member_status("", embed=detailed, flow=rj.WHOP_WEBHOOK)
 
             # Case channels: real-time webhook-only (no startup/sync/backfill noise).
             try:
@@ -7194,7 +7307,12 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                         color=0xED4245,
                         event_kind="payment_failed",
                     )
-                    await log_member_status("", embed=mini, channel_name=PAYMENT_FAILURE_CHANNEL_NAME)
+                    await log_member_status(
+                        "",
+                        embed=mini,
+                        channel_name=PAYMENT_FAILURE_CHANNEL_NAME,
+                        flow=rj.WHOP_WEBHOOK,
+                    )
                 elif kind == "cancellation_scheduled":
                     mini = _build_case_minimal_embed(
                         title=title,
@@ -7204,7 +7322,12 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                         color=0xFEE75C,
                         event_kind="cancellation_scheduled",
                     )
-                    await log_member_status("", embed=mini, channel_name=MEMBER_CANCELLATION_CHANNEL_NAME)
+                    await log_member_status(
+                        "",
+                        embed=mini,
+                        channel_name=MEMBER_CANCELLATION_CHANNEL_NAME,
+                        flow=rj.WHOP_WEBHOOK,
+                    )
             except Exception:
                 pass
             with suppress(Exception):
@@ -7272,18 +7395,24 @@ async def handle_whop_webhook_receiver(request):
             verify=WHOP_WEBHOOK_VERIFY,
         )
         if not ok:
-            log.warning(f"[WhopWebhook] Signature verification failed: {reason}")
+            rj.tlog(log, "warning", rj.WHOP_WEBHOOK, "Signature verification failed: %s", reason)
             return web.Response(text=f"Invalid webhook signature ({reason})", status=401)
 
         try:
             payload = json.loads(raw_body.decode("utf-8"))
         except Exception:
-            log.warning("[WhopWebhook] Invalid JSON payload")
+            rj.tlog(log, "warning", rj.WHOP_WEBHOOK, "Invalid JSON payload")
             return web.Response(text="Invalid JSON payload", status=400)
 
         # Log the raw payload
         _save_raw_webhook_payload(payload, headers)
-        log.info(f"Received Whop webhook payload (saved to {WHOP_WEBHOOK_RAW_LOG_FILE.name})")
+        rj.tlog(
+            log,
+            "info",
+            rj.WHOP_WEBHOOK,
+            "Received Whop webhook payload (saved to %s)",
+            WHOP_WEBHOOK_RAW_LOG_FILE.name,
+        )
 
         # Record event ledger entry
         try:
@@ -7298,7 +7427,7 @@ async def handle_whop_webhook_receiver(request):
                 event = _whop_event_from_webhook_payload(payload, event_id=wh_id, occurred_at=occurred_at)
                 await _record_whop_event(event)
         except Exception as e:
-            log.warning(f"[WhopWebhook] Failed to record event: {e}")
+            rj.tlog(log, "warning", rj.PERSIST, "Failed to record Whop webhook event to ledger: %s", e)
 
         # Process the webhook directly (real-time staff cards + movement logs).
         # This replaces the legacy "forward raw JSON to a Discord webhook" behavior which caused blanks.
@@ -7307,7 +7436,7 @@ async def handle_whop_webhook_receiver(request):
         return web.Response(text="OK", status=200)
     
     except Exception as e:
-        log.error(f"Error handling webhook receiver: {e}", exc_info=True)
+        log.error("%s Error handling webhook receiver: %s", rj.flow_prefix(rj.HTTP), e, exc_info=True)
         return web.Response(text=f"Error: {str(e)}", status=500)
 
 async def init_http_server():
@@ -7322,12 +7451,18 @@ async def init_http_server():
         await site.start()
     except OSError as e:
         # Common on local dev: another bot already bound the port.
-        log.warning(f"[HTTP Server] Failed to bind port {HTTP_SERVER_PORT}: {e}")
+        rj.tlog(log, "warning", rj.HTTP, "Failed to bind port %s: %s", HTTP_SERVER_PORT, e)
         with suppress(Exception):
             await runner.cleanup()
         return
-    log.info(f"HTTP server started on port {HTTP_SERVER_PORT}")
-    log.info(f"Whop webhook receiver: http://0.0.0.0:{HTTP_SERVER_PORT}/whop-webhook")
+    rj.tlog(log, "info", rj.HTTP, "HTTP server started on port %s", HTTP_SERVER_PORT)
+    rj.tlog(
+        log,
+        "info",
+        rj.HTTP,
+        "Whop webhook receiver: http://0.0.0.0:%s/whop-webhook",
+        HTTP_SERVER_PORT,
+    )
 
 # -----------------------------
 # Cross-bot communication checks
@@ -7533,13 +7668,13 @@ async def support_ticket_sweeper_loop():
         await support_tickets.sweep_free_pass_tickets()
     except Exception as e:
         with suppress(Exception):
-            await log_other(f"⚠️ support_ticket_sweeper_loop error: `{str(e)[:200]}`")
+            await log_other(f"⚠️ support_ticket_sweeper_loop error: `{str(e)[:200]}`", flow=rj.SUPPORT_SWEEP)
 
 
 @support_ticket_sweeper_loop.error
 async def support_ticket_sweeper_loop_error(error):
     with suppress(Exception):
-        await log_other(f"🔁 support_ticket_sweeper_loop crashed: `{error}` — restarting in 5s")
+        await log_other(f"🔁 support_ticket_sweeper_loop crashed: `{error}` — restarting in 5s", flow=rj.SUPPORT_SWEEP)
     with suppress(Exception):
         support_ticket_sweeper_loop.cancel()
     await asyncio.sleep(5)
@@ -7593,7 +7728,10 @@ async def support_tickets_startup_backfill_today() -> None:
             ch = fetched if isinstance(fetched, discord.TextChannel) else None
     if not isinstance(ch, discord.TextChannel):
         with suppress(Exception):
-            await log_other(f"⚠️ SupportTickets backfill: member-status-logs channel not found (id={MEMBER_STATUS_LOGS_CHANNEL_ID})")
+            await log_other(
+                f"⚠️ SupportTickets backfill: member-status-logs channel not found (id={MEMBER_STATUS_LOGS_CHANNEL_ID})",
+                flow=rj.TICKETS,
+            )
         return
 
     now_local = _tz_now()
@@ -7629,7 +7767,10 @@ async def support_tickets_startup_backfill_today() -> None:
     with suppress(Exception):
         _support_tickets_backfill_state_save(state)
     with suppress(Exception):
-        await log_other(f"📌 SupportTickets backfill: scanned={scanned} since={today_local} last_id={state.get('last_message_id')}")
+        await log_other(
+            f"📌 SupportTickets backfill: scanned={scanned} since={today_local} last_id={state.get('last_message_id')}",
+            flow=rj.TICKETS,
+        )
 
 # -----------------------------
 # Scheduler loop
@@ -7654,7 +7795,7 @@ async def scheduler_loop():
                 member = guild.get_member(int(uid))
                 if not member:
                     mark_cancelled(int(uid), "left_guild")
-                    await log_other(f"👋 User `{uid}` left guild — sequence cancelled")
+                    await log_other(f"👋 User `{uid}` left guild — sequence cancelled", flow=rj.DISCORD_DM)
                     continue
 
                 if has_cancel_role(member):
@@ -7665,7 +7806,10 @@ async def scheduler_loop():
                         cancel_roles.append(_fmt_role(ROLE_CANCEL_B, guild))
                     cancel_info = ", ".join(cancel_roles) if cancel_roles else "cancel role"
                     mark_cancelled(member.id, "cancel_role_present")
-                    await log_other(f"🛑 Cancelled for {_fmt_user(member)} — {cancel_info} present (during scheduler)")
+                    await log_other(
+                        f"🛑 Cancelled for {_fmt_user(member)} — {cancel_info} present (during scheduler)",
+                        flow=rj.DISCORD_DM,
+                    )
                     continue
 
                 await send_day(member, day_key)
@@ -7691,13 +7835,13 @@ async def scheduler_loop():
                         )
                         await target_ch(embed=sched_embed)
             except Exception as e:
-                await log_other(f"⚠️ scheduler_loop user error for uid `{uid}`: `{e}`")
+                await log_other(f"⚠️ scheduler_loop user error for uid `{uid}`: `{e}`", flow=rj.DISCORD_DM)
     except Exception as e:
-        await log_other(f"❌ scheduler_loop tick error: `{e}`")
+        await log_other(f"❌ scheduler_loop tick error: `{e}`", flow=rj.DISCORD_DM)
 
 @scheduler_loop.error
 async def scheduler_loop_error(error):
-    await log_other(f"🔁 scheduler_loop crashed: `{error}` — restarting in 5s")
+    await log_other(f"🔁 scheduler_loop crashed: `{error}` — restarting in 5s", flow=rj.DISCORD_DM)
     with suppress(Exception):
         scheduler_loop.cancel()
     await asyncio.sleep(5)
@@ -7979,7 +8123,8 @@ async def sync_whop_memberships():
                                         f"⚠️ **Whop Sync skipped removal (mismatch)** {_fmt_user(member)}\n"
                                         f"   membership_id: `{membership_id}`\n"
                                         f"   whop_member_id: `{whop_member_id}`\n"
-                                        f"   whop_discord_id: `{did}`"
+                                        f"   whop_discord_id: `{did}`",
+                                        flow=rj.WHOP_SYNC,
                                     )
                                 continue
                             if did and did.isdigit() and int(did) == int(member.id):
@@ -8013,7 +8158,8 @@ async def sync_whop_memberships():
                                 await log_other(
                                     f"✅ **Whop Sync kept access (newer active membership)** {_fmt_user(member)}\n"
                                     f"   old_membership_id: `{membership_id}` (status `{actual_status}`)\n"
-                                    f"   new_membership_id: `{mid2}` (status `{st2}`)"
+                                    f"   new_membership_id: `{mid2}` (status `{st2}`)",
+                                    flow=rj.WHOP_SYNC,
                                 )
                             continue
                     except Exception:
@@ -8037,7 +8183,8 @@ async def sync_whop_memberships():
                                 f"⚠️ **Whop Sync would remove role (enforcement disabled)** {_fmt_user(member)}\n"
                                 f"   API Status: `{actual_status}`\n"
                                 f"   membership_id: `{membership_id}`\n"
-                                f"   Removed: {_fmt_role(ROLE_CANCEL_A, guild)}"
+                                f"   Removed: {_fmt_role(ROLE_CANCEL_A, guild)}",
+                                flow=rj.WHOP_SYNC,
                             )
                         continue
                     await member.remove_roles(
@@ -8048,7 +8195,8 @@ async def sync_whop_memberships():
                         await log_other(
                             f"🔄 **Sync Removed Role:** {_fmt_user(member)}\n"
                             f"   API Status: `{actual_status}`\n"
-                            f"   Removed: {_fmt_role(ROLE_CANCEL_A, guild)}"
+                            f"   Removed: {_fmt_role(ROLE_CANCEL_A, guild)}",
+                            flow=rj.WHOP_SYNC,
                         )
                     synced_count += 1
                     row_action = "removed_role"
@@ -8222,13 +8370,14 @@ async def sync_whop_memberships():
                     await log_other(
                         f"✅ **Auto-heal added Members role** {_fmt_user(mbr)}\n"
                         f"   membership_id: `{mid_active}`\n"
-                        f"   total_spent: `${spent:.2f}`"
+                        f"   total_spent: `${spent:.2f}`",
+                        flow=rj.WHOP_SYNC,
                     )
             except Exception:
                 continue
 
         if healed and (not sync_silent):
-            await log_other(f"✅ **Whop Auto-heal complete** — added Members role for {healed} user(s)")
+            await log_other(f"✅ **Whop Auto-heal complete** — added Members role for {healed} user(s)", flow=rj.WHOP_SYNC)
         auto_healed_count = healed
 
     # Optional: DM a sync summary report (throttled).
@@ -8257,7 +8406,8 @@ async def sync_whop_memberships():
             f"🔄 **Whop Sync Complete**\n"
             f"   Members checked: {len(members_to_check)}\n"
             f"   Roles updated: {synced_count}\n"
-            f"   Errors: {error_count}"
+            f"   Errors: {error_count}",
+            flow=rj.WHOP_SYNC,
         )
 
     # Optional: mirror an accurate sync summary to Neo Test Server (does not affect main guild output).
@@ -8827,7 +8977,7 @@ def _title_for_event(kind: str) -> tuple[str, int, str]:
 
 @sync_whop_memberships.error
 async def sync_whop_memberships_error(error):
-    await log_other(f"❌ Sync job error: `{error}`")
+    await log_other(f"❌ Sync job error: `{error}`", flow=rj.WHOP_SYNC)
     log.error(f"Sync job error: {error}", exc_info=True)
 
 # -----------------------------
@@ -9029,7 +9179,7 @@ async def on_ready():
         support_tickets.initialize(
             bot=bot,
             config=config,
-            log_func=log_other,
+            log_func=_support_tickets_journal_log,
             is_whop_linked=_is_whop_linked,
             timezone_name=tz_name,
             whop_api_client=whop_api_client,
@@ -9038,7 +9188,7 @@ async def on_ready():
     except Exception as e:
         # Don't silently disable the whole ticket system.
         with suppress(Exception):
-            await log_other(f"❌ support_tickets.initialize failed: `{str(e)[:400]}`")
+            await log_other(f"❌ support_tickets.initialize failed: `{str(e)[:400]}`", flow=rj.TICKETS)
 
     # Run nowhop cleanup immediately on startup (restart-safe).
     # This closes resolved `no_whop_link` tickets + removes stale No-Whop roles once linkage is confirmed.
@@ -9347,7 +9497,7 @@ async def on_ready():
                 if lines:
                     e.add_field(name="Notes", value=("\n".join(lines)[:1024] or "—"), inline=False)
 
-            await log_other(embed=e)
+            await log_other(embed=e, flow=rj.STARTUP)
         except Exception:
             pass
 
@@ -9797,7 +9947,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             )
         
         mark_cancelled(after.id, "cancel_role_added")
-        await log_other(f"🛑 Cancelled for {_fmt_user(after)} — {cancel_info} was added (role update)")
+        await log_other(f"🛑 Cancelled for {_fmt_user(after)} — {cancel_info} was added (role update)", flow=rj.ROLES)
         return
 
     if ROLE_TRIGGER not in before_roles and ROLE_TRIGGER in after_roles:
@@ -9807,7 +9957,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             return
         
         if has_sequence_before(after.id):
-            await log_other(f"⏭️ Skipped DM sequence for {_fmt_user(after)} — sequence previously run")
+            await log_other(f"⏭️ Skipped DM sequence for {_fmt_user(after)} — sequence previously run", flow=rj.DISCORD_DM)
             return
         
         enqueue_first_day(after.id)
@@ -9899,26 +10049,32 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         )
         if not suppress_logs:
             await log_role_event(embed=removed_embed)
-            await log_other(f"📤 **Member role removed** from {_fmt_user(after)}")
+            await log_other(f"📤 **Member role removed** from {_fmt_user(after)}", flow=rj.ROLES)
         
         # If Member role was removed and user has active DM sequence, cancel it
         if str(after.id) in queue_state:
             mark_cancelled(after.id, "member_role_removed_payment")
             if not suppress_logs:
-                await log_other(f"🛑 Cancelled DM sequence for {_fmt_user(after)} — Member role removed (likely payment cancellation)")
+                await log_other(
+                    f"🛑 Cancelled DM sequence for {_fmt_user(after)} — Member role removed (likely payment cancellation)",
+                    flow=rj.DISCORD_DM,
+                )
         
         asyncio.create_task(delayed_assign_former_member(after))
 
     if (ROLE_CANCEL_A not in before_roles) and (ROLE_CANCEL_A in after_roles):
         if not suppress_logs:
-            await log_other(f"📥 **Member role added** to {_fmt_user(after)}")
+            await log_other(f"📥 **Member role added** to {_fmt_user(after)}", flow=rj.ROLES)
         # Repeat-trial guard: had trial before + no payment → remove Member role and alert staff
         # Before removing, refresh total_spent from Whop API so paid first-time trials aren't blocked (member_history can be stale).
         if _is_repeat_trial_no_payment(after.id):
             # Staff one-time bypass: allow this member role add once, then revert to normal guard next time.
             if _consume_repeat_trial_bypass_once(after.id):
                 if log_other:
-                    await log_other(f"🟩 **Repeat trial bypass consumed:** Allowed Member role for {_fmt_user(after)} once.")
+                    await log_other(
+                        f"🟩 **Repeat trial bypass consumed:** Allowed Member role for {_fmt_user(after)} once.",
+                        flow=rj.ROLES,
+                    )
                 return
             # Only remove when we successfully got a fresh total_spent from API and it's <= threshold.
             # If we can't fetch (no mid, no client, API error), do not remove (fail open for paid users).
@@ -9979,10 +10135,11 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                             discord_kv=discord_kv,
                             whop_brief=last if isinstance(last, dict) else {},
                         )
-                        await log_member_status("", embed=e)
+                        await log_member_status("", embed=e, flow=rj.STAFF_EMBEDS)
                     if log_other:
                         await log_other(
-                            f"🚫 **Repeat trial guard:** Removed Member role from {_fmt_user(after)} — had trial before, total spend $0 or below threshold."
+                            f"🚫 **Repeat trial guard:** Removed Member role from {_fmt_user(after)} — had trial before, total spend $0 or below threshold.",
+                            flow=rj.ROLES,
                         )
                     return
         
@@ -10151,7 +10308,10 @@ async def on_message(message: discord.Message):
             await _maybe_open_tickets_from_member_status_logs(message)
         except Exception as ex:
             with suppress(Exception):
-                await log_other(f"❌ SupportTickets: trigger error in member-status-logs msg_id={int(getattr(message,'id',0) or 0)} err=`{str(ex)[:240]}`")
+                await log_other(
+                    f"❌ SupportTickets: trigger error in member-status-logs msg_id={int(getattr(message,'id',0) or 0)} err=`{str(ex)[:240]}`",
+                    flow=rj.TICKETS,
+                )
         # Ticket audit logs (member-status-logs messages too).
         try:
             await support_tickets.audit_message_create(message)
@@ -10199,7 +10359,10 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
             await _maybe_open_tickets_from_member_status_logs(after)
         except Exception as ex:
             with suppress(Exception):
-                await log_other(f"❌ SupportTickets: trigger error in member-status-logs edit msg_id={int(getattr(after,'id',0) or 0)} err=`{str(ex)[:240]}`")
+                await log_other(
+                    f"❌ SupportTickets: trigger error in member-status-logs edit msg_id={int(getattr(after,'id',0) or 0)} err=`{str(ex)[:240]}`",
+                    flow=rj.TICKETS,
+                )
 
 
 @bot.event
@@ -13034,7 +13197,7 @@ async def cancel_sequence(ctx, member: discord.Member):
         footer=f"ID: {member.id}",
         color=0xFEE75C,
     )
-    await log_other(embed=e)
+    await log_other(embed=e, flow=rj.DISCORD_DM)
 
 # -----------------------------
 # Run
