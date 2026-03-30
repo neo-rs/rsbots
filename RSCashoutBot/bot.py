@@ -17,7 +17,10 @@ from discord.ext import commands
 
 from panel_builder import (
     PanelAdminView,
-    build_panel_admin_summary_embed,
+    build_cashout_admin_hub_embed,
+    resolve_cashout_dm_copy,
+    resolve_cashout_ticket_intro,
+    resolve_cashout_ticket_next_template,
     resolve_panel_presentation,
     resolve_ticket_banner_url,
 )
@@ -146,6 +149,7 @@ class SheetIntegration:
     auth_header_name: str
     auth_token: str
     timeout_seconds: int
+    extra_editor_emails: Tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -335,12 +339,19 @@ class ConfigLoader:
             buttons=buttons,
         )
 
+        raw_extra = sheet_cfg.get('extra_editor_emails', [])
+        if not isinstance(raw_extra, list):
+            raw_extra = []
+        extra_editor_emails = tuple(
+            str(x).strip() for x in raw_extra if str(x).strip()
+        )
         sheet = SheetIntegration(
             enabled=bool(sheet_cfg.get('enabled', False)),
             endpoint_url=str(sheet_cfg.get('endpoint_url', '')).strip(),
             auth_header_name=str(sheet_cfg.get('auth_header_name', 'X-API-Key')).strip(),
             auth_token=str(sheet_cfg.get('auth_token', '')).strip(),
             timeout_seconds=int(sheet_cfg.get('timeout_seconds', 20)),
+            extra_editor_emails=extra_editor_emails,
         )
         if sheet.enabled and not sheet.endpoint_url:
             raise ConfigError('google_sheet.enabled is true but endpoint_url is empty')
@@ -770,12 +781,45 @@ class RSTicketBot(commands.Bot):
             embed.set_footer(text=footer)
         return embed
 
+    async def effective_sheet_extra_editor_emails(self) -> List[str]:
+        base = list(self.runtime.sheet.extra_editor_emails)
+        o = await self.panel_overrides.read()
+        extra = o.get('sheet_extra_editor_emails')
+        more: List[str] = []
+        if isinstance(extra, list):
+            more = [str(x).strip() for x in extra if str(x).strip()]
+        seen: set[str] = set()
+        out: List[str] = []
+        for e in base + more:
+            key = e.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(e)
+        return out
+
     async def panel_presentation_snapshot(self) -> Dict[str, Any]:
         title, desc, footer, color = await resolve_panel_presentation(self)
         o = await self.panel_overrides.read()
         settings_banner_input = '' if 'ticket_banner_url' not in o else str(o.get('ticket_banner_url', ''))[:500]
         eff = await resolve_ticket_banner_url(self)
         ticket_banner_effective_display = eff if eff else '(disabled / none)'
+
+        sub = self.get_button('request_submit')
+        if sub:
+            ti, tb = await resolve_cashout_ticket_intro(self, sub)
+            tnt = await resolve_cashout_ticket_next_template(self)
+        else:
+            ti, tb, tnt = '', '', ''
+
+        dm = await resolve_cashout_dm_copy(self)
+        extras = await self.effective_sheet_extra_editor_emails()
+        panel_extras = o.get('sheet_extra_editor_emails')
+        if isinstance(panel_extras, list) and panel_extras:
+            editors_lines = '\n'.join(str(x) for x in panel_extras)
+        else:
+            editors_lines = ''
+
         return {
             'panel_title': title,
             'panel_description': desc,
@@ -783,7 +827,62 @@ class RSTicketBot(commands.Bot):
             'panel_embed_color': color,
             'settings_banner_input': settings_banner_input,
             'ticket_banner_effective_display': ticket_banner_effective_display,
+            'cashout_ticket_intro_title_preview': ti,
+            'cashout_dm_title_preview': dm['title'],
+            'sheet_extra_editor_count': len(extras),
+            'ticket_intro_title_field': ti,
+            'ticket_intro_body_field': tb,
+            'ticket_next_step_field': tnt,
+            'dm_title_field': dm['title'],
+            'dm_sheet_ok_field': dm['sheet_ok'],
+            'dm_sheet_fail_field': dm['sheet_fail'],
+            'dm_field_sheet': dm['field_sheet_link'],
+            'dm_field_multi': dm['field_multi'],
+            'dm_field_multi_val': dm['field_multi_value'],
+            'dm_field_ticket': dm['field_ticket'],
+            'dm_field_error': dm['field_error'],
+            'sheet_editors_text_field': editors_lines,
         }
+
+    async def build_preview_ticket_embed(self, guild: discord.Guild) -> discord.Embed:
+        sub = self.get_button('request_submit')
+        if not sub:
+            return discord.Embed(
+                title='Ticket preview',
+                description='No `request_submit` button in config.',
+                color=self.runtime.ticket.ticket_embed_color,
+            )
+        intro_t, intro_b = await resolve_cashout_ticket_intro(self, sub)
+        tmpl = await resolve_cashout_ticket_next_template(self)
+        sample_link = 'https://docs.google.com/spreadsheets/d/preview_example/edit'
+        next_step = tmpl.replace('{link}', sample_link).replace('{view}', sample_link)[:1024]
+        color = self.runtime.ticket.ticket_embed_color
+        embed = discord.Embed(
+            title=intro_t,
+            description=(intro_b or '').strip() or None,
+            color=color,
+        )
+        embed.add_field(name='Opened By', value='@member (preview)', inline=True)
+        embed.add_field(name='Ticket Type', value=sub.label, inline=True)
+        embed.add_field(name='Next Step', value=next_step, inline=False)
+        footer = self.runtime.ticket.footer_text.strip()
+        if footer:
+            embed.set_footer(text=footer)
+        banner_url = await resolve_ticket_banner_url(self)
+        if banner_url:
+            embed.set_image(url=banner_url)
+        return embed
+
+    async def build_preview_dm_embed(self, guild: discord.Guild) -> discord.Embed:
+        dm = await resolve_cashout_dm_copy(self)
+        color = self.runtime.ticket.ticket_embed_color
+        sample = 'https://docs.google.com/spreadsheets/d/preview_example/edit'
+        ticket_href = f'https://discord.com/channels/{guild.id}/0000000000000000000'
+        emb = discord.Embed(title=dm['title'], description=dm['sheet_ok'], color=color)
+        emb.add_field(name=dm['field_sheet_link'], value=sample[:1024], inline=False)
+        emb.add_field(name=dm['field_multi'], value=dm['field_multi_value'][:1024], inline=False)
+        emb.add_field(name=dm['field_ticket'], value=ticket_href, inline=False)
+        return emb
 
     async def send_panel_card(self, channel: discord.TextChannel) -> None:
         await self._maybe_delete_previous_panel_card(channel)
@@ -975,6 +1074,9 @@ class RSTicketBot(commands.Bot):
             }
             if existing_sheet_file_id:
                 payload['existing_file_id'] = existing_sheet_file_id
+            extra_editors = await self.effective_sheet_extra_editor_emails()
+            if extra_editors:
+                payload['extra_editor_emails'] = extra_editors
             try:
                 sheet_result = await self.sheet_client.submit(button_def.sheet_route, payload)
             except Exception as exc:
@@ -992,9 +1094,10 @@ class RSTicketBot(commands.Bot):
                 profile_patch['cashout_sheet_file_id'] = str(sheet_result['file_id'])
         await self.profile_store.upsert_profile(user.id, profile_patch)
 
+        intro_title, intro_body = await resolve_cashout_ticket_intro(self, button_def)
         embed = discord.Embed(
-            title=button_def.intro_title,
-            description=button_def.intro_body.strip() or None,
+            title=intro_title,
+            description=intro_body.strip() or None,
             color=self.runtime.ticket.ticket_embed_color,
         )
         embed.add_field(name='Opened By', value=user.mention, inline=True)
@@ -1002,12 +1105,9 @@ class RSTicketBot(commands.Bot):
 
         if sheet_result.get('sheet_url'):
             view = sheet_result.get('view_url') or sheet_result['sheet_url']
-            next_step = (
-                'Fill out the sheet fully, then send the completed link back in this ticket when ready.\n'
-                'If you have multiple products, add additional rows in the same sheet (row 4+).\n'
-                f'View link: {view}'
-            )
-            embed.add_field(name='Next Step', value=next_step[:1024], inline=False)
+            tmpl = await resolve_cashout_ticket_next_template(self)
+            next_step = str(tmpl).replace('{link}', str(view)).replace('{view}', str(view))[:1024]
+            embed.add_field(name='Next Step', value=next_step, inline=False)
         elif button_def.key == 'request_submit':
             embed.add_field(name='Next Step', value='Staff will review your details here. If sheet integration is enabled later, your personal cashout sheet link will also appear here.', inline=False)
 
@@ -1048,27 +1148,20 @@ class RSTicketBot(commands.Bot):
             # Apps Script copy fails (permissions, Drive errors, etc.).
             try:
                 sheet_url = sheet_result.get('sheet_url')
-                dm_description: str
+                dm = await resolve_cashout_dm_copy(self)
                 dm_embed = discord.Embed(
-                    title='RS Cashout Submission Received',
+                    title=dm['title'],
                     color=self.runtime.ticket.ticket_embed_color,
                 )
                 if sheet_url:
-                    dm_description = (
-                        'Your personal cashout sheet copy is ready. Keep this link for reference and '
-                        'send the completed version back in your ticket when finished.'
-                    )
-                    dm_embed.description = dm_description
-                    dm_embed.add_field(name='Sheet Link', value=str(sheet_url)[:1024], inline=False)
-                    dm_embed.add_field(name='Multiple products?', value='Add additional rows in the same sheet (row 4+).', inline=False)
+                    dm_embed.description = dm['sheet_ok']
+                    dm_embed.add_field(name=dm['field_sheet_link'], value=str(sheet_url)[:1024], inline=False)
+                    dm_embed.add_field(name=dm['field_multi'], value=dm['field_multi_value'][:1024], inline=False)
                 else:
-                    dm_description = (
-                        'Your ticket is ready. The Google Sheets auto-copy failed, so staff will handle the sheet.'
-                    )
-                    dm_embed.description = dm_description
+                    dm_embed.description = dm['sheet_fail']
                     err = sheet_result.get('error') or sheet_result.get('raw') or 'unknown_error'
-                    dm_embed.add_field(name='Sheet Error', value=str(err)[:1024], inline=False)
-                dm_embed.add_field(name='Ticket', value=channel.mention, inline=False)
+                    dm_embed.add_field(name=dm['field_error'], value=str(err)[:1024], inline=False)
+                dm_embed.add_field(name=dm['field_ticket'], value=channel.jump_url, inline=False)
                 await user.send(embed=dm_embed)
             except discord.HTTPException:
                 LOG.warning('Could not DM user %s for cashout ticket', user.id)
@@ -1136,7 +1229,7 @@ async def cashoutpanel(interaction: discord.Interaction) -> None:
         await interaction.response.send_message('You do not have permission to use this command.', ephemeral=True)
         return
     snap = await bot_ref.panel_presentation_snapshot()
-    emb = build_panel_admin_summary_embed(snap)
+    emb = build_cashout_admin_hub_embed(snap)
     await interaction.response.send_message(embed=emb, view=PanelAdminView(bot_ref), ephemeral=True)
 
 

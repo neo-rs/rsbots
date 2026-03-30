@@ -8,10 +8,10 @@
 - Usage: `/cashout`
 
 #### `/cashoutpanel`
-- Description: Opens an ephemeral panel editor (edit title/description/footer, embed color, ticket banner URL), preview the panel embed, and post to the panel channel — similar to RSPromoBot’s builder flow.
+- Description: Opens an ephemeral **Cashout message editor**: edit the public panel card, the **Submit Cashout** ticket welcome embed (title, body, “Next step” template with `{link}` / `{view}`), the **member DM** copy and field labels, extra **Google Sheet editor** emails (merged with `config.json` → `google_sheet.extra_editor_emails`), plus previews for panel / ticket / DM and post panel.
 - Admin Only: Yes
 - Usage: `/cashoutpanel`
-- Notes: Overrides are stored in `panel_overrides.json` on the bot host (merged with `messages.json` / `config.json` defaults).
+- Notes: Runtime overrides live in `panel_overrides.json`. **Apps Script** must include the `extra_editor_emails` handler (see `google_apps_script.js` in this folder). Redeploy the web app after changing the script.
 
 #### `/cashoutnew`
 - Description: Opens a new Request/Submit flow for the member.

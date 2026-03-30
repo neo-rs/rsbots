@@ -82,6 +82,9 @@
     "endpoint_url": "https://script.google.com/macros/s/YOUR_APPS_SCRIPT_ID/exec",
     "auth_header_name": "X-API-Key",
     "auth_token": "CHANGE_ME",
-    "timeout_seconds": 20
+    "timeout_seconds": 20,
+    "extra_editor_emails": [
+      "staff-editor@example.com"
+    ]
   }
 }

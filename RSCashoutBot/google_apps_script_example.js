@@ -1,7 +1,7 @@
 function doPost(e) {
   const CONFIG = {
-    apiKey: 'CHANGE_ME',
-    templateSpreadsheetId: 'PASTE_TEMPLATE_SPREADSHEET_ID_HERE',
+    apiKey: "CHANGE_ME",
+    templateSpreadsheetId: '1Y3mQriVBVmaIMfi6agkUHd3oKgedZIhMbQksZyOVZ-s',
     rootFolderId: '', // optional: folder where created copies should live
     signatureImageUrl: '', // optional: public image URL for =IMAGE() in A1
     logSpreadsheetId: '', // optional: spreadsheet to log submissions into
@@ -77,8 +77,24 @@ function handleCashoutSubmit_(payload, config) {
   sheet.getRange('I5').setValue('Created At');
   sheet.getRange('J5').setValue(String(payload.created_at || ''));
 
-  // Sharing: requester can edit; anyone with link can view.
-  copyFile.addEditor(email);
+  // Sharing: requester + optional staff editors can edit; anyone with link can view.
+  try {
+    copyFile.addEditor(email);
+  } catch (err) {
+    // ignore invalid email
+  }
+  const extraEditors = payload.extra_editor_emails || payload.sheet_extra_editors || [];
+  if (extraEditors && extraEditors.length) {
+    for (let i = 0; i < extraEditors.length; i++) {
+      const ex = String(extraEditors[i] || '').trim();
+      if (!ex || ex.toLowerCase() === String(email).toLowerCase()) continue;
+      try {
+        copyFile.addEditor(ex);
+      } catch (err2) {
+        // ignore per-email failures
+      }
+    }
+  }
   copyFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
 
   if (config.logSpreadsheetId) {
