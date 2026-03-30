@@ -3380,6 +3380,9 @@ try:
     ONBOARDING_LOGS_CHANNEL_ID = int(LOG_CONTROLS.get("onboarding_logs_channel_id") or 0)
 except Exception:
     ONBOARDING_LOGS_CHANNEL_ID = 0
+STARTUP_CONSOLE_LOG_MODE = str(LOG_CONTROLS.get("startup_console_log_mode") or "summary").strip().lower()
+if STARTUP_CONSOLE_LOG_MODE not in {"summary", "each"}:
+    STARTUP_CONSOLE_LOG_MODE = "summary"
 
 # Channel limits monitor (posts counts/warnings on channel create/delete + staff slash command).
 CHANNEL_LIMITS_CONFIG = config.get("channel_limits", {}) if isinstance(config, dict) else {}
@@ -7455,12 +7458,11 @@ async def init_http_server():
         with suppress(Exception):
             await runner.cleanup()
         return
-    rj.tlog(log, "info", rj.HTTP, "HTTP server started on port %s", HTTP_SERVER_PORT)
     rj.tlog(
         log,
         "info",
         rj.HTTP,
-        "Whop webhook receiver: http://0.0.0.0:%s/whop-webhook",
+        "HTTP 0.0.0.0:%s — POST /create-invite, POST /whop-webhook",
         HTTP_SERVER_PORT,
     )
 
@@ -8980,6 +8982,131 @@ async def sync_whop_memberships_error(error):
     await log_other(f"❌ Sync job error: `{error}`", flow=rj.WHOP_SYNC)
     log.error(f"Sync job error: {error}", exc_info=True)
 
+
+def _discord_ch_mention(cid: object) -> str:
+    try:
+        i = int(str(cid).strip())
+        if i > 0:
+            return f"<#{i}>"
+    except Exception:
+        pass
+    return ""
+
+
+def _startup_discord_routes_log_enabled() -> bool:
+    raw = LOG_CONTROLS.get("startup_discord_routes_log", True)
+    if isinstance(raw, bool):
+        return raw
+    s = str(raw or "").strip().lower()
+    return s not in {"0", "false", "no", "off"}
+
+
+def _boot_discord_routes_summary_lines() -> list[str]:
+    """Startup operator map: which Discord channels are read/written per flow (<#id> for mentions)."""
+    lines: list[str] = []
+
+    lf = _discord_ch_mention(LOG_FIRST_CHANNEL_ID)
+    lo = _discord_ch_mention(LOG_OTHER_CHANNEL_ID)
+    ra = _discord_ch_mention(ROLE_AUDIT_CHANNEL_ID)
+    ms = _discord_ch_mention(MEMBER_STATUS_LOGS_CHANNEL_ID)
+    wl = _discord_ch_mention(WHOP_LOGS_CHANNEL_ID)
+    ww = _discord_ch_mention(WHOP_WEBHOOK_CHANNEL_ID)
+    inv = _discord_ch_mention(INVITE_CHANNEL_ID)
+
+    st = config.get("support_tickets") if isinstance(config, dict) else {}
+    ml_c = aud_c = wym_c = 0
+    with suppress(Exception):
+        ml_c = int((st.get("member_lookup") or {}).get("channel_id") or 0) if isinstance(st.get("member_lookup"), dict) else 0
+    with suppress(Exception):
+        aud_c = int((st.get("audit_logs") or {}).get("channel_id") or 0) if isinstance(st.get("audit_logs"), dict) else 0
+    with suppress(Exception):
+        wym_c = int((st.get("free_pass") or {}).get("what_you_missed_channel_id") or 0) if isinstance(st.get("free_pass"), dict) else 0
+    ml = _discord_ch_mention(ml_c)
+    audit = _discord_ch_mention(aud_c)
+    wym = _discord_ch_mention(wym_c)
+
+    w1: list[str] = []
+    if lf:
+        w1.append(f"DM_seq_day1_log→{lf}")
+    if lo:
+        w1.append(f"DM_seq_bot_log→{lo}")
+    if ra:
+        w1.append(f"role_audit→{ra}")
+    if ms:
+        w1.append(f"staff_cards+ticket_triggers→{ms}")
+    if inv:
+        w1.append(f"invite_create_target→{inv}")
+    if ml:
+        w1.append(f"lookup_panel→{ml}")
+    if wym:
+        w1.append(f"free_pass_preview→{wym}")
+    if audit:
+        w1.append(f"tickets_audit→{audit}")
+    try:
+        og = int(OUTPUT_GUILD_ID or 0)
+    except Exception:
+        og = 0
+    if og > 0:
+        w1.append(
+            f"neo_output g={og} #{OUTPUT_LOG_OTHER_CHANNEL_NAME or 'bot-logs'}/#{OUTPUT_MEMBER_STATUS_CHANNEL_NAME or 'member-status-logs'}/#{OUTPUT_WHOP_CHANNEL_NAME or 'whop-logs'}"
+        )
+    lines.append("[Boot][Discord routes] WRITE " + (" · ".join(w1) if w1 else "—"))
+
+    r1: list[str] = []
+    if bool(MEMBER_HISTORY_INGEST_ENABLED):
+        src = "+".join(x for x in (wl, ww) if x) or "—"
+        r1.append(f"mh_ingest READ {src}→member_history.json(disk)")
+    if ms:
+        r1.append(f"on_message member-status READ {ms}→tickets/reporting hooks")
+    http_whop = bool(str(WHOP_WEBHOOK_SECRET or "").strip())
+    if http_whop:
+        r1.append("whop_workflow Discord READ off (HTTP /whop-webhook canonical)")
+    elif ww or wl:
+        r1.append(f"whop_discord_parse READ { '+'.join(x for x in (ww, wl) if x) or '—'}")
+    lines.append("[Boot][Discord routes] READ " + (" | ".join(r1) if r1 else "—"))
+
+    x1: list[str] = []
+    if bool(REPORTING_CONFIG.get("enabled")):
+        try:
+            du = int(REPORTING_CONFIG.get("dm_user_id") or 0)
+        except Exception:
+            du = 0
+        if du > 0:
+            x1.append(f"reporting→DM<@{du}>")
+        try:
+            cg = int(REPORTING_CONFIG.get("cancel_reminders_output_guild_id") or 0)
+            cn = str(REPORTING_CONFIG.get("cancel_reminders_output_channel_name") or "").strip()
+            if cg and cn:
+                x1.append(f"cancel_reminders_mirror→guild {cg} #{cn}")
+        except Exception:
+            pass
+    wapi = config.get("whop_api") if isinstance(config, dict) else {}
+    with suppress(Exception):
+        sg = int(wapi.get("sync_summary_output_guild_id") or 0)
+        sn = str(wapi.get("sync_summary_output_channel_name") or "").strip()
+        if sg and sn:
+            x1.append(f"whop_sync_summary→guild {sg} #{sn}")
+    if bool(WHOP_MOVEMENT_LOG_ENABLED):
+        if str(WHOP_MOVEMENT_LOG_WEBHOOK_URL or "").strip():
+            x1.append("whop_movement→webhook_url")
+        else:
+            mc = _discord_ch_mention(WHOP_MOVEMENT_LOG_OUTPUT_CHANNEL_ID)
+            if mc:
+                x1.append(f"whop_movement→{mc}")
+            elif str(WHOP_MOVEMENT_LOG_OUTPUT_CHANNEL_NAME or "").strip():
+                try:
+                    mg = int(WHOP_MOVEMENT_LOG_OUTPUT_GUILD_ID or 0)
+                except Exception:
+                    mg = 0
+                x1.append(f"whop_movement→guild {mg} #{WHOP_MOVEMENT_LOG_OUTPUT_CHANNEL_NAME}")
+    if CHANNEL_LIMITS_ENABLED and CHANNEL_LIMITS_LOG_CHANNEL_ID:
+        x1.append(f"channel_limits→{_discord_ch_mention(CHANNEL_LIMITS_LOG_CHANNEL_ID)}")
+    if x1:
+        lines.append("[Boot][Discord routes] MIRROR/EXTRA " + " | ".join(x1))
+
+    return lines
+
+
 # -----------------------------
 # Events
 # -----------------------------
@@ -9308,18 +9435,27 @@ async def on_ready():
             payload["next_send"] = (_now() + timedelta(seconds=5)).isoformat().replace("+00:00", "Z")
     save_json(QUEUE_FILE, queue_state)
 
+    _boot_each = STARTUP_CONSOLE_LOG_MODE == "each"
+    _boot_parts: list[str] = []
+
     # Queue and Registry Status
     queue_count = len(queue_state)
     registry_count = len(registry)
-    log.info(f"[Queue] Active entries: {queue_count}")
-    log.info(f"[Registry] Registered users: {registry_count}")
+    if _boot_each:
+        log.info(f"[Queue] Active entries: {queue_count}")
+        log.info(f"[Registry] Registered users: {registry_count}")
+    else:
+        _boot_parts.append(f"queue={queue_count} reg={registry_count}")
     if post_startup_report:
         startup_kv.append(("queue_entries", queue_count))
         startup_kv.append(("registry_users", registry_count))
-    
+
     if not scheduler_loop.is_running():
         scheduler_loop.start()
-        log.info("[Scheduler] Started and state restored")
+        if _boot_each:
+            log.info("[Scheduler] Started and state restored")
+        else:
+            _boot_parts.append("scheduler=on")
 
     # Support tickets: Free Pass auto-delete sweeper (config-driven interval)
     try:
@@ -9338,20 +9474,30 @@ async def on_ready():
             pass
         if not support_ticket_sweeper_loop.is_running():
             support_ticket_sweeper_loop.start()
-            log.info(f"[SupportTickets] Free Pass sweeper started (every {max(30, int(sweeper_interval))}s)")
+            if _boot_each:
+                log.info(f"[SupportTickets] Free Pass sweeper started (every {max(30, int(sweeper_interval))}s)")
+            else:
+                _boot_parts.append(f"st_sweep={max(30, int(sweeper_interval))}s")
+    elif not _boot_each:
+        _boot_parts.append("st_sweep=off")
 
     # Support tickets: on-boot backfill from today's member-status-logs (restart-safe).
     with suppress(Exception):
         asyncio.create_task(support_tickets_startup_backfill_today())
-        log.info("[SupportTickets] Startup backfill scheduled")
+        if _boot_each:
+            log.info("[SupportTickets] Startup backfill scheduled")
     # Support tickets: ensure legacy open tickets have correct ticket-roles applied.
     with suppress(Exception):
         asyncio.create_task(support_tickets.reconcile_open_ticket_roles())
-        log.info("[SupportTickets] Role reconcile scheduled")
+        if _boot_each:
+            log.info("[SupportTickets] Role reconcile scheduled")
     # Support tickets: ensure staff member lookup panel exists (optional; config-driven).
     with suppress(Exception):
         asyncio.create_task(support_tickets.ensure_member_lookup_panel())
-        log.info("[SupportTickets] Member lookup panel scheduled")
+        if _boot_each:
+            log.info("[SupportTickets] Member lookup panel scheduled")
+    if not _boot_each:
+        _boot_parts.append("st_tasks=backfill+reconcile+panel")
 
     # Member history ingest: tail whop-logs + whop-membership-logs into member_history.json (resume-safe).
     if bool(MEMBER_HISTORY_INGEST_ENABLED):
@@ -9360,31 +9506,41 @@ async def on_ready():
         with suppress(Exception):
             if not member_history_ingest_loop.is_running():
                 member_history_ingest_loop.start()
-                log.info(f"[MemberHistory] Ingest loop started (every {int(MEMBER_HISTORY_INGEST_INTERVAL_SECONDS)}s)")
+                if _boot_each:
+                    log.info(f"[MemberHistory] Ingest loop started (every {int(MEMBER_HISTORY_INGEST_INTERVAL_SECONDS)}s)")
+                else:
+                    _boot_parts.append(f"mh_ingest={int(MEMBER_HISTORY_INGEST_INTERVAL_SECONDS)}s")
+    elif not _boot_each:
+        _boot_parts.append("mh_ingest=off")
 
     if post_startup_report:
         startup_notes.append("Scheduler started and state restored.")
-    
+
     # Cleanup old data on startup
     cleanup_old_data()
     cleanup_old_invites()
-    log.info("[Cleanup] Old data cleanup completed")
+    if _boot_each:
+        log.info("[Cleanup] Old data cleanup completed")
+    else:
+        _boot_parts.append("data_cleanup=ok")
 
+    scheduled = 0
     if guild:
-        scheduled = 0
         for m in guild.members:
             if not m.bot and not any(r.id in ROLES_TO_CHECK for r in m.roles):
                 asyncio.create_task(check_and_assign_role(m, silent=True))
                 scheduled += 1
         if scheduled:
-            log.info(f"[Boot Check] Scheduled fallback role checks for {scheduled} member(s)")
+            if _boot_each:
+                log.info(f"[Boot Check] Scheduled fallback role checks for {scheduled} member(s)")
+            else:
+                _boot_parts.append(f"role_fallback_60s={scheduled}")
             if post_startup_report:
                 startup_kv.append(("boot_check_scheduled", scheduled))
 
-    # Start HTTP server for invite tracking
+    # Start HTTP server (bind + log happens inside init_http_server; do not log "started" here — task is async).
     asyncio.create_task(init_http_server())
-    log.info(f"[HTTP Server] Started on port {HTTP_SERVER_PORT}")
-    
+
     # Initialize Whop API client if key provided
     if WHOP_API_KEY and WhopAPIClient:
         try:
@@ -9392,42 +9548,77 @@ async def on_ready():
                 base_url = WHOP_API_CONFIG.get("base_url", "https://api.whop.com/api/v1")
                 company_id = WHOP_API_CONFIG.get("company_id", "")
                 whop_api_client = WhopAPIClient(WHOP_API_KEY, base_url, company_id)
-                log.info("[Whop API] Client initialized")
+                if _boot_each:
+                    log.info("[Whop API] Client initialized")
+                else:
+                    _boot_parts.append("whop_api=on")
             else:
                 whop_api_client = None
-                log.info("[Whop API] Client disabled (placeholder key)")
+                if _boot_each:
+                    log.info("[Whop API] Client disabled (placeholder key)")
+                else:
+                    _boot_parts.append("whop_api=placeholder")
         except Exception as e:
             whop_api_client = None
             log.warning(f"[Whop API] Failed to initialize: {e}")
+            if not _boot_each:
+                _boot_parts.append("whop_api=err")
     else:
         whop_api_client = None
         if not WhopAPIClient:
-            log.info("[Whop API] Client disabled (module not available)")
+            if _boot_each:
+                log.info("[Whop API] Client disabled (module not available)")
+            else:
+                _boot_parts.append("whop_api=no_mod")
         else:
-            log.info("[Whop API] Client disabled (no API key)")
-    
+            if _boot_each:
+                log.info("[Whop API] Client disabled (no API key)")
+            else:
+                _boot_parts.append("whop_api=no_key")
+
     # Startup scans can be expensive; run them sequentially in one canonical routine.
     # NOTE: We do NOT rely on Discord whop-* channels when API/webhook mode is enabled.
     asyncio.create_task(_run_startup_scans())
-    
+    if not _boot_each:
+        _boot_parts.append("startup_scans=task")
+
     # Schedule periodic cleanup (every 24 hours)
     @tasks.loop(hours=24)
     async def periodic_cleanup():
         cleanup_old_data()
         cleanup_old_invites()
-    
+
     periodic_cleanup.start()
-    log.info("[Cleanup] Periodic cleanup scheduled (every 24 hours)")
-    
+    if _boot_each:
+        log.info("[Cleanup] Periodic cleanup scheduled (every 24 hours)")
+    else:
+        _boot_parts.append("cleanup_loop=24h")
+
     # Start Whop membership sync job AFTER startup scans (anti-rate-limit).
     if whop_api_client and WHOP_API_CONFIG.get("enable_sync", True):
         asyncio.create_task(_start_whop_sync_job_after_startup())
+        if not _boot_each:
+            _boot_parts.append("whop_sync=queued")
+    elif not _boot_each:
+        _boot_parts.append("whop_sync=off")
 
     # Start reporting loop (weekly report + daily reminders) if enabled
     if REPORTING_CONFIG.get("enabled"):
         if not reporting_loop.is_running():
             reporting_loop.start()
-            log.info("[Reporting] Reporting loop started")
+            if _boot_each:
+                log.info("[Reporting] Reporting loop started")
+            else:
+                _boot_parts.append("reporting=on")
+    elif not _boot_each:
+        _boot_parts.append("reporting=off")
+
+    if not _boot_each and _boot_parts:
+        log.info("[Boot] %s", " | ".join(_boot_parts))
+
+    if _startup_discord_routes_log_enabled():
+        for _route_line in _boot_discord_routes_summary_lines():
+            log.info("%s", _route_line)
 
     # One single startup report (anti-spam): file health + cache poisoning detection.
     if post_startup_report and LOG_OTHER_CHANNEL_ID:

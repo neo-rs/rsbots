@@ -80,6 +80,10 @@
     }
   },
   "log_controls": {
+    "_comment_startup_console_log_mode": "summary = one [Boot] line for loops/tasks; each = separate line per subsystem (noisy).",
+    "startup_console_log_mode": "summary",
+    "_comment_startup_discord_routes_log": "After boot, log [Boot][Discord routes] lines with <#channel_id> read/write map (disable with false).",
+    "startup_discord_routes_log": true,
     "boot_post_min_hours": 6,
     "role_update_batch_seconds": 2,
     "cid_ttl_minutes": 10,
