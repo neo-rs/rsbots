@@ -16,6 +16,7 @@ DEFAULT_RS_BOT_FOLDERS = [
     "RSMentionPinger",
     "RSuccessBot",
     "RSOnboarding",
+    "RSCashoutBot",
 ]
 
 

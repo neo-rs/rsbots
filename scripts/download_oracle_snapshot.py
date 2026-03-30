@@ -43,6 +43,7 @@ INCLUDES_DEFAULT = [
     "RSMentionPinger",
     "RSOnboarding",
     "RSuccessBot",
+    "RSCashoutBot",
     "scripts",
     "systemd",
     "mirror_world_config.py",
