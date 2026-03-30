@@ -199,6 +199,7 @@ from whop_webhook_handler import (
     handle_whop_webhook_message,
     extract_native_whop_card_debug,
     resolve_discord_id_from_whop_logs as _resolve_discord_id_from_whop_logs,
+    set_whop_logs_scan_journal,
     _extract_email_from_embed,
     _extract_discord_id_from_embed,
 )
@@ -2742,14 +2743,14 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
     did_i = int(did)
     member = guild.get_member(int(did_i))
     if not isinstance(member, discord.Member):
-        rj.tlog(
-            log,
-            "info",
-            rj.TICKETS,
-            "[TICKETS][DISCORD_MEMBER_FETCH] guild_id=%s discord_user_id=%s api=GET /guilds/{guild.id}/members/{user.id} reason=member_status_ticket_triggers_cache_miss",
-            guild.id,
-            int(did_i),
-        )
+        with suppress(Exception):
+            await journal_tlog(
+                "info",
+                rj.MEMBER_STATUS_CRM,
+                "[MEMBER_STATUS_CRM][DISCORD_MEMBER_FETCH] guild_id=%s discord_user_id=%s api=GET /guilds/{guild.id}/members/{user.id} reason=ticket_automation_cache_miss",
+                guild.id,
+                int(did_i),
+            )
         with suppress(Exception):
             member = await guild.fetch_member(int(did_i))
     if not isinstance(member, discord.Member):
@@ -4183,8 +4184,6 @@ def _save_raw_webhook_payload(payload: dict, headers: dict = None):
         # Save to file
         with open(WHOP_WEBHOOK_RAW_LOG_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        
-        rj.tlog(log, "info", rj.PERSIST, "Saved raw webhook payload to %s", WHOP_WEBHOOK_RAW_LOG_FILE.name)
     except Exception as e:
         rj.tlog(log, "error", rj.PERSIST, "Failed to save raw webhook payload: %s", e)
 
@@ -5751,6 +5750,30 @@ async def log_other(msg: str | None = None, *, embed: discord.Embed | None = Non
         await ch.send(embed=e, allowed_mentions=allow)
 
 
+async def journal_tlog(level: str, flow: str | None, msg: str, *args: object) -> None:
+    """Python log (journald) + optional Discord mirror to flow-specific journal/bot-logs (RSAdminBot-style split)."""
+    rj.tlog(log, level, flow, msg, *args)
+    if not bool(JOURNAL_LOGS.get("mirror_tlog_to_discord", True)):
+        return
+    try:
+        body = msg % args if args else str(msg)
+    except Exception:
+        body = str(msg)
+        if args:
+            body += " " + " ".join(str(a) for a in args)
+    body = str(body).strip()
+    if not body:
+        return
+    body = body[:1900]
+    lv = str(level or "info").lower()
+    if lv == "warning":
+        body = "⚠️ " + body
+    elif lv == "error":
+        body = "❌ " + body
+    with suppress(Exception):
+        await log_other(body, flow=flow)
+
+
 async def log_role_event(message: str | None = None, *, embed: discord.Embed | None = None):
     await log_other(message, embed=embed, flow=rj.ROLES)
 
@@ -6987,10 +7010,9 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
     # Many webhook types (withdrawals, payout methods, invoices, etc.) have no membership context.
     # We still log them above; staff-card output only happens when we can resolve a membership.
     if not mid:
-        rj.tlog(
-            log,
+        await journal_tlog(
             "info",
-            rj.WHOP_WEBHOOK,
+            rj.WHOP_HTTP_PROCESS,
             "[WHOP][SKIP_NO_MEMBERSHIP] type=%s delivery_id=%s shallow_mid_empty_after_resolve → no_staff_card no_crm_from_http",
             evt,
             str((headers or {}).get("webhook-id") or "")[:48],
@@ -7000,6 +7022,12 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
     now = datetime.now(timezone.utc)
     guild = bot.get_guild(GUILD_ID) if GUILD_ID else None
     if not isinstance(guild, discord.Guild):
+        await journal_tlog(
+            "warning",
+            rj.WHOP_HTTP_PROCESS,
+            "[WHOP][SKIP] guild_not_visible guild_id_config=%s",
+            int(GUILD_ID or 0),
+        )
         return
 
     async with _WHOP_API_EVENTS_LOCK:
@@ -7018,16 +7046,21 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
         if wh_id:
             dkey = f"whop_webhook:{wh_id}"
             if dkey in sent:
+                await journal_tlog(
+                    "info",
+                    rj.WHOP_HTTP_PROCESS,
+                    "[WHOP][DEDUPE_SKIP] delivery_id=%s → already_processed",
+                    str(wh_id)[:48],
+                )
                 return
             sent[dkey] = now.isoformat().replace("+00:00", "Z")
 
         # Fetch authoritative state via API (totals + dashboard). Discord linkage is enriched via whop-logs fallback.
         brief = await _fetch_whop_brief_by_membership_id(mid)
         if not isinstance(brief, dict) or not brief:
-            rj.tlog(
-                log,
+            await journal_tlog(
                 "warning",
-                rj.WHOP_WEBHOOK,
+                rj.WHOP_HTTP_PROCESS,
                 "[WHOP][SKIP_NO_BRIEF] mid=%s type=%s → Whop_API_brief_empty_no_staff_card",
                 mid,
                 evt,
@@ -7125,10 +7158,9 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
             state["sent"] = sent
             state["cases"] = cases
             _save_whop_api_events_state(state)
-            rj.tlog(
-                log,
+            await journal_tlog(
                 "info",
-                rj.WHOP_WEBHOOK,
+                rj.WHOP_HTTP_PROCESS,
                 "[WHOP][STATE_ONLY] type=%s mid=%s → no_classified_movement_kind; no_staff_embed_this_delivery",
                 evt_l,
                 mid2,
@@ -7136,10 +7168,9 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
             return
 
         title, color, embed_kind = _title_for_event(kind)
-        rj.tlog(
-            log,
+        await journal_tlog(
             "info",
-            rj.WHOP_WEBHOOK,
+            rj.WHOP_HTTP_PROCESS,
             "[WHOP][CLASSIFIED] type=%s kind=%s mid=%s embed_kind=%s | %s",
             evt_l,
             kind,
@@ -7250,10 +7281,9 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
         if did:
             member_obj = guild.get_member(int(did))
             if member_obj is None:
-                rj.tlog(
-                    log,
+                await journal_tlog(
                     "info",
-                    rj.WHOP_WEBHOOK,
+                    rj.WHOP_HTTP_PROCESS,
                     "[WHOP][DISCORD_MEMBER_FETCH] guild_id=%s discord_user_id=%s api=GET /guilds/{guild.id}/members/{user.id} reason=cache_miss_whop_webhook (429=Discord_rate_limit_same_endpoint)",
                     guild.id,
                     int(did),
@@ -7325,10 +7355,9 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                 if did:
                     member_obj = guild.get_member(int(did))
                     if member_obj is None:
-                        rj.tlog(
-                            log,
+                        await journal_tlog(
                             "info",
-                            rj.WHOP_WEBHOOK,
+                            rj.WHOP_HTTP_PROCESS,
                             "[WHOP][DISCORD_MEMBER_FETCH] guild_id=%s discord_user_id=%s api=GET /guilds/{guild.id}/members/{user.id} reason=after_unlinked_delay_cache_miss",
                             guild.id,
                             int(did),
@@ -7510,21 +7539,26 @@ async def handle_whop_webhook_receiver(request):
             verify=WHOP_WEBHOOK_VERIFY,
         )
         if not ok:
-            rj.tlog(log, "warning", rj.WHOP_WEBHOOK, "Signature verification failed: %s", reason)
+            await journal_tlog("warning", rj.WHOP_HTTP_INBOUND, "Signature verification failed: %s", reason)
             return web.Response(text=f"Invalid webhook signature ({reason})", status=401)
 
         try:
             payload = json.loads(raw_body.decode("utf-8"))
         except Exception:
-            rj.tlog(log, "warning", rj.WHOP_WEBHOOK, "Invalid JSON payload")
+            await journal_tlog("warning", rj.WHOP_HTTP_INBOUND, "Invalid JSON payload")
             return web.Response(text="Invalid JSON payload", status=400)
 
         # Log the raw payload
         _save_raw_webhook_payload(payload, headers)
-        rj.tlog(
-            log,
+        await journal_tlog(
             "info",
-            rj.WHOP_WEBHOOK,
+            rj.PERSIST,
+            "Saved raw webhook payload to %s",
+            WHOP_WEBHOOK_RAW_LOG_FILE.name,
+        )
+        await journal_tlog(
+            "info",
+            rj.WHOP_HTTP_INBOUND,
             "%s | raw_saved=%s",
             _whop_webhook_inbound_summary_line(payload, headers),
             WHOP_WEBHOOK_RAW_LOG_FILE.name,
@@ -7543,7 +7577,7 @@ async def handle_whop_webhook_receiver(request):
                 event = _whop_event_from_webhook_payload(payload, event_id=wh_id, occurred_at=occurred_at)
                 await _record_whop_event(event)
         except Exception as e:
-            rj.tlog(log, "warning", rj.PERSIST, "Failed to record Whop webhook event to ledger: %s", e)
+            await journal_tlog("warning", rj.PERSIST, "Failed to record Whop webhook event to ledger: %s", e)
 
         # Process the webhook directly (real-time staff cards + movement logs).
         # This replaces the legacy "forward raw JSON to a Discord webhook" behavior which caused blanks.
@@ -7567,12 +7601,11 @@ async def init_http_server():
         await site.start()
     except OSError as e:
         # Common on local dev: another bot already bound the port.
-        rj.tlog(log, "warning", rj.HTTP, "Failed to bind port %s: %s", HTTP_SERVER_PORT, e)
+        await journal_tlog("warning", rj.HTTP, "Failed to bind port %s: %s", HTTP_SERVER_PORT, e)
         with suppress(Exception):
             await runner.cleanup()
         return
-    rj.tlog(
-        log,
+    await journal_tlog(
         "info",
         rj.HTTP,
         "HTTP 0.0.0.0:%s — POST /create-invite, POST /whop-webhook",
@@ -9434,6 +9467,12 @@ async def on_ready():
         with suppress(Exception):
             asyncio.create_task(support_tickets.run_crm_startup_audit())
 
+    async def _whop_logs_scan_journal_line(msg: str) -> None:
+        await journal_tlog("info", rj.WHOP_LOGS_SCAN, "%s", msg)
+
+    with suppress(Exception):
+        set_whop_logs_scan_journal(_whop_logs_scan_journal_line)
+
     # Run nowhop cleanup immediately on startup (restart-safe).
     # This closes resolved `no_whop_link` tickets + removes stale No-Whop roles once linkage is confirmed.
     with suppress(Exception):
@@ -10618,7 +10657,7 @@ async def on_message(message: discord.Message):
             with suppress(Exception):
                 await log_other(
                     f"❌ SupportTickets: trigger error in member-status-logs msg_id={int(getattr(message,'id',0) or 0)} err=`{str(ex)[:240]}`",
-                    flow=rj.TICKETS,
+                    flow=rj.MEMBER_STATUS_CRM,
                 )
         # Ticket audit logs (member-status-logs messages too).
         try:
@@ -10669,7 +10708,7 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
             with suppress(Exception):
                 await log_other(
                     f"❌ SupportTickets: trigger error in member-status-logs edit msg_id={int(getattr(after,'id',0) or 0)} err=`{str(ex)[:240]}`",
-                    flow=rj.TICKETS,
+                    flow=rj.MEMBER_STATUS_CRM,
                 )
 
 

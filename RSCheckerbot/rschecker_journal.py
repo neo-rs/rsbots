@@ -36,6 +36,11 @@ SUPPORT_SWEEP = "support_sweep"
 INVITE_GHL = "invite_ghl"
 CHANNEL_LIMITS = "channel_limits"
 WHOP_TEXT = "whop_text"
+# Finer splits (RSAdminBot-style journal streams; map each to #journal-rscheckerbot-* when routing on)
+WHOP_HTTP_INBOUND = "whop_http_inbound"
+WHOP_HTTP_PROCESS = "whop_http_process"
+WHOP_LOGS_SCAN = "whop_logs_scan"
+MEMBER_STATUS_CRM = "member_status_crm"
 
 # Human titles for terminal / ELI5 lines (short)
 FLOW_TITLE: dict[str, str] = {
@@ -58,6 +63,10 @@ FLOW_TITLE: dict[str, str] = {
     INVITE_GHL: "Invites + GHL / create-invite HTTP",
     CHANNEL_LIMITS: "Channel limits monitor / slash",
     WHOP_TEXT: "Whop text channel (legacy whop-logs)",
+    WHOP_HTTP_INBOUND: "Whop HTTP webhook — POST receipt & payload shape",
+    WHOP_HTTP_PROCESS: "Whop HTTP webhook — classify, API brief, staff card, CRM hints",
+    WHOP_LOGS_SCAN: "Whop native #whop-logs history scan (identity / Discord ID resolve)",
+    MEMBER_STATUS_CRM: "Member-status channel — ticket open/close automation",
 }
 
 
@@ -102,6 +111,7 @@ def parse_journal_config(root: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "flow_labels_enabled": bool(raw.get("flow_labels_enabled", True)),
         "route_to_journal_channels": bool(raw.get("route_to_journal_channels", False)),
+        "mirror_tlog_to_discord": bool(raw.get("mirror_tlog_to_discord", True)),
         "category_id": category_id,
         "channel_names": channel_names,
     }

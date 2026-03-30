@@ -28,6 +28,15 @@ log = logging.getLogger("rs-checker")
 _WHOP_LOGS_LOOKUP_CACHE: dict[str, tuple[str, float]] = {}
 _WHOP_LOGS_LOOKUP_LAST: dict[str, float] = {}
 
+# Optional async callback (str -> None): RSCheckerbot main wires journal_tlog(WHOP_LOGS_SCAN, ...).
+_WHOP_LOGS_SCAN_JOURNAL = None
+
+
+def set_whop_logs_scan_journal(cb):
+    """Register async fn(msg: str) -> None to log each whop-logs history scan (identity resolve)."""
+    global _WHOP_LOGS_SCAN_JOURNAL
+    _WHOP_LOGS_SCAN_JOURNAL = cb
+
 # Canonical shared helpers (single source of truth)
 from rschecker_utils import load_json as _load_json
 from rschecker_utils import save_json as _save_json
@@ -718,6 +727,16 @@ async def _resolve_discord_id_from_whop_logs(
         _WHOP_LOGS_LOOKUP_LAST[cache_key_email or cache_key_key or "global"] = now
     except Exception:
         pass
+
+    jfn = _WHOP_LOGS_SCAN_JOURNAL
+    if jfn is not None:
+        with suppress(Exception):
+            lim_i = int(max(10, min(250, int(limit))))
+            scan_msg = (
+                f"[WHOP_LOGS_SCAN] channel=<#{ch.id}> limit={lim_i} "
+                f"hints email={'yes' if email_n else 'no'} mid={'yes' if mid else 'no'} key={'yes' if key else 'no'}"
+            )
+            await jfn(scan_msg)
 
     try:
         # This scan is throttled + cached; allow a deeper window so older members still resolve.
