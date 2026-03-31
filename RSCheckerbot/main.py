@@ -9326,6 +9326,73 @@ async def _post_journal_routing_audit() -> None:
     except Exception:
         return
 
+
+async def _post_flow_channel_purpose_headers() -> None:
+    """Post one short 'purpose' header into each configured flow channel (startup only)."""
+    try:
+        enabled = bool(JOURNAL_LOGS.get("route_to_journal_channels"))
+        if not enabled:
+            return
+        jl = config.get("journal_logs") if isinstance(config, dict) else {}
+        if not bool((jl or {}).get("startup_channel_headers_enabled", False)):
+            return
+        guild = _output_guild()
+        if not isinstance(guild, discord.Guild):
+            return
+        names = JOURNAL_LOGS.get("channel_names") if isinstance(JOURNAL_LOGS.get("channel_names"), dict) else {}
+        if not isinstance(names, dict) or not names:
+            return
+
+        preferred = [
+            rj.TICKETS,
+            rj.MEMBER_STATUS_CRM,
+            rj.WHOP_HTTP_PROCESS,
+            rj.WHOP_HTTP_INBOUND,
+            rj.GENERAL,
+            rj.STARTUP,
+            rj.PERSIST,
+            rj.HTTP,
+            rj.WHOP_LOGS_SCAN,
+        ]
+        rest = [str(k) for k in names.keys() if str(k) not in preferred]
+        flow_keys = preferred + sorted(rest)
+
+        purpose: dict[str, str] = {
+            rj.TICKETS: "Support ticket lifecycle movement: open/dedupe/suppress/resolve/close + sweepers.",
+            rj.MEMBER_STATUS_CRM: "CRM / triggers: member-status driven decisions (why a ticket/card/action fired).",
+            rj.WHOP_HTTP_PROCESS: "Whop processing: webhook classify/enrich/actions (the 'real work').",
+            rj.WHOP_HTTP_INBOUND: "Whop raw inbound: webhook receipt/payload shape (debug signatures/tolerance).",
+            rj.WHOP_LOGS_SCAN: "Whop logs scan: periodic history scan / linkage inference.",
+            rj.GENERAL: "General ops: background tasks, warnings, non-specific bot logs.",
+            rj.STARTUP: "Startup/boot: configuration audits and routing proofs.",
+            rj.PERSIST: "Persistence: JSON save/load and disk state updates.",
+            rj.HTTP: "HTTP: local invite API + webhook receiver server logs.",
+        }
+
+        for fk in flow_keys:
+            key = rj.normalize_flow(fk)
+            ch_name = str(names.get(key) or "").strip()
+            if not ch_name:
+                continue
+            ch = _find_text_channel_by_name(guild, ch_name)
+            if not isinstance(ch, discord.TextChannel):
+                continue
+            title = rj.flow_title(key)
+            desc = purpose.get(key) or "Flow-specific logs for this subsystem."
+            body = "\n".join(
+                [
+                    f"[Boot][Channel purpose] FLOW={key}",
+                    f"- Channel: <#{int(ch.id)}>",
+                    f"- Title: {title}",
+                    f"- Purpose: {desc}",
+                    f"- Source: RSCheckerbot `log_other(..., flow='{key}')` + tlog mirror (if enabled)",
+                ]
+            )[:1800]
+            with suppress(Exception):
+                await ch.send(body, allowed_mentions=discord.AllowedMentions.none())
+    except Exception:
+        return
+
 # -----------------------------
 # Events
 # -----------------------------
@@ -9852,6 +9919,9 @@ async def on_ready():
     # Journal routing audit (Discord-visible; operator check for flow→channel alignment).
     with suppress(Exception):
         await _post_journal_routing_audit()
+    # Optional: one-time per-channel purpose headers (operator clarity).
+    with suppress(Exception):
+        await _post_flow_channel_purpose_headers()
 
     # One single startup report (anti-spam): file health + cache poisoning detection.
     if post_startup_report and LOG_OTHER_CHANNEL_ID:

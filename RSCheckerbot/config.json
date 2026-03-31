@@ -82,7 +82,9 @@
       "invite_ghl": "invite-ghl",
       "channel_limits": "channel-limits",
       "whop_text": "whop-text-legacy"
-    }
+    },
+    "_comment_startup_channel_headers_enabled": "If true, post a one-time 'what this channel is for' header into each flow channel on startup (operator clarity).",
+    "startup_channel_headers_enabled": true
   },
   "log_controls": {
     "_comment_startup_console_log_mode": "summary = one [Boot] line for loops/tasks; each = separate line per subsystem (noisy).",
@@ -100,7 +102,7 @@
     "onboarding_logs_channel_id": 14052931698761402,
     "_comment_onboarding_logs": "RSOnboarding ticket-created cards; used in role audit for correlation link.",
     "_comment_output": "Optional: route ALL bot output logs to a different guild (e.g. Neo Test Server).",
-    "output_guild_id": 0,
+    "output_guild_id": 1451275225512546497,
     "output_log_other_channel_name": "rscheckerbot-ops",
     "output_member_status_channel_name": "member-status-events",
     "output_whop_channel_name": "whop-events"
