@@ -9220,10 +9220,42 @@ async def _whop_movement_send(*, content: str | None, embed: discord.Embed | Non
         except Exception:
             # Fall back to channel send below.
             pass
-    cid = int(WHOP_MOVEMENT_LOG_OUTPUT_CHANNEL_ID or 0)
-    ch = _WHOP_API_EVENTS_LOG_CH
-    if cid > 0:
-        if not isinstance(ch, discord.TextChannel) or int(getattr(ch, "id", 0) or 0) != cid:
+    # Choose destination channel.
+    # IMPORTANT: even if movement_log_output_channel_id is set, we still allow stage routing by name
+    # so separate channels can be auto-created under the Neo category.
+    gid = int(WHOP_MOVEMENT_LOG_OUTPUT_GUILD_ID or 0)
+    g = bot.get_guild(gid) if gid else None
+    ch: discord.TextChannel | None = None
+
+    # Stage routing (optional): choose a channel name based on embed.stage.
+    stage_name = ""
+    if isinstance(embed, discord.Embed):
+        with suppress(Exception):
+            desc = str(getattr(embed, "description", "") or "")
+            m = re.search(r"stage=`([^`]+)`", desc)
+            stage_name = str(m.group(1) or "").strip().lower() if m else ""
+    group = ""
+    if stage_name:
+        if stage_name.startswith(("http_", "process_", "membership_id_", "api_", "ledger_", "staff_card_posted")) or ("whop" in stage_name):
+            group = "whop_webhook"
+        elif stage_name.startswith("member_status_") or stage_name.startswith("msl_"):
+            group = "member_status"
+        elif stage_name.startswith("ticket_"):
+            group = "tickets"
+    want_name = ""
+    if group:
+        want_name = str((WHOP_MOVEMENT_LOG_STAGE_CHANNELS or {}).get(group) or "").strip()
+
+    # Prefer stage-specific channel name in the Neo guild.
+    if want_name and isinstance(g, discord.Guild):
+        with suppress(Exception):
+            cat_id = int(WHOP_MOVEMENT_LOG_CATEGORY_ID or 0) or None
+            ch = await _get_or_create_text_channel(g, name=want_name, category_id=cat_id)
+
+    # Fall back to configured channel id (single-channel mode).
+    if ch is None:
+        cid = int(WHOP_MOVEMENT_LOG_OUTPUT_CHANNEL_ID or 0)
+        if cid > 0:
             ch2 = bot.get_channel(cid)
             if isinstance(ch2, discord.TextChannel):
                 ch = ch2
@@ -9231,36 +9263,14 @@ async def _whop_movement_send(*, content: str | None, embed: discord.Embed | Non
                 with suppress(Exception):
                     fetched = await bot.fetch_channel(cid)
                     ch = fetched if isinstance(fetched, discord.TextChannel) else None
-            _WHOP_API_EVENTS_LOG_CH = ch if isinstance(ch, discord.TextChannel) else None
-    else:
-        # Name-based: create/find a dedicated channel in the configured guild (Neo).
-        gid = int(WHOP_MOVEMENT_LOG_OUTPUT_GUILD_ID or 0)
-        # Stage routing (optional): choose a channel name based on embed.stage.
+
+    # Final fallback: default name in Neo guild (may auto-create).
+    if ch is None and isinstance(g, discord.Guild):
         name = str(WHOP_MOVEMENT_LOG_OUTPUT_CHANNEL_NAME or "").strip() or "whop-movement-logs"
-        if isinstance(embed, discord.Embed):
-            stg = ""
-            with suppress(Exception):
-                desc = str(getattr(embed, "description", "") or "")
-                m = re.search(r"stage=`([^`]+)`", desc)
-                stg = str(m.group(1) or "").strip().lower() if m else ""
-            group = ""
-            if stg.startswith(("http_", "process_", "membership_id_", "api_", "ledger_", "staff_card_posted")) or ("whop" in stg):
-                group = "whop_webhook"
-            elif stg.startswith("member_status_") or stg.startswith("msl_"):
-                group = "member_status"
-            elif stg.startswith("ticket_"):
-                group = "tickets"
-            if group:
-                nm2 = str((WHOP_MOVEMENT_LOG_STAGE_CHANNELS or {}).get(group) or "").strip()
-                if nm2:
-                    name = nm2
-        g = bot.get_guild(gid) if gid else None
-        if isinstance(g, discord.Guild):
-            if not isinstance(ch, discord.TextChannel) or int(getattr(ch, "guild", None).id) != int(g.id) or str(getattr(ch, "name", "") or "") != name:
-                with suppress(Exception):
-                    cat_id = int(WHOP_MOVEMENT_LOG_CATEGORY_ID or 0) or None
-                    ch = await _get_or_create_text_channel(g, name=name, category_id=cat_id)
-                _WHOP_API_EVENTS_LOG_CH = ch if isinstance(ch, discord.TextChannel) else None
+        with suppress(Exception):
+            cat_id = int(WHOP_MOVEMENT_LOG_CATEGORY_ID or 0) or None
+            ch = await _get_or_create_text_channel(g, name=name, category_id=cat_id)
+
     if not isinstance(ch, discord.TextChannel):
         return
     with suppress(Exception):
