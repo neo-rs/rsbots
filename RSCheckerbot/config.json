@@ -188,6 +188,14 @@
     "movement_log_output_guild_id": 1451275225512546497,
     "movement_log_output_channel_id": 1466959374865137696,
     "movement_log_output_channel_name": "whop-movement-logs",
+    "_comment_movement_log_category": "Optional: when creating movement-log channels by name, place them under this Neo category.",
+    "movement_log_category_id": 1488415910422253608,
+    "_comment_movement_log_stage_channels": "Optional: split movement traces into separate Neo channels by stage group.",
+    "movement_log_stage_channels": {
+      "whop_webhook": "whop-webhook-trace",
+      "member_status": "member-status-trace",
+      "tickets": "ticket-trace"
+    },
     "_comment_movement_log_webhook": "Optional: send movement logs via a Discord webhook URL (put in config.secrets.json).",
     "movement_log_webhook_url": "",
     "_comment_unlinked_note": "Shown when a Whop webhook event is detected but the member has not connected Discord in Whop.",

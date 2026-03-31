@@ -3491,6 +3491,26 @@ try:
     WHOP_MOVEMENT_LOG_WEBHOOK_URL = str(WHOP_API_CONFIG.get("movement_log_webhook_url") or "").strip()
 except Exception:
     WHOP_MOVEMENT_LOG_WEBHOOK_URL = ""
+try:
+    WHOP_MOVEMENT_LOG_CATEGORY_ID = int(WHOP_API_CONFIG.get("movement_log_category_id") or 0)
+except Exception:
+    WHOP_MOVEMENT_LOG_CATEGORY_ID = 0
+WHOP_MOVEMENT_LOG_CATEGORY_ID = max(0, int(WHOP_MOVEMENT_LOG_CATEGORY_ID or 0))
+
+# Optional: route different movement-trace stages into separate Neo channels.
+# Example:
+#  whop_api: { movement_log_stage_channels: { whop_webhook: "whop-webhook-trace", member_status: "member-status-trace", tickets: "ticket-trace" } }
+try:
+    _raw_stage_channels = WHOP_API_CONFIG.get("movement_log_stage_channels") or {}
+except Exception:
+    _raw_stage_channels = {}
+WHOP_MOVEMENT_LOG_STAGE_CHANNELS: dict[str, str] = {}
+if isinstance(_raw_stage_channels, dict):
+    for k, v in _raw_stage_channels.items():
+        kk = str(k or "").strip().lower()
+        vv = str(v or "").strip()
+        if kk and vv:
+            WHOP_MOVEMENT_LOG_STAGE_CHANNELS[kk] = vv
 
 WHOP_UNLINKED_NOTE = str(
     WHOP_API_CONFIG.get("unlinked_note")
@@ -9142,12 +9162,31 @@ async def _whop_movement_send(*, content: str | None, embed: discord.Embed | Non
     else:
         # Name-based: create/find a dedicated channel in the configured guild (Neo).
         gid = int(WHOP_MOVEMENT_LOG_OUTPUT_GUILD_ID or 0)
+        # Stage routing (optional): choose a channel name based on embed.stage.
         name = str(WHOP_MOVEMENT_LOG_OUTPUT_CHANNEL_NAME or "").strip() or "whop-movement-logs"
+        if isinstance(embed, discord.Embed):
+            stg = ""
+            with suppress(Exception):
+                desc = str(getattr(embed, "description", "") or "")
+                m = re.search(r"stage=`([^`]+)`", desc)
+                stg = str(m.group(1) or "").strip().lower() if m else ""
+            group = ""
+            if stg.startswith(("http_", "process_", "membership_id_", "api_", "ledger_", "staff_card_posted")) or ("whop" in stg):
+                group = "whop_webhook"
+            elif stg.startswith("member_status_") or stg.startswith("msl_"):
+                group = "member_status"
+            elif stg.startswith("ticket_"):
+                group = "tickets"
+            if group:
+                nm2 = str((WHOP_MOVEMENT_LOG_STAGE_CHANNELS or {}).get(group) or "").strip()
+                if nm2:
+                    name = nm2
         g = bot.get_guild(gid) if gid else None
         if isinstance(g, discord.Guild):
             if not isinstance(ch, discord.TextChannel) or int(getattr(ch, "guild", None).id) != int(g.id) or str(getattr(ch, "name", "") or "") != name:
                 with suppress(Exception):
-                    ch = await _get_or_create_text_channel(g, name=name, category_id=None)
+                    cat_id = int(WHOP_MOVEMENT_LOG_CATEGORY_ID or 0) or None
+                    ch = await _get_or_create_text_channel(g, name=name, category_id=cat_id)
                 _WHOP_API_EVENTS_LOG_CH = ch if isinstance(ch, discord.TextChannel) else None
     if not isinstance(ch, discord.TextChannel):
         return
