@@ -7487,6 +7487,7 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                             membership_id_hint=str(mid2 or "").strip(),
                             whop_key=str((brief or {}).get("membership_id") or "").strip(),
                             limit=int(max(10, min(250, lim))),
+                            force_rescan=True,
                         )
                         did = int(did2) if str(did2 or "").strip().isdigit() else 0
                         if did > 0:
@@ -7520,6 +7521,7 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                         membership_id_hint=str(mid2 or "").strip(),
                         whop_key=whop_key_hint,
                         limit=int(max(10, min(250, lim))),
+                        force_rescan=True,
                     )
                     did = int(did2) if str(did2 or "").strip().isdigit() else 0
                     if did > 0:
@@ -7627,9 +7629,41 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                 note = WHOP_NOT_IN_GUILD_NOTE
                 discord_value = connected_disp
             else:
-                title2 = f"{title} (Discord not linked)"
+                # IMPORTANT: "Not linked" is a strong claim. If we cannot resolve linkage, report it as unresolved
+                # (API limitations + whop-logs lookup might lag), not as definitive "not linked".
+                title2 = f"{title} (Discord link unresolved)"
                 note = WHOP_UNLINKED_NOTE
-                discord_value = "Not linked"
+                discord_value = "Unresolved"
+                # One last retry before we emit "not linked": the `#whop-logs` card can arrive slightly after the webhook.
+                # Force a rescan to bypass the 60s throttle (prevents false negatives during bursts).
+                with suppress(Exception):
+                    try:
+                        delay_s = int(WHOP_API_CONFIG.get("unlinked_post_delay_seconds", 15))
+                    except Exception:
+                        delay_s = 15
+                    delay_s = int(max(0, min(delay_s, 60)))
+                    if delay_s:
+                        await asyncio.sleep(delay_s)
+                    lim2 = int(max(25, min(250, int(WHOP_API_CONFIG.get("logs_lookup_limit", 250) or 250))))
+                    did_retry = await _resolve_discord_id_from_whop_logs(
+                        guild,
+                        client=bot,
+                        email=str((brief or {}).get("email") or "").strip(),
+                        membership_id_hint=str(mid2 or "").strip(),
+                        whop_key=str((brief or {}).get("membership_id") or "").strip(),
+                        limit=lim2,
+                        force_rescan=True,
+                    )
+                    if str(did_retry or "").strip().isdigit():
+                        did = int(str(did_retry).strip())
+                        if did > 0:
+                            connected_disp = str(did)
+                            if isinstance(brief, dict):
+                                brief["connected_discord"] = connected_disp
+                            # fall through to linked path by treating member_obj as missing-but-linked (will show linked value)
+                            discord_value = connected_disp
+                            title2 = f"{title} (Discord linked, not in server)"
+                            note = WHOP_NOT_IN_GUILD_NOTE
             e_unlinked = _linked_hint_embed(title=title2, color=color, brief=brief, note=note, discord_value=discord_value)
             sent_msg = await log_member_status("", embed=e_unlinked)
             with suppress(Exception):
@@ -10939,7 +10973,8 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                     if st in {"past_due", "unpaid"}:
                         return "⚠️ Member role added (payment past due)"
                     if st in {"canceled", "cancelled", "expired", "inactive"}:
-                        return "⚠️ Member role added (Whop canceled)"
+                        # Avoid overstating: this is a snapshot from our best-effort Whop brief at that moment.
+                        return "⚠️ Member role added (Whop status snapshot: canceled)"
                     return "⚠️ Member role added (Whop status unclear)"
 
                 base_member_kv = [
@@ -10954,6 +10989,17 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                     ("roles_removed", removed_names or "—"),
                     ("reason", "member_role_regained"),
                 ]
+
+                # Delay before enrichment/post to reduce race conditions:
+                # - payment webhook + whop-logs card can arrive within seconds of role change
+                # - returning members can have multiple memberships; we want "best current" membership
+                try:
+                    delay_s = int(WHOP_API_CONFIG.get("member_role_regained_card_delay_seconds", 0) or 0)
+                except Exception:
+                    delay_s = 0
+                delay_s = int(max(0, min(delay_s, 60)))
+                if delay_s:
+                    await asyncio.sleep(delay_s)
 
                 # Try immediate Whop enrichment; otherwise post placeholder then edit.
                 _mid_now, whop_brief_now = await _resolve_whop_brief_for_discord_id(after.id)

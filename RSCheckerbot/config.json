@@ -213,6 +213,8 @@
     "logs_lookup_limit": 250,
     "_comment_unlinked_post_delay": "Seconds to wait before posting a 'Discord not linked' card so whop-logs native message can arrive first (avoids race with Whop Events). 0 = no delay.",
     "unlinked_post_delay_seconds": 15,
+    "_comment_member_role_regained_delay": "Seconds to wait before posting the 'member_role_regained' staff card (lets payment/webhook/whop-logs settle so the snapshot isn't misleading).",
+    "member_role_regained_card_delay_seconds": 12,
     "_comment_joined_report": "For `.checker syncsummary <start> <end>`: filters Whop memberships by JOINED date (excludes draft attempts) and optionally restricts to RS product titles.",
     "joined_report_require_date_joined": false,
     "joined_report_statuses": ["active", "trialing", "canceling", "completed", "canceled", "expired"],

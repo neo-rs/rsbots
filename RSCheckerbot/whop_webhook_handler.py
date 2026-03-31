@@ -661,6 +661,7 @@ async def _resolve_discord_id_from_whop_logs(
     membership_id_hint: str,
     whop_key: str,
     limit: int = 50,
+    force_rescan: bool = False,
 ) -> str:
     """Search whop-logs channel for a matching email/key and return Discord ID."""
     # Rate-limit protection: do not repeatedly scan channel history for the same key.
@@ -708,11 +709,12 @@ async def _resolve_discord_id_from_whop_logs(
     except Exception:
         pass
 
-    # Throttle repeated history scans.
+    # Throttle repeated history scans (unless force_rescan is requested).
     try:
-        last = float(_WHOP_LOGS_LOOKUP_LAST.get(cache_key_email or cache_key_key or "global", 0.0))
-        if (now - last) < 60.0:
-            return ""
+        if not force_rescan:
+            last = float(_WHOP_LOGS_LOOKUP_LAST.get(cache_key_email or cache_key_key or "global", 0.0))
+            if (now - last) < 60.0:
+                return ""
         _WHOP_LOGS_LOOKUP_LAST[cache_key_email or cache_key_key or "global"] = now
     except Exception:
         pass
@@ -774,6 +776,7 @@ async def resolve_discord_id_from_whop_logs(
     membership_id_hint: str = "",
     whop_key: str = "",
     limit: int = 50,
+    force_rescan: bool = False,
 ) -> str:
     """Resolve Discord ID by searching `whop-logs` for the matching email/key."""
     return await _resolve_discord_id_from_whop_logs(
@@ -783,6 +786,7 @@ async def resolve_discord_id_from_whop_logs(
         membership_id_hint=membership_id_hint,
         whop_key=whop_key,
         limit=limit,
+        force_rescan=force_rescan,
     )
 
 
