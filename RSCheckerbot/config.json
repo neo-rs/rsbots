@@ -55,9 +55,9 @@
   "journal_logs": {
     "_comment": "FLOW labels on embed footers. route_to_journal_channels=true + category_id creates/uses these channel names. mirror_tlog_to_discord mirrors [RSCheckerbot][FLOW] lines. Keep names aligned with RSAdminBot journal_live.rscheckerbot_journal_channel_names for split flows.",
     "flow_labels_enabled": true,
-    "route_to_journal_channels": false,
+    "route_to_journal_channels": true,
     "mirror_tlog_to_discord": true,
-    "category_id": 0,
+    "category_id": 1488415910422253608,
     "channel_names": {
       "general": "rscheckerbot-ops",
       "startup": "rscheckerbot-boot",

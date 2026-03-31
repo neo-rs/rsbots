@@ -9253,6 +9253,79 @@ def _boot_discord_routes_summary_lines() -> list[str]:
     return lines
 
 
+# --- Startup audit: journal flow → Discord channel map (operator-friendly) ---
+async def _post_journal_routing_audit() -> None:
+    """Post a human-readable flow routing map to the STARTUP flow channel.
+
+    This is the canonical operator check that flow routing is configured as expected.
+    """
+    try:
+        guild = _output_guild()
+        if not isinstance(guild, discord.Guild):
+            return
+
+        enabled = bool(JOURNAL_LOGS.get("route_to_journal_channels"))
+        try:
+            cat_id = int(JOURNAL_LOGS.get("category_id") or 0)
+        except Exception:
+            cat_id = 0
+        names = JOURNAL_LOGS.get("channel_names") if isinstance(JOURNAL_LOGS.get("channel_names"), dict) else {}
+
+        issues: list[str] = []
+        if not enabled:
+            issues.append("route_to_journal_channels=false")
+        if cat_id <= 0:
+            issues.append("category_id_missing")
+        else:
+            cat = guild.get_channel(int(cat_id))
+            if not isinstance(cat, discord.CategoryChannel):
+                issues.append(f"category_not_found id={cat_id}")
+
+        # Prefer stable ordering: show the high-value flows first.
+        preferred = [
+            rj.STARTUP,
+            rj.GENERAL,
+            rj.TICKETS,
+            rj.MEMBER_STATUS_CRM,
+            rj.WHOP_HTTP_INBOUND,
+            rj.WHOP_HTTP_PROCESS,
+            rj.WHOP_LOGS_SCAN,
+            rj.PERSIST,
+            rj.HTTP,
+        ]
+        rest = [str(k) for k in (names or {}).keys() if str(k) not in preferred]
+        flow_keys = preferred + sorted(rest)
+
+        lines: list[str] = []
+        lines.append("[Boot][Journal routing] Flow-based channel routing")
+        lines.append(f"- enabled: {'yes' if enabled else 'no'}")
+        lines.append(f"- category_id: {cat_id if cat_id > 0 else '—'}")
+        lines.append("")
+        lines.append("Flow → channel")
+
+        for fk in flow_keys:
+            key = rj.normalize_flow(fk)
+            ch_name = str(names.get(key) or "").strip() if isinstance(names, dict) else ""
+            if not ch_name:
+                continue
+            ch_obj = _find_text_channel_by_name(guild, ch_name)
+            status = "ok" if isinstance(ch_obj, discord.TextChannel) else "missing"
+            # Use mentions for operator clickability.
+            mention = f"<#{int(getattr(ch_obj, 'id', 0) or 0)}>" if isinstance(ch_obj, discord.TextChannel) else "—"
+            title = rj.flow_title(key)
+            lines.append(f"- {key}: #{ch_name} ({title}) — {status} {mention}".rstrip())
+
+        if issues:
+            lines.append("")
+            lines.append("Issues")
+            for it in issues:
+                lines.append(f"- {it}")
+
+        # Post to the STARTUP flow channel (will land in rscheckerbot-boot when routing is enabled).
+        await log_other("\n".join(lines)[:1800], flow=rj.STARTUP)
+    except Exception:
+        return
+
 # -----------------------------
 # Events
 # -----------------------------
@@ -9775,6 +9848,10 @@ async def on_ready():
     if _startup_discord_routes_log_enabled():
         for _route_line in _boot_discord_routes_summary_lines():
             log.info("%s", _route_line)
+
+    # Journal routing audit (Discord-visible; operator check for flow→channel alignment).
+    with suppress(Exception):
+        await _post_journal_routing_audit()
 
     # One single startup report (anti-spam): file health + cache poisoning detection.
     if post_startup_report and LOG_OTHER_CHANNEL_ID:
