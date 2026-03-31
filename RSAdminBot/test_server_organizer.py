@@ -13,38 +13,6 @@ import discord
 from discord.ext import commands
 
 
-def _discord_text_channel_name_safe(name: str) -> str:
-    """Return a Discord-safe channel name fragment, or empty if unusable."""
-    n = str(name or "").strip().lower().lstrip("#")
-    if not n or len(n) > 100:
-        return ""
-    for ch in n:
-        if not (ch.isalnum() or ch in "-_"):
-            return ""
-    return n
-
-
-def _rscheckerbot_flow_journal_channel_name(
-    flow_slug: str,
-    *,
-    channel_prefix: str,
-    overrides_norm: Dict[str, str],
-) -> str:
-    """Channel name for RSCheckerbot split journal (systemd → webhook → Discord).
-
-    overrides_norm: flow key (underscores) -> exact channel name. Fallback:
-    ``{channel_prefix}rscheckerbot-{flow-with-hyphens}`` (legacy).
-    """
-    s = str(flow_slug or "").strip().lower().replace("-", "_")
-    ch_slug = s.replace("_", "-")
-    legacy = f"{channel_prefix}rscheckerbot-{ch_slug}".lower()
-    custom = overrides_norm.get(s) if isinstance(overrides_norm, dict) else None
-    if not custom:
-        return legacy
-    safe = _discord_text_channel_name_safe(custom)
-    return safe if safe else legacy
-
-
 class TestServerOrganizer:
     """Organizes test server with categories and channels for monitoring."""
     
@@ -345,7 +313,6 @@ class TestServerOrganizer:
             return {}
 
         channel_prefix = str(cfg.get("channel_prefix") or "journal-")
-        rc_flow_names = cfg.get("rscheckerbot_journal_channel_names") if isinstance(cfg.get("rscheckerbot_journal_channel_names"), dict) else {}
 
         if "journal_channels" not in self.channels_data:
             self.channels_data["journal_channels"] = {}
@@ -353,24 +320,14 @@ class TestServerOrganizer:
         result: Dict[str, int] = {}
         for bot_key in rs_bot_keys:
             channel_name = f"{channel_prefix}{bot_key}".lower()
-            # Optional: allow base RSCheckerbot (flow=general) to use semantic channel names.
-            if str(bot_key).strip().lower() == "rscheckerbot":
-                # Config keys use flow slugs; "general" maps to the base `journal-rscheckerbot` channel.
-                general_override = rc_flow_names.get("general") if isinstance(rc_flow_names, dict) else None
-                if isinstance(general_override, str) and general_override.strip():
-                    safe = _discord_text_channel_name_safe(general_override)
-                    if safe:
-                        channel_name = safe.lower()
 
             # 1) Stored ID
             existing_id = self.channels_data["journal_channels"].get(bot_key)
             if existing_id:
                 ch = guild.get_channel(int(existing_id))
                 if ch and isinstance(ch, discord.TextChannel):
-                    if str(getattr(ch, "name", "") or "").strip().lower() == str(channel_name or "").strip().lower():
-                        result[bot_key] = ch.id
-                        continue
-                    # Name mismatch: don't reuse cached channel id; fall through to search/create.
+                    result[bot_key] = ch.id
+                    continue
 
             # 2) Search by name within the category
             found = discord.utils.get(guild.text_channels, name=channel_name, category=category)
@@ -447,9 +404,8 @@ class TestServerOrganizer:
                 if existing_id:
                     ch = guild.get_channel(int(existing_id))
                     if ch and isinstance(ch, discord.TextChannel):
-                        if str(getattr(ch, "name", "") or "").strip().lower() == str(channel_name or "").strip().lower():
-                            result[map_key] = ch.id
-                            have = True
+                        result[map_key] = ch.id
+                        have = True
 
                 if not have:
                     found = discord.utils.get(guild.text_channels, name=channel_name, category=category)
@@ -520,23 +476,14 @@ class TestServerOrganizer:
             raw_flows = cfg.get("rscheckerbot_journal_flows")
             if not isinstance(raw_flows, list):
                 raw_flows = []
-            rc_names_raw = cfg.get("rscheckerbot_journal_channel_names")
-            rc_names_norm: Dict[str, str] = {}
-            if isinstance(rc_names_raw, dict):
-                for k, v in rc_names_raw.items():
-                    ks = str(k or "").strip().lower().replace("-", "_")
-                    vs = _discord_text_channel_name_safe(str(v or ""))
-                    if ks and vs:
-                        rc_names_norm[ks] = vs
             for flow_slug in raw_flows:
                 s = str(flow_slug or "").strip().lower()
                 if not s or not all(c.isalnum() or c in "-_" for c in s):
                     continue
                 s = s.replace("-", "_")
                 map_key = f"rscheckerbot_{s}"
-                channel_name = _rscheckerbot_flow_journal_channel_name(
-                    s, channel_prefix=channel_prefix, overrides_norm=rc_names_norm
-                )
+                ch_slug = s.replace("_", "-")
+                channel_name = f"{channel_prefix}rscheckerbot-{ch_slug}".lower()
 
                 have = False
                 existing_id = self.channels_data["journal_channels"].get(map_key)

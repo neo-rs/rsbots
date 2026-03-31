@@ -17,8 +17,6 @@ from pathlib import Path
 from datetime import datetime, timezone
 from contextlib import suppress
 
-import rschecker_journal as rj
-
 # Support CRM tickets (Neo)
 import support_tickets
 
@@ -27,15 +25,6 @@ log = logging.getLogger("rs-checker")
 # whop-logs history lookup throttles (avoid Discord 429s)
 _WHOP_LOGS_LOOKUP_CACHE: dict[str, tuple[str, float]] = {}
 _WHOP_LOGS_LOOKUP_LAST: dict[str, float] = {}
-
-# Optional async callback (str -> None): RSCheckerbot main wires journal_tlog(WHOP_LOGS_SCAN, ...).
-_WHOP_LOGS_SCAN_JOURNAL = None
-
-
-def set_whop_logs_scan_journal(cb):
-    """Register async fn(msg: str) -> None to log each whop-logs history scan (identity resolve)."""
-    global _WHOP_LOGS_SCAN_JOURNAL
-    _WHOP_LOGS_SCAN_JOURNAL = cb
 
 # Canonical shared helpers (single source of truth)
 from rschecker_utils import load_json as _load_json
@@ -728,16 +717,6 @@ async def _resolve_discord_id_from_whop_logs(
     except Exception:
         pass
 
-    jfn = _WHOP_LOGS_SCAN_JOURNAL
-    if jfn is not None:
-        with suppress(Exception):
-            lim_i = int(max(10, min(250, int(limit))))
-            scan_msg = (
-                f"[WHOP_LOGS_SCAN] channel=<#{ch.id}> limit={lim_i} "
-                f"hints email={'yes' if email_n else 'no'} mid={'yes' if mid else 'no'} key={'yes' if key else 'no'}"
-            )
-            await jfn(scan_msg)
-
     try:
         # This scan is throttled + cached; allow a deeper window so older members still resolve.
         async for m in ch.history(limit=int(max(10, min(250, int(limit))))):
@@ -1251,7 +1230,7 @@ async def handle_whop_webhook_message(message: discord.Message, *, backfill_only
     except Exception as e:
         log.error(f"Error handling webhook message: {e}", exc_info=True)
         if _log_other and not backfill_only:
-            await _log_other(f"❌ **Whop Webhook Error:** {e}", flow=rj.WHOP_DISCORD)
+            await _log_other(f"❌ **Whop Webhook Error:** {e}")
 
 
 async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embed, json_match: re.Match):
@@ -1278,10 +1257,7 @@ async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embe
         if not event_type:
             log.warning(f"Whop workflow webhook has no event_type: {json_string}")
             if _log_other:
-                await _log_other(
-                    f"⚠️ **Whop Webhook:** Received webhook with empty event_type. Check Whop workflow variables.",
-                    flow=rj.WHOP_DISCORD,
-                )
+                await _log_other(f"⚠️ **Whop Webhook:** Received webhook with empty event_type. Check Whop workflow variables.")
             return
         
         if not has_data:
@@ -1291,8 +1267,7 @@ async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embe
                     f"⚠️ **Whop Webhook Error:** EVENT_DATA fields are empty!\n"
                     f"**Event Type:** `{event_type}`\n"
                     f"**Issue:** Whop workflow variables not populated. Check workflow configuration.\n"
-                    f"**Message ID:** {message.id}",
-                    flow=rj.WHOP_DISCORD,
+                    f"**Message ID:** {message.id}"
                 )
             return
         
@@ -1386,7 +1361,7 @@ async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embe
                         ],
                         whop_brief=whop_brief,
                     )
-                    await _log_member_status("", embed=detailed, flow=rj.WHOP_DISCORD)
+                    await _log_member_status("", embed=detailed)
                 else:
                     # Fallback (no resolved member): still avoid legacy field names.
                     embed = discord.Embed(
@@ -1409,7 +1384,7 @@ async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embe
                         value=f"reason `{info.get('reason','Unknown')}`",
                         inline=False,
                     )
-                    await _log_member_status("", embed=embed, flow=rj.WHOP_DISCORD)
+                    await _log_member_status("", embed=embed)
         
         if not discord_user_id:
             if _log_other:
@@ -1417,8 +1392,7 @@ async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embe
                     f"⚠️ **Whop Webhook:** No discord_user_id in event.\n"
                     f"**Event Type:** `{event_type}`\n"
                     f"**Email:** {email if email else 'N/A'}\n"
-                    f"**Message ID:** {message.id}",
-                    flow=rj.WHOP_DISCORD,
+                    f"**Message ID:** {message.id}"
                 )
 
             return
@@ -1430,10 +1404,7 @@ async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embe
         except ValueError:
             log.error(f"Invalid discord_user_id format: {discord_user_id}")
             if _log_other:
-                await _log_other(
-                    f"❌ **Whop Webhook Error:** Invalid discord_user_id format: `{discord_user_id}`",
-                    flow=rj.WHOP_DISCORD,
-                )
+                await _log_other(f"❌ **Whop Webhook Error:** Invalid discord_user_id format: `{discord_user_id}`")
             return
         
         member = await _resolve_member_safe(guild, did_int, force_fetch=True)
@@ -1444,8 +1415,7 @@ async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embe
                     f"⚠️ **Whop Webhook:** Member not found in guild.\n"
                     f"**Discord ID:** `{discord_user_id}`\n"
                     f"**Event Type:** `{event_type}`\n"
-                    f"**Email:** {email if email else 'N/A'}",
-                    flow=rj.WHOP_DISCORD,
+                    f"**Email:** {email if email else 'N/A'}"
                 )
             return
         
@@ -1470,11 +1440,11 @@ async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embe
             await handle_waitlist_approved(member, event_data)
         else:
             if _log_other:
-                await _log_other(f"ℹ️ **Whop Webhook:** Unhandled event type: {event_type}", flow=rj.WHOP_DISCORD)
+                await _log_other(f"ℹ️ **Whop Webhook:** Unhandled event type: {event_type}")
     except json.JSONDecodeError as e:
         log.error(f"JSON decode error in workflow webhook: {e}")
         if _log_other:
-            await _log_other(f"❌ **Whop Webhook Error:** Failed to parse JSON: {e}", flow=rj.WHOP_DISCORD)
+            await _log_other(f"❌ **Whop Webhook Error:** Failed to parse JSON: {e}")
 
 
 async def _handle_native_whop_message(message: discord.Message, embed: discord.Embed, *, backfill_only: bool = False):
@@ -1675,10 +1645,7 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
             # Still process summary storage even if member not found, but also post a minimal staff card
             # so events don't silently disappear.
             if _log_other:
-                await _log_other(
-                    f"⚠️ **Whop Native:** Member `{discord_user_id}` not found in guild (posting fallback card)",
-                    flow=rj.WHOP_DISCORD,
-                )
+                await _log_other(f"⚠️ **Whop Native:** Member `{discord_user_id}` not found in guild (posting fallback card)")
             if _log_member_status:
                 e = discord.Embed(
                     title=str(title or "Whop Native Event").strip()[:256],
@@ -1701,7 +1668,7 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                 with suppress(Exception):
                     e.set_footer(text="RSCheckerbot • Member Status Tracking")
                 with suppress(Exception):
-                    await _log_member_status("", embed=e, flow=rj.WHOP_DISCORD)
+                    await _log_member_status("", embed=e)
             member = None
 
         # Process role changes if member found
@@ -1809,10 +1776,7 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
             elif "membership update" in title_l:
                 if "past due" in membership_status.lower():
                     if _log_member_status:
-                        await _log_member_status(
-                            f"⚠️ **Whop Native:** {_fmt_user(member)} - Membership Past Due",
-                            flow=rj.WHOP_DISCORD,
-                        )
+                        await _log_member_status(f"⚠️ **Whop Native:** {_fmt_user(member)} - Membership Past Due")
                 elif "active" in membership_status.lower():
                     event_data = {
                         "event_type": "membership.activated",
@@ -1837,7 +1801,7 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
     except (ValueError, KeyError) as e:
         log.error(f"Error parsing native Whop message: {e}", exc_info=True)
         if _log_other:
-            await _log_other(f"❌ **Whop Native Error:** Failed to parse message: {e}", flow=rj.WHOP_DISCORD)
+            await _log_other(f"❌ **Whop Native Error:** Failed to parse message: {e}")
 
 
 def _parse_whop_content(content: str) -> dict:
@@ -1936,8 +1900,7 @@ async def _verify_webhook_with_api(member: discord.Member, event_data: dict, eve
                         f"⚠️ **API Verification Mismatch** for {_fmt_user(member)}\n"
                         f"   Webhook says: `{expected_status}`\n"
                         f"   API says: `{verification['actual_status'] or 'N/A'}`\n"
-                        f"   Event: `{event_type}`",
-                        flow=rj.WHOP_API,
+                        f"   Event: `{event_type}`"
                     )
     except Exception as e:
         log.error(f"API verification failed for {member.id}: {e}")
@@ -1969,7 +1932,7 @@ async def handle_membership_activated(member: discord.Member, event_data: dict):
             ],
             whop_brief=whop_brief,
         )
-        await _log_member_status("", embed=detailed, flow=rj.WHOP_DISCORD)
+        await _log_member_status("", embed=detailed)
     
     # Verify with API after processing
     await _verify_webhook_with_api(member, event_data, "membership.activated")
@@ -1995,7 +1958,7 @@ async def handle_membership_activated_pending(member: discord.Member, event_data
             ],
             whop_brief=whop_brief,
         )
-        await _log_member_status("", embed=detailed, flow=rj.WHOP_DISCORD)
+        await _log_member_status("", embed=detailed)
     
     # Verify with API after processing
     await _verify_webhook_with_api(member, event_data, "membership.activated.pending")
@@ -2124,7 +2087,7 @@ async def handle_membership_deactivated(
             ],
             whop_brief=whop_brief,
         )
-        await _log_member_status("", embed=detailed, flow=rj.WHOP_DISCORD)
+        await _log_member_status("", embed=detailed)
 
         # Minimal alert -> dedicated case channel (defaults to member-cancelation)
         minimal = build_case_minimal_embed(
@@ -2142,7 +2105,7 @@ async def handle_membership_deactivated(
             issue_key=issue_key,
             cooldown_hours=6.0,
         ):
-            await _log_member_status("", embed=minimal, channel_name=dest, flow=rj.WHOP_DISCORD)
+            await _log_member_status("", embed=minimal, channel_name=dest)
 
         # Support tickets (Neo): open/update a Cancellation ticket (skip payment-failure destinations).
         if dest == MEMBER_CANCELLATION_CHANNEL_NAME:
@@ -2195,7 +2158,7 @@ async def handle_payment_renewal(member: discord.Member, event_data: dict):
             discord_kv=[("event", "payment.succeeded.renewal")],
             whop_brief=whop_brief,
         )
-        await _log_member_status("", embed=detailed, flow=rj.WHOP_DISCORD)
+        await _log_member_status("", embed=detailed)
     
     # Verify with API after processing
     await _verify_webhook_with_api(member, event_data, "payment.succeeded.renewal")
@@ -2229,7 +2192,7 @@ async def handle_payment_activation(member: discord.Member, event_data: dict):
             ],
             whop_brief=whop_brief,
         )
-        await _log_member_status("", embed=detailed, flow=rj.WHOP_DISCORD)
+        await _log_member_status("", embed=detailed)
     
     # Verify with API after processing
     await _verify_webhook_with_api(member, event_data, "payment.succeeded.activation")
@@ -2253,7 +2216,7 @@ async def handle_payment_failed(member: discord.Member, event_data: dict):
             discord_kv=[("event", "payment.failed")],
             whop_brief=whop_brief,
         )
-        await _log_member_status("", embed=detailed, flow=rj.WHOP_DISCORD)
+        await _log_member_status("", embed=detailed)
 
         minimal = build_case_minimal_embed(
             title="❌ Payment Failed — Action Needed",
@@ -2270,12 +2233,7 @@ async def handle_payment_failed(member: discord.Member, event_data: dict):
             issue_key=issue_key,
             cooldown_hours=2.0,
         ):
-            await _log_member_status(
-                "",
-                embed=minimal,
-                channel_name=PAYMENT_FAILURE_CHANNEL_NAME,
-                flow=rj.WHOP_DISCORD,
-            )
+            await _log_member_status("", embed=minimal, channel_name=PAYMENT_FAILURE_CHANNEL_NAME)
 
         # Support tickets (Neo): open/update a Billing ticket (current month only).
         with suppress(Exception):

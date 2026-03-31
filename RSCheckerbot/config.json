@@ -52,45 +52,7 @@
     "_comment_log_other": "bot-logs - Everything else (days 2-7b, errors, role events, system events)",
     "member_status_logs_channel_id": 1452835008170426368
   },
-  "journal_logs": {
-    "_comment": "FLOW labels on embed footers. route_to_journal_channels=true + category_id creates/uses these channel names. mirror_tlog_to_discord mirrors [RSCheckerbot][FLOW] lines. Keep names aligned with RSAdminBot journal_live.rscheckerbot_journal_channel_names for split flows.",
-    "flow_labels_enabled": true,
-    "route_to_journal_channels": true,
-    "mirror_tlog_to_discord": true,
-    "category_id": 1488415910422253608,
-    "channel_names": {
-      "general": "rscheckerbot-ops",
-      "startup": "rscheckerbot-boot",
-      "http": "rscheckerbot-http",
-      "whop_webhook": "whop-webhook-receiver",
-      "whop_http_inbound": "whop-raw-inbound",
-      "whop_http_process": "whop-processing",
-      "whop_logs_scan": "whop-logs-scan",
-      "whop_discord": "whop-discord-native",
-      "whop_api": "whop-api",
-      "whop_sync": "whop-sync",
-      "persist": "rscheckerbot-persist",
-      "staff_embeds": "staff-embeds-crm",
-      "tickets": "support-ticket-events",
-      "member_status_crm": "member-status-events",
-      "discord_dm": "dm-sequence-logs",
-      "roles": "rscheckerbot-roles",
-      "role_audit": "discord-role-audit",
-      "reporting": "rscheckerbot-reporting",
-      "member_history": "member-history",
-      "support_sweep": "support-ticket-sweep",
-      "invite_ghl": "invite-ghl",
-      "channel_limits": "channel-limits",
-      "whop_text": "whop-text-legacy"
-    },
-    "_comment_startup_channel_headers_enabled": "If true, post a one-time 'what this channel is for' header into each flow channel on startup (operator clarity).",
-    "startup_channel_headers_enabled": true
-  },
   "log_controls": {
-    "_comment_startup_console_log_mode": "summary = one [Boot] line for loops/tasks; each = separate line per subsystem (noisy).",
-    "startup_console_log_mode": "summary",
-    "_comment_startup_discord_routes_log": "After boot, log [Boot][Discord routes] lines with <#channel_id> read/write map (disable with false).",
-    "startup_discord_routes_log": true,
     "boot_post_min_hours": 6,
     "role_update_batch_seconds": 2,
     "cid_ttl_minutes": 10,
@@ -102,10 +64,10 @@
     "onboarding_logs_channel_id": 14052931698761402,
     "_comment_onboarding_logs": "RSOnboarding ticket-created cards; used in role audit for correlation link.",
     "_comment_output": "Optional: route ALL bot output logs to a different guild (e.g. Neo Test Server).",
-    "output_guild_id": 1451275225512546497,
-    "output_log_other_channel_name": "rscheckerbot-ops",
-    "output_member_status_channel_name": "member-status-events",
-    "output_whop_channel_name": "whop-events"
+    "output_guild_id": 0,
+    "output_log_other_channel_name": "bot-logs",
+    "output_member_status_channel_name": "member-status-logs",
+    "output_whop_channel_name": "whop-logs"
   },
 
   "member_history": {
@@ -400,9 +362,9 @@
     "audit_logs": {
       "_comment": "Dyno-style audit logs for ticket categories (message create/edit/delete + channel create/update/delete).",
       "enabled": true,
-      "_comment_channel_id": "Forensic ticket audit (rename Discord channel to match channel_name when changing names).",
+      "_comment_channel_id": "Set to an existing #tickets-logs channel to prevent duplicates.",
       "channel_id": 1467506723790262464,
-      "channel_name": "support-ticket-audit",
+      "channel_name": "tickets-logs",
       "include_transcript_category": false
     },
     "startup_backfill": {
