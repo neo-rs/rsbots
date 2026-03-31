@@ -6794,18 +6794,56 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
     evt = _normalize_whop_std_event_type(_whop_std_event_type(payload))
     wh_id = str((headers or {}).get("webhook-id") or payload.get("id") or "").strip()
     mid = _whop_std_membership_id(payload)
+    trace_id = wh_id or f"whop:{int(time.time())}:{random.randint(1000, 9999)}"
     if not mid:
         mid, ctx = await _resolve_membership_id_for_std_webhook(evt, payload)
         if mid:
             with suppress(Exception):
-                await _whop_api_events_log(
-                    f"[Whop Webhook] resolved mid={mid} type={evt or '—'} pay={str(ctx.get('payment_id') or '—')} dspt={str(ctx.get('dispute_id') or '—')}"
+                e = _fmt_whop_movement_trace(
+                    trace_id=trace_id,
+                    stage="MEMBERSHIP_ID_RESOLVED",
+                    evt=evt or "—",
+                    membership_id=mid,
+                    reads=[
+                        "Webhook payload lacked membership_id; attempted resolver by payment/dispute/member/user hints",
+                    ],
+                    decisions=[
+                        f"resolved membership_id={mid}",
+                    ],
+                    actions=[],
+                    result=[],
+                    technical={
+                        "payment_id": str((ctx or {}).get("payment_id") or ""),
+                        "dispute_id": str((ctx or {}).get("dispute_id") or ""),
+                        "user_id": _whop_std_user_id(payload),
+                        "member_id": _whop_std_member_id(payload),
+                    },
                 )
+                await _whop_movement_send(content="", embed=e)
 
     # Always log receipt (movement logs in Neo).
     with suppress(Exception):
-        # Keep it intentionally simple for easy scanning.
-        await _whop_api_events_log(f"[Whop Webhook] detected type={evt or '—'} mid={mid or '—'} id={wh_id or '—'}")
+        e = _fmt_whop_movement_trace(
+            trace_id=trace_id,
+            stage="PROCESS_START",
+            evt=evt or "—",
+            membership_id=mid or "",
+            reads=[
+                "Parsed Whop standard webhook payload",
+            ],
+            decisions=[
+                ("membership_id present" if mid else "membership_id missing (will skip staff cards unless resolved)"),
+            ],
+            actions=[],
+            result=[],
+            technical={
+                "webhook_id": wh_id,
+                "payment_id": _whop_std_payment_id(payload),
+                "refund_id": _whop_std_refund_id(payload),
+                "dispute_id": _whop_std_dispute_id(payload),
+            },
+        )
+        await _whop_movement_send(content="", embed=e)
 
     # Many webhook types (withdrawals, payout methods, invoices, etc.) have no membership context.
     # We still log them above; staff-card output only happens when we can resolve a membership.
@@ -6840,6 +6878,27 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
         brief = await _fetch_whop_brief_by_membership_id(mid)
         if not isinstance(brief, dict) or not brief:
             return
+        with suppress(Exception):
+            e = _fmt_whop_movement_trace(
+                trace_id=trace_id,
+                stage="API_BRIEF_FETCHED",
+                evt=evt or "—",
+                membership_id=mid,
+                reads=[
+                    "Whop API: fetched membership brief (staff-safe fields only)",
+                ],
+                decisions=[],
+                actions=[],
+                result=[
+                    f"status={(brief or {}).get('status') or '—'}",
+                    f"product={(brief or {}).get('product') or '—'}",
+                ],
+                technical={
+                    "has_email": bool(str((brief or {}).get("email") or "").strip()),
+                    "connected_discord": str((brief or {}).get("connected_discord") or "").strip()[:120],
+                },
+            )
+            await _whop_movement_send(content="", embed=e)
 
         # Whop API sometimes omits user.email in membership payload; use webhook payload as fallback so
         # we can resolve Discord from whop-logs (email match) and persist identity cache.
@@ -7125,7 +7184,33 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                 note = WHOP_UNLINKED_NOTE
                 discord_value = "Not linked"
             e_unlinked = _linked_hint_embed(title=title2, color=color, brief=brief, note=note, discord_value=discord_value)
-            await log_member_status("", embed=e_unlinked)
+            sent_msg = await log_member_status("", embed=e_unlinked)
+            with suppress(Exception):
+                e = _fmt_whop_movement_trace(
+                    trace_id=trace_id,
+                    stage="STAFF_CARD_POSTED",
+                    evt=evt or "—",
+                    kind=kind,
+                    membership_id=str(mid2 or "").strip(),
+                    discord_id=str(did or ""),
+                    reads=[
+                        "Discord linkage unresolved → posting 'not linked / not in server' staff card",
+                    ],
+                    decisions=[
+                        ("connected_discord present but member not found in guild" if connected_disp else "Whop has no Discord linkage (connected_discord empty)"),
+                    ],
+                    actions=[
+                        "Posted to member-status-logs",
+                    ],
+                    result=[
+                        (f"member_status_msg_id={int(getattr(sent_msg, 'id', 0) or 0)}" if sent_msg else "member_status_msg_id=—"),
+                        (f"jump_url={str(getattr(sent_msg, 'jump_url', '') or '').strip()}" if sent_msg else "jump_url=—"),
+                    ],
+                    technical={
+                        "output_guild_id": int(getattr(_output_guild(), "id", 0) or 0) if _output_guild() else 0,
+                    },
+                )
+                await _whop_movement_send(content="", embed=e)
             with suppress(Exception):
                 await _whop_api_events_log(f"[Whop Webhook][detected] kind={kind} linked=no mid={mid2} type={evt or '—'}")
             with suppress(Exception):
@@ -7181,7 +7266,35 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                 member_kv=[("membership_id", mid2)],
                 whop_brief=brief,
             )
-            await log_member_status("", embed=detailed)
+            sent_msg = await log_member_status("", embed=detailed)
+            with suppress(Exception):
+                e = _fmt_whop_movement_trace(
+                    trace_id=trace_id,
+                    stage="STAFF_CARD_POSTED",
+                    evt=evt or "—",
+                    kind=kind,
+                    membership_id=str(mid2 or "").strip(),
+                    discord_id=int(getattr(member_obj, "id", 0) or 0),
+                    reads=[
+                        "Discord member resolved in guild",
+                    ],
+                    decisions=[
+                        f"linked=yes (discord_id={int(getattr(member_obj,'id',0) or 0)})",
+                    ],
+                    actions=[
+                        "Posted detailed staff card to member-status-logs",
+                        "Ticket automation runs from member-status-logs pipeline (separate stage)",
+                    ],
+                    result=[
+                        (f"member_status_msg_id={int(getattr(sent_msg, 'id', 0) or 0)}" if sent_msg else "member_status_msg_id=—"),
+                        (f"jump_url={str(getattr(sent_msg, 'jump_url', '') or '').strip()}" if sent_msg else "jump_url=—"),
+                    ],
+                    technical={
+                        "member_in_guild": True,
+                        "output_guild_id": int(getattr(_output_guild(), "id", 0) or 0) if _output_guild() else 0,
+                    },
+                )
+                await _whop_movement_send(content="", embed=e)
 
             # Case channels: real-time webhook-only (no startup/sync/backfill noise).
             try:
@@ -7263,6 +7376,7 @@ async def handle_whop_webhook_receiver(request):
     try:
         raw_body = await request.read()
         headers = {k.lower(): v for k, v in dict(request.headers).items()}
+        wh_id_hint = str(headers.get("webhook-id") or "").strip()
 
         ok, reason = verify_standard_webhook(
             headers,
@@ -7273,17 +7387,59 @@ async def handle_whop_webhook_receiver(request):
         )
         if not ok:
             log.warning(f"[WhopWebhook] Signature verification failed: {reason}")
+            with suppress(Exception):
+                e = _fmt_whop_movement_trace(
+                    trace_id=(wh_id_hint or f"whop:rejected:{int(time.time())}"),
+                    stage="HTTP_INBOUND_REJECTED",
+                    evt="",
+                    reads=["Received HTTP POST /whop-webhook", "Attempted signature verification"],
+                    decisions=[f"rejected (reason={str(reason or 'unknown')[:200]})"],
+                    actions=["Returned 401"],
+                    result=[],
+                    technical={"has_webhook_id": bool(wh_id_hint), "verify_enabled": bool(WHOP_WEBHOOK_VERIFY)},
+                )
+                await _whop_movement_send(content="", embed=e)
             return web.Response(text=f"Invalid webhook signature ({reason})", status=401)
 
         try:
             payload = json.loads(raw_body.decode("utf-8"))
         except Exception:
             log.warning("[WhopWebhook] Invalid JSON payload")
+            with suppress(Exception):
+                e = _fmt_whop_movement_trace(
+                    trace_id=(wh_id_hint or f"whop:bad_json:{int(time.time())}"),
+                    stage="HTTP_INBOUND_BAD_JSON",
+                    reads=["Received HTTP POST /whop-webhook"],
+                    decisions=["invalid JSON body"],
+                    actions=["Returned 400"],
+                    result=[],
+                    technical={"bytes": int(len(raw_body or b""))},
+                )
+                await _whop_movement_send(content="", embed=e)
             return web.Response(text="Invalid JSON payload", status=400)
 
         # Log the raw payload
         _save_raw_webhook_payload(payload, headers)
         log.info(f"Received Whop webhook payload (saved to {WHOP_WEBHOOK_RAW_LOG_FILE.name})")
+        with suppress(Exception):
+            evt = _normalize_whop_std_event_type(_whop_std_event_type(payload))
+            mid = _whop_std_membership_id(payload)
+            wh_id = str(headers.get("webhook-id") or payload.get("id") or "").strip()
+            e = _fmt_whop_movement_trace(
+                trace_id=(wh_id or f"whop:{int(time.time())}:{random.randint(1000, 9999)}"),
+                stage="HTTP_INBOUND_ACCEPTED",
+                evt=evt or "—",
+                membership_id=mid or "",
+                reads=[
+                    "Received HTTP POST /whop-webhook",
+                    f"Saved raw payload → {WHOP_WEBHOOK_RAW_LOG_FILE.name}",
+                ],
+                decisions=["signature verified"],
+                actions=["Queued immediate processing (standard webhook path)"],
+                result=[],
+                technical={"webhook_id": wh_id},
+            )
+            await _whop_movement_send(content="", embed=e)
 
         # Record event ledger entry
         try:
@@ -7299,6 +7455,16 @@ async def handle_whop_webhook_receiver(request):
                 await _record_whop_event(event)
         except Exception as e:
             log.warning(f"[WhopWebhook] Failed to record event: {e}")
+            with suppress(Exception):
+                e2 = _fmt_whop_movement_trace(
+                    trace_id=(wh_id_hint or f"whop:{int(time.time())}"),
+                    stage="LEDGER_RECORD_FAILED",
+                    reads=["Attempted to record whop_events.jsonl ledger entry"],
+                    decisions=["ledger write failed (non-fatal)"],
+                    actions=["Continuing processing anyway"],
+                    result=[f"error={str(e)[:240]}"],
+                )
+                await _whop_movement_send(content="", embed=e2)
 
         # Process the webhook directly (real-time staff cards + movement logs).
         # This replaces the legacy "forward raw JSON to a Discord webhook" behavior which caused blanks.
@@ -8555,6 +8721,20 @@ async def _whop_api_events_log(msg: str) -> None:
         return
     raw = str(msg).strip()
 
+    await _whop_movement_send(content=raw, embed=None)
+
+
+async def _whop_movement_send(*, content: str | None, embed: discord.Embed | None) -> None:
+    """Canonical sender for Whop movement traces (Neo)."""
+    global _WHOP_API_EVENTS_LOG_CH
+    if not WHOP_MOVEMENT_LOG_ENABLED:
+        return
+    if not bot.is_ready():
+        return
+    raw = str(content or "").strip()
+    if not raw and not isinstance(embed, discord.Embed):
+        return
+
     def _kv_pairs(s: str) -> dict[str, str]:
         out: dict[str, str] = {}
         try:
@@ -8620,9 +8800,10 @@ async def _whop_api_events_log(msg: str) -> None:
         e.set_footer(text="RSCheckerbot • Whop movement")
         return e
 
-    embed: discord.Embed | None = None
-    with suppress(Exception):
-        embed = _build_embed(raw)
+    # Back-compat: if no embed is provided, build the legacy one from key=value hints.
+    if not isinstance(embed, discord.Embed):
+        with suppress(Exception):
+            embed = _build_embed(raw)
 
     # Optional: send via Discord webhook (best-effort; avoids channel-perms issues).
     if WHOP_MOVEMENT_LOG_WEBHOOK_URL:
@@ -8675,6 +8856,62 @@ async def _whop_api_events_log(msg: str) -> None:
             await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none(), silent=True)
         else:
             await ch.send(content=raw[:1900], allowed_mentions=discord.AllowedMentions.none(), silent=True)
+
+
+def _fmt_whop_movement_trace(
+    *,
+    trace_id: str,
+    stage: str,
+    evt: str = "",
+    kind: str = "",
+    membership_id: str = "",
+    discord_id: int | str = 0,
+    reads: list[str] | None = None,
+    decisions: list[str] | None = None,
+    actions: list[str] | None = None,
+    result: list[str] | None = None,
+    technical: dict | None = None,
+) -> discord.Embed:
+    """Human-readable movement trace embed (no pings)."""
+    def _join(lines: list[str] | None) -> str:
+        xs = [str(x or "").strip() for x in (lines or [])]
+        xs = [x for x in xs if x]
+        if not xs:
+            return "—"
+        return "\n".join(f"- {x}" for x in xs)[:1024]
+
+    did_s = ""
+    try:
+        did_s = str(int(discord_id)) if str(discord_id or "").strip().isdigit() else str(discord_id or "").strip()
+    except Exception:
+        did_s = str(discord_id or "").strip()
+
+    e = discord.Embed(
+        title="Whop movement trace",
+        description=f"trace_id=`{str(trace_id or '—')[:128]}` • stage=`{str(stage or '—')[:128]}`",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    if evt:
+        e.add_field(name="Event type", value=str(evt)[:1024], inline=True)
+    if kind:
+        e.add_field(name="Kind", value=str(kind)[:1024], inline=True)
+    if membership_id:
+        e.add_field(name="Membership ID", value=str(membership_id)[:1024], inline=False)
+    if did_s:
+        e.add_field(name="Discord ID", value=f"`{did_s}`", inline=True)
+    e.add_field(name="1) Reads", value=_join(reads), inline=False)
+    e.add_field(name="2) Decisions", value=_join(decisions), inline=False)
+    e.add_field(name="3) Actions", value=_join(actions), inline=False)
+    e.add_field(name="4) Result", value=_join(result), inline=False)
+    if isinstance(technical, dict) and technical:
+        try:
+            tj = json.dumps(technical, ensure_ascii=False, sort_keys=True)[:900]
+        except Exception:
+            tj = str(technical)[:900]
+        e.add_field(name="5) Technical", value=f"```json\n{tj}\n```", inline=False)
+    e.set_footer(text="RSCheckerbot • Whop movement")
+    return e
 
 
 def _linked_hint_embed(*, title: str, color: int, brief: dict, note: str, discord_value: str = "") -> discord.Embed:
