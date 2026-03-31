@@ -4753,6 +4753,10 @@ echo "TARGET=$TARGET"
                 else [],
                 "rscheckerbot_journal_max_chars": int(cfg.get("rscheckerbot_journal_max_chars") or 0),
                 "rscheckerbot_journal_flush_seconds": float(cfg.get("rscheckerbot_journal_flush_seconds") or 0),
+                # Optional: flow slug (underscores) -> exact Discord channel name. Keep in sync with RSCheckerbot journal_logs.channel_names when possible.
+                "rscheckerbot_journal_channel_names": dict(cfg.get("rscheckerbot_journal_channel_names") or {})
+                if isinstance(cfg.get("rscheckerbot_journal_channel_names"), dict)
+                else {},
             }
         except Exception:
             return {
@@ -4774,6 +4778,7 @@ echo "TARGET=$TARGET"
                 "rscheckerbot_journal_flows": [],
                 "rscheckerbot_journal_max_chars": 0,
                 "rscheckerbot_journal_flush_seconds": 0.0,
+                "rscheckerbot_journal_channel_names": {},
             }
 
     def _get_webhooks_config(self) -> Dict[str, Any]:

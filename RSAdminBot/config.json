@@ -129,6 +129,18 @@
       "1438970053352751215": "conversational_deals"
     },
     "rscheckerbot_split_flow_journals": true,
+    "_comment_rscheckerbot_journal_channel_names": "Optional: flow slug -> exact #channel name for systemd journal mirror. Align keys with rscheckerbot_journal_flows and RSCheckerbot journal_logs.channel_names.",
+    "rscheckerbot_journal_channel_names": {
+      "general": "rscheckerbot-ops",
+      "whop_http_inbound": "whop-raw-inbound",
+      "whop_http_process": "whop-processing",
+      "whop_logs_scan": "whop-logs-scan",
+      "member_status_crm": "member-status-events",
+      "tickets": "support-ticket-events",
+      "persist": "rscheckerbot-persist",
+      "http": "rscheckerbot-http",
+      "startup": "rscheckerbot-boot"
+    },
     "rscheckerbot_journal_flows": [
       "whop_http_inbound",
       "whop_http_process",

@@ -108,6 +108,8 @@ class SupportTicketConfig:
     whop_membership_logs_channel_id: int
     member_response_ping_enabled: bool
     member_response_ping_cooldown_seconds: int
+    logging_enabled: bool
+    logging_show_technical: bool
 
 
 _BOT: commands.Bot | None = None
@@ -208,6 +210,103 @@ def _crm_fmt(action: str, **kv: object) -> str:
 
 async def _crm_log(action: str, **kv: object) -> None:
     await _log(_crm_fmt(action, **kv))
+
+
+def _make_trace_id(prefix: str) -> str:
+    p = str(prefix or "tkt").strip().lower() or "tkt"
+    # Short, stable, grep-friendly.
+    return f"{p}_{uuid.uuid4().hex[:10]}"
+
+
+def _ticket_log_enabled() -> bool:
+    cfg = _CFG
+    if not cfg:
+        return True
+    return bool(getattr(cfg, "logging_enabled", True))
+
+
+def _ticket_log_show_technical() -> bool:
+    cfg = _CFG
+    if not cfg:
+        return False
+    return bool(getattr(cfg, "logging_show_technical", False))
+
+
+def _fmt_ticket_movement_log(
+    *,
+    trace_id: str,
+    trace_tag: str = "",
+    stage: str,
+    flow: str,
+    event_lines: list[str] | None = None,
+    decision_lines: list[str] | None = None,
+    action_lines: list[str] | None = None,
+    result_lines: list[str] | None = None,
+    technical: dict | None = None,
+) -> str:
+    """Human-readable operator log (multiline), kept under _log truncation.
+
+    This intentionally matches the canonical "Support Tickets" terminal layout:
+    - stable header line
+    - numbered sections
+    - result label + Trace tag in RESULT
+    """
+    if not _ticket_log_enabled():
+        return ""
+    tid = str(trace_id or "").strip()
+    ttag = str(trace_tag or "").strip()
+    stg = str(stage or "").strip() or "TICKET_EVENT"
+    fl = str(flow or "").strip() or "support_tickets"
+
+    def sec(n: int, title: str, lines: list[str] | None) -> list[str]:
+        out = [f"{n}) {title}"]
+        if not lines:
+            out.append("- —")
+            return out
+        for x in lines:
+            xs = str(x or "").strip()
+            if xs:
+                out.append(f"- {xs}")
+        if len(out) == 1:
+            out.append("- —")
+        return out
+
+    header = "=" * 50
+    parts: list[str] = [header, "RSCheckerbot / Support Tickets", header, ""]
+
+    parts.extend(sec(1, "EVENT", event_lines))
+    parts.extend(sec(2, "DECISION", decision_lines))
+    parts.extend(sec(3, "ACTION", action_lines))
+    # Ensure RESULT always includes Trace tag if provided.
+    res = list(result_lines or [])
+    if ttag:
+        res.append(f"Trace: {ttag}")
+    parts.extend(sec(4, "RESULT", res))
+
+    if technical and _ticket_log_show_technical():
+        parts.append("5) TECHNICAL TRACE")
+        # Optional verbose metadata; keep canonical operator output clean by default.
+        if tid:
+            parts.append(f"- trace_id={tid}")
+        if stg:
+            parts.append(f"- stage={stg}")
+        if fl:
+            parts.append(f"- source_flow={fl}")
+        # Keep this intentionally compact; raw dict dumps are not operator-friendly.
+        for k in sorted(technical.keys()):
+            v = technical.get(k)
+            if v is None:
+                continue
+            vs = str(v).strip()
+            if not vs:
+                continue
+            if len(vs) > 240:
+                vs = vs[:240] + "…"
+            parts.append(f"- {k}={vs}")
+
+    msg = "\n".join(parts).strip()
+    # Hard cap well below Discord limit; _log will truncate again defensively.
+    return msg[:1750]
 
 
 def _crm_collect_config_issues() -> list[str]:
@@ -317,6 +416,27 @@ async def run_crm_startup_audit() -> None:
     iss_joined = "; ".join(issues) if issues else "none"
     if len(iss_joined) > 1600:
         iss_joined = iss_joined[:1600] + "…"
+
+    trace_id = _make_trace_id("tkt_audit")
+    await _log(
+        _fmt_ticket_movement_log(
+            trace_id=trace_id,
+            trace_tag="crm_config_audit",
+            stage="TICKET_CONFIG_AUDIT",
+            flow="startup",
+            event_lines=[
+                "Source flow: startup",
+                "Summary: startup ticket configuration check completed",
+            ],
+            result_lines=[
+                "TICKET CONFIG AUDIT",
+                f"Issues: {iss_joined}",
+            ],
+            technical={
+                "open_index_summary": " ".join(f"{k}={v}" for k, v in sorted(open_by_type.items())) or "none",
+            },
+        )
+    )
     await _crm_log("CONFIG_AUDIT", guild_id=cfg.guild_id, issues=iss_joined)
 
     summary = " ".join(f"{k}={v}" for k, v in sorted(open_by_type.items()))
@@ -368,6 +488,7 @@ def initialize(
     rf = st.get("resolution_followup") if isinstance(st.get("resolution_followup"), dict) else {}
     rf_templates = rf.get("templates") if isinstance(rf.get("templates"), dict) else {}
     al = st.get("audit_logs") if isinstance(st.get("audit_logs"), dict) else {}
+    lg = st.get("logging") if isinstance(st.get("logging"), dict) else {}
     tr = st.get("ticket_roles") if isinstance(st.get("ticket_roles"), dict) else {}
     nw = st.get("no_whop_link") if isinstance(st.get("no_whop_link"), dict) else {}
     ml = st.get("member_lookup") if isinstance(st.get("member_lookup"), dict) else {}
@@ -453,6 +574,8 @@ def initialize(
         whop_membership_logs_channel_id=_as_int(inv.get("whop_webhook_channel_id")),
         member_response_ping_enabled=_as_bool((st.get("member_response_ping") or {}).get("enabled", True)),
         member_response_ping_cooldown_seconds=max(60, _as_int((st.get("member_response_ping") or {}).get("cooldown_seconds")) or 300),
+        logging_enabled=_as_bool(lg.get("enabled", True)),
+        logging_show_technical=_as_bool(lg.get("show_technical", False)),
     )
 
     # Register persistent view so buttons survive restarts.
@@ -3426,59 +3549,181 @@ async def post_resolution_followup_and_remove_role(
     reference_jump_url: str = "",
 ) -> bool:
     """Mark an open ticket as resolved, remove its role, and post follow-up inside the ticket channel."""
+    trace_id = _make_trace_id("tkt_res")
+    flow = "resolution_followup"
+    uid_in = int(discord_id or 0)
+    ttype_in = str(ticket_type or "").strip().lower()
+    ev = str(resolution_event or "").strip() or "—"
+
+    async def _res_log(
+        *,
+        trace_tag: str,
+        stage: str,
+        event_lines: list[str] | None = None,
+        decision_lines: list[str] | None = None,
+        action_lines: list[str] | None = None,
+        result_lines: list[str] | None = None,
+        technical: dict | None = None,
+    ) -> None:
+        body = _fmt_ticket_movement_log(
+            trace_id=trace_id,
+            trace_tag=trace_tag,
+            stage=stage,
+            flow=flow,
+            event_lines=event_lines,
+            decision_lines=decision_lines,
+            action_lines=action_lines,
+            result_lines=result_lines,
+            technical=technical,
+        )
+        if body:
+            with suppress(Exception):
+                await _log(body)
+
     if not _ensure_cfg_loaded() or not _BOT:
+        await _res_log(
+            trace_tag="crm_resolution_skip",
+            stage="TICKET_RESOLUTION",
+            event_lines=[
+                f"Ticket type: {ttype_in or '—'}",
+                f"Member: <@{uid_in}>" if uid_in > 0 else "Member: —",
+                f"Resolution event: {ev}",
+            ],
+            decision_lines=["Resolution follow-up enabled: no (subsystem not ready)"],
+            result_lines=["RESOLUTION SKIPPED", "Reason: support tickets not initialized"],
+        )
         return False
     cfg = _cfg()
     if not cfg or not cfg.resolution_followup_enabled:
+        await _res_log(
+            trace_tag="crm_resolution_skip",
+            stage="TICKET_RESOLUTION",
+            event_lines=[
+                f"Ticket type: {ttype_in or '—'}",
+                f"Member: <@{uid_in}>" if uid_in > 0 else "Member: —",
+                f"Resolution event: {ev}",
+            ],
+            decision_lines=["Resolution follow-up: disabled in config"],
+            result_lines=["RESOLUTION SKIPPED", "Reason: resolution_followup disabled"],
+        )
         return False
     guild = _BOT.get_guild(int(cfg.guild_id))
     if not isinstance(guild, discord.Guild):
+        await _res_log(
+            trace_tag="crm_resolution_skip",
+            stage="TICKET_RESOLUTION",
+            event_lines=[f"Resolution event: {ev}"],
+            decision_lines=["Guild: not visible to bot"],
+            result_lines=["RESOLUTION SKIPPED"],
+        )
         return False
 
     uid = int(discord_id or 0)
     if uid <= 0:
+        await _res_log(
+            trace_tag="crm_resolution_skip",
+            stage="TICKET_RESOLUTION",
+            decision_lines=["Member: invalid discord id"],
+            result_lines=["RESOLUTION SKIPPED"],
+        )
         return False
     ttype = str(ticket_type or "").strip().lower()
     if ttype not in {"billing", "cancellation", "free_pass", "no_whop_link"}:
+        await _res_log(
+            trace_tag="crm_resolution_skip",
+            stage="TICKET_RESOLUTION",
+            event_lines=[f"Ticket type: {ttype or '—'}", f"Member: <@{uid}>"],
+            decision_lines=["Ticket type: not eligible for resolution follow-up path"],
+            result_lines=["RESOLUTION SKIPPED"],
+        )
         return False
 
-    # Find the open ticket channel (copy under lock).
+    delay_s = int(getattr(cfg, "resolution_followup_auto_close_after_seconds", 0) or 0)
+
+    # Find the open ticket channel (copy under lock). Do not await logging while holding the lock.
     ch_id = 0
-    already_sent = False
+    tid = ""
+    rec: dict | None = None
+    branch = ""  # not_found | already_sent | throttle | proceed
+
     async with _INDEX_LOCK:
         db = _index_load()
         found = _ticket_find_open(db, ticket_type=ttype, user_id=uid, fingerprint="")
         if not found:
-            return False
-        tid, rec = found
-        ch_id = _as_int(rec.get("channel_id"))
-        already_sent = bool(str(rec.get("resolved_followup_sent_at_iso") or "").strip())
-        if already_sent:
-            return True
+            branch = "not_found"
+        else:
+            tid, rec = found
+            ch_id = _as_int(rec.get("channel_id"))
+            already_sent = bool(str(rec.get("resolved_followup_sent_at_iso") or "").strip())
+            if already_sent:
+                branch = "already_sent"
+            else:
+                # Throttle retries (prevents spam if multiple resolve signals arrive).
+                now_iso = _now_iso()
+                last_try = _parse_iso(str(rec.get("resolved_followup_last_attempt_at_iso") or "").strip() or "")
+                if last_try and (_now_utc() - last_try) < timedelta(seconds=300):
+                    branch = "throttle"
+                else:
+                    # Mark resolved + record an attempt (we'll mark "sent" only after successful post).
+                    if not str(rec.get("resolved_at_iso") or "").strip():
+                        rec["resolved_at_iso"] = now_iso
+                    rec["resolved_event"] = str(resolution_event or "")[:200]
+                    rec["resolved_followup_last_attempt_at_iso"] = now_iso
+                    try:
+                        rec["resolved_followup_attempts"] = int(rec.get("resolved_followup_attempts") or 0) + 1
+                    except Exception:
+                        rec["resolved_followup_attempts"] = 1
+                    if reference_jump_url:
+                        rec["reference_jump_url"] = str(reference_jump_url or "")
+                    db["tickets"][tid] = rec  # type: ignore[index]
+                    _index_save(db)
+                    branch = "proceed"
 
-        # Throttle retries (prevents spam if multiple resolve signals arrive).
-        now_iso = _now_iso()
-        last_try = _parse_iso(str(rec.get("resolved_followup_last_attempt_at_iso") or "").strip() or "")
-        if last_try and (_now_utc() - last_try) < timedelta(seconds=300):
-            return True
-
-        # Mark resolved + record an attempt (we'll mark "sent" only after successful post).
-        if not str(rec.get("resolved_at_iso") or "").strip():
-            rec["resolved_at_iso"] = now_iso
-        rec["resolved_event"] = str(resolution_event or "")[:200]
-        rec["resolved_followup_last_attempt_at_iso"] = now_iso
-        try:
-            rec["resolved_followup_attempts"] = int(rec.get("resolved_followup_attempts") or 0) + 1
-        except Exception:
-            rec["resolved_followup_attempts"] = 1
-        # keep latest source reference
-        if reference_jump_url:
-            rec["reference_jump_url"] = str(reference_jump_url or "")
-        db["tickets"][tid] = rec  # type: ignore[index]
-        _index_save(db)
+    if branch == "not_found":
+        await _res_log(
+            trace_tag="crm_resolution_skip",
+            stage="TICKET_RESOLUTION",
+            event_lines=[
+                f"Ticket type: {ttype}",
+                f"Member: <@{uid}>",
+                f"Resolution event: {ev}",
+            ],
+            decision_lines=["Open ticket for this type + user: no"],
+            result_lines=["RESOLUTION SKIPPED", "Reason: no matching open ticket"],
+        )
+        return False
+    if branch == "already_sent":
+        await _res_log(
+            trace_tag="crm_resolution_duplicate",
+            stage="TICKET_RESOLUTION",
+            event_lines=[
+                f"Ticket type: {ttype}",
+                f"Member: <@{uid}>",
+                f"Channel: <#{ch_id}>" if ch_id else "Channel: —",
+            ],
+            decision_lines=["Resolved follow-up already posted: yes"],
+            result_lines=["DUPLICATE SKIP", "Reason: follow-up already sent for this open ticket"],
+        )
+        return True
+    if branch == "throttle":
+        await _res_log(
+            trace_tag="crm_resolution_throttle",
+            stage="TICKET_RESOLUTION",
+            event_lines=[f"Ticket type: {ttype}", f"Member: <@{uid}>", f"Channel: <#{ch_id}>" if ch_id else "Channel: —"],
+            decision_lines=["Retry throttle: within 300s of last attempt"],
+            result_lines=["RESOLUTION THROTTLED", "Reason: duplicate resolve signals; try again later"],
+        )
+        return True
 
     ch = guild.get_channel(int(ch_id)) if ch_id else None
     if not isinstance(ch, discord.TextChannel):
+        await _res_log(
+            trace_tag="crm_resolution_blocked",
+            stage="TICKET_RESOLUTION",
+            event_lines=[f"Ticket type: {ttype}", f"Member: <@{uid}>", f"Channel id: {ch_id or 0}"],
+            decision_lines=["Ticket channel: missing or not a text channel"],
+            result_lines=["RESOLUTION BLOCKED", "Reason: cannot post follow-up (channel not usable)"],
+        )
         return False
 
     owner = guild.get_member(uid)
@@ -3486,6 +3731,13 @@ async def post_resolution_followup_and_remove_role(
         with suppress(Exception):
             owner = await guild.fetch_member(uid)
     if not isinstance(owner, discord.Member):
+        await _res_log(
+            trace_tag="crm_resolution_blocked",
+            stage="TICKET_RESOLUTION",
+            event_lines=[f"Ticket type: {ttype}", f"Channel: <#{int(ch.id)}>"],
+            decision_lines=["Owner member: not found in guild"],
+            result_lines=["RESOLUTION BLOCKED", "Reason: could not resolve Discord member"],
+        )
         return False
 
     # Remove the ticket role now (resolved state).
@@ -3540,6 +3792,39 @@ async def post_resolution_followup_and_remove_role(
             resolution_event=resolution_event,
             reference_jump_url=reference_jump_url,
         )
+
+    auto_close_note = (
+        f"Auto-close after grace: {delay_s}s (if no member reply after follow-up)"
+        if delay_s > 0
+        else "Auto-close after grace: not configured (delay_seconds <= 0)"
+    )
+    await _res_log(
+        trace_tag="crm_resolution_followup",
+        stage="TICKET_RESOLUTION",
+        event_lines=[
+            "Source flow: resolution_followup",
+            f"Ticket type: {ttype}",
+            f"Member: <@{uid}>",
+            f"Channel: <#{int(ch.id)}>",
+            f"Resolution event: {ev}",
+            f"Reference: {reference_jump_url or '—'}",
+        ],
+        decision_lines=[
+            "Resolved follow-up: posted",
+            "Per-ticket role: removed from owner",
+        ],
+        action_lines=[
+            "Follow-up message: posted in ticket channel",
+            "Ticket role: removed from owner",
+            "Audit: ticket resolved event (if enabled)",
+            auto_close_note,
+        ],
+        result_lines=[
+            "RESOLUTION FOLLOW-UP POSTED",
+            "Next: sweeper may auto-close after grace if no human reply",
+        ],
+        technical={"ticket_id": str((rec or {}).get("ticket_id") or tid or "").strip()},
+    )
     return True
 
 
@@ -3722,11 +4007,35 @@ async def _open_or_update_ticket(
     fingerprint: str,
     category_id: int,
     preview_embed: discord.Embed,
+    source_flow: str = "",
     reference_jump_url: str = "",
     whop_dashboard_url: str = "",
     extra_sends: list[tuple[str, discord.Embed | None]] | None = None,
     extra_record_fields: dict | None = None,
 ) -> discord.TextChannel | None:
+    trace_id = _make_trace_id("tkt_open")
+    await _log(
+        _fmt_ticket_movement_log(
+            trace_id=trace_id,
+            trace_tag="crm_open_request",
+            stage="TICKET_OPEN_REQUEST",
+            flow=str(source_flow or "open_or_update"),
+            event_lines=[
+                f"Source flow: {str(source_flow or '—').strip() or '—'}",
+                f"Ticket type: {str(ticket_type or '').strip().lower() or 'unknown'}",
+                f"Member: <@{int(getattr(owner, 'id', 0) or 0)}>",
+                f"fingerprint={(str(fingerprint or '').strip()[:140] + ('…' if len(str(fingerprint or '').strip()) > 140 else '')) or '—'}",
+                f"Reference: {reference_jump_url or '—'}",
+            ],
+            decision_lines=[
+                f"Category configured: {'yes' if int(category_id or 0) > 0 else 'no'}",
+            ],
+            technical={
+                "reference_jump_url": str(reference_jump_url or ""),
+                "whop_dashboard_url": str(whop_dashboard_url or ""),
+            },
+        )
+    )
     if not _ensure_cfg_loaded():
         return None
     cfg = _cfg()
@@ -3735,14 +4044,46 @@ async def _open_or_update_ticket(
     if not isinstance(owner, discord.Member):
         return None
     if int(category_id or 0) <= 0:
-        await _log(f"⚠️ support_tickets: category_id is not configured for type={ticket_type}")
         await _crm_log("OPEN_ABORT", reason="category_id_missing", ticket_type=ticket_type, user_id=int(owner.id))
+        await _log(
+            _fmt_ticket_movement_log(
+                trace_id=trace_id,
+                trace_tag="crm_open_abort",
+                stage="TICKET_OPEN_DECISION",
+                flow=str(source_flow or "open_or_update"),
+                decision_lines=[
+                    "result=aborted",
+                    "reason=category_id_missing",
+                ],
+                result_lines=[
+                    f"TICKET BLOCKED [{str(ticket_type or '').strip().lower() or 'unknown'}]",
+                    "Reason: ticket category is not configured",
+                    "Action: no ticket created",
+                ],
+            )
+        )
         return None
 
     guild = _BOT.get_guild(int(cfg.guild_id))
     if not guild:
-        await _log(f"⚠️ support_tickets: guild not found (guild_id={cfg.guild_id})")
         await _crm_log("OPEN_ABORT", reason="guild_not_found", ticket_type=ticket_type, user_id=int(owner.id), guild_id=cfg.guild_id)
+        await _log(
+            _fmt_ticket_movement_log(
+                trace_id=trace_id,
+                trace_tag="crm_open_abort",
+                stage="TICKET_OPEN_DECISION",
+                flow=str(source_flow or "open_or_update"),
+                decision_lines=[
+                    "result=aborted",
+                    "reason=guild_not_found",
+                ],
+                result_lines=[
+                    f"TICKET BLOCKED [{str(ticket_type or '').strip().lower() or 'unknown'}]",
+                    f"Reason: guild not found (guild_id={int(cfg.guild_id)})",
+                    "Action: no ticket created",
+                ],
+            )
+        )
         return None
 
     # Preflight: category existence + bot perms (this is the #1 reason tickets "stop" after role/category changes).
@@ -3751,7 +4092,6 @@ async def _open_or_update_ticket(
     except Exception:
         cat = None
     if not isinstance(cat, discord.CategoryChannel):
-        await _log(f"❌ support_tickets: category not found type={ticket_type} category_id={int(category_id)}")
         await _crm_log(
             "CONFIG_FAIL",
             reason="category_not_found",
@@ -3759,23 +4099,42 @@ async def _open_or_update_ticket(
             user_id=int(owner.id),
             category_id=int(category_id),
         )
-    else:
-        me = getattr(guild, "me", None) or guild.get_member(int(getattr(getattr(_BOT, "user", None), "id", 0) or 0))
-        if isinstance(me, discord.Member):
-            with suppress(Exception):
-                p = cat.permissions_for(me)
-                if not bool(getattr(p, "view_channel", False)):
-                    await _log(
-                        f"❌ support_tickets: bot cannot view category type={ticket_type} category_id={int(category_id)}"
-                    )
-                if not bool(getattr(p, "manage_channels", False)):
-                    await _log(
-                        f"❌ support_tickets: bot cannot manage_channels in category type={ticket_type} category_id={int(category_id)}"
-                    )
-                if not bool(getattr(p, "manage_permissions", False)):
-                    await _log(
-                        f"⚠️ support_tickets: bot cannot manage_permissions in category type={ticket_type} category_id={int(category_id)}"
-                    )
+        await _log(
+            _fmt_ticket_movement_log(
+                trace_id=trace_id,
+                trace_tag="crm_open_abort",
+                stage="TICKET_OPEN_DECISION",
+                flow=str(source_flow or "open_or_update"),
+                decision_lines=[
+                    "result=aborted",
+                    "reason=category_not_found",
+                    f"category_id={int(category_id)}",
+                ],
+                result_lines=[
+                    f"TICKET BLOCKED [{str(ticket_type or '').strip().lower() or 'unknown'}]",
+                    "Reason: category channel not found / invalid",
+                    "Action: no ticket created",
+                ],
+            )
+        )
+        return None
+
+    me = getattr(guild, "me", None) or guild.get_member(int(getattr(getattr(_BOT, "user", None), "id", 0) or 0))
+    if isinstance(me, discord.Member):
+        with suppress(Exception):
+            p = cat.permissions_for(me)
+            if not bool(getattr(p, "view_channel", False)):
+                await _log(
+                    f"❌ support_tickets: bot cannot view category type={ticket_type} category_id={int(category_id)}"
+                )
+            if not bool(getattr(p, "manage_channels", False)):
+                await _log(
+                    f"❌ support_tickets: bot cannot manage_channels in category type={ticket_type} category_id={int(category_id)}"
+                )
+            if not bool(getattr(p, "manage_permissions", False)):
+                await _log(
+                    f"⚠️ support_tickets: bot cannot manage_permissions in category type={ticket_type} category_id={int(category_id)}"
+                )
 
     # Dedupe / cooldown: single open ticket per (type,user) or fingerprint.
     # no_whop_link: ping both member + staff on the header message.
@@ -3835,6 +4194,31 @@ async def _open_or_update_ticket(
                     ticket_id=existing_ticket_id,
                     fingerprint=str(fingerprint or ""),
                 )
+                await _log(
+                    _fmt_ticket_movement_log(
+                        trace_id=trace_id,
+                        trace_tag="crm_dedupe",
+                        stage="TICKET_OPEN_DECISION",
+                        flow=str(source_flow or "open_or_update"),
+                        decision_lines=[
+                            "result=deduped",
+                            "reason=existing_open_ticket",
+                            f"Existing open ticket: yes",
+                        ],
+                        action_lines=[
+                            f"Existing ticket reused: <#{int(ch.id)}>",
+                            "Header posted: refreshed",
+                        ],
+                        result_lines=[
+                            "DUPLICATE SKIP",
+                            f"Reason: matching open ticket already exists",
+                        ],
+                        technical={
+                            "existing_header_message_id": str(int(header_mid or 0)),
+                            "existing_channel_id": str(int(ch.id)),
+                        },
+                    )
+                )
                 # Important: do NOT bump last_activity for bot messages.
                 return ch
 
@@ -3884,6 +4268,28 @@ async def _open_or_update_ticket(
                     cooldown_seconds=int(cd_s),
                     fingerprint=str(fingerprint or ""),
                 )
+                await _log(
+                    _fmt_ticket_movement_log(
+                        trace_id=trace_id,
+                        trace_tag="crm_suppressed",
+                        stage="TICKET_OPEN_DECISION",
+                        flow=str(source_flow or "open_or_update"),
+                        decision_lines=[
+                            "Existing open ticket: no",
+                            "Cooldown blocked: yes",
+                            "Category configured: yes",
+                        ],
+                        result_lines=[
+                            "SUPPRESSED",
+                            "Reason: recently closed matching ticket still in cooldown",
+                        ],
+                        technical={
+                            "last_ticket_id": str(last_rec.get("ticket_id") or last_tid or "").strip(),
+                            "last_channel_id": str(int(_as_int(last_rec.get('channel_id')))),
+                            "last_closed_at_iso": str(last_rec.get("closed_at_iso") or "").strip(),
+                        },
+                    )
+                )
                 # Return a truthy sentinel so callers don't log this as a "failed open".
                 return discord.Object(id=int(_as_int(last_rec.get("channel_id")) or owner.id))
 
@@ -3910,13 +4316,29 @@ async def _open_or_update_ticket(
             reason="RSCheckerbot: open support ticket",
         )
         if not isinstance(ch, discord.TextChannel):
-            await _log(f"❌ support_tickets: failed to create ticket channel type={ticket_type} user_id={owner.id}")
             await _crm_log(
                 "OPEN_FAIL",
                 reason="channel_create_failed",
                 ticket_type=ticket_type,
                 user_id=int(owner.id),
                 category_id=int(category_id),
+            )
+            await _log(
+                _fmt_ticket_movement_log(
+                    trace_id=trace_id,
+                    trace_tag="crm_open_abort",
+                    stage="TICKET_OPEN_DECISION",
+                    flow=str(source_flow or "open_or_update"),
+                    decision_lines=[
+                        "result=aborted",
+                        "reason=channel_create_failed",
+                    ],
+                    result_lines=[
+                        f"TICKET BLOCKED [{str(ticket_type or '').strip().lower() or 'unknown'}]",
+                        "Reason: failed to create ticket channel",
+                        "Action: no ticket created",
+                    ],
+                )
             )
             return None
 
@@ -3990,6 +4412,32 @@ async def _open_or_update_ticket(
             channel_id=int(ch.id),
             ticket_id=ticket_id,
             category_id=int(category_id),
+        )
+        await _log(
+            _fmt_ticket_movement_log(
+                trace_id=trace_id,
+                trace_tag="crm_open",
+                stage="TICKET_OPEN_DECISION",
+                flow=str(source_flow or "open_or_update"),
+                decision_lines=[
+                    "Existing open ticket: no",
+                    "Cooldown blocked: no",
+                    "Category configured: yes",
+                ],
+                action_lines=[
+                    f"Created ticket: <#{int(ch.id)}>",
+                    f"Applied role: {str(getattr(guild.get_role(int(_ticket_role_id_for_type(ticket_type))) or None, 'name', None) or '—')}",
+                    f"Header posted: {'yes' if int(header_mid or 0) > 0 else 'no'}",
+                ],
+                result_lines=[
+                    "TICKET CREATED",
+                ],
+                technical={
+                    "header_message_id": str(int(header_mid or 0)),
+                    "topic": str(topic or "")[:240],
+                    "fingerprint": str(fingerprint or ""),
+                },
+            )
         )
         return ch
 
@@ -4662,6 +5110,7 @@ async def open_cancellation_ticket(
         fingerprint=fingerprint,
         category_id=int(cfg.cancellation_category_id),
         preview_embed=embed,
+        source_flow="member_status_crm",
         reference_jump_url=reference_jump_url,
         whop_dashboard_url=str((whop_brief or {}).get("dashboard_url") or "") if isinstance(whop_brief, dict) else "",
     )
@@ -4711,6 +5160,7 @@ async def open_billing_ticket(
         fingerprint=fingerprint,
         category_id=int(cfg.billing_category_id),
         preview_embed=embed,
+        source_flow="payment.failed",
         reference_jump_url=reference_jump_url,
     )
 
@@ -4837,6 +5287,7 @@ async def open_free_pass_ticket(
         fingerprint=fingerprint,
         category_id=int(cfg.free_pass_category_id),
         preview_embed=header,
+        source_flow="member_status_crm",
         extra_sends=extra,
         extra_record_fields={"what_you_missed_jump_url": str(source_jump or "")},
         reference_jump_url=str(reference_jump_url or ""),
@@ -4861,6 +5312,7 @@ async def open_free_pass_welcome_ticket(
         fingerprint=fingerprint,
         category_id=int(cfg.free_pass_category_id),
         preview_embed=header,
+        source_flow="welcome",
         reference_jump_url=str(reference_jump_url or ""),
         whop_dashboard_url=str((whop_brief or {}).get("dashboard_url") or "") if isinstance(whop_brief, dict) else "",
     )
@@ -4890,6 +5342,7 @@ async def open_member_welcome_ticket(
         fingerprint=fingerprint,
         category_id=int(cat_id),
         preview_embed=header,
+        source_flow="welcome",
         reference_jump_url=str(reference_jump_url or ""),
         whop_dashboard_url=str((whop_brief or {}).get("dashboard_url") or "") if isinstance(whop_brief, dict) else "",
     )
@@ -4919,6 +5372,7 @@ async def open_no_whop_link_ticket(
         fingerprint=fingerprint,
         category_id=int(cat_id),
         preview_embed=embed,
+        source_flow="no_whop_scan",
         reference_jump_url=reference_jump_url,
         whop_dashboard_url=str((whop_brief or {}).get("dashboard_url") or "") if isinstance(whop_brief, dict) else "",
         extra_record_fields={"no_whop_link_note": str(note or "").strip()},
@@ -5594,6 +6048,24 @@ async def close_ticket_by_channel_id(
     do_transcript: bool = True,
     delete_channel: bool = True,
 ) -> bool:
+    trace_id = _make_trace_id("tkt_close")
+    await _log(
+        _fmt_ticket_movement_log(
+            trace_id=trace_id,
+            trace_tag="crm_close_request",
+            stage="TICKET_CLOSE_REQUEST",
+            flow="manual_or_sweeper",
+            event_lines=[
+                "Source flow: manual_or_sweeper",
+                f"Channel: <#{int(channel_id or 0) or 0}>",
+                f"Close reason: {str(close_reason or '').strip() or '—'}",
+            ],
+            decision_lines=[
+                f"Transcript: {'yes' if bool(do_transcript) else 'no'}",
+                f"Delete channel: {'yes' if bool(delete_channel) else 'no'}",
+            ],
+        )
+    )
     if not _ensure_cfg_loaded():
         return False
     cfg = _cfg()
@@ -5641,6 +6113,30 @@ async def close_ticket_by_channel_id(
         if ticket_user_id:
             _crm_close_kw["user_id"] = int(ticket_user_id)
         await _crm_log("CLOSE", **_crm_close_kw)
+        await _log(
+            _fmt_ticket_movement_log(
+                trace_id=trace_id,
+                trace_tag="crm_close",
+                stage="TICKET_CLOSE_DECISION",
+                flow="manual_or_sweeper",
+                decision_lines=[
+                    "Channel exists: no",
+                ],
+                action_lines=[
+                    "Index status: CLOSED",
+                    "Role removed: attempted",
+                ],
+                result_lines=[
+                    "TICKET CLOSED",
+                    "Reason: channel missing (index-only close)",
+                ],
+                technical={
+                    "ticket_type": str(ticket_type or "unknown"),
+                    "ticket_id": str(ticket_id_meta or ""),
+                    "user_id": str(int(ticket_user_id or 0)),
+                },
+            )
+        )
         # Auto-remove the role tied to this ticket type.
         if ticket_user_id and ticket_type:
             mobj = guild.get_member(int(ticket_user_id))
@@ -5655,7 +6151,6 @@ async def close_ticket_by_channel_id(
     if do_transcript:
         ok = await export_transcript_for_channel_id(int(channel_id), close_reason=close_reason)
         if not ok:
-            await _log(f"❌ support_tickets: transcript failed; refusing to delete ticket channel_id={channel_id}")
             _crm_abort: dict[str, object] = {
                 "reason": "transcript_failed",
                 "channel_id": int(channel_id),
@@ -5667,6 +6162,29 @@ async def close_ticket_by_channel_id(
             if ticket_user_id:
                 _crm_abort["user_id"] = int(ticket_user_id)
             await _crm_log("CLOSE_ABORT", **_crm_abort)
+            await _log(
+                _fmt_ticket_movement_log(
+                    trace_id=trace_id,
+                    trace_tag="crm_close_abort",
+                    stage="TICKET_CLOSE_DECISION",
+                    flow="manual_or_sweeper",
+                    decision_lines=[
+                        "Transcript: failed",
+                    ],
+                    action_lines=[
+                        "Delete channel: refused",
+                    ],
+                    result_lines=[
+                        "TICKET BLOCKED",
+                        "Reason: transcript failed; refusing to delete channel",
+                    ],
+                    technical={
+                        "ticket_type": str(ticket_type or "unknown"),
+                        "ticket_id": str(ticket_id_meta or ""),
+                        "user_id": str(int(ticket_user_id or 0)),
+                    },
+                )
+            )
             return False
     else:
         # No transcript requested: still mark closed (keeps index + role state consistent).
@@ -5708,6 +6226,31 @@ async def close_ticket_by_channel_id(
     if ticket_user_id:
         _crm_done["user_id"] = int(ticket_user_id)
     await _crm_log("CLOSE", **_crm_done)
+    await _log(
+        _fmt_ticket_movement_log(
+            trace_id=trace_id,
+            trace_tag="crm_close",
+            stage="TICKET_CLOSE_DECISION",
+            flow="manual_or_sweeper",
+            decision_lines=[
+                f"Outcome: {str(_crm_done.get('outcome') or '')}",
+            ],
+            action_lines=[
+                f"Transcript: {'yes' if bool(do_transcript) else 'no'}",
+                f"Delete channel: {'yes' if bool(delete_channel) else 'no'}",
+                "Role removed: attempted",
+            ],
+            result_lines=[
+                "TICKET CLOSED",
+                f"Ticket type: {ticket_type or 'unknown'}",
+            ],
+            technical={
+                "ticket_id": str(ticket_id_meta or ""),
+                "user_id": str(int(ticket_user_id or 0)),
+                "channel_id": str(int(channel_id)),
+            },
+        )
+    )
     return True
 
 
@@ -6057,6 +6600,33 @@ async def sweep_resolved_tickets() -> None:
                 to_close.append((int(ch_id), f"resolved:{ev or 'ok'}"))
 
     for ch_id, reason in to_close:
+        tr = _make_trace_id("tkt_rsweep")
+        with suppress(Exception):
+            await _log(
+                _fmt_ticket_movement_log(
+                    trace_id=tr,
+                    trace_tag="crm_resolution_sweep_close",
+                    stage="TICKET_RESOLUTION_SWEEP",
+                    flow="resolution_sweep",
+                    event_lines=[
+                        "Source flow: resolution_sweep",
+                        f"Channel: <#{int(ch_id)}>",
+                        f"Close reason: {reason}",
+                    ],
+                    decision_lines=[
+                        "Resolved follow-up posted: yes",
+                        f"Grace elapsed: yes (>= {delay_s}s since follow-up)",
+                        "Member reply after follow-up: no",
+                    ],
+                    action_lines=[
+                        "Auto-close: executing (transcript + channel delete)",
+                    ],
+                    result_lines=[
+                        "RESOLUTION AUTO-CLOSE",
+                        "Next: close pipeline runs (see TICKET CLOSE log)",
+                    ],
+                )
+            )
         with suppress(Exception):
             await close_ticket_by_channel_id(int(ch_id), close_reason=reason, do_transcript=True, delete_channel=True)
 

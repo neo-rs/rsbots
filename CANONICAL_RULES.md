@@ -265,6 +265,22 @@ Enforcement:
 RSAdminBot must not overwrite its own running folder in-place.
 It must stage updates and apply them on restart via the systemd wrapper (`RSAdminBot/run_bot.sh`).
 
+### RSAdminBot journal live vs RSCheckerbot Discord logs (ownership)
+
+| Responsibility | Owner | Config |
+|----------------|--------|--------|
+| **In-Discord bot output** (embeds, `log_other`, ticket movement text, flow routing) | **RSCheckerbot** | `RSCheckerbot/config.json` → `journal_logs`, `log_controls`, `support_tickets` |
+| **Systemd journal mirror** (raw `journalctl` lines from the Ubuntu host → webhooks → Test Server channels) | **RSAdminBot** | `RSAdminBot/config.json` → `journal_live` |
+
+RSAdminBot does **not** own support-ticket lifecycle logging; it only **streams** RSCheckerbot’s process stdout/stderr when `journal_live.enabled` is true. Channel names for the **split RSCheckerbot flows** (`rscheckerbot_split_flow_journals`) are defined by:
+
+- `journal_live.rscheckerbot_journal_channel_names` — optional map `flow_slug` → exact channel name (operator-friendly names go here).
+- If a flow is missing from that map, RSAdminBot falls back to `journal-{prefix}rscheckerbot-{flow}`.
+
+**Keep split-flow names aligned** with `RSCheckerbot` `journal_logs.channel_names` for the same flow keys so operators see one naming scheme whether logs come from bot routing or from journal mirroring.
+
+After renaming channels in config, **rename or recreate** the Discord channels (or update stored webhook/channel IDs in `config.secrets.json`) so RSAdminBot does not create a second set with the new names while old webhooks still point at old channels.
+
 ## 🚫 FORBIDDEN PATTERNS
 
 - `shell=True`

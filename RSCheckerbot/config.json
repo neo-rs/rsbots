@@ -53,35 +53,35 @@
     "member_status_logs_channel_id": 1452835008170426368
   },
   "journal_logs": {
-    "_comment": "FLOW labels on Discord embed footers (flow_labels_enabled). route_to_journal_channels=true + category_id → split #journal-rscheckerbot-* per flow. mirror_tlog_to_discord mirrors python [RSCheckerbot][FLOW] lines (Whop HTTP, scans, etc.) into the matching flow channel.",
+    "_comment": "FLOW labels on embed footers. route_to_journal_channels=true + category_id creates/uses these channel names. mirror_tlog_to_discord mirrors [RSCheckerbot][FLOW] lines. Keep names aligned with RSAdminBot journal_live.rscheckerbot_journal_channel_names for split flows.",
     "flow_labels_enabled": true,
     "route_to_journal_channels": false,
     "mirror_tlog_to_discord": true,
     "category_id": 0,
     "channel_names": {
-      "general": "journal-rscheckerbot-general",
-      "startup": "journal-rscheckerbot-boot",
-      "http": "journal-rscheckerbot-http",
-      "whop_webhook": "journal-rscheckerbot-whop-webhook",
-      "whop_http_inbound": "journal-rscheckerbot-whop-http-inbound",
-      "whop_http_process": "journal-rscheckerbot-whop-http-process",
-      "whop_logs_scan": "journal-rscheckerbot-whop-logs-scan",
-      "whop_discord": "journal-rscheckerbot-whop-discord",
-      "whop_api": "journal-rscheckerbot-whop-api",
-      "whop_sync": "journal-rscheckerbot-whop-sync",
-      "persist": "journal-rscheckerbot-persist",
-      "staff_embeds": "journal-rscheckerbot-staff-embeds",
-      "tickets": "journal-rscheckerbot-tickets",
-      "member_status_crm": "journal-rscheckerbot-member-status-crm",
-      "discord_dm": "journal-rscheckerbot-dm-sequence",
-      "roles": "journal-rscheckerbot-roles",
-      "role_audit": "journal-rscheckerbot-role-audit",
-      "reporting": "journal-rscheckerbot-reporting",
-      "member_history": "journal-rscheckerbot-member-history",
-      "support_sweep": "journal-rscheckerbot-support-sweep",
-      "invite_ghl": "journal-rscheckerbot-invite-ghl",
-      "channel_limits": "journal-rscheckerbot-channel-limits",
-      "whop_text": "journal-rscheckerbot-whop-text"
+      "general": "rscheckerbot-ops",
+      "startup": "rscheckerbot-boot",
+      "http": "rscheckerbot-http",
+      "whop_webhook": "whop-webhook-receiver",
+      "whop_http_inbound": "whop-raw-inbound",
+      "whop_http_process": "whop-processing",
+      "whop_logs_scan": "whop-logs-scan",
+      "whop_discord": "whop-discord-native",
+      "whop_api": "whop-api",
+      "whop_sync": "whop-sync",
+      "persist": "rscheckerbot-persist",
+      "staff_embeds": "staff-embeds-crm",
+      "tickets": "support-ticket-events",
+      "member_status_crm": "member-status-events",
+      "discord_dm": "dm-sequence-logs",
+      "roles": "rscheckerbot-roles",
+      "role_audit": "discord-role-audit",
+      "reporting": "rscheckerbot-reporting",
+      "member_history": "member-history",
+      "support_sweep": "support-ticket-sweep",
+      "invite_ghl": "invite-ghl",
+      "channel_limits": "channel-limits",
+      "whop_text": "whop-text-legacy"
     }
   },
   "log_controls": {
@@ -101,9 +101,9 @@
     "_comment_onboarding_logs": "RSOnboarding ticket-created cards; used in role audit for correlation link.",
     "_comment_output": "Optional: route ALL bot output logs to a different guild (e.g. Neo Test Server).",
     "output_guild_id": 0,
-    "output_log_other_channel_name": "bot-logs",
-    "output_member_status_channel_name": "member-status-logs",
-    "output_whop_channel_name": "whop-logs"
+    "output_log_other_channel_name": "rscheckerbot-ops",
+    "output_member_status_channel_name": "member-status-events",
+    "output_whop_channel_name": "whop-events"
   },
 
   "member_history": {
@@ -398,9 +398,9 @@
     "audit_logs": {
       "_comment": "Dyno-style audit logs for ticket categories (message create/edit/delete + channel create/update/delete).",
       "enabled": true,
-      "_comment_channel_id": "Set to an existing #tickets-logs channel to prevent duplicates.",
+      "_comment_channel_id": "Forensic ticket audit (rename Discord channel to match channel_name when changing names).",
       "channel_id": 1467506723790262464,
-      "channel_name": "tickets-logs",
+      "channel_name": "support-ticket-audit",
       "include_transcript_category": false
     },
     "startup_backfill": {
