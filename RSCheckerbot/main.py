@@ -2745,6 +2745,38 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
     title_low = title.lower()
     ref_url = str(getattr(msg, "jump_url", "") or "").strip()
     occurred_at = getattr(msg, "created_at", None) or datetime.now(timezone.utc)
+    trace_id = f"msl:{int(getattr(msg, 'id', 0) or 0)}"
+
+    # Always emit a first-pass routing snapshot so "why did it choose billing/cancel/freepass?" is visible.
+    with suppress(Exception):
+        mid_hint = str((whop_brief or {}).get("membership_id") or "").strip() if isinstance(whop_brief, dict) else ""
+        has_members_role = bool(has_member_role(member))
+        e_route = _fmt_whop_movement_trace(
+            trace_id=trace_id,
+            stage="TICKET_ROUTE_EVAL",
+            evt="member-status-logs",
+            kind=str(kind or "").strip(),
+            membership_id=mid_hint,
+            discord_id=int(did_i),
+            reads=[
+                f"Source staff card: {_fmt_channel_mention(int(MEMBER_STATUS_LOGS_CHANNEL_ID or 0))} msg_id={int(getattr(msg,'id',0) or 0)}",
+                (f"jump_url={ref_url}" if ref_url else "jump_url=—"),
+                f"title={title[:180]}",
+            ],
+            decisions=[
+                f"kind={str(kind or '—')}",
+                f"has_members_role={'yes' if has_members_role else 'no'}",
+                ("membership_id_in_history=yes" if _membership_id_from_history(int(did_i)) else "membership_id_in_history=no"),
+            ],
+            actions=[],
+            result=[],
+            technical={
+                "ts": int(ts_i or 0),
+                "footer_ok": bool(footer_ok),
+                "has_discord_id_field": bool(has_discord_id_field),
+            },
+        )
+        await _whop_movement_send(content="", embed=e_route)
 
     # No-Whop-Link close trigger: if member-status-logs shows Connected Discord matching this member, close ticket + remove role.
     try:
@@ -2760,6 +2792,20 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                     resolution_event="discord_linked",
                     reference_jump_url=ref_url,
                 )
+                with suppress(Exception):
+                    e = _fmt_whop_movement_trace(
+                        trace_id=trace_id,
+                        stage="TICKET_AUTOMATION_ACTION",
+                        evt="member-status-logs",
+                        kind=str(kind or "").strip(),
+                        membership_id=str((whop_brief or {}).get("membership_id") or "").strip() if isinstance(whop_brief, dict) else "",
+                        discord_id=int(did_i),
+                        reads=["Detected Connected Discord proof on staff card"],
+                        decisions=["close no_whop_link ticket if open"],
+                        actions=["close_no_whop_link_if_linked() called"],
+                        result=[],
+                    )
+                    await _whop_movement_send(content="", embed=e)
 
     # Close Free Pass as soon as we see an access-confirmation style card in member-status-logs.
     if (
@@ -2778,6 +2824,20 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                     resolution_event="access_restored",
                     reference_jump_url=ref_url,
                 )
+                with suppress(Exception):
+                    e = _fmt_whop_movement_trace(
+                        trace_id=trace_id,
+                        stage="TICKET_AUTOMATION_ACTION",
+                        evt="member-status-logs",
+                        kind=str(kind or "").strip(),
+                        membership_id=str((whop_brief or {}).get("membership_id") or "").strip() if isinstance(whop_brief, dict) else "",
+                        discord_id=int(did_i),
+                        reads=["Access-restored signal detected on staff card"],
+                        decisions=["close free_pass ticket if whop linked"],
+                        actions=["close_free_pass_if_whop_linked() called"],
+                        result=[],
+                    )
+                    await _whop_movement_send(content="", embed=e)
 
             # Also post a follow-up + remove roles for resolved billing/cancellation tickets, if any.
             # This is a soft-resolve: the ticket stays open until staff closes (or auto-close after grace).
@@ -2788,6 +2848,20 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                     resolution_event="access_restored",
                     reference_jump_url=ref_url,
                 )
+                with suppress(Exception):
+                    e = _fmt_whop_movement_trace(
+                        trace_id=trace_id,
+                        stage="TICKET_AUTOMATION_ACTION",
+                        evt="member-status-logs",
+                        kind=str(kind or "").strip(),
+                        membership_id=str((whop_brief or {}).get("membership_id") or "").strip() if isinstance(whop_brief, dict) else "",
+                        discord_id=int(did_i),
+                        reads=["Access-restored signal detected on staff card"],
+                        decisions=["post resolution follow-up (billing) + remove role"],
+                        actions=["post_resolution_followup_and_remove_role(ticket_type=billing) called"],
+                        result=[],
+                    )
+                    await _whop_movement_send(content="", embed=e)
             with suppress(Exception):
                 await support_tickets.post_resolution_followup_and_remove_role(
                     discord_id=int(did_i),
@@ -2795,6 +2869,20 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                     resolution_event="access_restored",
                     reference_jump_url=ref_url,
                 )
+                with suppress(Exception):
+                    e = _fmt_whop_movement_trace(
+                        trace_id=trace_id,
+                        stage="TICKET_AUTOMATION_ACTION",
+                        evt="member-status-logs",
+                        kind=str(kind or "").strip(),
+                        membership_id=str((whop_brief or {}).get("membership_id") or "").strip() if isinstance(whop_brief, dict) else "",
+                        discord_id=int(did_i),
+                        reads=["Access-restored signal detected on staff card"],
+                        decisions=["post resolution follow-up (cancellation) + remove role"],
+                        actions=["post_resolution_followup_and_remove_role(ticket_type=cancellation) called"],
+                        result=[],
+                    )
+                    await _whop_movement_send(content="", embed=e)
 
     # Payment succeeded is a strong resolve signal (post follow-ups).
     if ("payment succeeded" in title_low or "payment received" in title_low):
@@ -2806,6 +2894,20 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                     resolution_event="payment_succeeded",
                     reference_jump_url=ref_url,
                 )
+                with suppress(Exception):
+                    e = _fmt_whop_movement_trace(
+                        trace_id=trace_id,
+                        stage="TICKET_AUTOMATION_ACTION",
+                        evt="member-status-logs",
+                        kind=str(kind or "").strip(),
+                        membership_id=str((whop_brief or {}).get("membership_id") or "").strip() if isinstance(whop_brief, dict) else "",
+                        discord_id=int(did_i),
+                        reads=["Payment succeeded signal detected on staff card"],
+                        decisions=["close free_pass ticket if whop linked"],
+                        actions=["close_free_pass_if_whop_linked(resolution_event=payment_succeeded) called"],
+                        result=[],
+                    )
+                    await _whop_movement_send(content="", embed=e)
             with suppress(Exception):
                 await support_tickets.post_resolution_followup_and_remove_role(
                     discord_id=int(did_i),
@@ -2813,6 +2915,20 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                     resolution_event="payment_succeeded",
                     reference_jump_url=ref_url,
                 )
+                with suppress(Exception):
+                    e = _fmt_whop_movement_trace(
+                        trace_id=trace_id,
+                        stage="TICKET_AUTOMATION_ACTION",
+                        evt="member-status-logs",
+                        kind=str(kind or "").strip(),
+                        membership_id=str((whop_brief or {}).get("membership_id") or "").strip() if isinstance(whop_brief, dict) else "",
+                        discord_id=int(did_i),
+                        reads=["Payment succeeded signal detected on staff card"],
+                        decisions=["post resolution follow-up (billing) + remove role"],
+                        actions=["post_resolution_followup_and_remove_role(ticket_type=billing, resolution_event=payment_succeeded) called"],
+                        result=[],
+                    )
+                    await _whop_movement_send(content="", embed=e)
             with suppress(Exception):
                 await support_tickets.post_resolution_followup_and_remove_role(
                     discord_id=int(did_i),
@@ -2820,6 +2936,20 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                     resolution_event="payment_succeeded",
                     reference_jump_url=ref_url,
                 )
+                with suppress(Exception):
+                    e = _fmt_whop_movement_trace(
+                        trace_id=trace_id,
+                        stage="TICKET_AUTOMATION_ACTION",
+                        evt="member-status-logs",
+                        kind=str(kind or "").strip(),
+                        membership_id=str((whop_brief or {}).get("membership_id") or "").strip() if isinstance(whop_brief, dict) else "",
+                        discord_id=int(did_i),
+                        reads=["Payment succeeded signal detected on staff card"],
+                        decisions=["post resolution follow-up (cancellation) + remove role"],
+                        actions=["post_resolution_followup_and_remove_role(ticket_type=cancellation, resolution_event=payment_succeeded) called"],
+                        result=[],
+                    )
+                    await _whop_movement_send(content="", embed=e)
 
         # Free Pass / Member Welcome automation (product + first-time vs renewal).
         try:
@@ -2887,10 +3017,40 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
             fp = f"{int(did_i)}|freepass|{_tz_now().date().isoformat()}"
             try:
                 ch_created = await support_tickets.open_free_pass_ticket(member=member, fingerprint=fp, reference_jump_url=ref_url)
+                with suppress(Exception):
+                    e = _fmt_whop_movement_trace(
+                        trace_id=trace_id,
+                        stage="TICKET_AUTOMATION_RESULT",
+                        evt="member-status-logs",
+                        kind="free_pass",
+                        membership_id=_membership_id_from_history(int(did_i)) or "",
+                        discord_id=int(did_i),
+                        reads=["kind==member_joined", "membership_id_in_history=no → eligible for free_pass ticket"],
+                        decisions=["route=free_pass"],
+                        actions=[f"open_free_pass_ticket(fingerprint={fp})"],
+                        result=[
+                            (f"ticket_channel={_fmt_channel_mention(int(ch_created))}" if ch_created else "ticket_channel=—"),
+                            (f"source_card={ref_url}" if ref_url else "source_card=—"),
+                        ],
+                    )
+                    await _whop_movement_send(content="", embed=e)
                 if not ch_created:
                     await log_other(f"❌ SupportTickets: failed to open free-pass ticket for `{did_i}` (member_joined)")
             except Exception as ex:
                 await log_other(f"❌ SupportTickets: exception opening free-pass ticket for `{did_i}` (member_joined) err=`{str(ex)[:240]}`")
+                with suppress(Exception):
+                    e = _fmt_whop_movement_trace(
+                        trace_id=trace_id,
+                        stage="TICKET_AUTOMATION_ERROR",
+                        evt="member-status-logs",
+                        kind="free_pass",
+                        discord_id=int(did_i),
+                        reads=["Attempted to open free_pass ticket"],
+                        decisions=["route=free_pass"],
+                        actions=["open_free_pass_ticket() raised"],
+                        result=[f"error={str(ex)[:240]}"],
+                    )
+                    await _whop_movement_send(content="", embed=e)
         return
 
     # Billing (payment failed / billing issue)
@@ -2908,10 +3068,50 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                 occurred_at=occurred_at,
                 reference_jump_url=ref_url,
             )
+            with suppress(Exception):
+                reasons = []
+                if kind == "payment_failed":
+                    reasons.append("kind==payment_failed")
+                if "billing issue" in title_low:
+                    reasons.append("title contains 'billing issue'")
+                if "past due" in title_low:
+                    reasons.append("title contains 'past due'")
+                if "payment failed" in title_low:
+                    reasons.append("title contains 'payment failed'")
+                e = _fmt_whop_movement_trace(
+                    trace_id=trace_id,
+                    stage="TICKET_AUTOMATION_RESULT",
+                    evt="member-status-logs",
+                    kind="billing",
+                    membership_id=str(mid or ""),
+                    discord_id=int(did_i),
+                    reads=(reasons or ["billing trigger matched"]),
+                    decisions=[f"route=billing (status={st or '—'})"],
+                    actions=[f"open_billing_ticket(fingerprint={fp})"],
+                    result=[
+                        (f"ticket_channel={_fmt_channel_mention(int(ch_created))}" if ch_created else "ticket_channel=—"),
+                        (f"source_card={ref_url}" if ref_url else "source_card=—"),
+                    ],
+                )
+                await _whop_movement_send(content="", embed=e)
             if not ch_created:
                 await log_other(f"❌ SupportTickets: failed to open billing ticket for `{did_i}` (kind={kind})")
         except Exception as ex:
             await log_other(f"❌ SupportTickets: exception opening billing ticket for `{did_i}` (kind={kind}) err=`{str(ex)[:240]}`")
+            with suppress(Exception):
+                e = _fmt_whop_movement_trace(
+                    trace_id=trace_id,
+                    stage="TICKET_AUTOMATION_ERROR",
+                    evt="member-status-logs",
+                    kind="billing",
+                    membership_id=str(mid or ""),
+                    discord_id=int(did_i),
+                    reads=["Attempted to open billing ticket"],
+                    decisions=["route=billing"],
+                    actions=["open_billing_ticket() raised"],
+                    result=[f"error={str(ex)[:240]}"],
+                )
+                await _whop_movement_send(content="", embed=e)
         return
 
     # Cancellation
@@ -2934,10 +3134,51 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                 fingerprint=fp,
                 reference_jump_url=ref_url,
             )
+            with suppress(Exception):
+                reasons = []
+                if kind in {"cancellation_scheduled", "deactivated"}:
+                    reasons.append(f"kind=={kind}")
+                if "cancellation" in title_low:
+                    reasons.append("title contains 'cancellation'")
+                if "deactivated" in title_low:
+                    reasons.append("title contains 'deactivated'")
+                if reason:
+                    reasons.append("cancellation reason field present")
+                e = _fmt_whop_movement_trace(
+                    trace_id=trace_id,
+                    stage="TICKET_AUTOMATION_RESULT",
+                    evt="member-status-logs",
+                    kind="cancellation",
+                    membership_id=str(mid or ""),
+                    discord_id=int(did_i),
+                    reads=(reasons or ["cancellation trigger matched"]),
+                    decisions=["route=cancellation"],
+                    actions=[f"open_cancellation_ticket(fingerprint={fp})"],
+                    result=[
+                        (f"ticket_channel={_fmt_channel_mention(int(ch_created))}" if ch_created else "ticket_channel=—"),
+                        (f"source_card={ref_url}" if ref_url else "source_card=—"),
+                    ],
+                    technical={"cancellation_reason": str(reason or "")[:220]},
+                )
+                await _whop_movement_send(content="", embed=e)
             if not ch_created:
                 await log_other(f"❌ SupportTickets: failed to open cancellation ticket for `{did_i}` (kind={kind})")
         except Exception as ex:
             await log_other(f"❌ SupportTickets: exception opening cancellation ticket for `{did_i}` (kind={kind}) err=`{str(ex)[:240]}`")
+            with suppress(Exception):
+                e = _fmt_whop_movement_trace(
+                    trace_id=trace_id,
+                    stage="TICKET_AUTOMATION_ERROR",
+                    evt="member-status-logs",
+                    kind="cancellation",
+                    membership_id=str(mid or ""),
+                    discord_id=int(did_i),
+                    reads=["Attempted to open cancellation ticket"],
+                    decisions=["route=cancellation"],
+                    actions=["open_cancellation_ticket() raised"],
+                    result=[f"error={str(ex)[:240]}"],
+                )
+                await _whop_movement_send(content="", embed=e)
         return
 
 
@@ -8912,6 +9153,15 @@ def _fmt_whop_movement_trace(
         e.add_field(name="5) Technical", value=f"```json\n{tj}\n```", inline=False)
     e.set_footer(text="RSCheckerbot • Whop movement")
     return e
+
+
+def _fmt_channel_mention(channel_id: int | str) -> str:
+    """Canonical channel mention formatter for operator logs."""
+    try:
+        cid = int(channel_id)
+    except Exception:
+        cid = 0
+    return f"<#{cid}>" if cid > 0 else "—"
 
 
 def _linked_hint_embed(*, title: str, color: int, brief: dict, note: str, discord_value: str = "") -> discord.Embed:
