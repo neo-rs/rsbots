@@ -2545,6 +2545,9 @@ def _extract_reporting_from_member_status_embed(
         kind = "payment_failed"
     elif "membership deactivated" in t_low or "deactivated" in t_low:
         kind = "deactivated"
+    elif ("whop canceled" in t_low) or ("whop cancelled" in t_low) or ("membership status" in t_low and ("canceled" in t_low or "cancelled" in t_low)) or ("membership canceled" in t_low) or ("membership cancelled" in t_low):
+        # Some internal role-driven cards use "Whop canceled" wording instead of "deactivated".
+        kind = "deactivated"
     elif "member joined" in t_low:
         kind = "member_joined"
     else:
@@ -2751,6 +2754,16 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
     with suppress(Exception):
         mid_hint = str((whop_brief or {}).get("membership_id") or "").strip() if isinstance(whop_brief, dict) else ""
         has_members_role = bool(has_member_role(member))
+        status_hint = str((whop_brief or {}).get("status") or "").strip() if isinstance(whop_brief, dict) else ""
+        unknown_why: list[str] = []
+        if str(kind or "").strip().lower() == "unknown":
+            unknown_why.append("kind=unknown because the staff-card title/description did not match any known patterns")
+            if title_low:
+                unknown_why.append(f"title_low_contains: payment_failed={('payment failed' in title_low)} cancellation={('cancellation' in title_low)} deactivated={('deactivated' in title_low)} joined={('member joined' in title_low)} whop_canceled={('whop canceled' in title_low or 'whop cancelled' in title_low)}")
+            if status_hint:
+                unknown_why.append(f"status={status_hint} (only status=trialing auto-maps to kind=trialing)")
+            else:
+                unknown_why.append("status missing in whop_brief (cannot use status fallback)")
         e_route = _fmt_whop_movement_trace(
             trace_id=trace_id,
             stage="TICKET_ROUTE_EVAL",
@@ -2767,6 +2780,7 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                 f"kind={str(kind or '—')}",
                 f"has_members_role={'yes' if has_members_role else 'no'}",
                 ("membership_id_in_history=yes" if _membership_id_from_history(int(did_i)) else "membership_id_in_history=no"),
+                *(unknown_why[:6] if unknown_why else []),
             ],
             actions=[],
             result=[],
@@ -6249,6 +6263,49 @@ async def log_member_status(msg: str, embed: discord.Embed = None, *, channel_na
         except TypeError:
             # Backwards compatibility (older discord.py)
             sent = await ch.send(content=(content or ""), embed=embed, allowed_mentions=allow)
+        # Backend movement trace (Neo only): always explain where this staff card came from.
+        # This does NOT change RS Server outputs; it only mirrors a structured trace into the movement channel.
+        with suppress(Exception):
+            if sent and is_member_status_target and isinstance(embed, discord.Embed):
+                ts_i2, kind2, discord_id2, whop_brief2 = _extract_reporting_from_member_status_embed(
+                    embed,
+                    fallback_ts=int((getattr(sent, "created_at", None) or datetime.now(timezone.utc)).timestamp()),
+                )
+                source_tag, why_lines = _infer_member_status_card_source(embed)
+                src_lines, src_tech = _infer_member_status_field_sources(embed)
+                mid2 = str((whop_brief2 or {}).get("membership_id") or "").strip() if isinstance(whop_brief2, dict) else ""
+                st2 = str((whop_brief2 or {}).get("status") or "").strip() if isinstance(whop_brief2, dict) else ""
+                e_trace = _fmt_whop_movement_trace(
+                    trace_id=f"msl:{int(getattr(sent,'id',0) or 0)}",
+                    stage="MEMBER_STATUS_CARD_EMITTED",
+                    evt="member-status-logs",
+                    kind=str(kind2 or "").strip(),
+                    membership_id=mid2,
+                    discord_id=(int(discord_id2) if discord_id2 else 0),
+                    reads=[
+                        f"posted_to={_fmt_channel_mention(int(getattr(ch,'id',0) or 0))}",
+                        f"msg_id={int(getattr(sent,'id',0) or 0)}",
+                        (f"jump_url={str(getattr(sent,'jump_url','') or '').strip()}" if str(getattr(sent,'jump_url','') or '').strip() else "jump_url=—"),
+                        (f"title={str(getattr(embed,'title','') or '')[:180]}" if str(getattr(embed,'title','') or '').strip() else "title=—"),
+                    ],
+                    decisions=[
+                        f"source={source_tag}",
+                        *why_lines[:6],
+                        (f"status={st2}" if st2 else "status=—"),
+                        "field_sources:",
+                        *[f"  {x}" for x in src_lines[:14]],
+                    ],
+                    actions=[],
+                    result=[],
+                    technical={
+                        "in_main_guild": bool(in_main_guild),
+                        "output_guild_id": int(getattr(guild, "id", 0) or 0),
+                        "kind": str(kind2 or ""),
+                        "ts": int(ts_i2 or 0),
+                        "field_sources": src_tech,
+                    },
+                )
+                await _whop_movement_send(content="", embed=e_trace)
         try:
             await _maybe_capture_for_reporting(embed, is_member_status=is_member_status_target)
         except Exception:
@@ -9162,6 +9219,121 @@ def _fmt_channel_mention(channel_id: int | str) -> str:
     except Exception:
         cid = 0
     return f"<#{cid}>" if cid > 0 else "—"
+
+
+def _infer_member_status_card_source(sent_embed: discord.Embed) -> tuple[str, list[str]]:
+    """Best-effort: infer where a member-status-logs staff card came from.
+
+    Returns (source_tag, why_lines).
+    """
+    if not isinstance(sent_embed, discord.Embed):
+        return ("unknown", ["embed missing / not a Discord embed"])
+    title = str(getattr(sent_embed, "title", "") or "").strip()
+    desc = str(getattr(sent_embed, "description", "") or "").strip()
+    t_low = title.lower()
+    d_low = desc.lower()
+
+    # Strongest signal: explicit event tag in embed fields.
+    event_val = ""
+    reason_val = ""
+    try:
+        for f in (getattr(sent_embed, "fields", None) or []):
+            n = str(getattr(f, "name", "") or "").strip().lower()
+            v = str(getattr(f, "value", "") or "").strip()
+            if n == "event" and not event_val:
+                event_val = v
+            if n == "reason" and not reason_val:
+                reason_val = v
+    except Exception:
+        event_val = event_val or ""
+        reason_val = reason_val or ""
+
+    if event_val:
+        ev = str(event_val).strip().lower()
+        if "whop.webhook" in ev or ev.startswith("whop.webhook."):
+            return ("http_webhook", [f"event field indicates webhook ({event_val})"])
+        if ev.startswith(("payment.", "membership.")):
+            return ("whop_workflow_or_native", [f"event field indicates Whop event ({event_val})"])
+
+    # Role-driven cards often carry a reason field.
+    if str(reason_val).strip().lower() == "member_role_regained":
+        return ("discord_member_update", ["reason=member_role_regained (member update role change)"])
+
+    if "member joined" in t_low:
+        return ("discord_member_join", ["title indicates join event"])
+    if "member left" in t_low:
+        return ("discord_member_leave", ["title indicates leave event"])
+
+    if "whop" in t_low or "membership" in t_low or "payment" in t_low or "cancel" in t_low:
+        return ("whop_related_unknown_source", ["title contains Whop/payment/cancel keywords but no explicit event tag"])
+
+    if "whop" in d_low or "membership" in d_low or "payment" in d_low or "cancel" in d_low:
+        return ("whop_related_unknown_source", ["description contains Whop/payment/cancel keywords but no explicit event tag"])
+
+    return ("unknown", ["no event/reason tag found and title/description did not match known sources"])
+
+
+def _infer_member_status_field_sources(sent_embed: discord.Embed) -> tuple[list[str], dict]:
+    """Best-effort: explain where each visible label/value likely came from.
+
+    Returns (human_lines, technical_dict).
+    """
+    if not isinstance(sent_embed, discord.Embed):
+        return (["embed missing / not a Discord embed"], {"reason": "no_embed"})
+
+    footer_txt = ""
+    with suppress(Exception):
+        footer_txt = str(getattr(getattr(sent_embed, "footer", None), "text", "") or "").strip()
+    f_low = footer_txt.lower()
+
+    # Default assumption by footer.
+    default_src = "unknown"
+    if "whop api" in f_low:
+        default_src = "whop_api_brief"
+    elif "member status tracking" in f_low or "rscheckerbot" in f_low:
+        default_src = "rscheckerbot_internal"
+
+    lines: list[str] = []
+    tech: dict = {"default": default_src, "footer": footer_txt[:120]}
+
+    def _src_for(name: str, value: str) -> str:
+        n = str(name or "").strip().lower()
+        v = str(value or "").strip()
+        if not v or v == "—":
+            return "missing"
+        if n in {"member (whop)", "membership", "product", "status", "total spent (lifetime)", "total spent", "whop dashboard", "dashboard"}:
+            return "whop_api_brief" if default_src == "whop_api_brief" else default_src
+        if n in {"email"}:
+            # Email can be absent from API brief and filled from webhook payload for linkage; we can't distinguish here.
+            return "whop_api_brief_or_webhook_payload" if default_src == "whop_api_brief" else default_src
+        if n in {"discord", "connected discord", "connected_discord", "discord id"}:
+            if "not linked" in v.lower():
+                return "whop_discord_linkage=none (api+fallbacks)"
+            if v.isdigit() or re.search(r"\b\d{17,19}\b", v):
+                return "whop_discord_linkage=resolved (api or whop-logs enrichment)"
+            return "whop_discord_linkage=unknown"
+        if n in {"membership id", "membership_id"}:
+            return "whop_webhook_payload_or_api" if default_src == "whop_api_brief" else default_src
+        return default_src
+
+    try:
+        for f in (getattr(sent_embed, "fields", None) or []):
+            nm = str(getattr(f, "name", "") or "").strip()
+            vv = str(getattr(f, "value", "") or "").strip()
+            if not nm:
+                continue
+            src = _src_for(nm, vv)
+            lines.append(f"{nm}: {src}")
+            if len(lines) >= 18:
+                break
+    except Exception:
+        pass
+
+    if not lines:
+        lines = [f"(no fields) default={default_src}"]
+
+    tech["sources"] = lines[:]
+    return (lines, tech)
 
 
 def _linked_hint_embed(*, title: str, color: int, brief: dict, note: str, discord_value: str = "") -> discord.Embed:
