@@ -2543,6 +2543,8 @@ def _extract_reporting_from_member_status_embed(
         kind = "cancellation_scheduled"
     elif "payment failed" in t_low:
         kind = "payment_failed"
+    elif "member left" in t_low:
+        kind = "member_left"
     elif "membership deactivated" in t_low or "deactivated" in t_low:
         kind = "deactivated"
     elif ("whop canceled" in t_low) or ("whop cancelled" in t_low) or ("membership status" in t_low and ("canceled" in t_low or "cancelled" in t_low)) or ("membership canceled" in t_low) or ("membership cancelled" in t_low):
@@ -9307,6 +9309,9 @@ def _infer_member_status_field_sources(sent_embed: discord.Embed) -> tuple[list[
             # Email can be absent from API brief and filled from webhook payload for linkage; we can't distinguish here.
             return "whop_api_brief_or_webhook_payload" if default_src == "whop_api_brief" else default_src
         if n in {"discord", "connected discord", "connected_discord", "discord id"}:
+            # For Discord-driven staff cards, the Discord ID is from the Discord event itself.
+            if default_src == "rscheckerbot_internal":
+                return "discord_event (member object)"
             if "not linked" in v.lower():
                 return "whop_discord_linkage=none (api+fallbacks)"
             if v.isdigit() or re.search(r"\b\d{17,19}\b", v):
