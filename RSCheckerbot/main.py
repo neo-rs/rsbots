@@ -2773,6 +2773,9 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
             kind=str(kind or "").strip(),
             membership_id=mid_hint,
             discord_id=int(did_i),
+            bottom_line=(
+                f"route_check: kind={str(kind or '—')}, members_role={'yes' if has_members_role else 'no'}, whop_linked={'yes' if _membership_id_from_history(int(did_i)) else 'no'}"
+            ),
             reads=[
                 f"Source staff card: {_fmt_channel_mention(int(MEMBER_STATUS_LOGS_CHANNEL_ID or 0))} msg_id={int(getattr(msg,'id',0) or 0)}",
                 (f"jump_url={ref_url}" if ref_url else "jump_url=—"),
@@ -6377,6 +6380,7 @@ async def log_member_status(msg: str, embed: discord.Embed = None, *, channel_na
                     kind=str(kind2 or "").strip(),
                     membership_id=mid2,
                     discord_id=(int(discord_id2) if discord_id2 else 0),
+                    bottom_line=f"posted staff card → {_fmt_channel_mention(int(getattr(ch,'id',0) or 0))}",
                     reads=[
                         f"posted_to={_fmt_channel_mention(int(getattr(ch,'id',0) or 0))}",
                         f"msg_id={int(getattr(sent,'id',0) or 0)}",
@@ -9128,6 +9132,38 @@ async def _whop_movement_send(*, content: str | None, embed: discord.Embed | Non
     if not raw and not isinstance(embed, discord.Embed):
         return
 
+    # Dedupe movement traces (prevents create+edit double posts).
+    global _WHOP_MOVEMENT_TRACE_DEDUPE
+    try:
+        _WHOP_MOVEMENT_TRACE_DEDUPE
+    except Exception:
+        _WHOP_MOVEMENT_TRACE_DEDUPE = {}  # type: ignore[var-annotated]
+    try:
+        now = time.time()
+        ttl = 12.0
+        # Best-effort key: title+description+stage.
+        k = ""
+        if isinstance(embed, discord.Embed):
+            k = f"{str(getattr(embed,'title','') or '')}|{str(getattr(embed,'description','') or '')}"
+        else:
+            k = raw
+        k = k.strip()
+        if k:
+            # prune
+            try:
+                cutoff = now - ttl
+                stale = [kk for kk, ts in (_WHOP_MOVEMENT_TRACE_DEDUPE or {}).items() if float(ts) < cutoff]
+                for kk in stale[:2000]:
+                    _WHOP_MOVEMENT_TRACE_DEDUPE.pop(kk, None)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            prev = (_WHOP_MOVEMENT_TRACE_DEDUPE or {}).get(k)  # type: ignore[attr-defined]
+            if prev and (now - float(prev)) < ttl:
+                return
+            (_WHOP_MOVEMENT_TRACE_DEDUPE or {})[k] = now  # type: ignore[index]
+    except Exception:
+        pass
+
     def _kv_pairs(s: str) -> dict[str, str]:
         out: dict[str, str] = {}
         try:
@@ -9288,6 +9324,7 @@ def _fmt_whop_movement_trace(
     kind: str = "",
     membership_id: str = "",
     discord_id: int | str = 0,
+    bottom_line: str = "",
     reads: list[str] | None = None,
     decisions: list[str] | None = None,
     actions: list[str] | None = None,
@@ -9308,9 +9345,24 @@ def _fmt_whop_movement_trace(
     except Exception:
         did_s = str(discord_id or "").strip()
 
+    stg = str(stage or "").strip()
+    stg_low = stg.lower()
+    group_title = "Movement trace"
+    if stg_low.startswith("ticket_"):
+        group_title = "Support Tickets / Movement"
+    elif stg_low.startswith("member_status_"):
+        group_title = "Member-Status / Movement"
+    elif stg_low.startswith(("http_", "process_", "membership_id_", "api_", "ledger_")) or "whop" in stg_low:
+        group_title = "Whop Webhook / Movement"
+
+    desc_lines = [f"trace_id=`{str(trace_id or '—')[:128]}` • stage=`{stg[:128] or '—'}`"]
+    bl = str(bottom_line or "").strip()
+    if bl:
+        desc_lines.append(f"Bottom line: {bl[:240]}")
+
     e = discord.Embed(
-        title="Whop movement trace",
-        description=f"trace_id=`{str(trace_id or '—')[:128]}` • stage=`{str(stage or '—')[:128]}`",
+        title=group_title,
+        description="\n".join(desc_lines),
         color=0x5865F2,
         timestamp=datetime.now(timezone.utc),
     )
