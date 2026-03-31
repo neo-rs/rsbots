@@ -6016,6 +6016,79 @@ async def log_role_audit(
         await ch.send(embed=e, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
 
 
+async def _audit_who_changed_member_role(
+    *,
+    guild: discord.Guild,
+    target_user_id: int,
+    member_role_id: int,
+    added: bool,
+    window_seconds: int = 120,
+) -> tuple[str, str]:
+    """Best-effort: identify who added/removed the Members role via Discord audit log.
+
+    Returns (actor_label, why). On failure/unknown, returns ("unknown", "...").
+    """
+    if not isinstance(guild, discord.Guild) or target_user_id <= 0 or member_role_id <= 0:
+        return ("unknown", "invalid inputs")
+    me = guild.me or guild.get_member(int(getattr(bot.user, "id", 0) or 0))
+    if not me or not getattr(me.guild_permissions, "view_audit_log", False):
+        return ("unknown", "missing view_audit_log permission")
+    try:
+        now = datetime.now(timezone.utc)
+        async for entry in guild.audit_logs(limit=8, action=discord.AuditLogAction.member_role_update):
+            try:
+                tgt = getattr(entry, "target", None)
+                if not tgt or int(getattr(tgt, "id", 0) or 0) != int(target_user_id):
+                    continue
+                created_at = getattr(entry, "created_at", None)
+                if created_at:
+                    dt = created_at.replace(tzinfo=timezone.utc) if created_at.tzinfo is None else created_at.astimezone(timezone.utc)
+                    if (now - dt).total_seconds() > float(max(10, window_seconds)):
+                        continue
+
+                # Try to detect role change from before/after lists if available.
+                before_ids: set[int] = set()
+                after_ids: set[int] = set()
+                with suppress(Exception):
+                    chg = getattr(entry, "changes", None)
+                    b = getattr(chg, "before", None)
+                    a = getattr(chg, "after", None)
+
+                    def _ids(obj: object) -> set[int]:
+                        out: set[int] = set()
+                        if isinstance(obj, list):
+                            for it in obj:
+                                try:
+                                    rid = int(getattr(it, "id", it))
+                                    if rid:
+                                        out.add(rid)
+                                except Exception:
+                                    continue
+                        return out
+
+                    before_ids = _ids(getattr(b, "roles", b))
+                    after_ids = _ids(getattr(a, "roles", a))
+
+                if before_ids or after_ids:
+                    changed_to_added = (member_role_id not in before_ids) and (member_role_id in after_ids)
+                    changed_to_removed = (member_role_id in before_ids) and (member_role_id not in after_ids)
+                    if added and not changed_to_added:
+                        continue
+                    if (not added) and not changed_to_removed:
+                        continue
+
+                actor = getattr(entry, "user", None)
+                actor_id = int(getattr(actor, "id", 0) or 0) if actor else 0
+                actor_name = str(getattr(actor, "name", "") or getattr(actor, "display_name", "") or "").strip() if actor else ""
+                actor_label = f"{actor_name} ({actor_id})" if actor_name and actor_id else (f"{actor_id}" if actor_id else "unknown")
+                return (actor_label, "matched guild audit log member_role_update entry")
+            except Exception:
+                continue
+    except Exception as e:
+        return ("unknown", f"audit log fetch failed: {str(e)[:120]}")
+    return ("unknown", "no recent matching audit entry found")
+
+
 async def log_whop(msg: str):
     """Log to Whop logs channel (for subscription data from Whop system)"""
     guild = _output_guild()
@@ -10602,7 +10675,18 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         )
         if not suppress_logs:
             await log_role_event(embed=removed_embed)
-            await log_other(f"📤 **Member role removed** from {_fmt_user(after)}")
+            actor_label, actor_why = await _audit_who_changed_member_role(
+                guild=after.guild,
+                target_user_id=int(after.id),
+                member_role_id=int(ROLE_CANCEL_A or 0),
+                added=False,
+            )
+            note = "Trigger: Discord role update observed"
+            if actor_label != "unknown":
+                note += f" • Actor: {actor_label}"
+            else:
+                note += " • Actor: unknown (Discord doesn’t always expose who/what did it without audit access)"
+            await log_other(f"📤 **Member role removed** from {_fmt_user(after)}\n{note}\nAudit: {actor_why}")
         
         # If Member role was removed and user has active DM sequence, cancel it
         if str(after.id) in queue_state:
@@ -10614,7 +10698,18 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
     if (ROLE_CANCEL_A not in before_roles) and (ROLE_CANCEL_A in after_roles):
         if not suppress_logs:
-            await log_other(f"📥 **Member role added** to {_fmt_user(after)}")
+            actor_label, actor_why = await _audit_who_changed_member_role(
+                guild=after.guild,
+                target_user_id=int(after.id),
+                member_role_id=int(ROLE_CANCEL_A or 0),
+                added=True,
+            )
+            note = "Trigger: Discord role update observed"
+            if actor_label != "unknown":
+                note += f" • Actor: {actor_label}"
+            else:
+                note += " • Actor: unknown (Discord doesn’t always expose who/what did it without audit access)"
+            await log_other(f"📥 **Member role added** to {_fmt_user(after)}\n{note}\nAudit: {actor_why}")
         # Repeat-trial guard: had trial before + no payment → remove Member role and alert staff
         # Before removing, refresh total_spent from Whop API so paid first-time trials aren't blocked (member_history can be stale).
         if _is_repeat_trial_no_payment(after.id):
