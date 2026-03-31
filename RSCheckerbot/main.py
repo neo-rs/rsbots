@@ -3146,6 +3146,32 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                     reason = v
                     break
         try:
+            # Guard: returning members can have multiple memberships. If the *current* best Whop brief is active/trialing,
+            # do NOT open a cancellation ticket from a stale "canceled" snapshot.
+            with suppress(Exception):
+                _mid_best, brief_best = await _resolve_whop_brief_for_discord_id(int(did_i))
+                st_best = str((brief_best or {}).get("status") or "").strip().lower() if isinstance(brief_best, dict) else ""
+                if st_best in {"active", "trialing", "canceling"}:
+                    e_blk = _fmt_whop_movement_trace(
+                        trace_id=trace_id,
+                        stage="TICKET_AUTOMATION_BLOCKED",
+                        evt="member-status-logs",
+                        kind="cancellation",
+                        membership_id=str(_mid_best or mid or ""),
+                        discord_id=int(did_i),
+                        bottom_line=f"blocked cancellation ticket: current_whop_status={st_best}",
+                        reads=[
+                            f"trigger_kind={kind}",
+                            f"staff_card_title={title[:140]}",
+                        ],
+                        decisions=[
+                            f"block because current best Whop status is {st_best} (returning member / multi-membership safe-guard)",
+                        ],
+                        actions=[],
+                        result=[],
+                    )
+                    await _whop_movement_send(content="", embed=e_blk)
+                    return
             ch_created = await support_tickets.open_cancellation_ticket(
                 member=member,
                 whop_brief=whop_brief if isinstance(whop_brief, dict) else {},
@@ -5448,9 +5474,33 @@ async def _resolve_whop_brief_for_discord_id(discord_id: int) -> tuple[str, dict
     if isinstance(summary, dict) and summary:
         return ("", summary)
     # Fallback: use the last membership_id from member_history for API lookup.
+    # IMPORTANT: returning members can have multiple memberships; the stored `last_membership_id`
+    # can point at an older canceled membership. When possible, pivot to Whop user memberships and pick the best active one.
     mid = str(_membership_id_from_history(int(discord_id)) or "").strip()
     if not mid:
         return ("", {})
+
+    # 1) Try to pivot: membership_id -> membership object -> user_id -> list user memberships -> pick best.
+    if whop_api_client and getattr(whop_api_client, "get_membership_by_id", None) and getattr(whop_api_client, "get_user_memberships", None):
+        try:
+            m0 = await whop_api_client.get_membership_by_id(str(mid))  # type: ignore[attr-defined]
+        except Exception:
+            m0 = {}
+        uid = ""
+        with suppress(Exception):
+            uid = str(_deep_get(m0, "user.id") or _deep_get(m0, "user") or _deep_get(m0, "data.user.id") or _deep_get(m0, "data.user") or "").strip()
+        if uid and str(uid).startswith("user_"):
+            try:
+                candidates = await whop_api_client.get_user_memberships(uid)  # type: ignore[attr-defined]
+            except Exception:
+                candidates = []
+            best_mid = _pick_best_membership_id_for_user(candidates or [])
+            if best_mid and best_mid != mid:
+                brief_best = await _fetch_whop_brief_by_membership_id(best_mid)
+                if isinstance(brief_best, dict) and brief_best:
+                    return (best_mid, brief_best)
+
+    # 2) Default: fetch brief for stored membership id.
     brief = await _fetch_whop_brief_by_membership_id(mid)
     return (mid, brief if isinstance(brief, dict) else {})
 
