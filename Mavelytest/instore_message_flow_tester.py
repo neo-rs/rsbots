@@ -192,7 +192,7 @@ def _noop_setup_slash(self: Any) -> None:
     return None
 
 
-def _patch_discord_sends_for_dry_run() -> List[Any]:
+def _patch_discord_sends_for_capture(*, live_send: bool) -> List[Any]:
     import discord
 
     fake_message = MagicMock()
@@ -235,10 +235,18 @@ def _patch_discord_sends_for_dry_run() -> List[Any]:
                 "embeds": embed_payload,
             }
         )
-        return fake_message
+        if not live_send:
+            return fake_message
+
+        # Live-send mode: still capture payload, but call the real Discord send().
+        try:
+            return await _orig_send(self, *args, **kwargs)
+        except Exception:
+            raise
 
     patches: List[Any] = []
     for cls in (discord.TextChannel, discord.Thread, discord.DMChannel):
+        _orig_send = getattr(cls, "send")
         p = patch.object(cls, "send", new=_dry_send)
         p.start()
         patches.append(p)
@@ -1113,9 +1121,7 @@ async def run_once(
     iam.InstorebotForwarder._setup_slash_commands = _noop_setup_slash  # type: ignore[method-assign]
 
     CAPTURED_SENDS.clear()
-    patches: List[Any] = []
-    if dry_run:
-        patches = _patch_discord_sends_for_dry_run()
+    patches: List[Any] = _patch_discord_sends_for_capture(live_send=(not dry_run))
 
     exit_code = 0
     log = logging.getLogger("instorebotforwarder")
@@ -1329,6 +1335,15 @@ async def run_once(
                     else:
                         print("  (No dry-run captures; using log trace.)")
                 else:
+                    early_exit_k = ""
+                    early_exit_v = ""
+                    try:
+                        if early_exits:
+                            early_exit_k = str(early_exits[-1][0] or "")
+                            early_exit_v = str(early_exits[-1][1] or "")
+                    except Exception:
+                        early_exit_k = ""
+                        early_exit_v = ""
                     if early_exit_v:
                         print(f"  FAIL reason: forward early_exit={early_exit_k}:{early_exit_v}")
                     if flow_trace:
