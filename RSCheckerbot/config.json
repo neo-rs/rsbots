@@ -326,7 +326,7 @@
       "enabled": true,
       "timezone": "America/New_York",
       "run_time_local": "23:59",
-      "run_pass_on_startup": false,
+      "run_pass_on_startup": true,
       "followup_remaining_days": 7,
       "_comment_followup_template": "Placeholders: {mention} {member} {days}",
       "followup_template": "Heads up {mention} your access ends in {days} days. If you want to stay in just reply here and we'll help you out.",
