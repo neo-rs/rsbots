@@ -652,7 +652,89 @@ def mavely_bridge_playwright_startup_hint() -> str:
         import playwright.sync_api  # noqa: F401
     except Exception:
         return "Mavely: Playwright not installed (pip install playwright && playwright install chromium)"
-    return "Mavely: headless unwrap via mavely_link_resolve.py (same as Mavelytest)"
+    return (
+        "Mavely: headless unwrap via mavely_link_resolve.py; optional persistent fallback "
+        "(outbound_playwright_persistent_enabled / OUTBOUND_PLAYWRIGHT_PERSISTENT=1)"
+    )
+
+
+def _affiliate_merchant_resolution_acceptable(url: str) -> bool:
+    """
+    True when `url` is a plausible final store/deal destination for affiliate rewrap.
+    Uses scoring + deny hosts (not a fixed per-retailer allowlist) so new merchants work when paths look real.
+    """
+    u = (url or "").strip()
+    if not (u.startswith("http://") or u.startswith("https://")):
+        return False
+    if _is_cloudflare_or_cdn_error_landing(u):
+        return False
+    if _url_is_mavely_bridge_surface(u):
+        return False
+    return _score_merchant_outbound_url(u) > 0
+
+
+def _outbound_persistent_playwright_enabled(cfg: Optional[dict]) -> bool:
+    raw = (os.getenv("OUTBOUND_PLAYWRIGHT_PERSISTENT", "") or "").strip().lower()
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    return _bool_or_default((cfg or {}).get("outbound_playwright_persistent_enabled"), False)
+
+
+def _outbound_playwright_headed_from_cfg(cfg: Optional[dict]) -> bool:
+    raw = (os.getenv("OUTBOUND_PLAYWRIGHT_HEADED", "") or "").strip().lower()
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    return _bool_or_default((cfg or {}).get("outbound_playwright_headed"), False)
+
+
+def _outbound_playwright_settle_ms(cfg: Optional[dict]) -> int:
+    try:
+        v = int((cfg or {}).get("outbound_playwright_settle_ms") or 0)
+    except Exception:
+        v = 0
+    if v <= 0:
+        try:
+            v = int((os.getenv("OUTBOUND_PLAYWRIGHT_SETTLE_MS", "") or "").strip() or "6000")
+        except Exception:
+            v = 6000
+    return max(500, min(v, 60_000))
+
+
+def _outbound_playwright_poll_s(cfg: Optional[dict]) -> float:
+    try:
+        v = int((cfg or {}).get("outbound_playwright_poll_s") or 0)
+    except Exception:
+        v = 0
+    if v <= 0:
+        try:
+            v = int((os.getenv("OUTBOUND_PLAYWRIGHT_POLL_S", "") or "").strip() or "10")
+        except Exception:
+            v = 10
+    return float(max(1, min(v, 60)))
+
+
+def _outbound_playwright_profile_dir_resolved(cfg: Optional[dict]) -> str:
+    repo_root = Path(__file__).resolve().parents[1]
+    raw = str((cfg or {}).get("outbound_playwright_profile_dir") or "").strip()
+    if raw:
+        p = Path(raw)
+        if not p.is_absolute():
+            p = repo_root / p
+        return str(p.resolve())
+    env = (os.getenv("OUTBOUND_PLAYWRIGHT_PROFILE_DIR", "") or "").strip()
+    if env:
+        p = Path(env)
+        if not p.is_absolute():
+            p = repo_root / p
+        return str(p.resolve())
+    pd = resolve_mavely_profile_dir()
+    if pd:
+        return str(pd.resolve())
+    return str((Path(__file__).resolve().parent / ".mavely_profile").resolve())
 
 
 _mavely_playwright_last_error: str = ""
@@ -1728,18 +1810,6 @@ def _aff_short_err(s: Optional[str], n: int = 160) -> str:
     return t if len(t) <= n else (t[:n] + "...")
 
 
-async def _try_external_mavely_merchant_via_discord(cfg: dict, raw_short: str) -> Optional[str]:
-    fn = (cfg or {}).get("_mavely_discord_resolve_merchant")
-    if not callable(fn):
-        return None
-    try:
-        out = await fn(raw_short)
-    except Exception:
-        return None
-    s = (str(out).strip() if out else "") or ""
-    return s or None
-
-
 async def _mavely_rewrap_short_link_from_merchant_url(
     cfg: dict,
     u: str,
@@ -1752,7 +1822,7 @@ async def _mavely_rewrap_short_link_from_merchant_url(
     unwrap_source_label: str,
 ) -> None:
     """
-    For mavely.app.link: once a real merchant URL is known (unwrap, Discord resolver, etc.),
+    For mavely.app.link: once a real merchant URL is known (unwrap, etc.),
     apply Amazon tagging or Mavely create_link / fallbacks (same as successful Playwright unwrap).
     """
     target_for_mavely = _strip_tracking_params(merchant_url) or merchant_url
@@ -2077,6 +2147,58 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                         except Exception:
                             break
 
+                    if _outbound_persistent_playwright_enabled(cfg) and (
+                        not _affiliate_merchant_resolution_acceptable(candidate)
+                    ):
+                        entry = short_norm if short_norm.startswith("http") else candidate
+                        profile = _outbound_playwright_profile_dir_resolved(cfg)
+                        headed = _outbound_playwright_headed_from_cfg(cfg)
+                        settle = _outbound_playwright_settle_ms(cfg)
+                        poll = _outbound_playwright_poll_s(cfg)
+                        try:
+                            t_ms_pw = int(min(float(hub_html_timeout_s) * 2000.0, 120_000.0))
+                        except Exception:
+                            t_ms_pw = 60_000
+                        if flow_on:
+                            print(
+                                "[OutboundResolve] resolver_unresolved_wrapper in=%r candidate=%r "
+                                "-> resolver_playwright_persistent_started profile=%s headed=%s"
+                                % (
+                                    _aff_dbg_clip(entry, 88),
+                                    _aff_dbg_clip(candidate, 88),
+                                    profile,
+                                    headed,
+                                ),
+                                flush=True,
+                            )
+                        async with _playwright_mavely_async_lock():
+                            pw_out = await asyncio.to_thread(
+                                _mavely_resolve.playwright_resolve_outbound_persistent_sync,
+                                entry,
+                                timeout_ms=t_ms_pw,
+                                profile_dir=profile,
+                                headed=headed,
+                                settle_ms=settle,
+                                poll_s=poll,
+                                accept_merchant=_affiliate_merchant_resolution_acceptable,
+                            )
+                        if flow_on:
+                            print(
+                                "[OutboundResolve] resolver_playwright_persistent_result out=%r"
+                                % (_aff_dbg_clip(pw_out or "", 120),),
+                                flush=True,
+                            )
+                        if pw_out:
+                            cand_pw = unwrap_known_query_redirects(pw_out) or pw_out
+                            if _affiliate_merchant_resolution_acceptable(cand_pw):
+                                candidate = cand_pw
+                                if flow_on:
+                                    print(
+                                        "[OutboundResolve] resolver_merchant_accepted url=%r"
+                                        % (_aff_dbg_clip(candidate, 120),),
+                                        flush=True,
+                                    )
+
                     if _is_cloudflare_or_cdn_error_landing(candidate):
                         candidate = start_u
                     resolved[u] = candidate
@@ -2162,19 +2284,6 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                 if link_b and not err_b and link_b != raw:
                     mapped[u] = link_b
                     notes[u] = "rewrapped mavely link (hub GraphQL fallback; app.link rejected by API)"
-                    continue
-                ext_merchant = await _try_external_mavely_merchant_via_discord(cfg, raw)
-                if ext_merchant and (not is_mavely_link(ext_merchant)):
-                    await _mavely_rewrap_short_link_from_merchant_url(
-                        cfg,
-                        u,
-                        raw,
-                        ext_merchant,
-                        mapped,
-                        notes,
-                        amazon_mask_cache,
-                        unwrap_source_label="discord resolver",
-                    )
                     continue
                 # IMPORTANT: Do not downgrade mavely.app.link to a hub URL (mavelyinfluencer.com / mavelylife.com).
                 # If we cannot resolve a real merchant URL, keep the original short link unchanged.

@@ -1,16 +1,20 @@
 """
 Canonical Mavely short-link helpers (query-param embeds + headless Chromium when no browser profile).
 
-Single source of truth for behavior shared with `Mavelytest/mavely_link_tester.py`.
+Single source of truth for behavior shared with `Mavelytest/mavely_link_tester.py` and
+`Tester/mavely_link_tester_v4.py` (persistent context + anti-automation flags).
+
 `affiliate_rewriter.py` imports this module only — do not duplicate Branch/query/Playwright paths there.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
-from typing import Iterator, List, Optional, Tuple
+from pathlib import Path
+from typing import Callable, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qsl, unquote, urlparse
 
 EMBEDDED_MERCHANT_QUERY_KEYS: Tuple[str, ...] = (
@@ -181,6 +185,144 @@ def playwright_resolve_mavely_to_merchant_url(url: str, timeout_ms: int) -> Opti
             finally:
                 try:
                     browser.close()
+                except Exception:
+                    pass
+    except Exception:
+        return None
+    return None
+
+
+def _strip_trailing_junk(url: str) -> str:
+    return (url or "").strip().rstrip(").,]\"'")
+
+
+def collect_https_urls_from_html(html: str, *, max_chars: int = 2_000_000) -> List[str]:
+    """Best-effort https? URLs from HTML/JS (generic; caller filters with merchant predicate)."""
+    t = (html or "")[: max(10_000, int(max_chars))]
+    if not t:
+        return []
+    try:
+        found = re.findall(r"https?://[^\s\"'<>\\]+", t, flags=re.IGNORECASE)
+    except Exception:
+        return []
+    out: List[str] = []
+    seen: set = set()
+    for raw in found:
+        c = _strip_trailing_junk(raw)
+        if not (c.startswith("http://") or c.startswith("https://")):
+            continue
+        if c in seen:
+            continue
+        seen.add(c)
+        out.append(c)
+    return out
+
+
+def playwright_resolve_outbound_persistent_sync(
+    url: str,
+    *,
+    timeout_ms: int,
+    profile_dir: str,
+    headed: bool,
+    settle_ms: int,
+    poll_s: float,
+    accept_merchant: Callable[[str], bool],
+) -> Optional[str]:
+    """
+    Generic persistent Chromium (parity with Tester/mavely_link_tester_v4.py):
+    launch_persistent_context, domcontentloaded, settle, poll address bar, then scan HTML for https URLs.
+
+    `accept_merchant` is supplied by affiliate_rewriter (scores outbound URLs; not host-allowlist-only).
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return None
+    u = (url or "").strip()
+    if not u.startswith("http"):
+        return None
+    t_ms = max(5_000, min(int(timeout_ms), 180_000))
+    settle_ms = max(500, min(int(settle_ms), 60_000))
+    poll_s = max(1.0, min(float(poll_s), 60.0))
+    prof = Path(profile_dir).expanduser()
+    try:
+        prof.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    launch_args = [
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-http2",
+    ]
+    if sys.platform.startswith("linux") or (
+        (os.getenv("MAVELY_PLAYWRIGHT_NO_SANDBOX", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    ):
+        launch_args.append("--no-sandbox")
+    ua = (os.getenv("MAVELY_USER_AGENT", "") or "").strip() or DEFAULT_PLAYWRIGHT_UA
+    extra: dict = {}
+    ck = (os.getenv("MAVELY_COOKIES", "") or "").strip()
+    if ck:
+        extra["Cookie"] = ck
+    try:
+        with sync_playwright() as p:
+            ctx = p.chromium.launch_persistent_context(
+                user_data_dir=str(prof.resolve()),
+                headless=not headed,
+                args=launch_args,
+                user_agent=ua,
+                viewport={"width": 1400, "height": 900},
+            )
+            try:
+                page = ctx.new_page()
+                if extra:
+                    try:
+                        page.set_extra_http_headers(extra)
+                    except Exception:
+                        pass
+                page.goto(u, wait_until="domcontentloaded", timeout=t_ms)
+                try:
+                    page.wait_for_timeout(int(settle_ms))
+                except Exception:
+                    pass
+                final_url = (page.url or "").strip()
+                content = ""
+                poll_end = time.time() + poll_s
+                while time.time() < poll_end:
+                    try:
+                        cur = (page.url or "").strip()
+                    except Exception:
+                        cur = ""
+                    if cur.startswith("http") and accept_merchant(cur):
+                        return cur
+                    try:
+                        page.wait_for_timeout(1_000)
+                    except Exception:
+                        break
+                    try:
+                        final_url = (page.url or "").strip()
+                        content = page.content() or ""
+                    except Exception:
+                        content = ""
+                if final_url.startswith("http") and accept_merchant(final_url):
+                    return final_url
+                if not content:
+                    try:
+                        content = page.content() or ""
+                    except Exception:
+                        content = ""
+                best: Optional[str] = None
+                best_len = -1
+                for cand in collect_https_urls_from_html(content):
+                    if not accept_merchant(cand):
+                        continue
+                    ln = len(cand)
+                    if ln > best_len:
+                        best_len = ln
+                        best = cand
+                return best
+            finally:
+                try:
+                    ctx.close()
                 except Exception:
                     pass
     except Exception:

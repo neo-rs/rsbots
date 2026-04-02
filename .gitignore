@@ -141,7 +141,9 @@
 !Mavelytest/*.bat
 Mavelytest/audit_logs/
 Mavelytest/*_report.json
-Mavelytest/mavely_discord_resolver_config.json
+
+# Tester (local Playwright profile; keep scripts tracked)
+Tester/pw_profile/
 
 # Kit (GHL and other integration tools)
 !kit/

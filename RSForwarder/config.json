@@ -9,13 +9,16 @@
   "brand_name": "Reselling Secrets",
   "affiliate_rewrite_enabled": true,
   "affiliate_hub_html_timeout_s": 32,
+  "outbound_playwright_persistent_enabled": false,
+  "outbound_playwright_headed": false,
+  "outbound_playwright_settle_ms": 6000,
+  "outbound_playwright_poll_s": 10,
+  "outbound_playwright_profile_dir": "",
   "affiliate_skip_domains": [
     "ebay.com",
     "stockx.com"
   ],
   "forwarding_logs_channel_id": "1446374766180307015",
-  "mavely_discord_resolver_channel_id": "1489266184942649484",
-  "mavely_discord_resolver_timeout_s": 120,
   "price_glitch_role_id": "886824827745337374",
   "channels": [
     {
