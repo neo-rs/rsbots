@@ -2975,7 +2975,7 @@ class RSForwarderBot:
         existing = self.get_channel_config(src_key)
 
         if not existing:
-            ok, msg, emb = self._rsadd_apply(
+            ok, msg, emb = await self._rsadd_apply(
                 source_channel_id=src_id,
                 destination_webhook_url=wh_url,
                 role_id=role_id if role_specified else "",
