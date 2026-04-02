@@ -117,6 +117,7 @@ class SupportTicketConfig:
     cancellation_countdown_churn_category_id: int
     cancellation_countdown_churn_category_name: str
     cancellation_countdown_churn_prefix_channel_name: bool
+    cancellation_countdown_run_pass_on_startup: bool
 
 
 _BOT: commands.Bot | None = None
@@ -442,10 +443,11 @@ def initialize(
         cancellation_countdown_run_time_local=str(cc.get("run_time_local") or "23:59").strip() or "23:59",
         cancellation_countdown_followup_remaining_days=max(0, _as_int(cc.get("followup_remaining_days")) or 7),
         cancellation_countdown_followup_template=str(cc.get("followup_template") or "").strip()
-        or "Heads up {mention} — your access ends in 7 days. If you want to stay in, reply here and we can help.",
+        or "Heads up {mention} your access ends in {days} days. If you want to stay in just reply here and we'll help you out.",
         cancellation_countdown_churn_category_id=max(0, _as_int(cc.get("churn_category_id"))),
         cancellation_countdown_churn_category_name=str(cc.get("churn_category_name") or "").strip(),
         cancellation_countdown_churn_prefix_channel_name=_as_bool(cc.get("churn_prefix_channel_name", True)),
+        cancellation_countdown_run_pass_on_startup=_as_bool(cc.get("run_pass_on_startup", False)),
     )
 
     # Register persistent view so buttons survive restarts.
@@ -3926,6 +3928,33 @@ async def run_cancellation_countdown_scheduler_tick() -> None:
         return
     state["last_run_date"] = today
     _cancellation_countdown_state_save(state)
+
+
+async def run_cancellation_countdown_startup_pass() -> None:
+    """Run one daily pass after bot ready when run_pass_on_startup is true.
+
+    Does not update cancellation_countdown_state last_run_date, so the scheduled
+    pass at run_time_local still runs the same calendar day if it has not yet.
+    """
+    cfg = _cfg()
+    bot = _BOT
+    if not cfg or not bot or not bool(cfg.cancellation_countdown_enabled):
+        return
+    if not bool(cfg.cancellation_countdown_run_pass_on_startup):
+        return
+    with suppress(Exception):
+        if hasattr(bot, "is_ready") and not bot.is_ready():
+            return
+    try:
+        await _run_cancellation_countdown_daily_pass()
+    except Exception as e:
+        with suppress(Exception):
+            await _log(f"❌ support_tickets: cancellation_countdown startup pass error: {str(e)[:240]}")
+        return
+    with suppress(Exception):
+        await _log(
+            "📋 cancellation_countdown: startup pass finished (last_run_date unchanged; nightly still at run_time_local)"
+        )
 
 
 async def get_open_cancellation_ticket_channel_id(user_id: int) -> int:

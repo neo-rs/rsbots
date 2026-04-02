@@ -322,10 +322,11 @@
       "free_pass_transcript_channel_id": 0
     },
     "cancellation_countdown": {
-      "_comment": "Once per local day at run_time_local: refresh open cancellation ticket headers. Uses cancellation_renewal_end_iso when present; otherwise one-time backfill from the stored header embed (Access Ends On or Whop Status date). Does not auto-close or delete channels. churn moves when remaining days hits 0. State: data/cancellation_countdown_state.json",
+      "_comment": "Once per local day at run_time_local: refresh open cancellation ticket headers. Uses cancellation_renewal_end_iso when present; otherwise one-time backfill from the stored header embed (Access Ends On or Whop Status date). Does not auto-close or delete channels. churn moves when remaining days hits 0. State: data/cancellation_countdown_state.json. run_pass_on_startup runs one pass after bot ready without advancing last_run_date (nightly still runs).",
       "enabled": true,
       "timezone": "America/New_York",
       "run_time_local": "23:59",
+      "run_pass_on_startup": false,
       "followup_remaining_days": 7,
       "_comment_followup_template": "Placeholders: {mention} {member} {days}",
       "followup_template": "Heads up {mention} your access ends in {days} days. If you want to stay in just reply here and we'll help you out.",

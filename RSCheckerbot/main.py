@@ -10146,6 +10146,12 @@ async def on_ready():
         if not cancellation_countdown_loop.is_running():
             cancellation_countdown_loop.start()
             log.info("[SupportTickets] Cancellation countdown scheduler started (60s tick)")
+        try:
+            if bool(cc_block.get("run_pass_on_startup", False)):
+                asyncio.create_task(support_tickets.run_cancellation_countdown_startup_pass())
+                log.info("[SupportTickets] Cancellation countdown startup pass scheduled")
+        except Exception:
+            pass
 
     # Support tickets: on-boot backfill from today's member-status-logs (restart-safe).
     with suppress(Exception):
