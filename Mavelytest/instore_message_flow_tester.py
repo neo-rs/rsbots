@@ -12,6 +12,13 @@ Paste a message link (stable, PTB, or Canary host is fine):
 Requirements:
   - MWBots/Instorebotforwarder/config.json + config.secrets.json (valid bot_token)
   - Bot must be able to read the source channel (same as production)
+
+Canonical code path (same as Oracle after /mwupdate instorebotforwarder):
+  - This script prepends ./MWBots to sys.path before `import Instorebotforwarder`.
+  - InstorebotForwarder loads config from Path(__file__).parent beside instore_auto_mirror_bot.py,
+    i.e. MWBots/Instorebotforwarder/config.json on disk.
+  - At startup the tester prints the resolved module file + config path so you can verify.
+  - Not identical to production: see docstring "Tester vs live service" in run_once (patches, env, secrets).
   - Stop the live Instorebotforwarder service while using the SAME token, or Discord will
     reject the duplicate session (Invalid session / disconnect loop).
 
@@ -1114,6 +1121,13 @@ async def run_once(
     skip_gemini_api: bool,
     audit_json_path: Optional[Path],
 ) -> int:
+    """Run one forward. Code is imported from MWBots/Instorebotforwarder (sys.path).
+
+    Tester vs live systemd service (not byte-for-byte identical):
+    - Patches: no instance lock / no slash setup / send() wrapped to capture (live-send still calls real send).
+    - Config: local MWBots/Instorebotforwarder/config*.json — Oracle may differ until synced.
+    - Environment: your PC vs server (IP, DNS, Playwright/cookies if any) can change URL expansion or Gemini.
+    """
     from Instorebotforwarder import instore_auto_mirror_bot as iam
 
     iam.InstorebotForwarder._acquire_single_instance_lock = _noop_instance_lock  # type: ignore[method-assign]
@@ -1163,6 +1177,18 @@ async def run_once(
             except Exception:
                 pass
         return 2
+
+    _mod_fp = Path(iam.__file__).resolve()
+    _cfg_raw = getattr(app, "config_path", None)
+    _cfg_fp = Path(_cfg_raw).resolve() if _cfg_raw else Path()
+    audit["canonical_paths"] = {
+        "instore_auto_mirror_bot_py": str(_mod_fp),
+        "merged_config_json": str(_cfg_fp) if _cfg_fp.parts else "",
+        "mwbots_on_sys_path_front": bool(sys.path and str(_MWBOTS.resolve()) == str(Path(sys.path[0]).resolve())),
+    }
+    print(f"[TESTER] Instore code module: {_mod_fp}")
+    print(f"[TESTER] Instore config file: {_cfg_fp if _cfg_fp.parts else '(unknown)'}")
+    log.info("[TESTER] canonical_paths=%s", audit["canonical_paths"])
 
     setattr(app, "_instore_flow_tester_suppress_struct_gemini_reason", None)
 

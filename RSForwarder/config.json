@@ -81,6 +81,14 @@
         "role_id": "",
         "text": ""
       }
+    },
+    {
+      "source_channel_id": "1487446697146712296",
+      "source_channel_name": "price-error-glitched",
+      "role_mention": {
+        "role_id": "1139628383853101166",
+        "text": ""
+      }
     }
   ],
   "rs_server_icon_url": "https://cdn.discordapp.com/icons/876528050081251379/a_a9a346601bbd93532d931e5280616797.gif?size=256",
