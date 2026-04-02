@@ -71,6 +71,17 @@ def _message_jump_url_for_log(message: discord.Message) -> str:
         return ""
 
 
+def _first_http_url_from_text(text: str) -> Optional[str]:
+    try:
+        for u, _, _ in affiliate_rewriter.extract_urls_with_spans(text or ""):
+            u2 = (u or "").strip()
+            if u2.startswith(("http://", "https://")):
+                return u2
+    except Exception:
+        pass
+    return None
+
+
 def _webhook_post_url_with_wait(webhook_url: str) -> str:
     u = (webhook_url or "").strip()
     if not u:
@@ -1247,6 +1258,8 @@ class RSForwarderBot:
         # Debounce for auto Current List writes (avoid re-writing on every chunk message).
         self._rs_fs_last_current_list_hash: str = ""
         self._rs_fs_last_current_list_ts: float = 0.0
+        # Mavely Discord merchant resolver: request message id -> Future[str] (fulfilled by reply in resolver channel)
+        self._mavely_resolver_pending: Dict[int, asyncio.Future] = {}
         
         # Validate required config
         if not self.config.get("bot_token"):
@@ -1278,6 +1291,109 @@ class RSForwarderBot:
         base = dict(self.config or {})
         base["_affiliate_compute_memo"] = {}
         return base
+
+    def _mavely_discord_resolver_channel_id(self) -> int:
+        try:
+            v = str((self.config or {}).get("mavely_discord_resolver_channel_id") or "").strip()
+            return int(v) if v.isdigit() else 0
+        except Exception:
+            return 0
+
+    def _attach_mavely_discord_resolver_to_aff_cfg(
+        self, aff_cfg: Dict[str, Any], message: Optional[discord.Message]
+    ) -> None:
+        if not self._mavely_discord_resolver_channel_id() or not message:
+            return
+        jump = _message_jump_url_for_log(message)
+
+        async def _resolve(mavely_short: str) -> Optional[str]:
+            return await self._mavely_discord_resolve_merchant(mavely_short, context_jump=jump)
+
+        aff_cfg["_mavely_discord_resolve_merchant"] = _resolve
+
+    async def _maybe_fulfill_mavely_discord_resolver(self, message: discord.Message) -> None:
+        cid = self._mavely_discord_resolver_channel_id()
+        if not cid or int(message.channel.id) != cid:
+            return
+        ref = message.reference
+        if not ref or not ref.message_id:
+            return
+        mid = int(ref.message_id)
+        fut = self._mavely_resolver_pending.get(mid)
+        if not fut or fut.done():
+            return
+        url = _first_http_url_from_text(message.content or "")
+        if not url:
+            return
+        self._mavely_resolver_pending.pop(mid, None)
+        if not fut.done():
+            fut.set_result(url)
+
+    async def _mavely_discord_resolve_merchant(self, mavely_short_url: str, *, context_jump: str = "") -> Optional[str]:
+        cid = self._mavely_discord_resolver_channel_id()
+        if not cid or not (mavely_short_url or "").strip():
+            return None
+        try:
+            timeout_s = int((self.config or {}).get("mavely_discord_resolver_timeout_s") or 120)
+        except Exception:
+            timeout_s = 120
+        timeout_s = max(10, min(int(timeout_s), 600))
+
+        ch = self.bot.get_channel(cid)
+        if ch is None:
+            try:
+                ch = await self.bot.fetch_channel(cid)
+            except Exception:
+                ch = None
+        if ch is None or not hasattr(ch, "send"):
+            return None
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        embed = discord.Embed(
+            title="Mavely: merchant URL needed",
+            description=(
+                "Reply **to this message** with **only** the store product URL (https://…).\n\n"
+                f"Short link: {mavely_short_url.strip()}"
+            ),
+            color=discord.Color.orange(),
+        )
+        if context_jump:
+            embed.add_field(name="Source", value=context_jump, inline=False)
+        try:
+            req = await ch.send(embed=embed)
+        except Exception as e:
+            print(f"{Colors.YELLOW}[MavelyDiscord] post request failed: {e}{Colors.RESET}", flush=True)
+            return None
+        mid = int(req.id)
+        self._mavely_resolver_pending[mid] = fut
+        ch_ref = _discord_channel_mention(cid)
+        print(
+            f"{Colors.CYAN}[MavelyDiscord] {ch_ref} waiting up to {timeout_s}s for merchant URL (request msg={mid}){Colors.RESET}",
+            flush=True,
+        )
+        try:
+            out = await asyncio.wait_for(fut, timeout=float(timeout_s))
+            s = (str(out).strip() if out else "") or ""
+            if s:
+                print(
+                    f"{Colors.GREEN}[MavelyDiscord] {ch_ref} got merchant URL: {_repost_log_clip(s, 96)}{Colors.RESET}",
+                    flush=True,
+                )
+            return s or None
+        except asyncio.TimeoutError:
+            print(
+                f"{Colors.YELLOW}[MavelyDiscord] {ch_ref} timed out after {timeout_s}s (request msg={mid}){Colors.RESET}",
+                flush=True,
+            )
+            return None
+        except Exception as e:
+            print(f"{Colors.YELLOW}[MavelyDiscord] {ch_ref} wait failed: {e}{Colors.RESET}", flush=True)
+            return None
+        finally:
+            self._mavely_resolver_pending.pop(mid, None)
+            if not fut.done():
+                fut.cancel()
 
     def _rs_server_guild_id(self) -> int:
         """
@@ -4908,12 +5024,27 @@ class RSForwarderBot:
             else:
                 print(f"  {Colors.YELLOW}No channels configured. Use !add command to add channels.{Colors.RESET}")
 
+            try:
+                mcid = self._mavely_discord_resolver_channel_id()
+                if mcid:
+                    print(
+                        f"{Colors.CYAN}[Startup] Mavely Discord merchant resolver: {_discord_channel_mention(mcid)} "
+                        f"(timeout_s={(self.config or {}).get('mavely_discord_resolver_timeout_s', 120)}){Colors.RESET}"
+                    )
+            except Exception:
+                pass
+
             print(f"{Colors.CYAN}{'='*60}{Colors.RESET}\n")
         
         @self.bot.event
         async def on_message(message: discord.Message):
             # Process commands first
             await self.bot.process_commands(message)
+
+            try:
+                await self._maybe_fulfill_mavely_discord_resolver(message)
+            except Exception:
+                pass
             
             # Don't skip bot messages - we want to forward ALL messages including bot messages
             # Only skip our own bot's messages to avoid loops
@@ -8433,6 +8564,7 @@ class RSForwarderBot:
             ch_ref = _discord_channel_mention(channel_id)
             aff_cfg = self._affiliate_cfg(channel_config)
             aff_cfg["_affiliate_log_channel_ref"] = ch_ref
+            self._attach_mavely_discord_resolver_to_aff_cfg(aff_cfg, message)
 
             any_changed = False
             content_changed = False
@@ -8736,6 +8868,7 @@ class RSForwarderBot:
             affiliate_notes: Dict[str, str] = {}
             aff_cfg = self._affiliate_cfg(channel_config)
             aff_cfg["_affiliate_log_channel_ref"] = src_ch_ref
+            self._attach_mavely_discord_resolver_to_aff_cfg(aff_cfg, message)
             if rewrite_enabled and content:
                 content, _changed, _notes = await affiliate_rewriter.rewrite_text(aff_cfg, content)
                 if _changed:

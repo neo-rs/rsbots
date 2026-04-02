@@ -1722,6 +1722,82 @@ async def mavely_preflight(cfg: dict) -> Tuple[bool, int, Optional[str]]:
     ok, status, err = await asyncio.to_thread(_do)
     return ok, status, err
 
+
+def _aff_short_err(s: Optional[str], n: int = 160) -> str:
+    t = (s or "").replace("\r", " ").replace("\n", " ").strip()
+    return t if len(t) <= n else (t[:n] + "...")
+
+
+async def _try_external_mavely_merchant_via_discord(cfg: dict, raw_short: str) -> Optional[str]:
+    fn = (cfg or {}).get("_mavely_discord_resolve_merchant")
+    if not callable(fn):
+        return None
+    try:
+        out = await fn(raw_short)
+    except Exception:
+        return None
+    s = (str(out).strip() if out else "") or ""
+    return s or None
+
+
+async def _mavely_rewrap_short_link_from_merchant_url(
+    cfg: dict,
+    u: str,
+    raw_short: str,
+    merchant_url: str,
+    mapped: Dict[str, str],
+    notes: Dict[str, str],
+    amazon_mask_cache: Dict[str, str],
+    *,
+    unwrap_source_label: str,
+) -> None:
+    """
+    For mavely.app.link: once a real merchant URL is known (unwrap, Discord resolver, etc.),
+    apply Amazon tagging or Mavely create_link / fallbacks (same as successful Playwright unwrap).
+    """
+    target_for_mavely = _strip_tracking_params(merchant_url) or merchant_url
+    _aff_flow(
+        cfg,
+        "mavely_unwrap merchant=%r (from %r)"
+        % (_aff_dbg_clip(target_for_mavely, 120), unwrap_source_label),
+    )
+    if is_amazon_like_url(merchant_url):
+        affiliate_url = build_amazon_affiliate_url(cfg, merchant_url)
+        if affiliate_url:
+            raw_mask = _env_first_token("AMAZON_DISCORD_MASK_LINK", "1").lower()
+            mask_enabled = raw_mask in {"1", "true", "yes", "y", "on"}
+            mask_prefix = _env_first_token("AMAZON_DISCORD_MASK_PREFIX", "amzn.to") or "amzn.to"
+            try:
+                mask_len = int(_env_first_token("AMAZON_DISCORD_MASK_LEN", "7") or "7")
+            except Exception:
+                mask_len = 7
+            if mask_enabled:
+                rep = amazon_mask_cache.get(affiliate_url)
+                if not rep:
+                    rep = discord_masked_link(mask_prefix, affiliate_url, slug_len=mask_len)
+                    amazon_mask_cache[affiliate_url] = rep
+                mapped[u] = rep
+            else:
+                mapped[u] = affiliate_url
+            notes[u] = "amazon affiliate (mavely unwrap merchant=%s)" % _aff_dbg_clip(target_for_mavely, 140)
+            return
+    link, err = await mavely_create_link(cfg, target_for_mavely)
+    if link and not err and link != raw_short:
+        mapped[u] = link
+        notes[u] = "rewrapped mavely link (merchant=%s)" % _aff_dbg_clip(target_for_mavely, 180)
+        return
+    mapped[u] = _strip_tracking_params(merchant_url) or merchant_url
+    reason = _aff_short_err(err, 160)
+    if _is_mavely_unsupported(err):
+        notes[u] = "merchant not supported by Mavely; used merchant=%s" % _aff_dbg_clip(target_for_mavely, 180)
+    else:
+        notes[u] = (
+            f"mavely rewrap failed ({reason}); fell back to merchant={_aff_dbg_clip(target_for_mavely, 160)} (stripped tracking)"
+            if reason
+            else f"mavely rewrap failed; fell back to merchant={_aff_dbg_clip(target_for_mavely, 160)} (stripped tracking)"
+        )
+
+
 async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[str, str], Dict[str, str]]:
     """
     Returns (mapped, notes):
@@ -2023,10 +2099,6 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
             target = raw
             resolved[u] = target
 
-        def _short_err(s: Optional[str], n: int = 160) -> str:
-            t = (s or "").replace("\r", " ").replace("\n", " ").strip()
-            return t if len(t) <= n else (t[:n] + "...")
-
         def _is_mavely_unsupported(err_msg: Optional[str]) -> bool:
             m = (err_msg or "").strip().lower()
             return ("merchant not supported" in m) or ("brand not found" in m)
@@ -2053,49 +2125,16 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
             # rejects that host (common), optionally retry once with the expanded hub URL (see
             # MAVELY_GRAPHQL_BRIDGE_FALLBACK).
             if target and (not is_mavely_link(target)) and (target != raw):
-                target_for_mavely = _strip_tracking_params(target) or target
-                _aff_flow(
+                await _mavely_rewrap_short_link_from_merchant_url(
                     cfg,
-                    "mavely_unwrap merchant=%r (from %r)"
-                    % (_aff_dbg_clip(target_for_mavely, 120), _aff_dbg_clip(raw, 88)),
+                    u,
+                    raw,
+                    target,
+                    mapped,
+                    notes,
+                    amazon_mask_cache,
+                    unwrap_source_label=_aff_dbg_clip(raw, 88),
                 )
-                # Amazon: always use your associate tag (and optional Discord mask) — skip Mavely GraphQL for storefront URLs.
-                if is_amazon_like_url(target):
-                    affiliate_url = build_amazon_affiliate_url(cfg, target)
-                    if affiliate_url:
-                        raw_mask = _env_first_token("AMAZON_DISCORD_MASK_LINK", "1").lower()
-                        mask_enabled = raw_mask in {"1", "true", "yes", "y", "on"}
-                        mask_prefix = _env_first_token("AMAZON_DISCORD_MASK_PREFIX", "amzn.to") or "amzn.to"
-                        try:
-                            mask_len = int(_env_first_token("AMAZON_DISCORD_MASK_LEN", "7") or "7")
-                        except Exception:
-                            mask_len = 7
-                        if mask_enabled:
-                            rep = amazon_mask_cache.get(affiliate_url)
-                            if not rep:
-                                rep = discord_masked_link(mask_prefix, affiliate_url, slug_len=mask_len)
-                                amazon_mask_cache[affiliate_url] = rep
-                            mapped[u] = rep
-                        else:
-                            mapped[u] = affiliate_url
-                        notes[u] = "amazon affiliate (mavely unwrap merchant=%s)" % _aff_dbg_clip(target_for_mavely, 140)
-                        continue
-                link, err = await mavely_create_link(cfg, target_for_mavely)
-                if link and not err and link != raw:
-                    mapped[u] = link
-                    notes[u] = "rewrapped mavely link (merchant=%s)" % _aff_dbg_clip(target_for_mavely, 180)
-                else:
-                    # Non-Amazon: fall back to stripped merchant URL when Mavely cannot rewrap.
-                    mapped[u] = _strip_tracking_params(target)
-                    reason = _short_err(err)
-                    if _is_mavely_unsupported(err):
-                        notes[u] = "merchant not supported by Mavely; used merchant=%s" % _aff_dbg_clip(target_for_mavely, 180)
-                    else:
-                        notes[u] = (
-                            f"mavely rewrap failed ({reason}); fell back to merchant={_aff_dbg_clip(target_for_mavely, 160)} (stripped tracking)"
-                            if reason
-                            else f"mavely rewrap failed; fell back to merchant={_aff_dbg_clip(target_for_mavely, 160)} (stripped tracking)"
-                        )
             else:
                 # On bridge (or no merchant): GraphQL often rejects createAffiliateLink(mavely.app.link/...).
                 link, err = await mavely_create_link(cfg, raw)
@@ -2103,7 +2142,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                     mapped[u] = link
                     notes[u] = "rewrapped mavely link (direct)"
                     continue
-                reason = _short_err(err)
+                reason = _aff_short_err(err)
                 bridge_u = (_strip_tracking_params(target) or target or "").strip()
                 link_b: Optional[str] = None
                 err_b: Optional[str] = None
@@ -2124,11 +2163,24 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                     mapped[u] = link_b
                     notes[u] = "rewrapped mavely link (hub GraphQL fallback; app.link rejected by API)"
                     continue
+                ext_merchant = await _try_external_mavely_merchant_via_discord(cfg, raw)
+                if ext_merchant and (not is_mavely_link(ext_merchant)):
+                    await _mavely_rewrap_short_link_from_merchant_url(
+                        cfg,
+                        u,
+                        raw,
+                        ext_merchant,
+                        mapped,
+                        notes,
+                        amazon_mask_cache,
+                        unwrap_source_label="discord resolver",
+                    )
+                    continue
                 # IMPORTANT: Do not downgrade mavely.app.link to a hub URL (mavelyinfluencer.com / mavelylife.com).
                 # If we cannot resolve a real merchant URL, keep the original short link unchanged.
                 extra = ""
                 if err_b:
-                    extra = "; hub fallback failed: %s" % _short_err(err_b)
+                    extra = "; hub fallback failed: %s" % _aff_short_err(err_b)
                 notes[u] = (
                     (f"rewrap failed ({reason}); could not resolve merchant URL; kept original mavely.app.link{extra}")
                     if reason
@@ -2147,7 +2199,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
             # Do not call create_link(influencer bridge) — wrong pipeline (Mavely→Mavely).
             notes[u] = (
                 "expand landed on Mavely bridge; API from original URL failed — left unchanged "
-                f"({_short_err(err_bridge, 120)})"
+                f"({_aff_short_err(err_bridge, 120)})"
                 if err_bridge
                 else "expand landed on Mavely bridge; API from original URL failed — left unchanged"
             )
@@ -2203,13 +2255,13 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                 if _is_mavely_unsupported(err):
                     notes[u] = "expanded only (merchant not supported by Mavely)"
                 else:
-                    reason = _short_err(err)
+                    reason = _aff_short_err(err)
                     notes[u] = f"expanded only (mavely failed: {reason})" if reason else "expanded only"
         else:
             if _is_mavely_unsupported(err):
                 notes[u] = "merchant not supported by Mavely"
             else:
-                notes[u] = _short_err(err, 220) or "no change"
+                notes[u] = _aff_short_err(err, 220) or "no change"
 
     if affiliate_rewrite_debug_on(cfg):
         if affiliate_rewrite_debug_verbose_on(cfg):

@@ -141,6 +141,7 @@
 !Mavelytest/*.bat
 Mavelytest/audit_logs/
 Mavelytest/*_report.json
+Mavelytest/mavely_discord_resolver_config.json
 
 # Kit (GHL and other integration tools)
 !kit/

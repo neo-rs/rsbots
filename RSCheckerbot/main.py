@@ -8193,6 +8193,30 @@ async def support_ticket_sweeper_loop_error(error):
     with suppress(Exception):
         support_ticket_sweeper_loop.start()
 
+
+@tasks.loop(seconds=60)
+async def cancellation_countdown_loop():
+    """Daily cancellation ticket header refresh + optional in-ticket follow-up (support_tickets.cancellation_countdown)."""
+    try:
+        if not bot.is_ready():
+            return
+        await support_tickets.run_cancellation_countdown_scheduler_tick()
+    except Exception as e:
+        with suppress(Exception):
+            await log_other(f"⚠️ cancellation_countdown_loop error: `{str(e)[:200]}`")
+
+
+@cancellation_countdown_loop.error
+async def cancellation_countdown_loop_error(error):
+    with suppress(Exception):
+        await log_other(f"🔁 cancellation_countdown_loop crashed: `{error}` — restarting in 5s")
+    with suppress(Exception):
+        cancellation_countdown_loop.cancel()
+    await asyncio.sleep(5)
+    with suppress(Exception):
+        cancellation_countdown_loop.start()
+
+
 # -----------------------------
 # Support tickets: startup backfill (member-status-logs)
 # -----------------------------
@@ -10111,6 +10135,17 @@ async def on_ready():
         if not support_ticket_sweeper_loop.is_running():
             support_ticket_sweeper_loop.start()
             log.info(f"[SupportTickets] Free Pass sweeper started (every {max(30, int(sweeper_interval))}s)")
+
+    try:
+        st_cc = config.get("support_tickets") if isinstance(config, dict) else {}
+        cc_block = st_cc.get("cancellation_countdown") if isinstance(st_cc.get("cancellation_countdown"), dict) else {}
+        cc_enabled = bool(cc_block.get("enabled", False))
+    except Exception:
+        cc_enabled = False
+    if cc_enabled:
+        if not cancellation_countdown_loop.is_running():
+            cancellation_countdown_loop.start()
+            log.info("[SupportTickets] Cancellation countdown scheduler started (60s tick)")
 
     # Support tickets: on-boot backfill from today's member-status-logs (restart-safe).
     with suppress(Exception):
