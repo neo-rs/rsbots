@@ -115,6 +115,8 @@ class SupportTicketConfig:
     cancellation_countdown_followup_remaining_days: int
     cancellation_countdown_followup_template: str
     cancellation_countdown_churn_category_id: int
+    cancellation_countdown_churn_category_name: str
+    cancellation_countdown_churn_prefix_channel_name: bool
 
 
 _BOT: commands.Bot | None = None
@@ -442,6 +444,8 @@ def initialize(
         cancellation_countdown_followup_template=str(cc.get("followup_template") or "").strip()
         or "Heads up {mention} — your access ends in 7 days. If you want to stay in, reply here and we can help.",
         cancellation_countdown_churn_category_id=max(0, _as_int(cc.get("churn_category_id"))),
+        cancellation_countdown_churn_category_name=str(cc.get("churn_category_name") or "").strip(),
+        cancellation_countdown_churn_prefix_channel_name=_as_bool(cc.get("churn_prefix_channel_name", True)),
     )
 
     # Register persistent view so buttons survive restarts.
@@ -3602,6 +3606,89 @@ async def has_open_ticket_for_user(*, ticket_type: str, user_id: int) -> bool:
         return bool(found and _ticket_is_open(found[1]))
 
 
+def _strip_discord_embed_field_text(s: str) -> str:
+    v = str(s or "").strip()
+    v = re.sub(r"\*+", "", v)
+    v = v.replace("`", "").strip()
+    return v.strip()
+
+
+def _parse_embed_access_end_datetime(s: str) -> datetime | None:
+    """Parse 'February 21, 2026' / ISO / common US dates from embed field text (UTC date at midnight)."""
+    raw = _strip_discord_embed_field_text(s)
+    if not raw or raw in {"—", "-", "n/a", "N/A"}:
+        return None
+    dt = _parse_dt_any(raw)
+    if dt:
+        return dt
+    for fmt in ("%B %d, %Y", "%b %d, %Y", "%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d"):
+        with suppress(ValueError):
+            return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+    return None
+
+
+def _access_end_candidate_from_whop_status_field(status_text: str) -> str:
+    """Use last parenthetical that looks like a date, e.g. 'Canceled (February 21, 2026)'."""
+    raw = _strip_discord_embed_field_text(status_text)
+    if not raw:
+        return ""
+    for m in reversed(list(re.finditer(r"\(([^)]*)\)", raw))):
+        inner = str(m.group(1) or "").strip()
+        if inner and _parse_embed_access_end_datetime(inner):
+            return inner
+    return ""
+
+
+async def _backfill_cancellation_renewal_iso_from_header(
+    *,
+    channel: discord.TextChannel,
+    header_message_id: int,
+) -> str:
+    """Legacy tickets: read Access Ends On (or Whop Status date) from the stored header embed → ISO for countdown."""
+    if header_message_id <= 0:
+        return ""
+    try:
+        msg = await channel.fetch_message(int(header_message_id))
+    except Exception:
+        return ""
+    for em in getattr(msg, "embeds", []) or []:
+        access_raw = ""
+        status_raw = ""
+        for field in getattr(em, "fields", []) or []:
+            nm = str(field.name or "").strip().casefold()
+            val = _strip_discord_embed_field_text(str(field.value or ""))
+            if nm in {"access ends on", "access_ends_on", "ends on"}:
+                access_raw = val
+            if nm in {"whop status", "whop_status"}:
+                status_raw = val
+        cand = access_raw or _access_end_candidate_from_whop_status_field(status_raw)
+        if not cand:
+            continue
+        dt = _parse_embed_access_end_datetime(cand)
+        if dt:
+            return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+    return ""
+
+
+def _resolve_cancellation_churn_category(
+    guild: discord.Guild,
+    cfg: SupportTicketConfig,
+) -> discord.CategoryChannel | None:
+    """Resolve churn destination: prefer churn_category_id, else exact category name match (case-insensitive)."""
+    cid = int(cfg.cancellation_countdown_churn_category_id or 0)
+    if cid > 0:
+        ch = guild.get_channel(cid)
+        if isinstance(ch, discord.CategoryChannel):
+            return ch
+    nm = str(cfg.cancellation_countdown_churn_category_name or "").strip()
+    if nm:
+        want = nm.casefold()
+        for cat in guild.categories:
+            if str(cat.name or "").strip().casefold() == want:
+                return cat
+    return None
+
+
 async def _run_cancellation_countdown_daily_pass() -> None:
     cfg = _cfg()
     bot = _BOT
@@ -3619,7 +3706,9 @@ async def _run_cancellation_countdown_daily_pass() -> None:
                 continue
             if not _ticket_is_open(rec):
                 continue
-            if not str(rec.get("cancellation_renewal_end_iso") or "").strip():
+            has_iso = str(rec.get("cancellation_renewal_end_iso") or "").strip()
+            header_mid = _as_int(rec.get("header_message_id") or 0)
+            if not has_iso and header_mid <= 0:
                 continue
             uid = _as_int(rec.get("user_id"))
             if uid <= 0:
@@ -3629,15 +3718,74 @@ async def _run_cancellation_countdown_daily_pass() -> None:
     tz_nm = str(cfg.cancellation_countdown_timezone or "UTC").strip() or "UTC"
     follow_th = int(cfg.cancellation_countdown_followup_remaining_days or 0)
 
+    churn_cat = _resolve_cancellation_churn_category(guild, cfg)
+    churn_effective_id = int(getattr(churn_cat, "id", 0) or 0) if churn_cat else 0
+    churn_configured = bool(
+        int(cfg.cancellation_countdown_churn_category_id or 0) > 0
+        or str(cfg.cancellation_countdown_churn_category_name or "").strip()
+    )
+    if churn_configured and not churn_cat:
+        with suppress(Exception):
+            await _log(
+                "⚠️ cancellation_countdown: churn configured but category not found in guild "
+                f"(churn_category_id={cfg.cancellation_countdown_churn_category_id} "
+                f"churn_category_name={cfg.cancellation_countdown_churn_category_name!r})"
+            )
+
+    stats: dict[str, int] = {
+        "seen": len(snapshots),
+        "rem_zero": 0,
+        "rem_positive": 0,
+        "followups": 0,
+        "churn_moved": 0,
+        "skipped_channel": 0,
+        "skipped_no_end": 0,
+        "iso_backfilled": 0,
+    }
+
     for tid, uid, rec_snap in snapshots:
+        ch_id = int(rec_snap.get("channel_id") or 0)
+        header_mid = int(rec_snap.get("header_message_id") or 0)
+        ch = guild.get_channel(ch_id)
+        if not isinstance(ch, discord.TextChannel):
+            stats["skipped_channel"] += 1
+            continue
+
+        iso = str(rec_snap.get("cancellation_renewal_end_iso") or "").strip()
+        if not iso and header_mid > 0:
+            iso_new = await _backfill_cancellation_renewal_iso_from_header(
+                channel=ch,
+                header_message_id=header_mid,
+            )
+            if iso_new:
+                async with _INDEX_LOCK:
+                    db = _index_load()
+                    cur = (db.get("tickets") or {}).get(tid) if isinstance(db.get("tickets"), dict) else None
+                    if isinstance(cur, dict) and _ticket_is_open(cur):
+                        cur["cancellation_renewal_end_iso"] = iso_new
+                        disp = str(_fmt_date_any(iso_new) or "").strip()
+                        if disp:
+                            cur["cancellation_renewal_end_display"] = disp
+                        db["tickets"][tid] = cur  # type: ignore[index]
+                        _index_save(db)
+                rec_snap["cancellation_renewal_end_iso"] = iso_new
+                iso = iso_new
+                stats["iso_backfilled"] += 1
+
+        if not iso:
+            stats["skipped_no_end"] += 1
+            continue
+
         rem = _cancellation_calendar_remaining_days(
-            end_iso=str(rec_snap.get("cancellation_renewal_end_iso") or ""),
+            end_iso=iso,
             tz_name=tz_nm,
         )
         if rem is None:
+            stats["skipped_no_end"] += 1
             continue
         brief = _cancellation_brief_from_ticket_record(rec_snap, remaining_days=rem)
         if not brief:
+            stats["skipped_no_end"] += 1
             continue
 
         member = guild.get_member(uid)
@@ -3659,11 +3807,10 @@ async def _run_cancellation_countdown_daily_pass() -> None:
             reference_jump_url=str(rec_snap.get("reference_jump_url") or ""),
         )
 
-        ch_id = int(rec_snap.get("channel_id") or 0)
-        header_mid = int(rec_snap.get("header_message_id") or 0)
-        ch = guild.get_channel(ch_id)
-        if not isinstance(ch, discord.TextChannel):
-            continue
+        if rem == 0:
+            stats["rem_zero"] += 1
+        else:
+            stats["rem_positive"] += 1
 
         new_mid = 0
         with suppress(Exception):
@@ -3697,27 +3844,30 @@ async def _run_cancellation_countdown_daily_pass() -> None:
                     with suppress(Exception):
                         await ch.send(content=body[:2000], allowed_mentions=am)
                         sent_follow = True
+                        stats["followups"] += 1
 
-        churn_cid = int(cfg.cancellation_countdown_churn_category_id or 0)
         moved_to_churn = False
-        if churn_cid > 0 and rem == 0:
+        if churn_cat and rem == 0:
             cur_cat = int(getattr(ch, "category_id", 0) or 0)
-            if cur_cat != churn_cid:
-                cat = guild.get_channel(churn_cid)
-                if isinstance(cat, discord.CategoryChannel):
-                    with suppress(Exception):
-                        await ch.edit(
-                            category=cat,
-                            reason="RSCheckerbot: cancellation access ended (0 days remaining) → churn category",
-                        )
-                        moved_to_churn = True
-                else:
+            if cur_cat != churn_effective_id:
+                new_ch_name = str(ch.name or "") or "ticket"
+                if bool(cfg.cancellation_countdown_churn_prefix_channel_name):
+                    if not new_ch_name.strip().lower().startswith("churn-"):
+                        new_ch_name = _slug_channel_name(f"churn-{ch.name}", max_len=90) or "churn-ticket"
+                try:
+                    await ch.edit(
+                        category=churn_cat,
+                        name=new_ch_name,
+                        reason="RSCheckerbot: cancellation access ended (0 days remaining) → churn category",
+                    )
+                    moved_to_churn = True
+                    stats["churn_moved"] += 1
+                except Exception as e:
                     with suppress(Exception):
                         await _log(
-                            f"⚠️ support_tickets: cancellation_countdown churn_category_id={churn_cid} missing or not a category"
+                            f"⚠️ cancellation_countdown: churn move/rename failed channel_id={ch.id} err={str(e)[:200]}"
                         )
 
-        iso = str(rec_snap.get("cancellation_renewal_end_iso") or "").strip()
         display_refresh = str(_fmt_date_any(iso) or "").strip()
 
         async with _INDEX_LOCK:
@@ -3740,6 +3890,15 @@ async def _run_cancellation_countdown_daily_pass() -> None:
             if isinstance(db.get("tickets"), dict):
                 db["tickets"][tid] = cur  # type: ignore[index]
             _index_save(db)
+
+    with suppress(Exception):
+        await _log(
+            "📋 cancellation_countdown daily summary: "
+            f"candidates={stats['seen']} iso_backfilled={stats['iso_backfilled']} "
+            f"rem_zero={stats['rem_zero']} rem_positive={stats['rem_positive']} "
+            f"followups_sent={stats['followups']} churn_moved={stats['churn_moved']} "
+            f"skipped_no_end={stats['skipped_no_end']} skipped_missing_channel={stats['skipped_channel']}"
+        )
 
 
 async def run_cancellation_countdown_scheduler_tick() -> None:

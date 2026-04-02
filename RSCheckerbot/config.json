@@ -322,15 +322,17 @@
       "free_pass_transcript_channel_id": 0
     },
     "cancellation_countdown": {
-      "_comment": "Once per local day at run_time_local: refresh open cancellation ticket header embeds (Remaining Days from cancellation_renewal_end_iso). Legacy open tickets without stored ISO are skipped until the next webhook/member-status open that updates the record. Does not auto-close or delete channels. Optional churn_category_id moves the ticket channel to that category when remaining days hits 0 (bot needs Manage Channels). State: data/cancellation_countdown_state.json",
+      "_comment": "Once per local day at run_time_local: refresh open cancellation ticket headers. Uses cancellation_renewal_end_iso when present; otherwise one-time backfill from the stored header embed (Access Ends On or Whop Status date). Does not auto-close or delete channels. churn moves when remaining days hits 0. State: data/cancellation_countdown_state.json",
       "enabled": true,
       "timezone": "America/New_York",
       "run_time_local": "23:59",
       "followup_remaining_days": 7,
       "_comment_followup_template": "Placeholders: {mention} {member} {days}",
       "followup_template": "Heads up {mention} your access ends in {days} days. If you want to stay in just reply here and we'll help you out.",
-      "_comment_churn_category_id": "Discord category ID to move open cancellation tickets into when access has ended (0 days left). 0 = do not move. Same as transcript/archive category is OK if that matches your server layout.",
-      "churn_category_id": 1489313482171220049
+      "_comment_churn_category_id": "Preferred: set churn_category_id to the Churn Ticket category snowflake. If 0 or invalid, churn_category_name is used (exact name, case-insensitive). Moves only when calendar Remaining Days is 0; job runs once daily at run_time_local.",
+      "churn_category_id": 1489313482171220049,
+      "churn_category_name": "Churn Ticket",
+      "churn_prefix_channel_name": true
     },
     "free_pass": {
       "what_you_missed_channel_id": 1310420229129764924,
