@@ -22,6 +22,21 @@ RSForwarder is a standalone bot for forwarding messages from RS Server channels 
 - **Admin Only**: No (but requires channel access)
 - **Returns**: Confirmation embed. The webhook is saved server-side in `config.secrets.json -> destination_webhooks` (not in `config.json`).
 
+#### `!s`
+- **Description**: Short one-line webhook forward mapping: creates or reuses an **RSForwarder** webhook on the **destination** channel (no pasted webhook URL)
+- **Aliases**: `rss`, `rsfwd`
+- **Parameters** (space-separated):
+  - Source: `#channel` mention or numeric channel id
+  - Literal `d`
+  - Destination: `#channel` mention or numeric channel id (where messages are posted via webhook)
+  - Optional: literal `r`, then `<@&role>` or role id, then optional extra mention text
+- **Usage**:
+  - `!s 1484473267031904287 d 1384321601092456538`
+  - `!s <#1484473267031904287> d <#1384321601092456538> r <@&886824827745337374>`
+- **Admin Only**: No (bot needs **Manage Webhooks** on the destination channel)
+- **Returns**: Confirmation embed. New sources are added like `!rsadd`; if the source is already mapped, the webhook URL and (if you pass `r …`) role mention are updated.
+- **Note**: Requires the same bot permissions as the interactive `!rsadd` mapper for auto-webhook creation.
+
 #### `!rslist`
 - **Description**: List all configured channels
 - **Aliases**: `list`
@@ -166,15 +181,15 @@ RSForwarder is a standalone bot for forwarding messages from RS Server channels 
 
 ## Command Summary
 
-- **Total Commands**: 18
-- **Admin Commands**: 6 (`!rstestall`, `!rsfscheck`, `!rsfstest`, `!rsfstestsku`, `!rsfsrun`, `!rsrestartadminbot`, `!rsstartadminbot`)
-- **Public Commands**: 12
-- **Commands with Aliases**: 10
+- **Total Commands**: 19
+- **Admin Commands**: 7 (`!rstestall`, `!rsfscheck`, `!rsfstest`, `!rsfstestsku`, `!rsfsrun`, `!rsrestartadminbot`, `!rsstartadminbot`)
+- **Public Commands**: 13
+- **Commands with Aliases**: 11
 - **Command Prefix**: `!rs` (unique prefix to avoid conflicts)
 
 ## Notes
 
-- All commands use the `!` prefix and are namespaced with `rs...` (example: `!rsadd`, `!rsfsrun`)
+- All commands use the `!` prefix and are usually namespaced with `rs...` (example: `!rsadd`, `!rsfsrun`). The short forward-map command is `!s` (aliases `rss`, `rsfwd`).
 - Commands that manage channels require access to the source channel
 - Webhook URLs must be valid Discord webhook URLs (format: `https://discord.com/api/webhooks/...`)
 - Role IDs must be valid numeric Discord role IDs
