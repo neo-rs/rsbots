@@ -35,9 +35,7 @@ RSForwarder is a standalone bot for forwarding messages from RS Server channels 
   - `!s <#1484473267031904287> d <#1384321601092456538> r <@&886824827745337374>`
 - **Admin Only**: No (bot needs **Manage Webhooks** on the destination channel)
 - **Returns**: Confirmation embed. New sources are added like `!rsadd`; if the source is already mapped, the webhook URL and (if you pass `r …`) role mention are updated.
-- **Note**: Requires the same bot permissions as the interactive `!rsadd` mapper for auto-webhook creation.
-- **Where to run it**: This is handled by the **RSForwarder** bot user (same account that runs `!rslist` / `!rsadd`). A **journal** channel that only shows `rsadminbot-journal-*` log lines is usually **not** a place where RSForwarder receives your messages unless that bot is **in the server** and has **View Channel + Read Message History + Send Messages** there. Prefer a normal staff/bot channel in **Reselling Secrets** (or Neo Test) where you already use RSForwarder commands, or invite RSForwarder into the journal server/channel if you really want commands there.
-- **Do not map journal channels as sources**: Channels whose names contain `journal` (e.g. `journal-rsforwarder`) are **rejected** as new forward sources unless `forward_allow_journal_source` is true in `config.json` (or env `RS_FORWARDER_ALLOW_JOURNAL_SOURCE=1`). If you already mapped one by mistake, run `!rsremove <journal_channel_id>`. While that mapping exists, the bot **skips** forwarding **bot-authored** messages and lines starting with `!` from those channels so log spam does not flood deal channels.
+- **Note**: Requires the same bot permissions as the interactive `!rsadd` mapper for auto-webhook creation. Like other RSForwarder `!` commands, it runs wherever the **RSForwarder** bot can read your message (any configured guild/channel with permissions).
 
 #### `!rslist`
 - **Description**: List all configured channels
