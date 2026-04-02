@@ -717,6 +717,26 @@ def _outbound_playwright_poll_s(cfg: Optional[dict]) -> float:
     return float(max(1, min(v, 60)))
 
 
+def _outbound_playwright_navigation_timeout_ms(cfg: Optional[dict], hub_html_timeout_s: float) -> int:
+    """Playwright `page.goto` + navigation budget for persistent outbound resolve (ms)."""
+    try:
+        v = int((cfg or {}).get("outbound_playwright_navigation_timeout_ms") or 0)
+    except Exception:
+        v = 0
+    if v <= 0:
+        try:
+            v = int((os.getenv("OUTBOUND_PLAYWRIGHT_NAV_TIMEOUT_MS", "") or "").strip() or "0")
+        except Exception:
+            v = 0
+    if v > 0:
+        return max(30_000, min(v, 180_000))
+    try:
+        base = int(min(float(hub_html_timeout_s) * 2000.0, 120_000.0))
+    except Exception:
+        base = 60_000
+    return max(base, 60_000)
+
+
 def _outbound_playwright_profile_dir_resolved(cfg: Optional[dict]) -> str:
     repo_root = Path(__file__).resolve().parents[1]
     raw = str((cfg or {}).get("outbound_playwright_profile_dir") or "").strip()
@@ -2160,10 +2180,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                         headed = _outbound_playwright_headed_from_cfg(cfg)
                         settle = _outbound_playwright_settle_ms(cfg)
                         poll = _outbound_playwright_poll_s(cfg)
-                        try:
-                            t_ms_pw = int(min(float(hub_html_timeout_s) * 2000.0, 120_000.0))
-                        except Exception:
-                            t_ms_pw = 60_000
+                        t_ms_pw = _outbound_playwright_navigation_timeout_ms(cfg, hub_html_timeout_s)
                         if flow_on:
                             print(
                                 "[OutboundResolve] resolver_unresolved_wrapper in=%r candidate=%r "

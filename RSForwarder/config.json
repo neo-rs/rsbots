@@ -11,6 +11,7 @@
   "affiliate_hub_html_timeout_s": 32,
   "outbound_playwright_persistent_enabled": false,
   "outbound_playwright_headed": false,
+  "outbound_playwright_navigation_timeout_ms": 120000,
   "outbound_playwright_settle_ms": 6000,
   "outbound_playwright_poll_s": 10,
   "outbound_playwright_profile_dir": "",
