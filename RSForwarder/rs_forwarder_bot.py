@@ -2878,143 +2878,6 @@ class RSForwarderBot:
         except Exception:
             return None
 
-    def _extract_role_id_from_ref(self, role_ref: str) -> Optional[str]:
-        """Parse `<@&id>` or raw digits into a role id string."""
-        s = str(role_ref or "").strip()
-        if not s:
-            return None
-        if s.startswith("<@&") and s.endswith(">"):
-            inner = s[3:-1].strip()
-            return inner if inner.isdigit() else None
-        return s if s.isdigit() else None
-
-    def _parse_forward_map_short_body(self, body: str) -> Tuple[str, Optional[int], Optional[int], bool, str, str]:
-        """
-        Parse: `<source> d <dest> [r <role> [text...]]`
-
-        Returns (error_message, src_id, dest_id, role_was_specified, role_id, trailing_text).
-        When error_message is non-empty, other return values are unused placeholders.
-        """
-        raw = (body or "").strip()
-        if not raw:
-            return (
-                "**Usage:** `!s <#source|id> d <#dest|id> [r <@&role|id> [optional text]]`\n"
-                "**Examples:**\n"
-                "`!s 1484473267031904287 d 1384321601092456538`\n"
-                "`!s <#1484473267031904287> d <#1384321601092456538> r <@&886824827745337374>`",
-                None,
-                None,
-                False,
-                "",
-                "",
-            )
-        parts = raw.split()
-        i = 0
-        sid = self._extract_channel_id_from_ref(parts[i])
-        if sid is None:
-            return (f"❌ Bad source channel: `{parts[i]}`", None, None, False, "", "")
-        i += 1
-        if i >= len(parts) or str(parts[i]).lower() != "d":
-            return ("❌ Expected literal `d` between source and destination.", None, None, False, "", "")
-        i += 1
-        if i >= len(parts):
-            return ("❌ Missing destination channel after `d`.", None, None, False, "", "")
-        did = self._extract_channel_id_from_ref(parts[i])
-        if did is None:
-            return (f"❌ Bad destination channel: `{parts[i]}`", None, None, False, "", "")
-        i += 1
-        role_specified = False
-        role_id = ""
-        text = ""
-        if i < len(parts):
-            if str(parts[i]).lower() != "r":
-                return (
-                    f"❌ Expected `r` before role (got `{parts[i]}`), or omit the role block entirely.",
-                    None,
-                    None,
-                    False,
-                    "",
-                    "",
-                )
-            i += 1
-            if i >= len(parts):
-                return ("❌ Missing role after `r`.", None, None, False, "", "")
-            role_specified = True
-            rid = self._extract_role_id_from_ref(parts[i])
-            if rid is None:
-                return (f"❌ Bad role: `{parts[i]}` (use `<@&id>` or numeric id).", None, None, False, "", "")
-            role_id = rid
-            i += 1
-            text = " ".join(parts[i:]).strip()
-        return ("", int(sid), int(did), role_specified, role_id, text)
-
-    async def _forward_map_short_apply(
-        self,
-        *,
-        source_channel_id: int,
-        dest_channel: Union[discord.TextChannel, discord.Thread],
-        role_specified: bool,
-        role_id: str,
-        text: str,
-    ) -> Tuple[bool, str, Optional[discord.Embed]]:
-        """
-        Create or reuse a webhook on the destination channel, then add or update a source→webhook mapping.
-        """
-        ok_wh, msg_wh, wh_url = await self._get_or_create_destination_webhook_url(dest_channel)
-        if not ok_wh or not wh_url:
-            return False, msg_wh or "Webhook setup failed.", None
-
-        try:
-            src_id = int(source_channel_id or 0)
-        except Exception:
-            src_id = 0
-        if src_id <= 0:
-            return False, "Invalid source channel id.", None
-
-        src_key = str(src_id)
-        existing = self.get_channel_config(src_key)
-
-        if not existing:
-            ok, msg, emb = await self._rsadd_apply(
-                source_channel_id=src_id,
-                destination_webhook_url=wh_url,
-                role_id=role_id if role_specified else "",
-                text=text if role_specified else "",
-            )
-            return ok, msg, emb
-
-        if not self._set_destination_webhook_secret(src_key, wh_url):
-            return False, "Failed to write webhook into config.secrets.json on the server.", None
-        existing["destination_webhook_url"] = wh_url
-        if role_specified:
-            if "role_mention" not in existing:
-                existing["role_mention"] = {}
-            existing["role_mention"]["role_id"] = role_id
-            existing["role_mention"]["text"] = text
-
-        self.save_config()
-        self.load_config()
-
-        ch_obj = await self._resolve_channel_by_id(src_id)
-        ch_name = str(getattr(ch_obj, "name", "") or f"channel-{src_id}") if ch_obj else f"channel-{src_id}"
-        dest_ref = _discord_channel_mention(getattr(dest_channel, "id", ""))
-        emb = discord.Embed(
-            title="✅ Forwarding job updated (quick map)",
-            color=discord.Color.blue(),
-            description="Webhook auto-created or reused on the destination; mapping saved.",
-        )
-        emb.add_field(name="📥 Source", value=f"`{ch_name}`\nID: `{src_key}`", inline=True)
-        emb.add_field(name="📤 Destination", value=f"{dest_ref}\n(secrets: webhook URL)", inline=True)
-        rm = existing.get("role_mention") or {}
-        if rm.get("role_id"):
-            emb.add_field(
-                name="📢 Role mention",
-                value=f"<@&{rm.get('role_id')}> {rm.get('text', '')}",
-                inline=False,
-            )
-        emb.set_footer(text="!rslist / !rsview / !rsremove")
-        return True, "ok", emb
-
     def _get_destination_channel_webhook_url(self, destination_channel_id: int) -> str:
         """
         Cache: destination channel id -> webhook url (stored server-side in config.secrets.json).
@@ -5094,23 +4957,6 @@ class RSForwarderBot:
         async def on_command_error(ctx, error):  # type: ignore[override]
             # Do not reply for CommandNotFound so other bots (e.g. RSAdminBot) can handle !archive, !transfer, !delete, !clear.
             if isinstance(error, commands.CommandNotFound):
-                # Journal visibility: quick-map commands are easy to typo or run before deploy; log once to stdout/journal.
-                try:
-                    content = (getattr(ctx.message, "content", None) or "").strip()
-                    if content.startswith("!"):
-                        tail = content[1:].split(None, 1)
-                        inv = (tail[0] or "").lower() if tail else ""
-                        if inv in {"s", "rss", "rsfwd"}:
-                            ch = getattr(ctx.channel, "id", 0)
-                            g = getattr(ctx.guild, "id", 0) if ctx.guild else 0
-                            print(
-                                f"{Colors.YELLOW}[CmdErr] Command not found: {inv!r} guild={g} channel={ch} "
-                                f"(update/deploy RSForwarder, or run in a channel where this bot reads messages — "
-                                f"journal mirrors are often write-only from the bot's perspective).{Colors.RESET}",
-                                flush=True,
-                            )
-                except Exception:
-                    pass
                 return
 
             # Make command failures visible in journal + (best-effort) to the invoking user.
@@ -5758,33 +5604,68 @@ class RSForwarderBot:
             if not channels:
                 await ctx.send("❌ No channels configured.")
                 return
-            
+
+            desc = (
+                "**Change mappings:** `!rsadd` (mapper or manual webhook) · `!rsupdate` · `!rsview <#source>` · "
+                "`!rsremove <#source>`\n"
+                "**SOP:** `Canonical_SOP_with_Explainable_Logging.md` (mirror-world repo) — push → deploy "
+                "(`update_rs_bots.bat` / `!botupdate`) → `systemctl restart mirror-world-rsforwarder.service` → "
+                "verify with RSAdminBot **`!whereami`**."
+            )
             embed = discord.Embed(
                 title="📋 Configured Channels",
-                color=discord.Color.blue()
+                description=desc[:4096],
+                color=discord.Color.blue(),
             )
-            
+
             for channel in channels:
-                source_id = channel.get("source_channel_id", "unknown")
-                source_name = channel.get("source_channel_name", "unknown")
-                webhook = channel.get("destination_webhook_url", "")
-                role_config = channel.get("role_mention", {})
-                
-                status = "✅" if webhook else "❌"
-                value = f"Webhook: {'Configured' if webhook else 'Not set'}"
-                
-                if role_config.get("role_id"):
-                    role_id = role_config.get("role_id")
-                    text = role_config.get("text", "")
-                    value += f"\nRole: <@&{role_id}> {text}"
-                
+                source_id = str(channel.get("source_channel_id", "") or "").strip() or "unknown"
+                source_name = str(channel.get("source_channel_name", "") or "unknown").strip()
+                webhook = str(channel.get("destination_webhook_url", "") or "").strip()
+                role_config = channel.get("role_mention") or {}
+                in_place = bool((channel or {}).get("repost_in_place"))
+                has_wh = bool(webhook)
+
+                if in_place:
+                    status = "✅"
+                    route = "Mode: **In-place repost** (no webhook; bot reposts in the source channel)"
+                elif has_wh:
+                    status = "✅"
+                    route = "Webhook: **configured** (stored in `config.secrets.json` → `destination_webhooks`)"
+                else:
+                    status = "❌"
+                    route = "Webhook: **not set** — forwarding disabled until you map with `!rsadd`"
+
+                if source_id.isdigit():
+                    src_line = f"**Source:** <#{source_id}> · `id={source_id}`"
+                else:
+                    src_line = f"**Source id (fix in config):** `{source_id}`"
+
+                value = f"{src_line}\n{route}"
+
+                rid_raw = str(role_config.get("role_id") or "").strip()
+                if rid_raw:
+                    rtext = str(role_config.get("text") or "").strip()
+                    tail = f" {rtext}" if rtext else ""
+                    if rid_raw.isdigit():
+                        value += f"\n**Role:** <@&{rid_raw}> · `id={rid_raw}`{tail}"
+                    else:
+                        value += f"\n**Role id:** `{rid_raw}`{tail}"
+
                 embed.add_field(
                     name=f"{status} {source_name}",
-                    value=f"ID: `{source_id}`\n{value}",
-                    inline=False
+                    value=value[:1024],
+                    inline=False,
                 )
-            
-            await ctx.send(embed=embed)
+
+            embed.set_footer(
+                text="Channel <#…> links are clickable in servers where the bot can see that channel. "
+                "Role names may show as unknown in other guilds — use the numeric id after id=."
+            )
+            await ctx.send(
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=True),
+            )
         
         @self.bot.command(name='rsupdate', aliases=['update'])
         async def update_channel(ctx, source_channel: discord.TextChannel = None, destination_webhook_url: str = None,
@@ -7433,40 +7314,6 @@ class RSForwarderBot:
                     f"❌ Channel `{channel_name}` ({source_channel_id}) not found in configuration."
                 )
 
-        @self.bot.command(name="s", aliases=["rss", "rsfwd"])
-        async def forward_map_short(ctx, *, body: str = ""):
-            """
-            Short webhook forward map: auto-create webhook on destination.
-
-            Usage: `!s <#source|id> d <#dest|id> [r <@&role|id> [optional text]]`
-            """
-            err, sid, did, role_specified, role_id, extra_text = self._parse_forward_map_short_body(body)
-            if err:
-                await ctx.send(err)
-                return
-            if sid is None or did is None:
-                await ctx.send("❌ Could not parse source/destination channels.")
-                return
-
-            dest_obj = await self._resolve_channel_by_id(int(did))
-            if not isinstance(dest_obj, (discord.TextChannel, discord.Thread)):
-                await ctx.send(
-                    f"❌ Destination <#{did}> is not a text channel or thread the bot can use (got {type(dest_obj).__name__})."
-                )
-                return
-
-            ok, msg, emb = await self._forward_map_short_apply(
-                source_channel_id=int(sid),
-                dest_channel=dest_obj,
-                role_specified=role_specified,
-                role_id=role_id,
-                text=extra_text,
-            )
-            if not ok or not emb:
-                await ctx.send(f"❌ {msg}")
-                return
-            await ctx.send(embed=emb)
-        
         @self.bot.command(name='rstest', aliases=['test'])
         async def test_forward(ctx, source_channel_id: str = None, limit: int = 1):
             """Test forwarding by forwarding recent messages from a source channel
@@ -8239,7 +8086,6 @@ class RSForwarderBot:
             commands_list = [
                 ("`!rsstatus`", "Show bot status and configuration"),
                 ("`!rslist`", "List all configured forwarding jobs"),
-                ("`!s <#src|id> d <#dest|id> [r <@&role|id> [text]]`", "Quick map: auto webhook on dest (`rss`, `rsfwd`)"),
                 ("`!rsadd <#channel|id> <webhook_url> [role_id] [text]`", "Add a new forwarding job"),
                 ("`!rsupdate <#channel|id> [webhook_url] [role_id] [text]`", "Update an existing forwarding job"),
                 ("`!rsview <#channel|id>`", "View details of a specific forwarding job"),
