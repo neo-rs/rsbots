@@ -328,6 +328,15 @@ def main() -> int:
     ap.add_argument("--server-name", default=None, help="Server name from oraclekeys/servers.json (defaults to first entry)")
     ap.add_argument("--out-dir", default=str(REPO_ROOT / "Oraclserver-files"), help="Local output dir (default: Oraclserver-files)")
     ap.add_argument("--remote-root", default=None, help="Remote root override (default: /home/rsadmin/bots/mirror-world or server entry)")
+    ap.add_argument(
+        "--remote-tar-dir",
+        default=None,
+        help=(
+            "Remote directory to write the snapshot tar.gz before scp. "
+            "Default: <parent of remote-root>/_snapshots. "
+            "NOTE: tar is deleted after successful download to avoid /tmp bloat."
+        ),
+    )
     ap.add_argument("--no-oracle-server-data", action="store_true", help="Do not include OracleServerData in the snapshot")
     ap.add_argument(
         "--scp-timeout",
@@ -386,7 +395,9 @@ def main() -> int:
     snap_dir = out_dir / f"server_full_snapshot_{ts}"
     snap_dir.mkdir(parents=True, exist_ok=True)
 
-    remote_tar = f"/tmp/rsbots_full_snapshot_{ts}.tar.gz"
+    remote_tar_parent_default = str(Path(entry.remote_root.rstrip("/")).parent / "_snapshots")
+    remote_tar_dir = str(args.remote_tar_dir).strip() if (args.remote_tar_dir and str(args.remote_tar_dir).strip()) else remote_tar_parent_default
+    remote_tar = f"{remote_tar_dir}/rsbots_full_snapshot_{ts}.tar.gz"
 
     includes = list(INCLUDES_DEFAULT)
     if not args.no_oracle_server_data:
@@ -397,6 +408,7 @@ def main() -> int:
     remote_cmd = (
         "set -euo pipefail; set -f; "
         f"cd {shlex.quote(entry.remote_root)}; "
+        f"mkdir -p {shlex.quote(remote_tar_dir)}; "
         f"rm -f {shlex.quote(remote_tar)} || true; "
         "set +e; "
         f"tar -czf {shlex.quote(remote_tar)} "
@@ -433,6 +445,18 @@ def main() -> int:
 
     print("[3/3] Extracting ...")
     _safe_extract(local_tar, snap_dir)
+
+    # Always delete the remote tar after a successful download to prevent /tmp (or other dir) bloat.
+    try:
+        cleanup_cmd = f"set -euo pipefail; rm -f {shlex.quote(remote_tar)} || true; echo CLEANED_REMOTE_TAR={shlex.quote(remote_tar)}"
+        ssh_cleanup = _build_ssh_base(entry) + [f"bash -lc {shlex.quote(cleanup_cmd)}"]
+        cres = _run(ssh_cleanup, timeout=args.ssh_timeout)
+        if cres.returncode == 0:
+            print(cres.stdout.strip())
+        else:
+            print(f"[cleanup] WARNING: remote tar delete failed (exit {cres.returncode})")
+    except Exception as e:
+        print(f"[cleanup] WARNING: remote tar delete failed: {e}")
 
     print(f"DONE: {snap_dir}")
     _prune_old_snapshots(out_dir, args.keep_snapshots, snap_dir)

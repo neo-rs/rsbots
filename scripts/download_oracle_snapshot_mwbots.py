@@ -192,11 +192,13 @@ def _safe_extract(tar_path: Path, dest_dir: Path) -> None:
 
 def _merge_instore_full_from_remote(entry: ServerEntry, snap_dir: Path, ts: str, scp_timeout: int) -> None:
     """Replace Instorebotforwarder in snap_dir with a no-excludes tar of that folder only."""
-    remote_tar = f"/tmp/instorebotforwarder_supp_{ts}.tar.gz"
+    remote_tar_dir = str(Path(entry.remote_root.rstrip("/")).parent / "_snapshots")
+    remote_tar = f"{remote_tar_dir}/instorebotforwarder_supp_{ts}.tar.gz"
     remote_cmd = (
         "set -euo pipefail; "
         f"cd {shlex.quote(entry.remote_root)}; "
         "if [ ! -d Instorebotforwarder ]; then echo 'SKIP=no_instore_dir'; exit 0; fi; "
+        f"mkdir -p {shlex.quote(remote_tar_dir)}; "
         f"rm -f {shlex.quote(remote_tar)} || true; "
         f"tar --ignore-failed-read -czf {shlex.quote(remote_tar)} Instorebotforwarder; "
         f"ls -lh {shlex.quote(remote_tar)}"
@@ -224,6 +226,14 @@ def _merge_instore_full_from_remote(entry: ServerEntry, snap_dir: Path, ts: str,
     if sk:
         print(f"[supp] Skipped {sk} member(s) on supplemental extract (path length / OS)")
     print("[supp] Instorebotforwarder merge done.")
+
+    # Cleanup remote tar to avoid /tmp bloat.
+    try:
+        cleanup_cmd = f"set -euo pipefail; rm -f {shlex.quote(remote_tar)} || true"
+        ssh_cleanup = _build_ssh_base(entry) + [f"bash -lc {shlex.quote(cleanup_cmd)}"]
+        _run(ssh_cleanup, timeout=60)
+    except Exception:
+        pass
 
 
 def _verify_snapshot(snap_dir: Path, full_backup: bool) -> None:
@@ -293,6 +303,15 @@ def main() -> int:
     ap.add_argument("--server-name", default=None, help="Server name from oraclekeys/servers.json (defaults to first entry)")
     ap.add_argument("--out-dir", default=str(REPO_ROOT / "Oraclserver-files-mwbots"), help="Local output dir")
     ap.add_argument("--remote-root", default=None, help="Remote root override (default: from servers.json)")
+    ap.add_argument(
+        "--remote-tar-dir",
+        default=None,
+        help=(
+            "Remote directory to write tar.gz before scp. "
+            "Default: <parent of remote-root>/_snapshots. "
+            "NOTE: tar is deleted after successful download to prevent /tmp bloat."
+        ),
+    )
     ap.add_argument("--keep-snapshots", type=int, default=1, help="Keep only newest N snapshot folders (default: 1)")
     ap.add_argument("--prune-only", action="store_true", help="Only prune old local snapshot folders (no SSH)")
     ap.add_argument("--no-secrets", action="store_true", help="Exclude secrets and runtime data (code-only snapshot)")
@@ -342,7 +361,9 @@ def main() -> int:
     snap_dir = out_dir / f"server_full_snapshot_{ts}"
     snap_dir.mkdir(parents=True, exist_ok=True)
 
-    remote_tar = f"/tmp/mwbots_full_snapshot_{ts}.tar.gz"
+    remote_tar_parent_default = str(Path(entry.remote_root.rstrip("/")).parent / "_snapshots")
+    remote_tar_dir = str(args.remote_tar_dir).strip() if (args.remote_tar_dir and str(args.remote_tar_dir).strip()) else remote_tar_parent_default
+    remote_tar = f"{remote_tar_dir}/mwbots_full_snapshot_{ts}.tar.gz"
     includes = list(INCLUDES_DEFAULT)
     excludes = EXCLUDES_NO_SECRETS if args.no_secrets else EXCLUDES_FULL
     mode = "code-only (no secrets)" if args.no_secrets else "full backup"
@@ -352,6 +373,7 @@ def main() -> int:
     remote_cmd = (
         "set -euo pipefail; set -f; "
         f"cd {shlex.quote(entry.remote_root)}; "
+        f"mkdir -p {shlex.quote(remote_tar_dir)}; "
         f"rm -f {shlex.quote(remote_tar)} || true; "
         f"tar --ignore-failed-read -czf {shlex.quote(remote_tar)} "
         + " ".join(excludes)
@@ -381,6 +403,20 @@ def main() -> int:
         print(res2.stdout)
         print(res2.stderr)
         raise RuntimeError(f"SCP download failed (exit {res2.returncode})")
+
+    # Always delete the remote tar after a successful download to prevent /tmp bloat.
+    try:
+        cleanup_cmd = f"set -euo pipefail; rm -f {shlex.quote(remote_tar)} || true; echo CLEANED_REMOTE_TAR={shlex.quote(remote_tar)}"
+        ssh_cleanup = _build_ssh_base(entry) + [f"bash -lc {shlex.quote(cleanup_cmd)}"]
+        cres = _run(ssh_cleanup, timeout=60)
+        if cres.returncode == 0:
+            for line in (cres.stdout or "").strip().splitlines():
+                if line.startswith("CLEANED_REMOTE_TAR="):
+                    print(line)
+        else:
+            print(f"[cleanup] WARNING: remote tar delete failed (exit {cres.returncode})")
+    except Exception as e:
+        print(f"[cleanup] WARNING: remote tar delete failed: {e}")
 
     print("[3/3] Extracting ...")
     _safe_extract(local_tar, snap_dir)

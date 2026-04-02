@@ -2054,6 +2054,11 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
             # MAVELY_GRAPHQL_BRIDGE_FALLBACK).
             if target and (not is_mavely_link(target)) and (target != raw):
                 target_for_mavely = _strip_tracking_params(target) or target
+                _aff_flow(
+                    cfg,
+                    "mavely_unwrap merchant=%r (from %r)"
+                    % (_aff_dbg_clip(target_for_mavely, 120), _aff_dbg_clip(raw, 88)),
+                )
                 # Amazon: always use your associate tag (and optional Discord mask) — skip Mavely GraphQL for storefront URLs.
                 if is_amazon_like_url(target):
                     affiliate_url = build_amazon_affiliate_url(cfg, target)
@@ -2073,23 +2078,23 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                             mapped[u] = rep
                         else:
                             mapped[u] = affiliate_url
-                        notes[u] = "amazon affiliate (mavely.app.link unwrap)"
+                        notes[u] = "amazon affiliate (mavely unwrap merchant=%s)" % _aff_dbg_clip(target_for_mavely, 140)
                         continue
                 link, err = await mavely_create_link(cfg, target_for_mavely)
                 if link and not err and link != raw:
                     mapped[u] = link
-                    notes[u] = "rewrapped mavely link"
+                    notes[u] = "rewrapped mavely link (merchant=%s)" % _aff_dbg_clip(target_for_mavely, 180)
                 else:
                     # Non-Amazon: fall back to stripped merchant URL when Mavely cannot rewrap.
                     mapped[u] = _strip_tracking_params(target)
                     reason = _short_err(err)
                     if _is_mavely_unsupported(err):
-                        notes[u] = "merchant not supported by Mavely; used expanded destination"
+                        notes[u] = "merchant not supported by Mavely; used merchant=%s" % _aff_dbg_clip(target_for_mavely, 180)
                     else:
                         notes[u] = (
-                            f"mavely rewrap failed ({reason}); fell back to expanded destination (stripped tracking)"
+                            f"mavely rewrap failed ({reason}); fell back to merchant={_aff_dbg_clip(target_for_mavely, 160)} (stripped tracking)"
                             if reason
-                            else "mavely rewrap failed; fell back to expanded destination (stripped tracking)"
+                            else f"mavely rewrap failed; fell back to merchant={_aff_dbg_clip(target_for_mavely, 160)} (stripped tracking)"
                         )
             else:
                 # On bridge (or no merchant): GraphQL often rejects createAffiliateLink(mavely.app.link/...).
@@ -2119,20 +2124,16 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                     mapped[u] = link_b
                     notes[u] = "rewrapped mavely link (hub GraphQL fallback; app.link rejected by API)"
                     continue
-                # Repost must still change something: use expanded bridge when we have it (was mapped=0 → no rewrite).
-                if target and target != raw:
-                    mapped[u] = _strip_tracking_params(target) or target
-                    extra = ""
-                    if err_b:
-                        extra = "; hub fallback failed: %s" % _short_err(err_b)
-                    notes[u] = (
-                        (f"rewrap failed ({reason}); expanded to bridge (stripped){extra}")
-                        if reason
-                        else f"rewrap failed; expanded to bridge (stripped){extra}"
-                    )
-                else:
-                    mapped[u] = _strip_tracking_params(raw) or raw
-                    notes[u] = f"rewrap failed ({reason})" if reason else "rewrap failed (no expanded destination)"
+                # IMPORTANT: Do not downgrade mavely.app.link to a hub URL (mavelyinfluencer.com / mavelylife.com).
+                # If we cannot resolve a real merchant URL, keep the original short link unchanged.
+                extra = ""
+                if err_b:
+                    extra = "; hub fallback failed: %s" % _short_err(err_b)
+                notes[u] = (
+                    (f"rewrap failed ({reason}); could not resolve merchant URL; kept original mavely.app.link{extra}")
+                    if reason
+                    else f"rewrap failed; could not resolve merchant URL; kept original mavely.app.link{extra}"
+                )
             continue
 
         # Do not pass through another creator's Mavely bridge URL. Always try YOUR link from the *original*
