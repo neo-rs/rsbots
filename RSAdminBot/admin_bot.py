@@ -3357,7 +3357,7 @@ class RSAdminBot:
         
         # Initialize ServiceManager (canonical owner for bot management operations)
         self.service_manager: Optional[ServiceManager] = None
-        if self.current_server:
+        if self.current_server or self._should_use_local_exec():
             # Pass script executor and bot group getter to ServiceManager
             self.service_manager = ServiceManager(
                 self._execute_sh_script,
@@ -4235,6 +4235,52 @@ class RSAdminBot:
             )
             await ctx.send(embed=embed, view=_ClearConfirmView())
 
+    def _ensure_remote_root_for_local_exec(self) -> None:
+        """When ssh_server_name is unset or servers.json is missing, still set remote_root on the Ubuntu host.
+
+        /botupdate and /mwupdate use _execute_ssh_command; in local-exec mode that runs bash locally and only
+        needs a real live tree path (remote_root). Windows/off-box installs still require ssh_server_name + SSH.
+        """
+        if os.name == "nt":
+            return
+        le = self.config.get("local_exec") if isinstance(self.config.get("local_exec"), dict) else {}
+        if not bool(le.get("enabled", True)):
+            return
+        candidates: List[str] = []
+        for k in ("live_root", "remote_root"):
+            v = str((self.config or {}).get(k) or "").strip()
+            if v:
+                candidates.append(v)
+        try:
+            candidates.append(str(self.base_path.parent.resolve()))
+        except Exception:
+            pass
+        candidates.append("/home/rsadmin/bots/mirror-world")
+        seen: set[str] = set()
+        for c in candidates:
+            c = (c or "").strip()
+            if not c or c in seen:
+                continue
+            seen.add(c)
+            try:
+                p = Path(c).expanduser().resolve()
+                if p.is_dir():
+                    self.remote_root = str(p)
+                    print(
+                        f"{Colors.GREEN}[Local Exec] remote_root={self.remote_root} "
+                        f"(no ssh_server_name / using local mirror-world tree){Colors.RESET}"
+                    )
+                    if hasattr(self, "logger") and self.logger:
+                        self.logger.log_config_validation(
+                            "remote_root_fallback",
+                            "valid",
+                            "Set remote_root for local-exec without SSH server selection",
+                            {"remote_root": self.remote_root},
+                        )
+                    return
+            except Exception:
+                continue
+
     def _load_ssh_config(self):
         """Load SSH server configuration from the canonical oraclekeys/servers.json.
 
@@ -4257,6 +4303,7 @@ class RSAdminBot:
                 print(f"{Colors.YELLOW}[SSH] Set ssh_server_name in RSAdminBot/config.json to a name from oraclekeys/servers.json{Colors.RESET}")
                 if hasattr(self, "logger") and self.logger:
                     self.logger.log_config_validation("ssh_config", "missing", "Missing ssh_server_name (must match oraclekeys/servers.json entry name)", {})
+                self._ensure_remote_root_for_local_exec()
                 return
 
             # 2) Load canonical server list and pick the entry by exact name match.
@@ -4345,6 +4392,7 @@ class RSAdminBot:
             print(f"{Colors.RED}[SSH] Traceback: {traceback.format_exc()[:200]}{Colors.RESET}")
             if hasattr(self, 'logger') and self.logger:
                 self.logger.log_config_validation("ssh_config", "invalid", f"Failed to load SSH config: {e}", {"error": str(e)})
+            self._ensure_remote_root_for_local_exec()
     
     def _build_ssh_base(self, server_config: Dict[str, Any]) -> List[str]:
         """Build SSH base command list (self-contained, no external dependencies).
@@ -4454,6 +4502,12 @@ class RSAdminBot:
     
     def _check_ssh_available(self) -> Tuple[bool, str]:
         """Check if SSH is available and configured. Returns (is_available, error_message)"""
+        # Oracle/Ubuntu: management commands run locally when remote_root is the live tree — no SSH selection needed.
+        if self._should_use_local_exec():
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.log_config_validation("ssh_available", "valid", "SSH available via local execution", {"local_exec": True})
+            return True, ""
+
         if not self.current_server:
             error_msg = "No SSH server configured (missing ssh_server_name / servers.json selection)"
             print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
@@ -4461,14 +4515,6 @@ class RSAdminBot:
             if hasattr(self, 'logger') and self.logger:
                 self.logger.log_config_validation("ssh_available", "invalid", error_msg, {})
             return False, error_msg
-
-        # If we're running on Linux and the repo root exists locally, prefer local execution when
-        # the SSH key is not present. This keeps RSAdminBot functional on the Ubuntu host without
-        # storing private keys on the server.
-        if self._should_use_local_exec():
-            if hasattr(self, 'logger') and self.logger:
-                self.logger.log_config_validation("ssh_available", "valid", "SSH available via local execution", {"local_exec": True})
-            return True, ""
         
         # Check SSH key (should already be resolved to absolute path in _load_ssh_config)
         ssh_key = str(self.current_server.get("key") or "").strip()
@@ -4503,10 +4549,12 @@ class RSAdminBot:
                 return False
             if not (self.config.get("local_exec") or {}).get("enabled", True):
                 return False
-            # If the configured repo root exists locally on this machine, we can run locally.
-            repo_root = Path(getattr(self, "remote_root", "") or "")
+            repo_root_s = str(getattr(self, "remote_root", "") or "").strip()
+            if not repo_root_s:
+                return False
+            repo_root = Path(repo_root_s).expanduser().resolve()
             if repo_root.is_dir():
-                    return True
+                return True
         except Exception:
             return False
         return False
@@ -7744,12 +7792,6 @@ echo "CHANGED_END"
         if "\r" in cmd_txt:
             cmd_txt = cmd_txt.replace("\r\n", "\n").replace("\r", "\n")
 
-        # Check if server is configured (canonical: oraclekeys/servers.json + ssh_server_name selector)
-        if not self.current_server:
-            error_msg = "No SSH server configured (missing ssh_server_name / servers.json selection)"
-            print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
-            return False, "", error_msg
-
         # Local execution mode (Ubuntu host): run commands directly in bash without SSH.
         if self._should_use_local_exec():
             try:
@@ -7791,6 +7833,12 @@ echo "CHANGED_END"
                 if log_it and hasattr(self, 'logger') and self.logger:
                     self.logger.log_ssh_command(command, False, None, error_msg, None)
                 return False, "", error_msg
+
+        # Remote SSH path requires a selected server (Windows or local_exec disabled).
+        if not self.current_server:
+            error_msg = "No SSH server configured (missing ssh_server_name / servers.json selection)"
+            print(f"{Colors.RED}[SSH Error] {error_msg}{Colors.RESET}")
+            return False, "", error_msg
         
         # Build SSH command locally (self-contained)
         # Check if SSH key exists (already resolved in _load_ssh_config)
