@@ -5094,6 +5094,23 @@ class RSForwarderBot:
         async def on_command_error(ctx, error):  # type: ignore[override]
             # Do not reply for CommandNotFound so other bots (e.g. RSAdminBot) can handle !archive, !transfer, !delete, !clear.
             if isinstance(error, commands.CommandNotFound):
+                # Journal visibility: quick-map commands are easy to typo or run before deploy; log once to stdout/journal.
+                try:
+                    content = (getattr(ctx.message, "content", None) or "").strip()
+                    if content.startswith("!"):
+                        tail = content[1:].split(None, 1)
+                        inv = (tail[0] or "").lower() if tail else ""
+                        if inv in {"s", "rss", "rsfwd"}:
+                            ch = getattr(ctx.channel, "id", 0)
+                            g = getattr(ctx.guild, "id", 0) if ctx.guild else 0
+                            print(
+                                f"{Colors.YELLOW}[CmdErr] Command not found: {inv!r} guild={g} channel={ch} "
+                                f"(update/deploy RSForwarder, or run in a channel where this bot reads messages — "
+                                f"journal mirrors are often write-only from the bot's perspective).{Colors.RESET}",
+                                flush=True,
+                            )
+                except Exception:
+                    pass
                 return
 
             # Make command failures visible in journal + (best-effort) to the invoking user.

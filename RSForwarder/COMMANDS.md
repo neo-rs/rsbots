@@ -36,6 +36,7 @@ RSForwarder is a standalone bot for forwarding messages from RS Server channels 
 - **Admin Only**: No (bot needs **Manage Webhooks** on the destination channel)
 - **Returns**: Confirmation embed. New sources are added like `!rsadd`; if the source is already mapped, the webhook URL and (if you pass `r …`) role mention are updated.
 - **Note**: Requires the same bot permissions as the interactive `!rsadd` mapper for auto-webhook creation.
+- **Where to run it**: This is handled by the **RSForwarder** bot user (same account that runs `!rslist` / `!rsadd`). A **journal** channel that only shows `rsadminbot-journal-*` log lines is usually **not** a place where RSForwarder receives your messages unless that bot is **in the server** and has **View Channel + Read Message History + Send Messages** there. Prefer a normal staff/bot channel in **Reselling Secrets** (or Neo Test) where you already use RSForwarder commands, or invite RSForwarder into the journal server/channel if you really want commands there.
 
 #### `!rslist`
 - **Description**: List all configured channels
