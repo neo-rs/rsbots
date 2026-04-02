@@ -75,14 +75,6 @@
       }
     },
     {
-      "source_channel_id": "",
-      "source_channel_name": "amazon-deals",
-      "role_mention": {
-        "role_id": "",
-        "text": ""
-      }
-    },
-    {
       "source_channel_id": "1457129579557949551",
       "source_channel_name": "food-grocery",
       "role_mention": {
