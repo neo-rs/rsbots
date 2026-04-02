@@ -9,7 +9,7 @@
   "brand_name": "Reselling Secrets",
   "affiliate_rewrite_enabled": true,
   "affiliate_hub_html_timeout_s": 32,
-  "outbound_playwright_persistent_enabled": false,
+  "outbound_playwright_persistent_enabled": true,
   "outbound_playwright_headed": false,
   "outbound_playwright_navigation_timeout_ms": 120000,
   "outbound_playwright_settle_ms": 6000,
