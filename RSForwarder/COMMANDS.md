@@ -28,7 +28,7 @@ RSForwarder is a standalone bot for forwarding messages from RS Server channels 
 - **Parameters**: None
 - **Usage**: `!rslist`
 - **Admin Only**: No
-- **Returns**: Embed with a short **how to change** block (`!rsadd`, `!rsupdate`, `!rsview`, `!rsremove`) and pointer to **`Canonical_SOP_with_Explainable_Logging.md`** (mirror-world repo) for deploy / `!whereami` verification.
+- **Returns**: Embed with a short **how to change** block (`!rsadd`, `!rsupdate`, `!rsview`, `!rsremove`) and pointer to **`Canonical_SOP_with_Explainable_Logging.md`** (mirror-world repo) for deploy / `!whereami` verification. Each webhook row shows **active** vs **⚠️ stale** (URL in secrets but webhook deleted in Discord) and, when valid, **Posts to: `<#destination>`** so you open the correct channel’s Integrations.
 
 #### `!rsupdate`
 - **Description**: Update an existing forwarding job

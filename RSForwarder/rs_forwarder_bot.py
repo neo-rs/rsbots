@@ -102,6 +102,31 @@ def _webhook_lookup_guild_channel_ids(webhook_url: str) -> Tuple[Optional[str], 
         return None, None
 
 
+def _webhook_execute_url_health(webhook_url: str) -> Tuple[bool, Optional[str]]:
+    """
+    One GET to Discord: (still_valid, channel_id_or_none) for the webhook's channel.
+    Used to detect URLs left in secrets after someone deletes the webhook in Integrations.
+    """
+    try:
+        import requests
+
+        m = re.search(r"/webhooks/(\d+)/([^/?\s]+)", (webhook_url or "").strip())
+        if not m:
+            return False, None
+        wid, token = m.group(1), m.group(2)
+        r = requests.get(
+            f"https://discord.com/api/v10/webhooks/{wid}/{token}",
+            timeout=5,
+        )
+        if r.status_code != 200:
+            return False, None
+        j = r.json()
+        cid = str((j or {}).get("channel_id") or "").strip()
+        return True, (cid if cid.isdigit() else None)
+    except Exception:
+        return False, None
+
+
 def _posted_message_url_from_webhook_response(
     response: Any, webhook_url: str
 ) -> Tuple[Optional[str], str]:
@@ -2908,6 +2933,68 @@ class RSForwarderBot:
         except Exception:
             return False
 
+    def _delete_destination_channel_webhook_cache(self, destination_channel_id: int) -> None:
+        """Drop cached URL for a destination channel (e.g. webhook was deleted in Discord UI)."""
+        try:
+            secrets = self._load_secrets_dict()
+            d = secrets.get("destination_channel_webhooks")
+            if not isinstance(d, dict):
+                return
+            k = str(int(destination_channel_id))
+            if k in d:
+                del d[k]
+                secrets["destination_channel_webhooks"] = d
+                self._save_secrets_dict(secrets)
+        except Exception:
+            pass
+
+    def _replace_destination_webhook_url_in_secrets(self, old_url: str, new_url: str) -> int:
+        """Rewrite destination_webhooks entries that still point at a deleted webhook URL."""
+        o = (old_url or "").strip()
+        n = (new_url or "").strip()
+        if not o or not n or o == n:
+            return 0
+        try:
+            secrets = self._load_secrets_dict()
+            wh = secrets.get("destination_webhooks")
+            if not isinstance(wh, dict):
+                return 0
+            changed = 0
+            for sk, v in list(wh.items()):
+                if str(v or "").strip() == o:
+                    wh[sk] = n
+                    changed += 1
+            if changed:
+                secrets["destination_webhooks"] = wh
+                self._save_secrets_dict(secrets)
+            return changed
+        except Exception:
+            return 0
+
+    def _refresh_stale_destination_webhook(
+        self, old_url: Optional[str], new_url: str, destination_channel_id: int
+    ) -> None:
+        if not old_url:
+            return
+        o = old_url.strip()
+        nn = (new_url or "").strip()
+        if not o or not nn or o == nn:
+            return
+        n = self._replace_destination_webhook_url_in_secrets(o, nn)
+        if n:
+            try:
+                print(
+                    f"{Colors.YELLOW}[Forward] Refreshed stale webhook URL for destination <#{destination_channel_id}> "
+                    f"({n} source mapping(s) updated in destination_webhooks){Colors.RESET}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+            try:
+                self.load_config()
+            except Exception:
+                pass
+
     async def _get_or_create_destination_webhook_url(
         self, destination_channel: Union[discord.TextChannel, discord.Thread]
     ) -> Tuple[bool, str, str]:
@@ -2922,9 +3009,22 @@ class RSForwarderBot:
         if not dest_id:
             return False, "Invalid destination channel.", ""
 
+        stale_url: Optional[str] = None
         cached = self._get_destination_channel_webhook_url(dest_id)
         if cached:
-            return True, "ok", cached
+            ok_cached, _ = _webhook_execute_url_health(cached)
+            if ok_cached:
+                return True, "ok", cached
+            stale_url = cached.strip()
+            self._delete_destination_channel_webhook_cache(dest_id)
+            try:
+                print(
+                    f"{Colors.YELLOW}[Forward] Cached webhook for <#{dest_id}> is invalid (deleted in Discord?); "
+                    f"rediscovering or creating…{Colors.RESET}",
+                    flush=True,
+                )
+            except Exception:
+                pass
 
         # Try to reuse an existing webhook created by this bot.
         try:
@@ -2946,6 +3046,7 @@ class RSForwarderBot:
                 url = str(getattr(h, "url", "") or "").strip()
                 if url:
                     self._set_destination_channel_webhook_url(dest_id, url)
+                    self._refresh_stale_destination_webhook(stale_url, url, dest_id)
                     return True, "ok", url
             except Exception:
                 continue
@@ -2960,6 +3061,7 @@ class RSForwarderBot:
             if not url:
                 return False, "Webhook created but URL was not available.", ""
             self._set_destination_channel_webhook_url(dest_id, url)
+            self._refresh_stale_destination_webhook(stale_url, url, dest_id)
             return True, "ok", url
         except Exception as e:
             return False, f"Failed to create webhook in destination channel (need Manage Webhooks): {str(e)[:180]}", ""
@@ -5630,8 +5732,19 @@ class RSForwarderBot:
                     status = "✅"
                     route = "Mode: **In-place repost** (no webhook; bot reposts in the source channel)"
                 elif has_wh:
-                    status = "✅"
-                    route = "Webhook: **configured** (stored in `config.secrets.json` → `destination_webhooks`)"
+                    wh_ok, wh_ch = _webhook_execute_url_health(webhook)
+                    if wh_ok:
+                        status = "✅"
+                        route = "Webhook: **active** (`config.secrets.json` → `destination_webhooks`)"
+                        if wh_ch and str(wh_ch).isdigit():
+                            route += f"\n**Posts to:** <#{wh_ch}> (open this channel’s **Integrations → Webhooks** to see it)"
+                    else:
+                        status = "⚠️"
+                        route = (
+                            "Webhook URL saved, but Discord says it is **gone** (deleted in Integrations?). "
+                            "Run **`!rsadd`** and map again using the same **destination** channel — the bot will "
+                            "recreate the webhook and refresh secrets."
+                        )
                 else:
                     status = "❌"
                     route = "Webhook: **not set** — forwarding disabled until you map with `!rsadd`"
@@ -5659,8 +5772,9 @@ class RSForwarderBot:
                 )
 
             embed.set_footer(
-                text="Channel <#…> links are clickable in servers where the bot can see that channel. "
-                "Role names may show as unknown in other guilds — use the numeric id after id=."
+                text="“Configured” means a URL exists in secrets; ⚠️ means Discord rejected that URL. "
+                "If you checked a different channel’s Integrations, open **Posts to:** above. "
+                "Role names may show as unknown outside the home guild — use id=."
             )
             await ctx.send(
                 embed=embed,
