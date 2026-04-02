@@ -1279,6 +1279,46 @@ class RSForwarderBot:
         base["_affiliate_compute_memo"] = {}
         return base
 
+    def _forward_allow_journal_source(self) -> bool:
+        """When true, journal-named sources behave like any other channel (not recommended)."""
+        cfg = self.config or {}
+        v = cfg.get("forward_allow_journal_source")
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+        raw = (os.getenv("RS_FORWARDER_ALLOW_JOURNAL_SOURCE", "") or "").strip().lower()
+        return raw in {"1", "true", "yes", "y", "on"}
+
+    def _channel_name_looks_like_journal(self, name: str) -> bool:
+        return "journal" in str(name or "").lower()
+
+    def _should_skip_forward_journal_source_noise(self, message: discord.Message) -> bool:
+        """
+        If a *journal* channel was mistakenly mapped as a forward source, RSAdminBot (and similar)
+        will spam the destination. Skip other-bots and prefix commands in those channels unless
+        forward_allow_journal_source is enabled.
+        """
+        if self._forward_allow_journal_source():
+            return False
+        try:
+            name = str(getattr(message.channel, "name", "") or "").lower()
+        except Exception:
+            return False
+        if "journal" not in name:
+            return False
+        try:
+            if getattr(message.author, "bot", False):
+                return True
+        except Exception:
+            pass
+        try:
+            if (message.content or "").lstrip().startswith("!"):
+                return True
+        except Exception:
+            pass
+        return False
+
     def _rs_server_guild_id(self) -> int:
         """
         RS Server guild ID (used for branding/icon fetch). Canonical config keys:
@@ -3132,6 +3172,19 @@ class RSForwarderBot:
 
         ch_obj = await self._resolve_channel_by_id(int(src_id))
         ch_name = str(getattr(ch_obj, "name", "") or f"channel-{src_id}") if ch_obj else f"channel-{src_id}"
+
+        if self._channel_name_looks_like_journal(ch_name) and not self._forward_allow_journal_source():
+            return (
+                False,
+                (
+                    f"Refusing: source channel `{ch_name}` looks like a **journal/log** channel. Using it as a "
+                    "forward source spams your destination with bot logs. Run "
+                    f"`!rsremove {src_key}` if you already mapped one. To override, set "
+                    "`forward_allow_journal_source`: true in RSForwarder `config.json` or env "
+                    "`RS_FORWARDER_ALLOW_JOURNAL_SOURCE=1`."
+                ),
+                None,
+            )
 
         rid = str(role_id or "").strip()
         rtext = str(text or "").strip()
@@ -5076,6 +5129,8 @@ class RSForwarderBot:
             channel_config = self.get_channel_config(channel_id)
             
             if channel_config:
+                if self._should_skip_forward_journal_source_noise(message):
+                    return
                 # Forward the message
                 await self.forward_message(message, channel_id, channel_config)
 
