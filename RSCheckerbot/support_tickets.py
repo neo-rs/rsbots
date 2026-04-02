@@ -6285,6 +6285,237 @@ async def sweep_resolved_tickets() -> None:
             await close_ticket_by_channel_id(int(ch_id), close_reason=reason, do_transcript=True, delete_channel=True)
 
 
+async def reconcile_cancellation_scan() -> dict:
+    """Compare configured cancellation category vs tickets_index (read-only).
+
+    Buckets:
+    - aligned_open: OPEN cancellation index row, channel is under cancellation category
+    - zombies: CLOSED cancellation index row, channel still exists in cancellation category
+    - orphans: channel in category, `cancel-` name + ticket topic, but no index row for that channel_id
+    - unsafe: `cancel-` name in category but no index row and missing/invalid ticket topic (manual review)
+    - ghosts: OPEN cancellation in index but Discord channel no longer exists
+    - open_moved: OPEN cancellation in index but channel exists under a different category (e.g. churn)
+    """
+    out: dict[str, object] = {
+        "ok": False,
+        "err": "",
+        "cancellation_category_id": 0,
+        "channels_in_category": 0,
+        "aligned_open": [],
+        "zombies": [],
+        "orphans": [],
+        "unsafe": [],
+        "ghosts": [],
+        "open_moved": [],
+    }
+    if not _ensure_cfg_loaded() or not _BOT:
+        out["err"] = "support_tickets not initialized"
+        return out
+    cfg = _cfg()
+    if not cfg:
+        out["err"] = "no config"
+        return out
+    cat_id = int(cfg.cancellation_category_id or 0)
+    out["cancellation_category_id"] = cat_id
+    if cat_id <= 0:
+        out["err"] = "cancellation_category_id not configured"
+        return out
+    guild = _BOT.get_guild(int(cfg.guild_id))
+    if not isinstance(guild, discord.Guild):
+        out["err"] = "guild not found"
+        return out
+    cat = guild.get_channel(cat_id)
+    if not isinstance(cat, discord.CategoryChannel):
+        out["err"] = "cancellation category not found"
+        return out
+
+    async with _INDEX_LOCK:
+        db = _index_load()
+
+    channels = [ch for ch in list(cat.channels or []) if isinstance(ch, discord.TextChannel)]
+    out["channels_in_category"] = len(channels)
+
+    aligned: list[int] = []
+    zombies: list[int] = []
+    orphans: list[int] = []
+    unsafe: list[int] = []
+
+    for ch in channels:
+        top = getattr(ch, "topic", "") or ""
+        ticket_ok = _topic_is_support_ticket(top) and _ticket_type_from_topic(top) == "cancellation"
+        name_ok = str(getattr(ch, "name", "") or "").strip().lower().startswith("cancel-")
+        found = _ticket_by_channel_id(db, int(ch.id))
+        if found:
+            _tid, rec = found
+            if str(rec.get("ticket_type") or "").strip().lower() != "cancellation":
+                continue
+            if _ticket_is_open(rec):
+                aligned.append(int(ch.id))
+            else:
+                zombies.append(int(ch.id))
+        else:
+            if not name_ok:
+                continue
+            if ticket_ok:
+                orphans.append(int(ch.id))
+            else:
+                unsafe.append(int(ch.id))
+
+    ghosts: list[dict[str, int | str]] = []
+    moved: list[dict[str, int | str]] = []
+    for tid, rec in _ticket_iter(db):
+        if str(rec.get("ticket_type") or "").strip().lower() != "cancellation":
+            continue
+        if not _ticket_is_open(rec):
+            continue
+        cid = _as_int(rec.get("channel_id"))
+        if cid <= 0:
+            continue
+        ch = guild.get_channel(cid)
+        if ch is None:
+            ghosts.append({"ticket_id": str(tid), "channel_id": int(cid)})
+        elif isinstance(ch, discord.TextChannel):
+            cur_cat = int(getattr(ch, "category_id", 0) or 0)
+            if cur_cat != cat_id:
+                moved.append({"ticket_id": str(tid), "channel_id": int(cid), "current_category_id": int(cur_cat)})
+
+    out["aligned_open"] = aligned
+    out["zombies"] = zombies
+    out["orphans"] = orphans
+    out["unsafe"] = unsafe
+    out["ghosts"] = ghosts
+    out["open_moved"] = moved
+    out["ok"] = True
+    return out
+
+
+async def _mark_open_cancellation_ghost_closed(*, ticket_id: str, channel_id: int) -> bool:
+    cfg = _cfg()
+    bot = _BOT
+    if not cfg or not bot:
+        return False
+    guild = bot.get_guild(int(cfg.guild_id))
+    uid = 0
+    async with _INDEX_LOCK:
+        db = _index_load()
+        tickets = db.get("tickets") if isinstance(db.get("tickets"), dict) else {}
+        rec = tickets.get(str(ticket_id))
+        if not isinstance(rec, dict):
+            return False
+        if str(rec.get("ticket_type") or "").strip().lower() != "cancellation":
+            return False
+        if not _ticket_is_open(rec):
+            return False
+        if _as_int(rec.get("channel_id")) != int(channel_id):
+            return False
+        rec["status"] = "CLOSED"
+        rec["close_reason"] = "reconcile_ghost_channel_missing"
+        rec["closed_at_iso"] = _now_iso()
+        tickets[str(ticket_id)] = rec  # type: ignore[index]
+        db["tickets"] = tickets
+        _index_save(db)
+        uid = _as_int(rec.get("user_id"))
+
+    if isinstance(guild, discord.Guild) and uid > 0:
+        mobj = guild.get_member(int(uid))
+        if not isinstance(mobj, discord.Member):
+            with suppress(Exception):
+                mobj = await guild.fetch_member(int(uid))
+        if isinstance(mobj, discord.Member):
+            with suppress(Exception):
+                await _set_ticket_role_for_member(guild=guild, member=mobj, ticket_type="cancellation", add=False)
+    return True
+
+
+async def reconcile_cancellation_apply(
+    *,
+    mode: str,
+    max_actions: int = 30,
+) -> dict[str, object]:
+    """Apply reconciliation. Modes: zombies | orphans | ghosts | all.
+
+    Zombies/orphans: delete Discord channel with do_transcript=False (no index row or CLOSED row).
+    Ghosts: mark OPEN index row CLOSED when channel is missing.
+    """
+    m = str(mode or "").strip().lower()
+    if m not in {"zombies", "orphans", "ghosts", "all"}:
+        return {"ok": False, "err": f"invalid mode `{mode}`"}
+
+    cap = max(1, min(int(max_actions or 30), 200))
+    scan = await reconcile_cancellation_scan()
+    if not bool(scan.get("ok")):
+        return {"ok": False, "err": str(scan.get("err") or "scan failed")}
+
+    zombies: list[int] = list(scan.get("zombies") or [])
+    orphans: list[int] = list(scan.get("orphans") or [])
+    ghosts: list[dict[str, object]] = list(scan.get("ghosts") or [])
+
+    z_ok = 0
+    o_ok = 0
+    g_ok = 0
+    fail_n = 0
+
+    if m in {"zombies", "all"}:
+        for zid in zombies[:cap]:
+            try:
+                if await close_ticket_by_channel_id(
+                    int(zid),
+                    close_reason="reconcile_zombie_closed_index",
+                    do_transcript=False,
+                    delete_channel=True,
+                ):
+                    z_ok += 1
+                else:
+                    fail_n += 1
+            except Exception:
+                fail_n += 1
+
+    if m in {"orphans", "all"}:
+        for oid in orphans[:cap]:
+            try:
+                if await close_ticket_by_channel_id(
+                    int(oid),
+                    close_reason="reconcile_orphan_no_index",
+                    do_transcript=False,
+                    delete_channel=True,
+                ):
+                    o_ok += 1
+                else:
+                    fail_n += 1
+            except Exception:
+                fail_n += 1
+
+    if m in {"ghosts", "all"}:
+        for row in ghosts[:cap]:
+            tid = str((row or {}).get("ticket_id") or "")
+            g_ch = _as_int((row or {}).get("channel_id"))
+            if not tid or g_ch <= 0:
+                fail_n += 1
+                continue
+            try:
+                if await _mark_open_cancellation_ghost_closed(ticket_id=tid, channel_id=int(g_ch)):
+                    g_ok += 1
+                else:
+                    fail_n += 1
+            except Exception:
+                fail_n += 1
+
+    stats: dict[str, object] = {
+        "ok": True,
+        "zombies_closed": z_ok,
+        "orphans_deleted": o_ok,
+        "ghosts_marked": g_ok,
+        "failed": fail_n,
+    }
+
+    with suppress(Exception):
+        await _log(
+            f"🧩 support_tickets: reconcile_cancellation_apply mode={m} "
+            f"zombies_closed={z_ok} orphans_deleted={o_ok} ghosts_marked={g_ok} failed={fail_n}"
+        )
+    return stats
+
+
 async def get_ticket_record_for_channel_id(channel_id: int) -> dict | None:
     async with _INDEX_LOCK:
         db = _index_load()

@@ -93,6 +93,29 @@ RSOnboarding never removes the Member role.
 - **Admin Only**: Yes (requires administrator permissions)
 - **Returns**: Removal summary (removed count, failed count)
 
+#### `.checker reconcilecancel`
+- **Description**: Compare the configured **cancellation ticket category** to `RSCheckerbot/data/tickets_index.json`, then optionally fix drift (admin-only). **Scan** is read-only. **Apply** can delete Discord channels **without transcript** for zombies/orphans, or mark index CLOSED for ghosts (missing channel).
+- **Aliases**: `reconcile-cancellation`, `reconcilecancellation`, `cancelreconcile`
+- **Parameters**:
+  - `scan` or `apply … confirm` (see below)
+  - For `apply`: `zombies` | `orphans` | `ghosts` | `all`, then literal `confirm`, optional integer **max per bucket** (default 30, max 200)
+- **Usage**:
+  - `.checker reconcilecancel scan`
+  - `.checker reconcilecancel apply zombies confirm`
+  - `.checker reconcilecancel apply orphans confirm`
+  - `.checker reconcilecancel apply ghosts confirm`
+  - `.checker reconcilecancel apply all confirm 40`
+  - `.checker reconcilecancel help`
+- **Admin Only**: Yes (requires administrator permissions)
+- **Returns**: Scan = embed with counts + sample IDs; apply = summary line (zombies_closed, orphans_deleted, ghosts_marked, failed)
+- **Notes**:
+  - Run only in `support_tickets.guild_id` (bot replies with an error in other guilds)
+  - **Zombies**: index row is CLOSED `cancellation` but the channel still exists under the cancellation category (delete channel, no transcript)
+  - **Orphans**: channel under cancellation category, name `cancel-*`, valid RS ticket topic, but **no** index row for that channel (delete channel, no transcript)
+  - **Unsafe** (scan only): `cancel-*` name but missing/invalid ticket topic — **not** auto-deleted; fix manually
+  - **Ghosts**: OPEN `cancellation` in index but Discord channel is gone — marks index CLOSED and removes cancellation ticket role best-effort
+  - **OPEN but not in cancel category** (scan only): e.g. moved to churn manually — listed for visibility; not changed by apply
+
 #### `.checker syncsummary`
 - **Description**: DM a boss-friendly report to the invoker. With **no dates**, it re-sends the latest **Whop Sync Summary + CSV** (from `#whop-sync-summary` mirror). With **dates**, it generates a **Whop memberships joined report** filtered by **Whop “Joined at”** (membership `created_at`, with `date_joined` fallback) and DMs an embed + CSV.
 - **Aliases**: `whopsync`, `whopsyncsummary`, `sync-report`
@@ -239,8 +262,8 @@ These commands are only available **inside an OPEN support ticket channel** and 
 
 ## Command Summary
 
-- **Total Commands**: 19
-- **Admin Commands**: 17 (the `.checker` commands require administrator permissions)
+- **Total Commands**: 21
+- **Admin Commands**: 18 (the `.checker` commands require administrator permissions)
 - **Public Commands**: 0
 - **Commands with Aliases**: 11
 - **Command Prefix**: `.checker` (dot prefix) + `!` (ticket channels only)

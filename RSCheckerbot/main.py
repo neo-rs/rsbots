@@ -11529,6 +11529,163 @@ async def fix_no_whop_roles(ctx, billing_role_id: str = "", confirm: str = ""):
     )
 
 
+def _support_tickets_guild_id() -> int:
+    st = config.get("support_tickets") if isinstance(config, dict) else {}
+    try:
+        return int(st.get("guild_id") or 0)
+    except Exception:
+        return 0
+
+
+@bot.command(name="reconcilecancel", aliases=["reconcile-cancellation", "reconcilecancellation", "cancelreconcile"])
+@commands.has_permissions(administrator=True)
+@commands.guild_only()
+async def reconcile_cancel_cmd(ctx: commands.Context, *args: str):
+    """Scan or repair drift between cancellation category channels and tickets_index.json (admin only)."""
+    parts = [str(x or "").strip() for x in args if str(x or "").strip()]
+    sg = _support_tickets_guild_id()
+    if sg and int(ctx.guild.id) != int(sg):
+        await ctx.send("❌ Run this command in the configured `support_tickets.guild_id` server only.", delete_after=20)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    if not parts or str(parts[0]).lower() == "help":
+        await ctx.send(
+            "**Cancellation reconcile** (admin only)\n"
+            "• `.checker reconcilecancel scan` — counts + sample channel IDs (read-only)\n"
+            "• `.checker reconcilecancel apply zombies confirm` — delete channels still in cancellation category but index is CLOSED (no transcript)\n"
+            "• `.checker reconcilecancel apply orphans confirm` — delete `cancel-*` channels with valid ticket topic but **no** index row (no transcript)\n"
+            "• `.checker reconcilecancel apply ghosts confirm` — mark OPEN index rows CLOSED when the Discord channel is gone\n"
+            "• `.checker reconcilecancel apply all confirm [max]` — run zombies, then orphans, then ghosts (each bucket capped)\n"
+            "Optional last arg: max actions per bucket (default 30, max 200).",
+            delete_after=60,
+        )
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    sub = str(parts[0]).lower()
+    if sub == "scan":
+        scan = await support_tickets.reconcile_cancellation_scan()
+        if not bool(scan.get("ok")):
+            await ctx.send(f"❌ reconcile scan failed: `{scan.get('err')}`", delete_after=25)
+            with suppress(Exception):
+                await ctx.message.delete()
+            return
+
+        def _sample_chans(ids: list[int], lim: int = 12) -> str:
+            if not ids:
+                return "—"
+            lines = [f"<#{int(x)}>" for x in ids[:lim]]
+            if len(ids) > lim:
+                lines.append(f"… +{len(ids) - lim} more")
+            return "\n".join(lines)[:900]
+
+        def _sample_ghosts(rows: list[dict], lim: int = 8) -> str:
+            if not rows:
+                return "—"
+            out = []
+            for r in rows[:lim]:
+                out.append(f"`{r.get('ticket_id')}` ch={r.get('channel_id')}")
+            if len(rows) > lim:
+                out.append(f"… +{len(rows) - lim} more")
+            return "\n".join(out)[:900]
+
+        moved = list(scan.get("open_moved") or [])
+        moved_lines = []
+        for r in moved[:8]:
+            moved_lines.append(
+                f"`{r.get('ticket_id')}` <#{r.get('channel_id')}> cat={r.get('current_category_id')}"
+            )
+        moved_txt = "\n".join(moved_lines) if moved_lines else "—"
+        if len(moved) > 8:
+            moved_txt += f"\n… +{len(moved) - 8} more"
+
+        e = discord.Embed(
+            title="Cancellation reconcile — scan",
+            description="Compare **cancellation category** vs `tickets_index.json`.",
+            color=0x5865F2,
+        )
+        e.add_field(
+            name="Category",
+            value=f"id `{scan.get('cancellation_category_id')}` • channels in category: **{scan.get('channels_in_category')}**",
+            inline=False,
+        )
+        e.add_field(
+            name="Aligned (OPEN index + channel here)",
+            value=f"**{len(scan.get('aligned_open') or [])}**",
+            inline=True,
+        )
+        e.add_field(
+            name="Zombies (CLOSED index, channel still here)",
+            value=f"**{len(scan.get('zombies') or [])}**\n{_sample_chans(list(scan.get('zombies') or []))}",
+            inline=False,
+        )
+        e.add_field(
+            name="Orphans (no index, cancel- + ticket topic)",
+            value=f"**{len(scan.get('orphans') or [])}**\n{_sample_chans(list(scan.get('orphans') or []))}",
+            inline=False,
+        )
+        e.add_field(
+            name="Unsafe (cancel- name, bad/missing topic)",
+            value=f"**{len(scan.get('unsafe') or [])}**\n{_sample_chans(list(scan.get('unsafe') or []))}",
+            inline=False,
+        )
+        e.add_field(
+            name="Ghosts (OPEN index, channel deleted)",
+            value=f"**{len(scan.get('ghosts') or [])}**\n{_sample_ghosts(list(scan.get('ghosts') or []))}",
+            inline=False,
+        )
+        e.add_field(
+            name="OPEN but not in cancel category",
+            value=f"**{len(moved)}**\n{moved_txt[:1024]}",
+            inline=False,
+        )
+        e.set_footer(text="Apply uses no transcript for zombies/orphans • RSCheckerbot")
+        await ctx.send(embed=e, delete_after=120)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    if sub != "apply":
+        await ctx.send("❌ Unknown subcommand. Try `.checker reconcilecancel help`", delete_after=15)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    if len(parts) < 3 or str(parts[2]).lower() != "confirm":
+        await ctx.send(
+            "❌ Confirmation required. Example: `.checker reconcilecancel apply zombies confirm`",
+            delete_after=20,
+        )
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    mode = str(parts[1]).lower()
+    cap = 30
+    if len(parts) >= 4 and str(parts[3]).isdigit():
+        cap = int(parts[3])
+
+    with suppress(Exception):
+        await ctx.send(f"⏳ reconcile apply `{mode}` (max {cap} per bucket)…", delete_after=15)
+    res = await support_tickets.reconcile_cancellation_apply(mode=mode, max_actions=int(cap))
+    if not bool(res.get("ok")):
+        await ctx.send(f"❌ apply failed: `{res.get('err')}`", delete_after=25)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+    await ctx.send(
+        f"✅ reconcile apply **{mode}** — zombies_closed={res.get('zombies_closed')} "
+        f"orphans_deleted={res.get('orphans_deleted')} ghosts_marked={res.get('ghosts_marked')} "
+        f"failed={res.get('failed')}",
+        delete_after=45,
+    )
+    with suppress(Exception):
+        await ctx.message.delete()
+
+
 @bot.command(name="transcript")
 @support_tickets.staff_check_for_ctx()
 @commands.guild_only()
