@@ -1810,6 +1810,11 @@ def _aff_short_err(s: Optional[str], n: int = 160) -> str:
     return t if len(t) <= n else (t[:n] + "...")
 
 
+def _is_mavely_unsupported(err_msg: Optional[str]) -> bool:
+    m = (err_msg or "").strip().lower()
+    return ("merchant not supported" in m) or ("brand not found" in m)
+
+
 async def _mavely_rewrap_short_link_from_merchant_url(
     cfg: dict,
     u: str,
@@ -2220,10 +2225,6 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
         if _is_cloudflare_or_cdn_error_landing(target):
             target = raw
             resolved[u] = target
-
-        def _is_mavely_unsupported(err_msg: Optional[str]) -> bool:
-            m = (err_msg or "").strip().lower()
-            return ("merchant not supported" in m) or ("brand not found" in m)
 
         # Skip affiliate rewriting for configured marketplace domains.
         # Still allow expansion/unwrapping to surface the final destination when available.
