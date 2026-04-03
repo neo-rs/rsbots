@@ -31,16 +31,17 @@ RSForwarder is a standalone bot for forwarding messages from RS Server channels 
 - **Returns**: Embed with a short **how to change** block (`!rsadd`, `!rsupdate`, `!rsview`, `!rsremove`) and pointer to **`Canonical_SOP_with_Explainable_Logging.md`** (mirror-world repo) for deploy / `!whereami` verification. Each webhook row shows **active** vs **⚠️ stale** (URL in secrets but webhook deleted in Discord) and, when valid, **Posts to: `<#destination>`** so you open the correct channel’s Integrations.
 
 #### `!rsupdate`
-- **Description**: Update an existing forwarding job
+- **Description**: Update an existing forwarding job — **interactive menus** (no pasted webhook URL) or **manual** line for scripts
 - **Aliases**: `update`
-- **Parameters**: 
-  - `source_channel`: Discord channel mention or channel ID (required)
-  - `destination_webhook_url`: Webhook URL (optional)
-  - `role_id`: Role ID (optional)
-  - `text`: Text for role mention (optional)
-- **Usage**: `!rsupdate #personal-deals <WEBHOOK_URL> 886824827745337374 "new text"`
-- **Admin Only**: No (but requires channel access)
-- **Returns**: Updated configuration confirmation. If a webhook URL is provided, it is saved server-side in `config.secrets.json -> destination_webhooks`.
+- **Parameters**:
+  - **Interactive:** none, or only `source_channel` to skip the “pick source” step
+  - **Manual:** `source_channel` + at least one of: `destination_webhook_url` (full `https://discord.com/api/webhooks/...`), `role_id`, or keyword `text=…`
+- **Usage**:
+  - `!rsupdate` — dropdown: pick **source** → pick **Destination (webhook)** / **Role** / **Extra text** (same auto-webhook behavior as `!rsadd`)
+  - `!rsupdate #price-error-glitched` — start at “what to update” for that source
+  - Manual: `!rsupdate #personal-deals <WEBHOOK_URL> 886824827745337374 "new text"`
+- **Admin Only**: No (but requires channel access; destination/role pickers use the server you run the command in)
+- **Returns**: Confirmation embed (manual) or live message with selects (interactive). **In-place repost** sources only show role / extra text (no destination webhook).
 
 #### `!rsview`
 - **Description**: View details of a specific forwarding job

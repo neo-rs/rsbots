@@ -5784,103 +5784,415 @@ class RSForwarderBot:
         @self.bot.command(name='rsupdate', aliases=['update'])
         async def update_channel(ctx, source_channel: discord.TextChannel = None, destination_webhook_url: str = None,
                                 role_id: str = None, *, text: str = None):
-            """Update an existing forwarding job
-            
-            Usage: !rsupdate <#channel|channel_id> [webhook_url] [role_id] [text]
-            
-            Examples:
-            !rsupdate #personal-deals <WEBHOOK_URL> 886824827745337374 "new text"
-            !rsupdate 1446174806981480578 <WEBHOOK_URL>
             """
-            if not source_channel:
-                await ctx.send(
-                    "❌ **Usage:** `!rsupdate <#channel|channel_id> [webhook_url] [role_id] [text]`\n\n"
-                    "**Examples:**\n"
-                    "`!rsupdate #personal-deals <WEBHOOK_URL> 886824827745337374 \"new text\"`\n"
-                    "`!rsupdate 1446174806981480578 <WEBHOOK_URL>`"
+            Update an existing forwarding job.
+
+            **Interactive (menus):** `!rsupdate` or `!rsupdate #source`
+            **Manual (scripts):** `!rsupdate #source <https://discord.com/api/webhooks/...> [role_id] [text]`
+            """
+            wh_raw = (destination_webhook_url or "").strip()
+            manual_webhook = wh_raw.startswith("https://discord.com/api/webhooks/")
+            manual_role = role_id is not None
+            manual_text = text is not None
+            wants_manual = manual_webhook or manual_role or manual_text
+
+            if wants_manual:
+                if not source_channel:
+                    await ctx.send(
+                        "❌ Manual mode needs the **source** channel first.\n"
+                        "**Example:** `!rsupdate #personal-deals <WEBHOOK_URL>`\n"
+                        "Tip: run **`!rsupdate`** with no args for **click menus** (no pasted webhook URL)."
+                    )
+                    return
+                source_channel_id = str(source_channel.id)
+                channel_name = source_channel.name
+                existing = self.get_channel_config(source_channel_id)
+                if not existing:
+                    await ctx.send(
+                        f"❌ Channel `{channel_name}` ({source_channel_id}) is not configured.\nUse `!rsadd` first."
+                    )
+                    return
+                updated = False
+                if manual_webhook:
+                    ok = self._set_destination_webhook_secret(source_channel_id, wh_raw)
+                    if not ok:
+                        await ctx.send("❌ Failed to write webhook into `config.secrets.json`.")
+                        return
+                    existing["destination_webhook_url"] = wh_raw
+                    updated = True
+                if manual_role:
+                    try:
+                        int(str(role_id).strip())
+                    except ValueError:
+                        await ctx.send("❌ `role_id` must be numeric.")
+                        return
+                    existing.setdefault("role_mention", {})
+                    existing["role_mention"]["role_id"] = str(role_id).strip()
+                    updated = True
+                if manual_text:
+                    existing.setdefault("role_mention", {})
+                    existing["role_mention"]["text"] = str(text or "").strip()
+                    updated = True
+                if not updated:
+                    await ctx.send("❌ Nothing to apply.")
+                    return
+                self.save_config()
+                self.load_config()
+                embed = discord.Embed(
+                    title="✅ Forwarding Job Updated",
+                    color=discord.Color.blue(),
+                    description=f"Updated `{channel_name}`",
                 )
-                return
-            
-            source_channel_id = str(source_channel.id)
-            channel_name = source_channel.name
-            
-            # Find existing channel config
-            existing = self.get_channel_config(source_channel_id)
-            if not existing:
-                await ctx.send(
-                    f"❌ Channel `{channel_name}` ({source_channel_id}) is not configured!\n"
-                    f"Use `!rsadd` to add it first."
-                )
-                return
-            
-            # Update fields if provided
-            updated = False
-            if destination_webhook_url:
-                if not destination_webhook_url.startswith('https://discord.com/api/webhooks/'):
-                    await ctx.send("❌ Invalid webhook URL format. Must be a Discord webhook URL.")
-                    return
-                ok = self._set_destination_webhook_secret(source_channel_id, destination_webhook_url.strip())
-                if not ok:
-                    await ctx.send("❌ Failed to write webhook into `config.secrets.json`. Check file permissions on the server.")
-                    return
-                # Keep in-memory value for display; it won't be written to config.json
-                existing["destination_webhook_url"] = destination_webhook_url.strip()
-                updated = True
-            
-            if role_id is not None:
-                try:
-                    int(role_id)  # Validate format
-                except ValueError:
-                    await ctx.send("❌ Invalid role ID format. Role ID must be a number.")
-                    return
-                if "role_mention" not in existing:
-                    existing["role_mention"] = {}
-                existing["role_mention"]["role_id"] = role_id.strip()
-                updated = True
-            
-            if text is not None:
-                if "role_mention" not in existing:
-                    existing["role_mention"] = {}
-                existing["role_mention"]["text"] = text.strip()
-                updated = True
-            
-            if not updated:
-                await ctx.send("❌ No fields to update. Provide at least one: webhook_url, role_id, or text.")
-                return
-            
-            # Save changes
-            self.save_config()
-            self.load_config()
-            
-            # Build confirmation message
-            embed = discord.Embed(
-                title="✅ Forwarding Job Updated",
-                color=discord.Color.blue(),
-                description=f"Updated configuration for `{channel_name}`"
-            )
-            
-            webhook = existing.get("destination_webhook_url", "")
-            role_config = existing.get("role_mention", {})
-            
-            embed.add_field(
-                name="📥 Source Channel",
-                value=f"`{channel_name}`\nID: `{source_channel_id}`",
-                inline=True
-            )
-            embed.add_field(
-                name="📤 Destination",
-                value="Webhook configured (saved to secrets)" if webhook else "Not set",
-                inline=True
-            )
-            
-            if role_config.get("role_id"):
+                wv = existing.get("destination_webhook_url", "")
+                rc = existing.get("role_mention", {})
+                embed.add_field(name="📥 Source", value=f"`{channel_name}`\n`{source_channel_id}`", inline=True)
                 embed.add_field(
-                    name="📢 Role Mention",
-                    value=f"<@&{role_config.get('role_id')}> {role_config.get('text', '')}",
-                    inline=False
+                    name="📤 Destination",
+                    value="Webhook saved to secrets" if wv else "Not set",
+                    inline=True,
                 )
-            
-            await ctx.send(embed=embed)
+                if rc.get("role_id"):
+                    embed.add_field(
+                        name="📢 Role",
+                        value=f"<@&{rc.get('role_id')}> {rc.get('text', '')}",
+                        inline=False,
+                    )
+                await ctx.send(embed=embed)
+                return
+
+            if not isinstance(getattr(ctx, "channel", None), discord.TextChannel):
+                await ctx.send("❌ Run `!rsupdate` in a server text channel.")
+                return
+
+            owner_id = int(getattr(getattr(ctx, "author", None), "id", 0) or 0)
+            pre_src: Optional[str] = None
+            if source_channel is not None:
+                pre_src = str(source_channel.id)
+                if not self.get_channel_config(pre_src):
+                    await ctx.send(
+                        f"❌ <#{pre_src}> is not a configured forward source. Use `!rsadd` first, or run `!rsupdate` without args to pick from the list."
+                    )
+                    return
+
+            bot_ref = self
+
+            class _RoleTextModal(discord.ui.Modal, title="Role mention — extra text"):
+                def __init__(self, src_key: str, current: str):
+                    super().__init__(timeout=300)
+                    self._src_key = src_key
+                    self._inp = discord.ui.TextInput(
+                        label="Text after the role ping (optional)",
+                        default=current[:200] if current else "",
+                        style=discord.TextStyle.short,
+                        required=False,
+                        max_length=200,
+                    )
+                    self.add_item(self._inp)
+
+                async def on_submit(self, interaction: discord.Interaction):
+                    if owner_id and int(interaction.user.id) != owner_id:
+                        await interaction.response.send_message("❌ Not your wizard.", ephemeral=True)
+                        return
+                    ex = bot_ref.get_channel_config(self._src_key)
+                    if not ex:
+                        await interaction.response.send_message("❌ Source no longer configured.", ephemeral=True)
+                        return
+                    ex.setdefault("role_mention", {})
+                    ex["role_mention"]["text"] = str(self._inp.value or "").strip()
+                    bot_ref.save_config()
+                    bot_ref.load_config()
+                    await interaction.response.send_message("✅ Role extra text saved.", ephemeral=True)
+
+            class _RsUpdateWizardView(discord.ui.View):
+                def __init__(self):
+                    super().__init__(timeout=600)
+                    self._message: Optional[discord.Message] = None
+                    self._src_key: Optional[str] = pre_src
+                    self._step = "pick_source" if pre_src is None else "pick_action"
+                    self._rebuild()
+
+                async def _guard(self, interaction: discord.Interaction) -> bool:
+                    if owner_id and int(interaction.user.id) != owner_id:
+                        await interaction.response.send_message(
+                            "❌ This wizard is not for you. Run `!rsupdate` yourself.",
+                            ephemeral=True,
+                        )
+                        return False
+                    return True
+
+                def _cfg_channels(self) -> List[Dict[str, Any]]:
+                    chans = (bot_ref.config or {}).get("channels") or []
+                    return chans if isinstance(chans, list) else []
+
+                async def _embed(self) -> discord.Embed:
+                    emb = discord.Embed(title="RSForwarder — Update mapping", color=discord.Color.blurple())
+                    if self._step == "pick_source":
+                        rows = [
+                            c
+                            for c in self._cfg_channels()
+                            if str((c or {}).get("source_channel_id") or "").strip()
+                        ][:25]
+                        if not rows:
+                            emb.description = "No forward sources configured. Use **`!rsadd`** first."
+                        else:
+                            emb.description = "Choose the **source** channel whose forward job you want to change."
+                    elif self._step == "pick_action":
+                        emb.description = f"Source: <#{self._src_key}>\n\nChoose **what** to update."
+                    elif self._step == "pick_dest":
+                        emb.description = (
+                            f"Source: <#{self._src_key}>\n\nPick the **destination** channel where forwarded "
+                            f"messages should appear. RSForwarder will **create or reuse** a webhook there "
+                            f"(same as `!rsadd`)."
+                        )
+                    elif self._step == "pick_role":
+                        emb.description = f"Source: <#{self._src_key}>\n\nPick the **role** to ping on forwards."
+                    return emb
+
+                def _rebuild(self) -> None:
+                    self.clear_items()
+                    if self._step == "pick_source":
+                        opts: List[discord.SelectOption] = []
+                        for ch in self._cfg_channels()[:25]:
+                            sid = str((ch or {}).get("source_channel_id") or "").strip()
+                            if not sid:
+                                continue
+                            nm = str((ch or {}).get("source_channel_name") or sid)[:95]
+                            opts.append(discord.SelectOption(label=nm, value=sid, description=f"id {sid}"[:100]))
+                        if not opts:
+                            btn = discord.ui.Button(label="Close", style=discord.ButtonStyle.secondary, row=2)
+
+                            async def _close(i: discord.Interaction):
+                                self.stop()
+                                await i.response.edit_message(view=None)
+
+                            btn.callback = _close  # type: ignore[assignment]
+                            self.add_item(btn)
+                            return
+                        sel = discord.ui.Select(placeholder="Select source channel…", min_values=1, max_values=1, options=opts, row=0)
+
+                        async def _on_src(i: discord.Interaction):
+                            if not await self._guard(i):
+                                return
+                            self._src_key = str(i.data.get("values", [""])[0] or "").strip()
+                            if not bot_ref.get_channel_config(self._src_key):
+                                await i.response.send_message("❌ That source is not configured.", ephemeral=True)
+                                return
+                            self._step = "pick_action"
+                            self._rebuild()
+                            await i.response.edit_message(embed=await self._embed(), view=self)
+
+                        sel.callback = _on_src  # type: ignore[assignment]
+                        self.add_item(sel)
+                    elif self._step == "pick_action":
+                        ex = bot_ref.get_channel_config(self._src_key or "") or {}
+                        in_place = bool(ex.get("repost_in_place"))
+                        act_opts: List[discord.SelectOption] = []
+                        if not in_place:
+                            act_opts.append(
+                                discord.SelectOption(
+                                    label="Destination (webhook)",
+                                    value="dest",
+                                    description="Pick channel → auto create/reuse webhook",
+                                )
+                            )
+                        act_opts.extend(
+                            [
+                                discord.SelectOption(label="Role to ping", value="role", description="Choose @role from this server"),
+                                discord.SelectOption(
+                                    label="Extra text after role ping",
+                                    value="roletext",
+                                    description="Short line (e.g. “deals found”)",
+                                ),
+                            ]
+                        )
+                        asel = discord.ui.Select(
+                            placeholder="What do you want to update?",
+                            min_values=1,
+                            max_values=1,
+                            options=act_opts,
+                            row=0,
+                        )
+
+                        async def _on_act(i: discord.Interaction):
+                            if not await self._guard(i):
+                                return
+                            v = str(i.data.get("values", [""])[0] or "")
+                            if v == "dest":
+                                self._step = "pick_dest"
+                                self._rebuild()
+                                await i.response.edit_message(embed=await self._embed(), view=self)
+                                return
+                            if v == "role":
+                                self._step = "pick_role"
+                                self._rebuild()
+                                await i.response.edit_message(embed=await self._embed(), view=self)
+                                return
+                            if v == "roletext":
+                                cur = str((ex.get("role_mention") or {}).get("text") or "")
+                                await i.response.send_modal(_RoleTextModal(self._src_key or "", cur))
+                                return
+
+                        asel.callback = _on_act  # type: ignore[assignment]
+                        self.add_item(asel)
+
+                        back = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary, row=2)
+
+                        async def _back(i: discord.Interaction):
+                            if not await self._guard(i):
+                                return
+                            if pre_src is None:
+                                self._src_key = None
+                                self._step = "pick_source"
+                                self._rebuild()
+                                await i.response.edit_message(embed=await self._embed(), view=self)
+                            else:
+                                self.stop()
+                                await i.response.edit_message(
+                                    content="✅ Closed (you started with a fixed source channel). Run `!rsupdate` again to change another job.",
+                                    embed=None,
+                                    view=None,
+                                )
+
+                        back.callback = _back  # type: ignore[assignment]
+                        self.add_item(back)
+                    elif self._step == "pick_dest":
+                        ch_sel = discord.ui.ChannelSelect(
+                            custom_id="rsupdate_dest_ch",
+                            placeholder="Destination channel for webhook…",
+                            channel_types=[
+                                discord.ChannelType.text,
+                                discord.ChannelType.news,
+                                discord.ChannelType.public_thread,
+                                discord.ChannelType.private_thread,
+                            ],
+                            min_values=1,
+                            max_values=1,
+                            row=0,
+                        )
+
+                        async def _on_ch(i: discord.Interaction):
+                            if not await self._guard(i):
+                                return
+                            raw = (i.data.get("values") or [None])[0]
+                            try:
+                                cid = int(raw)
+                            except Exception:
+                                await i.response.send_message("❌ Bad channel id.", ephemeral=True)
+                                return
+                            ch_obj = i.guild.get_channel(cid) if i.guild else None
+                            if ch_obj is None:
+                                try:
+                                    ch_obj = await i.client.fetch_channel(cid)
+                                except Exception:
+                                    ch_obj = None
+                            if not isinstance(ch_obj, (discord.TextChannel, discord.Thread)):
+                                await i.response.send_message("❌ Pick a text channel or thread.", ephemeral=True)
+                                return
+                            await i.response.defer(ephemeral=True)
+                            ok_wh, msg_wh, wh_url = await bot_ref._get_or_create_destination_webhook_url(ch_obj)
+                            if not ok_wh or not wh_url:
+                                await i.followup.send(f"❌ {msg_wh}", ephemeral=True)
+                                return
+                            sk = self._src_key or ""
+                            ex2 = bot_ref.get_channel_config(sk)
+                            if not ex2:
+                                await i.followup.send("❌ Source config missing.", ephemeral=True)
+                                return
+                            if not bot_ref._set_destination_webhook_secret(sk, wh_url):
+                                await i.followup.send("❌ Failed to write secrets.", ephemeral=True)
+                                return
+                            ex2["destination_webhook_url"] = wh_url
+                            bot_ref.save_config()
+                            bot_ref.load_config()
+                            await i.followup.send(
+                                f"✅ Webhook updated. Posts go to <#{getattr(ch_obj, 'id', 0)}>.",
+                                ephemeral=True,
+                            )
+                            self.stop()
+                            try:
+                                if self._message:
+                                    await self._message.edit(view=None)
+                            except Exception:
+                                pass
+
+                        ch_sel.callback = _on_ch  # type: ignore[assignment]
+                        self.add_item(ch_sel)
+                        b2 = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary, row=2)
+
+                        async def _b2(i: discord.Interaction):
+                            if not await self._guard(i):
+                                return
+                            self._step = "pick_action"
+                            self._rebuild()
+                            await i.response.edit_message(embed=await self._embed(), view=self)
+
+                        b2.callback = _b2  # type: ignore[assignment]
+                        self.add_item(b2)
+                    elif self._step == "pick_role":
+                        r_sel = discord.ui.RoleSelect(
+                            custom_id="rsupdate_role",
+                            placeholder="Role to mention on forwards…",
+                            min_values=1,
+                            max_values=1,
+                            row=0,
+                        )
+
+                        async def _on_r(i: discord.Interaction):
+                            if not await self._guard(i):
+                                return
+                            raw = (i.data.get("values") or [None])[0]
+                            try:
+                                rid = int(raw)
+                            except Exception:
+                                await i.response.send_message("❌ Bad role id.", ephemeral=True)
+                                return
+                            sk = self._src_key or ""
+                            ex3 = bot_ref.get_channel_config(sk)
+                            if not ex3:
+                                await i.response.send_message("❌ Source config missing.", ephemeral=True)
+                                return
+                            ex3.setdefault("role_mention", {})
+                            ex3["role_mention"]["role_id"] = str(rid)
+                            bot_ref.save_config()
+                            bot_ref.load_config()
+                            self._step = "pick_action"
+                            self._rebuild()
+                            emb_ok = await self._embed()
+                            emb_ok.add_field(
+                                name="Last change",
+                                value=f"✅ Role set to <@&{rid}>",
+                                inline=False,
+                            )
+                            await i.response.edit_message(embed=emb_ok, view=self)
+
+                        r_sel.callback = _on_r  # type: ignore[assignment]
+                        self.add_item(r_sel)
+                        b3 = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary, row=2)
+
+                        async def _b3(i: discord.Interaction):
+                            if not await self._guard(i):
+                                return
+                            self._step = "pick_action"
+                            self._rebuild()
+                            await i.response.edit_message(embed=await self._embed(), view=self)
+
+                        b3.callback = _b3  # type: ignore[assignment]
+                        self.add_item(b3)
+
+                async def on_timeout(self) -> None:
+                    try:
+                        if self._message:
+                            await self._message.edit(view=None)
+                    except Exception:
+                        pass
+
+            view = _RsUpdateWizardView()
+            emb = await view._embed()
+            try:
+                sent = await ctx.send(embed=emb, view=view)
+                view._message = sent
+            except Exception:
+                await ctx.send(embed=emb, view=view)
         
         @self.bot.command(name='rsview', aliases=['view'])
         async def view_channel(ctx, source_channel: discord.TextChannel = None):
@@ -8201,7 +8513,7 @@ class RSForwarderBot:
                 ("`!rsstatus`", "Show bot status and configuration"),
                 ("`!rslist`", "List all configured forwarding jobs"),
                 ("`!rsadd <#channel|id> <webhook_url> [role_id] [text]`", "Add a new forwarding job"),
-                ("`!rsupdate <#channel|id> [webhook_url] [role_id] [text]`", "Update an existing forwarding job"),
+                ("`!rsupdate` (menus) or `!rsupdate #source <webhook_url> …`", "Update a forwarding job (interactive or manual)"),
                 ("`!rsview <#channel|id>`", "View details of a specific forwarding job"),
                 ("`!rsremove <#channel|id>`", "Remove a forwarding job"),
                 ("`!rstest [channel_id] [limit]`", "Test forwarding by forwarding recent messages (default: 1 message)"),
