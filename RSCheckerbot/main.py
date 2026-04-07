@@ -11732,6 +11732,92 @@ async def reconcile_cancel_cmd(ctx: commands.Context, *args: str):
         await ctx.message.delete()
 
 
+@bot.command(name="reconcilebillingcancel", aliases=["reconcile-billing-cancel", "billingcancelreconcile"])
+@commands.has_permissions(administrator=True)
+@commands.guild_only()
+async def reconcile_billing_cancel_cmd(ctx: commands.Context, *args: str):
+    """Scan or close OPEN billing tickets when the same user already has an OPEN cancellation ticket (admin only)."""
+    parts = [str(x or "").strip() for x in args if str(x or "").strip()]
+    sg = _support_tickets_guild_id()
+    if sg and int(ctx.guild.id) != int(sg):
+        await ctx.send("❌ Run this command in the configured `support_tickets.guild_id` server only.", delete_after=20)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    if not parts or str(parts[0]).lower() == "help":
+        await ctx.send(
+            "**Billing vs cancellation overlap** (admin only)\n"
+            "• `.checker reconcilebillingcancel scan` — list users with **both** OPEN billing + OPEN cancellation\n"
+            "• `.checker reconcilebillingcancel apply confirm` — close billing (transcript + delete) for each overlap\n"
+            "• `.checker reconcilebillingcancel apply confirm 50` — optional max closes (default 30, max 200)\n"
+            "Use after deploy to clean historical double-open tickets; new events use the billing→cancellation handoff in code.",
+            delete_after=75,
+        )
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    sub = str(parts[0]).lower()
+    if sub == "scan":
+        scan = await support_tickets.reconcile_billing_vs_cancellation_scan()
+        if not bool(scan.get("ok")):
+            await ctx.send(f"❌ scan failed: `{scan.get('err')}`", delete_after=25)
+            with suppress(Exception):
+                await ctx.message.delete()
+            return
+        cands = list(scan.get("candidates") or [])
+        lines: list[str] = []
+        for row in cands[:15]:
+            uid = int((row or {}).get("user_id") or 0)
+            bch = int((row or {}).get("billing_channel_id") or 0)
+            cch = int((row or {}).get("cancellation_channel_id") or 0)
+            lines.append(f"<@{uid}> billing <#{bch}> • cancel <#{cch}>")
+        body = "\n".join(lines) if lines else "—"
+        if len(cands) > 15:
+            body += f"\n… +{len(cands) - 15} more"
+        e = discord.Embed(
+            title="Billing vs cancellation — scan",
+            description=f"Users with **both** OPEN billing and OPEN cancellation: **{len(cands)}**",
+            color=0x5865F2,
+        )
+        e.add_field(name="Sample", value=body[:1024] or "—", inline=False)
+        e.set_footer(text="apply confirm closes billing only • RSCheckerbot")
+        await ctx.send(embed=e, delete_after=120)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    if sub != "apply" or len(parts) < 2 or str(parts[1]).lower() != "confirm":
+        await ctx.send(
+            "❌ Try `.checker reconcilebillingcancel scan` or `.checker reconcilebillingcancel apply confirm`",
+            delete_after=20,
+        )
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    cap = 30
+    if len(parts) >= 3 and str(parts[2]).isdigit():
+        cap = int(parts[2])
+
+    with suppress(Exception):
+        await ctx.send(f"⏳ Closing overlapping billing tickets (max {cap})…", delete_after=15)
+    res = await support_tickets.reconcile_billing_vs_cancellation_apply(max_actions=int(cap))
+    if not bool(res.get("ok")):
+        await ctx.send(f"❌ apply failed: `{res.get('err')}`", delete_after=25)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+    await ctx.send(
+        f"✅ reconcile billing↔cancel overlap — closed_billing={res.get('closed')} failed={res.get('failed')} "
+        f"skipped_cap={res.get('skipped')} total_candidates={res.get('total_candidates')}",
+        delete_after=45,
+    )
+    with suppress(Exception):
+        await ctx.message.delete()
+
+
 @bot.command(name="transcript")
 @support_tickets.staff_check_for_ctx()
 @commands.guild_only()

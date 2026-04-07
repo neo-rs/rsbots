@@ -6545,6 +6545,106 @@ async def reconcile_cancellation_apply(
     return stats
 
 
+def _users_with_open_billing_and_cancellation(db: dict) -> list[dict[str, int]]:
+    """User IDs that have both an OPEN billing and an OPEN cancellation ticket (index truth)."""
+    open_by_user: dict[int, dict[str, int]] = {}
+    for _tid, rec in _ticket_iter(db):
+        if not _ticket_is_open(rec):
+            continue
+        ttype = str(rec.get("ticket_type") or "").strip().lower()
+        if ttype not in {"billing", "cancellation"}:
+            continue
+        uid = _as_int(rec.get("user_id"))
+        if uid <= 0:
+            continue
+        ch = _as_int(rec.get("channel_id"))
+        slot = open_by_user.setdefault(uid, {})
+        slot[ttype] = ch
+    out: list[dict[str, int]] = []
+    for uid, slots in open_by_user.items():
+        if "billing" in slots and "cancellation" in slots:
+            out.append(
+                {
+                    "user_id": int(uid),
+                    "billing_channel_id": int(slots.get("billing") or 0),
+                    "cancellation_channel_id": int(slots.get("cancellation") or 0),
+                }
+            )
+    return out
+
+
+async def reconcile_billing_vs_cancellation_scan() -> dict[str, object]:
+    """Read-only: list users with OPEN billing + OPEN cancellation (overlap to clean up)."""
+    out: dict[str, object] = {"ok": False, "err": "", "candidates": []}
+    if not _ensure_cfg_loaded():
+        out["err"] = "support_tickets not initialized"
+        return out
+    async with _INDEX_LOCK:
+        db = _index_load()
+        candidates = _users_with_open_billing_and_cancellation(db)
+    out["candidates"] = candidates
+    out["ok"] = True
+    return out
+
+
+async def reconcile_billing_vs_cancellation_apply(
+    *,
+    max_actions: int = 30,
+    close_reason: str = "reconcile: open_cancellation_ticket_exists",
+) -> dict[str, object]:
+    """Close OPEN billing tickets for users who also have an OPEN cancellation ticket (transcript + delete)."""
+    if not _ensure_cfg_loaded():
+        return {"ok": False, "err": "support_tickets not initialized", "closed": 0, "failed": 0, "skipped": 0, "total_candidates": 0}
+
+    cap = max(1, min(int(max_actions or 30), 200))
+    async with _INDEX_LOCK:
+        db = _index_load()
+        candidates = _users_with_open_billing_and_cancellation(db)
+    total = len(candidates)
+    to_process = candidates[:cap]
+    skipped = max(0, total - len(to_process))
+
+    closed = 0
+    failed = 0
+    reason = str(close_reason or "reconcile: open_cancellation_ticket_exists").strip() or "reconcile: open_cancellation_ticket_exists"
+
+    for row in to_process:
+        uid = _as_int((row or {}).get("user_id"))
+        if uid <= 0:
+            failed += 1
+            continue
+        try:
+            ok = await close_open_ticket_for_user(
+                int(uid),
+                ticket_type="billing",
+                close_reason=reason,
+                do_transcript=True,
+                delete_channel=True,
+            )
+            if ok:
+                closed += 1
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+
+    with suppress(Exception):
+        await _log(
+            f"🧩 support_tickets: reconcile_billing_vs_cancellation_apply "
+            f"closed={closed} failed={failed} skipped={skipped} total_candidates={total} cap={cap}"
+        )
+
+    return {
+        "ok": True,
+        "err": "",
+        "closed": closed,
+        "failed": failed,
+        "skipped": skipped,
+        "total_candidates": total,
+        "cap": cap,
+    }
+
+
 async def get_ticket_record_for_channel_id(channel_id: int) -> dict | None:
     async with _INDEX_LOCK:
         db = _index_load()

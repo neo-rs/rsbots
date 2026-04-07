@@ -116,6 +116,23 @@ RSOnboarding never removes the Member role.
   - **Ghosts**: OPEN `cancellation` in index but Discord channel is gone — marks index CLOSED and removes cancellation ticket role best-effort
   - **OPEN but not in cancel category** (scan only): e.g. moved to churn manually — listed for visibility; not changed by apply
 
+#### `.checker reconcilebillingcancel`
+- **Description**: Find users who have **both** an OPEN **billing** ticket and an OPEN **cancellation** ticket (historical overlap), then optionally **close billing only** with transcript + channel delete. Cancellation ticket is unchanged. Complements the automatic billing→cancellation handoff on new `member-status-logs` cancellation cards.
+- **Aliases**: `reconcile-billing-cancel`, `billingcancelreconcile`
+- **Parameters**:
+  - `scan` — read-only list (sample mentions + channel links)
+  - `apply confirm` — close overlapping billing tickets; optional third arg **max closes** (default 30, max 200)
+- **Usage**:
+  - `.checker reconcilebillingcancel scan`
+  - `.checker reconcilebillingcancel apply confirm`
+  - `.checker reconcilebillingcancel apply confirm 50`
+  - `.checker reconcilebillingcancel help`
+- **Admin Only**: Yes (requires administrator permissions)
+- **Returns**: Scan = embed with count + sample rows; apply = summary (`closed_billing`, `failed`, `skipped_cap`, `total_candidates`)
+- **Notes**:
+  - Run only in `support_tickets.guild_id` (bot replies with an error in other guilds)
+  - **Apply** uses `close_open_ticket_for_user` for `billing` (transcript + delete per config); billing role removed by existing close path
+
 #### `.checker syncsummary`
 - **Description**: DM a boss-friendly report to the invoker. With **no dates**, it re-sends the latest **Whop Sync Summary + CSV** (from `#whop-sync-summary` mirror). With **dates**, it generates a **Whop memberships joined report** filtered by **Whop “Joined at”** (membership `created_at`, with `date_joined` fallback) and DMs an embed + CSV.
 - **Aliases**: `whopsync`, `whopsyncsummary`, `sync-report`
@@ -262,10 +279,10 @@ These commands are only available **inside an OPEN support ticket channel** and 
 
 ## Command Summary
 
-- **Total Commands**: 21
-- **Admin Commands**: 18 (the `.checker` commands require administrator permissions)
+- **Total Commands**: 22
+- **Admin Commands**: 19 (the `.checker` commands require administrator permissions)
 - **Public Commands**: 0
-- **Commands with Aliases**: 11
+- **Commands with Aliases**: 12
 - **Command Prefix**: `.checker` (dot prefix) + `!` (ticket channels only)
 
 ## Notes
