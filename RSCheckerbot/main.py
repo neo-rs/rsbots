@@ -6,6 +6,7 @@ import re
 import csv
 import io
 import time
+import random
 import hashlib
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -3172,6 +3173,33 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                     )
                     await _whop_movement_send(content="", embed=e_blk)
                     return
+
+            billing_closed_for_handoff = False
+            had_open_billing_ticket = False
+
+            with suppress(Exception):
+                had_open_billing_ticket = await support_tickets.has_open_ticket_for_user(
+                    ticket_type="billing",
+                    user_id=int(did_i),
+                )
+
+            if had_open_billing_ticket:
+                with suppress(Exception):
+                    billing_closed_for_handoff = await support_tickets.close_open_ticket_for_user(
+                        int(did_i),
+                        ticket_type="billing",
+                        close_reason="moved_to_cancellation_flow",
+                        do_transcript=True,
+                        delete_channel=True,
+                    )
+
+            if had_open_billing_ticket:
+                with suppress(Exception):
+                    await log_other(
+                        f"🔁 SupportTickets: billing→cancellation handoff for `{did_i}` "
+                        f"closed_billing={'yes' if billing_closed_for_handoff else 'no'}"
+                    )
+
             ch_created = await support_tickets.open_cancellation_ticket(
                 member=member,
                 whop_brief=whop_brief if isinstance(whop_brief, dict) else {},
@@ -3189,6 +3217,10 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                     reasons.append("title contains 'deactivated'")
                 if reason:
                     reasons.append("cancellation reason field present")
+                if had_open_billing_ticket:
+                    reasons.append("open billing ticket found for user")
+                if billing_closed_for_handoff:
+                    reasons.append("closed billing ticket for billing→cancellation handoff")
                 e = _fmt_whop_movement_trace(
                     trace_id=trace_id,
                     stage="TICKET_AUTOMATION_RESULT",
@@ -3198,10 +3230,18 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                     discord_id=int(did_i),
                     reads=(reasons or ["cancellation trigger matched"]),
                     decisions=["route=cancellation"],
-                    actions=[f"open_cancellation_ticket(fingerprint={fp})"],
+                    actions=[
+                        (
+                            "close_open_ticket_for_user(ticket_type=billing)"
+                            if had_open_billing_ticket
+                            else "no open billing ticket to close"
+                        ),
+                        f"open_cancellation_ticket(fingerprint={fp})",
+                    ],
                     result=[
                         (f"ticket_channel={_fmt_channel_mention(int(ch_created))}" if ch_created else "ticket_channel=—"),
                         (f"source_card={ref_url}" if ref_url else "source_card=—"),
+                        f"billing_handoff_closed={'yes' if billing_closed_for_handoff else 'no'}",
                     ],
                     technical={"cancellation_reason": str(reason or "")[:220]},
                 )

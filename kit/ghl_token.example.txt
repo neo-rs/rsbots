@@ -1,4 +1,0 @@
-Put your GHL Private Integration Bearer token on the line below (one line only).
-Then save this file as ghl_token.txt in this folder (kit\). ghl_token.txt is gitignored.
-
-pit-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
