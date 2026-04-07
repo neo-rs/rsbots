@@ -4349,12 +4349,15 @@ class SupportTicketControlsView(discord.ui.View):
             await interaction.response.send_message("⏳ Exporting transcript and closing…", ephemeral=True)
         ch_id = int(getattr(getattr(interaction, "channel", None), "id", 0) or 0)
         if ch_id:
-            await close_ticket_by_channel_id(
-                ch_id,
-                close_reason="manual_transcript",
-                do_transcript=True,
-                delete_channel=True,
-            )
+            try:
+                await close_ticket_by_channel_id(
+                    ch_id,
+                    close_reason="manual_transcript",
+                    do_transcript=True,
+                    delete_channel=True,
+                )
+            except Exception as ex:
+                await _log(f"❌ support_tickets: Transcript&Close button failed channel_id={ch_id} err={str(ex)[:400]}")
 
     @discord.ui.button(
         label="Close",
@@ -4369,12 +4372,15 @@ class SupportTicketControlsView(discord.ui.View):
             await interaction.response.send_message("⏳ Closing ticket…", ephemeral=True)
         ch_id = int(getattr(getattr(interaction, "channel", None), "id", 0) or 0)
         if ch_id:
-            await close_ticket_by_channel_id(
-                ch_id,
-                close_reason="manual_close",
-                do_transcript=True,
-                delete_channel=True,
-            )
+            try:
+                await close_ticket_by_channel_id(
+                    ch_id,
+                    close_reason="manual_close",
+                    do_transcript=True,
+                    delete_channel=True,
+                )
+            except Exception as ex:
+                await _log(f"❌ support_tickets: Close button failed channel_id={ch_id} err={str(ex)[:400]}")
 
 
 class _MembershipReportModal(discord.ui.Modal, title="Membership Report"):
@@ -5805,6 +5811,11 @@ async def export_transcript_for_channel_id(channel_id: int, *, close_reason: str
         ref_url = str(rec.get("reference_jump_url") or "")
         wym_url = str(rec.get("what_you_missed_jump_url") or "")
 
+    await _log(
+        f"📄 support_tickets: transcript export START channel_id={int(channel_id)} "
+        f"ticket_id={str(tid)} type={ticket_type} user_id={user_id} (fetching full history; may take minutes)"
+    )
+
     tx_ch = await _get_or_create_transcript_channel(guild=guild, ticket_type=ticket_type)
     if not isinstance(tx_ch, discord.TextChannel):
         await _log(f"⚠️ support_tickets: transcript channel not configured for type={ticket_type}")
@@ -5887,6 +5898,11 @@ async def export_transcript_for_channel_id(channel_id: int, *, close_reason: str
     except Exception:
         return False
 
+    await _log(
+        f"📄 support_tickets: transcript export UPLOAD ok channel_id={int(channel_id)} "
+        f"ticket_id={str(tid)} type={ticket_type} transcript_lines={len(lines)} → <#{int(tx_ch.id)}>"
+    )
+
     # Mark closed in index (channel deletion handled by caller)
     async with _INDEX_LOCK:
         db = _index_load()
@@ -5928,6 +5944,11 @@ async def close_ticket_by_channel_id(
             ticket_type = str(rec0.get("ticket_type") or "").strip().lower()
             ticket_user_id = _as_int(rec0.get("user_id"))
 
+    await _log(
+        f"🚪 support_tickets: close_ticket START channel_id={int(channel_id)} "
+        f"reason={str(close_reason or '')[:120]} transcript={bool(do_transcript)} delete_channel={bool(delete_channel)}"
+    )
+
     ch = guild.get_channel(int(channel_id))
     if not isinstance(ch, discord.TextChannel):
         # Channel gone; mark closed
@@ -5951,6 +5972,7 @@ async def close_ticket_by_channel_id(
             if isinstance(mobj, discord.Member):
                 with suppress(Exception):
                     await _set_ticket_role_for_member(guild=guild, member=mobj, ticket_type=ticket_type, add=False)
+        await _log(f"🚪 support_tickets: close_ticket DONE channel_id={int(channel_id)} (channel already missing; index closed)")
         return True
 
     if do_transcript:
@@ -5985,6 +6007,10 @@ async def close_ticket_by_channel_id(
     if delete_channel:
         with suppress(Exception):
             await ch.delete(reason=f"RSCheckerbot: close ticket ({close_reason})")
+    await _log(
+        f"🚪 support_tickets: close_ticket DONE channel_id={int(channel_id)} "
+        f"reason={str(close_reason or '')[:120]} deleted={bool(delete_channel)}"
+    )
     return True
 
 
