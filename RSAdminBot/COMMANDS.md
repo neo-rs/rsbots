@@ -67,6 +67,7 @@ These commands open a **dropdown** to pick a bot. All outputs are ephemeral.
 
 #### `/mwupdate`
 - **What**: update an MW bot from the GitHub checkout (**python-only**) and restart it
+- **Note**: **`catalognavbot`** is wired for **`botctl` / systemd / journal_live** but is **not** deployed from **`mwbots-code`** by this command. Update **`catalog_nav_bot/`** on the live mirror-world tree (e.g. `git pull` on mirror-world if tracked, SCP, or upload), then **`bash RSAdminBot/botctl.sh restart catalognavbot`**.
 
 #### `/selfupdate`
 - **What**: **safe RSAdminBot update** (staged) + service restart to apply

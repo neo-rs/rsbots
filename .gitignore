@@ -14,6 +14,7 @@
 !/oracle_server_specs_menu.bat
 !/oracle_repo_drift_scan.bat
 !/update_rs_bots.bat
+!/update_mw_bots.bat
 
 # Allow canonical docs at repo root
 !/CANONICAL_RULES.md
@@ -126,6 +127,18 @@
 !WhopMembershipSync/config.json
 !WhopMembershipSync/requirements.txt
 !WhopMembershipSync/*.bat
+
+# Catalog Navigation Bot (live mirror-world tree; token stays in local config.json only)
+!catalog_nav_bot/
+!catalog_nav_bot/**/
+!catalog_nav_bot/*.py
+!catalog_nav_bot/**/*.py
+!catalog_nav_bot/*.md
+!catalog_nav_bot/requirements.txt
+!catalog_nav_bot/config.example.json
+!catalog_nav_bot/.gitignore
+!catalog_nav_bot/*.bat
+catalog_nav_bot/data/
 
 # Allow shared scripts used by RSAdminBot (Oracle data tools)
 !scripts/

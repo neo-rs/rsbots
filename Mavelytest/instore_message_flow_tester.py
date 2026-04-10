@@ -458,6 +458,11 @@ def _collect_source_snapshot_audit(app: Any, msg: Any) -> Dict[str, Any]:
     block_err: Optional[str] = None
     try:
         block = (app._simple_message_block(msg) or "").strip()  # noqa: SLF001
+        try:
+            block = app._strip_mavely_bridge_urls_when_shortlink_present(block)  # noqa: SLF001
+            block = app._strip_mavely_influencer_urls_from_text(block)  # noqa: SLF001
+        except Exception:
+            pass
     except Exception as ex:
         block_err = f"{type(ex).__name__}: {ex}"
 
@@ -741,6 +746,11 @@ async def print_pre_flight_report(
             ga["early_exit"] = {"reason": "no_guild"}
         else:
             block = (app._simple_message_block(msg) or "").strip()  # noqa: SLF001
+            try:
+                block = app._strip_mavely_bridge_urls_when_shortlink_present(block)  # noqa: SLF001
+                block = app._strip_mavely_influencer_urls_from_text(block)  # noqa: SLF001
+            except Exception:
+                pass
             if not block:
                 print("  FAIL: empty 4D block — nothing to parse for Gemini.")
                 ga["early_exit"] = {"reason": "empty_simple_message_block"}
@@ -765,6 +775,7 @@ async def print_pre_flight_report(
                 gemini_ctx["kept"] = kept
                 gemini_ctx["desc_in"] = desc_in
                 gemini_ctx["parsed"] = parsed
+                gemini_ctx["stripped_block_for_url"] = block
                 try:
                     _loose_urls = [
                         u for (u, _, _) in affiliate_rewriter.extract_urls_with_spans(desc_in) if (u or "").strip()
@@ -901,9 +912,19 @@ async def print_pre_flight_report(
             h0 = str(gemini_ctx.get("h0") or "")
             b0 = str(gemini_ctx.get("b0") or "")
             kept = list(gemini_ctx.get("kept") or [])
-            raw_url = ""
+            raw_from_det = ""
             if det and str(getattr(det, "final_url", "") or "").strip():
-                raw_url = str(getattr(det, "final_url", "") or "").strip()
+                raw_from_det = str(getattr(det, "final_url", "") or "").strip()
+            blk = str(gemini_ctx.get("stripped_block_for_url") or "")
+            try:
+                embed_href = str(
+                    app._gemini_route_outbound_url(urls, raw_from_det, blk)  # noqa: SLF001
+                    or ""
+                ).strip()
+            except Exception:
+                embed_href = ""
+            if not embed_href and raw_from_det and not app._host_is_mavely_influencer_bridge(raw_from_det):  # noqa: SLF001
+                embed_href = raw_from_det.strip()
             ch = None
             ch_fetch_err: Optional[str] = None
             if not msg.guild:
@@ -925,39 +946,52 @@ async def print_pre_flight_report(
                 print(f"  OK: destination channel id={getattr(ch, 'id', dest_id)}")
                 if audit is not None:
                     ga["destination_channel_id"] = int(getattr(ch, "id", dest_id) or dest_id)
-            if not raw_url or not affiliate_rewriter.is_amazon_like_url(raw_url):
-                print("  FAIL: need E) Amazon OK (final_url) to rebuild description with store link")
+            if not embed_href:
+                print("  FAIL: no embed link resolved (need Amazon final_url, mavely.app.link in message, or hub URL)")
                 if audit is not None:
                     ga.setdefault(
                         "assembly_block",
-                        {"reason": "final_url_missing_or_not_amazon"},
+                        {"reason": "embed_href_missing"},
                     )
             elif not (h1 or h0) and not (b1 or b0) and not kept:
                 print("  SKIP: no structured parse from section 5 — nothing to rebuild")
             else:
-                gemini_ctx["raw_url"] = raw_url
+                h1s = app._strip_mavely_influencer_urls_from_text(h1)  # noqa: SLF001
+                b1s = app._strip_mavely_influencer_urls_from_text(b1)  # noqa: SLF001
+                kept_s: List[str] = []
+                for x in kept:
+                    k = app._strip_mavely_influencer_urls_from_text(str(x or "")).strip()  # noqa: SLF001
+                    if k:
+                        kept_s.append(k)
+                gemini_ctx["raw_url"] = embed_href
                 gemini_ctx["can_assemble"] = True
                 try:
-                    desc_out = app._rebuild_amz_deals_embed_description(h1, b1, kept, raw_url)  # noqa: SLF001
+                    desc_out = app._rebuild_amz_deals_embed_description(h1s, b1s, kept_s, embed_href)  # noqa: SLF001
                 except Exception as ex_rb:
-                    desc_out = app._rebuild_amz_deals_embed_description(h0, b0, kept, raw_url)  # noqa: SLF001
+                    desc_out = app._rebuild_amz_deals_embed_description(  # noqa: SLF001
+                        app._strip_mavely_influencer_urls_from_text(h0),  # noqa: SLF001
+                        app._strip_mavely_influencer_urls_from_text(b0),  # noqa: SLF001
+                        kept_s,
+                        embed_href,
+                    )
                     if audit is not None:
                         ga["rebuild_error"] = f"{type(ex_rb).__name__}: {ex_rb}"
+                desc_out = app._strip_mavely_influencer_urls_from_text(desc_out)  # noqa: SLF001
                 gemini_ctx["desc_rebuilt"] = desc_out
                 print(f"  Rebuilt embed.description ({len(desc_out)} chars): {_preview_text(desc_out, 560)!r}")
                 print()
                 print("  G) Outbound embed summary")
                 print(
-                    "     embed.description = **bold** headline + body + \"### Product info\" + exact kept lines "
-                    "+ plain Amazon URL (last line)"
+                    "     embed.description = **bold** headline + body + kept lines + outbound link line "
+                    "(Amazon / hub / mavely.app.link — not mavelyinfluencer.com bridge)"
                 )
-                print(f"     embed.url         = final_url from E)  ({_preview_text(raw_url, 120)})")
+                print(f"     embed.url         = {_preview_text(embed_href, 120)}")
                 print("     source embed footer was not in 4D, so it is not in OUTPUT")
                 if audit is not None:
                     ga.update(
                         {
                             "desc_out_rebuilt": desc_out,
-                            "embed_url": raw_url,
+                            "embed_url": embed_href,
                         }
                     )
 

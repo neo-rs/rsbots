@@ -33,6 +33,7 @@ units=(
   "mirror-world-dailyschedulereminder.service"
   "mirror-world-instorebotforwarder.service"
   "mirror-world-whopmembershipsync.service"
+  "mirror-world-catalognavbot.service"
 )
 
 echo "Bootstrapping shared venv..."
@@ -79,6 +80,9 @@ echo "      DailyScheduleReminder: ensure DailyScheduleReminder/config.secrets.j
 echo "        sudo systemctl restart mirror-world-dailyschedulereminder.service"
 echo "      WhopMembershipSync: ensure WhopMembershipSync/config.secrets.json has whop_api.api_key and google_service_account_json, then:"
 echo "        sudo systemctl restart mirror-world-whopmembershipsync.service"
+echo "      Catalog Nav Bot: lives under catalog_nav_bot/ on the live mirror-world tree (not mwbots-code). Ensure catalog_nav_bot/config.json has token, then:"
+echo "        sudo systemctl restart mirror-world-catalognavbot.service"
+echo "      NOTE: /mwupdate does not deploy catalog_nav_bot; update files via git pull on mirror-world (if tracked), SCP, or your file tool, then restart the service."
 
 echo "Done. Current status summary:"
 for unit in "${units[@]}"; do

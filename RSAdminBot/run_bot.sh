@@ -145,9 +145,13 @@ case "$BOT_KEY" in
     cd "$ROOT_DIR/WhopMembershipSync"
     exec "$PY" -u "main.py"
     ;;
+  catalognavbot)
+    cd "$ROOT_DIR/catalog_nav_bot"
+    exec "$PY" -u "navigation_bot.py"
+    ;;
   *)
     echo "ERROR: Unknown bot_key: $BOT_KEY"
-    echo "Valid bot_key values: rsadminbot rsforwarder rsonboarding rscheckerbot rsmentionpinger rssuccessbot rspromobot rscashoutbot datamanagerbot discumbot instorebotforwarder pingbot dailyschedulereminder whopmembershipsync"
+    echo "Valid bot_key values: rsadminbot rsforwarder rsonboarding rscheckerbot rsmentionpinger rssuccessbot rspromobot rscashoutbot datamanagerbot discumbot instorebotforwarder pingbot dailyschedulereminder whopmembershipsync catalognavbot"
     exit 1
     ;;
 esac

@@ -82,7 +82,7 @@ if errorlevel 1 (
 echo.
 echo === PUSH COMPLETE ===
 echo Pushed commit %SHA% to GitHub (origin/main)
-echo NOTE: This pushes to GitHub only. To deploy to Oracle: use RSAdminBot /mwupdate or /botsync.
+echo NOTE: This pushes to GitHub only. To deploy to Oracle: run update_mw_bots.bat from mirror-world root, or use RSAdminBot !mwupdate / /mwupdate (or /botsync).
 echo.
 echo DONE.
 set EC=0

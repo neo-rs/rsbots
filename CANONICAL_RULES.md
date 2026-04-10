@@ -213,6 +213,65 @@ When you need to run compound commands remotely, prefer a single `bash -lc`:
      - On Ubuntu, prefer **local-exec** (no SSH key required on the server)
      - `COMMANDS.md` files ARE synced (documentation files, same as .py files)
 
+### Oracle code updates: two GitHub flows (RS vs MW)
+
+These are **different repos and different push scripts**. Do not mix them.
+
+| Track | Code lives in | Push to GitHub (Windows) | Deploy to Oracle (Windows) | RSAdminBot (Discord / local-exec) |
+|-------|----------------|---------------------------|------------------------------|-----------------------------------|
+| **RS bots** | **mirror-world** repo root (`RSForwarder`, `RSAdminBot`, …) | **`push_rsbots_py_only.bat`** | **`update_rs_bots.bat`** → `run_oracle_update_bots.py --group rs` | **`!botupdate`** / **`/botupdate`** |
+| **MW bots** | Nested **`MWBots/`** git repo (`MWDiscumBot`, `MWDataManagerBot`, …) | **`push_mwbots_py_only.bat`** | **`update_mw_bots.bat`** → `run_oracle_update_bots.py --group mw` | **`!mwupdate`** / **`/mwupdate`** |
+
+On the server, both tracks **`git pull`** a separate checkout (`rsbots-code` vs `mwbots-code` per **`RSAdminBot/config.json`** → `code_checkouts`), sync into the **same live** tree (`remote_root`, usually `/home/rsadmin/bots/mirror-world`), then **`RSAdminBot/botctl.sh restart <bot_key>`**. Shell entrypoints are shared:
+
+| File | Role |
+|------|------|
+| **`RSAdminBot/run_bot.sh`** | **systemd `ExecStart` wrapper**: repo **`.venv`**, `PYTHONPATH`, starts the process for the **bot key** (RSAdminBot staging applies here for `rsadminbot`). |
+| **`RSAdminBot/botctl.sh`** | **Service control** → **`mirror-world-<bot>.service`**; **`run_oracle_update_bots.py`** calls **`botctl.sh restart`** after each synced bot. |
+| **`RSAdminBot/install_services.sh`** | Refresh **systemd units** when services change — not every push. |
+
+---
+
+### Canonical RS-bot flow: `push_rsbots_py_only.bat` → `update_rs_bots.bat`
+
+**Goal:** `main` on the **mirror-world** GitHub remote is the source of truth for RS bots; Oracle’s **live** tree receives the allowed tracked files; the service is **restarted**.
+
+**Typical sequence (Windows, mirror-world repo root):**
+
+1. **`push_rsbots_py_only.bat`**
+   - Stages **tracked** changes (`git add -u`). The script also includes **explicit `git add …` lines** for paths that are new to git — **extend those lines when you add a new top-level bot folder** or other new tracked paths.
+   - Un-stages server-owned runtime data where applicable (e.g. `RSCheckerbot/member_history.json`).
+   - Prompts for confirmation, then **commit + push** to **`origin/main`** (the remote the **server `rsbots-code` checkout** pulls from).
+
+2. **`update_rs_bots.bat`**
+   - Runs `py -3 scripts/run_oracle_update_bots.py --group rs` (extra args pass through, e.g. `update_rs_bots.bat --bot rsforwarder`).
+   - Uses **`oraclekeys/servers.json`** and SSH key resolution (see **Ubuntu access** above).
+   - On Oracle, for each chosen **bot key** (`bot_groups.rs_bots` plus **`rsadminbot`**): **`git pull --ff-only`** in **`code_checkouts.rsbots_code_root`** (default `/home/rsadmin/bots/rsbots-code`), sync into **live** tree with backup, exclusions as RSAdminBot (no `config.secrets.json`, no `member_history.json`, etc.), then **`bash RSAdminBot/botctl.sh restart <bot_key>`**.
+
+**Discord / server (no Windows):** **`!botupdate`** / **`/botupdate`** (owner-only). **`!botsync`** / **`/botsync`** syncs from operator-provided sources instead of “pull `main` only”.
+
+---
+
+### Canonical MW-bot flow: `push_mwbots_py_only.bat` → `update_mw_bots.bat`
+
+**Goal:** `main` on the **MWBots** GitHub remote is the source of truth for Mirror World bots under **`MWBots/`**; Oracle syncs from **`mwbots-code`** into the **same live** tree; **`botctl.sh restart`** for each selected MW bot key.
+
+**Typical sequence (Windows, mirror-world repo root):**
+
+1. **`push_mwbots_py_only.bat`**
+   - Changes directory to **`MWBots/`** (nested repository — **not** mirror-world root).
+   - Stages **tracked** files matching a **safe extension allowlist** via PowerShell (`.py`, `.md`, `.json`, `.txt`, `requirements.txt`), excluding secrets and runtime paths (`config.secrets.json`, `tokens.env`, `member_history.json`, Playwright profile dirs, Mavely cookie/token files, etc.).
+   - **Commit + push** to **`origin/main`** on the MWBots repo (script does not use the same interactive `choice` prompt as `push_rsbots_py_only.bat`; review `git diff --cached` output before the commit runs).
+
+2. **`update_mw_bots.bat`**
+   - Runs `py -3 scripts/run_oracle_update_bots.py --group mw` (extra args pass through, e.g. `update_mw_bots.bat --bot discumbot`).
+   - Same **`oraclekeys/servers.json`** / SSH as the RS batch file.
+   - On Oracle, for each chosen **bot key** from **`bot_groups.mirror_bots`**: **`git pull --ff-only`** in **`code_checkouts.mwbots_code_root`** (default `/home/rsadmin/bots/mwbots-code`), sync into **live** tree + backup + same exclusion model, then **`bash RSAdminBot/botctl.sh restart <bot_key>`**.
+
+**Discord / server (no Windows):** **`!mwupdate`** / **`/mwupdate`** (owner-only), as noted in `push_mwbots_py_only.bat`.
+
+**Exception — `catalognavbot` (Catalog Navigation Bot):** Code lives under **`catalog_nav_bot/`** on the **live** mirror-world tree. It is **not** copied from **`mwbots-code`** by `run_oracle_update_bots.py`, so **`!mwupdate` / `/mwupdate` must not be relied on** to deploy this bot’s Python. Track it in the **mirror-world** repo (see **`push_rsbots_py_only.bat`** `git add catalog_nav_bot`), **`git pull`** on the Oracle checkout when applicable, or upload files manually, then **`bash RSAdminBot/botctl.sh restart catalognavbot`**. It still uses the same **systemd** / **`run_bot.sh`** / **journal_live** wiring as other `mirror_bots` keys.
+
 ### Verification (canonical)
 
 - **Hashed manifest verification** must be used to verify local vs server code state:

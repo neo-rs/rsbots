@@ -5,7 +5,7 @@
 # Special bot_name: "all" or "allbots" to operate on all mirror-world bots
 #
 # This script manages mirror-world bots:
-# - datamanagerbot, pingbot, discumbot
+# - datamanagerbot, pingbot, discumbot, catalognavbot, ...
 
 set -e  # Exit on error
 
@@ -20,6 +20,7 @@ declare -A SERVICES=(
     ["instorebotforwarder"]="mirror-world-instorebotforwarder.service"
     ["pingbot"]="mirror-world-pingbot.service"
     ["whopmembershipsync"]="mirror-world-whopmembershipsync.service"
+    ["catalognavbot"]="mirror-world-catalognavbot.service"
 )
 
 # Handle "all" or "allbots" case

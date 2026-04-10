@@ -46,6 +46,7 @@ reqs=(
   "$ROOT_DIR/MWDiscumBot/requirements.txt"
   "$ROOT_DIR/DailyScheduleReminder/requirements.txt"
   "$ROOT_DIR/Instorebotforwarder/requirements.txt"
+  "$ROOT_DIR/catalog_nav_bot/requirements.txt"
 )
 
 args=()

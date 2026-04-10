@@ -47,6 +47,7 @@ declare -A SERVICES=(
   ["instorebotforwarder"]="mirror-world-instorebotforwarder.service"
   ["pingbot"]="mirror-world-pingbot.service"
   ["whopmembershipsync"]="mirror-world-whopmembershipsync.service"
+  ["catalognavbot"]="mirror-world-catalognavbot.service"
 )
 
 service_for_bot() {
@@ -102,7 +103,7 @@ case "$ACTION" in
           exit 0
         fi
         ;;
-      dailyschedulereminder|datamanagerbot|discumbot|instorebotforwarder|pingbot|whopmembershipsync)
+      dailyschedulereminder|datamanagerbot|discumbot|instorebotforwarder|pingbot|whopmembershipsync|catalognavbot)
         if [ -f "$ROOT_DIR/manage_mirror_bots.sh" ]; then
           bash "$ROOT_DIR/manage_mirror_bots.sh" "$ACTION" "$bot"
           exit 0

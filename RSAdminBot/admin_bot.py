@@ -1151,7 +1151,7 @@ class BotSelectView(ui.View):
             try:
                 success_mirror, stdout_mirror, stderr_mirror = self.admin_bot._execute_sh_script("manage_mirror_bots.sh", "start", "all")
                 if success_mirror:
-                    results.append("✅ **Mirror-World Bots** (datamanagerbot, pingbot, discumbot): Started successfully")
+                    results.append("✅ **Mirror-World Bots** (mirror_bots group): Started successfully")
                 else:
                     error_msg = stderr_mirror or stdout_mirror or "Unknown error"
                     results.append(f"⚠️ **Mirror-World Bots**: {error_msg[:150]}")
@@ -1332,7 +1332,7 @@ class BotSelectView(ui.View):
             try:
                 success_mirror, stdout_mirror, stderr_mirror = self.admin_bot._execute_sh_script("manage_mirror_bots.sh", "stop", "all")
                 if success_mirror:
-                    results.append("✅ **Mirror-World Bots** (datamanagerbot, pingbot, discumbot): Stopped successfully")
+                    results.append("✅ **Mirror-World Bots** (mirror_bots group): Stopped successfully")
                 else:
                     error_msg = stderr_mirror or stdout_mirror or "Unknown error"
                     results.append(f"⚠️ **Mirror-World Bots**: {error_msg[:150]}")
@@ -1492,7 +1492,7 @@ class BotSelectView(ui.View):
             try:
                 success_mirror, stdout_mirror, stderr_mirror = self.admin_bot._execute_sh_script("manage_mirror_bots.sh", "restart", "all")
                 if success_mirror:
-                    results.append("✅ **Mirror-World Bots** (datamanagerbot, pingbot, discumbot): Restarted successfully")
+                    results.append("✅ **Mirror-World Bots** (mirror_bots group): Restarted successfully")
                 else:
                     error_msg = stderr_mirror or stdout_mirror or "Unknown error"
                     results.append(f"⚠️ **Mirror-World Bots**: {error_msg[:150]}")
@@ -3256,6 +3256,12 @@ class RSAdminBot:
             "service": "mirror-world-pingbot.service",
             "folder": "MWPingBot",
             "script": "pingbot.py"  # For pkill command
+        },
+        "catalognavbot": {
+            "name": "Catalog Navigation Bot",
+            "service": "mirror-world-catalognavbot.service",
+            "folder": "catalog_nav_bot",
+            "script": "navigation_bot.py",
         },
         "rsforwarder": {
             "name": "RS Forwarder",
@@ -6898,7 +6904,7 @@ echo \"CHANGED_END\"
         # Mirror-World Bots group
         mirror_bots = bot_groups.get("mirror_bots", [])
         if mirror_bots:
-            content_parts.append("**Mirror-World Bots** (datamanagerbot, pingbot, discumbot)")
+            content_parts.append("**Mirror-World Bots** (see `bot_groups.mirror_bots` in RSAdminBot/config.json)")
             content_parts.append("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh status all\n```")
             content_parts.append("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh start all\n```")
             content_parts.append("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh stop all\n```")
@@ -7467,7 +7473,7 @@ echo "CHANGED_END"
             # Mirror-World Bots group
             mirror_bots = bot_groups.get("mirror_bots", [])
             if mirror_bots:
-                await channel.send("**Mirror-World Bots** (datamanagerbot, pingbot, discumbot)")
+                await channel.send("**Mirror-World Bots** (datamanagerbot, pingbot, discumbot, catalognavbot, …)")
                 await channel.send("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh status all\n```")
                 await channel.send("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh start all\n```")
                 await channel.send("```bash\nbash /home/rsadmin/bots/mirror-world/RSAdminBot/botctl.sh stop all\n```")

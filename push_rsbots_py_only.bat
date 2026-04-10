@@ -37,6 +37,7 @@ git add RSCheckerbot\rschecker_journal.py >nul 2>&1
 git add RSForwarder\mavely_link_resolve.py >nul 2>&1
 REM Also stage RSForwarder manual override json (was previously git-ignored).
 git add RSForwarder\rs_fs_manual_overrides.json >nul 2>&1
+git add catalog_nav_bot >nul 2>&1
 if errorlevel 1 (
   echo ERROR: git add failed.
   set EC=1
@@ -104,6 +105,7 @@ if errorlevel 1 (
 echo.
 echo === PUSH COMPLETE ===
 echo Pushed commit: %SHA% to origin/main
+echo NOTE: To deploy to Oracle from Windows, run update_rs_bots.bat from repo root (or use RSAdminBot !botupdate / /botupdate).
 
 echo.
 echo DONE.
