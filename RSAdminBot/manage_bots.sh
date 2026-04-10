@@ -31,6 +31,7 @@ declare -A SERVICES=(
     ["discumbot"]="mirror-world-discumbot.service"
     ["pingbot"]="mirror-world-pingbot.service"
     ["rsmentionpinger"]="mirror-world-rsmentionpinger.service"
+    ["catalognavbot"]="mirror-world-catalognavbot.service"
 )
 
 # Handle "all" or "allbots" case

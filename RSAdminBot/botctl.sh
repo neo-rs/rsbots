@@ -97,13 +97,13 @@ case "$ACTION" in
           exit 0
         fi
         ;;
-      rsforwarder|rsonboarding|rsmentionpinger|rscheckerbot|rssuccessbot|rspromobot|rscashoutbot)
+      rsforwarder|rsonboarding|rsmentionpinger|rscheckerbot|rssuccessbot|rspromobot|rscashoutbot|catalognavbot)
         if [ -f "$ROOT_DIR/manage_rs_bots.sh" ]; then
           bash "$ROOT_DIR/manage_rs_bots.sh" "$ACTION" "$bot"
           exit 0
         fi
         ;;
-      dailyschedulereminder|datamanagerbot|discumbot|instorebotforwarder|pingbot|whopmembershipsync|catalognavbot)
+      dailyschedulereminder|datamanagerbot|discumbot|instorebotforwarder|pingbot|whopmembershipsync)
         if [ -f "$ROOT_DIR/manage_mirror_bots.sh" ]; then
           bash "$ROOT_DIR/manage_mirror_bots.sh" "$ACTION" "$bot"
           exit 0
