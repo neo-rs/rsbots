@@ -18,6 +18,72 @@ from explainable_log import ExplainableLog
 
 TITLE_PATTERN = re.compile(r"^\s*New\s+Catalog\s*-\s*(?P<store>.+?)\s+(?P<category>.+?)\s*$", re.IGNORECASE)
 WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _norm_title_compare_key(s: str) -> str:
+    return WHITESPACE_RE.sub(" ", (s or "").strip()).casefold()
+
+
+@dataclass(frozen=True)
+class TitleRewriteRule:
+    """One entry from config title_rewrites: either exact (from/to) or regex (match/replace)."""
+
+    exact_from_key: Optional[str] = None
+    exact_to: Optional[str] = None
+    pattern: Optional[re.Pattern[str]] = None
+    repl: Optional[str] = None
+
+
+def _parse_title_rewrite_rules(raw: object) -> Tuple[TitleRewriteRule, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError("config.title_rewrites must be a list")
+    out: List[TitleRewriteRule] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"config.title_rewrites[{i}] must be an object")
+        match_s = str(item.get("match", "")).strip()
+        from_s = str(item.get("from", "")).strip()
+        to_raw = item.get("to")
+        replace_raw = item.get("replace")
+        to_s = str(to_raw).strip() if to_raw is not None else ""
+        repl_s = str(replace_raw) if replace_raw is not None else ""
+
+        has_regex = bool(match_s)
+        has_exact = bool(from_s) and bool(to_s)
+        if has_regex and has_exact:
+            raise ValueError(
+                f"config.title_rewrites[{i}]: use either (from+to) or (match+replace), not both"
+            )
+        if has_regex:
+            if not repl_s:
+                raise ValueError(f"config.title_rewrites[{i}]: match requires a non-empty replace string")
+            try:
+                pat = re.compile(match_s, re.IGNORECASE | re.DOTALL)
+            except re.error as e:
+                raise ValueError(f"config.title_rewrites[{i}]: invalid regex {match_s!r}: {e}") from e
+            out.append(TitleRewriteRule(pattern=pat, repl=repl_s))
+        elif has_exact:
+            out.append(TitleRewriteRule(exact_from_key=_norm_title_compare_key(from_s), exact_to=to_s))
+        else:
+            raise ValueError(
+                f"config.title_rewrites[{i}]: need (from+to) for exact rewrite or (match+replace) for regex"
+            )
+    return tuple(out)
+
+
+def _apply_title_rewrites(title: str, rules: Tuple[TitleRewriteRule, ...]) -> str:
+    if not title or not rules:
+        return title
+    for rule in rules:
+        if rule.exact_from_key is not None:
+            if _norm_title_compare_key(title) == rule.exact_from_key and rule.exact_to is not None:
+                return rule.exact_to
+        elif rule.pattern is not None and rule.repl is not None:
+            if rule.pattern.search(title):
+                return rule.pattern.sub(rule.repl, title, count=1)
+    return title
 DISCORD_MESSAGE_URL_RE = re.compile(
     r"^https://discord\.com/channels/(?P<guild_id>\d+)/(?P<channel_id>\d+)/(?P<message_id>\d+)$",
     re.IGNORECASE,
@@ -91,6 +157,7 @@ class Config:
     log_skip_traffic: bool
     navigation_edit_min_interval_seconds: float
     delete_superseded_source_catalog_messages: bool
+    title_rewrite_rules: Tuple[TitleRewriteRule, ...]
 
     @staticmethod
     def from_dict(data: dict, root: Path) -> "Config":
@@ -124,6 +191,8 @@ class Config:
         if nav_edit_interval > 10.0:
             nav_edit_interval = 10.0
 
+        title_rewrite_rules = _parse_title_rewrite_rules(data.get("title_rewrites"))
+
         return Config(
             token=token,
             source_bot_id=source_bot_id,
@@ -150,6 +219,7 @@ class Config:
             delete_superseded_source_catalog_messages=bool(
                 data.get("delete_superseded_source_catalog_messages", True)
             ),
+            title_rewrite_rules=title_rewrite_rules,
         )
 
 
@@ -442,6 +512,7 @@ class CatalogNavigationBot(commands.Bot):
             {
                 "event": "ready",
                 "title_regex": self.config_data.title_regex,
+                "title_rewrite_rules": len(self.config_data.title_rewrite_rules),
                 "state_path": str(self.config_data.state_path),
             }
         )
@@ -688,8 +759,18 @@ class CatalogNavigationBot(commands.Bot):
         return out
 
     def _parse_message(self, message: discord.Message) -> Optional[Tuple[str, str]]:
+        rules = self.config_data.title_rewrite_rules
         for title in self._title_candidates(message):
-            match = self.title_pattern.match(title)
+            rewritten = _apply_title_rewrites(title, rules)
+            if rewritten != title:
+                self.explain.trace(
+                    {
+                        "event": "title_rewrite",
+                        "before": title,
+                        "after": rewritten,
+                    }
+                )
+            match = self.title_pattern.match(rewritten)
             if match:
                 store_label = normalize_label(match.group("store"))
                 category_label = normalize_label(match.group("category"))

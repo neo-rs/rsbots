@@ -84,6 +84,7 @@ Logs follow the project Explainable Logging style: section headers, **Bottom lin
 - No SQLite is used
 - Runtime storage is JSON only
 - The catalog line is matched by `title_regex` against each embed **title**, every non-empty line of embed **description** and **field** values, embed **author** name, and each line of message **content** (first hit wins)
+- **`title_rewrites`** (optional): ordered list of fixes when the monitor cannot emit `New Catalog - <Store> <Category>`. Each item is either **`from` + `to`** (exact match after trimming and collapsing whitespace; comparison is case-insensitive) or **`match` + `replace`** (regex; first match applies one substitution, case-insensitive). Rewrites run **before** `title_regex`. Example: provider title `New Catalog - Ascended Heroes Walmart` → add `{ "from": "New Catalog - Ascended Heroes Walmart", "to": "New Catalog - Walmart Ascended Heroes" }` so **store** = Walmart and **category** = Ascended Heroes
 - The `Main Catalog` message is recreated whenever a new matching source message is seen in the watched channel
 - Category buttons on the main catalog message point to the **first known source message** (jump URL) for that category; the message body is only title + short intro (no duplicate `→ #channel` lines)
 - Optional `separator`: if non-empty, one trailing line is appended to **navigation reply** embeds only (not the main catalog message)
