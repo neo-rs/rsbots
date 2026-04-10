@@ -63,11 +63,12 @@ These commands open a **dropdown** to pick a bot. All outputs are ephemeral.
 - **What**: sync a bot folder to the Oracle host
 
 #### `/botupdate`
-- **What**: update an RS bot from the GitHub checkout (**python-only**) and restart it
+- **What**: update an **RS-group** bot from GitHub (**python-only**) and restart it
+- **Note**: **`catalognavbot`** (Catalog Navigation Bot) appears here; it pulls **`catalog_nav_bot/`** from the **mirror-world** live tree on Oracle, not from **`rsbots-code`**, but the command flow matches other RS bots.
 
 #### `/mwupdate`
-- **What**: update an MW bot from the GitHub checkout (**python-only**) and restart it
-- **Note**: **`catalognavbot`** is wired for **`botctl` / systemd / journal_live** but is **not** deployed from **`mwbots-code`** by this command. Update **`catalog_nav_bot/`** on the live mirror-world tree (e.g. `git pull` on mirror-world if tracked, SCP, or upload), then **`bash RSAdminBot/botctl.sh restart catalognavbot`**.
+- **What**: update an MW bot from the **`mwbots-code`** checkout (**python-only**) and restart it
+- **Note**: Does **not** include catalog nav (use **`/botupdate`**).
 
 #### `/selfupdate`
 - **What**: **safe RSAdminBot update** (staged) + service restart to apply

@@ -6,6 +6,7 @@ import json
 import shlex
 import subprocess
 import sys
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,7 +18,7 @@ from mirror_world_config import load_oracle_servers, resolve_oracle_ssh_key_path
 
 
 BOT_KEY_TO_FOLDER: Dict[str, str] = {
-    # RS bots
+    # RS bots (rsbots-code checkout; see main() for catalognavbot → remote_root exception)
     "rsadminbot": "RSAdminBot",
     "rsforwarder": "RSForwarder",
     "rsonboarding": "RSOnboarding",
@@ -27,13 +28,19 @@ BOT_KEY_TO_FOLDER: Dict[str, str] = {
     "rspromobot": "RSPromoBot",
     "rscashoutbot": "RSCashoutBot",
     "whopmembershipsync": "WhopMembershipSync",
-    # Mirror-world bots
+    "catalognavbot": "catalog_nav_bot",
+    # Mirror-world bots (mwbots-code checkout)
     "dailyschedulereminder": "DailyScheduleReminder",
     "datamanagerbot": "MWDataManagerBot",
     "discumbot": "MWDiscumBot",
     "instorebotforwarder": "Instorebotforwarder",
     "pingbot": "MWPingBot",
 }
+
+
+def _paths_same_canonical(a: str, b: str) -> bool:
+    """True if paths refer to the same directory (handles trailing slashes)."""
+    return os.path.normpath((a or "").strip().rstrip("/")) == os.path.normpath((b or "").strip().rstrip("/"))
 
 
 def _pick_server(servers: List[Dict[str, Any]], server_name: Optional[str]) -> Dict[str, Any]:
@@ -81,10 +88,20 @@ def _build_ssh_cmd(*, user: str, host: str, key_path: Path, ssh_options: str, re
     return cmd
 
 
-def _update_snippet(*, code_root: str, live_root: str, bot_folder: str) -> str:
+def _update_snippet(
+    *,
+    code_root: str,
+    live_root: str,
+    bot_folder: str,
+    destructive_git_clean: bool = True,
+) -> str:
     """
     Sync tracked python-only files (plus a small safe set of md/json/txt/requirements)
     from the bot's code checkout into the live tree, excluding secrets/runtime data.
+
+    When ``destructive_git_clean`` is False (code_root is the live mirror-world tree),
+    skip ``git reset --hard`` / ``git clean -fdx`` so server-only untracked files
+    (secrets, Playwright profiles, etc.) are not deleted.
     """
     code_root_q = shlex.quote(code_root)
     live_root_q = shlex.quote(live_root)
@@ -95,6 +112,22 @@ def _update_snippet(*, code_root: str, live_root: str, bot_folder: str) -> str:
     # - Never overwrite member_history.json (server-owned)
     # - Allow only specific extensions
     # - Backup before overwrite (best-effort)
+    if destructive_git_clean:
+        preclean = """
+#
+# Ensure the checkout is clean before git pull (separate mwbots/rsbots clone only).
+#
+git reset --hard HEAD >/dev/null 2>&1 || true
+git clean -fdx >/dev/null 2>&1 || true
+"""
+    else:
+        preclean = """
+#
+# Live tree checkout: do not reset/clean — would delete untracked secrets and runtime data.
+#
+echo "INFO: skipping git reset/clean (live mirror-world tree checkout)"
+"""
+
     return f"""
 set -euo pipefail
 CODE_ROOT={code_root_q}
@@ -111,16 +144,7 @@ if [ ! -d "$LIVE_ROOT" ]; then
 fi
 
 cd "$CODE_ROOT"
-#
-# Ensure the checkout is clean before git pull.
-# Without this, any untracked runtime artifacts (e.g. Playwright cache files)
-# can cause `git pull --ff-only` to abort with:
-#   "local changes ... would be overwritten by merge"
-#   "untracked working tree files would be overwritten"
-#
-git reset --hard HEAD >/dev/null 2>&1 || true
-git clean -fdx >/dev/null 2>&1 || true
-
+{preclean}
 OLD="$(git rev-parse HEAD 2>/dev/null || echo '')"
 echo "INFO: pulling latest code for $BOT_FOLDER ..."
 git fetch origin
@@ -194,7 +218,13 @@ bash {live_root_q}/RSAdminBot/botctl.sh restart {shlex.quote(bot_key)}
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    ap = argparse.ArgumentParser(description="Update MW/RS bots on Oracle from GitHub checkouts via SSH.")
+    ap = argparse.ArgumentParser(
+        description="Update MW/RS bots on Oracle from GitHub checkouts via SSH.",
+        epilog=(
+            "RS group: catalognavbot syncs catalog_nav_bot/ from remote_root (mirror-world git), "
+            "not rsbots_code_root; other rs_bots use rsbots_code_root."
+        ),
+    )
     ap.add_argument("--group", choices=["mw", "rs"], required=True, help="Update group: mw=mirror_bots, rs=rs_bots + rsadminbot")
     ap.add_argument("--server-name", default=None, help="Server name from oraclekeys/servers.json")
     ap.add_argument(
@@ -291,9 +321,19 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     for bot_key in chosen:
         bot_folder = BOT_KEY_TO_FOLDER[bot_key]
-        print(f"=== Updating {bot_key} (folder: {bot_folder}) ===")
+        if args.group == "rs" and bot_key == "catalognavbot":
+            sync_code_root = remote_root
+        else:
+            sync_code_root = code_root
+        destructive = not _paths_same_canonical(sync_code_root, remote_root)
+        print(f"=== Updating {bot_key} (folder: {bot_folder}, code_root={sync_code_root}) ===")
 
-        update_cmd = _update_snippet(code_root=code_root, live_root=remote_root, bot_folder=bot_folder)
+        update_cmd = _update_snippet(
+            code_root=sync_code_root,
+            live_root=remote_root,
+            bot_folder=bot_folder,
+            destructive_git_clean=destructive,
+        )
         restart_cmd = _restart_snippet(live_root=remote_root, bot_key=bot_key)
         remote_cmd = f"{update_cmd}\n{restart_cmd}"
 

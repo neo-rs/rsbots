@@ -247,8 +247,11 @@ On the server, both tracks **`git pull`** a separate checkout (`rsbots-code` vs 
    - Runs `py -3 scripts/run_oracle_update_bots.py --group rs` (extra args pass through, e.g. `update_rs_bots.bat --bot rsforwarder`).
    - Uses **`oraclekeys/servers.json`** and SSH key resolution (see **Ubuntu access** above).
    - On Oracle, for each chosen **bot key** (`bot_groups.rs_bots` plus **`rsadminbot`**): **`git pull --ff-only`** in **`code_checkouts.rsbots_code_root`** (default `/home/rsadmin/bots/rsbots-code`), sync into **live** tree with backup, exclusions as RSAdminBot (no `config.secrets.json`, no `member_history.json`, etc.), then **`bash RSAdminBot/botctl.sh restart <bot_key>`**.
+   - **Exception (one key):** **`catalognavbot`** is in **`bot_groups.rs_bots`** and uses the **same** Discord/batch path as other RS bots, but its sources live under **`catalog_nav_bot/`** in the **mirror-world** repo. For that key only, the updater uses **`remote_root`** as the git checkout (not **`rsbots-code`**). **`manage_rs_bots.sh`** owns its systemd service (not **`manage_mirror_bots.sh`**).
 
-**Discord / server (no Windows):** **`!botupdate`** / **`/botupdate`** (owner-only). **`!botsync`** / **`/botsync`** syncs from operator-provided sources instead of “pull `main` only”.
+**Discord / server (no Windows):** **`!botupdate`** / **`/botupdate`** (owner-only), including **`catalognavbot`**. **`!mwupdate`** / **`/mwupdate`** is MW-only and does **not** list catalog nav. **`!botsync`** / **`/botsync`** syncs from operator-provided sources instead of “pull `main` only”.
+
+**Catalog nav safety on Oracle:** When the pull root is the live mirror-world tree (same as **`remote_root`**), **`run_oracle_update_bots.py`** skips **`git reset --hard`** / **`git clean -fdx`** so untracked secrets and runtime files are not wiped. Separate **`rsbots-code`** / **`mwbots-code`** checkouts still use the aggressive clean before pull.
 
 ---
 
@@ -269,8 +272,6 @@ On the server, both tracks **`git pull`** a separate checkout (`rsbots-code` vs 
    - On Oracle, for each chosen **bot key** from **`bot_groups.mirror_bots`**: **`git pull --ff-only`** in **`code_checkouts.mwbots_code_root`** (default `/home/rsadmin/bots/mwbots-code`), sync into **live** tree + backup + same exclusion model, then **`bash RSAdminBot/botctl.sh restart <bot_key>`**.
 
 **Discord / server (no Windows):** **`!mwupdate`** / **`/mwupdate`** (owner-only), as noted in `push_mwbots_py_only.bat`.
-
-**Exception — `catalognavbot` (Catalog Navigation Bot):** Code lives under **`catalog_nav_bot/`** on the **live** mirror-world tree. It is **not** copied from **`mwbots-code`** by `run_oracle_update_bots.py`, so **`!mwupdate` / `/mwupdate` must not be relied on** to deploy this bot’s Python. Track it in the **mirror-world** repo (see **`push_rsbots_py_only.bat`** `git add catalog_nav_bot`), **`git pull`** on the Oracle checkout when applicable, or upload files manually, then **`bash RSAdminBot/botctl.sh restart catalognavbot`**. It still uses the same **systemd** / **`run_bot.sh`** / **journal_live** wiring as other `mirror_bots` keys.
 
 ### Verification (canonical)
 
