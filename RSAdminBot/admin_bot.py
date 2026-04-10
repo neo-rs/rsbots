@@ -1667,13 +1667,10 @@ class BotSelectView(ui.View):
             return
 
         if group == "rs_bots":
-            rs_root = self.admin_bot._get_update_code_root_for_group("rs_bots")
-            pull_root = rs_root
-            if bot_key == "catalognavbot":
-                pull_root = str(getattr(self.admin_bot, "remote_root", "") or "").strip() or "/home/rsadmin/bots/mirror-world"
+            code_root = self.admin_bot._get_update_code_root_for_group("rs_bots")
             await interaction.followup.send(
                 f"📦 **Updating {bot_info['name']} from GitHub (python-only)...**\n"
-                f"```\nPulling + copying tracked files from {pull_root}\n```",
+                f"```\nPulling + copying tracked files from {code_root}\n```",
                 ephemeral=True,
             )
             ok, result = self.admin_bot._botupdate_one_py_only(bot_key)
@@ -1709,14 +1706,10 @@ class BotSelectView(ui.View):
             return
 
         code_root = self.admin_bot._get_update_code_root_for_group("rs_bots")
-        live_root = str(getattr(self.admin_bot, "remote_root", "") or "").strip() or "/home/rsadmin/bots/mirror-world"
         status_msg = await interaction.followup.send(
             embed=MessageHelper.create_info_embed(
                 title="Updating All RS Bots (python-only)",
-                message=(
-                    f"Most bots pull from **rsbots-code** (`{code_root}`); "
-                    f"**catalognavbot** pulls from the **mirror-world** live tree (`{live_root}`)."
-                ),
+                message=f"Pulling + copying tracked files from {code_root} and restarting each service.",
                 fields=[
                     {"name": "Bots", "value": str(len(rs_keys)), "inline": True},
                     {"name": "Note", "value": "RSAdminBot is excluded (use !selfupdate).", "inline": False},
@@ -2841,7 +2834,7 @@ class RSAdminSlashCog(commands.Cog):
 
     @app_commands.command(
         name="botupdate",
-        description="Update an RS-group bot from GitHub (python-only) and restart. Includes catalognavbot.",
+        description="Update an RS-group bot from GitHub (python-only) and restart (owner-only).",
     )
     async def botupdate(self, interaction: discord.Interaction) -> None:
         await self._send_bot_select(
@@ -2849,7 +2842,7 @@ class RSAdminSlashCog(commands.Cog):
             action="update",
             action_display="Update",
             title="📦 Update RS Bot (python-only)",
-            description="Pick an RS bot (or All RS Bots), including Catalog Navigation Bot, to update from GitHub.",
+            description="Pick an RS bot (or All RS Bots) to update from GitHub.",
             bot_keys=self.admin_bot._get_rs_bot_keys(),
         )
 
@@ -7411,19 +7404,10 @@ echo "CHANGED_END"
     def _botupdate_one_py_only(self, bot_key: str) -> Tuple[bool, Dict[str, Any]]:
         """Update a single RS-group bot from rsbots-code (python-only) and restart the service.
 
-        ``catalognavbot`` is listed under ``bot_groups.rs_bots`` but its sources live in the
-        **mirror-world** repo; updates use ``remote_root`` as the git checkout (same as
-        ``push_rsbots_py_only.bat``), not ``rsbots-code``.
+        ``catalognavbot`` uses the same checkout as other RS bots: ``git pull`` in
+        ``code_checkouts.rsbots_code_root``, then sync tracked ``catalog_nav_bot/**`` into
+        the live ``remote_root`` tree. The live tree does not need to be a git repo.
         """
-        key = (bot_key or "").strip().lower()
-        if key == "catalognavbot":
-            live = str(getattr(self, "remote_root", "") or "").strip() or "/home/rsadmin/bots/mirror-world"
-            return self._update_one_py_only_from_checkout(
-                bot_key,
-                allowed_group="rs_bots",
-                code_root=live,
-                allow_rsadminbot=False,
-            )
         code_root = self._get_update_code_root_for_group("rs_bots")
         return self._update_one_py_only_from_checkout(
             bot_key,

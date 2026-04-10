@@ -105,7 +105,7 @@ if errorlevel 1 (
 echo.
 echo === PUSH COMPLETE ===
 echo Pushed commit: %SHA% to origin/main
-echo NOTE: To deploy to Oracle from Windows, run update_rs_bots.bat from repo root (or RSAdminBot !botupdate / /botupdate). catalog_nav_bot deploys with the RS group (catalognavbot uses mirror-world git pull on the server).
+echo NOTE: To deploy to Oracle from Windows, run update_rs_bots.bat from repo root (or RSAdminBot !botupdate / /botupdate). catalog_nav_bot deploys with catalognavbot like other RS bots (rsbots-code git pull on server).
 
 echo.
 echo DONE.

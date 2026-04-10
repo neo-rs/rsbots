@@ -18,7 +18,7 @@ from mirror_world_config import load_oracle_servers, resolve_oracle_ssh_key_path
 
 
 BOT_KEY_TO_FOLDER: Dict[str, str] = {
-    # RS bots (rsbots-code checkout; see main() for catalognavbot → remote_root exception)
+    # RS bots (rsbots-code checkout → sync into live remote_root)
     "rsadminbot": "RSAdminBot",
     "rsforwarder": "RSForwarder",
     "rsonboarding": "RSOnboarding",
@@ -218,13 +218,7 @@ bash {live_root_q}/RSAdminBot/botctl.sh restart {shlex.quote(bot_key)}
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    ap = argparse.ArgumentParser(
-        description="Update MW/RS bots on Oracle from GitHub checkouts via SSH.",
-        epilog=(
-            "RS group: catalognavbot syncs catalog_nav_bot/ from remote_root (mirror-world git), "
-            "not rsbots_code_root; other rs_bots use rsbots_code_root."
-        ),
-    )
+    ap = argparse.ArgumentParser(description="Update MW/RS bots on Oracle from GitHub checkouts via SSH.")
     ap.add_argument("--group", choices=["mw", "rs"], required=True, help="Update group: mw=mirror_bots, rs=rs_bots + rsadminbot")
     ap.add_argument("--server-name", default=None, help="Server name from oraclekeys/servers.json")
     ap.add_argument(
@@ -321,10 +315,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     for bot_key in chosen:
         bot_folder = BOT_KEY_TO_FOLDER[bot_key]
-        if args.group == "rs" and bot_key == "catalognavbot":
-            sync_code_root = remote_root
-        else:
-            sync_code_root = code_root
+        sync_code_root = code_root
         destructive = not _paths_same_canonical(sync_code_root, remote_root)
         print(f"=== Updating {bot_key} (folder: {bot_folder}, code_root={sync_code_root}) ===")
 

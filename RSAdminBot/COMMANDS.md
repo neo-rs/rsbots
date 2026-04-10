@@ -64,7 +64,7 @@ These commands open a **dropdown** to pick a bot. All outputs are ephemeral.
 
 #### `/botupdate`
 - **What**: update an **RS-group** bot from GitHub (**python-only**) and restart it
-- **Note**: **`catalognavbot`** (Catalog Navigation Bot) appears here; it pulls **`catalog_nav_bot/`** from the **mirror-world** live tree on Oracle, not from **`rsbots-code`**, but the command flow matches other RS bots.
+- **Note**: **`catalognavbot`** uses the same **`rsbots-code`** pull + sync-to-live path as other RS bots; **`catalog_nav_bot/`** must exist in that repo checkout.
 
 #### `/mwupdate`
 - **What**: update an MW bot from the **`mwbots-code`** checkout (**python-only**) and restart it

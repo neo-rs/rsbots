@@ -247,11 +247,11 @@ On the server, both tracks **`git pull`** a separate checkout (`rsbots-code` vs 
    - Runs `py -3 scripts/run_oracle_update_bots.py --group rs` (extra args pass through, e.g. `update_rs_bots.bat --bot rsforwarder`).
    - Uses **`oraclekeys/servers.json`** and SSH key resolution (see **Ubuntu access** above).
    - On Oracle, for each chosen **bot key** (`bot_groups.rs_bots` plus **`rsadminbot`**): **`git pull --ff-only`** in **`code_checkouts.rsbots_code_root`** (default `/home/rsadmin/bots/rsbots-code`), sync into **live** tree with backup, exclusions as RSAdminBot (no `config.secrets.json`, no `member_history.json`, etc.), then **`bash RSAdminBot/botctl.sh restart <bot_key>`**.
-   - **Exception (one key):** **`catalognavbot`** is in **`bot_groups.rs_bots`** and uses the **same** Discord/batch path as other RS bots, but its sources live under **`catalog_nav_bot/`** in the **mirror-world** repo. For that key only, the updater uses **`remote_root`** as the git checkout (not **`rsbots-code`**). **`manage_rs_bots.sh`** owns its systemd service (not **`manage_mirror_bots.sh`**).
+   - **`catalognavbot`** is in **`bot_groups.rs_bots`** (same **`/botupdate`** / **`update_rs_bots.bat`** as RSForwarder). **`catalog_nav_bot/`** must be **tracked in the same GitHub repo** that **`rsbots-code`** pulls (your mirror-world monorepo). **`git pull`** runs in **`rsbots-code`**; files copy into the **live** **`remote_root`** tree (which does **not** need to be a git checkout). **`manage_rs_bots.sh`** owns its systemd service.
 
 **Discord / server (no Windows):** **`!botupdate`** / **`/botupdate`** (owner-only), including **`catalognavbot`**. **`!mwupdate`** / **`/mwupdate`** is MW-only and does **not** list catalog nav. **`!botsync`** / **`/botsync`** syncs from operator-provided sources instead of “pull `main` only”.
 
-**Catalog nav safety on Oracle:** When the pull root is the live mirror-world tree (same as **`remote_root`**), **`run_oracle_update_bots.py`** skips **`git reset --hard`** / **`git clean -fdx`** so untracked secrets and runtime files are not wiped. Separate **`rsbots-code`** / **`mwbots-code`** checkouts still use the aggressive clean before pull.
+**Oracle updater safety:** **`run_oracle_update_bots.py`** uses **`git reset --hard`** / **`git clean -fdx`** only on the **checkout** clone (**`rsbots-code`** / **`mwbots-code`**), not on the live tree. The live tree only receives **`tar`** extract of tracked paths.
 
 ---
 
