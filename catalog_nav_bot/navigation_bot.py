@@ -84,6 +84,79 @@ def _apply_title_rewrites(title: str, rules: Tuple[TitleRewriteRule, ...]) -> st
             if rule.pattern.search(title):
                 return rule.pattern.sub(rule.repl, title, count=1)
     return title
+
+
+# Captures the remainder after "New Catalog -" for store/category splitting.
+NEW_CATALOG_PREFIX_RE = re.compile(
+    r"^\s*New\s+Catalog\s*-\s*(?P<tail>.+)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_catalog_store_names(raw: object) -> Tuple[str, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError("config.catalog_store_names must be a list")
+    seen: set[str] = set()
+    names: List[str] = []
+    for i, item in enumerate(raw):
+        s = str(item).strip()
+        if not s:
+            raise ValueError(f"config.catalog_store_names[{i}] must be non-empty")
+        k = s.casefold()
+        if k in seen:
+            continue
+        seen.add(k)
+        names.append(s)
+    names.sort(key=len, reverse=True)
+    return tuple(names)
+
+
+def _compile_catalog_store_splitters(
+    stores_desc: Tuple[str, ...],
+) -> Tuple[Tuple[re.Pattern[str], re.Pattern[str], str], ...]:
+    out: List[Tuple[re.Pattern[str], re.Pattern[str], str]] = []
+    for s in stores_desc:
+        esc = re.escape(s)
+        out.append(
+            (
+                re.compile(rf"^{esc}\s+(.+)$", re.IGNORECASE),
+                re.compile(rf"^(.+)\s+{esc}$", re.IGNORECASE),
+                s,
+            )
+        )
+    return tuple(out)
+
+
+def _parse_store_category_by_known_stores(
+    tail: str,
+    splitters: Tuple[Tuple[re.Pattern[str], re.Pattern[str], str], ...],
+) -> Optional[Tuple[str, str, str]]:
+    """
+    Detect store vs category when the monitor uses either:
+    - ``Store Category`` (e.g. Target Ascended Heroes)
+    - ``Category Store`` (e.g. Ascended Heroes Walmart)
+
+    Returns (store_display, category_raw, method) with method store_prefix | store_suffix, or None.
+    """
+    t = WHITESPACE_RE.sub(" ", tail.strip())
+    if not t:
+        return None
+    for prefix_pat, suffix_pat, store in splitters:
+        m = prefix_pat.match(t)
+        if m:
+            cat = WHITESPACE_RE.sub(" ", m.group(1).strip())
+            if cat:
+                return store, cat, "store_prefix"
+        m = suffix_pat.match(t)
+        if m:
+            cat = WHITESPACE_RE.sub(" ", m.group(1).strip())
+            if cat:
+                return store, cat, "store_suffix"
+    return None
+
+
 DISCORD_MESSAGE_URL_RE = re.compile(
     r"^https://discord\.com/channels/(?P<guild_id>\d+)/(?P<channel_id>\d+)/(?P<message_id>\d+)$",
     re.IGNORECASE,
@@ -158,6 +231,7 @@ class Config:
     navigation_edit_min_interval_seconds: float
     delete_superseded_source_catalog_messages: bool
     title_rewrite_rules: Tuple[TitleRewriteRule, ...]
+    catalog_store_names: Tuple[str, ...]
 
     @staticmethod
     def from_dict(data: dict, root: Path) -> "Config":
@@ -192,6 +266,7 @@ class Config:
             nav_edit_interval = 10.0
 
         title_rewrite_rules = _parse_title_rewrite_rules(data.get("title_rewrites"))
+        catalog_store_names = _parse_catalog_store_names(data.get("catalog_store_names"))
 
         return Config(
             token=token,
@@ -220,6 +295,7 @@ class Config:
                 data.get("delete_superseded_source_catalog_messages", True)
             ),
             title_rewrite_rules=title_rewrite_rules,
+            catalog_store_names=catalog_store_names,
         )
 
 
@@ -388,6 +464,7 @@ class CatalogNavigationBot(commands.Bot):
         self.config_data = config
         self.state = NavigationState(config.state_path)
         self.title_pattern = re.compile(config.title_regex, re.IGNORECASE)
+        self._catalog_store_splitters = _compile_catalog_store_splitters(config.catalog_store_names)
         self._log = logging.getLogger("catalog_nav_bot")
         self.explain = ExplainableLog(
             self._log,
@@ -513,6 +590,7 @@ class CatalogNavigationBot(commands.Bot):
                 "event": "ready",
                 "title_regex": self.config_data.title_regex,
                 "title_rewrite_rules": len(self.config_data.title_rewrite_rules),
+                "catalog_store_names": len(self.config_data.catalog_store_names),
                 "state_path": str(self.config_data.state_path),
             }
         )
@@ -591,9 +669,9 @@ class CatalogNavigationBot(commands.Bot):
         parsed = self._parse_message(message)
         if not parsed:
             candidates = self._title_candidates(message)
-            self.explain.section("SOURCE MESSAGE / NO REGEX MATCH")
+            self.explain.section("SOURCE MESSAGE / NO PARSE MATCH")
             self.explain.eli5(
-                "This message was from the source bot in an allowed channel, but nothing matched title_regex.",
+                "This message was from the source bot in an allowed channel, but nothing matched catalog_store_names split or title_regex.",
                 [
                     f"source_message_id={message.id}",
                     f"title_candidates={candidates!r}",
@@ -601,8 +679,8 @@ class CatalogNavigationBot(commands.Bot):
             )
             self.explain.failure(
                 [
-                    "Check embed title, first line of embed description, embed field name/value, or first line of message content against title_regex.",
-                    "Ensure named groups (?P<store>...) and (?P<category>...) are present.",
+                    "If the line is `New Catalog - …`, ensure the store name appears in catalog_store_names (both `Store Category` and `Category Store` orders are supported).",
+                    "Otherwise check candidates against title_regex with named groups (?P<store>...) and (?P<category>...).",
                 ]
             )
             self.explain.trace(
@@ -611,6 +689,7 @@ class CatalogNavigationBot(commands.Bot):
                     "message_id": message.id,
                     "channel_id": message.channel.id,
                     "candidates": candidates,
+                    "catalog_store_names_count": len(self.config_data.catalog_store_names),
                     "pattern": self.config_data.title_regex,
                     "message_shape": _message_shape_for_trace(message),
                 }
@@ -760,6 +839,7 @@ class CatalogNavigationBot(commands.Bot):
 
     def _parse_message(self, message: discord.Message) -> Optional[Tuple[str, str]]:
         rules = self.config_data.title_rewrite_rules
+        splitters = self._catalog_store_splitters
         for title in self._title_candidates(message):
             rewritten = _apply_title_rewrites(title, rules)
             if rewritten != title:
@@ -770,6 +850,26 @@ class CatalogNavigationBot(commands.Bot):
                         "after": rewritten,
                     }
                 )
+            if splitters:
+                nm = NEW_CATALOG_PREFIX_RE.match(rewritten)
+                if nm:
+                    tail = nm.group("tail")
+                    hit = _parse_store_category_by_known_stores(tail, splitters)
+                    if hit:
+                        store_raw, category_raw, method = hit
+                        store_label = normalize_label(store_raw)
+                        category_label = normalize_label(category_raw)
+                        if store_label and category_label:
+                            self.explain.trace(
+                                {
+                                    "event": "parse_via_catalog_store_names",
+                                    "method": method,
+                                    "tail": tail.strip(),
+                                    "store_label": store_label,
+                                    "category_label": category_label,
+                                }
+                            )
+                            return store_label, category_label
             match = self.title_pattern.match(rewritten)
             if match:
                 store_label = normalize_label(match.group("store"))
