@@ -194,7 +194,8 @@ restart_service() {
 status_service() {
     if ! service_exists; then
         echo "not_found"
-        exit 1
+        # Exit 0: query succeeded; ServiceManager maps not_found -> exists=false (not a script failure).
+        exit 0
     fi
     
     STATE=$(get_status)

@@ -144,6 +144,11 @@ case "$ACTION" in
       echo "ERROR: Unknown bot name: $TARGET"
       exit 1
     fi
+    load_state="$(systemctl show "$svc" -p LoadState --value 2>/dev/null | tr -d '\r' || true)"
+    if [ -z "$load_state" ] || [ "$load_state" = "not-found" ]; then
+      echo "0"
+      exit 0
+    fi
     systemctl show "$svc" --property=MainPID --no-pager --value 2>/dev/null | tr -d '\r'
     ;;
 
