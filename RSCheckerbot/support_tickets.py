@@ -4349,12 +4349,21 @@ class SupportTicketControlsView(discord.ui.View):
             await interaction.response.send_message("⏳ Exporting transcript and closing…", ephemeral=True)
         ch_id = int(getattr(getattr(interaction, "channel", None), "id", 0) or 0)
         if ch_id:
-            await close_ticket_by_channel_id(
+            ok = await close_ticket_by_channel_id(
                 ch_id,
                 close_reason="manual_transcript",
                 do_transcript=True,
                 delete_channel=True,
             )
+            if not ok:
+                with suppress(Exception):
+                    await interaction.followup.send(
+                        "❌ Could not finish closing this ticket (transcript upload or channel delete failed). "
+                        "Check RSCheckerbot logs. Common fix: grant the bot **Manage Channels** on the ticket category. "
+                        "If this channel is stuck after an older bug (index CLOSED but channel still exists), set that ticket back to OPEN in "
+                        "`RSCheckerbot/data/tickets_index.json` on the host (or delete the channel manually), then retry.",
+                        ephemeral=True,
+                    )
 
     @discord.ui.button(
         label="Close",
@@ -4369,12 +4378,21 @@ class SupportTicketControlsView(discord.ui.View):
             await interaction.response.send_message("⏳ Closing ticket…", ephemeral=True)
         ch_id = int(getattr(getattr(interaction, "channel", None), "id", 0) or 0)
         if ch_id:
-            await close_ticket_by_channel_id(
+            ok = await close_ticket_by_channel_id(
                 ch_id,
                 close_reason="manual_close",
                 do_transcript=True,
                 delete_channel=True,
             )
+            if not ok:
+                with suppress(Exception):
+                    await interaction.followup.send(
+                        "❌ Could not finish closing this ticket (transcript upload or channel delete failed). "
+                        "Check RSCheckerbot logs. Common fix: grant the bot **Manage Channels** on the ticket category. "
+                        "If this channel is stuck after an older bug (index CLOSED but channel still exists), set that ticket back to OPEN in "
+                        "`RSCheckerbot/data/tickets_index.json` on the host (or delete the channel manually), then retry.",
+                        ephemeral=True,
+                    )
 
 
 class _MembershipReportModal(discord.ui.Modal, title="Membership Report"):
@@ -5887,17 +5905,8 @@ async def export_transcript_for_channel_id(channel_id: int, *, close_reason: str
     except Exception:
         return False
 
-    # Mark closed in index (channel deletion handled by caller)
-    async with _INDEX_LOCK:
-        db = _index_load()
-        found2 = _ticket_by_channel_id(db, int(channel_id))
-        if found2:
-            tid2, rec2 = found2
-            rec2["status"] = "CLOSED"
-            rec2["close_reason"] = str(close_reason or "")
-            rec2["closed_at_iso"] = closed_at_iso
-            db["tickets"][tid2] = rec2  # type: ignore[index]
-            _index_save(db)
+    # Index stays OPEN until the ticket channel is actually removed (see close_ticket_by_channel_id).
+    # Otherwise a failed delete leaves a live channel while the index says CLOSED — staff cannot retry.
     return True
 
 
@@ -5958,19 +5967,30 @@ async def close_ticket_by_channel_id(
         if not ok:
             await _log(f"❌ support_tickets: transcript failed; refusing to delete ticket channel_id={channel_id}")
             return False
-    else:
-        # No transcript requested: still mark closed (keeps index + role state consistent).
-        async with _INDEX_LOCK:
-            db = _index_load()
-            found = _ticket_by_channel_id(db, int(channel_id))
-            if found:
-                tid, rec = found
-                if _ticket_is_open(rec):
-                    rec["status"] = "CLOSED"
-                    rec["close_reason"] = str(close_reason or "")
-                    rec["closed_at_iso"] = _now_iso()
-                    db["tickets"][tid] = rec  # type: ignore[index]
-                    _index_save(db)
+
+    if delete_channel:
+        try:
+            await ch.delete(reason=f"RSCheckerbot: close ticket ({close_reason})")
+        except Exception as ex:
+            await _log(
+                f"❌ support_tickets: delete failed channel_id={channel_id} "
+                f"(ticket stays OPEN for retry); err={ex!r}"
+            )
+            return False
+
+    # Mark CLOSED only after transcript (if any) and optional channel delete succeeded.
+    closed_at = _now_iso()
+    async with _INDEX_LOCK:
+        db = _index_load()
+        found = _ticket_by_channel_id(db, int(channel_id))
+        if found:
+            tid, rec = found
+            if _ticket_is_open(rec):
+                rec["status"] = "CLOSED"
+                rec["close_reason"] = str(close_reason or "")
+                rec["closed_at_iso"] = closed_at
+                db["tickets"][tid] = rec  # type: ignore[index]
+                _index_save(db)
 
     # Auto-remove the role tied to this ticket type (remove only that role).
     if ticket_user_id and ticket_type:
@@ -5982,9 +6002,6 @@ async def close_ticket_by_channel_id(
             with suppress(Exception):
                 await _set_ticket_role_for_member(guild=guild, member=mobj, ticket_type=ticket_type, add=False)
 
-    if delete_channel:
-        with suppress(Exception):
-            await ch.delete(reason=f"RSCheckerbot: close ticket ({close_reason})")
     return True
 
 

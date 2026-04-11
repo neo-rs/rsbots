@@ -11832,12 +11832,20 @@ async def ticket_transcript(ctx: commands.Context):
         return
     with suppress(Exception):
         await ctx.send("⏳ Exporting transcript and closing…", delete_after=10)
-    await support_tickets.close_ticket_by_channel_id(
+    ok = await support_tickets.close_ticket_by_channel_id(
         ch_id,
         close_reason="manual_transcript",
         do_transcript=True,
         delete_channel=True,
     )
+    if not ok:
+        await ctx.send(
+            "❌ Close did not complete (transcript or delete failed). Check RSCheckerbot logs; "
+            "ensure the bot has **Manage Channels** on the ticket category. "
+            "If the index is CLOSED but this channel still exists (older bug), set that row back to OPEN in "
+            "`RSCheckerbot/data/tickets_index.json` on the server or delete the channel manually, then retry.",
+            delete_after=25,
+        )
 
 
 @bot.command(name="close")
@@ -11854,12 +11862,20 @@ async def ticket_close(ctx: commands.Context):
         return
     with suppress(Exception):
         await ctx.send("⏳ Closing ticket…", delete_after=10)
-    await support_tickets.close_ticket_by_channel_id(
+    ok = await support_tickets.close_ticket_by_channel_id(
         ch_id,
         close_reason="manual_close",
         do_transcript=True,
         delete_channel=True,
     )
+    if not ok:
+        await ctx.send(
+            "❌ Close did not complete (transcript or delete failed). Check RSCheckerbot logs; "
+            "ensure the bot has **Manage Channels** on the ticket category. "
+            "If the index is CLOSED but this channel still exists (older bug), set that row back to OPEN in "
+            "`RSCheckerbot/data/tickets_index.json` on the server or delete the channel manually, then retry.",
+            delete_after=25,
+        )
 
 
 def _parse_date_ymd(s: str) -> datetime | None:

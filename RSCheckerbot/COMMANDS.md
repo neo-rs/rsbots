@@ -267,7 +267,7 @@ These commands are only available **inside an OPEN support ticket channel** and 
 - **Parameters**: None
 - **Usage**: `!transcript` (run inside a ticket channel)
 - **Admin Only**: No (staff-only via `config.json -> support_tickets.permissions.staff_role_ids` or Discord Administrator)
-- **Returns**: Uploads a transcript file + summary embed in the appropriate transcripts channel, then closes/deletes the ticket channel
+- **Returns**: Uploads a transcript file + summary embed in the appropriate transcripts channel, then closes/deletes the ticket channel. If export or delete fails, replies with an error (ticket stays OPEN in the index so staff can retry after fixing permissions or config).
 
 #### `!close`
 - **Description**: Close the ticket (defaults to transcript + delete)
@@ -275,7 +275,7 @@ These commands are only available **inside an OPEN support ticket channel** and 
 - **Parameters**: None
 - **Usage**: `!close` (run inside a ticket channel)
 - **Admin Only**: No (staff-only via `config.json -> support_tickets.permissions.staff_role_ids` or Discord Administrator)
-- **Returns**: Same as `!transcript` by default (exports then deletes)
+- **Returns**: Same as `!transcript` by default (exports then deletes), including the same failure behavior
 
 ## Command Summary
 
