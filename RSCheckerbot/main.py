@@ -7406,6 +7406,8 @@ def _whop_detected_movement_line(
     receipt: dict | None,
     cards: str,
     embed_kind: str = "",
+    card_title: str = "",
+    brief_status: str = "",
 ) -> str:
     bits: list[str] = [
         "[Whop Webhook][detected]",
@@ -7420,6 +7422,12 @@ def _whop_detected_movement_line(
     ek = str(embed_kind or "").strip()
     if ek:
         bits.append(f"embed_kind={_whop_detected_kv_sanitize(ek, max_len=80)}")
+    ct = str(card_title or "").strip()
+    if ct:
+        bits.append(f"card_title={_whop_detected_kv_sanitize(ct, max_len=120)}")
+    st = str(brief_status or "").strip()
+    if st:
+        bits.append(f"brief_status={_whop_detected_kv_sanitize(st, max_len=40)}")
     if wh_id:
         bits.append(f"wh_id={_whop_detected_kv_sanitize(wh_id, max_len=120)}")
     if isinstance(receipt, dict) and receipt:
@@ -8121,6 +8129,8 @@ async def _process_whop_standard_webhook(
                         receipt=receipt,
                         cards=_whop_staff_cards_plan(kind=str(kind or ""), member_in_guild=False),
                         embed_kind=str(embed_kind or ""),
+                        card_title=str(title2 or title or ""),
+                        brief_status=str((brief or {}).get("status") or "").strip(),
                     )
                 )
             with suppress(Exception):
@@ -8244,6 +8254,8 @@ async def _process_whop_standard_webhook(
                         receipt=receipt,
                         cards=_whop_staff_cards_plan(kind=str(kind or ""), member_in_guild=True),
                         embed_kind=str(embed_kind or ""),
+                        card_title=str(title or "").strip(),
+                        brief_status=str((brief or {}).get("status") or "").strip(),
                     )
                 )
             with suppress(Exception):
@@ -9750,6 +9762,8 @@ async def _whop_movement_send(*, content: str | None, embed: discord.Embed | Non
         issue = str(kv.get("issue") or "").strip()
         wh_evt = str(kv.get("wh_id") or "").strip()
         embed_kind_kv = str(kv.get("embed_kind") or "").strip()
+        card_title_kv = str(kv.get("card_title") or "").strip()
+        brief_status_kv = str(kv.get("brief_status") or "").strip()
         cards_plan = str(kv.get("cards") or "").strip()
         bind = str(kv.get("bind") or "").strip()
         path = str(kv.get("path") or "").strip()
@@ -9787,8 +9801,15 @@ async def _whop_movement_send(*, content: str | None, embed: discord.Embed | Non
             e.add_field(name="Discord ID", value=f"`{did}`", inline=True)
         elif linked:
             e.add_field(name="Linked", value=("yes" if linked == "yes" else "no"), inline=True)
+        if card_title_kv:
+            # Movement line uses single-token KV values (spaces → underscores); restore for display.
+            card_title_disp = str(card_title_kv).replace("_", " ").strip()
+            e.add_field(name="Staff card title", value=card_title_disp[:1024], inline=False)
+        if brief_status_kv:
+            brief_status_disp = str(brief_status_kv).replace("_", " ").strip()
+            e.add_field(name="Whop brief status", value=brief_status_disp[:1024], inline=True)
         if embed_kind_kv:
-            e.add_field(name="Card layout", value=embed_kind_kv[:1024], inline=True)
+            e.add_field(name="Embed layout key", value=embed_kind_kv[:1024], inline=True)
         if wh_evt:
             e.add_field(name="Whop delivery id", value=f"`{wh_evt[:900]}`", inline=False)
         ingress_bits: list[str] = []
