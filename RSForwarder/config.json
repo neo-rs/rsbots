@@ -21,6 +21,10 @@
   ],
   "forwarding_logs_channel_id": "1446374766180307015",
   "price_glitch_role_id": "886824827745337374",
+  "dedupe_window_s": 2.0,
+  "dedupe_sent_ttl_s": 900,
+  "dedupe_max_entries": 5000,
+  "dedupe_debug": false,
   "channels": [
     {
       "source_channel_id": "1446174806981480578",
@@ -33,6 +37,7 @@
     {
       "source_channel_id": "1446174861931188387",
       "source_channel_name": "online-important",
+      "dedupe_priority": 100,
       "role_mention": {
         "role_id": "1139627400901169212",
         "text": ""
@@ -85,6 +90,7 @@
     {
       "source_channel_id": "1487446697146712296",
       "source_channel_name": "price-error-glitched",
+      "dedupe_priority": 200,
       "role_mention": {
         "role_id": "1139628383853101166",
         "text": ""

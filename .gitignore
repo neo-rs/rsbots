@@ -223,6 +223,10 @@ venv/
 # Server-only secrets (never commit)
 **/config.secrets.json
 
+# DailyScheduleReminder local forward-queue resume cursor (machine-specific)
+DailyScheduleReminder/mirror_forward_checkpoint.json
+DailyScheduleReminder/mirror_forward_hdnation_failures.jsonl
+
 # SSH private keys
 **/*.key
 **/*.pem

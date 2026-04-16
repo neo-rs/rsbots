@@ -22,7 +22,8 @@ import time
 import hashlib
 import unicodedata
 import re
-from urllib.parse import urlparse
+from collections import OrderedDict
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 from RSForwarder import affiliate_rewriter
 from RSForwarder import novnc_stack
@@ -1256,6 +1257,15 @@ class RSForwarderBot:
         self._mavely_last_autologin_msg: Optional[str] = None
         self._mavely_last_refresher_pid: Optional[int] = None
         self._mavely_last_refresher_log_path: Optional[str] = None
+
+        # Global dedupe (cross-source) state for forwarding (not RS-FS sheet).
+        # - pending_by_key: winner candidate within the dedupe window
+        # - sent_cache: recently sent keys to suppress repeat sends
+        self._dedupe_lock = asyncio.Lock()
+        self._dedupe_pending_by_key: Dict[str, Dict[str, Any]] = {}
+        self._dedupe_pending_task_by_key: Dict[str, asyncio.Task] = {}
+        self._dedupe_sent_cache: "OrderedDict[str, float]" = OrderedDict()
+
         self.load_config()
 
         # RS - Full Send List sheet sync (Zephyr release feed -> Google Sheet)
@@ -2855,6 +2865,670 @@ class RSForwarderBot:
             if str(channel.get("source_channel_id")) == str(channel_id):
                 return channel
         return None
+
+    # -------------------------
+    # Global forwarding dedupe
+    # -------------------------
+    def _dedupe_window_s(self) -> float:
+        try:
+            v = float((self.config or {}).get("dedupe_window_s") or 0.0)
+        except Exception:
+            v = 0.0
+        return max(0.0, min(v, 10.0))
+
+    def _dedupe_sent_ttl_s(self) -> int:
+        try:
+            v = int((self.config or {}).get("dedupe_sent_ttl_s") or 0)
+        except Exception:
+            v = 0
+        return max(0, min(v, 24 * 3600))
+
+    def _dedupe_max_entries(self) -> int:
+        try:
+            v = int((self.config or {}).get("dedupe_max_entries") or 5000)
+        except Exception:
+            v = 5000
+        return max(100, min(v, 100000))
+
+    def _dedupe_debug(self) -> bool:
+        try:
+            return bool((self.config or {}).get("dedupe_debug", False))
+        except Exception:
+            return False
+
+    def _dedupe_priority(self, channel_config: Optional[Dict[str, Any]]) -> int:
+        try:
+            return int((channel_config or {}).get("dedupe_priority") or 0)
+        except Exception:
+            return 0
+
+    def _dedupe_clip(self, s: str, n: int = 220) -> str:
+        t = str(s or "").replace("\r", " ").replace("\n", " ").strip()
+        if len(t) <= n:
+            return t
+        return t[: max(0, n - 3)] + "..."
+
+    def _dedupe_normalize_text(self, text: str) -> str:
+        """
+        Normalize deal text so cross-channel reposts match:
+        - lower
+        - collapse whitespace
+        - strip obvious leading/trailing punctuation
+        """
+        t = str(text or "")
+        try:
+            t = unicodedata.normalize("NFKC", t)
+        except Exception:
+            pass
+        t = t.replace("\u200b", " ")
+        t = t.lower()
+        t = re.sub(r"\s+", " ", t).strip()
+        t = t.strip(" \t-–—|:;.,")
+        return t
+
+    def _dedupe_normalize_url(self, url: str) -> str:
+        u = str(url or "").strip().strip(")>.],\"'")  # common trailing punctuation from chat
+        if not u:
+            return ""
+        try:
+            p = urlparse(u)
+        except Exception:
+            return u
+        scheme = (p.scheme or "https").lower()
+        netloc = (p.netloc or "").lower()
+        path = p.path or ""
+        # Best-effort: drop common tracking params (keep everything else).
+        try:
+            q = []
+            for k, v in parse_qsl(p.query or "", keep_blank_values=True):
+                kk = (k or "").strip().lower()
+                if not kk:
+                    continue
+                if kk.startswith("utm_") or kk in {"fbclid", "gclid", "igshid", "mc_cid", "mc_eid"}:
+                    continue
+                q.append((k, v))
+            query = urlencode(q, doseq=True)
+        except Exception:
+            query = p.query or ""
+        try:
+            return urlunparse((scheme, netloc, path, "", query, ""))  # drop params/fragments
+        except Exception:
+            return u
+
+    def _dedupe_extract_urls(self, text: str) -> List[str]:
+        """
+        Extract HTTP URLs from text. We keep it simple and robust (Discord formatting included).
+        """
+        t = str(text or "")
+        if not t:
+            return []
+        urls = re.findall(r"https?://\S+", t, flags=re.IGNORECASE) or []
+        out: List[str] = []
+        seen: Set[str] = set()
+        for raw in urls:
+            nu = self._dedupe_normalize_url(raw)
+            if not nu:
+                continue
+            if nu in seen:
+                continue
+            seen.add(nu)
+            out.append(nu)
+        return out
+
+    def _dedupe_embed_text(self, embeds_raw: List[Dict[str, Any]]) -> str:
+        """
+        Convert embed dicts into a stable text blob for dedupe.
+        We include title/description/fields only (footer/author often change).
+        """
+        parts: List[str] = []
+        for e in embeds_raw or []:
+            if not isinstance(e, dict):
+                continue
+            title = str(e.get("title") or "").strip()
+            desc = str(e.get("description") or "").strip()
+            if title:
+                parts.append(title)
+            if desc:
+                parts.append(desc)
+            fields = e.get("fields") or []
+            if isinstance(fields, list):
+                for f in fields:
+                    if not isinstance(f, dict):
+                        continue
+                    n = str(f.get("name") or "").strip()
+                    v = str(f.get("value") or "").strip()
+                    if n and v:
+                        parts.append(f"{n}: {v}")
+                    elif v:
+                        parts.append(v)
+        return "\n".join([p for p in parts if p])
+
+    def _dedupe_first_two_lines(self, text: str) -> Tuple[str, str]:
+        lines = []
+        for ln in str(text or "").splitlines():
+            t = self._dedupe_normalize_text(ln)
+            if not t:
+                continue
+            lines.append(t)
+            if len(lines) >= 2:
+                break
+        if not lines:
+            return "", ""
+        if len(lines) == 1:
+            return lines[0], ""
+        return lines[0], lines[1]
+
+    def _dedupe_build_key(self, *, content: str, embeds_raw: List[Dict[str, Any]]) -> Tuple[str, str, str]:
+        """
+        Return (key_hash, basis_type, basis_preview).
+        Strategy:
+        - URLs-first (content + embed text): u|url1|url2...
+        - else: t|line1|line2 from normalized first 2 lines
+        """
+        emb_txt = self._dedupe_embed_text(embeds_raw or [])
+        combined = "\n".join([s for s in [str(content or ""), emb_txt] if (s or "").strip()])
+
+        urls = self._dedupe_extract_urls(combined)
+        if urls:
+            urls_sorted = sorted(urls)
+            basis = "u|" + "|".join(urls_sorted)
+            key = hashlib.sha1(basis.encode("utf-8", errors="replace")).hexdigest()
+            prev = self._dedupe_clip("|".join(urls_sorted), 260)
+            return key, "url", prev
+
+        l1, l2 = self._dedupe_first_two_lines(combined)
+        basis = "t|" + (l1 or "") + "|" + (l2 or "")
+        key = hashlib.sha1(basis.encode("utf-8", errors="replace")).hexdigest()
+        prev = self._dedupe_clip(" | ".join([p for p in [l1, l2] if p]), 260)
+        return key, "text", prev
+
+    def _dedupe_log(self, level_color: str, tag: str, msg: str) -> None:
+        try:
+            print(f"{level_color}[DEDUP] {tag} {msg}{Colors.RESET}", flush=True)
+        except Exception:
+            pass
+
+    def _dedupe_sent_cache_prune(self, now: float) -> None:
+        ttl = float(self._dedupe_sent_ttl_s() or 0)
+        if ttl <= 0:
+            self._dedupe_sent_cache.clear()
+            return
+        # Remove expired from oldest -> newest
+        try:
+            while self._dedupe_sent_cache:
+                _k, ts = next(iter(self._dedupe_sent_cache.items()))
+                if (now - float(ts or 0.0)) <= ttl:
+                    break
+                self._dedupe_sent_cache.popitem(last=False)
+        except Exception:
+            # If iteration fails for any reason, keep best-effort behavior.
+            pass
+        # Enforce size cap
+        max_n = int(self._dedupe_max_entries() or 5000)
+        try:
+            while len(self._dedupe_sent_cache) > max_n:
+                self._dedupe_sent_cache.popitem(last=False)
+        except Exception:
+            pass
+
+    async def _build_forward_payload(
+        self,
+        *,
+        message: discord.Message,
+        channel_id: str,
+        channel_config: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], str]:
+        """
+        Build webhook payload for a message (includes affiliate rewrite and branding).
+        Returns (payload, webhook_url).
+        """
+        webhook_url = str((channel_config or {}).get("destination_webhook_url", "") or "").strip()
+        source_channel_name = str((channel_config or {}).get("source_channel_name") or f"Channel {channel_id}")
+        src_ch_ref = _discord_channel_mention(channel_id)
+
+        if not webhook_url:
+            return {}, ""
+
+        # Prepare message content
+        content = message.content or ""
+
+        # Affiliate rewrite (standalone, same behavior as Instorebotforwarder)
+        rewrite_enabled = bool(self.config.get("affiliate_rewrite_enabled", True))
+        affiliate_changed = False
+        affiliate_notes: Dict[str, str] = {}
+        aff_cfg = self._affiliate_cfg(channel_config)
+        aff_cfg["_affiliate_log_channel_ref"] = src_ch_ref
+        if rewrite_enabled and content:
+            content, _changed, _notes = await affiliate_rewriter.rewrite_text(aff_cfg, content)
+            if _changed:
+                affiliate_changed = True
+            if isinstance(_notes, dict):
+                for k, v in _notes.items():
+                    if k and v:
+                        affiliate_notes[str(k)] = str(v)
+
+        # Never forward/ping @Members
+        if content:
+            content = self._strip_members_mentions(content)
+
+        # Get channel name for custom titles
+        channel_name = str((channel_config or {}).get("source_channel_name") or "Unknown Channel")
+
+        # Prepare embeds
+        embeds_raw = [e.to_dict() for e in message.embeds] if message.embeds else []
+        if rewrite_enabled and embeds_raw:
+            rewritten_embeds = []
+            for e in embeds_raw:
+                ee, _ch, _notes = await affiliate_rewriter.rewrite_embed_dict(aff_cfg, e)
+                if _ch:
+                    affiliate_changed = True
+                if isinstance(_notes, dict):
+                    for k, v in _notes.items():
+                        if k and v:
+                            affiliate_notes[str(k)] = str(v)
+                rewritten_embeds.append(ee)
+            embeds_raw = rewritten_embeds
+
+        # Human-friendly affiliate signal
+        if rewrite_enabled and affiliate_notes:
+            try:
+                if affiliate_changed:
+                    print(
+                        f"{Colors.GREEN}[Affiliate] {src_ch_ref} ✅ Rewrote affiliate links ({len(affiliate_notes)} url(s)){Colors.RESET}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"{Colors.YELLOW}[Affiliate] {src_ch_ref} ↩ No affiliate rewrite ({len(affiliate_notes)} url(s)){Colors.RESET}",
+                        flush=True,
+                    )
+                shown = 0
+                limit = 4 if affiliate_changed else 2
+                for u, note in list(affiliate_notes.items()):
+                    if shown >= limit:
+                        break
+                    print(
+                        f"{Colors.CYAN}[Affiliate] {src_ch_ref} - {u} ({note}){Colors.RESET}",
+                        flush=True,
+                    )
+                    shown += 1
+            except Exception:
+                pass
+
+        # If no embeds and we have content, create an embed from the message
+        if not embeds_raw and content:
+            embed = self._create_embed_from_message(content, channel_name, str(message.author) if message.author else None)
+            embeds_raw = [embed]
+
+        # Apply RS branding to all embeds
+        embeds = self._apply_rs_branding(embeds_raw, channel_name)
+
+        # Role mention
+        role_mention_text = self._get_role_mention_text(channel_config)
+
+        # Conditional role mention for "Price Glitch!"
+        price_glitch_role_id = str((self.config or {}).get("price_glitch_role_id", "") or "").strip()
+        if price_glitch_role_id:
+            for embed_dict in embeds_raw:
+                description = str(embed_dict.get("description", "") or "")
+                if "Price Glitch!" in description:
+                    role_mention_text = f"<@&{price_glitch_role_id}> Possible Price Error"
+                    break
+
+        # Never add @Members even if configured
+        if role_mention_text:
+            for rid in self._members_role_ids():
+                if f"<@&{rid}>" in role_mention_text:
+                    role_mention_text = None
+                    break
+
+        # Attachments
+        attachment_urls = [att.url for att in message.attachments] if message.attachments else []
+        first_image_url = None
+        if message.attachments:
+            for att in message.attachments:
+                if att.content_type and att.content_type.startswith("image/"):
+                    first_image_url = att.url
+                    break
+            if not first_image_url and attachment_urls:
+                first_image_url = attachment_urls[0]
+
+        if first_image_url and embeds:
+            if "image" not in embeds[0] or not (embeds[0].get("image") or {}).get("url"):
+                embeds[0]["image"] = {"url": first_image_url}
+
+        brand_name = str((self.config or {}).get("brand_name") or "Reselling Secrets")
+
+        # Ensure RS icon is available (best-effort)
+        if not self.rs_icon_url:
+            guild_id = self._rs_server_guild_id()
+            if guild_id:
+                try:
+                    self.rs_guild = self.bot.get_guild(guild_id)
+                    if self.rs_guild:
+                        self.rs_icon_url = self._get_guild_icon_url(self.rs_guild)
+                except Exception:
+                    pass
+                if not self.rs_icon_url:
+                    try:
+                        import requests
+                        bot_token = str((self.config or {}).get("bot_token", "") or "").strip()
+                        if bot_token:
+                            headers = {
+                                "Authorization": f"Bot {bot_token}",
+                                "User-Agent": "DiscordBot (RSForwarder)",
+                            }
+                            response = requests.get(
+                                f"https://discord.com/api/v10/guilds/{guild_id}?with_counts=false",
+                                headers=headers,
+                                timeout=5,
+                            )
+                            if response.status_code == 200:
+                                guild_data = response.json()
+                                icon_hash = guild_data.get("icon")
+                                if icon_hash:
+                                    ext = "gif" if str(icon_hash).startswith("a_") else "png"
+                                    self.rs_icon_url = f"https://cdn.discordapp.com/icons/{guild_id}/{icon_hash}.{ext}?size=256"
+                                    print(f"{Colors.GREEN}[Forward] Fetched RS icon via API: {self.rs_icon_url[:50]}...{Colors.RESET}")
+                    except Exception as e:
+                        if self.stats.get("messages_forwarded", 0) == 0:
+                            print(f"{Colors.YELLOW}[Warn] Could not fetch RS icon: {e}{Colors.RESET}")
+
+        payload: Dict[str, Any] = {"username": brand_name}
+        if self.rs_icon_url:
+            payload["avatar_url"] = self.rs_icon_url
+            if int(self.stats.get("messages_forwarded", 0) or 0) <= 1:
+                print(f"{Colors.GREEN}[Forward] Using RS icon: {self.rs_icon_url[:50]}...{Colors.RESET}")
+        else:
+            if int(self.stats.get("messages_forwarded", 0) or 0) == 0:
+                print(f"{Colors.RED}[Warn] RS Server icon not available - webhook will use default avatar{Colors.RESET}")
+                print(f"{Colors.YELLOW}[Warn] Check that bot is in RS Server Guild-ID: {self._rs_server_guild_id()}{Colors.RESET}")
+
+        final_content_parts: List[str] = []
+        if role_mention_text:
+            final_content_parts.append(role_mention_text)
+        if content and embeds:
+            final_content_parts.append(content)
+
+        final_content = "\n".join(final_content_parts).strip() if final_content_parts else ""
+        if final_content:
+            if len(final_content) > 2000:
+                final_content = final_content[:1997] + "..."
+            payload["content"] = final_content
+
+        if embeds:
+            payload["embeds"] = embeds[:10]
+
+        if attachment_urls and (not embeds):
+            if payload.get("content") and len(str(payload.get("content") or "")) + sum(len(u) for u in attachment_urls[:5]) < 2000:
+                payload["content"] = str(payload.get("content") or "") + "\n" + "\n".join(attachment_urls[:5])
+            elif not payload.get("content"):
+                payload["content"] = "\n".join(attachment_urls[:5])
+
+        if not payload.get("content") and not payload.get("embeds"):
+            payload["content"] = "[Message forwarded from RS Server]"
+
+        # Debug payload once
+        if int(self.stats.get("messages_forwarded", 0) or 0) == 0:
+            try:
+                print(f"{Colors.CYAN}[Debug] Payload username: {payload.get('username')}{Colors.RESET}")
+                av = payload.get("avatar_url") or ""
+                print(f"{Colors.CYAN}[Debug] Payload avatar_url: {(av[:50] + '...') if av else 'NOT SET'}{Colors.RESET}")
+            except Exception:
+                pass
+
+        return payload, webhook_url
+
+    async def _forward_send_once(
+        self,
+        *,
+        message: discord.Message,
+        channel_id: str,
+        channel_config: Dict[str, Any],
+        dedupe_key_short: str,
+    ) -> bool:
+        payload, webhook_url = await self._build_forward_payload(message=message, channel_id=channel_id, channel_config=channel_config)
+        if not payload or not webhook_url:
+            return False
+        return await self._send_webhook_payload(
+            message=message,
+            channel_id=channel_id,
+            channel_config=channel_config,
+            webhook_url=webhook_url,
+            payload=payload,
+            dedupe_key_short=dedupe_key_short,
+        )
+
+    async def _dedupe_submit_candidate(
+        self,
+        *,
+        key: str,
+        basis_type: str,
+        basis_preview: str,
+        priority: int,
+        channel_id: str,
+        channel_config: Dict[str, Any],
+        message: discord.Message,
+    ) -> None:
+        """
+        Global dedupe gate:
+        - Hold candidates within a short window
+        - Prefer higher priority candidate
+        - Suppress duplicates for TTL after send
+        """
+        now = time.time()
+        ttl = float(self._dedupe_sent_ttl_s() or 0)
+        window_s = float(self._dedupe_window_s() or 0.0)
+        if (not key) or ttl <= 0 or window_s <= 0:
+            # No dedupe configured; build+send immediately (single canonical send path).
+            await self._forward_send_once(
+                message=message,
+                channel_id=channel_id,
+                channel_config=channel_config,
+                dedupe_key_short="",
+            )
+            return
+
+        src_ch_ref = _discord_channel_mention(channel_id)
+        src_name = str((channel_config or {}).get("source_channel_name") or "")
+        mid = int(getattr(message, "id", 0) or 0)
+        jump = _message_jump_url_for_log(message)
+        key_short = str(key)[:10]
+
+        async with self._dedupe_lock:
+            self._dedupe_sent_cache_prune(now)
+            ts_prev = self._dedupe_sent_cache.get(key)
+            if ts_prev is not None and (now - float(ts_prev or 0.0)) <= ttl:
+                self._dedupe_log(
+                    Colors.YELLOW,
+                    "DEDUP_SUPPRESSED",
+                    f"key={key_short} reason=already_sent_ttl src={src_ch_ref} name={src_name!r} prio={priority} msg_id={mid} basis={basis_type} preview={basis_preview!r} jump={jump or '(none)'}",
+                )
+                return
+
+            # Seen log (only when we're actually in dedupe mode)
+            self._dedupe_log(
+                Colors.CYAN,
+                "DEDUP_SEEN",
+                f"key={key_short} src={src_ch_ref} name={src_name!r} prio={priority} msg_id={mid} basis={basis_type} preview={basis_preview!r} jump={jump or '(none)'}",
+            )
+
+            cand = {
+                "key": key,
+                "key_short": key_short,
+                "basis_type": basis_type,
+                "basis_preview": basis_preview,
+                "priority": int(priority or 0),
+                "channel_id": str(channel_id or ""),
+                "channel_name": src_name,
+                "message": message,
+                "message_id": mid,
+                "jump_url": jump,
+                "channel_config": channel_config,
+                "created_ts": now,
+            }
+
+            existing = self._dedupe_pending_by_key.get(key)
+            if existing is None:
+                self._dedupe_pending_by_key[key] = cand
+                self._dedupe_log(
+                    Colors.CYAN,
+                    "DEDUP_PENDING_SET",
+                    f"key={key_short} winner_src={src_ch_ref} prio={priority} window_s={window_s}",
+                )
+                if key not in self._dedupe_pending_task_by_key:
+                    self._dedupe_pending_task_by_key[key] = asyncio.create_task(self._dedupe_flush_key(key))
+                return
+
+            ex_prio = int(existing.get("priority") or 0)
+            ex_ch = _discord_channel_mention(existing.get("channel_id") or "")
+            ex_mid = int(existing.get("message_id") or 0)
+
+            if int(priority or 0) > ex_prio:
+                self._dedupe_pending_by_key[key] = cand
+                self._dedupe_log(
+                    Colors.GREEN,
+                    "DEDUP_PENDING_REPLACED",
+                    f"key={key_short} old_winner_src={ex_ch} old_prio={ex_prio} old_msg_id={ex_mid} new_winner_src={src_ch_ref} new_prio={priority} new_msg_id={mid} reason=higher_priority",
+                )
+                return
+
+            # Lower (or equal) priority loses.
+            self._dedupe_log(
+                Colors.YELLOW,
+                "DEDUP_SUPPRESSED",
+                f"key={key_short} reason=lower_priority loser_src={src_ch_ref} loser_prio={priority} loser_msg_id={mid} winner_src={ex_ch} winner_prio={ex_prio} winner_msg_id={ex_mid}",
+            )
+            return
+
+    async def _dedupe_flush_key(self, key: str) -> None:
+        """
+        Flush after the window. Sends only the pending winner.
+        """
+        try:
+            window_s = float(self._dedupe_window_s() or 0.0)
+            if window_s > 0:
+                await asyncio.sleep(window_s)
+
+            # Pull candidate under lock, and mark as sent (tentatively) to avoid races.
+            cand = None
+            now = time.time()
+            ttl = float(self._dedupe_sent_ttl_s() or 0)
+            async with self._dedupe_lock:
+                self._dedupe_pending_task_by_key.pop(key, None)
+                cand = self._dedupe_pending_by_key.pop(key, None)
+                self._dedupe_sent_cache_prune(now)
+                if cand is None:
+                    return
+                ts_prev = self._dedupe_sent_cache.get(key)
+                if ts_prev is not None and ttl > 0 and (now - float(ts_prev or 0.0)) <= ttl:
+                    self._dedupe_log(Colors.YELLOW, "DEDUP_FLUSH_SKIPPED", f"key={str(key)[:10]} reason=already_sent")
+                    return
+                # Tentatively reserve. If send fails we remove it.
+                self._dedupe_sent_cache[key] = now
+                try:
+                    self._dedupe_sent_cache.move_to_end(key)
+                except Exception:
+                    pass
+                self._dedupe_sent_cache_prune(now)
+
+            # Send outside lock.
+            key_short = str(cand.get("key_short") or str(key)[:10])
+            src = _discord_channel_mention(cand.get("channel_id") or "")
+            prio = int(cand.get("priority") or 0)
+            mid = int(cand.get("message_id") or 0)
+            self._dedupe_log(
+                Colors.CYAN,
+                "DEDUP_FLUSH_SEND",
+                f"key={key_short} winner_src={src} prio={prio} msg_id={mid}",
+            )
+
+            ok = await self._forward_send_once(
+                message=cand.get("message"),
+                channel_id=str(cand.get("channel_id") or ""),
+                channel_config=cand.get("channel_config") or {},
+                dedupe_key_short=key_short,
+            )
+            if not ok:
+                # On failure, allow retry (remove reservation).
+                async with self._dedupe_lock:
+                    try:
+                        self._dedupe_sent_cache.pop(key, None)
+                    except Exception:
+                        pass
+        except Exception as e:
+            try:
+                self._dedupe_log(Colors.RED, "DEDUP_FLUSH_ERR", f"key={str(key)[:10]} err={self._dedupe_clip(str(e), 240)!r}")
+            except Exception:
+                pass
+        finally:
+            # Ensure no stale task pointers remain.
+            async with self._dedupe_lock:
+                self._dedupe_pending_task_by_key.pop(key, None)
+
+    async def _send_webhook_payload(
+        self,
+        *,
+        message: discord.Message,
+        channel_id: str,
+        channel_config: Dict[str, Any],
+        webhook_url: str,
+        payload: Dict[str, Any],
+        dedupe_key_short: str,
+    ) -> bool:
+        """
+        Canonical send path for forwarded messages.
+        Returns True on successful POST to webhook.
+        """
+        try:
+            import requests
+
+            src_ch_ref = _discord_channel_mention(channel_id)
+            key_part = f" dedupe_key={dedupe_key_short}" if dedupe_key_short else ""
+            webhook_exec = _webhook_post_url_with_wait(webhook_url)
+            response = requests.post(webhook_exec, json=payload, timeout=10)
+
+            if response.status_code in [200, 204]:
+                self.stats["messages_forwarded"] += 1
+                posted_url, dest_ch_ref = _posted_message_url_from_webhook_response(response, webhook_url)
+                dest_part = dest_ch_ref or "(unknown dest channel)"
+                posted_part = posted_url or "(no message id; webhook wait=true response empty)"
+                embed_count = len(payload.get("embeds") or [])
+                content_len = len(str(payload.get("content") or ""))
+                print(
+                    f"{Colors.GREEN}[Forward]{key_part} Posted to {dest_part} - {posted_part}{Colors.RESET}",
+                    flush=True,
+                )
+                print(
+                    f"{Colors.GREEN}[Forward]{key_part} ✓ {src_ch_ref} → {content_len} chars, {embed_count} embed(s){Colors.RESET}",
+                    flush=True,
+                )
+                await self._send_forwarding_log(message, channel_config, success=True)
+                return True
+
+            self.stats["errors"] += 1
+            error_msg = f"{response.status_code}: {str(response.text or '')[:200]}"
+            print(
+                f"{Colors.RED}[Forward]{key_part} ✗ {src_ch_ref} Error {error_msg}{Colors.RESET}",
+                flush=True,
+            )
+            await self._send_forwarding_log(message, channel_config, success=False, error=error_msg)
+            return False
+        except Exception as e:
+            self.stats["errors"] += 1
+            try:
+                msg = self._dedupe_clip(str(e), 240)
+            except Exception:
+                msg = str(e)[:240]
+            print(
+                f"{Colors.RED}[Forward]{' dedupe_key=' + dedupe_key_short if dedupe_key_short else ''} Exception sending webhook: {msg}{Colors.RESET}",
+                flush=True,
+            )
+            try:
+                await self._send_forwarding_log(message, channel_config, success=False, error=str(e)[:240])
+            except Exception:
+                pass
+            return False
 
     def _zephyr_release_feed_channel_id(self) -> Optional[int]:
         try:
@@ -9189,271 +9863,30 @@ class RSForwarderBot:
                 f"{Colors.CYAN}[Forward] Forwarding from {src_ch_ref}...{Colors.RESET}",
                 flush=True,
             )
-            
-            # Prepare message content
-            content = message.content or ""
 
-            # Affiliate rewrite (standalone, same behavior as Instorebotforwarder)
-            rewrite_enabled = bool(self.config.get("affiliate_rewrite_enabled", True))
-            affiliate_changed = False
-            affiliate_notes: Dict[str, str] = {}
-            aff_cfg = self._affiliate_cfg(channel_config)
-            aff_cfg["_affiliate_log_channel_ref"] = src_ch_ref
-            if rewrite_enabled and content:
-                content, _changed, _notes = await affiliate_rewriter.rewrite_text(aff_cfg, content)
-                if _changed:
-                    affiliate_changed = True
-                if isinstance(_notes, dict):
-                    for k, v in _notes.items():
-                        if k and v:
-                            affiliate_notes[str(k)] = str(v)
-
-            # Never forward/ping @Members
-            if content:
-                content = self._strip_members_mentions(content)
-            
-            # Get channel name for custom titles
-            channel_name = channel_config.get("source_channel_name", "Unknown Channel")
-            
-            # Prepare embeds - convert normal messages to embeds if needed
-            embeds_raw = [e.to_dict() for e in message.embeds] if message.embeds else []
-
-            if rewrite_enabled and embeds_raw:
-                rewritten_embeds = []
-                for e in embeds_raw:
-                    ee, _ch, _notes = await affiliate_rewriter.rewrite_embed_dict(aff_cfg, e)
-                    if _ch:
-                        affiliate_changed = True
-                    if isinstance(_notes, dict):
-                        for k, v in _notes.items():
-                            if k and v:
-                                affiliate_notes[str(k)] = str(v)
-                    rewritten_embeds.append(ee)
-                embeds_raw = rewritten_embeds
-
-            # Human-friendly affiliate signal (helps debug why links didn't change)
-            if rewrite_enabled and affiliate_notes:
-                try:
-                    if affiliate_changed:
-                        print(
-                            f"{Colors.GREEN}[Affiliate] {src_ch_ref} ✅ Rewrote affiliate links ({len(affiliate_notes)} url(s)){Colors.RESET}",
-                            flush=True,
-                        )
-                    else:
-                        print(
-                            f"{Colors.YELLOW}[Affiliate] {src_ch_ref} ↩ No affiliate rewrite ({len(affiliate_notes)} url(s)){Colors.RESET}",
-                            flush=True,
-                        )
-
-                    shown = 0
-                    limit = 4 if affiliate_changed else 2
-                    for u, note in list(affiliate_notes.items()):
-                        if shown >= limit:
-                            break
-                        # `note` may include "reason -> replacement" from affiliate_rewriter.rewrite_text
-                        print(
-                            f"{Colors.CYAN}[Affiliate] {src_ch_ref} - {u} ({note}){Colors.RESET}",
-                            flush=True,
-                        )
-                        shown += 1
-                except Exception:
-                    pass
-            
-            # If no embeds and we have content, create an embed from the message
-            if not embeds_raw and content:
-                embed = self._create_embed_from_message(content, channel_name, str(message.author) if message.author else None)
-                embeds_raw = [embed]
-            
-            # Apply RS branding to all embeds
-            embeds = self._apply_rs_branding(embeds_raw, channel_name)
-            
-            # Check if we need to add role mention (works for both normal messages and embeds)
-            role_mention_text = self._get_role_mention_text(channel_config)
-            
-            # Conditional role mention for "Price Glitch!" messages (when price_glitch_role_id is configured)
-            price_glitch_role_id = self.config.get("price_glitch_role_id", "").strip()
-            if price_glitch_role_id:
-                # Check if any embed description contains exact phrase "Price Glitch!" (case-sensitive match)
-                # Instorebotforwarder adds "**Price Glitch!**" which appears as "Price Glitch!" in embed description
-                for embed_dict in embeds_raw:
-                    description = embed_dict.get("description", "") or ""
-                    # Check for exact phrase "Price Glitch!" (case-sensitive, with exclamation mark)
-                    if "Price Glitch!" in description:
-                        role_mention_text = f"<@&{price_glitch_role_id}> Possible Price Error"
-                        break
-            
-            # Never add @Members even if configured
-            if role_mention_text:
-                for rid in self._members_role_ids():
-                    if f"<@&{rid}>" in role_mention_text:
-                        role_mention_text = None
-                        break
-            # Debug: Log role mention status
-            if self.stats['messages_forwarded'] == 0:
-                if role_mention_text:
-                    print(f"{Colors.CYAN}[Debug] Role mention will be added: {role_mention_text[:50]}...{Colors.RESET}")
-                else:
-                    print(f"{Colors.CYAN}[Debug] No role mention (text is blank or not configured){Colors.RESET}")
-            
-            # Prepare attachments - get first image for embed
+            # Global dedupe + priority window happens BEFORE affiliate rewrite.
+            # Build key from raw message content + raw embed text (+ attachment URLs), then queue the winner.
+            raw_embeds = [e.to_dict() for e in message.embeds] if message.embeds else []
             attachment_urls = [att.url for att in message.attachments] if message.attachments else []
-            first_image_url = None
-            if message.attachments:
-                # Find first image attachment
-                for att in message.attachments:
-                    if att.content_type and att.content_type.startswith('image/'):
-                        first_image_url = att.url
-                        break
-                # If no image found but we have attachments, use first one
-                if not first_image_url and attachment_urls:
-                    first_image_url = attachment_urls[0]
-            
-            # Add image to embeds if we have one and embed doesn't already have an image
-            if first_image_url and embeds:
-                # Add image to first embed if it doesn't already have one
-                if "image" not in embeds[0] or not embeds[0].get("image", {}).get("url"):
-                    embeds[0]["image"] = {"url": first_image_url}
-            
-            # Build webhook payload
-            import requests
-            
-            brand_name = self.config.get("brand_name", "Reselling Secrets")
-            
-            # ALWAYS set avatar from RS Server icon (for ALL message types)
-            # If icon not loaded yet, try to fetch it now
-            if not self.rs_icon_url:
-                guild_id = self._rs_server_guild_id()
-                if guild_id:
-                    # Try to get from cached guild first
-                    self.rs_guild = self.bot.get_guild(guild_id)
-                    if self.rs_guild:
-                        self.rs_icon_url = self._get_guild_icon_url(self.rs_guild)
-                    # If still not found, try API synchronously
-                    if not self.rs_icon_url:
-                        # Fetch icon via API (synchronous for this message)
-                        import requests
-                        try:
-                            bot_token = self.config.get("bot_token", "").strip()
-                            if bot_token:
-                                headers = {
-                                    'Authorization': f'Bot {bot_token}',
-                                    'User-Agent': 'DiscordBot (RSForwarder)'
-                                }
-                                response = requests.get(
-                                    f'https://discord.com/api/v10/guilds/{guild_id}?with_counts=false',
-                                    headers=headers,
-                                    timeout=5
-                                )
-                                if response.status_code == 200:
-                                    guild_data = response.json()
-                                    icon_hash = guild_data.get("icon")
-                                    if icon_hash:
-                                        ext = "gif" if str(icon_hash).startswith("a_") else "png"
-                                        self.rs_icon_url = f"https://cdn.discordapp.com/icons/{guild_id}/{icon_hash}.{ext}?size=256"
-                                        print(f"{Colors.GREEN}[Forward] Fetched RS icon via API: {self.rs_icon_url[:50]}...{Colors.RESET}")
-                        except Exception as e:
-                            if self.stats['messages_forwarded'] == 0:
-                                print(f"{Colors.YELLOW}[Warn] Could not fetch RS icon: {e}{Colors.RESET}")
-            
-            # Build payload - ALWAYS set username and avatar
-            payload = {
-                "username": brand_name,  # ALWAYS override with RS branding
-            }
-            
-            # ALWAYS set avatar if we have it
-            if self.rs_icon_url:
-                payload["avatar_url"] = self.rs_icon_url
-                if self.stats['messages_forwarded'] <= 1:  # Log first few times
-                    print(f"{Colors.GREEN}[Forward] Using RS icon: {self.rs_icon_url[:50]}...{Colors.RESET}")
-            else:
-                # Log warning if icon still not available
-                if self.stats['messages_forwarded'] == 0:
-                    print(f"{Colors.RED}[Warn] RS Server icon not available - webhook will use default avatar{Colors.RESET}")
-                    print(f"{Colors.YELLOW}[Warn] Check that bot is in RS Server Guild-ID: {self._rs_server_guild_id()}{Colors.RESET}")
-            
-            # Build content with role mention if needed
-            # Since we're converting everything to embeds, role mention goes in content before embed
-            final_content_parts = []
-            
-            # Add role mention if configured (appears before embed)
-            if role_mention_text:
-                final_content_parts.append(role_mention_text)
-            
-            # If the original message had content and embeds, preserve the content too (forward full message).
-            if content and embeds:
-                final_content_parts.append(content)
+            content_for_key = (message.content or "").strip()
+            try:
+                if attachment_urls:
+                    content_for_key = (content_for_key + "\n" + "\n".join(attachment_urls[:5])).strip()
+            except Exception:
+                pass
 
-            # Only add content if we have anything to post in content (role mention and/or original content)
-            if final_content_parts:
-                
-                # Combine content
-                final_content = "\n".join(final_content_parts) if final_content_parts else None
-                
-                # Truncate if too long
-                if final_content and len(final_content) > 2000:
-                    final_content = final_content[:1997] + "..."
-                
-                # Add content if present
-                if final_content:
-                    payload["content"] = final_content
-            
-            # Add embeds (max 10)
-            if embeds:
-                payload["embeds"] = embeds[:10]
-                # Debug: Log embed titles (first message only)
-                if self.stats['messages_forwarded'] == 0:
-                    for i, embed in enumerate(embeds[:3]):  # Log first 3 embeds
-                        embed_title = embed.get("title", "[No title]")
-                        embed_footer = embed.get("footer", {}).get("text", "[No footer]")
-                        print(f"{Colors.CYAN}[Debug] Embed {i+1} title: '{embed_title}' | footer: '{embed_footer[:50]}...'{Colors.RESET}")
-            
-            # Add attachment URLs to content if no embeds and content is short
-            if attachment_urls and not embeds and final_content and len(final_content) + sum(len(url) for url in attachment_urls[:5]) < 2000:
-                payload["content"] = final_content + "\n" + "\n".join(attachment_urls[:5])
-            elif attachment_urls and not embeds and not final_content:
-                payload["content"] = "\n".join(attachment_urls[:5])
-            
-            # Ensure at least content or embeds
-            if not payload.get("content") and not payload.get("embeds"):
-                payload["content"] = "[Message forwarded from RS Server]"
-            
-            # Debug: Log payload (first message only)
-            if self.stats['messages_forwarded'] == 0:
-                print(f"{Colors.CYAN}[Debug] Payload username: {payload.get('username')}{Colors.RESET}")
-                print(f"{Colors.CYAN}[Debug] Payload avatar_url: {payload.get('avatar_url', 'NOT SET')[:50] if payload.get('avatar_url') else 'NOT SET'}{Colors.RESET}")
-            
-            # Send to webhook (wait=true so we can log the posted message jump link)
-            webhook_exec = _webhook_post_url_with_wait(webhook_url)
-            response = requests.post(webhook_exec, json=payload, timeout=10)
+            key, basis_type, basis_preview = self._dedupe_build_key(content=content_for_key, embeds_raw=raw_embeds or [])
+            prio = self._dedupe_priority(channel_config)
 
-            if response.status_code in [200, 204]:
-                self.stats['messages_forwarded'] += 1
-                embed_count = len(embeds)
-                role_mention = " (with role mention)" if role_mention_text else ""
-                posted_url, dest_ch_ref = _posted_message_url_from_webhook_response(response, webhook_url)
-                dest_part = dest_ch_ref or "(unknown dest channel)"
-                posted_part = posted_url or "(no message id; webhook wait=true response empty)"
-                print(
-                    f"{Colors.GREEN}[Forward] Posted to {dest_part} - {posted_part}{Colors.RESET}",
-                    flush=True,
-                )
-                print(
-                    f"{Colors.GREEN}[Forward] ✓ {src_ch_ref} → {len(content)} chars, {embed_count} embed(s){role_mention}{Colors.RESET}",
-                    flush=True,
-                )
-
-                # Send forwarding log
-                await self._send_forwarding_log(message, channel_config, success=True)
-            else:
-                self.stats['errors'] += 1
-                error_msg = f"{response.status_code}: {response.text[:200]}"
-                print(
-                    f"{Colors.RED}[Forward] ✗ {src_ch_ref} Error {error_msg}{Colors.RESET}",
-                    flush=True,
-                )
-                
-                # Send forwarding log with error
-                await self._send_forwarding_log(message, channel_config, success=False, error=error_msg)
+            await self._dedupe_submit_candidate(
+                key=key,
+                basis_type=basis_type,
+                basis_preview=basis_preview,
+                priority=prio,
+                channel_id=channel_id,
+                channel_config=channel_config,
+                message=message,
+            )
                 
         except Exception as e:
             self.stats['errors'] += 1
