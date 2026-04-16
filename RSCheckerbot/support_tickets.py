@@ -31,6 +31,7 @@ INDEX_PATH = BASE_DIR / "data" / "tickets_index.json"
 PENDING_STARTUP_PATH = BASE_DIR / "data" / "pending_ticket_startup_messages.json"
 MIGRATIONS_STATE_PATH = BASE_DIR / "data" / "support_tickets_migrations.json"
 MEMBER_HISTORY_PATH = BASE_DIR / "member_history.json"
+WHOP_LOGS_EVENTS_PATH = BASE_DIR / "data" / "whop_logs_events.json"
 WHOP_IDENTITY_CACHE_PATH = BASE_DIR / "whop_identity_cache.json"
 MEMBER_LOOKUP_PANEL_STATE_PATH = BASE_DIR / "data" / "support_member_lookup_panel.json"
 CANCELLATION_COUNTDOWN_STATE_PATH = BASE_DIR / "data" / "cancellation_countdown_state.json"
@@ -5374,11 +5375,22 @@ async def sweep_no_whop_link_scan(*, force: bool = False) -> str:
     resolved_linked = 0
     resolved_unlinked = 0
 
+    # Prefer live `#whop-logs` index (email → events) over member_history for membership hints.
+    # Lazy import avoids import cycle: support_tickets → whop_discord_ingest → whop_webhook_handler → support_tickets.
+    whop_logs_mid_by_did: dict[str, str] = {}
+    if WHOP_LOGS_EVENTS_PATH.exists():
+        with suppress(Exception):
+            from whop_discord_ingest import membership_hints_by_discord_id_from_events_file
+
+            whop_logs_mid_by_did = membership_hints_by_discord_id_from_events_file(WHOP_LOGS_EVENTS_PATH)
+
     for m in members:
         uid = int(getattr(m, "id", 0) or 0)
         if uid <= 0:
             continue
-        mid = _membership_id_from_member_history(int(uid))
+        mid = str(whop_logs_mid_by_did.get(str(uid), "") or "").strip()
+        if not mid:
+            mid = _membership_id_from_member_history(int(uid))
         if not str(mid or "").strip():
             # Fallback: open a discord-only ticket (roles + join date).
             skipped_no_mid += 1

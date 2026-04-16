@@ -200,7 +200,9 @@ from whop_webhook_handler import (
     resolve_discord_id_from_whop_logs as _resolve_discord_id_from_whop_logs,
     _extract_email_from_embed,
     _extract_discord_id_from_embed,
+    _whop_brief_from_event,
 )
+import whop_discord_ingest
 
 # Import Whop API client
 from whop_api_client import WhopAPIClient, WhopAPIError
@@ -4968,16 +4970,125 @@ def _apply_whop_membership_log_event_to_by_email(
     return True
 
 
+async def _ingest_whop_logs_live(message: discord.Message) -> None:
+    """Live ingest: `#whop-logs` → `data/whop_logs_events.json` + `member_history.json` baseline (when enabled)."""
+    try:
+        cid = int(WHOP_LOGS_CHANNEL_ID or 0) if str(WHOP_LOGS_CHANNEL_ID or "").strip().isdigit() else 0
+        if cid <= 0:
+            return
+        await whop_discord_ingest.append_whop_logs_discord_message(
+            events_path=WHOP_LOGS_EVENTS_FILE,
+            configured_channel_id=cid,
+            message=message,
+            source_name="whop-logs",
+        )
+        if not bool(MEMBER_HISTORY_INGEST_ENABLED):
+            return
+        if not message.embeds:
+            return
+        e0 = message.embeds[0]
+        if not isinstance(e0, discord.Embed):
+            return
+        title = str(getattr(e0, "title", "") or "").strip() or "(no title)"
+        jump = str(getattr(message, "jump_url", "") or "").strip()
+        created_iso = ""
+        with suppress(Exception):
+            if getattr(message, "created_at", None):
+                created_iso = message.created_at.astimezone(timezone.utc).isoformat()  # type: ignore[union-attr]
+        mid = int(getattr(message, "id", 0) or 0)
+        db = _load_member_history()
+        if not isinstance(db, dict):
+            db = {}
+        db = _ensure_whop_users_shape(db)
+        _apply_whop_logs_to_history(
+            db,
+            channel_id=cid,
+            message_id=mid,
+            jump_url=jump,
+            created_at_iso=created_iso,
+            title=title,
+            embed=e0,
+        )
+        _save_member_history(db)
+        st = _ingest_state_load()
+        _ingest_set_after_id(st, cid, mid)
+        _ingest_state_save(st)
+    except Exception:
+        return
+
+
+async def _trial_abuse_workflow_alert(message: discord.Message, event_data: dict, info: dict) -> None:
+    """Canonical member-status producer for trial-abuse signals (workflow / Discord EVENT_DATA)."""
+    try:
+        event_type = str(event_data.get("event_type", "") or "").strip()
+        discord_user_id = str(event_data.get("discord_user_id", "") or "").strip()
+        email = str(event_data.get("email", "") or "").strip()
+        guild = message.guild if message.guild else None
+        mem: discord.Member | None = None
+        if discord_user_id and guild:
+            try:
+                uid_i = int(str(discord_user_id).strip())
+                mem = guild.get_member(uid_i)
+                if mem is None:
+                    mem = await guild.fetch_member(uid_i)
+            except Exception:
+                mem = None
+        if mem:
+            whop_brief = await _whop_brief_from_event(mem, event_data)
+            relevant = coerce_role_ids(ROLE_TRIGGER, WELCOME_ROLE_ID, ROLE_CANCEL_A, ROLE_CANCEL_B)
+            access = access_roles_plain(mem, relevant)
+            detailed = _build_member_status_detailed_embed(
+                title="🚩 Trial Abuse Signal",
+                member=mem,
+                access_roles=access,
+                color=0xED4245,
+                discord_kv=[
+                    ("event", str(event_type or "").strip() or "whop_workflow"),
+                    ("reason", str((info or {}).get("reason", "Unknown"))),
+                    ("email", str(email or "").strip().lower() if email else "—"),
+                ],
+                whop_brief=whop_brief,
+            )
+            await log_member_status("", embed=detailed)
+            return
+        embed = discord.Embed(
+            title="🚩 Trial Abuse Signal",
+            color=0xED4245,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(
+            name="Member Info",
+            value=f"discord_id `{str(discord_user_id or 'N/A')}`",
+            inline=False,
+        )
+        embed.add_field(
+            name="Discord Info",
+            value=f"event `{str(event_type or '').strip()}`",
+            inline=False,
+        )
+        embed.add_field(
+            name="Payment Info",
+            value=f"reason `{str((info or {}).get('reason','Unknown'))}`",
+            inline=False,
+        )
+        await log_member_status("", embed=embed)
+    except Exception:
+        return
+
+
 @tasks.loop(seconds=300)
 async def member_history_ingest_loop() -> None:
-    """Tail whop-logs + whop-membership-logs and update member_history.json (resume-safe)."""
+    """Tail whop-membership-logs into member_history.json (resume-safe).
+
+    `#whop-logs` → `data/whop_logs_events.json` + native baseline is updated live via `_ingest_whop_logs_live`.
+    """
     try:
         if not bot.is_ready():
             return
         if not bool(MEMBER_HISTORY_INGEST_ENABLED):
             return
-        # Require channel IDs
-        if not (str(WHOP_LOGS_CHANNEL_ID or "").strip().isdigit() or str(WHOP_WEBHOOK_CHANNEL_ID or "").strip().isdigit()):
+        # Periodic tail only for whop-membership-logs (native membership feed).
+        if not str(WHOP_WEBHOOK_CHANNEL_ID or "").strip().isdigit():
             return
 
         st = _ingest_state_load()
@@ -4986,7 +5097,7 @@ async def member_history_ingest_loop() -> None:
             db = {}
         db = _ensure_whop_users_shape(db)
 
-        async def _tail_channel(cid: int, *, mode: str) -> int:
+        async def _tail_membership_logs_channel(cid: int) -> int:
             if cid <= 0:
                 return 0
             ch0 = bot.get_channel(int(cid))
@@ -4995,8 +5106,8 @@ async def member_history_ingest_loop() -> None:
                     ch0 = await bot.fetch_channel(int(cid))
             if not isinstance(ch0, discord.TextChannel):
                 return 0
-            events_path = WHOP_MEMBERSHIP_LOGS_EVENTS_FILE if mode == "whop_membership_logs" else WHOP_LOGS_EVENTS_FILE
-            source_name = "whop-membership-logs" if mode == "whop_membership_logs" else "whop-logs"
+            events_path = WHOP_MEMBERSHIP_LOGS_EVENTS_FILE
+            source_name = "whop-membership-logs"
             by_email = _load_events_by_email(events_path)
             after_id = _ingest_after_id(st, int(cid))
             after_obj = discord.Object(id=int(after_id)) if int(after_id) > 0 else None
@@ -5017,46 +5128,26 @@ async def member_history_ingest_loop() -> None:
                     if getattr(m, "created_at", None):
                         created_iso = m.created_at.astimezone(timezone.utc).isoformat()  # type: ignore[union-attr]
                 mid = int(getattr(m, "id", 0) or 0)
-                if mode == "whop_membership_logs":
-                    desc = str(getattr(e0, "description", "") or "")
-                    _apply_whop_membership_log_to_history(
-                        db,
-                        channel_id=int(cid),
-                        message_id=mid,
-                        jump_url=jump,
-                        created_at_iso=created_iso,
-                        title=title,
-                        desc=desc,
-                    )
-                    with suppress(Exception):
-                        _apply_whop_membership_log_event_to_by_email(
-                            by_email,
-                            embed=e0,
-                            desc=desc,
-                            title=title,
-                            message_id=mid,
-                            jump_url=jump,
-                            created_at_iso=created_iso,
-                        )
-                else:
-                    _apply_whop_logs_to_history(
-                        db,
-                        channel_id=int(cid),
-                        message_id=mid,
-                        jump_url=jump,
-                        created_at_iso=created_iso,
-                        title=title,
+                desc = str(getattr(e0, "description", "") or "")
+                _apply_whop_membership_log_to_history(
+                    db,
+                    channel_id=int(cid),
+                    message_id=mid,
+                    jump_url=jump,
+                    created_at_iso=created_iso,
+                    title=title,
+                    desc=desc,
+                )
+                with suppress(Exception):
+                    _apply_whop_membership_log_event_to_by_email(
+                        by_email,
                         embed=e0,
+                        desc=desc,
+                        title=title,
+                        message_id=mid,
+                        jump_url=jump,
+                        created_at_iso=created_iso,
                     )
-                    with suppress(Exception):
-                        _apply_whop_logs_event_to_by_email(
-                            by_email,
-                            embed=e0,
-                            title=title,
-                            message_id=mid,
-                            jump_url=jump,
-                            created_at_iso=created_iso,
-                        )
             if newest_seen and int(newest_seen) > int(after_id or 0):
                 _ingest_set_after_id(st, int(cid), int(newest_seen))
             if processed > 0 and by_email:
@@ -5064,16 +5155,14 @@ async def member_history_ingest_loop() -> None:
                     _save_events_by_email(events_path, by_email, source_name=source_name, channel_id=int(cid))
             return processed
 
-        logs_cid = int(WHOP_LOGS_CHANNEL_ID or 0) if str(WHOP_LOGS_CHANNEL_ID or "").strip().isdigit() else 0
         mem_cid = int(WHOP_WEBHOOK_CHANNEL_ID or 0) if str(WHOP_WEBHOOK_CHANNEL_ID or "").strip().isdigit() else 0
-        p1 = await _tail_channel(logs_cid, mode="whop_logs")
-        p2 = await _tail_channel(mem_cid, mode="whop_membership_logs")
+        p2 = await _tail_membership_logs_channel(mem_cid)
 
-        if p1 or p2:
+        if p2:
             _save_member_history(db)
             _ingest_state_save(st)
             with suppress(Exception):
-                await log_other(f"🧾 member_history_ingest: whop_logs={p1} whop_membership_logs={p2}")
+                await log_other(f"🧾 member_history_ingest: whop_membership_logs={p2}")
     except Exception as e:
         with suppress(Exception):
             await log_other(f"⚠️ member_history_ingest_loop error: `{str(e)[:200]}`")
@@ -5437,6 +5526,13 @@ async def _fetch_whop_brief_by_membership_id(membership_id: str) -> dict:
                         if did_s.isdigit():
                             brief["connected_discord"] = did_s
                             return brief
+
+            # 2b) Live `data/whop_logs_events.json` index (email → discord_id) updated on each `#whop-logs` message.
+            with suppress(Exception):
+                did_ev = await whop_discord_ingest.lookup_discord_id_for_email(WHOP_LOGS_EVENTS_FILE, email_hint)
+                if did_ev:
+                    brief["connected_discord"] = did_ev
+                    return brief
 
             try:
                 lim = int(WHOP_API_CONFIG.get("logs_lookup_limit") or 50)
@@ -7271,8 +7367,89 @@ async def _resolve_membership_id_for_std_webhook(evt: str, payload: dict) -> tup
     return ("", ctx)
 
 
-async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> None:
-    """Process Whop standard webhooks (real-time) into staff cards + movement logs."""
+def _whop_detected_kv_sanitize(v: object, *, max_len: int = 200) -> str:
+    """Single-token values for _whop_movement_send/_kv_pairs (no whitespace)."""
+    s = str(v or "").strip().replace(" ", "_")
+    if len(s) > max_len:
+        s = s[: max(1, max_len - 1)] + "…"
+    return s
+
+
+def _whop_staff_cards_plan(*, kind: str, member_in_guild: bool) -> str:
+    """Human-readable, no-space routing hint for movement logs."""
+    msl_name = str(OUTPUT_MEMBER_STATUS_CHANNEL_NAME or "").strip() or "member-status-logs"
+    msl_name = _whop_detected_kv_sanitize(msl_name, max_len=80)
+    if not member_in_guild:
+        return f"linked_hint->#{msl_name}"
+    parts = [f"detailed_member_status->#{msl_name}"]
+    if kind == "payment_failed":
+        parts.append(
+            "minimal_case->#"
+            + _whop_detected_kv_sanitize(PAYMENT_FAILURE_CHANNEL_NAME, max_len=80)
+        )
+    elif kind == "cancellation_scheduled":
+        parts.append(
+            "minimal_case->#"
+            + _whop_detected_kv_sanitize(MEMBER_CANCELLATION_CHANNEL_NAME, max_len=80)
+        )
+    return "+".join(parts)
+
+
+def _whop_detected_movement_line(
+    *,
+    kind: str,
+    evt: str,
+    mid: str,
+    linked: str,
+    did: int | str,
+    wh_id: str,
+    receipt: dict | None,
+    cards: str,
+    embed_kind: str = "",
+) -> str:
+    bits: list[str] = [
+        "[Whop Webhook][detected]",
+        f"kind={_whop_detected_kv_sanitize(kind)}",
+        f"type={_whop_detected_kv_sanitize(evt or '—')}",
+        f"mid={_whop_detected_kv_sanitize(mid)}",
+        f"linked={_whop_detected_kv_sanitize(linked)}",
+    ]
+    ds = str(did or "").strip()
+    if ds.isdigit() and int(ds) > 0:
+        bits.append(f"did={int(ds)}")
+    ek = str(embed_kind or "").strip()
+    if ek:
+        bits.append(f"embed_kind={_whop_detected_kv_sanitize(ek, max_len=80)}")
+    if wh_id:
+        bits.append(f"wh_id={_whop_detected_kv_sanitize(wh_id, max_len=120)}")
+    if isinstance(receipt, dict) and receipt:
+        lp = str(receipt.get("listen") or "").strip()
+        if lp:
+            bits.append(f"bind={_whop_detected_kv_sanitize(lp)}")
+        pth = str(receipt.get("path") or "").strip() or "/whop-webhook"
+        bits.append(f"path={_whop_detected_kv_sanitize(pth)}")
+        rm = str(receipt.get("remote") or "").strip()
+        if rm:
+            bits.append(f"remote={_whop_detected_kv_sanitize(rm, max_len=80)}")
+        ho = str(receipt.get("host") or "").strip()
+        if ho:
+            bits.append(f"host={_whop_detected_kv_sanitize(ho, max_len=120)}")
+        xf = str(receipt.get("forwarded") or "").strip()
+        if xf:
+            bits.append(f"xff={_whop_detected_kv_sanitize(xf, max_len=120)}")
+    bits.append(f"cards={_whop_detected_kv_sanitize(cards, max_len=500)}")
+    return " ".join(bits)
+
+
+async def _process_whop_standard_webhook(
+    payload: dict, *, headers: dict, receipt: dict | None = None
+) -> None:
+    """Process Whop standard webhooks (real-time) into staff cards + movement logs.
+
+    Canonical inbound path for Standard Webhooks is HTTP POST /whop-webhook (handle_whop_webhook_receiver).
+    When ``WHOP_WEBHOOK_SECRET`` is set, ``on_message`` returns before ``handle_whop_webhook_message`` so
+    Discord-native Whop channels do not duplicate this pipeline.
+    """
     if not isinstance(payload, dict) or not payload:
         return
     if not whop_api_client or not bot.is_ready():
@@ -7480,6 +7657,18 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
             _save_whop_api_events_state(state)
             return
 
+        # When Whop omits `webhook-id`, retries look like distinct deliveries; dedupe staff cards by membership+kind+UTC day.
+        if not wh_id:
+            day_utc = now.strftime("%Y-%m-%d")
+            card_dkey = f"whop_staff_day:{str(mid2 or '').strip()}:{str(kind or '').strip()}:{day_utc}"
+            if card_dkey in sent:
+                state["memberships"] = memberships
+                state["sent"] = sent
+                state["cases"] = cases
+                _save_whop_api_events_state(state)
+                return
+            sent[card_dkey] = now.isoformat().replace("+00:00", "Z")
+
         title, color, embed_kind = _title_for_event(kind)
         # Fill missing Whop fields from membership-log baseline (no extra API calls).
         try:
@@ -7514,6 +7703,15 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                                     connected_disp = str(did)
                                     if isinstance(brief, dict):
                                         brief["connected_discord"] = connected_disp
+                if not did:
+                    with suppress(Exception):
+                        did_ev = await whop_discord_ingest.lookup_discord_id_for_email(WHOP_LOGS_EVENTS_FILE, email_hint)
+                        if str(did_ev or "").strip().isdigit():
+                            did = int(str(did_ev).strip())
+                            if did > 0:
+                                connected_disp = str(did)
+                                if isinstance(brief, dict):
+                                    brief["connected_discord"] = connected_disp
                 if not did:
                     try:
                         lim = int(WHOP_API_CONFIG.get("logs_lookup_limit", 50))
@@ -7611,6 +7809,15 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                                         connected_disp = str(did)
                                         if isinstance(brief, dict):
                                             brief["connected_discord"] = connected_disp
+                if not did and email_hint:
+                    with suppress(Exception):
+                        did_ev = await whop_discord_ingest.lookup_discord_id_for_email(WHOP_LOGS_EVENTS_FILE, email_hint)
+                        if str(did_ev or "").strip().isdigit():
+                            did = int(str(did_ev).strip())
+                            if did > 0:
+                                connected_disp = str(did)
+                                if isinstance(brief, dict):
+                                    brief["connected_discord"] = connected_disp
                 if not did and email_hint:
                     try:
                         lim = int(WHOP_API_CONFIG.get("logs_lookup_limit", 50))
@@ -7733,7 +7940,19 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                 )
                 await _whop_movement_send(content="", embed=e)
             with suppress(Exception):
-                await _whop_api_events_log(f"[Whop Webhook][detected] kind={kind} linked=no mid={mid2} type={evt or '—'}")
+                await _whop_api_events_log(
+                    _whop_detected_movement_line(
+                        kind=str(kind or ""),
+                        evt=str(evt or ""),
+                        mid=str(mid2 or ""),
+                        linked="no",
+                        did=(int(did) if str(did or "").strip().isdigit() else 0),
+                        wh_id=str(wh_id or ""),
+                        receipt=receipt,
+                        cards=_whop_staff_cards_plan(kind=str(kind or ""), member_in_guild=False),
+                        embed_kind=str(embed_kind or ""),
+                    )
+                )
             with suppress(Exception):
                 issue_override = ""
                 case_key_override = ""
@@ -7843,7 +8062,17 @@ async def _process_whop_standard_webhook(payload: dict, *, headers: dict) -> Non
                 pass
             with suppress(Exception):
                 await _whop_api_events_log(
-                    f"[Whop Webhook][detected] kind={kind} linked=yes did={member_obj.id} mid={mid2} type={evt or '—'}"
+                    _whop_detected_movement_line(
+                        kind=str(kind or ""),
+                        evt=str(evt or ""),
+                        mid=str(mid2 or ""),
+                        linked="yes",
+                        did=int(getattr(member_obj, "id", 0) or 0),
+                        wh_id=str(wh_id or ""),
+                        receipt=receipt,
+                        cards=_whop_staff_cards_plan(kind=str(kind or ""), member_in_guild=True),
+                        embed_kind=str(embed_kind or ""),
+                    )
                 )
             with suppress(Exception):
                 issue_override = ""
@@ -7989,8 +8218,15 @@ async def handle_whop_webhook_receiver(request):
 
         # Process the webhook directly (real-time staff cards + movement logs).
         # This replaces the legacy "forward raw JSON to a Discord webhook" behavior which caused blanks.
+        receipt = {
+            "path": "/whop-webhook",
+            "listen": f"0.0.0.0:{int(HTTP_SERVER_PORT)}",
+            "remote": str(getattr(request, "remote", "") or "").strip(),
+            "host": str(headers.get("host") or "").strip(),
+            "forwarded": str(headers.get("x-forwarded-for") or "").strip(),
+        }
         with suppress(Exception):
-            await _process_whop_standard_webhook(payload, headers=headers)
+            await _process_whop_standard_webhook(payload, headers=headers, receipt=receipt)
         return web.Response(text="OK", status=200)
     
     except Exception as e:
@@ -9332,6 +9568,14 @@ async def _whop_movement_send(*, content: str | None, embed: discord.Embed | Non
         did = str(kv.get("did") or "").strip()
         mid = str(kv.get("mid") or kv.get("membership_id") or "").strip()
         issue = str(kv.get("issue") or "").strip()
+        wh_evt = str(kv.get("wh_id") or "").strip()
+        embed_kind_kv = str(kv.get("embed_kind") or "").strip()
+        cards_plan = str(kv.get("cards") or "").strip()
+        bind = str(kv.get("bind") or "").strip()
+        path = str(kv.get("path") or "").strip()
+        remote = str(kv.get("remote") or "").strip()
+        host = str(kv.get("host") or "").strip()
+        xff = str(kv.get("xff") or "").strip()
 
         title = "Whop movement"
         if s.startswith("[Whop Webhook][detected]"):
@@ -9363,6 +9607,25 @@ async def _whop_movement_send(*, content: str | None, embed: discord.Embed | Non
             e.add_field(name="Discord ID", value=f"`{did}`", inline=True)
         elif linked:
             e.add_field(name="Linked", value=("yes" if linked == "yes" else "no"), inline=True)
+        if embed_kind_kv:
+            e.add_field(name="Card layout", value=embed_kind_kv[:1024], inline=True)
+        if wh_evt:
+            e.add_field(name="Whop delivery id", value=f"`{wh_evt[:900]}`", inline=False)
+        ingress_bits: list[str] = []
+        if bind:
+            ingress_bits.append(f"listen `{bind}`")
+        if path:
+            ingress_bits.append(f"path `{path}`")
+        if remote:
+            ingress_bits.append(f"remote `{remote}`")
+        if host:
+            ingress_bits.append(f"Host `{host}`")
+        if xff:
+            ingress_bits.append(f"XFF `{xff}`")
+        if ingress_bits:
+            e.add_field(name="Received at", value="\n".join(ingress_bits)[:1024], inline=False)
+        if cards_plan:
+            e.add_field(name="Staff cards triggered", value=cards_plan[:1024], inline=False)
 
         # If the message references a channel id "(123...)", surface it.
         ch_id = ""
@@ -10258,7 +10521,30 @@ async def on_ready():
             log.info("[Whop API] Client disabled (module not available)")
         else:
             log.info("[Whop API] Client disabled (no API key)")
-    
+
+    try:
+        init_whop_handler(
+            WHOP_WEBHOOK_CHANNEL_ID,
+            WHOP_LOGS_CHANNEL_ID,
+            ROLE_TRIGGER,
+            WELCOME_ROLE_ID,
+            ROLE_CANCEL_A,
+            ROLE_CANCEL_B,
+            log_other,
+            log_member_status,
+            _fmt_user,
+            member_status_logs_channel_id=MEMBER_STATUS_LOGS_CHANNEL_ID,
+            record_member_whop_summary_func=record_member_whop_summary,
+            record_whop_event_func=_record_whop_event,
+            whop_api_key=WHOP_API_KEY,
+            whop_api_config=WHOP_API_CONFIG,
+            lifetime_role_ids=list(LIFETIME_ROLE_IDS),
+            trial_abuse_alert_func=_trial_abuse_workflow_alert,
+        )
+        log.info("[WhopDiscord] Native/workflow handler initialized")
+    except Exception as e:
+        log.warning("[WhopDiscord] init_whop_handler failed: %s", str(e)[:400])
+
     # Startup scans can be expensive; run them sequentially in one canonical routine.
     # NOTE: We do NOT rely on Discord whop-* channels when API/webhook mode is enabled.
     asyncio.create_task(_run_startup_scans())
@@ -11205,6 +11491,11 @@ async def on_message(message: discord.Message):
     # Ticket audit logs (human messages in ticket categories).
     with suppress(Exception):
         await support_tickets.audit_message_create(message)
+
+    # Live `#whop-logs` ingest (always; independent of HTTP webhook secret gating below).
+    if WHOP_LOGS_CHANNEL_ID and int(getattr(getattr(message, "channel", None), "id", 0) or 0) == int(WHOP_LOGS_CHANNEL_ID):
+        with suppress(Exception):
+            await _ingest_whop_logs_live(message)
 
     # Also allow non-bot messages in member-status-logs to be ignored (tickets trigger only from bot cards).
 

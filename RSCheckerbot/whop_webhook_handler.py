@@ -33,18 +33,9 @@ from rschecker_utils import fmt_money, usd_amount
 from rschecker_utils import access_roles_plain, coerce_role_ids
 from rschecker_utils import fmt_date_any as _fmt_date_any
 from rschecker_utils import parse_dt_any as _parse_dt_any
-from staff_embeds import build_case_minimal_embed, build_member_status_detailed_embed
 from whop_brief import fetch_whop_brief
 from whop_native_membership_cache import record_summary as _record_native_summary_by_mid
 from staff_channels import PAYMENT_FAILURE_CHANNEL_NAME, MEMBER_CANCELLATION_CHANNEL_NAME
-from staff_alerts_store import (
-    load_staff_alerts,
-    save_staff_alerts,
-    should_post_alert,
-    record_alert_post,
-    should_post_and_record_alert,
-)
-
 # Import Whop API client (required; do not silently disable modules)
 from whop_api_client import WhopAPIClient, WhopAPIError
 
@@ -63,6 +54,7 @@ _log_member_status = None
 _fmt_user = None
 _record_member_whop_summary = None
 _record_whop_event = None
+_trial_abuse_alert_func = None
 
 # Identity tracking and trial abuse detection
 MEMBER_STATUS_LOGS_CHANNEL_ID = None
@@ -79,7 +71,6 @@ BASE_DIR = Path(__file__).resolve().parent
 IDENTITY_CACHE_FILE = BASE_DIR / "whop_identity_cache.json"
 TRIAL_CACHE_FILE = BASE_DIR / "trial_history.json"
 IDENTITY_CONFLICTS_FILE = BASE_DIR / "identity_conflicts.jsonl"
-STAFF_ALERTS_FILE = BASE_DIR / "staff_alerts.json"
 PAYMENT_CACHE_FILE = BASE_DIR / "payment_cache.json"
 
 from rschecker_utils import extract_discord_id_from_whop_member_record
@@ -1107,6 +1098,7 @@ def initialize(
     whop_api_key=None,
     whop_api_config=None,
     lifetime_role_ids=None,
+    trial_abuse_alert_func=None,
 ):
     """
     Initialize handler with configuration and logging functions.
@@ -1132,6 +1124,7 @@ def initialize(
     global LIFETIME_ROLE_IDS
     global _log_other, _log_member_status, _fmt_user, _record_member_whop_summary, _record_whop_event
     global MEMBER_STATUS_LOGS_CHANNEL_ID, EXPECTED_ROLES, _whop_api_client, _whop_api_config
+    global _trial_abuse_alert_func
     
     WHOP_WEBHOOK_CHANNEL_ID = webhook_channel_id
     WHOP_LOGS_CHANNEL_ID = whop_logs_channel_id
@@ -1153,6 +1146,7 @@ def initialize(
     _record_member_whop_summary = record_member_whop_summary_func
     _record_whop_event = record_whop_event_func
     MEMBER_STATUS_LOGS_CHANNEL_ID = member_status_logs_channel_id
+    _trial_abuse_alert_func = trial_abuse_alert_func
     
     # Load expected roles config
     try:
@@ -1340,55 +1334,9 @@ async def _handle_workflow_webhook(message: discord.Message, embed: discord.Embe
                 except ValueError:
                     should_alert = False
             
-            if should_alert and _log_member_status:
-                guild = message.guild if message.guild else None
-                mem: discord.Member | None = None
-                if discord_user_id and guild:
-                    try:
-                        user_id_int = int(str(discord_user_id).strip())
-                        mem = await _resolve_member_safe(guild, user_id_int, force_fetch=True)
-                    except Exception:
-                        mem = None
-
-                if mem:
-                    whop_brief = await _whop_brief_from_event(mem, event_data)
-                    access = _access_roles_compact(mem)
-                    detailed = build_member_status_detailed_embed(
-                        title="🚩 Trial Abuse Signal",
-                        member=mem,
-                        access_roles=access,
-                        color=0xED4245,
-                        discord_kv=[
-                            ("event", str(event_type or "").strip() or "whop_workflow"),
-                            ("reason", info.get("reason", "Unknown")),
-                            ("email", _norm_email(email) if email else "—"),
-                        ],
-                        whop_brief=whop_brief,
-                    )
-                    await _log_member_status("", embed=detailed)
-                else:
-                    # Fallback (no resolved member): still avoid legacy field names.
-                    embed = discord.Embed(
-                        title="🚩 Trial Abuse Signal",
-                        color=0xED4245,
-                        timestamp=datetime.now(timezone.utc),
-                    )
-                    embed.add_field(
-                        name="Member Info",
-                        value=f"discord_id `{str(discord_user_id or 'N/A')}`",
-                        inline=False,
-                    )
-                    embed.add_field(
-                        name="Discord Info",
-                        value=f"event `{str(event_type or '').strip()}`",
-                        inline=False,
-                    )
-                    embed.add_field(
-                        name="Payment Info",
-                        value=f"reason `{info.get('reason','Unknown')}`",
-                        inline=False,
-                    )
-                    await _log_member_status("", embed=embed)
+            if should_alert and _trial_abuse_alert_func:
+                with suppress(Exception):
+                    await _trial_abuse_alert_func(message, event_data, info)
         
         if not discord_user_id:
             if _log_other:
@@ -1646,33 +1594,11 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
                 member = await guild.fetch_member(discord_user_id)
         
         if not member:
-            # Still process summary storage even if member not found, but also post a minimal staff card
-            # so events don't silently disappear.
+            # Summary storage still ran above; staff cards for Whop events are canonical in `main.py`.
             if _log_other:
-                await _log_other(f"⚠️ **Whop Native:** Member `{discord_user_id}` not found in guild (posting fallback card)")
-            if _log_member_status:
-                e = discord.Embed(
-                    title=str(title or "Whop Native Event").strip()[:256],
-                    description=str(description or "").strip()[:3500] or "—",
-                    color=0xFEE75C,
-                    timestamp=datetime.now(timezone.utc),
+                await _log_other(
+                    f"⚠️ **Whop Native:** Member `{discord_user_id}` not found in guild (summary cached; no member-status card from native path)"
                 )
-                with suppress(Exception):
-                    if email_value:
-                        e.add_field(name="Email", value=str(email_value)[:1024], inline=False)
-                with suppress(Exception):
-                    e.add_field(name="Discord ID", value=f"`{discord_user_id}`", inline=False)
-                with suppress(Exception):
-                    if membership_id_hint:
-                        e.add_field(name="Membership ID", value=f"`{membership_id_hint}`", inline=False)
-                with suppress(Exception):
-                    dash = str(summary_from_native.get("dashboard_url") or "").strip() if isinstance(summary_from_native, dict) else ""
-                    if dash:
-                        e.add_field(name="Whop Dashboard", value=dash[:1024], inline=False)
-                with suppress(Exception):
-                    e.set_footer(text="RSCheckerbot • Member Status Tracking")
-                with suppress(Exception):
-                    await _log_member_status("", embed=e)
             member = None
 
         # Process role changes if member found
@@ -1779,8 +1705,8 @@ async def _handle_native_whop_message(message: discord.Message, embed: discord.E
             # Check for membership status changes
             elif "membership update" in title_l:
                 if "past due" in membership_status.lower():
-                    if _log_member_status:
-                        await _log_member_status(f"⚠️ **Whop Native:** {_fmt_user(member)} - Membership Past Due")
+                    if _log_other:
+                        await _log_other(f"⚠️ **Whop Native:** {_fmt_user(member)} - Membership Past Due")
                 elif "active" in membership_status.lower():
                     event_data = {
                         "event_type": "membership.activated",
@@ -1921,23 +1847,6 @@ async def handle_membership_activated(member: discord.Member, event_data: dict):
         await member.add_roles(cleanup_role, reason="Whop: Membership activated")
         log.info(f"Assigned cleanup role to {member} for membership activation")
     
-    if _log_member_status:
-        whop_brief = await _whop_brief_from_event(member, event_data)
-        access = _access_roles_compact(member)
-        detailed = build_member_status_detailed_embed(
-            title="✅ Membership Activated",
-            member=member,
-            access_roles=access,
-            color=0x57F287,
-            event_kind="active",
-            discord_kv=[
-                ("event", "membership.activated"),
-                ("roles_added", cleanup_role.name if cleanup_role else "—"),
-            ],
-            whop_brief=whop_brief,
-        )
-        await _log_member_status("", embed=detailed)
-    
     # Verify with API after processing
     await _verify_webhook_with_api(member, event_data, "membership.activated")
 
@@ -1947,23 +1856,7 @@ async def handle_membership_activated(member: discord.Member, event_data: dict):
 
 
 async def handle_membership_activated_pending(member: discord.Member, event_data: dict):
-    """Handle pending membership activation - log with support card embed"""
-    if _log_member_status:
-        whop_brief = await _whop_brief_from_event(member, event_data)
-        access = _access_roles_compact(member)
-        detailed = build_member_status_detailed_embed(
-            title="⏳ Membership Activated (Pending)",
-            member=member,
-            access_roles=access,
-            color=0xFEE75C,
-            event_kind="active",
-            discord_kv=[
-                ("event", "membership.activated.pending"),
-            ],
-            whop_brief=whop_brief,
-        )
-        await _log_member_status("", embed=detailed)
-    
+    """Handle pending membership activation (roles/tickets only; staff cards are canonical in main.py)."""
     # Verify with API after processing
     await _verify_webhook_with_api(member, event_data, "membership.activated.pending")
 
@@ -2051,81 +1944,26 @@ async def handle_membership_deactivated(
         if welcome_role and welcome_role in member.roles:
             roles_would_remove.append(welcome_role)
     
-    if _log_member_status:
-        whop_brief = await _whop_brief_from_event(member, event_data)
-        access = _access_roles_compact(member)
-        # still_entitled:
-        # - True  => cancellation scheduled (access continues)
-        # - False => deactivated and not entitled
-        # - None  => unverified (missing membership_id / API unavailable / API error)
-        if title_override:
-            title = title_override
-        elif lifetime_protected:
-            title = "Lifetime Access — No Role Removal"
-        elif still_entitled is True:
-            title = "⚠️ Cancellation Scheduled"
-        elif still_entitled is False:
-            title = "🟧 Membership Deactivated"
-        else:
-            title = "🟧 Membership Deactivated (Unverified)"
-        color = int(color_override) if isinstance(color_override, int) else 0xFEE75C
-        kind = (
-            "payment_failed"
-            if ("payment failed" in title.lower() or dest == PAYMENT_FAILURE_CHANNEL_NAME)
-            else ("cancellation_scheduled" if still_entitled is True else "deactivated")
-        )
-        detailed = build_member_status_detailed_embed(
-            title=title,
-            member=member,
-            access_roles=access,
-            color=color,
-            event_kind=kind,
-            discord_kv=[
-                ("event", "membership.deactivated"),
-                ("role_removal", "disabled (sync-only)"),
-                ("roles_would_remove", ", ".join([r.name for r in roles_would_remove]) if roles_would_remove else "—"),
-                ("lifetime_role_protected", "true" if lifetime_protected else "false"),
-                ("membership_id_source", membership_id_source or "—"),
-                ("entitlement_checked", "true" if entitlement_checked else "false"),
-                ("entitlement_error", entitlement_error or "—"),
-            ],
-            whop_brief=whop_brief,
-        )
-        await _log_member_status("", embed=detailed)
+    whop_brief: dict = {}
+    with suppress(Exception):
+        wb = await _whop_brief_from_event(member, event_data)
+        whop_brief = wb if isinstance(wb, dict) else {}
 
-        # Minimal alert -> dedicated case channel (defaults to member-cancelation)
-        minimal = build_case_minimal_embed(
-            title=title,
-            member=member,
-            access_roles=access,
-            whop_brief=whop_brief,
-            color=color,
-            event_kind=kind,
-        )
-        issue_key = f"whop.deactivated:{_membership_id_from_event(member, event_data)}"
-        if await should_post_and_record_alert(
-            STAFF_ALERTS_FILE,
-            discord_id=member.id,
-            issue_key=issue_key,
-            cooldown_hours=6.0,
-        ):
-            await _log_member_status("", embed=minimal, channel_name=dest)
+    # Support tickets (Neo): open/update a Cancellation ticket (skip payment-failure destinations).
+    if dest == MEMBER_CANCELLATION_CHANNEL_NAME:
+        with suppress(Exception):
+            occurred_at = _parse_dt_any(str(event_data.get("_occurred_at_iso") or "")) or datetime.now(timezone.utc)
+            mid = _membership_id_from_event(member, event_data) or str(membership_id or "").strip()
+            fingerprint = f"{mid or int(member.id)}|cancel|{occurred_at.date().isoformat()}"
+            reason_txt = _event_reason_from_data(event_data)
+            await support_tickets.open_cancellation_ticket(
+                member=member,
+                whop_brief=whop_brief,
+                cancellation_reason=reason_txt,
+                fingerprint=fingerprint,
+                reference_jump_url=str(event_data.get("_source_jump_url") or "").strip(),
+            )
 
-        # Support tickets (Neo): open/update a Cancellation ticket (skip payment-failure destinations).
-        if dest == MEMBER_CANCELLATION_CHANNEL_NAME:
-            with suppress(Exception):
-                occurred_at = _parse_dt_any(str(event_data.get("_occurred_at_iso") or "")) or datetime.now(timezone.utc)
-                mid = _membership_id_from_event(member, event_data) or str(membership_id or "").strip()
-                fingerprint = f"{mid or int(member.id)}|cancel|{occurred_at.date().isoformat()}"
-                reason_txt = _event_reason_from_data(event_data)
-                await support_tickets.open_cancellation_ticket(
-                    member=member,
-                    whop_brief=whop_brief,
-                    cancellation_reason=reason_txt,
-                    fingerprint=fingerprint,
-                    reference_jump_url=str(event_data.get("_source_jump_url") or "").strip(),
-                )
-    
     # Verify with API after processing
     await _verify_webhook_with_api(member, event_data, "membership.deactivated")
 
@@ -2150,20 +1988,6 @@ async def handle_payment_renewal(member: discord.Member, event_data: dict):
         await member.add_roles(member_role, reason="Whop: Payment renewal")
         log.info(f"Assigned Member role to {member} for payment renewal")
     
-    if _log_member_status:
-        whop_brief = await _whop_brief_from_event(member, event_data)
-        access = _access_roles_compact(member)
-        detailed = build_member_status_detailed_embed(
-            title="✅ Payment Renewed",
-            member=member,
-            access_roles=access,
-            color=0x57F287,
-            event_kind="active",
-            discord_kv=[("event", "payment.succeeded.renewal")],
-            whop_brief=whop_brief,
-        )
-        await _log_member_status("", embed=detailed)
-    
     # Verify with API after processing
     await _verify_webhook_with_api(member, event_data, "payment.succeeded.renewal")
 
@@ -2181,23 +2005,6 @@ async def handle_payment_activation(member: discord.Member, event_data: dict):
         await member.add_roles(member_role, reason="Whop: Payment activation")
         log.info(f"Assigned Member role to {member} for payment activation")
     
-    if _log_member_status:
-        whop_brief = await _whop_brief_from_event(member, event_data)
-        access = _access_roles_compact(member)
-        detailed = build_member_status_detailed_embed(
-            title="✅ Payment Activated",
-            member=member,
-            access_roles=access,
-            color=0x57F287,
-            event_kind="active",
-            discord_kv=[
-                ("event", "payment.succeeded.activation"),
-                ("roles_added", member_role.name if member_role else "—"),
-            ],
-            whop_brief=whop_brief,
-        )
-        await _log_member_status("", embed=detailed)
-    
     # Verify with API after processing
     await _verify_webhook_with_api(member, event_data, "payment.succeeded.activation")
 
@@ -2207,55 +2014,29 @@ async def handle_payment_activation(member: discord.Member, event_data: dict):
 
 
 async def handle_payment_failed(member: discord.Member, event_data: dict):
-    """Handle payment failure - log with support card embed"""
-    if _log_member_status:
-        whop_brief = await _whop_brief_from_event(member, event_data)
-        access = _access_roles_compact(member)
-        detailed = build_member_status_detailed_embed(
-            title="❌ Payment Failed — Action Needed",
-            member=member,
-            access_roles=access,
-            color=0xED4245,
-            event_kind="payment_failed",
-            discord_kv=[("event", "payment.failed")],
-            whop_brief=whop_brief,
-        )
-        await _log_member_status("", embed=detailed)
+    """Handle payment failure (billing ticket only; staff cards are canonical in main.py)."""
+    whop_brief: dict = {}
+    with suppress(Exception):
+        wb = await _whop_brief_from_event(member, event_data)
+        whop_brief = wb if isinstance(wb, dict) else {}
 
-        minimal = build_case_minimal_embed(
-            title="❌ Payment Failed — Action Needed",
+    # Support tickets (Neo): open/update a Billing ticket (current month only).
+    with suppress(Exception):
+        occurred_at = _parse_dt_any(str(event_data.get("_occurred_at_iso") or "")) or datetime.now(timezone.utc)
+        invoice_id = _safe_get(event_data, "invoice_id", "invoice.id", default="").strip()
+        payment_id = _safe_get(event_data, "payment_id", "payment.id", default="").strip()
+        fingerprint = invoice_id or payment_id or f"payment.failed|{int(member.id)}|{occurred_at.date().isoformat()}"
+        st = str((whop_brief or {}).get("status") or event_data.get("status") or "Past Due").strip()
+        if st.lower() in {"past_due", "past due", "unpaid"}:
+            st = "Past Due"
+        await support_tickets.open_billing_ticket(
             member=member,
-            access_roles=access,
-            whop_brief=whop_brief,
-            color=0xED4245,
-            event_kind="payment_failed",
+            event_type="payment.failed",
+            status=st or "Past Due",
+            fingerprint=fingerprint,
+            occurred_at=occurred_at,
+            reference_jump_url=str(event_data.get("_source_jump_url") or "").strip(),
         )
-        issue_key = f"whop.payment_failed:{_membership_id_from_event(member, event_data)}"
-        if await should_post_and_record_alert(
-            STAFF_ALERTS_FILE,
-            discord_id=member.id,
-            issue_key=issue_key,
-            cooldown_hours=2.0,
-        ):
-            await _log_member_status("", embed=minimal, channel_name=PAYMENT_FAILURE_CHANNEL_NAME)
-
-        # Support tickets (Neo): open/update a Billing ticket (current month only).
-        with suppress(Exception):
-            occurred_at = _parse_dt_any(str(event_data.get("_occurred_at_iso") or "")) or datetime.now(timezone.utc)
-            invoice_id = _safe_get(event_data, "invoice_id", "invoice.id", default="").strip()
-            payment_id = _safe_get(event_data, "payment_id", "payment.id", default="").strip()
-            fingerprint = invoice_id or payment_id or f"payment.failed|{int(member.id)}|{occurred_at.date().isoformat()}"
-            st = str((whop_brief or {}).get("status") or event_data.get("status") or "Past Due").strip()
-            if st.lower() in {"past_due", "past due", "unpaid"}:
-                st = "Past Due"
-            await support_tickets.open_billing_ticket(
-                member=member,
-                event_type="payment.failed",
-                status=st or "Past Due",
-                fingerprint=fingerprint,
-                occurred_at=occurred_at,
-                reference_jump_url=str(event_data.get("_source_jump_url") or "").strip(),
-            )
 
 
 async def handle_payment_refunded(member: discord.Member, event_data: dict):
