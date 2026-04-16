@@ -7463,7 +7463,9 @@ async def _process_whop_standard_webhook(
         mid, ctx = await _resolve_membership_id_for_std_webhook(evt, payload)
         if mid:
             with suppress(Exception):
-                e = _fmt_whop_movement_trace(
+                e = _whop_trace_with_step(
+                    step=6,
+                    total_steps=11,
                     trace_id=trace_id,
                     stage="MEMBERSHIP_ID_RESOLVED",
                     evt=evt or "—",
@@ -7487,7 +7489,9 @@ async def _process_whop_standard_webhook(
 
     # Always log receipt (movement logs in Neo).
     with suppress(Exception):
-        e = _fmt_whop_movement_trace(
+        e = _whop_trace_with_step(
+            step=5,
+            total_steps=11,
             trace_id=trace_id,
             stage="PROCESS_START",
             evt=evt or "—",
@@ -7512,6 +7516,29 @@ async def _process_whop_standard_webhook(
     # Many webhook types (withdrawals, payout methods, invoices, etc.) have no membership context.
     # We still log them above; staff-card output only happens when we can resolve a membership.
     if not mid:
+        with suppress(Exception):
+            e = _whop_trace_with_step(
+                step=6,
+                total_steps=11,
+                trace_id=trace_id,
+                stage="MEMBERSHIP_ID_MISSING_ABORT",
+                evt=evt or "—",
+                membership_id="",
+                reads=[
+                    "Parsed Whop standard webhook payload",
+                    "Attempted membership_id resolver (no result)",
+                ],
+                decisions=[
+                    "membership_id missing → skip staff cards",
+                ],
+                actions=[
+                    "No staff card posted",
+                ],
+                result=[
+                    f"webhook_id={str(wh_id or '—')[:120]}",
+                ],
+            )
+            await _whop_movement_send(content="", embed=e)
         return
 
     now = datetime.now(timezone.utc)
@@ -7535,15 +7562,63 @@ async def _process_whop_standard_webhook(
         if wh_id:
             dkey = f"whop_webhook:{wh_id}"
             if dkey in sent:
+                with suppress(Exception):
+                    e = _whop_trace_with_step(
+                        step=7,
+                        total_steps=11,
+                        trace_id=trace_id,
+                        stage="DEDUPE_DELIVERY_SKIPPED",
+                        evt=evt or "—",
+                        kind="",
+                        membership_id=str(mid or "").strip(),
+                        reads=[
+                            "Checked per-delivery dedupe key whop_webhook:{webhook-id}",
+                        ],
+                        decisions=[
+                            "skip staff cards (already processed this webhook-id)",
+                        ],
+                        actions=[
+                            "No staff card posted",
+                        ],
+                        result=[
+                            f"webhook_id={str(wh_id or '—')[:120]}",
+                        ],
+                    )
+                    await _whop_movement_send(content="", embed=e)
                 return
             sent[dkey] = now.isoformat().replace("+00:00", "Z")
 
         # Fetch authoritative state via API (totals + dashboard). Discord linkage is enriched via whop-logs fallback.
         brief = await _fetch_whop_brief_by_membership_id(mid)
         if not isinstance(brief, dict) or not brief:
+            with suppress(Exception):
+                e = _whop_trace_with_step(
+                    step=8,
+                    total_steps=11,
+                    trace_id=trace_id,
+                    stage="API_BRIEF_MISSING_ABORT",
+                    evt=evt or "—",
+                    membership_id=str(mid or "").strip(),
+                    reads=[
+                        "Whop API: attempted to fetch membership brief",
+                    ],
+                    decisions=[
+                        "brief missing/empty → skip staff cards",
+                    ],
+                    actions=[
+                        "No staff card posted",
+                    ],
+                    result=[
+                        f"membership_id={str(mid or '').strip()}",
+                        f"webhook_id={str(wh_id or '—')[:120]}",
+                    ],
+                )
+                await _whop_movement_send(content="", embed=e)
             return
         with suppress(Exception):
-            e = _fmt_whop_movement_trace(
+            e = _whop_trace_with_step(
+                step=8,
+                total_steps=11,
                 trace_id=trace_id,
                 stage="API_BRIEF_FETCHED",
                 evt=evt or "—",
@@ -7655,7 +7730,100 @@ async def _process_whop_standard_webhook(
             state["sent"] = sent
             state["cases"] = cases
             _save_whop_api_events_state(state)
+            with suppress(Exception):
+                e = _whop_trace_with_step(
+                    step=9,
+                    total_steps=11,
+                    trace_id=trace_id,
+                    stage="KIND_MISSING_ABORT",
+                    evt=evt or "—",
+                    membership_id=str(mid2 or "").strip(),
+                    reads=[
+                        "Attempted kind classification from webhook evt and membership diff",
+                    ],
+                    decisions=[
+                        "kind unresolved → skip staff cards",
+                    ],
+                    actions=[
+                        "No staff card posted",
+                    ],
+                    result=[
+                        f"membership_id={str(mid2 or '').strip()}",
+                        f"webhook_id={str(wh_id or '—')[:120]}",
+                    ],
+                )
+                await _whop_movement_send(content="", embed=e)
             return
+
+        # Logical dedupe: Whop can redeliver the same business event with different webhook-ids (retry storms).
+        # Suppress staff cards for identical (membership_id + evt + kind) within a short window.
+        #
+        # This does NOT replace per-delivery webhook-id dedupe above; it is a second layer to protect staff channels.
+        try:
+            logical_enabled = bool(WHOP_API_CONFIG.get("logical_dedupe_enabled", True))
+        except Exception:
+            logical_enabled = True
+        try:
+            logical_window_s = int(WHOP_API_CONFIG.get("logical_dedupe_window_seconds", 120) or 120)
+        except Exception:
+            logical_window_s = 120
+        logical_window_s = int(max(0, min(logical_window_s, 3600)))
+        try:
+            exempt = WHOP_API_CONFIG.get("logical_dedupe_exempt_kinds")
+            exempt_kinds = [str(x or "").strip().lower() for x in (exempt or [])] if isinstance(exempt, list) else []
+        except Exception:
+            exempt_kinds = []
+        if not exempt_kinds:
+            # Safe defaults: disputes/refunds are high-signal; do not suppress by default.
+            exempt_kinds = ["dispute_created", "dispute_updated", "refund_created", "refund_updated"]
+        kind_l = str(kind or "").strip().lower()
+        evt_l2 = str(evt_l or evt or "").strip().lower()
+        logical_key = f"whop_staff_logical:{str(mid2 or '').strip()}:{kind_l}:{evt_l2}"
+        if logical_enabled and logical_window_s > 0 and kind_l and (kind_l not in set(exempt_kinds)):
+            prev_iso = sent.get(logical_key) if isinstance(sent.get(logical_key), str) else ""
+            prev_ts = None
+            if prev_iso:
+                with suppress(Exception):
+                    prev_ts = _parse_dt_any(prev_iso)
+            if isinstance(prev_ts, datetime):
+                try:
+                    delta_s = (now - prev_ts.astimezone(timezone.utc)).total_seconds()
+                except Exception:
+                    delta_s = 0.0
+                if 0 <= float(delta_s) < float(logical_window_s):
+                    with suppress(Exception):
+                        e = _whop_trace_with_step(
+                            step=7,
+                            total_steps=11,
+                            trace_id=trace_id,
+                            stage="DEDUPE_LOGICAL_SKIPPED",
+                            evt=evt or "—",
+                            kind=kind,
+                            membership_id=str(mid2 or "").strip(),
+                            reads=[
+                                "Computed staff card kind from webhook + API brief",
+                                "Checked logical dedupe window (membership_id + evt + kind)",
+                            ],
+                            decisions=[
+                                f"skip staff cards (delta_s={int(delta_s)} < window_s={int(logical_window_s)})",
+                            ],
+                            actions=[
+                                "No staff card posted (retry storm protection)",
+                            ],
+                            result=[
+                                f"logical_key={logical_key[:220]}",
+                                f"prev={str(prev_iso)[:120] or '—'}",
+                                f"now={now.isoformat().replace('+00:00','Z')}",
+                                f"webhook_id={str(wh_id or '—')[:120]}",
+                            ],
+                        )
+                        await _whop_movement_send(content="", embed=e)
+                    state["memberships"] = memberships
+                    state["sent"] = sent
+                    state["cases"] = cases
+                    _save_whop_api_events_state(state)
+                    return
+            sent[logical_key] = now.isoformat().replace("+00:00", "Z")
 
         # When Whop omits `webhook-id`, retries look like distinct deliveries; dedupe staff cards by membership+kind+UTC day.
         if not wh_id:
@@ -7914,7 +8082,9 @@ async def _process_whop_standard_webhook(
             e_unlinked = _linked_hint_embed(title=title2, color=color, brief=brief, note=note, discord_value=discord_value)
             sent_msg = await log_member_status("", embed=e_unlinked)
             with suppress(Exception):
-                e = _fmt_whop_movement_trace(
+                e = _whop_trace_with_step(
+                    step=11,
+                    total_steps=11,
                     trace_id=trace_id,
                     stage="STAFF_CARD_POSTED",
                     evt=evt or "—",
@@ -8008,7 +8178,9 @@ async def _process_whop_standard_webhook(
             )
             sent_msg = await log_member_status("", embed=detailed)
             with suppress(Exception):
-                e = _fmt_whop_movement_trace(
+                e = _whop_trace_with_step(
+                    step=11,
+                    total_steps=11,
                     trace_id=trace_id,
                     stage="STAFF_CARD_POSTED",
                     evt=evt or "—",
@@ -8138,7 +8310,9 @@ async def handle_whop_webhook_receiver(request):
         if not ok:
             log.warning(f"[WhopWebhook] Signature verification failed: {reason}")
             with suppress(Exception):
-                e = _fmt_whop_movement_trace(
+                e = _whop_trace_with_step(
+                    step=2,
+                    total_steps=11,
                     trace_id=(wh_id_hint or f"whop:rejected:{int(time.time())}"),
                     stage="HTTP_INBOUND_REJECTED",
                     evt="",
@@ -8156,7 +8330,9 @@ async def handle_whop_webhook_receiver(request):
         except Exception:
             log.warning("[WhopWebhook] Invalid JSON payload")
             with suppress(Exception):
-                e = _fmt_whop_movement_trace(
+                e = _whop_trace_with_step(
+                    step=2,
+                    total_steps=11,
                     trace_id=(wh_id_hint or f"whop:bad_json:{int(time.time())}"),
                     stage="HTTP_INBOUND_BAD_JSON",
                     reads=["Received HTTP POST /whop-webhook"],
@@ -8175,7 +8351,9 @@ async def handle_whop_webhook_receiver(request):
             evt = _normalize_whop_std_event_type(_whop_std_event_type(payload))
             mid = _whop_std_membership_id(payload)
             wh_id = str(headers.get("webhook-id") or payload.get("id") or "").strip()
-            e = _fmt_whop_movement_trace(
+            e = _whop_trace_with_step(
+                step=3,
+                total_steps=11,
                 trace_id=(wh_id or f"whop:{int(time.time())}:{random.randint(1000, 9999)}"),
                 stage="HTTP_INBOUND_ACCEPTED",
                 evt=evt or "—",
@@ -8206,7 +8384,9 @@ async def handle_whop_webhook_receiver(request):
         except Exception as e:
             log.warning(f"[WhopWebhook] Failed to record event: {e}")
             with suppress(Exception):
-                e2 = _fmt_whop_movement_trace(
+                e2 = _whop_trace_with_step(
+                    step=4,
+                    total_steps=11,
                     trace_id=(wh_id_hint or f"whop:{int(time.time())}"),
                     stage="LEDGER_RECORD_FAILED",
                     reads=["Attempted to record whop_events.jsonl ledger entry"],
@@ -9796,6 +9976,40 @@ def _fmt_whop_movement_trace(
             tj = str(technical)[:900]
         e.add_field(name="5) Technical", value=f"```json\n{tj}\n```", inline=False)
     e.set_footer(text="RSCheckerbot • Whop movement")
+    return e
+
+
+def _whop_trace_with_step(*, step: int, total_steps: int, **kwargs) -> discord.Embed:
+    """Build a movement-trace embed that includes step=`X/Y` in the description header line."""
+    e = _fmt_whop_movement_trace(**kwargs)
+    try:
+        s = int(step or 0)
+    except Exception:
+        s = 0
+    try:
+        t = int(total_steps or 0)
+    except Exception:
+        t = 0
+    if not isinstance(e, discord.Embed) or s <= 0 or t <= 0:
+        return e
+    try:
+        desc = str(getattr(e, "description", "") or "")
+        lines = desc.splitlines() if desc else []
+        if not lines:
+            e.description = f"step=`{s}/{t}`"
+            return e
+        # First line is currently: trace_id=`...` • stage=`...`
+        # Insert step after trace_id for consistent scanning.
+        if "trace_id=" in lines[0] and "stage=" in lines[0] and "step=" not in lines[0]:
+            parts = lines[0].split(" • ")
+            if parts:
+                parts.insert(1, f"step=`{s}/{t}`")
+                lines[0] = " • ".join(parts)
+        else:
+            lines[0] = f"step=`{s}/{t}` • {lines[0]}"
+        e.description = "\n".join(lines)
+    except Exception:
+        return e
     return e
 
 
