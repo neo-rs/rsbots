@@ -157,6 +157,24 @@ RSOnboarding never removes the Member role.
   - Ledger stores only staff-safe fields (no email / names)
   - Messages without a parseable Discord ID are skipped (ledger is keyed per member)
 
+#### `.checker alignmsltickets`
+- **Description**: Align cancellation/churn ticket state using the uploaded ledger `RSCheckerbot/data/member_status_logs_events.json`. `scan` reports what’s missing; `apply confirm` fetches the specific source staff-card messages by `message_id` and replays them through the **canonical** member-status ticket automation (so it can create/move/update tickets + `tickets_index.json`).
+- **Aliases**: `align-msl-tickets`, `alignmsl`, `align-msl`
+- **Parameters**:
+  - `scan [max_rows]` — read-only report (default 25, max 250)
+  - `apply confirm [max_actions]` — apply fixes (default 40, max 250)
+- **Usage**:
+  - `.checker alignmsltickets scan`
+  - `.checker alignmsltickets scan 100`
+  - `.checker alignmsltickets apply confirm`
+  - `.checker alignmsltickets apply confirm 80`
+  - `.checker alignmsltickets help`
+- **Admin Only**: Yes (requires administrator permissions)
+- **Returns**: Scan = embed summary + sample rows; apply = summary (`attempted`, `applied`, `fetch_failed`, `replay_failed`)
+- **Notes**:
+  - Requires `dm_sequence.member_status_logs_channel_id` to be configured
+  - Apply uses `fetch_message(message_id)` for each ledger card, then calls `_maybe_open_tickets_from_member_status_logs()` (canonical)
+
 #### `.checker reconcilebillingcancel`
 - **Description**: Find users who have **both** an OPEN **billing** ticket and an OPEN **cancellation** ticket (historical overlap), then optionally **close billing only** with transcript + channel delete. Cancellation ticket is unchanged. Complements the automatic billing→cancellation handoff on new `member-status-logs` cancellation cards.
 - **Aliases**: `reconcile-billing-cancel`, `billingcancelreconcile`
@@ -320,8 +338,8 @@ These commands are only available **inside an OPEN support ticket channel** and 
 
 ## Command Summary
 
-- **Total Commands**: 24
-- **Admin Commands**: 21 (the `.checker` commands require administrator permissions)
+- **Total Commands**: 25
+- **Admin Commands**: 22 (the `.checker` commands require administrator permissions)
 - **Public Commands**: 0
 - **Commands with Aliases**: 12
 - **Command Prefix**: `.checker` (dot prefix) + `!` (ticket channels only)

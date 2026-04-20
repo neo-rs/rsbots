@@ -12228,6 +12228,274 @@ async def backfill_msl_events_cmd(ctx: commands.Context, *args: str):
         await ctx.message.delete()
 
 
+@bot.command(name="alignmsltickets", aliases=["align-msl-tickets", "alignmsl", "align-msl"])
+@commands.has_permissions(administrator=True)
+@commands.guild_only()
+async def align_msl_tickets_cmd(ctx: commands.Context, *args: str):
+    """Align tickets_index + Discord tickets based on `data/member_status_logs_events.json` (admin only)."""
+    parts = [str(x or "").strip() for x in args if str(x or "").strip()]
+    sg = _support_tickets_guild_id()
+    if sg and int(ctx.guild.id) != int(sg):
+        await ctx.send("❌ Run this command in the configured `support_tickets.guild_id` server only.", delete_after=20)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    if not parts or str(parts[0]).lower() in {"help", "h", "?"}:
+        await ctx.send(
+            "**MSL ticket alignment (admin only)**\n"
+            "Uses `RSCheckerbot/data/member_status_logs_events.json` (ledger) to identify missing cancellation/churn actions,\n"
+            "then applies fixes by fetching the specific source staff-card messages and replaying them through the canonical\n"
+            "`member-status-logs` ticket automation.\n"
+            "\n"
+            "Usage:\n"
+            "• `.checker alignmsltickets scan [max_rows]` — read-only report\n"
+            "• `.checker alignmsltickets apply confirm [max_actions]` — apply missing ticket creation / churn moves\n"
+            "\n"
+            "Defaults:\n"
+            "• max_rows=25 (scan)\n"
+            "• max_actions=40 (apply)\n",
+            delete_after=90,
+        )
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    mode = str(parts[0]).strip().lower()
+    want_apply = mode == "apply"
+    want_scan = mode == "scan"
+    if not want_apply and not want_scan:
+        await ctx.send("❌ Unknown subcommand. Try `.checker alignmsltickets help`", delete_after=20)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    if want_apply:
+        if len(parts) < 2 or str(parts[1]).lower() != "confirm":
+            await ctx.send("❌ Confirmation required. Example: `.checker alignmsltickets apply confirm 40`", delete_after=25)
+            with suppress(Exception):
+                await ctx.message.delete()
+            return
+
+    try:
+        max_n = int(parts[1] if want_scan and len(parts) >= 2 else (parts[2] if want_apply and len(parts) >= 3 else (25 if want_scan else 40)))
+    except Exception:
+        max_n = 25 if want_scan else 40
+    max_n = int(max(5, min(max_n, 250)))
+
+    if not MEMBER_STATUS_LOGS_CHANNEL_ID:
+        await ctx.send("❌ `dm_sequence.member_status_logs_channel_id` is not configured.", delete_after=25)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+    ch = bot.get_channel(int(MEMBER_STATUS_LOGS_CHANNEL_ID))
+    if not isinstance(ch, discord.TextChannel):
+        await ctx.send("❌ Could not resolve member-status-logs channel.", delete_after=25)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    # Load ledger + index (local runtime files)
+    ledger = load_json(MEMBER_STATUS_LOGS_EVENTS_FILE)
+    by_did = ledger.get("by_discord_id") if isinstance(ledger, dict) else None
+    by_did = by_did if isinstance(by_did, dict) else {}
+    idx = load_json(BASE_DIR / "data" / "tickets_index.json")
+    tmap = idx.get("tickets") if isinstance(idx, dict) else None
+    tmap = tmap if isinstance(tmap, dict) else {}
+
+    def _ticket_is_open(rec: dict) -> bool:
+        return str(rec.get("status") or "").strip().upper() == "OPEN"
+
+    def _churn_marked(rec: dict) -> bool:
+        if str(rec.get("cancellation_moved_to_churn_at_iso") or "").strip():
+            return True
+        nm = str(rec.get("channel_name") or "").strip().lower()
+        return nm.startswith("churn-")
+
+    # Per-user ticket index summary
+    per_user: dict[int, list[dict]] = {}
+    for rec in tmap.values():
+        if not isinstance(rec, dict):
+            continue
+        try:
+            uid = int(rec.get("user_id") or 0)
+        except Exception:
+            continue
+        if uid > 0:
+            per_user.setdefault(uid, []).append(rec)
+
+    def _ever_has(uid: int, ticket_type: str) -> bool:
+        for r in per_user.get(uid, []):
+            if str(r.get("ticket_type") or "").strip() == ticket_type:
+                return True
+        return False
+
+    def _open_has(uid: int, ticket_type: str) -> bool:
+        for r in per_user.get(uid, []):
+            if str(r.get("ticket_type") or "").strip() == ticket_type and _ticket_is_open(r):
+                return True
+        return False
+
+    def _latest_card(uid: int, kind: str) -> dict | None:
+        rec = by_did.get(str(uid)) if isinstance(by_did, dict) else None
+        if not isinstance(rec, dict):
+            return None
+        cards = rec.get("cards")
+        if not isinstance(cards, dict):
+            return None
+        best = None
+        best_iso = ""
+        k0 = str(kind or "").strip().lower()
+        for c in cards.values():
+            if not isinstance(c, dict):
+                continue
+            if str(c.get("kind") or "").strip().lower() != k0:
+                continue
+            iso = str(c.get("created_at_iso") or "")
+            if (best is None) or (iso > best_iso):
+                best = c
+                best_iso = iso
+        return best
+
+    # Identify candidates (mirrors what your local alignment report focuses on)
+    cancel_users: set[int] = set()
+    deact_users: set[int] = set()
+    for did_s, rec in (by_did or {}).items():
+        try:
+            did_i = int(str(did_s).strip())
+        except Exception:
+            continue
+        if did_i <= 0:
+            continue
+        cards = rec.get("cards") if isinstance(rec, dict) else None
+        if not isinstance(cards, dict):
+            continue
+        for c in cards.values():
+            if not isinstance(c, dict):
+                continue
+            k = str(c.get("kind") or "").strip().lower()
+            if k == "cancellation_scheduled":
+                cancel_users.add(did_i)
+            elif k == "deactivated":
+                deact_users.add(did_i)
+
+    missing_any_cancel = sorted([u for u in cancel_users if not _ever_has(u, "cancellation")])
+    missing_open_cancel = sorted([u for u in cancel_users if not _open_has(u, "cancellation")])
+
+    churn_missing_markers: list[tuple[int, dict]] = []
+    for uid in sorted(deact_users):
+        # Only consider users who currently have an OPEN cancellation ticket (churn move is a live channel move)
+        for r in per_user.get(uid, []):
+            if str(r.get("ticket_type") or "").strip() != "cancellation":
+                continue
+            if not _ticket_is_open(r):
+                continue
+            if not _churn_marked(r):
+                churn_missing_markers.append((uid, r))
+
+    if want_scan:
+        def _fmt_user_line(uid: int, kind: str) -> str:
+            c = _latest_card(uid, kind) or {}
+            brief = c.get("whop_brief") if isinstance(c.get("whop_brief"), dict) else {}
+            mid = str(brief.get("membership_id") or "").strip()
+            spent = str(brief.get("total_spent") or "").strip()
+            title = str(c.get("title") or "").strip()
+            when = str(c.get("created_at_iso") or "").strip().replace("+00:00", "Z")
+            jump = str(c.get("jump_url") or "").strip()
+            return f"- <@{uid}> mid=`{mid}` spent=`{spent}` at `{when}` title={title} {jump}"
+
+        e = discord.Embed(
+            title="MSL ticket alignment — scan",
+            description="Read-only: compares `member_status_logs_events.json` vs `tickets_index.json` for cancellation/churn alignment.",
+            color=0x5865F2,
+        )
+        e.add_field(name="Ledger", value=f"members={int((ledger.get('meta') or {}).get('unique_members') or 0)} • cards={int((ledger.get('meta') or {}).get('total_cards') or 0)}", inline=False)
+        e.add_field(name="Cancellation Scheduled users", value=f"{len(cancel_users)}", inline=True)
+        e.add_field(name="Missing ANY cancellation ticket", value=f"{len(missing_any_cancel)}", inline=True)
+        e.add_field(name="Missing OPEN cancellation ticket", value=f"{len(missing_open_cancel)}", inline=True)
+        e.add_field(name="Deactivated users", value=f"{len(deact_users)}", inline=True)
+        e.add_field(name="OPEN deactivated tickets missing churn markers", value=f"{len(churn_missing_markers)}", inline=True)
+
+        miss_lines = "\n".join([_fmt_user_line(uid, "cancellation_scheduled") for uid in missing_any_cancel[:max_n]]) or "—"
+        churn_lines = "\n".join(
+            [
+                f"- <@{uid}> ticket=<#{int(r.get('channel_id') or 0)}> name=`{str(r.get('channel_name') or '')}` "
+                f"deactivated_card={str((_latest_card(uid,'deactivated') or {}).get('jump_url') or '').strip()}"
+                for uid, r in churn_missing_markers[:max_n]
+            ]
+        ) or "—"
+        e.add_field(name="Missing cancellation (sample)", value=miss_lines[:1024], inline=False)
+        e.add_field(name="Churn missing markers (sample)", value=churn_lines[:1024], inline=False)
+        e.set_footer(text="Use apply confirm to fetch + replay source staff cards through canonical automation")
+        await ctx.send(embed=e, delete_after=180)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    # APPLY: fetch specific message IDs from ledger and replay through canonical handler
+    applied = 0
+    fetch_failed = 0
+    replay_failed = 0
+
+    async def _fetch_and_replay(msg_id: int) -> None:
+        nonlocal applied, fetch_failed, replay_failed
+        try:
+            m = await ch.fetch_message(int(msg_id))
+        except Exception:
+            fetch_failed += 1
+            return
+        try:
+            await _maybe_open_tickets_from_member_status_logs(m)
+            applied += 1
+        except Exception:
+            replay_failed += 1
+
+    # Priority: create missing cancellation tickets first
+    targets: list[int] = []
+    for uid in missing_any_cancel:
+        c = _latest_card(uid, "cancellation_scheduled") or {}
+        try:
+            mid = int(c.get("message_id") or 0)
+        except Exception:
+            mid = 0
+        if mid:
+            targets.append(mid)
+    # Then apply churn moves via deactivated cards
+    for uid, _rec in churn_missing_markers:
+        c = _latest_card(uid, "deactivated") or {}
+        try:
+            mid = int(c.get("message_id") or 0)
+        except Exception:
+            mid = 0
+        if mid:
+            targets.append(mid)
+
+    # Deduplicate while preserving order
+    seen: set[int] = set()
+    targets2: list[int] = []
+    for mid in targets:
+        if mid in seen:
+            continue
+        seen.add(mid)
+        targets2.append(mid)
+
+    cap = int(max_n)
+    targets2 = targets2[:cap]
+
+    with suppress(Exception):
+        await ctx.send(f"⏳ alignmsltickets apply: replaying {len(targets2)} staff cards from ledger…", delete_after=20)
+
+    for mid in targets2:
+        await _fetch_and_replay(int(mid))
+
+    await ctx.send(
+        f"✅ alignmsltickets apply complete — attempted={len(targets2)} applied={applied} fetch_failed={fetch_failed} replay_failed={replay_failed}",
+        delete_after=60,
+    )
+    with suppress(Exception):
+        await ctx.message.delete()
+
+
 @bot.command(name="reconcilecancel", aliases=["reconcile-cancellation", "reconcilecancellation", "cancelreconcile"])
 @commands.has_permissions(administrator=True)
 @commands.guild_only()
