@@ -116,6 +116,47 @@ RSOnboarding never removes the Member role.
   - **Ghosts**: OPEN `cancellation` in index but Discord channel is gone — marks index CLOSED and removes cancellation ticket role best-effort
   - **OPEN but not in cancel category** (scan only): e.g. moved to churn manually — listed for visibility; not changed by apply
 
+#### `.checker backfilltickets`
+- **Description**: Replay recent `#member-status-logs` history through the **canonical ticket automation** (same logic used on live message create/edit). Use this to backfill tickets that were missed before a deploy/fix, and to align `tickets_index.json` with past staff cards.
+- **Aliases**: `backfill-tickets`, `ticketbackfill`, `backfillmsl`, `backfill-msl`
+- **Parameters**:
+  - `scan [days] [max_messages]` — read-only counts
+  - `apply confirm [days] [max_messages]` — re-run ticket triggers for each staff card (dedupe-safe)
+  - `days` (optional): how many days back to scan (default 7, max 60)
+  - `max_messages` (optional): cap messages scanned (default 1500, max 10000)
+- **Usage**:
+  - `.checker backfilltickets scan`
+  - `.checker backfilltickets scan 14 3000`
+  - `.checker backfilltickets apply confirm`
+  - `.checker backfilltickets apply confirm 14 3000`
+  - `.checker backfilltickets help`
+- **Admin Only**: Yes (requires administrator permissions)
+- **Returns**: Scan = embed with counts; apply = summary line (`scanned`, `embed_msgs`, `replayed`, `errors`)
+- **Notes**:
+  - Run only in `support_tickets.guild_id`
+  - Applies current guards (Lite exclusion, lifetime exclusion, spend minimum, cooldown + dedupe)
+  - Use `.checker reconcilecancel scan` after backfill to see `open_moved` (tickets already under churn)
+
+#### `.checker backfillmslevents`
+- **Description**: Backfill and maintain a per-message runtime ledger for `#member-status-logs` in `RSCheckerbot/data/member_status_logs_events.json` (admin-only). This is a durable dataset to analyze historical staff cards and replay automation deterministically.
+- **Aliases**: `backfill-msl-events`, `backfillmslstore`, `backfill-msl-store`
+- **Parameters**:
+  - `scan [days] [max_messages]` — read-only counts
+  - `apply confirm [days] [max_messages]` — writes/updates the ledger by upserting each message (keyed by Discord `message_id`)
+  - `days` (optional): how many days back to scan (default 14, max 120)
+  - `max_messages` (optional): cap messages scanned (default 3000, max 20000)
+- **Usage**:
+  - `.checker backfillmslevents scan`
+  - `.checker backfillmslevents scan 30 8000`
+  - `.checker backfillmslevents apply confirm`
+  - `.checker backfillmslevents apply confirm 30 8000`
+  - `.checker backfillmslevents help`
+- **Admin Only**: Yes (requires administrator permissions)
+- **Returns**: Scan = embed with counts; apply = summary line (`scanned`, `embed_msgs`, `wrote_attempts`, `errors`)
+- **Notes**:
+  - Ledger stores only staff-safe fields (no email / names)
+  - Messages without a parseable Discord ID are skipped (ledger is keyed per member)
+
 #### `.checker reconcilebillingcancel`
 - **Description**: Find users who have **both** an OPEN **billing** ticket and an OPEN **cancellation** ticket (historical overlap), then optionally **close billing only** with transcript + channel delete. Cancellation ticket is unchanged. Complements the automatic billing→cancellation handoff on new `member-status-logs` cancellation cards.
 - **Aliases**: `reconcile-billing-cancel`, `billingcancelreconcile`
@@ -279,8 +320,8 @@ These commands are only available **inside an OPEN support ticket channel** and 
 
 ## Command Summary
 
-- **Total Commands**: 22
-- **Admin Commands**: 19 (the `.checker` commands require administrator permissions)
+- **Total Commands**: 24
+- **Admin Commands**: 21 (the `.checker` commands require administrator permissions)
 - **Public Commands**: 0
 - **Commands with Aliases**: 12
 - **Command Prefix**: `.checker` (dot prefix) + `!` (ticket channels only)

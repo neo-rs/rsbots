@@ -223,6 +223,7 @@ from whop_webhook_handler import (
     _whop_brief_from_event,
 )
 import whop_discord_ingest
+import member_status_logs_ingest
 
 # Import Whop API client
 from whop_api_client import WhopAPIClient, WhopAPIError
@@ -4547,6 +4548,7 @@ MEMBER_HISTORY_INGEST_STATE_FILE = BASE_DIR / "data" / "member_history_ingest_st
 BLANK_OUTPUTS_JSONL = BASE_DIR / "data" / "blank_outputs.jsonl"
 WHOP_LOGS_EVENTS_FILE = BASE_DIR / "data" / "whop_logs_events.json"
 WHOP_MEMBERSHIP_LOGS_EVENTS_FILE = BASE_DIR / "data" / "whop_membership_logs_events.json"
+MEMBER_STATUS_LOGS_EVENTS_FILE = BASE_DIR / "data" / "member_status_logs_events.json"
 
 
 def _ensure_data_dir() -> None:
@@ -5039,6 +5041,39 @@ async def _ingest_whop_logs_live(message: discord.Message) -> None:
         st = _ingest_state_load()
         _ingest_set_after_id(st, cid, mid)
         _ingest_state_save(st)
+    except Exception:
+        return
+
+
+async def _ingest_member_status_logs_live(message: discord.Message) -> None:
+    """Live ingest: `#member-status-logs` → `data/member_status_logs_events.json` (per-message ledger)."""
+    try:
+        cid = int(MEMBER_STATUS_LOGS_CHANNEL_ID or 0) if str(MEMBER_STATUS_LOGS_CHANNEL_ID or "").strip().isdigit() else 0
+        if cid <= 0:
+            return
+        if int(getattr(getattr(message, "channel", None), "id", 0) or 0) != int(cid):
+            return
+        if not getattr(message, "embeds", None):
+            return
+        e0 = message.embeds[0]
+        if not isinstance(e0, discord.Embed):
+            return
+        ts_i, kind, did, whop_brief = _extract_reporting_from_member_status_embed(
+            e0,
+            fallback_ts=int((getattr(message, "created_at", None) or datetime.now(timezone.utc)).timestamp()),
+        )
+        # Store only when Discord ID is resolvable (ledger is per-member).
+        if not did:
+            return
+        await member_status_logs_ingest.upsert_member_status_logs_message(
+            events_path=MEMBER_STATUS_LOGS_EVENTS_FILE,
+            configured_channel_id=cid,
+            message=message,
+            kind=str(kind or ""),
+            discord_id=int(did or 0),
+            whop_brief=whop_brief if isinstance(whop_brief, dict) else None,
+            source_name="member-status-logs",
+        )
     except Exception:
         return
 
@@ -11511,6 +11546,8 @@ async def on_message(message: discord.Message):
     # Ticket triggers from member-status-logs channel (regardless of author),
     # but only if the embed footer identifies RSCheckerbot.
     if MEMBER_STATUS_LOGS_CHANNEL_ID and int(getattr(getattr(message, "channel", None), "id", 0) or 0) == int(MEMBER_STATUS_LOGS_CHANNEL_ID):
+        with suppress(Exception):
+            await _ingest_member_status_logs_live(message)
         try:
             await _maybe_open_tickets_from_member_status_logs(message)
         except Exception as ex:
@@ -11564,6 +11601,8 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
         await support_tickets.audit_message_edit(before, after)
     # Also re-run ticket triggers when member-status-logs messages are edited/updated.
     if MEMBER_STATUS_LOGS_CHANNEL_ID and int(getattr(getattr(after, "channel", None), "id", 0) or 0) == int(MEMBER_STATUS_LOGS_CHANNEL_ID):
+        with suppress(Exception):
+            await _ingest_member_status_logs_live(after)
         try:
             await _maybe_open_tickets_from_member_status_logs(after)
         except Exception as ex:
@@ -11913,6 +11952,280 @@ def _support_tickets_guild_id() -> int:
         return int(st.get("guild_id") or 0)
     except Exception:
         return 0
+
+
+@bot.command(name="backfilltickets", aliases=["backfill-tickets", "ticketbackfill", "backfillmsl", "backfill-msl"])
+@commands.has_permissions(administrator=True)
+@commands.guild_only()
+async def backfill_tickets_cmd(ctx: commands.Context, *args: str):
+    """Backfill missing tickets by replaying member-status-logs history through the canonical ticket automation."""
+    parts = [str(x or "").strip() for x in args if str(x or "").strip()]
+    sg = _support_tickets_guild_id()
+    if sg and int(ctx.guild.id) != int(sg):
+        await ctx.send("❌ Run this command in the configured `support_tickets.guild_id` server only.", delete_after=20)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    if not parts or str(parts[0]).lower() in {"help", "h", "?"}:
+        await ctx.send(
+            "**Ticket backfill (admin only)**\n"
+            "Replay `#member-status-logs` history through the same logic used for live ticket creation.\n"
+            "\n"
+            "Usage:\n"
+            "• `.checker backfilltickets scan [days] [max_messages]` — read-only counts\n"
+            "• `.checker backfilltickets apply confirm [days] [max_messages]` — create/update missing tickets\n"
+            "\n"
+            "Args:\n"
+            "• days: how many days back to scan (default 7, max 60)\n"
+            "• max_messages: cap messages scanned (default 1500, max 10000)\n",
+            delete_after=75,
+        )
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    mode = str(parts[0]).strip().lower()
+    want_apply = mode == "apply"
+    want_scan = mode == "scan"
+    if not want_apply and not want_scan:
+        await ctx.send("❌ Unknown subcommand. Try `.checker backfilltickets help`", delete_after=20)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    if want_apply:
+        if len(parts) < 2 or str(parts[1]).lower() != "confirm":
+            await ctx.send("❌ Confirmation required. Example: `.checker backfilltickets apply confirm 7 1500`", delete_after=25)
+            with suppress(Exception):
+                await ctx.message.delete()
+            return
+
+    # Parse args (days/max_messages)
+    try:
+        days = int(parts[2] if (want_apply and len(parts) >= 3) else (parts[1] if (want_scan and len(parts) >= 2) else 7))
+    except Exception:
+        days = 7
+    try:
+        max_messages = int(parts[3] if (want_apply and len(parts) >= 4) else (parts[2] if (want_scan and len(parts) >= 3) else 1500))
+    except Exception:
+        max_messages = 1500
+    days = int(max(1, min(days, 60)))
+    max_messages = int(max(50, min(max_messages, 10000)))
+
+    if not MEMBER_STATUS_LOGS_CHANNEL_ID:
+        await ctx.send("❌ `dm_sequence.member_status_logs_channel_id` is not configured.", delete_after=25)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+    ch = bot.get_channel(int(MEMBER_STATUS_LOGS_CHANNEL_ID))
+    if not isinstance(ch, discord.TextChannel):
+        await ctx.send("❌ Could not resolve member-status-logs channel.", delete_after=25)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=int(days))
+    scanned = 0
+    eligible = 0
+    would_trigger = 0
+    applied = 0
+    errors = 0
+
+    with suppress(Exception):
+        await ctx.send(
+            f"⏳ backfill `{mode}`: scanning <#{int(MEMBER_STATUS_LOGS_CHANNEL_ID)}> (days={days}, max_messages={max_messages})…",
+            delete_after=15,
+        )
+
+    try:
+        async for msg in ch.history(limit=int(max_messages), oldest_first=False):
+            scanned += 1
+            try:
+                created_at = getattr(msg, "created_at", None)
+                if created_at and created_at.replace(tzinfo=timezone.utc) < cutoff:
+                    break
+            except Exception:
+                pass
+            if not getattr(msg, "embeds", None):
+                continue
+            e0 = msg.embeds[0]
+            if not isinstance(e0, discord.Embed):
+                continue
+            eligible += 1
+
+            # Fast pre-filter: cancellation/deactivated titles are the main alignment use-case, but still allow other ticket types.
+            title = str(getattr(e0, "title", "") or "").strip().lower()
+            if any(k in title for k in ("cancellation", "deactivated", "payment failed", "member joined", "membership activated", "payment succeeded", "access restored")):
+                would_trigger += 1
+
+            if want_apply:
+                try:
+                    await _maybe_open_tickets_from_member_status_logs(msg)
+                    applied += 1
+                except Exception:
+                    errors += 1
+    except Exception:
+        errors += 1
+
+    if want_scan:
+        e = discord.Embed(
+            title="Ticket backfill — scan",
+            description="Read-only inventory of recent member-status-logs cards for ticket replay.",
+            color=0x5865F2,
+        )
+        e.add_field(name="Window", value=f"days={days} • max_messages={max_messages}", inline=False)
+        e.add_field(name="Scanned messages", value=str(scanned), inline=True)
+        e.add_field(name="Messages w/ embed", value=str(eligible), inline=True)
+        e.add_field(name="Titles that look ticket-relevant", value=str(would_trigger), inline=True)
+        e.set_footer(text="Use apply confirm to replay through canonical ticket automation")
+        await ctx.send(embed=e, delete_after=120)
+    else:
+        await ctx.send(
+            f"✅ backfill apply complete — scanned={scanned} embed_msgs={eligible} replayed={applied} errors={errors}",
+            delete_after=60,
+        )
+    with suppress(Exception):
+        await ctx.message.delete()
+
+
+@bot.command(name="backfillmslevents", aliases=["backfill-msl-events", "backfillmslstore", "backfill-msl-store"])
+@commands.has_permissions(administrator=True)
+@commands.guild_only()
+async def backfill_msl_events_cmd(ctx: commands.Context, *args: str):
+    """Backfill `data/member_status_logs_events.json` by scanning member-status-logs history (admin only)."""
+    parts = [str(x or "").strip() for x in args if str(x or "").strip()]
+    sg = _support_tickets_guild_id()
+    if sg and int(ctx.guild.id) != int(sg):
+        await ctx.send("❌ Run this command in the configured `support_tickets.guild_id` server only.", delete_after=20)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    if not parts or str(parts[0]).lower() in {"help", "h", "?"}:
+        await ctx.send(
+            "**Member-status ledger backfill (admin only)**\n"
+            "Populate `RSCheckerbot/data/member_status_logs_events.json` by scanning `#member-status-logs` history.\n"
+            "\n"
+            "Usage:\n"
+            "• `.checker backfillmslevents scan [days] [max_messages]`\n"
+            "• `.checker backfillmslevents apply confirm [days] [max_messages]`\n"
+            "\n"
+            "Defaults: days=14, max_messages=3000\n"
+            "Limits: days max 120, max_messages max 20000\n",
+            delete_after=75,
+        )
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    mode = str(parts[0]).strip().lower()
+    want_apply = mode == "apply"
+    want_scan = mode == "scan"
+    if not want_apply and not want_scan:
+        await ctx.send("❌ Unknown subcommand. Try `.checker backfillmslevents help`", delete_after=20)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    if want_apply:
+        if len(parts) < 2 or str(parts[1]).lower() != "confirm":
+            await ctx.send("❌ Confirmation required. Example: `.checker backfillmslevents apply confirm 14 3000`", delete_after=25)
+            with suppress(Exception):
+                await ctx.message.delete()
+            return
+
+    try:
+        days = int(parts[2] if (want_apply and len(parts) >= 3) else (parts[1] if (want_scan and len(parts) >= 2) else 14))
+    except Exception:
+        days = 14
+    try:
+        max_messages = int(parts[3] if (want_apply and len(parts) >= 4) else (parts[2] if (want_scan and len(parts) >= 3) else 3000))
+    except Exception:
+        max_messages = 3000
+    days = int(max(1, min(days, 120)))
+    max_messages = int(max(50, min(max_messages, 20000)))
+
+    if not MEMBER_STATUS_LOGS_CHANNEL_ID:
+        await ctx.send("❌ `dm_sequence.member_status_logs_channel_id` is not configured.", delete_after=25)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+    ch = bot.get_channel(int(MEMBER_STATUS_LOGS_CHANNEL_ID))
+    if not isinstance(ch, discord.TextChannel):
+        await ctx.send("❌ Could not resolve member-status-logs channel.", delete_after=25)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=int(days))
+    scanned = 0
+    embeds = 0
+    resolvable = 0
+    wrote = 0
+    errors = 0
+
+    with suppress(Exception):
+        await ctx.send(
+            f"⏳ msl-ledger `{mode}`: scanning <#{int(MEMBER_STATUS_LOGS_CHANNEL_ID)}> (days={days}, max_messages={max_messages})…",
+            delete_after=15,
+        )
+
+    try:
+        async for msg in ch.history(limit=int(max_messages), oldest_first=False):
+            scanned += 1
+            try:
+                created_at = getattr(msg, "created_at", None)
+                if created_at and created_at.replace(tzinfo=timezone.utc) < cutoff:
+                    break
+            except Exception:
+                pass
+            if not getattr(msg, "embeds", None):
+                continue
+            e0 = msg.embeds[0]
+            if not isinstance(e0, discord.Embed):
+                continue
+            embeds += 1
+            try:
+                ts_i, kind, did, whop_brief = _extract_reporting_from_member_status_embed(
+                    e0,
+                    fallback_ts=int((getattr(msg, "created_at", None) or datetime.now(timezone.utc)).timestamp()),
+                )
+                if did:
+                    resolvable += 1
+            except Exception:
+                did = None
+                kind = "unknown"
+                whop_brief = {}
+
+            if want_apply:
+                try:
+                    await _ingest_member_status_logs_live(msg)
+                    wrote += 1
+                except Exception:
+                    errors += 1
+    except Exception:
+        errors += 1
+
+    if want_scan:
+        e = discord.Embed(
+            title="Member-status ledger — scan",
+            description="Read-only inventory for `data/member_status_logs_events.json` backfill.",
+            color=0x5865F2,
+        )
+        e.add_field(name="Window", value=f"days={days} • max_messages={max_messages}", inline=False)
+        e.add_field(name="Scanned messages", value=str(scanned), inline=True)
+        e.add_field(name="Messages w/ embed", value=str(embeds), inline=True)
+        e.add_field(name="Embeds w/ Discord ID", value=str(resolvable), inline=True)
+        e.set_footer(text="Use apply confirm to write the ledger file (edits are upserted by message_id)")
+        await ctx.send(embed=e, delete_after=120)
+    else:
+        await ctx.send(
+            f"✅ msl-ledger apply complete — scanned={scanned} embed_msgs={embeds} wrote_attempts={wrote} errors={errors}",
+            delete_after=60,
+        )
+    with suppress(Exception):
+        await ctx.message.delete()
 
 
 @bot.command(name="reconcilecancel", aliases=["reconcile-cancellation", "reconcilecancellation", "cancelreconcile"])
