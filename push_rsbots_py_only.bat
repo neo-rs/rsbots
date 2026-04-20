@@ -36,6 +36,10 @@ git add RSCashoutBot >nul 2>&1
 git add RSCheckerbot\rschecker_journal.py >nul 2>&1
 git add RSCheckerbot\whop_discord_ingest.py >nul 2>&1
 git add RSCheckerbot\whop_std_webhook_kinds.py >nul 2>&1
+git add RSCheckerbot\member_status_logs_ingest.py >nul 2>&1
+git add RSCheckerbot\scripts\analyze_msl_vs_tickets.py >nul 2>&1
+git add RSCheckerbot\scripts\audit_ticket_index_vs_discord.py >nul 2>&1
+git add RSCheckerbot\scripts\scan_member_status_logs_ledger.py >nul 2>&1
 git add RSForwarder\mavely_link_resolve.py >nul 2>&1
 REM Also stage RSForwarder manual override json (was previously git-ignored).
 git add RSForwarder\rs_fs_manual_overrides.json >nul 2>&1
