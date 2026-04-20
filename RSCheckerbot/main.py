@@ -12426,8 +12426,13 @@ async def align_msl_tickets_cmd(ctx: commands.Context, *args: str):
         ) or "—"
         e.add_field(name="Missing cancellation (sample)", value=miss_lines[:1024], inline=False)
         e.add_field(name="Churn missing markers (sample)", value=churn_lines[:1024], inline=False)
-        e.set_footer(text="Use apply confirm to fetch + replay source staff cards through canonical automation")
+        e.set_footer(text="Next: run `.checker alignmsltickets apply confirm [max_actions]` to apply fixes")
         await ctx.send(embed=e, delete_after=180)
+        with suppress(Exception):
+            await ctx.send(
+                f"Next: `.checker alignmsltickets apply confirm {int(max(40, min(250, max_n)))}"`[:2000],
+                delete_after=45,
+            )
         with suppress(Exception):
             await ctx.message.delete()
         return
