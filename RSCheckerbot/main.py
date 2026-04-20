@@ -12429,8 +12429,10 @@ async def align_msl_tickets_cmd(ctx: commands.Context, *args: str):
         e.set_footer(text="Next: run `.checker alignmsltickets apply confirm [max_actions]` to apply fixes")
         await ctx.send(embed=e, delete_after=180)
         with suppress(Exception):
+            next_n = int(max(40, min(250, max_n)))
+            next_cmd = f"Next: `.checker alignmsltickets apply confirm {next_n}`"
             await ctx.send(
-                f"Next: `.checker alignmsltickets apply confirm {int(max(40, min(250, max_n)))}"`[:2000],
+                next_cmd[:2000],
                 delete_after=45,
             )
         with suppress(Exception):
