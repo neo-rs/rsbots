@@ -262,6 +262,10 @@
   "support_tickets": {
     "_comment": "Discord-native Support CRM tickets (main RS server for now). All IDs are config-driven.",
     "guild_id": 876528050081251379,
+    "cancellation": {
+      "_comment_min_total_spent_usd": "Guard: do not open cancellation tickets unless Total Spent (lifetime) >= this amount. Lifetime-role members are always excluded separately.",
+      "min_total_spent_usd": 30.0
+    },
     "permissions": {
       "_comment": "Staff can run !transcript/!close and view all ticket channels. Admin roles are optional; administrators are always treated as allowed.",
       "staff_role_ids": [1351371587617558539],

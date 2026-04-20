@@ -1962,6 +1962,7 @@ async def handle_membership_deactivated(
                 cancellation_reason=reason_txt,
                 fingerprint=fingerprint,
                 reference_jump_url=str(event_data.get("_source_jump_url") or "").strip(),
+                trigger_kind="deactivated",
             )
 
     # Verify with API after processing

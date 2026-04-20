@@ -35,6 +35,7 @@ REM New bot folders / modules (git add -u skips untracked paths).
 git add RSCashoutBot >nul 2>&1
 git add RSCheckerbot\rschecker_journal.py >nul 2>&1
 git add RSCheckerbot\whop_discord_ingest.py >nul 2>&1
+git add RSCheckerbot\whop_std_webhook_kinds.py >nul 2>&1
 git add RSForwarder\mavely_link_resolve.py >nul 2>&1
 REM Also stage RSForwarder manual override json (was previously git-ignored).
 git add RSForwarder\rs_fs_manual_overrides.json >nul 2>&1

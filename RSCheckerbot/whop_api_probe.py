@@ -1151,6 +1151,35 @@ def _scan_rscheckerbot_member_status_code() -> dict:
                             producer_titles.add(_title_key(title))
                     break
 
+        kinds_py = root / "whop_std_webhook_kinds.py"
+        if kinds_py.exists():
+            src2 = kinds_py.read_text(encoding="utf-8", errors="ignore")
+            try:
+                tree2 = ast.parse(src2, filename=str(kinds_py))
+            except Exception:
+                tree2 = None
+            if tree2 is not None:
+                for node in ast.walk(tree2):
+                    if isinstance(node, ast.FunctionDef) and node.name == "title_color_layout_for_whop_staff_kind":
+                        for subnode in ast.walk(node):
+                            if isinstance(subnode, ast.Return):
+                                out = _is_title_tuple(subnode)
+                                if not out:
+                                    continue
+                                title, embed_kind = out
+                                title_for_event_map.append(
+                                    {
+                                        "file": "whop_std_webhook_kinds.py",
+                                        "line": int(getattr(subnode, "lineno", 0) or 0),
+                                        "title": title,
+                                        "title_key": _title_key(title),
+                                        "embed_kind": embed_kind,
+                                        "source": "title_color_layout_for_whop_staff_kind",
+                                    }
+                                )
+                                producer_titles.add(_title_key(title))
+                        break
+
         # Consumers (anchor line numbers)
         for name in (
             "_extract_reporting_from_member_status_embed",

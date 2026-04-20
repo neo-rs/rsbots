@@ -19,6 +19,7 @@ from rschecker_utils import parse_dt_any as _parse_dt_any
 from rschecker_utils import access_roles_plain as _access_roles_plain
 from rschecker_utils import roles_plain as _roles_plain
 from rschecker_utils import extract_discord_id_from_whop_member_record as _extract_discord_id_from_whop_member_record
+from rschecker_utils import usd_amount as _usd_amount
 from staff_embeds import build_member_status_detailed_embed as _build_member_status_detailed_embed
 from ticket_channels import ensure_ticket_like_channel as _ensure_ticket_like_channel
 from ticket_channels import slug_channel_name as _slug_channel_name
@@ -49,6 +50,7 @@ class SupportTicketConfig:
     legacy_staff_role_ids: list[int]
     admin_role_ids: list[int]
     include_ticket_owner_in_channel: bool
+    lifetime_role_ids: list[int]
     cancellation_category_id: int
     billing_category_id: int
     free_pass_category_id: int
@@ -72,6 +74,7 @@ class SupportTicketConfig:
     cooldown_billing_seconds: int
     cooldown_cancellation_seconds: int
     cooldown_member_welcome_seconds: int
+    cancellation_min_total_spent_usd: float
     startup_enabled: bool
     startup_external_sender_enabled: bool
     startup_delay_seconds: int
@@ -346,6 +349,7 @@ def initialize(
     fp = st.get("free_pass") if isinstance(st.get("free_pass"), dict) else {}
     fp_ad = fp.get("auto_delete") if isinstance(fp.get("auto_delete"), dict) else {}
     dd = st.get("dedupe") if isinstance(st.get("dedupe"), dict) else {}
+    canc = st.get("cancellation") if isinstance(st.get("cancellation"), dict) else {}
     sm = st.get("startup_messages") if isinstance(st.get("startup_messages"), dict) else {}
     sm_templates = sm.get("templates") if isinstance(sm.get("templates"), dict) else {}
     hm = st.get("header_messages") if isinstance(st.get("header_messages"), dict) else {}
@@ -369,12 +373,19 @@ def initialize(
                 out.append(v)
         return sorted(list(dict.fromkeys(out)))
 
+    def _as_float(v: object) -> float:
+        try:
+            return float(str(v).strip())
+        except Exception:
+            return 0.0
+
     _CFG = SupportTicketConfig(
         guild_id=_as_int(st.get("guild_id")),
         staff_role_ids=_int_list(perms.get("staff_role_ids")),
         legacy_staff_role_ids=_int_list(perms.get("legacy_staff_role_ids")),
         admin_role_ids=_int_list(perms.get("admin_role_ids")),
         include_ticket_owner_in_channel=_as_bool(perms.get("include_ticket_owner_in_channel", True)),
+        lifetime_role_ids=_int_list(dm.get("lifetime_role_ids")),
         cancellation_category_id=_as_int(cats.get("cancellation_category_id")),
         billing_category_id=_as_int(cats.get("billing_category_id")),
         free_pass_category_id=_as_int(cats.get("free_pass_category_id")),
@@ -398,6 +409,7 @@ def initialize(
         cooldown_billing_seconds=max(0, _as_int((dd.get("billing") or {}).get("cooldown_seconds")) or 21600),
         cooldown_cancellation_seconds=max(0, _as_int((dd.get("cancellation") or {}).get("cooldown_seconds")) or 86400),
         cooldown_member_welcome_seconds=max(0, _as_int((dd.get("member_welcome") or {}).get("cooldown_seconds")) or 86400),
+        cancellation_min_total_spent_usd=max(0.0, _as_float(canc.get("min_total_spent_usd")) or 0.0),
         startup_enabled=_as_bool(sm.get("enabled")),
         startup_external_sender_enabled=_as_bool(sm.get("external_sender_enabled")),
         startup_delay_seconds=max(5, _as_int(sm.get("delay_seconds")) or 300),
@@ -4971,12 +4983,39 @@ async def open_cancellation_ticket(
     cancellation_reason: str = "",
     fingerprint: str,
     reference_jump_url: str = "",
+    trigger_kind: str = "",
 ) -> discord.TextChannel | None:
     cfg = _cfg()
     if not cfg:
         return None
+    # Lifetime members: never open cancellation tickets (explicit operator rule).
+    try:
+        life_ids = set(int(x) for x in (cfg.lifetime_role_ids or []) if int(x) > 0)
+    except Exception:
+        life_ids = set()
+    if life_ids:
+        try:
+            if any(int(getattr(r, "id", 0) or 0) in life_ids for r in (getattr(member, "roles", None) or [])):
+                return None
+        except Exception:
+            pass
     if _is_lite_membership(whop_brief):
         return None
+    # Spend guard: apply only for cancellation_scheduled (trial cancels / $0 spend noise).
+    # Deactivated should still open a churn ticket even when spend is low (operator request).
+    tk = str(trigger_kind or "").strip().lower()
+    if tk in {"cancellation_scheduled", ""}:
+        try:
+            min_spent = float(getattr(cfg, "cancellation_min_total_spent_usd", 0.0) or 0.0)
+        except Exception:
+            min_spent = 0.0
+        if min_spent > 0:
+            b = whop_brief if isinstance(whop_brief, dict) else {}
+            spent = 0.0
+            with suppress(Exception):
+                spent = float(_usd_amount(b.get("total_spent")))
+            if float(spent) < float(min_spent):
+                return None
     embed = build_cancellation_preview_embed(
         member=member,
         whop_brief=whop_brief,
@@ -4988,7 +5027,7 @@ async def open_cancellation_ticket(
         whop_brief=whop_brief,
         cancellation_reason=cancellation_reason,
     )
-    return await _open_or_update_ticket(
+    ch = await _open_or_update_ticket(
         ticket_type="cancellation",
         owner=member,
         fingerprint=fingerprint,
@@ -4998,6 +5037,37 @@ async def open_cancellation_ticket(
         whop_dashboard_url=str((whop_brief or {}).get("dashboard_url") or "") if isinstance(whop_brief, dict) else "",
         extra_record_fields=snap,
     )
+    # Deactivated = immediate churn: move to churn category now (rather than waiting for daily countdown).
+    # This keeps cancellation_scheduled tickets in the cancellation category until access ends.
+    if isinstance(ch, discord.TextChannel) and tk == "deactivated":
+        guild = ch.guild if isinstance(getattr(ch, "guild", None), discord.Guild) else None
+        if isinstance(guild, discord.Guild):
+            churn_cat = _resolve_cancellation_churn_category(guild, cfg)
+            churn_effective_id = int(getattr(churn_cat, "id", 0) or 0) if churn_cat else 0
+            if churn_cat and churn_effective_id and int(getattr(ch, "category_id", 0) or 0) != churn_effective_id:
+                new_ch_name = str(ch.name or "") or "ticket"
+                if bool(cfg.cancellation_countdown_churn_prefix_channel_name):
+                    if not new_ch_name.strip().lower().startswith("churn-"):
+                        new_ch_name = _slug_channel_name(f"churn-{new_ch_name}", max_len=90) or "churn-ticket"
+                with suppress(Exception):
+                    await ch.edit(
+                        category=churn_cat,
+                        name=new_ch_name,
+                        reason="RSCheckerbot: membership deactivated → churn category",
+                    )
+                # Persist the move time in the ticket index (best-effort, same field as countdown job).
+                with suppress(Exception):
+                    async with _INDEX_LOCK:
+                        db = _index_load()
+                        # Find the open cancellation ticket for this owner+fingerprint.
+                        tid, rec = _ticket_find_open(db, ticket_type="cancellation", user_id=int(member.id), fingerprint=str(fingerprint or ""))
+                        if tid and isinstance(rec, dict) and _ticket_is_open(rec):
+                            rec["cancellation_moved_to_churn_at_iso"] = _now_iso()
+                            rec["channel_name"] = str(new_ch_name or "")
+                            if isinstance(db.get("tickets"), dict):
+                                db["tickets"][str(tid)] = rec  # type: ignore[index]
+                            _index_save(db)
+    return ch
 
 
 def _in_current_month(dt: datetime) -> bool:
