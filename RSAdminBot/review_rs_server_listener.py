@@ -264,7 +264,9 @@ class ReviewRSServerListener(commands.Cog):
                     value = str(getattr(f, "value", "") or "").strip()
                     if not name or not value:
                         continue
-                    if name in {"tcin", "sku", "upc"}:
+                    # Accept common identifier fields across monitors.
+                    # Target: TCIN, Walmart: SKU/UPC, BestBuy: PID
+                    if name in {"tcin", "sku", "upc", "pid"}:
                         dig = _digits_only(value)
                         if dig:
                             id_lines.append(f"{name.upper()}: {dig}")
@@ -287,7 +289,7 @@ class ReviewRSServerListener(commands.Cog):
                     )
                 except Exception:
                     blob = ""
-                for key in ("tcin", "sku", "upc"):
+                for key in ("tcin", "sku", "upc", "pid"):
                     m = re.search(rf"(?i)\b{key}\b[^\d]*(\d{{6,}})", blob)
                     if m:
                         id_lines.append(f"{key.upper()}: {m.group(1)}")
@@ -324,7 +326,7 @@ class ReviewRSServerListener(commands.Cog):
         ttl = title.strip() if title else "(not found)"
         return [
             f"Product Title:```{ttl}```",
-            f"SKU/TCIN/UPC```{ids_block}```",
+            f"SKU/TCIN/UPC/PID```{ids_block}```",
             f"Image URL ```{img}```",
         ]
 
