@@ -132,6 +132,17 @@ These commands open a **dropdown** to pick a bot. All outputs are ephemeral.
 - **What**: push a bots-only snapshot to `neo-rs/oraclefiles`
 - **Requires**: `oraclefiles_sync.enabled=true` + `oraclefiles_sync.deploy_key_path` in `RSAdminBot/config.secrets.json`
 
+## Message triggers (Neo Test Server only)
+
+These are **not** slash commands. They are **message listeners** scoped to a single channel to avoid spam.
+
+#### `review rs` (in-channel trigger)
+- **Where**: Neo Test Server channel `1496065906923540561`
+- **Who**: Owner/Admin-only (uses RSAdminBot's canonical admin checks)
+- **What**: replies with:
+  - channel lists for RS categories (clickable `<#channel_id>` mentions only)
+  - the last 3 message links for each configured RS “important” channel
+
 ## Removed command suites (no longer available)
 
 - **Whop tracking**: `whopscan`, `whopstats`, `whophistory`

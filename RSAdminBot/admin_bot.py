@@ -3435,6 +3435,11 @@ class RSAdminBot:
         # Primary interface: slash commands (ephemeral; test-server; owner-only).
         # Optional: RSNotes adds `/rsnote` (also synced to test server only).
         self.bot = commands.Bot(command_prefix='!', intents=intents)
+        # Attach the main instance so extension modules can reuse admin checks safely.
+        try:
+            setattr(self.bot, "rsadmin_instance", self)
+        except Exception:
+            pass
 
         # Ensure RSNotes slash command registration runs once per process start.
         # setup_hook runs after login and before the gateway is connected (discord.py best-practice spot).
@@ -3442,6 +3447,13 @@ class RSAdminBot:
             try:
                 await self._initialize_rsnotes()
                 await self._initialize_admin_slash_commands()
+                # Neo Test Server: message-trigger listeners (no slash commands).
+                try:
+                    await self.bot.load_extension("review_rs_server_listener")
+                except commands.ExtensionAlreadyLoaded:
+                    pass
+                except Exception:
+                    pass
             except Exception as e:
                 try:
                     print(f"{Colors.YELLOW}[RSNotes] setup_hook init failed: {type(e).__name__}: {str(e)[:200]}{Colors.RESET}")
