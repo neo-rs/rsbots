@@ -143,6 +143,15 @@ These are **not** slash commands. They are **message listeners** scoped to a sin
   - channel lists for RS categories (clickable `<#channel_id>` mentions only)
   - the last 3 message links for each configured RS “important” channel
 
+#### Catalog formatting (message-link trigger)
+- **Where**: Neo Test Server channel `1496075487452069920`
+- **Input**: paste one or more Discord message links (supports `discord.com` and `ptb.discord.com`)
+- **Who**: Owner/Admin-only
+- **What**: for each link, replies with:
+  - `Product Title` (embed title)
+  - `SKU/TCIN/UPC` (from embed fields, when present)
+  - `Image URL` (direct attachment URL or embed image/thumbnail URL)
+
 ## Removed command suites (no longer available)
 
 - **Whop tracking**: `whopscan`, `whopstats`, `whophistory`

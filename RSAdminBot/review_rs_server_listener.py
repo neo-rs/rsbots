@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Sequence
+import re
+from typing import Optional, Sequence, Iterable, Tuple
 
 import discord
 from discord.ext import commands
@@ -11,6 +12,7 @@ from discord.ext import commands
 class ReviewRSConfig:
     # Trigger channel (Neo Test Server)
     trigger_channel_id: int = 1496065906923540561
+    catalog_trigger_channel_id: int = 1496075487452069920
 
     # Source guild (Reselling Secrets)
     rs_server_guild_id: int = 876528050081251379
@@ -32,6 +34,9 @@ class ReviewRSConfig:
         1312134455506239508,  # aco-forms
     )
 
+    # Max links to process per trigger message (spam safety)
+    catalog_max_links: int = 8
+
 
 def _chunk_lines(lines: list[str], *, max_chars: int = 1900) -> list[str]:
     chunks: list[str] = []
@@ -49,6 +54,41 @@ def _chunk_lines(lines: list[str], *, max_chars: int = 1900) -> list[str]:
     if cur:
         chunks.append("\n".join(cur))
     return chunks
+
+
+_DISCORD_MSG_LINK_RE = re.compile(
+    r"https?://(?:(?:ptb|canary)\.)?discord\.com/channels/(?P<guild>\d+)/(?P<channel>\d+)/(?P<message>\d+)",
+    re.IGNORECASE,
+)
+
+
+def _extract_discord_message_links(text: str) -> list[Tuple[int, int, int]]:
+    out: list[Tuple[int, int, int]] = []
+    for m in _DISCORD_MSG_LINK_RE.finditer(str(text or "")):
+        try:
+            out.append((int(m.group("guild")), int(m.group("channel")), int(m.group("message"))))
+        except Exception:
+            continue
+    # de-dupe in order
+    seen = set()
+    uniq: list[Tuple[int, int, int]] = []
+    for t in out:
+        if t in seen:
+            continue
+        seen.add(t)
+        uniq.append(t)
+    return uniq
+
+
+def _first_nonempty(*vals: Optional[str]) -> str:
+    for v in vals:
+        if v and str(v).strip():
+            return str(v).strip()
+    return ""
+
+
+def _digits_only(s: str) -> str:
+    return "".join(ch for ch in (s or "") if ch.isdigit())
 
 
 class ReviewRSServerListener(commands.Cog):
@@ -181,16 +221,180 @@ class ReviewRSServerListener(commands.Cog):
             lines.append(f"- {link}")
         return lines
 
+    def _extract_catalog_fields(self, msg: discord.Message) -> tuple[str, list[str], str]:
+        """
+        Returns (product_title, id_lines, image_url)
+        - product_title: embed.title preferred
+        - id_lines: e.g. ["TCIN: 95082118", "UPC: 012345..."] (only those found)
+        - image_url: attachment image url OR embed.image/thumbnail url
+        """
+        title = ""
+        id_lines: list[str] = []
+        image_url = ""
+
+        # Attachments first (direct URL)
+        try:
+            for a in (getattr(msg, "attachments", None) or [])[:5]:
+                try:
+                    ct = str(getattr(a, "content_type", "") or "")
+                    if ct.startswith("image/") and getattr(a, "url", None):
+                        image_url = str(a.url)
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        embed = None
+        try:
+            embed = (msg.embeds or [None])[0]
+        except Exception:
+            embed = None
+
+        if isinstance(embed, discord.Embed):
+            try:
+                title = _first_nonempty(getattr(embed, "title", None), getattr(embed, "description", None))
+            except Exception:
+                title = ""
+
+            # IDs from fields
+            try:
+                for f in (getattr(embed, "fields", None) or []):
+                    name = str(getattr(f, "name", "") or "").strip().lower()
+                    value = str(getattr(f, "value", "") or "").strip()
+                    if not name or not value:
+                        continue
+                    if name in {"tcin", "sku", "upc"}:
+                        dig = _digits_only(value)
+                        if dig:
+                            id_lines.append(f"{name.upper()}: {dig}")
+            except Exception:
+                pass
+
+            # Fallback: look for TCIN/SKU/UPC patterns anywhere in embed text
+            if not id_lines:
+                blob = ""
+                try:
+                    blob = "\n".join(
+                        [
+                            str(getattr(embed, "title", "") or ""),
+                            str(getattr(embed, "description", "") or ""),
+                            "\n".join(
+                                f"{getattr(f,'name','')}: {getattr(f,'value','')}"
+                                for f in (getattr(embed, "fields", None) or [])
+                            ),
+                        ]
+                    )
+                except Exception:
+                    blob = ""
+                for key in ("tcin", "sku", "upc"):
+                    m = re.search(rf"(?i)\b{key}\b[^\d]*(\d{{6,}})", blob)
+                    if m:
+                        id_lines.append(f"{key.upper()}: {m.group(1)}")
+
+            # Image URL from embed if no attachment url found
+            if not image_url:
+                try:
+                    image_url = _first_nonempty(
+                        getattr(getattr(embed, "image", None), "url", None),
+                        getattr(getattr(embed, "thumbnail", None), "url", None),
+                    )
+                except Exception:
+                    image_url = ""
+
+        title = (title or "").strip()
+        if title and "\n" in title:
+            title = title.splitlines()[0].strip()
+
+        # Clean id_lines duplicates while preserving order
+        seen = set()
+        uniq_ids: list[str] = []
+        for line in id_lines:
+            if line in seen:
+                continue
+            seen.add(line)
+            uniq_ids.append(line)
+
+        return title, uniq_ids, image_url
+
+    def _format_catalog_reply(self, *, title: str, ids: Iterable[str], image_url: str) -> list[str]:
+        ids_list = [str(x).strip() for x in (ids or []) if str(x).strip()]
+        ids_block = "\n".join(ids_list) if ids_list else "(not found)"
+        img = image_url.strip() if image_url else "(not found)"
+        ttl = title.strip() if title else "(not found)"
+        return [
+            f"Product Title:```{ttl}```",
+            f"SKU/TCIN/UPC```{ids_block}```",
+            f"Image URL ```{img}```",
+        ]
+
+    async def _handle_catalog_links(self, message: discord.Message) -> None:
+        links = _extract_discord_message_links(str(message.content or ""))
+        if not links:
+            await message.reply("❌ No Discord message links found in your message.", mention_author=False)
+            return
+
+        if len(links) > int(self.cfg.catalog_max_links):
+            links = links[: int(self.cfg.catalog_max_links)]
+
+        out_lines: list[str] = []
+        for (gid, cid, mid) in links:
+            try:
+                ch = await self.bot.fetch_channel(int(cid))
+                if not isinstance(ch, discord.TextChannel):
+                    out_lines.append(f"❌ Could not fetch text channel `{cid}`.")
+                    out_lines.append("")
+                    continue
+                src_msg = await ch.fetch_message(int(mid))
+                title, ids, image_url = self._extract_catalog_fields(src_msg)
+                out_lines.extend(self._format_catalog_reply(title=title, ids=ids, image_url=image_url))
+                out_lines.append("")
+            except Exception as e:
+                out_lines.append(f"❌ Failed to fetch/parse `{gid}/{cid}/{mid}` ({type(e).__name__}).")
+                out_lines.append("")
+
+        chunks = _chunk_lines(out_lines, max_chars=1900)
+        first = True
+        for chunk in chunks:
+            if not chunk.strip():
+                continue
+            if first:
+                await message.reply(chunk, mention_author=False)
+                first = False
+            else:
+                await message.channel.send(chunk)
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         try:
-            if not message or not getattr(message, "content", None):
+            if not message:
                 return
             if message.author and getattr(message.author, "bot", False):
                 return
-            if not message.channel or int(getattr(message.channel, "id", 0) or 0) != int(self.cfg.trigger_channel_id):
+
+            ch_id = int(getattr(getattr(message, "channel", None), "id", 0) or 0)
+            if not ch_id:
                 return
 
+            # Catalog formatting trigger (Neo Test Server)
+            if ch_id == int(self.cfg.catalog_trigger_channel_id):
+                if not self._is_allowed_author(message):
+                    try:
+                        await message.reply("❌ Owner/Admin-only.", mention_author=False)
+                    except Exception:
+                        pass
+                    return
+                if not getattr(message, "content", None):
+                    return
+                await self._handle_catalog_links(message)
+                return
+
+            # RS review trigger (Neo Test Server)
+            if ch_id != int(self.cfg.trigger_channel_id):
+                return
+
+            if not getattr(message, "content", None):
+                return
             content = str(message.content or "").strip().lower()
             if content != "review rs":
                 return
