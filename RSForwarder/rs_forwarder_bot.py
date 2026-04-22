@@ -29,6 +29,7 @@ from RSForwarder import affiliate_rewriter
 from RSForwarder import novnc_stack
 from RSForwarder import rs_fs_sheet_sync
 from RSForwarder.rs_fs_monitor_data_resolver import RsFsMonitorDataResolver
+from RSForwarder import fetch_monitor_channels as _fetch_monitor_channels
 from RSForwarder import zephyr_release_feed_parser
 
 # Ensure repo root is importable when executed as a script (matches Ubuntu run_bot.sh PYTHONPATH).
@@ -3822,6 +3823,181 @@ class RSForwarderBot:
                 continue
         return out
 
+    def _rs_fs_monitor_live_capture_enabled(self) -> bool:
+        """
+        If enabled, RSForwarder will upsert new monitor-channel posts into RSForwarder/monitor_data/*.json at runtime.
+        The manual backfill tool (fetch_monitor_channels.py) still exists for initial/bulk capture.
+        """
+        try:
+            v = (self.config or {}).get("rs_fs_monitor_live_capture_enabled")
+            if v is None:
+                return False
+            if isinstance(v, bool):
+                return v
+            return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+        except Exception:
+            return False
+
+    def _rs_fs_monitor_live_capture_store_max(self) -> int:
+        try:
+            v = int((self.config or {}).get("rs_fs_monitor_live_capture_store_max") or 5000)
+        except Exception:
+            v = 5000
+        return max(100, min(v, 25000))
+
+    def _rs_fs_monitor_channel_key_by_id(self) -> Dict[int, str]:
+        """
+        Reverse map of config rs_fs_monitor_channel_ids: channel_id -> channel_key.
+        """
+        out: Dict[int, str] = {}
+        for k, v in (self._rs_fs_monitor_channel_ids() or {}).items():
+            try:
+                cid = int(v)
+            except Exception:
+                continue
+            if cid > 0 and k:
+                out[cid] = str(k)
+        return out
+
+    async def _maybe_capture_monitor_message(self, message: discord.Message) -> None:
+        """
+        If this message is in a configured monitor channel, upsert it into monitor_data/<channel_key>.json.
+        """
+        if not self._rs_fs_monitor_live_capture_enabled():
+            return
+        try:
+            ch_id = int(getattr(getattr(message, "channel", None), "id", 0) or 0)
+        except Exception:
+            ch_id = 0
+        if not ch_id:
+            return
+        channel_key = (self._rs_fs_monitor_channel_key_by_id() or {}).get(ch_id) or ""
+        if not channel_key:
+            return
+
+        def _build_item_key(pid_obj: dict, title_key: str) -> str:
+            try:
+                if isinstance(pid_obj, dict) and str(pid_obj.get("kind") or "") in {"field", "derived"} and str(pid_obj.get("value") or "").strip():
+                    nm = str(pid_obj.get("name") or "ID").strip()
+                    val = str(pid_obj.get("value") or "").strip()
+                    return f"{nm}:{val}"
+            except Exception:
+                pass
+            return f"TITLE:{title_key}"
+
+        def _norm_title_key(raw_title: str) -> str:
+            # Mirror fetch_monitor_channels._upsert_channel_messages normalization (no second implementation of storage).
+            try:
+                import re as _re
+
+                t = str(raw_title or "").strip().lower()
+                t = _re.sub(r"\s+", " ", t)
+                t = _re.sub(r"[^a-z0-9\s]+", "", t)
+                t = t.strip()
+                if len(t) > 140:
+                    t = t[:140].strip()
+                return t
+            except Exception:
+                return ""
+
+        try:
+            embeds = []
+            for e in (getattr(message, "embeds", None) or []):
+                try:
+                    embeds.append(e.to_dict())
+                except Exception:
+                    continue
+            created_at = getattr(message, "created_at", None)
+            ts = created_at.isoformat() if created_at else ""
+            msg_dict = {
+                "id": str(getattr(message, "id", "") or ""),
+                "timestamp": ts,
+                "author": {
+                    "id": str(getattr(getattr(message, "author", None), "id", "") or ""),
+                    "username": str(getattr(getattr(message, "author", None), "name", "") or ""),
+                },
+                "content": str(getattr(message, "content", "") or ""),
+                "embeds": embeds,
+                "attachments": [],
+            }
+        except Exception:
+            return
+
+        try:
+            title, primary_url = _fetch_monitor_channels._extract_primary_title_and_url(msg_dict)  # type: ignore[attr-defined]
+            human = _fetch_monitor_channels._extract_embed_human_summary(msg_dict)  # type: ignore[attr-defined]
+            product_id = _fetch_monitor_channels._extract_product_id(msg_dict)  # type: ignore[attr-defined]
+            # For readable logs + NEW/UPDATE classification.
+            product_title = str((human or {}).get("title") or title or "").strip()
+            product_url = str((human or {}).get("url") or primary_url or "").strip()
+            title_key = _norm_title_key(product_title) or f"msg-{str(msg_dict.get('id') or '')}"
+            item_key = _build_item_key(product_id if isinstance(product_id, dict) else {}, title_key)
+            stored_msg = {
+                "id": msg_dict.get("id") or "",
+                "timestamp": msg_dict.get("timestamp") or "",
+                "author": msg_dict.get("author") or {},
+                "content": msg_dict.get("content") or "",
+                "embeds": msg_dict.get("embeds") if isinstance(msg_dict.get("embeds"), list) else [],
+                "attachments": [],
+                "extracted": {
+                    "title": title,
+                    "primary_url": primary_url,
+                    "human": human,
+                    "product_id": product_id,
+                },
+            }
+        except Exception:
+            return
+
+        try:
+            out_dir = Path(__file__).resolve().parent / "monitor_data"
+            store_path = out_dir / f"{channel_key}.json"
+            existed = False
+            try:
+                if store_path.exists():
+                    prev_obj = json.loads(store_path.read_text(encoding="utf-8", errors="replace") or "{}")
+                    prev_items = prev_obj.get("items_by_key") if isinstance(prev_obj, dict) else None
+                    if isinstance(prev_items, dict) and item_key in prev_items:
+                        existed = True
+            except Exception:
+                existed = False
+            out = _fetch_monitor_channels._upsert_channel_messages(  # type: ignore[attr-defined]
+                store_path,
+                channel_key=str(channel_key),
+                channel_id=int(ch_id),
+                new_messages=[stored_msg],
+                max_store=self._rs_fs_monitor_live_capture_store_max(),
+            )
+            try:
+                items = out.get("item_keys_sorted") or []
+                pid = (stored_msg.get("extracted") or {}).get("product_id") if isinstance(stored_msg.get("extracted"), dict) else {}
+                pid_txt = ""
+                if isinstance(pid, dict):
+                    kind = str(pid.get("kind") or "")
+                    nm = str(pid.get("name") or "")
+                    val = str(pid.get("value") or "")
+                    if kind in {"field", "derived"} and val:
+                        pid_txt = f"{kind}:{nm}={val}"
+                    elif kind == "title" and val:
+                        pid_txt = f"title:{val}"
+                safe_title = (product_title or "").encode("ascii", "replace").decode("ascii")[:140]
+                safe_url = (product_url or "").encode("ascii", "replace").decode("ascii")[:160]
+                action = "ALREADY_HAVE_UPDATING" if existed else "NEW_ADDING"
+                # One readable line, stable fields.
+                line = (
+                    f"{Colors.CYAN}[MonitorData]{Colors.RESET} {action} "
+                    f"channel={channel_key} unique_items={len(items)} "
+                    f"id={pid_txt or 'NONE'} "
+                    f"product={safe_title!r}"
+                )
+                if safe_url:
+                    line += f" url={safe_url}"
+                print(line)
+            except Exception:
+                pass
+        except Exception:
+            return
+
     def _rs_fs_manual_overrides_path(self) -> Path:
         # Runtime JSON (server-side). Not intended to be committed.
         return (Path(__file__).resolve().parent / "rs_fs_manual_overrides.json").resolve()
@@ -5078,6 +5254,36 @@ class RSForwarderBot:
                 print(f"  {Colors.YELLOW}No channels configured. Use !add command to add channels.{Colors.RESET}")
 
             print(f"{Colors.CYAN}{'='*60}{Colors.RESET}\n")
+
+            # Optional: MonitorData startup summary (unique items per monitor_data json)
+            try:
+                if self._rs_fs_monitor_live_capture_enabled():
+                    m = self._rs_fs_monitor_channel_ids() or {}
+                    out_dir = Path(__file__).resolve().parent / "monitor_data"
+                    print(f"{Colors.CYAN}[MonitorData]{Colors.RESET} startup enabled=true channels={len(m)} dir={str(out_dir)}")
+                    key_counts = []
+                    for k in sorted(m.keys()):
+                        p = out_dir / f"{k}.json"
+                        n_items = 0
+                        try:
+                            if p.exists():
+                                obj = json.loads(p.read_text(encoding="utf-8", errors="replace") or "{}")
+                                ids = obj.get("item_keys_sorted") if isinstance(obj, dict) else None
+                                if isinstance(ids, list):
+                                    n_items = len(ids)
+                                else:
+                                    items = obj.get("items_by_key") if isinstance(obj, dict) else None
+                                    if isinstance(items, dict):
+                                        n_items = len(items)
+                        except Exception:
+                            n_items = 0
+                        key_counts.append((k, n_items))
+                    # Print a few per line for readability
+                    if key_counts:
+                        for k, n_items in key_counts:
+                            print(f"{Colors.CYAN}[MonitorData]{Colors.RESET} channel={k} unique_items={n_items}")
+            except Exception:
+                pass
         
         @self.bot.event
         async def on_message(message: discord.Message):
@@ -5092,6 +5298,12 @@ class RSForwarderBot:
             # Optional: Zephyr release feed -> RS-FS Google Sheet sync
             try:
                 await self._maybe_sync_rs_fs_sheet_from_message(message)
+            except Exception:
+                pass
+
+            # Optional: live monitor_data capture (monitor channels -> RSForwarder/monitor_data/*.json)
+            try:
+                await self._maybe_capture_monitor_message(message)
             except Exception:
                 pass
             
