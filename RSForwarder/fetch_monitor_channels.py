@@ -635,6 +635,17 @@ def main() -> None:
         help="Optional pacing delay (seconds) between Discord requests (default: 0).",
     )
     parser.add_argument(
+        "--stop-on-error",
+        action="store_true",
+        help="When fetching messages, stop the whole run on the first per-channel error instead of skipping to the next channel.",
+    )
+    parser.add_argument(
+        "--channels-only",
+        type=str,
+        default="",
+        help="Optional comma-separated channel keys to process (keys from rs_fs_monitor_channel_ids). If omitted, processes all.",
+    )
+    parser.add_argument(
         "--checkpoint-file",
         type=str,
         default="",
@@ -644,6 +655,17 @@ def main() -> None:
         "--resume-checkpoint",
         action="store_true",
         help="When doing bulk backfill, resume per-channel pagination from checkpoint if available.",
+    )
+    parser.add_argument(
+        "--run-log-file",
+        type=str,
+        default="",
+        help="Optional log file path to append all stdout/stderr to (still prints to console).",
+    )
+    parser.add_argument(
+        "--progress-inline",
+        action="store_true",
+        help="Show an in-place (single-line) progress indicator during bulk backfill (no spam).",
     )
     parser.add_argument(
         "--interactive",
@@ -656,6 +678,63 @@ def main() -> None:
         help="Non-interactive mode (default): write all channels found under configured categories.",
     )
     args = parser.parse_args()
+
+    # Optional tee of all output to a log file (without hiding console output).
+    run_log_file = str(getattr(args, "run_log_file", "") or "").strip()
+    if run_log_file:
+        class _Tee:
+            def __init__(self, a, b):
+                self._a = a
+                self._b = b
+
+            def write(self, s):
+                self._a.write(s)
+                try:
+                    self._b.write(s)
+                except Exception:
+                    pass
+
+            def flush(self):
+                try:
+                    self._a.flush()
+                except Exception:
+                    pass
+                try:
+                    self._b.flush()
+                except Exception:
+                    pass
+
+        try:
+            Path(run_log_file).parent.mkdir(parents=True, exist_ok=True)
+            _fp = open(run_log_file, "a", encoding="utf-8", buffering=1)
+            sys.stdout = _Tee(sys.stdout, _fp)  # type: ignore[assignment]
+            sys.stderr = _Tee(sys.stderr, _fp)  # type: ignore[assignment]
+            print(f"(tee) logging to: {run_log_file}")
+        except Exception:
+            pass
+
+    progress_inline = bool(getattr(args, "progress_inline", False))
+
+    def _progress_line(channel_key: str, fetched: int, target: int) -> None:
+        if not progress_inline or target <= 0:
+            return
+        msg = f"[backfill] {channel_key}: {fetched}/{target}"
+        if len(msg) > 120:
+            msg = msg[:117] + "..."
+        try:
+            sys.stdout.write("\r" + msg + " " * 6)
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+    def _progress_newline() -> None:
+        if not progress_inline:
+            return
+        try:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
 
     base = Path(__file__).resolve().parent
     config, config_path, _ = load_config_with_secrets(base)
@@ -788,6 +867,18 @@ def main() -> None:
             print("Run the channel fetch mode first, then re-run with --fetch-recent-messages.")
             sys.exit(1)
 
+        # Optional filter to one/few channels for clarity
+        channels_only_raw = str(args.channels_only or "").strip()
+        if channels_only_raw:
+            wanted = [c.strip() for c in channels_only_raw.split(",") if c.strip()]
+            wanted_set = {w.lower() for w in wanted}
+            filtered = {k: v for (k, v) in mapping.items() if str(k).lower() in wanted_set}
+            if not filtered:
+                print(f"ERROR: --channels-only did not match any keys: {wanted}")
+                print(f"Tip: valid keys are the keys inside rs_fs_monitor_channel_ids in RSForwarder/config.json")
+                sys.exit(1)
+            mapping = filtered
+
         out_dir = base / "monitor_data"
         limit = int(args.messages_limit or 10)
         limit = max(1, min(100, limit))  # per-request Discord API limit max is 100
@@ -801,6 +892,7 @@ def main() -> None:
             min_delay_s = 0.0
         if min_delay_s > 10:
             min_delay_s = 10.0
+        stop_on_error = bool(args.stop_on_error)
 
         headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
         mode = "bulk" if target_total > 0 else "recent"
@@ -874,9 +966,13 @@ def main() -> None:
                     msgs = _discord_get_json(url, headers)
                 except Exception as e:
                     print(f"  ERROR: {channel_key} ({ch_id_int}) -> {type(e).__name__}: {e}")
+                    if stop_on_error:
+                        raise
                     break
                 if not isinstance(msgs, list):
                     print(f"  ERROR: {channel_key} ({ch_id_int}) -> unexpected response (not a list)")
+                    if stop_on_error:
+                        raise RuntimeError("Discord API returned non-list JSON for messages")
                     break
                 if not msgs:
                     break
@@ -886,6 +982,7 @@ def main() -> None:
                     if isinstance(m, dict):
                         msgs_all.append(m)
                 fetched_total += len(msgs)
+                _progress_line(str(channel_key), int(fetched_total), int(target_total))
 
                 # next page: before oldest id in this page
                 oldest = msgs[-1]
@@ -911,6 +1008,7 @@ def main() -> None:
 
                 # progress (bulk only)
                 if target_total > 0 and fetched_total % 500 == 0:
+                    _progress_newline()
                     print(f"  ... {channel_key}: fetched {fetched_total}/{target_total}")
 
             if not msgs_all:
@@ -926,6 +1024,8 @@ def main() -> None:
                 )
                 written_files += 1
                 continue
+
+            _progress_newline()
 
             stored: List[dict] = []
             # Only process up to target_total in case Discord returned more than requested
@@ -965,6 +1065,15 @@ def main() -> None:
                 max_store=store_max,
             )
             written_files += 1
+
+            # Explicit per-channel completion line (so it doesn't feel like "jumping")
+            unique_products = len(out.get("item_keys_sorted") or [])
+            fetched_display = min(fetched_total, target_total) if target_total > 0 else len(msgs_to_process)
+            target_display = target_total if target_total > 0 else fetched_display
+            if target_total > 0:
+                print(f"DONE: {channel_key}: fetched {fetched_display}/{target_display} -> unique_products={unique_products}")
+            else:
+                print(f"DONE: {channel_key}: fetched {fetched_display} -> unique_products={unique_products}")
 
             # Print quick preview of newest item
             first_key = (out.get("item_keys_sorted") or [None])[0]
