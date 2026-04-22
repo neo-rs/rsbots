@@ -1424,19 +1424,6 @@ class RSForwarderBot:
 
         return email, password
 
-    def _rsfs_auto_check_on_zephyr(self) -> bool:
-        try:
-            return bool((self.config or {}).get("rs_fs_auto_check_on_zephyr", False))
-        except Exception:
-            return False
-
-    def _rsfs_auto_check_debounce_s(self) -> float:
-        try:
-            v = float((self.config or {}).get("rs_fs_auto_check_debounce_s", 90.0) or 90.0)
-        except Exception:
-            v = 90.0
-        return max(60.0, min(v, 300.0))
-
     def _rsfs_auto_write_current_list(self) -> bool:
         try:
             return bool((self.config or {}).get("rs_fs_auto_write_current_list", True))
@@ -1763,182 +1750,6 @@ class RSForwarderBot:
         except Exception:
             pass
         return ok, msg, n
-
-    async def _rsfs_recover_live_affiliates_from_monitor_on_startup(self) -> None:
-        """
-        Recovery/journal step:
-        - Read `Full Send Live List`
-        - For rows where Affiliate URL (column G) is blank/invalid but Monitor URL (column H) has a value,
-          compute or reuse the affiliate URL from Monitor URL.
-        - Upsert Live rows, then upsert History rows to keep History affiliate_url consistent.
-        """
-        # In-memory guard (on_ready can fire again on reconnect)
-        if self._rs_fs_live_affiliate_recovery_done:
-            return
-        self._rs_fs_live_affiliate_recovery_done = True
-
-        try:
-            enabled = bool(self.config.get("rs_fs_recover_live_affiliate_on_startup", True))
-        except Exception:
-            enabled = True
-        if not enabled:
-            return
-
-        if not getattr(self, "_rs_fs_sheet", None) or not self._rs_fs_sheet.enabled():
-            return
-
-        try:
-            max_rows = int(self.config.get("rs_fs_recover_live_affiliate_max_rows", 300) or 300)
-        except Exception:
-            max_rows = 300
-        max_rows = max(10, min(max_rows, 2000))
-
-        try:
-            rewrite_enabled = bool(self.config.get("affiliate_rewrite_enabled", True))
-        except Exception:
-            rewrite_enabled = True
-
-        now_iso = rs_fs_sheet_sync.RsFsSheetSync._utc_now_iso()  # type: ignore[attr-defined]
-
-        verbose_rsfs = (os.getenv("RS_FS_RECOVERY_VERBOSE", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-        if verbose_rsfs:
-            print(
-                f"{Colors.CYAN}[RS-FS Recovery]{Colors.RESET} Starting Live affiliate recovery on startup (max_rows={max_rows}, rewrite_enabled={rewrite_enabled})"
-            )
-
-        try:
-            live_rows = await self._rs_fs_sheet.fetch_live_list_rows()
-        except Exception as e:
-            print(f"{Colors.RED}[RS-FS Recovery]{Colors.RESET} fetch_live_list_rows failed: {e}")
-            return
-
-        if not live_rows:
-            print(f"{Colors.YELLOW}[RS-FS Recovery]{Colors.RESET} Live list empty; nothing to do")
-            return
-
-        # Live list columns (A:H) in fetch_live_list_rows:
-        #   0 Store, 1 SKU-UPC, 2 Product Title, 3 STORE LINK, 4 Comps, 5 Category,
-        #   6 Affiliate URL (affiliated link), 7 monitor url link
-        candidates: List[Tuple[int, str, str, str, str]] = []  # (row_idx_0, store, sku, title, monitor_url)
-        unique_monitor_urls: List[str] = []
-        seen_monitor_urls: Set[str] = set()
-
-        for ri, row in enumerate(live_rows):
-            if len(candidates) >= max_rows:
-                break
-            if not isinstance(row, list) or len(row) < 8:
-                continue
-            store = str(row[0] or "").strip()
-            sku = str(row[1] or "").strip()
-            title = str(row[2] or "").strip()
-            aff = str(row[6] or "").strip() if len(row) > 6 else ""
-            mon = str(row[7] or "").strip() if len(row) > 7 else ""
-
-            if not (store and sku and mon):
-                continue
-            if _rsfs_is_valid_affiliate_url(aff):
-                continue
-            candidates.append((ri, store, sku, title, mon))
-            if mon not in seen_monitor_urls:
-                seen_monitor_urls.add(mon)
-                unique_monitor_urls.append(mon)
-
-        if verbose_rsfs:
-            print(
-                f"{Colors.CYAN}[RS-FS Recovery]{Colors.RESET} Live rows={len(live_rows)} candidates_affiliate_missing_or_invalid={len(candidates)} unique_monitor_urls={len(unique_monitor_urls)}"
-            )
-        if not candidates:
-            return
-
-        # Compute affiliate for monitor URLs.
-        # Even if monitor_url already contains Target tracking params, we still try to
-        # generate our own affiliate (Mavely/Amazon). If rewrite cannot produce a valid
-        # affiliate URL, we fall back to the original monitor_url if it is affiliate-looking.
-        aff_map: Dict[str, str] = {}
-        if rewrite_enabled and unique_monitor_urls:
-            try:
-                mapped, notes = await affiliate_rewriter.compute_affiliate_rewrites_plain(self.config, unique_monitor_urls)
-            except Exception as e:
-                print(f"{Colors.RED}[RS-FS Recovery]{Colors.RESET} affiliate rewrite failed: {e}")
-                mapped, notes = {}, {}
-
-            for u in unique_monitor_urls:
-                cand = str((mapped or {}).get(u) or "").strip()
-                if cand and _rsfs_is_valid_affiliate_url(cand):
-                    aff_map[u] = cand
-                elif _rsfs_is_valid_affiliate_url(u):
-                    aff_map[u] = u
-        else:
-            for u in unique_monitor_urls:
-                if _rsfs_is_valid_affiliate_url(u):
-                    aff_map[u] = u
-
-        # Build Live update rows: [store, sku, title, affiliate_url(G), monitor_url(H)]
-        live_update_rows: List[List[str]] = []
-        history_update_rows: List[List[str]] = []
-
-        # History cache for preserving first_seen + last_release_id
-        try:
-            history_cache = await self._rs_fs_sheet.fetch_history_cache(force=True)
-        except Exception:
-            history_cache = {}
-
-        rewritten = 0
-        skipped_no_affiliate = 0
-        for (ri, store, sku, title, mon) in candidates:
-            key = self._rsfs_key_store_sku(store, sku)
-            affiliate_url = aff_map.get(mon) or ""
-
-            # If we still couldn't derive an affiliate, don't blank out existing data.
-            if not _rsfs_is_valid_affiliate_url(affiliate_url):
-                skipped_no_affiliate += 1
-                if verbose_rsfs:
-                    print(
-                        f"{Colors.YELLOW}[RS-FS Recovery]{Colors.RESET} skip store={store} sku={sku}: cannot derive affiliate from monitor_url"
-                    )
-                continue
-
-            rewritten += 1
-            live_update_rows.append([store, sku, title, affiliate_url, mon])
-
-            # Upsert into History to keep affiliate_url consistent
-            hrec = history_cache.get(key) or {}
-            first_seen = str(hrec.get("first_seen") or "").strip() or now_iso
-            last_seen = now_iso
-            url = str(hrec.get("url") or "").strip() or mon
-            src = str(hrec.get("source") or "").strip() or "recovery"
-            last_release_id = str(hrec.get("last_release_id") or "").strip()
-            history_update_rows.append([store, sku, title or str(hrec.get("title") or "").strip(), url, affiliate_url, first_seen, last_seen, last_release_id, src])
-
-            if verbose_rsfs:
-                print(
-                    f"{Colors.CYAN}[RS-FS Recovery]{Colors.RESET} FILLED store={store} sku={sku} monitor_url_short={mon[:60]!r} affiliate_url_short={affiliate_url[:60]!r}"
-                )
-
-        if skipped_no_affiliate and verbose_rsfs:
-            print(
-                f"{Colors.YELLOW}[RS-FS Recovery]{Colors.RESET} skipped {skipped_no_affiliate} row(s): could not derive affiliate from monitor_url"
-            )
-        if not live_update_rows:
-            if verbose_rsfs:
-                print(f"{Colors.YELLOW}[RS-FS Recovery]{Colors.RESET} No live rows were filled; recovery stops")
-            return
-
-        # Upsert Live without deleting stale rows
-        try:
-            ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(live_update_rows, delete_stale=False)
-            print(f"{Colors.GREEN}[RS-FS Recovery]{Colors.RESET} Live sync ok={ok} msg={msg} added={added} updated={updated} deleted={deleted}")
-        except Exception as e:
-            print(f"{Colors.RED}[RS-FS Recovery]{Colors.RESET} Live sync failed: {e}")
-            return
-
-        # Upsert History with updated affiliate_url
-        if history_update_rows:
-            try:
-                ok_h, msg_h, added_h, updated_h = await self._rs_fs_sheet.upsert_history_rows(history_update_rows)
-                print(f"{Colors.GREEN}[RS-FS Recovery]{Colors.RESET} History upsert ok={ok_h} msg={msg_h} added={added_h} updated={updated_h}")
-            except Exception as e:
-                print(f"{Colors.RED}[RS-FS Recovery]{Colors.RESET} History upsert failed: {e}")
 
     async def _rsfs_sync_current_to_live_list(self) -> Tuple[bool, str, int, int, int]:
         """
@@ -4477,191 +4288,6 @@ class RSForwarderBot:
             return ""
         return "\n".join(parts).strip()
 
-    async def _maybe_handle_zephyr_removal(self, message: discord.Message) -> None:
-        """
-        Detect Zephyr Companion Bot removal messages and remove corresponding SKUs from the sheet.
-        Example message: "The following Release Feed has been removed: +94884499 | 💶┃full-send-🤖"
-        With command: "/removereleaseid release_id: 30"
-        """
-        try:
-            if not getattr(self, "_rs_fs_sheet", None) or not self._rs_fs_sheet.enabled():
-                return
-            
-            # Check if message is from Zephyr Companion Bot or Zephyr Monitors
-            author = getattr(message, "author", None)
-            author_name = str(getattr(author, "name", "") or "").strip().lower()
-            author_id = int(getattr(author, "id", 0) or 0)
-            # Accept messages from Zephyr Companion Bot (name contains both "zephyr" and "companion")
-            # OR from Zephyr Monitors bot (ID 595079249468063744 or name contains "zephyr" and "monitors")
-            is_zephyr_companion = "zephyr" in author_name and "companion" in author_name
-            is_zephyr_monitors = (author_id == 595079249468063744) or ("zephyr" in author_name and "monitors" in author_name)
-            if not (is_zephyr_companion or is_zephyr_monitors):
-                return
-            
-            # Try to fetch the message with embeds if they're not loaded
-            try:
-                if not (message.embeds or []) and hasattr(message, "channel"):
-                    # Try fetching the message to get embeds
-                    try:
-                        fetched = await message.channel.fetch_message(message.id)
-                        if fetched and fetched.embeds:
-                            message = fetched
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            
-            # Check if message contains removal confirmation
-            text = self._collect_embed_text(message)
-            # Also check message.content directly in case embed extraction fails
-            if not text:
-                try:
-                    content = str(getattr(message, "content", "") or "").strip()
-                    if content:
-                        text = content
-                except Exception:
-                    pass
-            
-            # Debug logging
-            try:
-                embeds_n = len(message.embeds or [])
-                print(f"{Colors.CYAN}[RS-FS Removal]{Colors.RESET} Checking removal: author={author_name}({author_id}) embeds={embeds_n} text_len={len(text or '')}")
-                if text:
-                    short = (text or "").replace("\n", " ").strip()[:200]
-                    print(f"{Colors.CYAN}[RS-FS Removal]{Colors.RESET} Text sample: {short!r}")
-            except Exception:
-                pass
-            
-            text_lower = (text or "").lower()
-            if "release feed has been removed" not in text_lower and "removed:" not in text_lower:
-                return
-            
-            # Extract release ID from /removereleaseid command
-            rid_match = re.search(r"/removereleaseid\s+release_id:\s*(\d+)", text, re.IGNORECASE)
-            if not rid_match:
-                # Also try searching in the raw embed data if text extraction failed
-                if not text:
-                    try:
-                        for embed in (message.embeds or []):
-                            # Check footer
-                            footer_text = getattr(getattr(embed, "footer", None), "text", "") or ""
-                            rid_match = re.search(r"/removereleaseid\s+release_id:\s*(\d+)", footer_text, re.IGNORECASE)
-                            if rid_match:
-                                text = footer_text  # Use footer as text for later checks
-                                break
-                            # Check description
-                            desc = getattr(embed, "description", "") or ""
-                            if desc:
-                                rid_match = re.search(r"/removereleaseid\s+release_id:\s*(\d+)", desc, re.IGNORECASE)
-                                if rid_match:
-                                    text = desc
-                                    break
-                    except Exception:
-                        pass
-                if not rid_match:
-                    return
-            
-            release_id = int(rid_match.group(1))
-            if release_id <= 0:
-                return
-            
-            # Find rows in Current List with matching release ID
-            current_list_rows = await self._rs_fs_sheet.fetch_current_list_rows()
-            rows_to_delete: List[int] = []  # 1-based row indices
-            
-            for i, row in enumerate(current_list_rows, start=2):  # Start at 2 (row 1 is header)
-                if len(row) < 1:
-                    continue
-                row_rid_str = str(row[0] or "").strip()
-                try:
-                    row_rid = int(row_rid_str)
-                    if row_rid == release_id:
-                        rows_to_delete.append(i)
-                except (ValueError, TypeError):
-                    continue
-            
-            if not rows_to_delete:
-                try:
-                    print(f"{Colors.CYAN}[RS-FS Removal]{Colors.RESET} Release ID {release_id} not found in Current List")
-                except Exception:
-                    pass
-                return
-            
-            # Delete rows from Current List
-            deleted_count = await self._rs_fs_sheet._delete_rows_by_indices(rows_to_delete)
-            
-            # Also remove from Live List by syncing Current List (which no longer has these rows)
-            # This ensures Live List stays in sync
-            live_sync_added = 0
-            live_sync_updated = 0
-            live_sync_deleted = 0
-            try:
-                all_current_rows = await self._rs_fs_sheet.fetch_current_list_rows()
-                all_rows: List[List[str]] = []
-                for row in all_current_rows:
-                    if len(row) < 3:
-                        continue
-                    # Skip header row
-                    if str(row[0] or "").strip().lower() == "release id":
-                        continue
-                    # Filter: Only process rows where "Full Send" column contains "full-send" (case-insensitive)
-                    full_send = str(row[12] or "").strip() if len(row) > 12 else ""
-                    full_send_lower = full_send.lower()
-                    if "full-send" not in full_send_lower and "💶┃full-send-🤖" not in full_send:
-                        continue
-                    store = str(row[1] or "").strip()
-                    sku = str(row[2] or "").strip()
-                    if not (store and sku):
-                        continue
-                    title = str(row[6] or "").strip() if len(row) > 6 else ""
-                    aff = str(row[8] or "").strip() if len(row) > 8 else ""
-                    url = str(row[7] or "").strip() if len(row) > 7 else ""
-                    all_rows.append([store, sku, title, aff, url])
-                
-                if all_rows:
-                    ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(all_rows)
-                    live_sync_added = added
-                    live_sync_updated = updated
-                    live_sync_deleted = deleted
-                    try:
-                        print(f"{Colors.GREEN}[RS-FS Removal]{Colors.RESET} Removed release ID {release_id}: deleted {deleted_count} row(s) from Current List, synced Live List (added={added}, updated={updated}, deleted={deleted})")
-                    except Exception:
-                        pass
-            except Exception as e:
-                try:
-                    print(f"{Colors.YELLOW}[RS-FS Removal]{Colors.RESET} Removed {deleted_count} row(s) from Current List, but Live List sync failed: {e}")
-                except Exception:
-                    pass
-            
-            # Send confirmation message to the channel
-            try:
-                channel = getattr(message, "channel", None)
-                if channel and hasattr(channel, "send"):
-                    # Build confirmation embed
-                    emb = discord.Embed(
-                        title="✅ RS-FS Sheet Updated",
-                        description=f"Release ID `{release_id}` has been removed from the sheet.",
-                        color=discord.Color.green(),
-                    )
-                    emb.add_field(
-                        name="Sheet Changes",
-                        value=f"Current List: `{deleted_count}` row(s) deleted\nLive List: `{live_sync_deleted}` row(s) removed",
-                        inline=False,
-                    )
-                    emb.set_footer(text="Sheet sync completed automatically")
-                    await channel.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
-            except Exception as e:
-                try:
-                    print(f"{Colors.YELLOW}[RS-FS Removal]{Colors.RESET} Failed to send confirmation message: {e}")
-                except Exception:
-                    pass
-                
-        except Exception as e:
-            try:
-                print(f"{Colors.RED}[RS-FS Removal]{Colors.RESET} Error handling Zephyr removal: {e}")
-            except Exception:
-                pass
-
     async def _maybe_sync_rs_fs_sheet_from_message(self, message: discord.Message) -> None:
         """
         Auto handler for Zephyr /listreleases output.\n
@@ -4735,59 +4361,6 @@ class RSForwarderBot:
             except Exception:
                 pass
 
-            async def _maybe_post_auto_check() -> None:
-                """
-                Post an RS-FS Check card automatically after /listreleases chunks arrive.
-                Debounced to avoid multi-chunk spam.
-                """
-                try:
-                    if not self._rsfs_auto_check_on_zephyr():
-                        return
-                    if not zephyr_release_feed_parser.looks_like_release_feed_embed_text(text or ""):
-                        return
-                    now = time.time()
-                    if (now - float(getattr(self, "_rs_fs_last_auto_check_ts", 0.0) or 0.0)) < self._rsfs_auto_check_debounce_s():
-                        return
-                    self._rs_fs_last_auto_check_ts = now
-
-                    out_id_raw = str((self.config or {}).get("rs_fs_sheet_status_channel_id") or "").strip()
-                    out_id = int(out_id_raw) if out_id_raw else int(target_ch)
-                    out_ch2 = await self._resolve_channel_by_id(int(out_id))
-                    if not (out_ch2 and hasattr(out_ch2, "send")):
-                        try:
-                            print(
-                                f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Auto check: cannot resolve sendable channel id={out_id}"
-                            )
-                        except Exception:
-                            pass
-                        return
-                    try:
-                        print(
-                            f"{Colors.CYAN}[RS-FS Sheet]{Colors.RESET} Auto check: sending button to channel_id={out_id} (debounce={self._rsfs_auto_check_debounce_s():.0f}s)"
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        await out_ch2.send(
-                            content="📊 **RS-FS Check Available**\nClick the button below to view the Full Send Check (only you will see it).",
-                            view=_RsFsCheckButtonView(self),
-                            allowed_mentions=discord.AllowedMentions.none(),
-                        )
-                        try:
-                            print(f"{Colors.CYAN}[RS-FS Sheet]{Colors.RESET} Auto check: sent button to channel")
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        msg0 = (str(e) or "send failed").replace("\n", " ").strip()
-                        if len(msg0) > 220:
-                            msg0 = msg0[:220] + "..."
-                        try:
-                            print(f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Auto check: send failed: {msg0}")
-                        except Exception:
-                            pass
-                except Exception:
-                    return
-
             # Always parse from the MOST RECENT merged listreleases text, not a single chunk.
             # Zephyr splits output into multiple messages/embeds and often places the `*-monitor`
             # tag on the next line. Parsing per-chunk can misclassify entries as "missing monitor tag".
@@ -4853,7 +4426,6 @@ class RSForwarderBot:
                     await self._rsfs_write_current_list(text_for_parse, reason="auto")
                 except Exception:
                     pass
-                await _maybe_post_auto_check()
 
                 # Mark message processed and return (no more work).
                 if mid:
@@ -4890,8 +4462,6 @@ class RSForwarderBot:
                 rid_by_key = {}
 
             # Post a visible check card early (even in dry-run, debounced).
-            await _maybe_post_auto_check()
-
             if not pairs:
                 try:
                     print(f"{Colors.YELLOW}[RS-FS Sheet]{Colors.RESET} Skip: parsed 0 items from embed text")
@@ -5654,14 +5224,6 @@ class RSForwarderBot:
             except Exception:
                 pass
 
-            # Recovery step:
-            # If Live List has empty Affiliate URL (col G) but monitor URL (col H) is present,
-            # fill affiliate + update History so future syncs are consistent.
-            try:
-                await self._rsfs_recover_live_affiliates_from_monitor_on_startup()
-            except Exception as e:
-                print(f"{Colors.YELLOW}[RS-FS Recovery]{Colors.RESET} start failed (best-effort): {e}")
-
             # Start background Mavely monitor (DM alerts + auto-start login desktop)
             try:
                 if self._mavely_monitor_task is None or self._mavely_monitor_task.done():
@@ -5701,12 +5263,6 @@ class RSForwarderBot:
             # Optional: Zephyr release feed -> RS-FS Google Sheet sync
             try:
                 await self._maybe_sync_rs_fs_sheet_from_message(message)
-            except Exception:
-                pass
-            
-            # Handle Zephyr Companion Bot removal messages - remove SKUs from sheet
-            try:
-                await self._maybe_handle_zephyr_removal(message)
             except Exception:
                 pass
             
