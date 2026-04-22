@@ -605,6 +605,90 @@ class RsFsSheetSync:
                 rows.append(row_str)
         return rows
 
+    async def prune_live_incomplete_rows(
+        self,
+        *,
+        apply: bool = False,
+        max_log: int = 50,
+    ) -> Tuple[bool, str, int]:
+        """
+        Remove rows from the Live List tab where any of the critical fields are missing:
+          - Product Title (col C)
+          - Store Link (col D)
+          - affiliated link (col G)
+
+        Returns (ok, msg, pruned_count). Dry-run by default unless apply=True.
+        """
+        tab = await self._resolve_tab_name()
+        if not tab:
+            return False, "missing live tab name", 0
+        service = self._get_service()
+        if not service:
+            return False, self.last_service_error() or "missing google service / deps", 0
+
+        rng = f"'{tab}'!A:H"
+        async with self._api_lock:
+            def _do_get() -> Dict[str, Any]:
+                return service.spreadsheets().values().get(
+                    spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                    range=rng,
+                ).execute()
+
+            try:
+                resp = await asyncio.to_thread(_do_get)
+            except Exception as e:
+                return False, f"failed to fetch live list rows: {e}", 0
+
+        values = resp.get("values") if isinstance(resp, dict) else None
+        if not isinstance(values, list) or not values:
+            return True, "no rows", 0
+
+        # Identify rows to delete (row indices are 1-based in Sheets; header row is 1).
+        to_delete: List[int] = []
+        logged = 0
+        for row_i_1_based, row in enumerate(values, start=1):
+            if row_i_1_based == 1:
+                continue  # header
+            if not isinstance(row, list):
+                continue
+            row_str = [str(c or "").strip() for c in row]
+            while len(row_str) < 8:
+                row_str.append("")
+            store = row_str[0]
+            sku = row_str[1]
+            title = row_str[2]
+            store_link = row_str[3]
+            aff = row_str[6]
+            if not (store or sku):
+                continue
+            if title and store_link and aff:
+                continue
+            to_delete.append(row_i_1_based)
+            if logged < max(0, int(max_log or 0)):
+                missing = []
+                if not title:
+                    missing.append("title")
+                if not store_link:
+                    missing.append("url")
+                if not aff:
+                    missing.append("affiliate")
+                print(f"[LivePrune] would_delete row={row_i_1_based} key={store}|{sku} missing={','.join(missing) or 'unknown'}")
+                logged += 1
+
+        if not to_delete:
+            return True, "no incomplete rows found", 0
+
+        if not apply:
+            return True, f"dry-run: would delete {len(to_delete)} row(s)", len(to_delete)
+
+        try:
+            # Uses the live tab gid (sheetId) by default.
+            await self._delete_rows_by_indices(sorted(set(to_delete)))
+        except Exception as e:
+            return False, f"delete failed: {e}", 0
+
+        return True, f"deleted {len(to_delete)} row(s)", len(to_delete)
+
     async def fetch_history_rows(self) -> List[List[str]]:
         """
         Fetch all rows from the History tab (excluding header).
@@ -856,72 +940,78 @@ class RsFsSheetSync:
                 except Exception as e:
                     return False, f"history append failed: {e}", 0, updated
 
-            # Best-effort dedupe: remove duplicate store|sku rows in History.
-            # Historical duplicates can accumulate if older runs already inserted duplicates;
-            # upsert alone does not delete extras.
-            #
-            # We keep the "best" row per key by preferring:
-            # - non-empty Affiliate URL
-            # - non-empty URL
-            # - non-empty Title
-            # - then latest Last Seen (UTC)
+            # IMPORTANT: History should be non-destructive by default.
+            # Older code attempted a "best-effort dedupe" by deleting weaker duplicates, but that can
+            # surprise operators by shrinking the History tab. Only run dedupe when explicitly enabled.
             try:
-                rng_full = f"'{tab}'!A:I"
-
-                def _do_get_full() -> List[List[str]]:
-                    resp = service.spreadsheets().values().get(
-                        spreadsheetId=self._sheet_cfg.spreadsheet_id,
-                        range=rng_full,
-                    ).execute()
-                    values = resp.get("values") if isinstance(resp, dict) else None
-                    return values if isinstance(values, list) else []
-
-                values_full = await asyncio.to_thread(_do_get_full)
-                # Build key -> (best_row_index_1_based, best_score_tuple)
-                best_by_key: Dict[str, Tuple[int, Tuple[int, int, int, str]]] = {}
-                to_delete: List[int] = []
-
-                for row_i, row in enumerate(values_full, start=1):
-                    if row_i == 1:
-                        continue  # header
-                    if not isinstance(row, list) or len(row) < 2:
-                        continue
-                    store = str(row[0] or "").strip()
-                    sku = str(row[1] or "").strip()
-                    if not (store and sku):
-                        continue
-                    if sku.lower() == "sku-upc":
-                        continue
-                    key = f"{store.lower()}|{sku.lower()}"
-
-                    title = str(row[2] or "").strip() if len(row) > 2 else ""
-                    url = str(row[3] or "").strip() if len(row) > 3 else ""
-                    aff = str(row[4] or "").strip() if len(row) > 4 else ""
-                    last_seen = str(row[6] or "").strip() if len(row) > 6 else ""
-
-                    # Score tuple: (aff_non_empty, url_non_empty, title_non_empty, last_seen)
-                    score = (1 if aff else 0, 1 if url else 0, 1 if title else 0, last_seen or "")
-                    if key not in best_by_key:
-                        best_by_key[key] = (row_i, score)
-                        continue
-
-                    best_row_i, best_score = best_by_key[key]
-                    if score > best_score:
-                        # New row is better; delete old keep row.
-                        to_delete.append(best_row_i)
-                        best_by_key[key] = (row_i, score)
-                    else:
-                        # Delete this weaker duplicate.
-                        to_delete.append(row_i)
-
-                # Delete duplicates (bottom-up by design in helper).
-                if to_delete:
-                    # Avoid deleting the same row multiple times.
-                    to_delete = sorted(set(to_delete))
-                    await self._delete_rows_by_indices(to_delete, sheet_id=int(_sheet_id or 0))
+                dedupe_enabled = bool((self.cfg or {}).get("rs_fs_history_dedupe_enabled"))
             except Exception:
-                # Never fail the upsert just because dedupe failed.
-                pass
+                dedupe_enabled = False
+
+            if dedupe_enabled:
+                # Best-effort dedupe: remove duplicate store|sku rows in History.
+                # We keep the "best" row per key by preferring:
+                # - non-empty Affiliate URL
+                # - non-empty URL
+                # - non-empty Title
+                # - then latest Last Seen (UTC)
+                try:
+                    rng_full = f"'{tab}'!A:I"
+
+                    def _do_get_full() -> List[List[str]]:
+                        resp = service.spreadsheets().values().get(
+                            spreadsheetId=self._sheet_cfg.spreadsheet_id,
+                            range=rng_full,
+                        ).execute()
+                        values = resp.get("values") if isinstance(resp, dict) else None
+                        return values if isinstance(values, list) else []
+
+                    values_full = await asyncio.to_thread(_do_get_full)
+                    # Build key -> (best_row_index_1_based, best_score_tuple)
+                    best_by_key: Dict[str, Tuple[int, Tuple[int, int, int, str]]] = {}
+                    to_delete: List[int] = []
+
+                    for row_i, row in enumerate(values_full, start=1):
+                        if row_i == 1:
+                            continue  # header
+                        if not isinstance(row, list) or len(row) < 2:
+                            continue
+                        store = str(row[0] or "").strip()
+                        sku = str(row[1] or "").strip()
+                        if not (store and sku):
+                            continue
+                        if sku.lower() == "sku-upc":
+                            continue
+                        key = f"{store.lower()}|{sku.lower()}"
+
+                        title = str(row[2] or "").strip() if len(row) > 2 else ""
+                        url = str(row[3] or "").strip() if len(row) > 3 else ""
+                        aff = str(row[4] or "").strip() if len(row) > 4 else ""
+                        last_seen = str(row[6] or "").strip() if len(row) > 6 else ""
+
+                        # Score tuple: (aff_non_empty, url_non_empty, title_non_empty, last_seen)
+                        score = (1 if aff else 0, 1 if url else 0, 1 if title else 0, last_seen or "")
+                        if key not in best_by_key:
+                            best_by_key[key] = (row_i, score)
+                            continue
+
+                        best_row_i, best_score = best_by_key[key]
+                        if score > best_score:
+                            # New row is better; delete old keep row.
+                            to_delete.append(best_row_i)
+                            best_by_key[key] = (row_i, score)
+                        else:
+                            # Delete this weaker duplicate.
+                            to_delete.append(row_i)
+
+                    # Delete duplicates (bottom-up by design in helper).
+                    if to_delete:
+                        # Avoid deleting the same row multiple times.
+                        to_delete = sorted(set(to_delete))
+                        await self._delete_rows_by_indices(to_delete, sheet_id=int(_sheet_id or 0))
+                except Exception:
+                    # Never fail the upsert just because dedupe failed.
+                    pass
 
         # Refresh cache
         try:

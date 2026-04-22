@@ -174,6 +174,51 @@ class RsFsMonitorDataResolver:
 
         return None
 
+    def explain_resolve(self, *, store: str, sku: str, monitor_tag: str = "") -> Tuple[Optional[MonitorResolved], str, str]:
+        """
+        Resolve like `resolve()`, but also return:
+        - reason: machine-readable short reason for misses
+        - channel_key: which monitor_data file we tried (if any)
+        """
+        sku_clean = _clean_id(sku)
+        if not sku_clean:
+            return None, "miss:empty_sku", ""
+
+        ck = ""
+        mt = (monitor_tag or "").strip().lower()
+        if mt:
+            ck = mt
+        if not ck:
+            ck = _store_to_channel_key(store)
+        if not ck:
+            return None, "miss:no_channel_key", ""
+
+        p = self._dir / f"{ck}.json"
+        if not p.is_file():
+            return None, "miss:monitor_file_missing", ck
+
+        idx = self._load_channel_index(ck)
+        if not idx:
+            return None, "miss:monitor_index_empty", ck
+
+        hit = idx.get(sku_clean)
+        if hit:
+            return hit, "hit:id", ck
+
+        sku_digits = "".join([c for c in sku_clean if c.isdigit()])
+        if sku_digits and sku_digits != sku_clean:
+            hit2 = idx.get(sku_digits)
+            if hit2:
+                return hit2, "hit:digits", ck
+
+        title_key = _clean_id(sku)
+        if title_key:
+            hit3 = idx.get(f"title:{title_key}")
+            if hit3:
+                return hit3, "hit:title", ck
+
+        return None, "miss:no_match", ck
+
     def build_resolved_by_key(
         self,
         *,
