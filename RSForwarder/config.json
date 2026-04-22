@@ -115,7 +115,7 @@
   "rs_fs_sheet_progress_enabled": true,
   "rs_fs_sheet_progress_update_s": 2.0,
   "rs_fs_monitor_lookup_enabled": true,
-  "rs_fs_monitor_live_capture_enabled": false,
+  "rs_fs_monitor_live_capture_enabled": true,
   "rs_fs_monitor_live_capture_store_max": 5000,
   "rs_fs_sheet_max_per_run": 250,
   "rs_fs_sheet_status_channel_id": "1438893232686895194",

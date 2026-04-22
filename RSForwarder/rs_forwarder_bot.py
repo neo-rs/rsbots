@@ -5255,12 +5255,20 @@ class RSForwarderBot:
 
             print(f"{Colors.CYAN}{'='*60}{Colors.RESET}\n")
 
-            # Optional: MonitorData startup summary (unique items per monitor_data json)
+            # MonitorData startup summary (unique items per monitor_data json)
             try:
-                if self._rs_fs_monitor_live_capture_enabled():
-                    m = self._rs_fs_monitor_channel_ids() or {}
-                    out_dir = Path(__file__).resolve().parent / "monitor_data"
-                    print(f"{Colors.CYAN}[MonitorData]{Colors.RESET} startup enabled=true channels={len(m)} dir={str(out_dir)}")
+                enabled = bool(self._rs_fs_monitor_live_capture_enabled())
+                m = self._rs_fs_monitor_channel_ids() or {}
+                out_dir = Path(__file__).resolve().parent / "monitor_data"
+                print(
+                    f"{Colors.CYAN}[MonitorData]{Colors.RESET} startup enabled={'true' if enabled else 'false'} "
+                    f"channels={len(m)} dir={str(out_dir)}"
+                )
+                if not enabled:
+                    print(
+                        f"{Colors.CYAN}[MonitorData]{Colors.RESET} (set rs_fs_monitor_live_capture_enabled=true to live-update monitor_data)"
+                    )
+                else:
                     key_counts = []
                     for k in sorted(m.keys()):
                         p = out_dir / f"{k}.json"
@@ -5278,7 +5286,6 @@ class RSForwarderBot:
                         except Exception:
                             n_items = 0
                         key_counts.append((k, n_items))
-                    # Print a few per line for readability
                     if key_counts:
                         for k, n_items in key_counts:
                             print(f"{Colors.CYAN}[MonitorData]{Colors.RESET} channel={k} unique_items={n_items}")
