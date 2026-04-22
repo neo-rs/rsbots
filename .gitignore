@@ -66,6 +66,7 @@
 !RSForwarder/rs_fs_manual_overrides.json
 !RSForwarder/messages.json
 !RSForwarder/vouch_config.json
+!RSForwarder/run_rs_fs_resolve_and_sync.bat
 
 !RSMentionPinger/
 !RSMentionPinger/**/

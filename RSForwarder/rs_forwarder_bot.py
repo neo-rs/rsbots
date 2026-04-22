@@ -28,6 +28,7 @@ from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 from RSForwarder import affiliate_rewriter
 from RSForwarder import novnc_stack
 from RSForwarder import rs_fs_sheet_sync
+from RSForwarder.rs_fs_monitor_data_resolver import RsFsMonitorDataResolver
 from RSForwarder import zephyr_release_feed_parser
 
 # Ensure repo root is importable when executed as a script (matches Ubuntu run_bot.sh PYTHONPATH).
@@ -1570,6 +1571,7 @@ class RSForwarderBot:
         
         rows: List[List[str]] = []
         last_seen = rs_fs_sheet_sync.RsFsSheetSync._utc_now_iso()  # type: ignore[attr-defined]
+        monitor_resolver = RsFsMonitorDataResolver(Path(__file__).resolve().parent / "monitor_data")
 
         for r in recs:
             rid = int(getattr(r, "release_id", 0) or 0)
@@ -1632,6 +1634,20 @@ class RSForwarderBot:
                         title = ov_t
                     status_bits.append("manual")
                     src = src or "manual"
+
+            # Canonical resolver: monitor_data snapshot (preferred, before History/web).
+            if key and not url:
+                try:
+                    hit = monitor_resolver.resolve(store=store, sku=sku_label, monitor_tag=monitor_tag)
+                except Exception:
+                    hit = None
+                if hit and str(getattr(hit, "url", "") or "").strip():
+                    url = str(getattr(hit, "url", "") or "").strip()
+                    ht = str(getattr(hit, "title", "") or "").strip()
+                    if ht and not self._rsfs_title_is_bad(ht, url=url):
+                        title = ht
+                    status_bits.append("monitor_data")
+                    src = src or "monitor_data"
             if key and not url and self._rsfs_use_history_cache() and key in (history or {}):
                 hrec = history.get(key) or {}
                 url = str(hrec.get("url") or "").strip()
@@ -3665,13 +3681,6 @@ class RSForwarderBot:
         except Exception:
             return True
 
-    def _rs_fs_monitor_history_limit(self) -> int:
-        try:
-            v = int((self.config or {}).get("rs_fs_monitor_lookup_history_limit") or 120)
-        except Exception:
-            v = 120
-        return max(20, min(v, 500))
-
     def _monitor_channel_name_for_store(self, store: str) -> Optional[str]:
         s = (store or "").strip().lower()
         # Map store name -> channel name (keys in rs_fs_monitor_channel_ids from fetch_monitor_channels).
@@ -3997,242 +4006,50 @@ class RSForwarderBot:
         guild: Optional[discord.Guild] = None,
     ) -> Optional[rs_fs_sheet_sync.RsFsPreviewEntry]:
         """
-        Try to find a matching monitor embed for (store, sku) and extract title + url from that embed.
-        Returns None if not found / not accessible.
+        Canonical monitor lookup (local): resolve (store, sku) using RSForwarder/monitor_data snapshots.
+
+        This replaces the old behavior that scanned Discord channel history for embeds (which was slow,
+        rate-limit prone, and depended on runtime Discord access). Returns None if not found.
         """
         if not self._rs_fs_monitor_lookup_enabled():
             return None
-        ch_name = self._monitor_channel_name_for_store(store)
-        if not ch_name:
-            return None
-        ch = await self._resolve_monitor_channel_for_store(store, guild=guild)
-        if not ch:
-            try:
-                if bool((self.config or {}).get("rs_fs_monitor_debug")):
-                    print(f"{Colors.YELLOW}[RS-FS Monitor]{Colors.RESET} channel not found for store={store!r} wanted_name={ch_name!r}")
-            except Exception:
-                pass
-            return None
-
-        target = self._clean_sku_text(sku)
-        if not target:
-            return None
-
-        target_digits = "".join([c for c in target if c.isdigit()])
-
-        def _looks_like_id_value(cleaned: str) -> bool:
-            # Heuristic: IDs are usually fairly long, or contain letters (ASIN / BestBuy sku).
-            if not cleaned:
-                return False
-            if any(c.isalpha() for c in cleaned):
-                return len(cleaned) >= 6
-            # numeric
-            return len(cleaned) >= 6
-
-        def _id_like_field_name(name: str) -> bool:
-            n = (name or "").strip().lower()
-            if not n:
-                return False
-            hints = (
-                "sku",
-                "pid",
-                "tcin",
-                "asin",
-                "upc",
-                "item",
-                "product",
-                "product id",
-                "productid",
-                "model",
-                "mpn",
-                "id",
-            )
-            return any(h in n for h in hints)
-
-        def _value_matches_target(raw_val: str) -> bool:
-            val_clean = self._clean_sku_text(raw_val or "")
-            if not val_clean:
-                return False
-            if val_clean == target:
-                return True
-            # Numeric-only match (handles formatting/commas/spaces)
-            if target_digits:
-                val_digits = "".join([c for c in val_clean if c.isdigit()])
-                if val_digits and val_digits == target_digits and len(target_digits) >= 6:
-                    return True
-            return False
-
-        limit = self._rs_fs_monitor_history_limit()
         debug_enabled = False
         try:
             debug_enabled = bool((self.config or {}).get("rs_fs_monitor_debug"))
         except Exception:
             debug_enabled = False
-        scanned_msgs = 0
-        scanned_embeds = 0
+
         try:
-            async for m in ch.history(limit=limit):
-                scanned_msgs += 1
-                embeds = getattr(m, "embeds", None) or []
-                for e in embeds:
-                    scanned_embeds += 1
-                    fields = getattr(e, "fields", None) or []
-
-                    def _extract_title_url() -> Tuple[str, str]:
-                        title = str(getattr(e, "title", "") or "").strip()
-                        urls: List[str] = []
-                        u0 = str(getattr(e, "url", "") or "").strip()
-                        if u0:
-                            urls.append(u0)
-                        # Pull URLs from any field values
-                        for f2 in fields:
-                            vv = str(getattr(f2, "value", "") or "")
-                            uu = self._first_url_in_text(vv)
-                            if uu:
-                                urls.append(uu)
-                        dd = str(getattr(e, "description", "") or "")
-                        uu2 = self._first_url_in_text(dd)
-                        if uu2:
-                            urls.append(uu2)
-
-                        # Prefer store-domain URLs when possible
-                        preferred = self._preferred_store_domains(store)
-                        url = ""
-                        for u in urls:
-                            try:
-                                host = (urlparse(u).netloc or "").lower()
-                            except Exception:
-                                host = ""
-                            if any(d in host for d in preferred):
-                                url = u
-                                break
-                        if not url:
-                            url = (urls[0] if urls else "").strip()
-                        # Never use URL as title fallback - keep title empty if not found
-                        return title, url
-
-                    # Pass 1: ID-like fields (SKU/PID/TCIN/ASIN/UPC/etc)
-                    for f in fields:
-                        name = str(getattr(f, "name", "") or "").strip()
-                        val = str(getattr(f, "value", "") or "").strip()
-                        if not (name and val):
-                            continue
-                        if not _id_like_field_name(name):
-                            continue
-                        if _value_matches_target(val):
-                            title, url = _extract_title_url()
-                            if debug_enabled:
-                                try:
-                                    g_id = int(getattr(getattr(ch, "guild", None), "id", 0) or 0)
-                                    jump = (
-                                        f"https://discord.com/channels/{g_id}/{int(getattr(ch,'id',0) or 0)}/{int(getattr(m,'id',0) or 0)}"
-                                        if g_id and int(getattr(ch,'id',0) or 0) and int(getattr(m,'id',0) or 0)
-                                        else ""
-                                    )
-                                    print(
-                                        f"{Colors.CYAN}[RS-FS Monitor]{Colors.RESET} HIT store={store} sku={sku} "
-                                        f"channel={getattr(ch,'name',ch_name)} method=field name={name!r} scanned_msgs={scanned_msgs} scanned_embeds={scanned_embeds}"
-                                        + (f" jump={jump}" if jump else "")
-                                    )
-                                except Exception:
-                                    pass
-                            return rs_fs_sheet_sync.RsFsPreviewEntry(
-                                store=store,
-                                sku=sku,
-                                url=url,
-                                title=title,
-                                error="" if url else "no url in monitor embed",
-                                source=f"monitor:{ch_name}",
-                                monitor_url=url,
-                                affiliate_url="",
-                            )
-
-                    # Pass 2: exact match anywhere in values (avoid false positives on short numbers)
-                    for f in fields:
-                        val = str(getattr(f, "value", "") or "").strip()
-                        if not val:
-                            continue
-                        val_clean = self._clean_sku_text(val)
-                        if not _looks_like_id_value(val_clean):
-                            continue
-                        if _value_matches_target(val):
-                            title, url = _extract_title_url()
-                            if debug_enabled:
-                                try:
-                                    g_id = int(getattr(getattr(ch, "guild", None), "id", 0) or 0)
-                                    jump = (
-                                        f"https://discord.com/channels/{g_id}/{int(getattr(ch,'id',0) or 0)}/{int(getattr(m,'id',0) or 0)}"
-                                        if g_id and int(getattr(ch,'id',0) or 0) and int(getattr(m,'id',0) or 0)
-                                        else ""
-                                    )
-                                    print(
-                                        f"{Colors.CYAN}[RS-FS Monitor]{Colors.RESET} HIT store={store} sku={sku} "
-                                        f"channel={getattr(ch,'name',ch_name)} method=any_value scanned_msgs={scanned_msgs} scanned_embeds={scanned_embeds}"
-                                        + (f" jump={jump}" if jump else "")
-                                    )
-                                except Exception:
-                                    pass
-                            return rs_fs_sheet_sync.RsFsPreviewEntry(
-                                store=store,
-                                sku=sku,
-                                url=url,
-                                title=title,
-                                error="" if url else "no url in monitor embed",
-                                source=f"monitor:{ch_name}",
-                                monitor_url=url,
-                                affiliate_url="",
-                            )
-
-                    # Fallback: raw text match anywhere in embed
-                    blob = " ".join(
-                        [
-                            str(getattr(e, "title", "") or ""),
-                            str(getattr(e, "description", "") or ""),
-                            " ".join([str(getattr(f, "name", "") or "") + " " + str(getattr(f, "value", "") or "") for f in fields]),
-                        ]
-                    )
-                    if target and target in self._clean_sku_text(blob):
-                        title = str(getattr(e, "title", "") or "").strip()
-                        url = str(getattr(e, "url", "") or "").strip()
-                        if not url:
-                            url = self._first_url_in_text(blob)
-                        # Never use URL as title fallback - keep title empty if not found
-                        if debug_enabled:
-                            try:
-                                g_id = int(getattr(getattr(ch, "guild", None), "id", 0) or 0)
-                                jump = (
-                                    f"https://discord.com/channels/{g_id}/{int(getattr(ch,'id',0) or 0)}/{int(getattr(m,'id',0) or 0)}"
-                                    if g_id and int(getattr(ch,'id',0) or 0) and int(getattr(m,'id',0) or 0)
-                                    else ""
-                                )
-                                print(
-                                    f"{Colors.CYAN}[RS-FS Monitor]{Colors.RESET} HIT store={store} sku={sku} "
-                                    f"channel={getattr(ch,'name',ch_name)} method=blob scanned_msgs={scanned_msgs} scanned_embeds={scanned_embeds}"
-                                    + (f" jump={jump}" if jump else "")
-                                )
-                            except Exception:
-                                pass
-                        return rs_fs_sheet_sync.RsFsPreviewEntry(
-                            store=store,
-                            sku=sku,
-                            url=url,
-                            title=title,
-                            error="" if url else "no url in monitor embed",
-                            source=f"monitor:{ch_name}",
-                            monitor_url=url,
-                            affiliate_url="",
-                        )
+            resolver = RsFsMonitorDataResolver(Path(__file__).resolve().parent / "monitor_data")
+            hit = resolver.resolve(store=store, sku=sku, monitor_tag="")
         except Exception:
+            hit = None
+
+        if not hit:
+            if debug_enabled:
+                try:
+                    print(f"{Colors.YELLOW}[RS-FS Monitor]{Colors.RESET} MISS store={store} sku={sku} (monitor_data)")
+                except Exception:
+                    pass
             return None
+
+        url = str(getattr(hit, "url", "") or "").strip()
+        title = str(getattr(hit, "title", "") or "").strip()
         if debug_enabled:
             try:
-                print(
-                    f"{Colors.YELLOW}[RS-FS Monitor]{Colors.RESET} MISS store={store} sku={sku} "
-                    f"channel={getattr(ch,'name',ch_name)} scanned_msgs={scanned_msgs} scanned_embeds={scanned_embeds} limit={limit}"
-                )
+                print(f"{Colors.CYAN}[RS-FS Monitor]{Colors.RESET} HIT store={store} sku={sku} source={getattr(hit,'source','')}")
             except Exception:
                 pass
-        return None
+        return rs_fs_sheet_sync.RsFsPreviewEntry(
+            store=store,
+            sku=sku,
+            url=url,
+            title=title,
+            error="" if url else "no url in monitor_data",
+            source=str(getattr(hit, "source", "") or "monitor_data"),
+            monitor_url=url,
+            affiliate_url="",
+        )
 
     def _collect_embed_text(self, message: discord.Message) -> str:
         parts: List[str] = []
@@ -4424,6 +4241,18 @@ class RSForwarderBot:
             if not dry_run:
                 try:
                     await self._rsfs_write_current_list(text_for_parse, reason="auto")
+                except Exception:
+                    pass
+
+                # Canonical: always sync Current (Full Send rows) -> Live after /listrelease write.
+                try:
+                    ok_sync, msg_sync, added, updated, _deleted = await self._rsfs_sync_current_to_live_list()
+                    try:
+                        print(
+                            f"{Colors.CYAN}[RS-FS Live]{Colors.RESET} sync after /listrelease ok={ok_sync} added={added} updated={updated} msg={msg_sync}"
+                        )
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
@@ -6601,39 +6430,8 @@ class RSForwarderBot:
 
             # Make monitor lookup verbose for this command (journald + clearer behavior).
             prev_dbg = (self.config or {}).get("rs_fs_monitor_debug")
-            prev_hist = (self.config or {}).get("rs_fs_monitor_lookup_history_limit")
             try:
                 self.config["rs_fs_monitor_debug"] = True
-                try:
-                    self.config["rs_fs_monitor_lookup_history_limit"] = max(int(prev_hist or 0), 2000)
-                except Exception:
-                    self.config["rs_fs_monitor_lookup_history_limit"] = 2000
-            except Exception:
-                pass
-
-            # Show which monitor channel we will use (name resolution is a common failure mode).
-            try:
-                ch_name = self._monitor_channel_name_for_store(st_in) or ""
-                ch_hit = await self._resolve_monitor_channel_for_store(st_in, guild=getattr(ctx, "guild", None)) if ch_name else None
-                if ch_hit:
-                    await ctx.send(
-                        embed=_rsfs_embed(
-                            "RS-FS Test SKU",
-                            status="Monitor channel resolved",
-                            fields=[("Channel", f"#{getattr(ch_hit,'name','')} (`{getattr(ch_hit,'id','')}`)", False)],
-                        ),
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                else:
-                    await ctx.send(
-                        embed=_rsfs_embed(
-                            "RS-FS Test SKU",
-                            status="⚠️ monitor channel not found",
-                            color=discord.Color.orange(),
-                            fields=[("Expected", f"`{ch_name}`", True)],
-                        ),
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
             except Exception:
                 pass
 
@@ -6709,10 +6507,6 @@ class RSForwarderBot:
                         (self.config or {}).pop("rs_fs_monitor_debug", None)
                     else:
                         self.config["rs_fs_monitor_debug"] = prev_dbg
-                    if prev_hist is None:
-                        (self.config or {}).pop("rs_fs_monitor_lookup_history_limit", None)
-                    else:
-                        self.config["rs_fs_monitor_lookup_history_limit"] = prev_hist
                 except Exception:
                     pass
 
@@ -6778,7 +6572,6 @@ class RSForwarderBot:
                 # Prevent live Zephyr message chunks from also being processed while we run.
                 prev_manual = bool(getattr(self, "_rs_fs_manual_run_in_progress", False))
                 self._rs_fs_manual_run_in_progress = True
-                prev_hist = None
                 try:
                     await ctx.send(f"✅ Running RS-FS LIVE upsert sync from <#{ch_id}> (max={lim})…")
 
@@ -7043,13 +6836,6 @@ class RSForwarderBot:
                         except Exception:
                             pass
 
-                    # Temporarily increase monitor lookup history (improves hit rate; reduces website scraping).
-                    prev_hist = (self.config or {}).get("rs_fs_monitor_lookup_history_limit")
-                    try:
-                        self.config["rs_fs_monitor_lookup_history_limit"] = max(int(prev_hist or 0), 600)
-                    except Exception:
-                        self.config["rs_fs_monitor_lookup_history_limit"] = 600
-
                     # Stage 1: monitor lookup (history+manual overrides count as hits)
                     monitor_hits: List[rs_fs_sheet_sync.RsFsPreviewEntry] = list(history_hits) + list(manual_hits)
                     remaining: List[Tuple[str, str]] = []
@@ -7072,110 +6858,15 @@ class RSForwarderBot:
                     g_obj = getattr(ch, "guild", None)
                     done = 0
                     errors = 0
-                    # Build per-channel index once (avoid scanning history per SKU).
-                    monitor_cache: Dict[str, Tuple[Optional[discord.TextChannel], Dict[str, Tuple[str, str]]]] = {}
-
-                    import re as _re
-
-                    def _id_like_field_name(name: str) -> bool:
-                        n = (name or "").strip().lower()
-                        if not n:
-                            return False
-                        hints = ("sku", "pid", "tcin", "asin", "upc", "item", "product", "model", "mpn", "id")
-                        return any(h in n for h in hints)
-
-                    async def _build_index(ch2: discord.TextChannel, *, limit_n: int) -> Dict[str, Tuple[str, str]]:
-                        idx: Dict[str, Tuple[str, str]] = {}
-                        base_name = self._normalize_monitor_channel_name(str(getattr(ch2, "name", "") or ""))
-                        preferred_domains = self._preferred_store_domains(base_name)
-
-                        def _all_urls(text: str) -> List[str]:
-                            try:
-                                return [u.strip() for u in _re.findall(r"(https?://[^\\s<>()]+)", text or "") if u.strip()]
-                            except Exception:
-                                return []
-
-                        def _pick_url(cands: List[str]) -> str:
-                            if not cands:
-                                return ""
-                            for u in cands:
-                                try:
-                                    host = (urlparse(u).netloc or "").lower()
-                                except Exception:
-                                    host = ""
-                                if any(d in host for d in preferred_domains):
-                                    return u
-                            return cands[0]
-
-                        async for mm in ch2.history(limit=limit_n):
-                            embeds2 = getattr(mm, "embeds", None) or []
-                            for ee in embeds2:
-                                fields2 = getattr(ee, "fields", None) or []
-                                title2 = str(getattr(ee, "title", "") or "").strip()
-                                url_candidates: List[str] = []
-                                u0 = str(getattr(ee, "url", "") or "").strip()
-                                if u0:
-                                    url_candidates.append(u0)
-                                for ff in fields2:
-                                    url_candidates.extend(_all_urls(str(getattr(ff, "value", "") or "")))
-                                url_candidates.extend(_all_urls(str(getattr(ee, "description", "") or "")))
-                                url2 = _pick_url([u for u in url_candidates if u])
-                                # IMPORTANT: never use URL as "title". Leave it blank if we can't extract a title.
-                                if not title2:
-                                    title2 = ""
-
-                                for ff in fields2:
-                                    name = str(getattr(ff, "name", "") or "").strip()
-                                    if not _id_like_field_name(name):
-                                        continue
-                                    val = str(getattr(ff, "value", "") or "").strip()
-                                    if not val:
-                                        continue
-                                    cleaned = self._clean_sku_text(val)
-                                    if cleaned and len(cleaned) >= 6 and cleaned not in idx:
-                                        idx[cleaned] = (title2, url2)
-                                    digits = "".join([c for c in cleaned if c.isdigit()])
-                                    if digits and len(digits) >= 6 and digits not in idx:
-                                        idx[digits] = (title2, url2)
-                        return idx
-
-                    # Use a larger history limit for manual runs (better hit rate).
-                    try:
-                        limit_mon = max(int((self.config or {}).get("rs_fs_monitor_lookup_history_limit") or 0), 2000)
-                    except Exception:
-                        limit_mon = 2000
 
                     for st, sk in pairs:
                         found = None
                         if self._rs_fs_monitor_lookup_enabled():
-                            ch_name = self._monitor_channel_name_for_store(st)
-                            if ch_name:
-                                base = self._normalize_monitor_channel_name(ch_name)
-                                if base not in monitor_cache:
-                                    ch2 = await self._resolve_monitor_channel_for_store(st, guild=g_obj)
-                                    idx = {}
-                                    if ch2:
-                                        try:
-                                            idx = await _build_index(ch2, limit_n=limit_mon)
-                                        except Exception:
-                                            idx = {}
-                                    monitor_cache[base] = (ch2, idx)
-                                ch2, idx = monitor_cache.get(base) or (None, {})
-                                target_clean = self._clean_sku_text(sk)
-                                target_digits = "".join([c for c in target_clean if c.isdigit()])
-                                hit = idx.get(target_clean) or (idx.get(target_digits) if target_digits else None)
-                                if hit:
-                                    t2, u2 = hit
-                                    found = rs_fs_sheet_sync.RsFsPreviewEntry(
-                                        store=st,
-                                        sku=sk,
-                                        url=u2 or "",
-                                        title=(t2 or "").strip(),
-                                        error=("" if (t2 or "").strip() else "title not found (monitor embed)") if (u2 or "").strip() else "no url in monitor embed",
-                                        source=f"monitor:{getattr(ch2,'name',ch_name)}",
-                                        monitor_url=(u2 or "").strip(),
-                                        affiliate_url="",
-                                    )
+                            # Canonical: resolve from monitor_data snapshots (no Discord history scan).
+                            try:
+                                found = await self._monitor_lookup_for_store(st, sk, guild=g_obj)
+                            except Exception:
+                                found = None
 
                         if found:
                             monitor_hits.append(found)
@@ -7803,14 +7494,7 @@ class RSForwarderBot:
                     else:
                         await ctx.send(f"❌ RS-FS live run failed: {msg}", allowed_mentions=discord.AllowedMentions.none())
                 finally:
-                    # Restore monitor lookup limit and manual-run guard
-                    try:
-                        if prev_hist is None:
-                            (self.config or {}).pop("rs_fs_monitor_lookup_history_limit", None)
-                        else:
-                            self.config["rs_fs_monitor_lookup_history_limit"] = prev_hist
-                    except Exception:
-                        pass
+                    # Restore manual-run guard
                     self._rs_fs_manual_run_in_progress = prev_manual
             except Exception as e:
                 await ctx.send(f"❌ RS-FS live run failed: {str(e)[:200]}")
