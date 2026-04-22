@@ -308,6 +308,24 @@ def _derive_product_id_from_url(url: str) -> Tuple[str, str]:
         if m:
             return "CODE", m.group(1).upper()
 
+    # Last resort: canonical URL key (host + path, no query).
+    # This gives stable identity for Shopify-style URLs like:
+    #   https://example.com/products/some-slug
+    # Without this, we fall back to title-only identity, which is less stable.
+    try:
+        m = re.match(r"^https?://([^/]+)(/[^?#]*)?", u, re.IGNORECASE)
+        if m:
+            host = (m.group(1) or "").strip().lower()
+            path = (m.group(2) or "").strip()
+            if path:
+                path = path.split("?", 1)[0].split("#", 1)[0]
+            # Normalize: strip trailing slash, collapse multiple slashes.
+            path = re.sub(r"/{2,}", "/", path).rstrip("/")
+            if host and path:
+                return "URL", f"{host}{path}"
+    except Exception:
+        pass
+
     return "", ""
 
 
@@ -342,6 +360,9 @@ def _extract_product_id(msg: dict) -> dict:
 
     # Derive from URL (embed url preferred)
     url = str(human.get("url") or "").strip()
+    if not url:
+        _t, primary_url = _extract_primary_title_and_url(msg)
+        url = str(primary_url or "").strip()
     id_type, id_value = _derive_product_id_from_url(url)
     if id_type and id_value:
         return {"kind": "derived", "name": id_type, "value": id_value}
