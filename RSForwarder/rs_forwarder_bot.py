@@ -1446,6 +1446,19 @@ class RSForwarderBot:
         except Exception:
             return False
 
+    def _rsfs_live_prune_incomplete_enabled(self) -> bool:
+        """
+        If enabled, prune incomplete rows (missing title/url/affiliate) from the Live List tab.
+        Default OFF because it is destructive (deletes sheet rows).
+        """
+        try:
+            v = (self.config or {}).get("rs_fs_live_prune_incomplete_enabled")
+            if isinstance(v, bool):
+                return v
+            return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+        except Exception:
+            return False
+
     @staticmethod
     def _rsfs_key_store_sku(store: str, sku: str) -> str:
         return f"{str(store or '').strip().lower()}|{str(sku or '').strip().lower()}"
@@ -1799,10 +1812,23 @@ class RSForwarderBot:
             title = str(row[6] or "").strip() if len(row) > 6 else ""
             url = str(row[7] or "").strip() if len(row) > 7 else ""
             aff = str(row[8] or "").strip() if len(row) > 8 else ""
+            # Live list should not be polluted with incomplete rows.
+            if not (title and url and aff):
+                continue
             all_rows.append([store, sku, title, aff, url])
         if not all_rows:
             return True, "no Full Send rows with store+sku", 0, 0, 0
-        return await self._rs_fs_sheet.sync_rows_mirror(all_rows, delete_stale=False)
+        ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(all_rows, delete_stale=False)
+        if ok and self._rsfs_live_prune_incomplete_enabled():
+            try:
+                okp, msgp, n = await self._rs_fs_sheet.prune_live_incomplete_rows(apply=True, max_log=20)
+                try:
+                    print(f"{Colors.CYAN}[RS-FS Live]{Colors.RESET} prune incomplete ok={okp} pruned={n} msg={msgp}")
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        return ok, msg, added, updated, deleted
 
     async def _collect_latest_zephyr_release_feed_text(
         self,
@@ -7546,6 +7572,9 @@ class RSForwarderBot:
                             u0 = str(url or "").strip()
                             t0 = str(title or "").strip()
                             a0 = str(aff or "").strip()
+                            # History should only contain complete rows.
+                            if not (t0 and u0 and a0):
+                                continue
                             src0 = str(resolved_by_key.get(k0, {}).get("source", "") or "").strip()
                             try:
                                 rid0 = int(rid_by_key.get(self._rs_fs_override_key(st0, sk0)) or 0)
@@ -7588,7 +7617,26 @@ class RSForwarderBot:
                         
                         # Sync all Current List items (Full Send only) to Live List
                         if all_rows:
+                            # Live list should not be polluted with incomplete rows.
+                            all_rows = [
+                                r
+                                for r in all_rows
+                                if isinstance(r, list)
+                                and len(r) >= 5
+                                and str(r[2] or "").strip()
+                                and str(r[3] or "").strip()
+                                and str(r[4] or "").strip()
+                            ]
                             ok, msg, added, updated, deleted = await self._rs_fs_sheet.sync_rows_mirror(all_rows, delete_stale=False)
+                            if ok and self._rsfs_live_prune_incomplete_enabled():
+                                try:
+                                    okp, msgp, n = await self._rs_fs_sheet.prune_live_incomplete_rows(apply=True, max_log=20)
+                                    try:
+                                        print(f"{Colors.CYAN}[RS-FS Live]{Colors.RESET} prune incomplete ok={okp} pruned={n} msg={msgp}")
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    pass
                             
                             # Track what was added/updated (key by store|sku to match sync)
                             for store, sku, title, aff, url in all_rows:

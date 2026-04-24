@@ -133,12 +133,12 @@ RSSuccessBot manages the success points system for Reselling Secrets. Members ea
 - **Returns**: Reload confirmation or error list
 
 #### `!sync`
-- **Description**: Manually sync slash commands
+- **Description**: Manually sync slash commands to the configured guild and clear global application-command registrations (prevents duplicate `/…` entries when both guild and global scopes were previously used)
 - **Aliases**: None
 - **Parameters**: None
 - **Usage**: `!sync`
 - **Admin Only**: Yes (requires manage_messages permission)
-- **Returns**: Sync status with command counts
+- **Returns**: Sync status with command counts and whether global registrations were cleared
 
 #### `!configinfo`
 - **Description**: Show configuration information

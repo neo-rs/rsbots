@@ -519,6 +519,18 @@ class RSSuccessBot:
             f"{total} total, {enabled} enabled, {published} with published message id"
         )
 
+    async def _clear_global_slash_command_registrations(self) -> bool:
+        """Remove globally registered slash commands so the tree is not listed twice (guild + global)."""
+        app_id = self.bot.application_id
+        if not app_id:
+            return False
+        try:
+            await self.bot.http.bulk_upsert_global_commands(app_id, [])
+            return True
+        except Exception as e:
+            print(f"{Colors.YELLOW}[Commands] Could not clear global application commands: {e}{Colors.RESET}")
+            return False
+
     def _setup_events(self):
         """Setup Discord event handlers"""
         
@@ -571,15 +583,13 @@ class RSSuccessBot:
                             print(f"{Colors.RED}[Commands] Error during guild sync: {sync_e}{Colors.RESET}")
                             import traceback
                             traceback.print_exc()
-                        
-                        # Also try global sync (can take up to 1 hour, but ensures commands work everywhere)
-                        try:
-                            global_synced = await self.bot.tree.sync()
-                            if global_synced:
-                                print(f"{Colors.GREEN}[Commands] Also synced {len(global_synced)} command(s) globally (may take up to 1 hour){Colors.RESET}")
-                        except Exception as global_e:
-                            print(f"{Colors.YELLOW}[Commands] Global sync warning (this is normal): {global_e}{Colors.RESET}")
-                            
+
+                        if await self._clear_global_slash_command_registrations():
+                            print(
+                                f"{Colors.GREEN}[Commands] Cleared global slash registrations "
+                                f"(canonical scope: guild only — avoids duplicate /commands in this server).{Colors.RESET}"
+                            )
+
                     except Exception as e:
                         print(f"{Colors.RED}[Commands] ERROR: Failed to sync slash commands: {e}{Colors.RESET}")
                         import traceback
@@ -1594,23 +1604,19 @@ class RSSuccessBot:
                 all_commands = list(self.bot.tree.get_commands())
                 print(f"{Colors.CYAN}[Sync] Found {len(all_commands)} registered command(s){Colors.RESET}")
                 
-                # Sync to guild
+                # Sync to guild (instant). Do not also sync globally — Discord shows both and every command appears twice.
                 synced = await self.bot.tree.sync(guild=discord.Object(id=guild_id))
                 print(f"{Colors.GREEN}[Sync] Guild sync returned {len(synced)} command(s){Colors.RESET}")
-                
+
+                cleared_global = await self._clear_global_slash_command_registrations()
+                if cleared_global:
+                    print(f"{Colors.GREEN}[Sync] Cleared global slash registrations (guild-only).{Colors.RESET}")
+
                 # Note: get_commands() is synchronous, not async
                 # We can't easily check existing commands without making API calls
                 # So we'll just show what we registered and synced
                 existing_commands = []
-                
-                # Also sync globally (can take up to 1 hour to propagate)
-                global_synced = []
-                try:
-                    global_synced = await self.bot.tree.sync()
-                    print(f"{Colors.GREEN}[Sync] Global sync returned {len(global_synced)} command(s){Colors.RESET}")
-                except Exception as e:
-                    print(f"{Colors.YELLOW}[Sync] Global sync warning: {e}{Colors.RESET}")
-                
+
                 # Determine what to show
                 commands_to_show = synced if synced else (existing_commands if existing_commands else all_commands)
                 sync_count = len(synced) if synced else len(existing_commands) if existing_commands else len(all_commands)
@@ -1619,8 +1625,9 @@ class RSSuccessBot:
                     title="✅ Commands Synced",
                     description=f"**Registered:** {len(all_commands)} command(s)\n"
                                f"**Synced to guild:** {len(synced)} new/updated\n"
-                               f"**Existing in guild:** {len(existing_commands)} command(s)\n\n"
-                               f"Commands may take a few minutes to appear in Discord.",
+                               f"**Existing in guild:** {len(existing_commands)} command(s)\n"
+                               f"**Global registrations:** {'cleared (no duplicate listings)' if cleared_global else 'clear failed — check logs'}\n\n"
+                               f"Guild slash commands update immediately; duplicates from old global copies should disappear after this run.",
                     color=discord.Color.green(),
                     timestamp=datetime.now(timezone.utc)
                 )
