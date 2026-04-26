@@ -8064,6 +8064,8 @@ echo "CHANGED_END"
                 "enabled": False,
                 "watch_channel_id": "",
                 "chromerrunner_dir": "/home/rsadmin/bots/mirror-world/Chromerrunner",
+                "mode": "headless",  # headless|cdp
+                "cdp_url": "http://127.0.0.1:9222",
                 "cooldown_seconds": 25,
                 "timeout_seconds": 120,
                 "auto_wait_seconds": 3.0,
@@ -9159,6 +9161,16 @@ echo "CHANGED_END"
             val = str(cfg.get("chrome_exe") or "").strip()
             return val or "/usr/bin/google-chrome"
 
+        def _cw_mode() -> str:
+            cfg = _cw_cfg()
+            val = str(cfg.get("mode") or "").strip().lower()
+            return val or "headless"
+
+        def _cw_cdp_url() -> str:
+            cfg = _cw_cfg()
+            val = str(cfg.get("cdp_url") or "").strip()
+            return val or "http://127.0.0.1:9222"
+
         def _cw_runner_dir() -> str:
             cfg = _cw_cfg()
             val = str(cfg.get("chromerrunner_dir") or "").strip()
@@ -9201,11 +9213,22 @@ echo "CHANGED_END"
             auto_wait = _cw_auto_wait_s()
             timeout_s = _cw_timeout_s()
             headless_flag = "--headless" if _cw_headless() else ""
+            mode = _cw_mode()
+            cdp_url_q = shlex.quote(_cw_cdp_url())
+
+            # Two modes:
+            # - headless: launch system chrome headless (still may be blocked by strict retailers on Oracle IP)
+            # - cdp: attach to a long-running Chrome with remote debugging + persistent profile
+            #        (closest to your local manual flow; still needs a solved session if Cloudflare challenges)
+            if mode == "cdp":
+                runner_flags = f"--connect-cdp --cdp-url {cdp_url_q}"
+            else:
+                runner_flags = f"{headless_flag} --chrome-exe {chrome_q}"
 
             cmd = (
                 f"cd {runner_dir_q}"
                 " && source .venv/bin/activate"
-                f" && python generic_product_checker.py --url {url_q} {headless_flag} --chrome-exe {chrome_q} --auto-wait-s {auto_wait}"
+                f" && python generic_product_checker.py --url {url_q} {runner_flags} --auto-wait-s {auto_wait}"
             )
 
             loop = asyncio.get_running_loop()
