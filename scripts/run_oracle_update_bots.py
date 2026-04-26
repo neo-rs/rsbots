@@ -175,10 +175,14 @@ sort -u "$TMP_SYNC_LIST" -o "$TMP_SYNC_LIST" || true
 
 TMP_SHARED_LIST="/tmp/mw_shared_${{BOT_FOLDER}}.txt"
 git ls-files "shared" 2>/dev/null | \\
-  grep -E "(\\.py$|\\.md$|\\.json$|\\.txt$|(^|/)requirements\\.txt$)" | \\
+  grep -E "(\\.py$|\\.md$|\\.json$|\\.txt$|\\.sh$|\\.service$|(^|/)requirements\\.txt$)" | \\
   grep -v -E "(^|/)config\\.secrets\\.json$" > "$TMP_SHARED_LIST" || true
 
-cat "$TMP_SYNC_LIST" "$TMP_SHARED_LIST" | sort -u > "${{TMP_SYNC_LIST}}.merged" || true
+TMP_UNITS_LIST="/tmp/mw_units_${{BOT_FOLDER}}.txt"
+git ls-files "systemd" 2>/dev/null | \\
+  grep -E "(^|/)systemd/.*\\.service$" > "$TMP_UNITS_LIST" || true
+
+cat "$TMP_SYNC_LIST" "$TMP_SHARED_LIST" "$TMP_UNITS_LIST" | sort -u > "${{TMP_SYNC_LIST}}.merged" || true
 mv "${{TMP_SYNC_LIST}}.merged" "$TMP_SYNC_LIST"
 
 SYNC_COUNT="$(wc -l < "$TMP_SYNC_LIST" | tr -d " ")"
