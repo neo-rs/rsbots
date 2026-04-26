@@ -92,9 +92,22 @@ function Run-Ssh {
     $wrapped
   )
   if ($Debug) { Write-Host "`nSSH $ssh $($args -join ' ')" }
-  # Stream output to console so callers can capture only exit code.
-  & $ssh @args 2>&1 | ForEach-Object { Write-Host $_ }
-  return [int]$LASTEXITCODE
+  # IMPORTANT (Windows PowerShell 5.1):
+  # `ssh.exe 2>&1 | ...` turns stderr into ErrorRecords and can surface as a scary "NativeCommandError"
+  # even when ssh exits 0 (Playwright/Node deprecation warnings do this).
+  # Redirect to temp files and print them as plain text instead.
+  $out = Join-Path $env:TEMP ("oracle_gui_runner_ssh_out_{0}.txt" -f ([guid]::NewGuid().ToString("N")))
+  $err = Join-Path $env:TEMP ("oracle_gui_runner_ssh_err_{0}.txt" -f ([guid]::NewGuid().ToString("N")))
+  try {
+    $p = Start-Process -FilePath $ssh -ArgumentList $args -NoNewWindow -Wait -PassThru `
+      -RedirectStandardOutput $out -RedirectStandardError $err
+    if (Test-Path $out) { Get-Content -LiteralPath $out | ForEach-Object { Write-Host $_ } }
+    if (Test-Path $err) { Get-Content -LiteralPath $err | ForEach-Object { Write-Host $_ } }
+    return [int]$p.ExitCode
+  } finally {
+    Remove-Item -LiteralPath $out -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $err -ErrorAction SilentlyContinue
+  }
 }
 
 function Start-Tunnels {
@@ -180,10 +193,11 @@ function Menu {
         if (-not $url) { continue }
         Write-Host ""
         Write-Host "Run flow:"
-        Write-Host "- Open/solve in noVNC browser"
-        Write-Host "- Then press ENTER in the SSH terminal when prompted"
+        Write-Host "- In noVNC: click the Chrome window, load the URL, and complete any human checks (Walmart 'Robot or human?', etc.)."
+        Write-Host "- Wait until the normal product page is visible (not the bot interstitial)."
+        Write-Host "- Then come back here: the SSH session will prompt you to press ENTER to extract."
         Write-Host ""
-        $rc = Run-Ssh $S ("cd {0}/Chromerrunner && source .venv/bin/activate && python generic_product_checker.py --url '{1}' --connect-cdp --cdp-url http://127.0.0.1:9222 --manual" -f $S.RemoteRoot, $url)
+        $rc = Run-Ssh $S ("cd {0}/Chromerrunner && export NODE_NO_WARNINGS=1 NODE_OPTIONS=--no-deprecation && source .venv/bin/activate && python generic_product_checker.py --url '{1}' --connect-cdp --cdp-url http://127.0.0.1:9222 --manual" -f $S.RemoteRoot, $url)
         if ($rc -ne 0) { Write-Host "ERROR: checker failed (exit=$rc)" }
         Pause
       }
@@ -196,7 +210,9 @@ function Menu {
         Write-Host "Note: CDP JSON User-Agent strings are not a perfect signal on Linux. Use noVNC to confirm you see a real Chrome window."
         $url = Prompt-Url
         if (-not $url) { continue }
-        $null = Run-Ssh $S ("cd {0}/Chromerrunner && source .venv/bin/activate && python generic_product_checker.py --url '{1}' --connect-cdp --cdp-url http://127.0.0.1:9222 --manual" -f $S.RemoteRoot, $url)
+        Write-Host ""
+        Write-Host "Next: complete any bot checks in noVNC (Walmart/GameStop), then press ENTER in the SSH checker prompt."
+        $null = Run-Ssh $S ("cd {0}/Chromerrunner && export NODE_NO_WARNINGS=1 NODE_OPTIONS=--no-deprecation && source .venv/bin/activate && python generic_product_checker.py --url '{1}' --connect-cdp --cdp-url http://127.0.0.1:9222 --manual" -f $S.RemoteRoot, $url)
         Pause
       }
       default {
