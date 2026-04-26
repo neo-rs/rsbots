@@ -120,3 +120,15 @@ Total Network Stock: N/A
 ```
 
 That means the data was not exposed, not necessarily zero stock.
+
+## Oracle note: “Chrome for Testing” vs Playwright
+
+- **Playwright is not “opening its own Walmart browser”** when you use `--connect-cdp`. In that mode Playwright is basically a **CDP remote-control client** attached to whatever Chrome is already listening on `9222`.
+- If you see a banner like **“Chrome for Testing … only for automated testing”**, that means the **Chrome binary on the server** is Google’s *testing* distribution (common on automation hosts), not “Playwright pretending to be Chrome”.
+- Prefer **stable Google Chrome** on Oracle. `start_chrome_oracle_cdp.sh` tries to avoid “Chrome for Testing” automatically, and you can force a binary:
+
+```bash
+CHROME_BIN=/opt/google/chrome/google-chrome bash start_chrome_oracle_cdp.sh --headed
+```
+
+Even with stable Chrome, strict retailers may still show bot pages (“Access Denied”, PerimeterX, etc.) from datacenter IPs — that’s separate from the CDP/Playwright wiring.

@@ -18,8 +18,6 @@ set -euo pipefail
 # - Uses a simple passwordless VNC (localhost only). Access is via your SSH tunnel.
 
 LOG="/tmp/chromerrunner_novnc.log"
-DISPLAY_NUM="${DISPLAY_NUM:-99}"
-DISPLAY=":${DISPLAY_NUM}"
 
 is_listening() {
   local port="$1"
@@ -27,14 +25,45 @@ is_listening() {
   return 0
 }
 
+detect_xvfb_display_num() {
+  # Prefer an already-running Xvfb display if present (common on long-lived servers).
+  # Example process: Xvfb :1 -screen 0 ...
+  local line disp num
+  line="$(pgrep -af '^Xvfb[[:space:]]+:' || true)"
+  if [[ -z "$line" ]]; then
+    echo ""
+    return 0
+  fi
+  line="$(echo "$line" | head -n 1)"
+  disp="$(echo "$line" | awk '{for(i=1;i<=NF;i++){ if ($i ~ /^:[0-9]+$/) { print $i; exit } } }')"
+  num="${disp#:}"
+  echo "$num"
+}
+
 echo "== Chromerrunner noVNC starter =="
-echo "display=${DISPLAY}"
 echo "log=${LOG}"
 
 if is_listening 6080; then
   echo "OK: noVNC already listening on :6080"
+  detected="$(detect_xvfb_display_num)"
+  if [[ -n "${detected}" ]]; then
+    echo "Detected existing Xvfb display: :${detected}"
+    echo "If headed Chrome shows no window, align DISPLAY to this value."
+  else
+    echo "NOTE: Could not detect an Xvfb display number from running processes."
+  fi
   exit 0
 fi
+
+DISPLAY_NUM="${DISPLAY_NUM:-}"
+if [[ -z "${DISPLAY_NUM}" ]]; then
+  DISPLAY_NUM="$(detect_xvfb_display_num)"
+fi
+if [[ -z "${DISPLAY_NUM}" ]]; then
+  DISPLAY_NUM="99"
+fi
+DISPLAY=":${DISPLAY_NUM}"
+echo "display=${DISPLAY}"
 
 need_bins=()
 for b in Xvfb fluxbox x11vnc websockify; do

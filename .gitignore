@@ -203,6 +203,7 @@ telnyx_sms/inbound.json
 !Chromerrunner/*.md
 !Chromerrunner/*.txt
 !Chromerrunner/*.bat
+!Chromerrunner/*.ps1
 !Chromerrunner/*.sh
 !Chromerrunner/requirements.txt
 

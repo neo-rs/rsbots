@@ -16,7 +16,9 @@ This intentionally does NOT try to bypass geo/anti-bot systems.
 import argparse
 import asyncio
 import json
+import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -32,6 +34,46 @@ OUTPUT.mkdir(exist_ok=True)
 
 MAX_CAPTURED_BODIES = 30
 MAX_CAPTURED_BODY_BYTES = 1_000_000
+
+
+def _is_chrome_for_testing_bin(path: Path) -> bool:
+    p = str(path).lower()
+    if "chrome-for-testing" in p or "chrome_for_testing" in p:
+        return True
+    try:
+        out = subprocess.check_output([str(path), "--version"], text=True, stderr=subprocess.STDOUT, timeout=5)
+    except Exception:
+        return False
+    o = (out or "").lower()
+    return ("chrome for testing" in o) or ("google chrome for testing" in o)
+
+
+def _pick_linux_chrome_executable() -> Optional[str]:
+    """
+    On some hosts `/usr/bin/google-chrome` is actually **Google Chrome for Testing**.
+    Prefer a stable install path when present.
+    """
+    candidates = [
+        Path("/opt/google/chrome/google-chrome"),
+        Path("/usr/bin/google-chrome-stable"),
+        Path("/usr/bin/google-chrome"),
+        Path("/usr/bin/chromium"),
+        Path("/usr/bin/chromium-browser"),
+    ]
+    for c in candidates:
+        try:
+            if c.exists() and os.access(c, os.X_OK) and not _is_chrome_for_testing_bin(c):
+                return str(c)
+        except Exception:
+            continue
+    # Last resort: still try common names even if they look like testing builds.
+    for c in candidates:
+        try:
+            if c.exists() and os.access(c, os.X_OK):
+                return str(c)
+        except Exception:
+            continue
+    return None
 
 
 def clean(value: Any) -> str:
@@ -449,10 +491,7 @@ async def main_async() -> None:
     # Default chrome exe on Linux if present and user didn't specify.
     chrome_exe = args.chrome_exe
     if not args.connect_cdp and not chrome_exe and sys.platform.startswith("linux"):
-        for candidate in ("/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"):
-            if Path(candidate).exists():
-                chrome_exe = candidate
-                break
+        chrome_exe = _pick_linux_chrome_executable()
 
     batch_results: List[Dict[str, Any]] = []
     for u in urls:
