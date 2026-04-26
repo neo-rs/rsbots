@@ -29,6 +29,7 @@ BOT_KEY_TO_FOLDER: Dict[str, str] = {
     "rscashoutbot": "RSCashoutBot",
     "whopmembershipsync": "WhopMembershipSync",
     "catalognavbot": "catalog_nav_bot",
+    "amazonasinchecker": "amazon_asin_promo_checker",
     # Mirror-world bots (mwbots-code checkout)
     "dailyschedulereminder": "DailyScheduleReminder",
     "datamanagerbot": "MWDataManagerBot",
