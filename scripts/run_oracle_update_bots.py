@@ -165,8 +165,9 @@ if [ "$PY_COUNT" = "0" ]; then
   exit 3
 fi
 
-TMP_SYNC_LIST="/tmp/mw_sync_${{BOT_FOLDER}}.txt"
-grep -E "(\\.py$|\\.md$|\\.json$|\\.txt$|(^|/)requirements\\.txt$)" "$TMP_ALL_LIST" | \\
+    TMP_SYNC_LIST="/tmp/mw_sync_${{BOT_FOLDER}}.txt"
+    # Include small safe non-python deploy files needed by bot management (e.g. *.sh wrappers, systemd *.service units).
+    grep -E "(\\.py$|\\.md$|\\.json$|\\.txt$|\\.sh$|\\.service$|(^|/)requirements\\.txt$)" "$TMP_ALL_LIST" | \\
   grep -v -E "(^|/)config\\.secrets\\.json$" > "$TMP_SYNC_LIST" || true
 grep -v -E "(^|/)tokens\\.env$" "$TMP_SYNC_LIST" > "$TMP_SYNC_LIST.ex" 2>/dev/null && mv "$TMP_SYNC_LIST.ex" "$TMP_SYNC_LIST" || true
 grep -v -E "(^|/)member_history\\.json$" "$TMP_SYNC_LIST" > "$TMP_SYNC_LIST.ex" 2>/dev/null && mv "$TMP_SYNC_LIST.ex" "$TMP_SYNC_LIST" || true
