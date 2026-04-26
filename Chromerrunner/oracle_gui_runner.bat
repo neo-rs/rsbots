@@ -40,7 +40,7 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-for /f "usebackq tokens=1-4 delims=|" %%A in (`py -3 -c "from mirror_world_config import load_oracle_servers, resolve_oracle_ssh_key_path; from pathlib import Path; root=Path('.').resolve(); servers,_=load_oracle_servers(root); s=servers[0]; key=resolve_oracle_ssh_key_path(s['key'], root); print(f\"{s['user']}|{s['host']}|{key}|{s.get('remote_root','/home/rsadmin/bots/mirror-world')}\")" 2^>^&1`) do (
+for /f "usebackq tokens=1-4 delims=;" %%A in (`py -3 -c "from mirror_world_config import load_oracle_servers, resolve_oracle_ssh_key_path; from pathlib import Path; root=Path('.').resolve(); servers,_=load_oracle_servers(root); s=servers[0]; key=resolve_oracle_ssh_key_path(s['key'], root); print(f\"{s['user']};{s['host']};{key};{s.get('remote_root','/home/rsadmin/bots/mirror-world')}\")" 2^>^&1`) do (
   set "ORA_USER=%%A"
   set "ORA_HOST=%%B"
   set "ORA_KEY=%%C"
