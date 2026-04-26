@@ -3264,6 +3264,12 @@ class RSAdminBot:
             "folder": "catalog_nav_bot",
             "script": "navigation_bot.py",
         },
+        "amazonasinchecker": {
+            "name": "Amazon ASIN Checker",
+            "service": "mirror-world-amazonasinchecker.service",
+            "folder": "amazon_asin_promo_checker",
+            "script": "discord_bot.py",
+        },
         "rsforwarder": {
             "name": "RS Forwarder",
             "service": "mirror-world-rsforwarder.service",

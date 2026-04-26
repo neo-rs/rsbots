@@ -34,6 +34,7 @@ units=(
   "mirror-world-instorebotforwarder.service"
   "mirror-world-whopmembershipsync.service"
   "mirror-world-catalognavbot.service"
+  "mirror-world-amazonasinchecker.service"
 )
 
 echo "Bootstrapping shared venv..."

@@ -149,9 +149,13 @@ case "$BOT_KEY" in
     cd "$ROOT_DIR/catalog_nav_bot"
     exec "$PY" -u "navigation_bot.py"
     ;;
+  amazonasinchecker)
+    cd "$ROOT_DIR/amazon_asin_promo_checker"
+    exec "$PY" -u "discord_bot.py"
+    ;;
   *)
     echo "ERROR: Unknown bot_key: $BOT_KEY"
-    echo "Valid bot_key values: rsadminbot rsforwarder rsonboarding rscheckerbot rsmentionpinger rssuccessbot rspromobot rscashoutbot datamanagerbot discumbot instorebotforwarder pingbot dailyschedulereminder whopmembershipsync catalognavbot"
+    echo "Valid bot_key values: rsadminbot rsforwarder rsonboarding rscheckerbot rsmentionpinger rssuccessbot rspromobot rscashoutbot datamanagerbot discumbot instorebotforwarder pingbot dailyschedulereminder whopmembershipsync catalognavbot amazonasinchecker"
     exit 1
     ;;
 esac

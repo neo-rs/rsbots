@@ -184,6 +184,17 @@ kit/*.csv
 telnyx_sms/sent_ids.json
 telnyx_sms/inbound.json
 
+# Amazon ASIN promo checker (standalone tool; secrets in .env)
+!amazon_asin_promo_checker/
+!amazon_asin_promo_checker/**/
+!amazon_asin_promo_checker/*.py
+!amazon_asin_promo_checker/*.md
+!amazon_asin_promo_checker/*.bat
+!amazon_asin_promo_checker/*.sh
+!amazon_asin_promo_checker/requirements.txt
+!amazon_asin_promo_checker/.env.example
+!amazon_asin_promo_checker/settings.example.json
+
 # Explicitly keep legacy/original sources out of GitHub
 RSAdminBot/original_files/**
 

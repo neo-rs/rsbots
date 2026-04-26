@@ -22,6 +22,7 @@ declare -A SERVICES=(
     ["rspromobot"]="mirror-world-rspromobot.service"
     ["rscashoutbot"]="mirror-world-rscashoutbot.service"
     ["catalognavbot"]="mirror-world-catalognavbot.service"
+    ["amazonasinchecker"]="mirror-world-amazonasinchecker.service"
 )
 
 # Handle "all" or "allbots" case

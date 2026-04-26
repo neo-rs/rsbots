@@ -47,6 +47,7 @@ reqs=(
   "$ROOT_DIR/DailyScheduleReminder/requirements.txt"
   "$ROOT_DIR/Instorebotforwarder/requirements.txt"
   "$ROOT_DIR/catalog_nav_bot/requirements.txt"
+  "$ROOT_DIR/amazon_asin_promo_checker/requirements.txt"
 )
 
 args=()

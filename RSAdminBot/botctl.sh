@@ -48,6 +48,7 @@ declare -A SERVICES=(
   ["pingbot"]="mirror-world-pingbot.service"
   ["whopmembershipsync"]="mirror-world-whopmembershipsync.service"
   ["catalognavbot"]="mirror-world-catalognavbot.service"
+  ["amazonasinchecker"]="mirror-world-amazonasinchecker.service"
 )
 
 service_for_bot() {

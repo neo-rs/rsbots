@@ -1,0 +1,17 @@
+[Unit]
+Description=Mirror World - Amazon ASIN Promo Checker (Discord bot)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=rsadmin
+WorkingDirectory=/home/rsadmin/bots/mirror-world
+ExecStart=/bin/bash /home/rsadmin/bots/mirror-world/RSAdminBot/run_bot.sh amazonasinchecker
+Restart=always
+RestartSec=8
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+
