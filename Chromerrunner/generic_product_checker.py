@@ -73,6 +73,10 @@ def _looks_like_price(s: str) -> bool:
     return bool(re.search(r"(\$|₱|€|£)\s*\d|(\d[\d,]*\.\d{2})", s))
 
 
+def _has_currency_symbol(s: str) -> bool:
+    return bool(re.search(r"(\$|₱|€|£)", str(s or "")))
+
+
 def _extract_price_candidates(text: str) -> List[str]:
     # Capture a few obvious price tokens; keep short to avoid noise.
     tokens = re.findall(r"(?:(?:\$|₱|€|£)\s*)?\d[\d,]*\.\d{2}", text)
@@ -355,9 +359,14 @@ async def check_url(
 
         # Price: prefer JSON-LD, then meta candidates, then visible text tokens.
         price_candidates = _extract_price_candidates(body_text if isinstance(body_text, str) else "")
+        # Prefer currency-tagged candidates to avoid false positives (ratings, counts, etc.)
+        price_candidates_sorted = sorted(
+            price_candidates,
+            key=lambda x: (0 if _has_currency_symbol(x) else 1),
+        )
         price_best = _first(
             None if jsonld_summary["jsonld_price"] == "N/A" else jsonld_summary["jsonld_price"],
-            next((p for p in price_candidates if _looks_like_price(p)), None),
+            next((p for p in price_candidates_sorted if _looks_like_price(p)), None),
         )
 
         result = {

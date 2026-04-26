@@ -9262,6 +9262,12 @@ echo "CHANGED_END"
                         return
                     self._chromerrunner_last_url_ts[url] = now
 
+                ack = None
+                try:
+                    ack = await message.reply(f"⏳ Chromerrunner starting…\nURL: {url}", mention_author=False)
+                except Exception:
+                    ack = None
+
                 ok, output = await _run_chromerrunner_url(url)
                 max_chars = _cw_max_chars()
                 output = output.replace("\\r\\n", "\\n").replace("\\r", "\\n").strip()
@@ -9269,7 +9275,14 @@ echo "CHANGED_END"
                     output = output[: max_chars - 3] + "..."
 
                 prefix = "✅" if ok else "⚠️"
-                await message.reply(f"{prefix} Chromerrunner\\nURL: {url}\\n\\n{output}", mention_author=False)
+                final_txt = f"{prefix} Chromerrunner done\nURL: {url}\n\n{output}"
+                if ack:
+                    try:
+                        await ack.edit(content=final_txt)
+                    except Exception:
+                        await message.reply(final_txt, mention_author=False)
+                else:
+                    await message.reply(final_txt, mention_author=False)
             except Exception:
                 pass
             finally:
