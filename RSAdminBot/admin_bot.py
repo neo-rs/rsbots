@@ -9228,7 +9228,8 @@ echo "CHANGED_END"
             cmd = (
                 f"cd {runner_dir_q}"
                 " && source .venv/bin/activate"
-                f" && python generic_product_checker.py --url {url_q} {runner_flags} --auto-wait-s {auto_wait}"
+                # Reduce noisy Node/Playwright warnings in Discord output.
+                f" && NODE_NO_WARNINGS=1 NODE_OPTIONS=--no-deprecation python generic_product_checker.py --url {url_q} {runner_flags} --auto-wait-s {auto_wait}"
             )
 
             loop = asyncio.get_running_loop()
@@ -9244,6 +9245,38 @@ echo "CHANGED_END"
             if not txt:
                 txt = "No output."
             return bool(ok), txt
+
+        def _summarize_output(url: str, ok: bool, output: str) -> Tuple[str, str]:
+            """
+            Return (prefix_emoji, human_summary). Keep it operator-readable.
+            """
+            out = (output or "").replace("\r\n", "\n").replace("\r", "\n")
+            low = out.lower()
+
+            if "err_name_not_resolved" in low:
+                return "⚠️", f"DNS failed for that URL (name not resolved). Please paste the full product link.\nURL: {url}"
+
+            # Common anti-bot blocks on Oracle IP
+            block_signals = [
+                "robot or human?",
+                "just a moment",
+                "sorry, you have been blocked",
+                "access denied",
+                "attention required",
+                "cloudflare",
+                "captcha",
+                "/blocked",
+            ]
+            if any(s in low for s in block_signals):
+                return "⚠️", (
+                    "Blocked / challenge page detected (likely anti-bot on Oracle IP).\n"
+                    f"URL: {url}\n\n"
+                    "If you need this store, use a solved persistent Chrome profile (CDP) with a GUI/noVNC once, "
+                    "or run from a residential IP environment."
+                )
+
+            # Otherwise, treat normal output as success/failure.
+            return ("✅" if ok else "⚠️"), f"URL: {url}\n\n{out.strip() or 'No output.'}"
 
         @self.bot.event
         async def on_message(message: discord.Message):
@@ -9293,12 +9326,12 @@ echo "CHANGED_END"
 
                 ok, output = await _run_chromerrunner_url(url)
                 max_chars = _cw_max_chars()
-                output = output.replace("\\r\\n", "\\n").replace("\\r", "\\n").strip()
-                if len(output) > max_chars:
-                    output = output[: max_chars - 3] + "..."
+                prefix, summary = _summarize_output(url, ok, output)
+                summary = summary.strip()
+                if len(summary) > max_chars:
+                    summary = summary[: max_chars - 3] + "..."
 
-                prefix = "✅" if ok else "⚠️"
-                final_txt = f"{prefix} Chromerrunner done\nURL: {url}\n\n{output}"
+                final_txt = f"{prefix} Chromerrunner done\n{summary}"
                 if ack:
                     try:
                         await ack.edit(content=final_txt)
