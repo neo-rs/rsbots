@@ -15,8 +15,14 @@ mkdir -p "$PROFILE_DIR"
 
 HEADED="no"
 START_URL="https://www.google.com/"
+DISPLAY_OVERRIDE=""
 if [[ "${1:-}" == "--headed" ]]; then
   HEADED="yes"
+  shift || true
+fi
+if [[ "${1:-}" == "--display" ]]; then
+  shift || true
+  DISPLAY_OVERRIDE="${1:-}"
   shift || true
 fi
 if [[ "${1:-}" == "--url" ]]; then
@@ -42,6 +48,14 @@ echo "CDP: http://127.0.0.1:9222"
 EXTRA_ARGS=()
 if [[ "$HEADED" == "yes" ]]; then
   echo "Mode: HEADED (requires DISPLAY/noVNC/X11)"
+  if [[ -n "$DISPLAY_OVERRIDE" ]]; then
+    export DISPLAY="$DISPLAY_OVERRIDE"
+  fi
+  if [[ -z "${DISPLAY:-}" ]]; then
+    # Common default for server noVNC stacks.
+    export DISPLAY=":99"
+  fi
+  echo "DISPLAY=${DISPLAY}"
 else
   echo "Mode: HEADLESS"
   EXTRA_ARGS+=(--headless=new)
