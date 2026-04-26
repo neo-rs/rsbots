@@ -200,7 +200,8 @@ BACKUP_TAR="$BACKUP_DIR/${{SAFE_BOT}}_preupdate_${{TS}}.tar.gz"
 echo "INFO: sync backup done (best-effort): $BACKUP_TAR"
 
 # Sync (always overwrite tracked safe list)
-env -u TAR_OPTIONS /bin/tar -cf - -T "$TMP_SYNC_LIST" | (cd "$LIVE_ROOT" && env -u TAR_OPTIONS /bin/tar -xf - --overwrite)
+# Avoid permission/mode/utime errors when extracting into the live tree.
+env -u TAR_OPTIONS /bin/tar -cf - -T "$TMP_SYNC_LIST" | (cd "$LIVE_ROOT" && env -u TAR_OPTIONS /bin/tar -xf - --overwrite --no-same-owner --no-same-permissions)
 
 echo "INFO: sync completed for $BOT_FOLDER"
 
