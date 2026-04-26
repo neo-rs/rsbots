@@ -40,8 +40,11 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-for /f "usebackq delims=" %%A in (`py -3 -c "from mirror_world_config import load_oracle_servers, resolve_oracle_ssh_key_path; from pathlib import Path; root=Path('.').resolve(); servers,_=load_oracle_servers(root); s=servers[0]; key=resolve_oracle_ssh_key_path(s['key'], root); print(s['user']); print(s['host']); print(str(key)); print(s.get('remote_root','/home/rsadmin/bots/mirror-world'))" 2^>^&1`) do (
-  if not defined ORA_USER (set "ORA_USER=%%A") else if not defined ORA_HOST (set "ORA_HOST=%%A") else if not defined ORA_KEY (set "ORA_KEY=%%A") else if not defined ORA_ROOT (set "ORA_ROOT=%%A")
+for /f "usebackq tokens=1-4 delims=|" %%A in (`py -3 -c "from mirror_world_config import load_oracle_servers, resolve_oracle_ssh_key_path; from pathlib import Path; root=Path('.').resolve(); servers,_=load_oracle_servers(root); s=servers[0]; key=resolve_oracle_ssh_key_path(s['key'], root); print(f\"{s['user']}|{s['host']}|{key}|{s.get('remote_root','/home/rsadmin/bots/mirror-world')}\")" 2^>^&1`) do (
+  set "ORA_USER=%%A"
+  set "ORA_HOST=%%B"
+  set "ORA_KEY=%%C"
+  set "ORA_ROOT=%%D"
 )
 popd
 
