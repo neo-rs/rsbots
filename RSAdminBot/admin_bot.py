@@ -3403,6 +3403,10 @@ class RSAdminBot:
         self._monitor_category_id: Optional[int] = None
         self._last_service_snapshot: Dict[str, Tuple[str, int]] = {}  # {bot_key: (state, pid)}
 
+        # Chromerrunner watcher (config-gated; single channel)
+        self._chromerrunner_last_url_ts: Dict[str, float] = {}
+        self._chromerrunner_lock: asyncio.Lock = asyncio.Lock()
+
         # Journal live streaming + webhooks (test server only; webhooks are stored server-side in config.secrets.json)
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._journal_channel_ids: Dict[str, int] = {}
@@ -8055,7 +8059,19 @@ echo "CHANGED_END"
             "guild_id": 0,
             "admin_role_ids": [],
             "admin_user_ids": [],
-            "log_channel_id": ""
+            "log_channel_id": "",
+            "chromerrunner_watcher": {
+                "enabled": False,
+                "watch_channel_id": "",
+                "chromerrunner_dir": "/home/rsadmin/bots/mirror-world/Chromerrunner",
+                "cooldown_seconds": 25,
+                "timeout_seconds": 120,
+                "auto_wait_seconds": 3.0,
+                "chrome_exe": "/usr/bin/google-chrome",
+                "headless": True,
+                "post_back_enabled": True,
+                "max_response_chars": 1600,
+            },
         }
         
         if self.config_path.exists():
@@ -9091,6 +9107,176 @@ echo "CHANGED_END"
             print(f"{Colors.GREEN}[Startup] ✓ Bot is ready and accepting commands{Colors.RESET}\n")
         
         # No on_message-based tracking: RSAdminBot is slash-only and avoids channel spam.
+        # Exception: config-gated Chromerrunner watcher for a single operator channel.
+
+        def _cw_cfg() -> Dict[str, Any]:
+            try:
+                raw = self.config.get("chromerrunner_watcher") if isinstance(self.config, dict) else None
+                return raw if isinstance(raw, dict) else {}
+            except Exception:
+                return {}
+
+        def _cw_enabled() -> bool:
+            cfg = _cw_cfg()
+            try:
+                return bool(cfg.get("enabled"))
+            except Exception:
+                return False
+
+        def _cw_channel_id() -> int:
+            cfg = _cw_cfg()
+            try:
+                return int(cfg.get("watch_channel_id") or 0)
+            except Exception:
+                return 0
+
+        def _cw_cooldown_s() -> float:
+            cfg = _cw_cfg()
+            try:
+                v = float(cfg.get("cooldown_seconds") or 0)
+                return max(0.0, min(v, 3600.0))
+            except Exception:
+                return 25.0
+
+        def _cw_timeout_s() -> int:
+            cfg = _cw_cfg()
+            try:
+                v = int(cfg.get("timeout_seconds") or 0)
+                return max(10, min(v, 600))
+            except Exception:
+                return 120
+
+        def _cw_auto_wait_s() -> float:
+            cfg = _cw_cfg()
+            try:
+                v = float(cfg.get("auto_wait_seconds") or 0.0)
+                return max(0.0, min(v, 30.0))
+            except Exception:
+                return 3.0
+
+        def _cw_chrome_exe() -> str:
+            cfg = _cw_cfg()
+            val = str(cfg.get("chrome_exe") or "").strip()
+            return val or "/usr/bin/google-chrome"
+
+        def _cw_runner_dir() -> str:
+            cfg = _cw_cfg()
+            val = str(cfg.get("chromerrunner_dir") or "").strip()
+            return val or "/home/rsadmin/bots/mirror-world/Chromerrunner"
+
+        def _cw_headless() -> bool:
+            cfg = _cw_cfg()
+            try:
+                return bool(cfg.get("headless", True))
+            except Exception:
+                return True
+
+        def _cw_post_back() -> bool:
+            cfg = _cw_cfg()
+            try:
+                return bool(cfg.get("post_back_enabled", True))
+            except Exception:
+                return True
+
+        def _cw_max_chars() -> int:
+            cfg = _cw_cfg()
+            try:
+                v = int(cfg.get("max_response_chars") or 0)
+                return max(200, min(v, 1800))
+            except Exception:
+                return 1600
+
+        def _extract_first_url(text: str) -> str:
+            t = str(text or "")
+            m = re.search(r"(https?://[^\\s<>\"]+)", t, flags=re.IGNORECASE)
+            if not m:
+                return ""
+            url = m.group(1).strip().rstrip(").,;]")
+            return url
+
+        async def _run_chromerrunner_url(url: str) -> Tuple[bool, str]:
+            url_q = shlex.quote(url)
+            chrome_q = shlex.quote(_cw_chrome_exe())
+            runner_dir_q = shlex.quote(_cw_runner_dir())
+            auto_wait = _cw_auto_wait_s()
+            timeout_s = _cw_timeout_s()
+            headless_flag = "--headless" if _cw_headless() else ""
+
+            cmd = (
+                f"cd {runner_dir_q}"
+                " && source .venv/bin/activate"
+                f" && python generic_product_checker.py --url {url_q} {headless_flag} --chrome-exe {chrome_q} --auto-wait-s {auto_wait}"
+            )
+
+            loop = asyncio.get_running_loop()
+            ok, out, err = await loop.run_in_executor(None, lambda: self._execute_ssh_command(cmd, timeout=timeout_s, log_it=True))
+            txt = ""
+            if out:
+                txt += out.strip()
+            if err:
+                if txt:
+                    txt += "\\n"
+                txt += err.strip()
+            txt = (txt or "").strip()
+            if not txt:
+                txt = "No output."
+            return bool(ok), txt
+
+        @self.bot.event
+        async def on_message(message: discord.Message):
+            try:
+                if not message or not getattr(message, "channel", None):
+                    return
+
+                if not _cw_enabled():
+                    return
+
+                try:
+                    if getattr(getattr(message, "author", None), "bot", False):
+                        return
+                except Exception:
+                    pass
+
+                watch_cid = _cw_channel_id()
+                if not watch_cid:
+                    return
+                try:
+                    cid = int(getattr(message.channel, "id", 0) or 0)
+                except Exception:
+                    cid = 0
+                if cid != watch_cid:
+                    return
+
+                if not _cw_post_back():
+                    return
+
+                url = _extract_first_url(getattr(message, "content", "") or "")
+                if not url:
+                    return
+
+                now = time.time()
+                cooldown = _cw_cooldown_s()
+                async with self._chromerrunner_lock:
+                    last = float(self._chromerrunner_last_url_ts.get(url, 0.0) or 0.0)
+                    if cooldown and (now - last) < cooldown:
+                        return
+                    self._chromerrunner_last_url_ts[url] = now
+
+                ok, output = await _run_chromerrunner_url(url)
+                max_chars = _cw_max_chars()
+                output = output.replace("\\r\\n", "\\n").replace("\\r", "\\n").strip()
+                if len(output) > max_chars:
+                    output = output[: max_chars - 3] + "..."
+
+                prefix = "✅" if ok else "⚠️"
+                await message.reply(f"{prefix} Chromerrunner\\nURL: {url}\\n\\n{output}", mention_author=False)
+            except Exception:
+                pass
+            finally:
+                try:
+                    await self.bot.process_commands(message)
+                except Exception:
+                    pass
         
         @self.bot.event
         async def on_command_error(ctx, error):

@@ -158,6 +158,18 @@
     "enabled": true,
     "post_on_startup": true,
     "channel_id": "1454869965000671406"
+  },
+  "chromerrunner_watcher": {
+    "enabled": true,
+    "watch_channel_id": "1497910212923883702",
+    "chromerrunner_dir": "/home/rsadmin/bots/mirror-world/Chromerrunner",
+    "cooldown_seconds": 25,
+    "timeout_seconds": 120,
+    "auto_wait_seconds": 3.0,
+    "chrome_exe": "/usr/bin/google-chrome",
+    "headless": true,
+    "post_back_enabled": true,
+    "max_response_chars": 1600
   }
 }
 
