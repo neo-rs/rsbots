@@ -13,6 +13,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILE_DIR="$SCRIPT_DIR/oracle_real_chrome_profile"
 mkdir -p "$PROFILE_DIR"
 
+HEADED="no"
+START_URL="https://www.google.com/"
+if [[ "${1:-}" == "--headed" ]]; then
+  HEADED="yes"
+  shift || true
+fi
+if [[ "${1:-}" == "--url" ]]; then
+  shift || true
+  START_URL="${1:-$START_URL}"
+  shift || true
+fi
+
 CHROME_BIN="${CHROME_BIN:-/usr/bin/google-chrome}"
 if [[ ! -x "$CHROME_BIN" ]]; then
   CHROME_BIN="$(command -v google-chrome || true)"
@@ -27,9 +39,16 @@ $CHROME_BIN --version || true
 echo "Profile: $PROFILE_DIR"
 echo "CDP: http://127.0.0.1:9222"
 
-# If you have a display/noVNC, remove --headless=new to run visibly.
+EXTRA_ARGS=()
+if [[ "$HEADED" == "yes" ]]; then
+  echo "Mode: HEADED (requires DISPLAY/noVNC/X11)"
+else
+  echo "Mode: HEADLESS"
+  EXTRA_ARGS+=(--headless=new)
+fi
+
 $CHROME_BIN \
-  --headless=new \
+  "${EXTRA_ARGS[@]}" \
   --remote-debugging-address=127.0.0.1 \
   --remote-debugging-port=9222 \
   --user-data-dir="$PROFILE_DIR" \
@@ -37,5 +56,5 @@ $CHROME_BIN \
   --no-default-browser-check \
   --disable-dev-shm-usage \
   --no-sandbox \
-  "https://www.google.com/"
+  "$START_URL"
 
