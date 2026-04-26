@@ -1,5 +1,15 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
+
+REM Explorer double-click closes the window on exit.
+REM Re-launch once inside `cmd /k` so the console stays open.
+if not defined ORACLE_GUI_RUNNER_WRAPPED (
+  set "ORACLE_GUI_RUNNER_WRAPPED=1"
+  start "Chromerrunner Oracle GUI Runner" cmd /k ""%~f0" --wrapped %*"
+  exit /b 0
+)
+if /I "%~1"=="--wrapped" shift
+
 set "DEBUG="
 if /I "%~1"=="--debug" (
   set "DEBUG=1"
@@ -23,6 +33,13 @@ set "ORA_USER="
 set "ORA_HOST="
 set "ORA_KEY="
 set "ORA_ROOT="
+where py >nul 2>&1
+if errorlevel 1 (
+  echo ERROR: `py` launcher not found. Install Python or run from a terminal where `py -3` works.
+  echo Tip: open PowerShell in repo root and run: py -3 --version
+  pause
+  exit /b 1
+)
 for /f "usebackq delims=" %%A in (`py -3 -c "from mirror_world_config import load_oracle_servers, resolve_oracle_ssh_key_path; from pathlib import Path; root=Path('.').resolve(); servers,_=load_oracle_servers(root); s=servers[0]; key=resolve_oracle_ssh_key_path(s['key'], root); print(s['user']); print(s['host']); print(str(key)); print(s.get('remote_root','/home/rsadmin/bots/mirror-world'))" 2^>^&1`) do (
   if not defined ORA_USER (set "ORA_USER=%%A") else if not defined ORA_HOST (set "ORA_HOST=%%A") else if not defined ORA_KEY (set "ORA_KEY=%%A") else if not defined ORA_ROOT (set "ORA_ROOT=%%A")
 )
