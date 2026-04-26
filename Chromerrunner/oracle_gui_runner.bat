@@ -1,6 +1,7 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
-cd /d "%~dp0"
+set "SCRIPT_DIR=%~dp0"
+cd /d "%SCRIPT_DIR%"
 title Chromerrunner - Oracle GUI/CDP runner
 
 REM This launcher:
@@ -9,12 +10,16 @@ REM - Starts Oracle Chrome with CDP enabled (headed if GUI exists)
 REM - Runs generic_product_checker.py in CDP mode with manual checkpoint (ENTER)
 
 REM Resolve Oracle connection info via repo helpers (oraclekeys/servers.json).
-for /f "usebackq delims=" %%A in (`py -3 -c "from mirror_world_config import load_oracle_servers, resolve_oracle_ssh_key_path; from pathlib import Path; import json; root=Path('.').resolve(); servers,_=load_oracle_servers(root); s=servers[0]; key=resolve_oracle_ssh_key_path(s['key'], root); print(s['user']); print(s['host']); print(str(key)); print(s.get('remote_root','/home/rsadmin/bots/mirror-world'))"`) do (
+pushd "%SCRIPT_DIR%\.."
+for /f "usebackq delims=" %%A in (`py -3 -c "from mirror_world_config import load_oracle_servers, resolve_oracle_ssh_key_path; from pathlib import Path; root=Path('.').resolve(); servers,_=load_oracle_servers(root); s=servers[0]; key=resolve_oracle_ssh_key_path(s['key'], root); print(s['user']); print(s['host']); print(str(key)); print(s.get('remote_root','/home/rsadmin/bots/mirror-world'))"`) do (
   if not defined ORA_USER (set "ORA_USER=%%A") else if not defined ORA_HOST (set "ORA_HOST=%%A") else if not defined ORA_KEY (set "ORA_KEY=%%A") else if not defined ORA_ROOT (set "ORA_ROOT=%%A")
 )
+popd
 
 if "%ORA_USER%"=="" (
   echo ERROR: Could not load Oracle server info (oraclekeys/servers.json).
+  echo - Make sure you run this from the repo (py -3 must work)
+  echo - Repo root should contain oraclekeys\servers.json
   pause
   exit /b 1
 )
@@ -92,12 +97,15 @@ echo.
 set /p URL=Paste product URL:
 if "%URL%"=="" goto :MENU
 
+REM Escape single quotes for bash single-quoted string: ' -> '"'"'
+set "URL_BASH=%URL:'=\"'\"'\"'%"
+
 echo.
 echo Running generic checker on Oracle (CDP + manual checkpoint)...
 echo - Chrome tab will open in the Oracle Chrome session.
 echo - Solve any challenge in noVNC GUI, then press ENTER here when ready.
 echo.
-"%WINDIR%\System32\OpenSSH\ssh.exe" -i "%ORA_KEY%" -o StrictHostKeyChecking=no -o ServerAliveInterval=60 -o ConnectTimeout=60 %ORA_USER%@%ORA_HOST% "bash -lc 'cd %ORA_ROOT%/Chromerrunner && source .venv/bin/activate && python generic_product_checker.py --url \"\"\"%URL%\"\"\" --connect-cdp --cdp-url http://127.0.0.1:9222 --manual'"
+"%WINDIR%\System32\OpenSSH\ssh.exe" -i "%ORA_KEY%" -o StrictHostKeyChecking=no -o ServerAliveInterval=60 -o ConnectTimeout=60 %ORA_USER%@%ORA_HOST% "bash -lc 'cd %ORA_ROOT%/Chromerrunner && source .venv/bin/activate && python generic_product_checker.py --url ''%URL_BASH%'' --connect-cdp --cdp-url http://127.0.0.1:9222 --manual'"
 echo.
 pause
 goto :MENU
