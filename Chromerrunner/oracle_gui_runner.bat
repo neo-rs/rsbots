@@ -3,6 +3,11 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 REM Explorer double-click closes the window on exit.
 REM Re-launch once inside `cmd /k` so the console stays open.
+REM For automated testing, pass --test to disable the wrapper and exit with a code.
+if /I "%~1"=="--test" (
+  shift
+  set "ORACLE_GUI_RUNNER_WRAPPED=1"
+)
 if not defined ORACLE_GUI_RUNNER_WRAPPED (
   set "ORACLE_GUI_RUNNER_WRAPPED=1"
   start "Chromerrunner Oracle GUI Runner" cmd /k ""%~f0" --wrapped %*"
@@ -40,12 +45,18 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-for /f "usebackq tokens=1-4 delims=;" %%A in (`py -3 -c "from mirror_world_config import load_oracle_servers, resolve_oracle_ssh_key_path; from pathlib import Path; root=Path('.').resolve(); servers,_=load_oracle_servers(root); s=servers[0]; key=resolve_oracle_ssh_key_path(s['key'], root); print(f\"{s['user']};{s['host']};{key};{s.get('remote_root','/home/rsadmin/bots/mirror-world')}\")" 2^>^&1`) do (
-  set "ORA_USER=%%A"
-  set "ORA_HOST=%%B"
-  set "ORA_KEY=%%C"
-  set "ORA_ROOT=%%D"
+set "TMPINFO=%TEMP%\oracle_gui_runner_info_%RANDOM%.cmd"
+py -3 -c "from mirror_world_config import load_oracle_servers, resolve_oracle_ssh_key_path; from pathlib import Path; root=Path('.').resolve(); servers,_=load_oracle_servers(root); s=servers[0]; key=resolve_oracle_ssh_key_path(s['key'], root); rr=s.get('remote_root','/home/rsadmin/bots/mirror-world'); print(f'set \"ORA_USER={s[\"user\"]}\"'); print(f'set \"ORA_HOST={s[\"host\"]}\"'); print(f'set \"ORA_KEY={key}\"'); print(f'set \"ORA_ROOT={rr}\"')" > "%TMPINFO%" 2>&1
+if errorlevel 1 (
+  echo ERROR: Failed to load oraclekeys/servers.json via python.
+  echo --- python output ---
+  type "%TMPINFO%"
+  del "%TMPINFO%" >nul 2>&1
+  pause
+  exit /b 1
 )
+call "%TMPINFO%"
+del "%TMPINFO%" >nul 2>&1
 popd
 
 if "%ORA_USER%"=="" (
@@ -55,6 +66,12 @@ if "%ORA_USER%"=="" (
   echo - Tip: run this as: oracle_gui_runner.bat --debug
   pause
   exit /b 1
+)
+
+REM In --test mode, stop after config resolution.
+if /I "%~1"=="--test-exit" (
+  echo OK: resolved server info
+  exit /b 0
 )
 
 echo ==============================================================================
