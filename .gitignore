@@ -67,6 +67,7 @@
 !RSForwarder/messages.json
 !RSForwarder/vouch_config.json
 !RSForwarder/run_rs_fs_resolve_and_sync.bat
+!RSForwarder/run_monitor_data_search.bat
 
 !RSMentionPinger/
 !RSMentionPinger/**/
@@ -194,6 +195,24 @@ telnyx_sms/inbound.json
 !amazon_asin_promo_checker/requirements.txt
 !amazon_asin_promo_checker/.env.example
 !amazon_asin_promo_checker/settings.example.json
+
+# Chromerrunner (real-chrome / headless product capture tool; no secrets in tracked scripts)
+!Chromerrunner/
+!Chromerrunner/**/
+!Chromerrunner/*.py
+!Chromerrunner/*.md
+!Chromerrunner/*.txt
+!Chromerrunner/*.bat
+!Chromerrunner/*.sh
+!Chromerrunner/requirements.txt
+
+# Chromerrunner runtime outputs (never commit)
+Chromerrunner/generic_results/
+Chromerrunner/target_results_v4/
+Chromerrunner/target_real_chrome_profile*/
+Chromerrunner/real_chrome_profile*/
+Chromerrunner/**/__pycache__/
+Chromerrunner/urls_from_generic_results.txt
 
 # Explicitly keep legacy/original sources out of GitHub
 RSAdminBot/original_files/**

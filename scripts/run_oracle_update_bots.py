@@ -30,12 +30,19 @@ BOT_KEY_TO_FOLDER: Dict[str, str] = {
     "whopmembershipsync": "WhopMembershipSync",
     "catalognavbot": "catalog_nav_bot",
     "amazonasinchecker": "amazon_asin_promo_checker",
+    # Tools (deployed into live mirror-world tree; no systemd service)
+    "chromerrunner": "Chromerrunner",
     # Mirror-world bots (mwbots-code checkout)
     "dailyschedulereminder": "DailyScheduleReminder",
     "datamanagerbot": "MWDataManagerBot",
     "discumbot": "MWDiscumBot",
     "instorebotforwarder": "Instorebotforwarder",
     "pingbot": "MWPingBot",
+}
+
+# Some update targets are folders/tools without a systemd service.
+BOT_KEY_RESTARTABLE: Dict[str, bool] = {
+    "chromerrunner": False,
 }
 
 
@@ -329,8 +336,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             bot_folder=bot_folder,
             destructive_git_clean=destructive,
         )
-        restart_cmd = _restart_snippet(live_root=remote_root, bot_key=bot_key)
-        remote_cmd = f"{update_cmd}\n{restart_cmd}"
+        restartable = BOT_KEY_RESTARTABLE.get(bot_key, True)
+        if restartable:
+            restart_cmd = _restart_snippet(live_root=remote_root, bot_key=bot_key)
+            remote_cmd = f"{update_cmd}\n{restart_cmd}"
+        else:
+            remote_cmd = update_cmd
 
         ssh_cmd = _build_ssh_cmd(
             user=user,
