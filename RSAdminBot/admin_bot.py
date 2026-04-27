@@ -3407,6 +3407,8 @@ class RSAdminBot:
         # Chromerrunner watcher (config-gated; single channel)
         self._chromerrunner_last_url_ts: Dict[str, float] = {}
         self._chromerrunner_lock: asyncio.Lock = asyncio.Lock()
+        # Rate-limit “I can't see content / can't parse” notices so we don't spam.
+        self._chromerrunner_last_notice_ts: Dict[str, float] = {}
 
         # Journal live streaming + webhooks (test server only; webhooks are stored server-side in config.secrets.json)
         self._http_session: Optional[aiohttp.ClientSession] = None
@@ -9604,21 +9606,58 @@ echo "CHANGED_END"
             if not _cw_channel_matches(message):
                 return
 
+            # Backend proof: log that the watcher saw a message in-scope, even if we later
+            # can't read content (Message Content intent) or can't parse a URL.
+            try:
+                ch = getattr(message, "channel", None)
+                cid = getattr(ch, "id", None)
+                parent_id = getattr(ch, "parent_id", None)
+                content = getattr(message, "content", None) or ""
+                embeds = getattr(message, "embeds", None) or []
+                author = getattr(message, "author", None)
+                author_id = getattr(author, "id", None)
+                author_name = getattr(author, "name", None)
+                print(
+                    f"{Colors.CYAN}[Chromerrunner][Seen] msg_id={getattr(message,'id',None)} "
+                    f"channel_id={cid} parent_id={parent_id} author_id={author_id} author={author_name} "
+                    f"content_len={len(str(content))} embeds={len(embeds)}{Colors.RESET}"
+                )
+            except Exception:
+                pass
+
             if not _cw_post_back():
                 return
 
             blob = _cw_gather_text_for_urls(message) or ""
             url = _extract_first_url(blob)
             if not url:
-                # Operator hint: slash commands work without Message Content intent; URL watching does not.
-                if not (blob or "").strip() and not getattr(message, "embeds", None):
-                    try:
-                        print(
-                            f"{Colors.YELLOW}[Chromerrunner] skipped message {getattr(message,'id',None)}: "
-                            f"empty content/embeds (enable Message Content intent + embeds for link previews){Colors.RESET}"
-                        )
-                    except Exception:
-                        pass
+                # Make “silent ignore” actionable: reply occasionally with the reason.
+                now = time.time()
+                ch = getattr(message, "channel", None)
+                ch_id = str(getattr(ch, "id", "") or "unknown")
+                last_notice = float(self._chromerrunner_last_notice_ts.get(ch_id, 0.0) or 0.0)
+                if (now - last_notice) >= 60.0:
+                    self._chromerrunner_last_notice_ts[ch_id] = now
+                    # Operator hint: slash commands work without Message Content intent; URL watching does not.
+                    if not (blob or "").strip() and not getattr(message, "embeds", None):
+                        try:
+                            await message.reply(
+                                "⚠️ Chromerrunner: I couldn't read any message content/embeds here.\n"
+                                "If links are being pasted but I see empty content, enable **Message Content Intent** "
+                                "for this bot and make sure link previews/embeds are allowed in this channel.",
+                                mention_author=False,
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            await message.reply(
+                                "⚠️ Chromerrunner: I saw a message but couldn't extract a full URL.\n"
+                                "Please paste the full product link (no truncation).",
+                                mention_author=False,
+                            )
+                        except Exception:
+                            pass
                 return
 
             now = time.time()
