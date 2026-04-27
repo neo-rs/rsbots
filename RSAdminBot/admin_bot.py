@@ -5805,6 +5805,17 @@ echo "TARGET=$TARGET"
                 except Exception:
                     pass
             except Exception as e:
+                # If Discord blocks new app-command creates (daily cap), avoid retry loops on every restart.
+                msg = str(e)
+                if "30034" in msg or "Max number of daily application command creates" in msg:
+                    try:
+                        print(
+                            f"{Colors.YELLOW}[RSNotes] Sync blocked by Discord daily limit (30034). "
+                            f"Skipping further slash sync attempts until limit resets.{Colors.RESET}"
+                        )
+                    except Exception:
+                        pass
+                    break
                 try:
                     print(f"{Colors.YELLOW}[RSNotes] Sync failed: guild={gid} err={type(e).__name__}: {str(e)[:160]}{Colors.RESET}")
                 except Exception:
@@ -5860,25 +5871,14 @@ echo "TARGET=$TARGET"
         except Exception:
             rs_gid = 0
 
-        # 1) Ensure Reselling Secrets has NO RSAdminBot slash commands (clear + sync empty guild set).
+        # 1) Reselling Secrets should have NO RSAdminBot slash commands.
+        # IMPORTANT: Do NOT clear/recreate commands in production guilds — it can trigger Discord daily limits
+        # and make commands “disappear” for the entire day. We simply never sync RSAdminBot slash commands there.
         if rs_gid:
             try:
-                gobj = discord.Object(id=int(rs_gid))
-                try:
-                    self.bot.tree.clear_commands(guild=gobj)
-                except Exception:
-                    pass
-                synced = await self.bot.tree.sync(guild=gobj)
-                try:
-                    names = sorted({str(getattr(x, "name", "") or "") for x in (synced or []) if getattr(x, "name", None)})
-                    print(f"{Colors.GREEN}[Slash] Cleared: guild={rs_gid} commands={len(names)}{Colors.RESET}")
-                except Exception:
-                    pass
-            except Exception as e:
-                try:
-                    print(f"{Colors.YELLOW}[Slash] Clear failed: guild={rs_gid} err={type(e).__name__}: {str(e)[:200]}{Colors.RESET}")
-                except Exception:
-                    pass
+                print(f"{Colors.GREEN}[Slash] RS guild: skipping slash sync (rs_gid={rs_gid}){Colors.RESET}")
+            except Exception:
+                pass
 
         # 2) Sync ALL slash commands to neo-test-server.
         if not test_gid:
@@ -5890,14 +5890,6 @@ echo "TARGET=$TARGET"
 
         try:
             gobj = discord.Object(id=int(test_gid))
-            try:
-                self.bot.tree.clear_commands(guild=gobj)
-            except Exception:
-                pass
-            try:
-                self.bot.tree.copy_global_to(guild=gobj)
-            except Exception:
-                pass
             synced = await self.bot.tree.sync(guild=gobj)
             try:
                 names = sorted({str(getattr(x, "name", "") or "") for x in (synced or []) if getattr(x, "name", None)})
@@ -5905,6 +5897,16 @@ echo "TARGET=$TARGET"
             except Exception:
                 pass
         except Exception as e:
+            msg = str(e)
+            if "30034" in msg or "Max number of daily application command creates" in msg:
+                try:
+                    print(
+                        f"{Colors.YELLOW}[Slash] Sync blocked by Discord daily limit (30034). "
+                        f"Commands may be invisible until the limit resets. Avoid restarts.{Colors.RESET}"
+                    )
+                except Exception:
+                    pass
+                return
             try:
                 print(f"{Colors.YELLOW}[Slash] Sync failed: guild={test_gid} err={type(e).__name__}: {str(e)[:200]}{Colors.RESET}")
             except Exception:
@@ -9494,11 +9496,12 @@ echo "CHANGED_END"
                 pref = 1 if any(h == p or h.endswith("." + p) for p in preferred) else 0
                 return (pref, len(u), u)
 
-            candidates: list[str] = []
+            # Collect candidates with their position so we can preserve the paste order.
+            candidates: list[tuple[int, str]] = []
             for m in re.finditer(r"\]\((https?://[^)\s]+)\)", t, flags=re.IGNORECASE):
-                candidates.append(m.group(1).strip())
+                candidates.append((m.start(1), m.group(1).strip()))
             for m in re.finditer(r"<(https?://[^>\s]+)>", t, flags=re.IGNORECASE):
-                candidates.append(m.group(1).strip())
+                candidates.append((m.start(1), m.group(1).strip()))
             for m in re.finditer(r"https?://", t, flags=re.IGNORECASE):
                 start = m.start()
                 i = start + len(m.group(0))
@@ -9511,18 +9514,11 @@ echo "CHANGED_END"
                         break
                     buf.append(ch)
                     i += 1
-                candidates.append("".join(buf).strip())
-            for m in re.finditer(
-                r"https?://(?:[\w.-]+\.)*(?:gamestop|walmart|target|bestbuy|homedepot|lowes|costco|samsclub)"
-                r"\.com[^\s<>\")\]]+",
-                t,
-                flags=re.IGNORECASE,
-            ):
-                candidates.append(m.group(0).strip())
+                candidates.append((start, "".join(buf).strip()))
 
-            cleaned: list[str] = []
+            cleaned: list[tuple[int, str, tuple]] = []
             seen = set()
-            for u in candidates:
+            for pos, u in candidates:
                 u = u.strip().rstrip(").,;]")
                 if not u:
                     continue
@@ -9530,13 +9526,15 @@ echo "CHANGED_END"
                 if key in seen:
                     continue
                 seen.add(key)
-                if _score(u)[0] < 0:
+                sc = _score(u)
+                if sc[0] < 0:
                     continue
-                cleaned.append(u)
+                cleaned.append((pos, u, sc))
 
-            cleaned.sort(key=_score, reverse=True)
+            # Prefer paste order first; if two start at same position, use score.
+            cleaned.sort(key=lambda x: (x[0], -x[2][0], -x[2][1]))
             lim = max(1, min(int(limit or 0), 10))
-            return cleaned[:lim]
+            return [u for _, u, _ in cleaned[:lim]]
 
         def _cw_channel_matches(message: discord.Message) -> bool:
             """True if this message is in the configured watch channel or a thread under it."""
@@ -9851,7 +9849,7 @@ echo "CHANGED_END"
             if len(urls) > 1:
                 try:
                     await message.reply(
-                        f"⏳ Chromerrunner queued: {len(urls)} link(s). Running now…",
+                        "⏳ Chromerrunner queued:\n" + "\n".join(f"{i}. <{u}>" for i, u in enumerate(urls, start=1)),
                         mention_author=False,
                     )
                 except Exception:
