@@ -9224,6 +9224,26 @@ echo "CHANGED_END"
                 .replace("\ufeff", "")  # BOM
             )
 
+            # Discord / mobile clients sometimes break long hosts across a line or ZWSP so plain
+            # scanning yields `https://www.game` only; stitch before we collect candidates.
+            def _fuse_split_retail_hosts(s: str) -> str:
+                out = s
+                out = re.sub(
+                    r"(https?://(?:www\.)?game)\s*\n?\s*(stop\.com)",
+                    r"\1\2",
+                    out,
+                    flags=re.IGNORECASE,
+                )
+                out = re.sub(
+                    r"(https?://(?:www\.)?wal)\s*\n?\s*(mart\.com)",
+                    r"\1\2",
+                    out,
+                    flags=re.IGNORECASE,
+                )
+                return out
+
+            t = _fuse_split_retail_hosts(t)
+
             def _host_of(u: str) -> str:
                 try:
                     return (urlparse(u).hostname or "").lower()
@@ -9233,12 +9253,16 @@ echo "CHANGED_END"
             def _looks_real_host(host: str) -> bool:
                 if not host or "." not in host:
                     return False
-                # Reject obvious partial hosts like `www.game`
-                if host.endswith(".game"):
+                hl = host.lower()
+                labels = hl.split(".")
+                if not labels:
                     return False
-                labels = host.split(".")
-                tld = labels[-1] if labels else ""
+                tld = labels[-1]
                 if len(tld) < 2:
+                    return False
+                # Never use substring tests like `.endswith(".game")`: that rejects `gamestop.com`.
+                # Only reject the real `.game` TLD (e.g. `www.game`), not GameStop product URLs.
+                if tld == "game" and "gamestop" not in hl:
                     return False
                 return True
 
@@ -9288,6 +9312,15 @@ echo "CHANGED_END"
                     i += 1
                 u = "".join(buf).strip()
                 candidates.append(u)
+
+            # 4) Recover full retailer URLs as one token when plain scanning stops too early.
+            for m in re.finditer(
+                r"https?://(?:[\w.-]+\.)*(?:gamestop|walmart|target|bestbuy|homedepot|lowes|costco|samsclub)"
+                r"\.com[^\s<>\")\]]+",
+                t,
+                flags=re.IGNORECASE,
+            ):
+                candidates.append(m.group(0).strip())
 
             cleaned: list[str] = []
             seen = set()
@@ -9460,74 +9493,137 @@ echo "CHANGED_END"
             # Otherwise, treat normal output as success/failure.
             return ("✅" if ok else "⚠️"), f"URL: {url}\n\n{out.strip() or 'No output.'}"
 
-        @self.bot.event
-        async def on_message(message: discord.Message):
+        async def _chromerrunner_reply_start(message: discord.Message, url: str):
             try:
-                if not message or not getattr(message, "channel", None):
-                    return
-
-                if not _cw_enabled():
-                    return
-
+                return await message.reply(f"⏳ Chromerrunner starting…\nURL: {url}", mention_author=False)
+            except discord.Forbidden:
                 try:
-                    if getattr(getattr(message, "author", None), "bot", False):
-                        return
+                    await message.channel.send(f"⏳ Chromerrunner starting…\nURL: {url}")
                 except Exception:
                     pass
+                return None
+            except Exception:
+                return None
 
-                if not _cw_channel_matches(message):
+        async def _chromerrunner_reply_final(message: discord.Message, ack: Any, final_txt: str):
+            if ack:
+                try:
+                    await ack.edit(content=final_txt)
                     return
+                except Exception:
+                    pass
+            try:
+                await message.reply(final_txt, mention_author=False)
+            except discord.Forbidden:
+                try:
+                    await message.channel.send(final_txt[:1900])
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
-                if not _cw_post_back():
+        async def _chromerrunner_handle_message(message: discord.Message) -> None:
+            """
+            Chromerrunner URL watcher (RSAdminBot process — config `chromerrunner_watcher`).
+            Orchestrates scripts under `Chromerrunner/` on Oracle via SSH/local-exec; no separate Discord bot.
+            """
+            if not message or not getattr(message, "channel", None):
+                return
+
+            if not _cw_enabled():
+                return
+
+            try:
+                if getattr(getattr(message, "author", None), "bot", False):
                     return
+            except Exception:
+                pass
 
-                url = _extract_first_url(_cw_gather_text_for_urls(message) or "")
-                if not url:
-                    return
+            if not _cw_channel_matches(message):
+                return
 
-                now = time.time()
-                cooldown = _cw_cooldown_s()
-                async with self._chromerrunner_lock:
-                    last = float(self._chromerrunner_last_url_ts.get(url, 0.0) or 0.0)
-                    if cooldown and (now - last) < cooldown:
-                        remain = max(0.0, cooldown - (now - last))
+            if not _cw_post_back():
+                return
+
+            blob = _cw_gather_text_for_urls(message) or ""
+            url = _extract_first_url(blob)
+            if not url:
+                # Operator hint: slash commands work without Message Content intent; URL watching does not.
+                if not (blob or "").strip() and not getattr(message, "embeds", None):
+                    try:
+                        print(
+                            f"{Colors.YELLOW}[Chromerrunner] skipped message {getattr(message,'id',None)}: "
+                            f"empty content/embeds (enable Message Content intent + embeds for link previews){Colors.RESET}"
+                        )
+                    except Exception:
+                        pass
+                return
+
+            now = time.time()
+            cooldown = _cw_cooldown_s()
+            async with self._chromerrunner_lock:
+                last = float(self._chromerrunner_last_url_ts.get(url, 0.0) or 0.0)
+                if cooldown and (now - last) < cooldown:
+                    remain = max(0.0, cooldown - (now - last))
+                    try:
+                        await message.reply(
+                            f"⏳ Chromerrunner cooldown (~{int(remain) + 1}s left for this URL). "
+                            f"Paste a different link or wait.",
+                            mention_author=False,
+                        )
+                    except discord.Forbidden:
                         try:
-                            await message.reply(
-                                f"⏳ Chromerrunner cooldown (~{int(remain) + 1}s left for this URL). "
-                                f"Paste a different link or wait.",
-                                mention_author=False,
+                            await message.channel.send(
+                                f"⏳ Chromerrunner cooldown (~{int(remain) + 1}s left for this URL)."
                             )
                         except Exception:
                             pass
-                        return
-                    self._chromerrunner_last_url_ts[url] = now
-
-                ack = None
-                try:
-                    ack = await message.reply(f"⏳ Chromerrunner starting…\nURL: {url}", mention_author=False)
-                except Exception:
-                    ack = None
-
-                ok, output = await _run_chromerrunner_url(url)
-                max_chars = _cw_max_chars()
-                prefix, summary = _summarize_output(url, ok, output)
-                summary = summary.strip()
-                if len(summary) > max_chars:
-                    summary = summary[: max_chars - 3] + "..."
-
-                final_txt = f"{prefix} Chromerrunner done\n{summary}"
-                if ack:
-                    try:
-                        await ack.edit(content=final_txt)
                     except Exception:
-                        await message.reply(final_txt, mention_author=False)
-                else:
-                    await message.reply(final_txt, mention_author=False)
-            except Exception:
-                pass
+                        pass
+                    return
+                self._chromerrunner_last_url_ts[url] = now
+
+            ack = await _chromerrunner_reply_start(message, url)
+
+            ok, output = await _run_chromerrunner_url(url)
+            max_chars = _cw_max_chars()
+            prefix, summary = _summarize_output(url, ok, output)
+            summary = summary.strip()
+            if len(summary) > max_chars:
+                summary = summary[: max_chars - 3] + "..."
+
+            final_txt = f"{prefix} Chromerrunner done\n{summary}"
+            await _chromerrunner_reply_final(message, ack, final_txt)
+
+        @self.bot.event
+        async def on_message(message: discord.Message):
+            try:
+                await _chromerrunner_handle_message(message)
+            except Exception as e:
+                try:
+                    print(f"{Colors.RED}[Chromerrunner watcher] error: {type(e).__name__}: {e}{Colors.RESET}")
+                    import traceback
+
+                    traceback.print_exc()
+                except Exception:
+                    pass
             finally:
                 try:
                     await self.bot.process_commands(message)
+                except Exception:
+                    pass
+
+        @self.bot.event
+        async def on_message_edit(before: discord.Message, after: discord.Message):
+            """
+            Discord often attaches Open Graph embeds after the first MESSAGE_CREATE.
+            Without this, `message.content` / embed-based URLs may only exist on MESSAGE_EDIT.
+            """
+            try:
+                await _chromerrunner_handle_message(after)
+            except Exception as e:
+                try:
+                    print(f"{Colors.RED}[Chromerrunner watcher/edit] error: {type(e).__name__}: {e}{Colors.RESET}")
                 except Exception:
                     pass
         
