@@ -9699,7 +9699,8 @@ echo "CHANGED_END"
                 f"cd {runner_dir_q}"
                 " && source .venv/bin/activate"
                 # Reduce noisy Node/Playwright warnings in Discord output.
-                f" && NODE_NO_WARNINGS=1 NODE_OPTIONS=--no-deprecation python generic_product_checker.py --url {url_q} {runner_flags}"
+                # python -u: unbuffered stdout so SSH captures Title/Price lines before process exit.
+                f" && NODE_NO_WARNINGS=1 NODE_OPTIONS=--no-deprecation python -u generic_product_checker.py --url {url_q} {runner_flags}"
                 f" --auto-wait-s {auto_wait} --goto-timeout-ms {goto_timeout_ms} --networkidle-timeout-ms {networkidle_timeout_ms} {skip_flag}{extra_flags}"
             )
 
@@ -9710,7 +9711,7 @@ echo "CHANGED_END"
                 txt += out.strip()
             if err:
                 if txt:
-                    txt += "\\n"
+                    txt += "\n"
                 txt += err.strip()
             txt = (txt or "").strip()
             if not txt:
@@ -9718,8 +9719,13 @@ echo "CHANGED_END"
             return bool(ok), txt
 
         def _chromerrunner_title_line(output: str) -> str:
-            m = re.search(r"(?m)^Title:\s*(.+)$", (output or "").replace("\r\n", "\n"))
-            return (m.group(1) or "").strip() if m else ""
+            raw = (output or "").replace("\r\n", "\n").replace("\r", "\n")
+            m = re.search(r"(?m)^Title:\s*(.+)$", raw)
+            t = (m.group(1) or "").strip() if m else ""
+            if t and t.upper() != "N/A":
+                return t
+            m2 = re.search(r"(?m)^Page title:\s*(.+)$", raw)
+            return (m2.group(1) or "").strip() if m2 else ""
 
         def _chromerrunner_title_looks_blocked(title: str) -> bool:
             tl = (title or "").strip().lower()
@@ -9815,18 +9821,30 @@ echo "CHANGED_END"
                     return (m.group(1).strip() if m else "")
 
                 title = _m(r"^Title:\s*(.+)$")
+                page_tab = _m(r"^Page title:\s*(.+)$")
                 price = _m(r"^Price:\s*(.+)$")
                 brand = _m(r"^Brand:\s*(.+)$")
                 image = _m(r"^Image:\s*(.+)$")
                 payloads = _m(r"^Captured JSON Payloads:\s*(.+)$")
 
+                headline = ""
+                if title and title.strip().upper() != "N/A":
+                    headline = title.strip()
+                elif page_tab and page_tab.strip():
+                    headline = page_tab.strip()
+
                 emb = discord.Embed(
-                    title=("Chromerrunner done" if ok else "Chromerrunner done (warning)"),
+                    title=(
+                        (headline[:256] if headline else None)
+                        or ("Chromerrunner done" if ok else "Chromerrunner done (warning)")
+                    ),
                     url=url,
                     color=(0x2ECC71 if ok else 0xF1C40F),
                 )
-                if title:
+                if title and title.strip():
                     emb.add_field(name="Title", value=title[:1024], inline=False)
+                elif page_tab and page_tab.strip():
+                    emb.add_field(name="Page title", value=page_tab[:1024], inline=False)
                 emb.add_field(name="URL", value=url[:1024], inline=False)
                 if price:
                     emb.add_field(name="Price", value=price[:1024], inline=True)
@@ -10020,7 +10038,9 @@ echo "CHANGED_END"
                 ok_ssh, output = await _run_chromerrunner_url(url)
                 semantic_ok = _chromerrunner_semantic_ok(ok_ssh, output)
                 prefix, summary = _summarize_output(url, semantic_ok, output)
-                final_txt = f"{prefix} Chromerrunner done"
+                cap = 1900
+                combined = f"{prefix}\n{summary}"
+                final_txt = combined if len(combined) <= cap else (combined[: cap - 28] + "\n…(truncated)")
                 await _chromerrunner_reply_final(
                     message,
                     ack,

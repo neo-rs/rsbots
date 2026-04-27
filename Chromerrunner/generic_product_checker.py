@@ -546,6 +546,7 @@ def print_result(r: Dict[str, Any]) -> None:
     if ou:
         print(f"Opened: {ou}")
     print(f"Title: {r.get('title')}")
+    print(f"Page title: {r.get('page_title')}")
     print(f"Price: {r.get('price')}")
     print(f"Brand: {r.get('brand')}")
     print(f"Image: {r.get('image')}")
