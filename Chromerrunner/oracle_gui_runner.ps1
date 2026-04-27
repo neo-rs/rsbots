@@ -1,5 +1,7 @@
 param(
-  [switch]$Debug
+  [switch]$Debug,
+  # Non-interactive: stop Chromerrunner noVNC listeners on Oracle (6080/5900), show memory, exit.
+  [switch]$StopNovnc
 )
 
 $ErrorActionPreference = "Stop"
@@ -129,6 +131,50 @@ function Start-Tunnels {
   Start-Process -FilePath $ssh -ArgumentList $args -WindowStyle Normal
 }
 
+function Stop-ChromerrunnerOracleNovnc {
+  param([pscustomobject]$S)
+  Write-Header "Stop Chromerrunner noVNC on Oracle (6080 + 5900 only)"
+  Write-Host "This stops websockify + x11vnc from start_oracle_novnc.sh."
+  Write-Host "It does NOT stop Chrome CDP on 9222 or Discord bots."
+  Write-Host ""
+
+  # Ensure server has latest stop script (same repo copy as this .ps1).
+  $scriptDir = Split-Path -Parent $PSCommandPath
+  if ([string]::IsNullOrWhiteSpace($scriptDir)) {
+    $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+  }
+  $localStop = Join-Path $scriptDir "stop_oracle_novnc.sh"
+  if (-not (Test-Path -LiteralPath $localStop)) {
+    Write-Host "ERROR: missing $localStop"
+    return 1
+  }
+  $scp = "$env:WINDIR\System32\OpenSSH\scp.exe"
+  $remotePath = "{0}/Chromerrunner/stop_oracle_novnc.sh" -f $S.RemoteRoot.TrimEnd('/')
+  $scpDest = "{0}@{1}:{2}" -f $S.User, $S.Host, $remotePath
+  $scpArgs = @(
+    "-i", $S.KeyPath,
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "ConnectTimeout=60",
+    $localStop,
+    $scpDest
+  )
+  if ($Debug) { Write-Host "`nSCP $scp $($scpArgs -join ' ')" }
+  $scpProc = Start-Process -FilePath $scp -ArgumentList $scpArgs -NoNewWindow -Wait -PassThru
+  if ([int]$scpProc.ExitCode -ne 0) {
+    Write-Host "WARNING: scp stop_oracle_novnc.sh exit code $($scpProc.ExitCode) (continuing anyway if file exists on server)"
+  }
+
+  $chromDir = Bash-SingleQuote(($S.RemoteRoot.TrimEnd('/') + '/Chromerrunner'))
+  $remote = "cd $chromDir && chmod +x stop_oracle_novnc.sh && bash ./stop_oracle_novnc.sh"
+  $rc = Run-Ssh $S $remote
+  if ($rc -ne 0) { Write-Host "WARNING: stop script exit code $rc" }
+  Write-Host ""
+  Write-Host "--- free -h (Oracle) ---"
+  $null = Run-Ssh $S "free -h"
+  Write-Host ""
+  return $rc
+}
+
 function Open-LocalNovnc {
   $novnc = "http://127.0.0.1:6080/vnc.html"
   Write-Host ""
@@ -158,6 +204,7 @@ function Menu {
     Write-Host "4) Start Oracle Chrome CDP (HEADLESS)"
     Write-Host "5) Run Generic Checker (CDP + MANUAL ENTER) [paste URL]"
     Write-Host "6) One-shot: noVNC + tunnels + headed chrome + run checker"
+    Write-Host "7) Stop noVNC on Oracle (6080 + 5900 only; bots/CDP untouched)"
     Write-Host "0) Exit"
     Write-Host ""
 
@@ -215,6 +262,10 @@ function Menu {
         $null = Run-Ssh $S ("cd {0}/Chromerrunner && export NODE_NO_WARNINGS=1 NODE_OPTIONS=--no-deprecation && source .venv/bin/activate && python generic_product_checker.py --url '{1}' --connect-cdp --cdp-url http://127.0.0.1:9222 --manual" -f $S.RemoteRoot, $url)
         Pause
       }
+      "7" {
+        $null = Stop-ChromerrunnerOracleNovnc -S $S
+        Pause
+      }
       default {
         continue
       }
@@ -224,5 +275,9 @@ function Menu {
 
 $repoRoot = Resolve-RepoRoot
 $server = Get-OracleServerInfo -RepoRoot $repoRoot
+if ($StopNovnc) {
+  $rc = Stop-ChromerrunnerOracleNovnc -S $server
+  exit $rc
+}
 Menu -S $server
 
