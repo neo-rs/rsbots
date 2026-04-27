@@ -9395,8 +9395,9 @@ echo "CHANGED_END"
                     # Stop at whitespace / quotes / brackets that typically terminate URLs in Discord.
                     if ch in " \t\r\n<>\"'":
                         break
-                    # Stop at common trailing punctuation (but allow '/' and '=' etc.)
-                    if ch in "),.;]":
+                    # Stop at common trailing punctuation (but allow '/' and '=' etc.).
+                    # Never treat '.' as a terminator — otherwise "https://www.retailer.com" stops at "https://www".
+                    if ch in "),;]":
                         break
                     buf.append(ch)
                     i += 1
@@ -9510,7 +9511,8 @@ echo "CHANGED_END"
                     ch = t[i]
                     if ch in " \t\r\n<>\"'":
                         break
-                    if ch in "),.;]":
+                    # Do not include '.' — required for "https://www.host.tld/path" (see _extract_first_url).
+                    if ch in "),;]":
                         break
                     buf.append(ch)
                     i += 1
@@ -9861,6 +9863,14 @@ echo "CHANGED_END"
                 async with self._chromerrunner_lock:
                     last = float(self._chromerrunner_last_url_ts.get(url, 0.0) or 0.0)
                     if cooldown and (now - last) < cooldown:
+                        try:
+                            rem = max(0.0, cooldown - (now - last))
+                            print(
+                                f"{Colors.YELLOW}[Chromerrunner][Cooldown] skip url={url[:200]} "
+                                f"retry_in_s={rem:.1f}{Colors.RESET}"
+                            )
+                        except Exception:
+                            pass
                         continue
                     self._chromerrunner_last_url_ts[url] = now
 
