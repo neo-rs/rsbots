@@ -9716,6 +9716,39 @@ echo "CHANGED_END"
                 txt = "No output."
             return bool(ok), txt
 
+        def _chromerrunner_title_line(output: str) -> str:
+            m = re.search(r"(?m)^Title:\s*(.+)$", (output or "").replace("\r\n", "\n"))
+            return (m.group(1) or "").strip() if m else ""
+
+        def _chromerrunner_title_looks_blocked(title: str) -> bool:
+            tl = (title or "").strip().lower()
+            if not tl or tl == "n/a":
+                return False
+            needles = (
+                "sorry, you have been blocked",
+                "access denied",
+                "attention required",
+                "verify you are human",
+                "just a moment",
+                "robot or human",
+                "before we continue",
+                "enable javascript",
+                "unexpected error",
+                "something went wrong",
+            )
+            return any(n in tl for n in needles)
+
+        def _chromerrunner_semantic_ok(ok_ssh: bool, output: str) -> bool:
+            """
+            SSH exit code is unreliable: Playwright/Node often writes warnings to stderr and bash may
+            surface a non-zero code even when generic_product_checker printed a full Title/Price block.
+            Prefer parsed checker output when present.
+            """
+            title = _chromerrunner_title_line(output)
+            if title:
+                return not _chromerrunner_title_looks_blocked(title)
+            return bool(ok_ssh)
+
         def _summarize_output(url: str, ok: bool, output: str) -> Tuple[str, str]:
             """
             Return (prefix_emoji, human_summary). Keep it operator-readable.
@@ -9726,18 +9759,23 @@ echo "CHANGED_END"
             if "err_name_not_resolved" in low:
                 return "⚠️", f"DNS failed for that URL (name not resolved). Please paste the full product link.\nURL: {url}"
 
-            # Common anti-bot blocks on Oracle IP
+            title = _chromerrunner_title_line(out)
+            if title and not _chromerrunner_title_looks_blocked(title) and title.upper() != "N/A":
+                # Trust the checker summary when Title parsed as a normal product line.
+                return "✅", f"URL: {url}\n\n{out.strip() or 'No output.'}"
+
+            # Common anti-bot blocks — scan only the head of output so JSON/network traces do not false-positive.
             block_signals = [
                 "robot or human?",
                 "just a moment",
                 "sorry, you have been blocked",
                 "access denied",
                 "attention required",
-                "cloudflare",
                 "captcha",
                 "/blocked",
             ]
-            if any(s in low for s in block_signals):
+            focus = low[:6000]
+            if any(s in focus for s in block_signals):
                 return "⚠️", (
                     "Blocked / challenge page detected (likely anti-bot on Oracle IP).\n"
                     f"URL: {url}\n\n"
@@ -9966,14 +10004,15 @@ echo "CHANGED_END"
 
                 # Keep Discord output compact: content is minimal, details live in embed.
                 ack = await _chromerrunner_reply_start(message, url) if idx == 1 else None
-                ok, output = await _run_chromerrunner_url(url)
-                prefix, summary = _summarize_output(url, ok, output)
+                ok_ssh, output = await _run_chromerrunner_url(url)
+                semantic_ok = _chromerrunner_semantic_ok(ok_ssh, output)
+                prefix, summary = _summarize_output(url, semantic_ok, output)
                 final_txt = f"{prefix} Chromerrunner done"
                 await _chromerrunner_reply_final(
                     message,
                     ack,
                     final_txt,
-                    embed=_build_chromerrunner_embed(url, ok, output),
+                    embed=_build_chromerrunner_embed(url, semantic_ok, output),
                 )
 
         @self.bot.event
