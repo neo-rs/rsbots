@@ -25,6 +25,10 @@
   "dedupe_sent_ttl_s": 900,
   "dedupe_max_entries": 5000,
   "dedupe_debug": false,
+  "monitor_data_search_listen_channel_ids": [
+    "1497910279164395723"
+  ],
+  "monitor_data_search_ignore_bot_messages": true,
   "channels": [
     {
       "source_channel_id": "1446174806981480578",

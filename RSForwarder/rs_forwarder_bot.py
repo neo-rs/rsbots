@@ -30,6 +30,7 @@ from RSForwarder import novnc_stack
 from RSForwarder import rs_fs_sheet_sync
 from RSForwarder.rs_fs_monitor_data_resolver import RsFsMonitorDataResolver
 from RSForwarder import fetch_monitor_channels as _fetch_monitor_channels
+from RSForwarder import monitor_data_search as _monitor_data_search
 from RSForwarder import zephyr_release_feed_parser
 
 # Ensure repo root is importable when executed as a script (matches Ubuntu run_bot.sh PYTHONPATH).
@@ -3885,6 +3886,184 @@ class RSForwarderBot:
                 out[cid] = str(k)
         return out
 
+    def _monitor_data_search_listen_channel_ids(self) -> List[int]:
+        """
+        Config list of Discord channel IDs where RSForwarder should read messages, extract product IDs,
+        and reply with monitor_data_search results as an embed.
+        """
+        raw = (self.config or {}).get("monitor_data_search_listen_channel_ids")
+        out: List[int] = []
+        if isinstance(raw, list):
+            for v in raw:
+                s = str(v or "").strip()
+                if not s:
+                    continue
+                try:
+                    out.append(int(s))
+                except Exception:
+                    continue
+        elif isinstance(raw, str):
+            for part in raw.split(","):
+                s = str(part or "").strip()
+                if not s:
+                    continue
+                try:
+                    out.append(int(s))
+                except Exception:
+                    continue
+        # de-dupe, stable
+        seen: set[int] = set()
+        uniq: List[int] = []
+        for x in out:
+            if x in seen or x <= 0:
+                continue
+            seen.add(x)
+            uniq.append(x)
+        return uniq
+
+    def _monitor_data_search_ignore_bot_messages(self) -> bool:
+        """
+        If true, messages from bot accounts are ignored in monitor_data_search listen channels.
+        This prevents reply loops when other bots post IDs into the listen channel.
+        """
+        try:
+            v = (self.config or {}).get("monitor_data_search_ignore_bot_messages")
+            if v is None:
+                return True
+            if isinstance(v, bool):
+                return v
+            return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+        except Exception:
+            return True
+
+    @staticmethod
+    def _extract_candidate_product_ids(text: str) -> List[str]:
+        """
+        Extract likely product IDs from freeform text. Conservative: only returns high-signal tokens.
+        Supports multiple IDs in one message.
+        """
+        t = str(text or "")
+        if not t.strip():
+            return []
+
+        cands: List[str] = []
+
+        # Amazon ASIN: 10 chars alnum, often starts with B0...
+        for m in re.findall(r"\b([A-Z0-9]{10})\b", t.upper()):
+            if m.startswith("B0") or m.startswith("B"):
+                cands.append(m)
+
+        # Explicit key=value forms
+        for m in re.findall(r"\b(?:asin|tcin|sku|pid|upc|ean|isbn)\s*[:=]\s*([A-Za-z0-9_-]{4,})\b", t, flags=re.IGNORECASE):
+            cands.append(m.strip())
+
+        # Long numeric IDs (PID/TCIN/UPC/etc)
+        for m in re.findall(r"\b(\d{6,})\b", t):
+            cands.append(m)
+
+        # De-dupe while preserving order
+        seen: set[str] = set()
+        out: List[str] = []
+        for x in cands:
+            x2 = str(x or "").strip().strip("`").strip()
+            if not x2:
+                continue
+            key = x2.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(x2)
+        return out
+
+    async def _maybe_run_monitor_data_search(self, message: discord.Message) -> None:
+        """
+        If message is posted in a configured listen channel, extract product ids and reply with an embed
+        showing monitor_data_search results.
+        """
+        try:
+            listen_ids = set(self._monitor_data_search_listen_channel_ids() or [])
+        except Exception:
+            listen_ids = set()
+        if not listen_ids:
+            return
+        try:
+            ch_id = int(getattr(getattr(message, "channel", None), "id", 0) or 0)
+        except Exception:
+            ch_id = 0
+        if not ch_id or ch_id not in listen_ids:
+            return
+
+        # Avoid loops / noisy bot messages (configurable)
+        if self._monitor_data_search_ignore_bot_messages():
+            try:
+                if getattr(message, "author", None) and getattr(message.author, "bot", False):
+                    return
+            except Exception:
+                pass
+
+        content = str(getattr(message, "content", "") or "")
+        ids = self._extract_candidate_product_ids(content)
+        if not ids:
+            return
+
+        # Keep it readable; cap work per message.
+        ids = ids[:5]
+
+        base = Path(__file__).resolve().parent
+        md_dir = base / "monitor_data"
+
+        # Build one embed per message (multiple IDs as fields).
+        emb = discord.Embed(title="Monitor data search", color=discord.Color.dark_teal())
+        emb.set_footer(text="Source: RSForwarder/monitor_data")
+
+        total_hits = 0
+        for q in ids:
+            try:
+                hits = _monitor_data_search.search_monitor_data(
+                    monitor_dir=md_dir,
+                    query=str(q),
+                    limit=3,
+                    exclude_channels=set(),  # monitor_data_search already excludes needoh-aio by default in CLI; here we want same behavior
+                )
+            except Exception:
+                hits = []
+
+            if not hits:
+                emb.add_field(name=f"{q}", value="No hits.", inline=False)
+                continue
+
+            total_hits += len(hits)
+            lines: List[str] = []
+            for h in hits:
+                ch = str(h.get("channel") or "")
+                title = str(h.get("title") or "").strip()
+                url = str(h.get("url") or "").strip()
+                stock = str(h.get("stock") or "").strip() or "-"
+                typ = str(h.get("embed_type") or "").strip() or "-"
+                unix = int(h.get("last_seen_unix") or 0)
+                rel = f"<t:{unix}:R>" if unix else "-"
+                t_short = (title[:80] + "...") if len(title) > 83 else title
+                line = f"- **{ch}** | stock={stock} | type={typ} | seen={rel}"
+                if url:
+                    line += f"\n  {url}"
+                if t_short:
+                    line += f"\n  {t_short}"
+                lines.append(line)
+
+            # Discord field value limit is 1024
+            value = "\n".join(lines)
+            if len(value) > 1000:
+                value = value[:1000] + "..."
+            emb.add_field(name=f"{q} (top {min(3, len(hits))})", value=value, inline=False)
+
+        try:
+            await message.reply(embed=emb, allowed_mentions=discord.AllowedMentions.none())
+        except Exception:
+            try:
+                await message.channel.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
+            except Exception:
+                return
+
     async def _maybe_capture_monitor_message(self, message: discord.Message) -> None:
         """
         If this message is in a configured monitor channel, upsert it into monitor_data/<channel_key>.json.
@@ -5337,6 +5516,12 @@ class RSForwarderBot:
             # Optional: live monitor_data capture (monitor channels -> RSForwarder/monitor_data/*.json)
             try:
                 await self._maybe_capture_monitor_message(message)
+            except Exception:
+                pass
+
+            # Optional: MonitorData search listen channels (query -> reply embed)
+            try:
+                await self._maybe_run_monitor_data_search(message)
             except Exception:
                 pass
             
