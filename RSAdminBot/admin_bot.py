@@ -9397,7 +9397,8 @@ echo "CHANGED_END"
                         break
                     # Stop at common trailing punctuation (but allow '/' and '=' etc.).
                     # Never treat '.' as a terminator — otherwise "https://www.retailer.com" stops at "https://www".
-                    if ch in "),;]":
+                    # Do not use ',' here — eBay / other searches use commas in query strings.
+                    if ch in ");]":
                         break
                     buf.append(ch)
                     i += 1
@@ -9512,11 +9513,17 @@ echo "CHANGED_END"
                     if ch in " \t\r\n<>\"'":
                         break
                     # Do not include '.' — required for "https://www.host.tld/path" (see _extract_first_url).
-                    if ch in "),;]":
+                    # Do not use ',' — query strings may contain commas.
+                    if ch in ");]":
                         break
                     buf.append(ch)
                     i += 1
                 candidates.append((start, "".join(buf).strip()))
+
+            # Supplement: greedy match to end of token (whitespace / angle / dquote only) so long
+            # URLs and comma-heavy queries are not truncated by ");]" heuristics above.
+            for m in re.finditer(r'https?://[^\s<>"]+', t, flags=re.IGNORECASE):
+                candidates.append((m.start(), m.group(0).strip()))
 
             cleaned: list[tuple[int, str, tuple]] = []
             seen = set()
@@ -9819,6 +9826,14 @@ echo "CHANGED_END"
             blob = _cw_gather_text_for_urls(message) or ""
             urls = _extract_urls(blob, limit=3)
             if not urls:
+                try:
+                    prev = repr((blob or "")[:400])
+                    print(
+                        f"{Colors.YELLOW}[Chromerrunner][ExtractFail] content_len={len(blob or '')} "
+                        f"blob_preview={prev}{Colors.RESET}"
+                    )
+                except Exception:
+                    pass
                 # Make “silent ignore” actionable: reply occasionally with the reason.
                 now = time.time()
                 ch = getattr(message, "channel", None)
