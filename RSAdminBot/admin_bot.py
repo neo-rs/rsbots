@@ -25,6 +25,7 @@ import platform
 import requests
 import time
 import re
+from urllib.parse import urlparse
 from collections import deque
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Callable, Awaitable, Union, Set
@@ -9199,12 +9200,115 @@ echo "CHANGED_END"
                 return 1600
 
         def _extract_first_url(text: str) -> str:
+            """
+            Extract a product URL from a Discord message.
+
+            Discord frequently makes naive `https?://...` regexes unsafe:
+            - URL previews / markdown can split tokens (e.g. `https://www.game` + `stop.com...`)
+            - Hidden `<>` wrappers / ZWSP characters can truncate matches
+
+            Strategy:
+            - Normalize a few common invisible/formatting characters
+            - Find *all* plausible http(s) URLs (including markdown `(...)` forms)
+            - Score candidates and return the best one (prefer longest + known retailer hosts)
+            """
             t = str(text or "")
-            m = re.search(r"(https?://[^\\s<>\"]+)", t, flags=re.IGNORECASE)
-            if not m:
+            if not t.strip():
                 return ""
-            url = m.group(1).strip().rstrip(").,;]")
-            return url
+
+            # Remove common zero-width / formatting characters that break naive regexes.
+            t = (
+                t.replace("\u200b", "")  # ZWSP
+                .replace("\u200c", "")  # ZWNJ
+                .replace("\u200d", "")  # ZWJ
+                .replace("\ufeff", "")  # BOM
+            )
+
+            def _host_of(u: str) -> str:
+                try:
+                    return (urlparse(u).hostname or "").lower()
+                except Exception:
+                    return ""
+
+            def _looks_real_host(host: str) -> bool:
+                if not host or "." not in host:
+                    return False
+                # Reject obvious partial hosts like `www.game`
+                if host.endswith(".game"):
+                    return False
+                labels = host.split(".")
+                tld = labels[-1] if labels else ""
+                if len(tld) < 2:
+                    return False
+                return True
+
+            def _score(u: str) -> tuple:
+                h = _host_of(u)
+                if not _looks_real_host(h):
+                    return (-1, 0, u)
+                preferred = (
+                    "walmart.com",
+                    "gamestop.com",
+                    "target.com",
+                    "homedepot.com",
+                    "lowes.com",
+                    "bestbuy.com",
+                    "costco.com",
+                    "samsclub.com",
+                )
+                pref = 1 if any(h == p or h.endswith("." + p) for p in preferred) else 0
+                # Prefer longer URLs (more specific), then preferred retailers.
+                return (pref, len(u), u)
+
+            candidates: list[str] = []
+
+            # 1) Markdown links: [text](https://example.com/path)
+            for m in re.finditer(r"\]\((https?://[^)\s]+)\)", t, flags=re.IGNORECASE):
+                candidates.append(m.group(1).strip())
+
+            # 2) Angle-bracket URLs: <https://example.com/path>
+            for m in re.finditer(r"<(https?://[^>\s]+)>", t, flags=re.IGNORECASE):
+                candidates.append(m.group(1).strip())
+
+            # 3) Plain URLs: scan from each `http` occurrence and consume a conservative URL charset,
+            #    including `&` and `%` etc., stopping at whitespace or closing delimiters.
+            for m in re.finditer(r"https?://", t, flags=re.IGNORECASE):
+                start = m.start()
+                i = start + len(m.group(0))
+                buf = [m.group(0)]
+                while i < len(t):
+                    ch = t[i]
+                    # Stop at whitespace / quotes / brackets that typically terminate URLs in Discord.
+                    if ch in " \t\r\n<>\"'":
+                        break
+                    # Stop at common trailing punctuation (but allow '/' and '=' etc.)
+                    if ch in "),.;]":
+                        break
+                    buf.append(ch)
+                    i += 1
+                u = "".join(buf).strip()
+                candidates.append(u)
+
+            cleaned: list[str] = []
+            seen = set()
+            for u in candidates:
+                u = u.strip().rstrip(").,;]")
+                if not u:
+                    continue
+                key = u.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                cleaned.append(u)
+
+            if not cleaned:
+                return ""
+
+            cleaned.sort(key=_score, reverse=True)
+            best = cleaned[0]
+            if _score(best)[0] < 0:
+                return ""
+            return best
 
         async def _run_chromerrunner_url(url: str) -> Tuple[bool, str]:
             url_q = shlex.quote(url)
