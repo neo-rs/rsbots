@@ -9681,6 +9681,7 @@ echo "CHANGED_END"
                 clip_h = 1150
             clip_h = max(400, min(clip_h, 4000))
             lazy_scroll = bool(cfg.get("lazy_wheel_scroll", False))
+            # Must match Chromerrunner/generic_product_checker.py argparse on the server (deploy with repo).
             extra_flags = f" --screenshot-policy {shlex.quote(sp)} --ebay-sch-clip-height {clip_h}"
             if lazy_scroll:
                 extra_flags += " --lazy-wheel-scroll"
