@@ -9749,6 +9749,21 @@ echo "CHANGED_END"
                 return not _chromerrunner_title_looks_blocked(title)
             return bool(ok_ssh)
 
+        def _chromerrunner_should_record_url_done(output: str) -> bool:
+            """
+            If the remote generic_product_checker.py is outdated or missing, argparse prints usage and
+            exits before any real run. Do not mark the URL as done for message dedupe — allow the
+            MESSAGE_EDIT pass (or a redeploy) to retry.
+            """
+            o = (output or "").lower()
+            if "usage: generic_product_checker.py" in o:
+                return False
+            if "unrecognized arguments" in o:
+                return False
+            if "provide --url or --url-file" in o and "opening:" not in o:
+                return False
+            return True
+
         def _summarize_output(url: str, ok: bool, output: str) -> Tuple[str, str]:
             """
             Return (prefix_emoji, human_summary). Keep it operator-readable.
@@ -9941,7 +9956,7 @@ echo "CHANGED_END"
                 return
 
             # Same Discord message_id often triggers twice (MESSAGE_CREATE + MESSAGE_EDIT with embeds).
-            # Reserve URLs once per message so we do not double-queue or re-run Playwright/SSH.
+            # Track URLs only after a real checker run (in-memory; not related to urls_from_generic_results.txt).
             try:
                 mid = int(getattr(message, "id", 0) or 0)
             except Exception:
@@ -9971,9 +9986,6 @@ echo "CHANGED_END"
                         except Exception:
                             pass
                         return
-                    for u in pending_urls:
-                        done.add(u)
-                    self._chromerrunner_msg_registry_ts[mid] = time.time()
                 urls = pending_urls
 
             if len(urls) > 1:
@@ -10014,6 +10026,21 @@ echo "CHANGED_END"
                     final_txt,
                     embed=_build_chromerrunner_embed(url, semantic_ok, output),
                 )
+                if mid and _chromerrunner_should_record_url_done(output):
+                    try:
+                        async with self._chromerrunner_lock:
+                            self._chromerrunner_urls_done_for_message_id.setdefault(mid, set()).add(url)
+                            self._chromerrunner_msg_registry_ts[mid] = time.time()
+                    except Exception:
+                        pass
+                elif mid:
+                    try:
+                        print(
+                            f"{Colors.YELLOW}[Chromerrunner] msg_id={mid} not marking URL done "
+                            f"(checker did not run — deploy Chromerrunner/generic_product_checker.py on server){Colors.RESET}"
+                        )
+                    except Exception:
+                        pass
 
         @self.bot.event
         async def on_message(message: discord.Message):
