@@ -3409,6 +3409,9 @@ class RSAdminBot:
         self._chromerrunner_lock: asyncio.Lock = asyncio.Lock()
         # Rate-limit “I can't see content / can't parse” notices so we don't spam.
         self._chromerrunner_last_notice_ts: Dict[str, float] = {}
+        # Discord fires on_message then on_message_edit when link previews attach — same URLs re-run unless deduped.
+        self._chromerrunner_urls_done_for_message_id: Dict[int, Set[str]] = {}
+        self._chromerrunner_msg_registry_ts: Dict[int, float] = {}
 
         # Journal live streaming + webhooks (test server only; webhooks are stored server-side in config.secrets.json)
         self._http_session: Optional[aiohttp.ClientSession] = None
@@ -9898,6 +9901,42 @@ echo "CHANGED_END"
                         except Exception:
                             pass
                 return
+
+            # Same Discord message_id often triggers twice (MESSAGE_CREATE + MESSAGE_EDIT with embeds).
+            # Reserve URLs once per message so we do not double-queue or re-run Playwright/SSH.
+            try:
+                mid = int(getattr(message, "id", 0) or 0)
+            except Exception:
+                mid = 0
+            if mid:
+                try:
+                    now_reg = time.time()
+                    tsmap = self._chromerrunner_msg_registry_ts
+                    donemap = self._chromerrunner_urls_done_for_message_id
+                    if len(tsmap) >= 800:
+                        cutoff = now_reg - 7200.0
+                        stale = [k for k, t in tsmap.items() if t < cutoff]
+                        for k in stale[:600]:
+                            tsmap.pop(k, None)
+                            donemap.pop(k, None)
+                except Exception:
+                    pass
+                async with self._chromerrunner_lock:
+                    done = self._chromerrunner_urls_done_for_message_id.setdefault(mid, set())
+                    pending_urls = [u for u in urls if u not in done]
+                    if not pending_urls:
+                        try:
+                            print(
+                                f"{Colors.DIM}[Chromerrunner][Dedupe] msg_id={mid} "
+                                f"skip duplicate dispatch (embed/edit; URLs already handled){Colors.RESET}"
+                            )
+                        except Exception:
+                            pass
+                        return
+                    for u in pending_urls:
+                        done.add(u)
+                    self._chromerrunner_msg_registry_ts[mid] = time.time()
+                urls = pending_urls
 
             if len(urls) > 1:
                 try:
