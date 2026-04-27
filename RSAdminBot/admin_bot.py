@@ -9310,6 +9310,84 @@ echo "CHANGED_END"
                 return ""
             return best
 
+        def _cw_channel_matches(message: discord.Message) -> bool:
+            """True if this message is in the configured watch channel or a thread under it."""
+            watch_cid = _cw_channel_id()
+            if not watch_cid:
+                return False
+            ch = getattr(message, "channel", None)
+            if ch is None:
+                return False
+            try:
+                cid = int(getattr(ch, "id", 0) or 0)
+            except Exception:
+                cid = 0
+            if cid == watch_cid:
+                return True
+            # Threads / forum posts: match parent text channel id.
+            try:
+                parent_id = getattr(ch, "parent_id", None)
+                if parent_id is not None and int(parent_id) == watch_cid:
+                    return True
+            except Exception:
+                pass
+            return False
+
+        def _cw_gather_text_for_urls(message: discord.Message) -> str:
+            """Discord often puts the only copy of a URL in embeds; content can be empty."""
+            parts: List[str] = []
+            try:
+                c = getattr(message, "content", None)
+                if c:
+                    parts.append(str(c))
+            except Exception:
+                pass
+            try:
+                for emb in getattr(message, "embeds", None) or []:
+                    if emb is None:
+                        continue
+                    for attr in ("url", "title", "description"):
+                        try:
+                            v = getattr(emb, attr, None)
+                            if v:
+                                parts.append(str(v))
+                        except Exception:
+                            pass
+                    try:
+                        au = getattr(getattr(emb, "author", None), "name", None)
+                        if au:
+                            parts.append(str(au))
+                    except Exception:
+                        pass
+                    try:
+                        for fld in getattr(emb, "fields", None) or []:
+                            if fld is None:
+                                continue
+                            try:
+                                if getattr(fld, "name", None):
+                                    parts.append(str(fld.name))
+                                if getattr(fld, "value", None):
+                                    parts.append(str(fld.value))
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    try:
+                        img = getattr(emb, "image", None)
+                        if img is not None and getattr(img, "url", None):
+                            parts.append(str(img.url))
+                    except Exception:
+                        pass
+                    try:
+                        th = getattr(emb, "thumbnail", None)
+                        if th is not None and getattr(th, "url", None):
+                            parts.append(str(th.url))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return "\n".join(parts)
+
         async def _run_chromerrunner_url(url: str) -> Tuple[bool, str]:
             url_q = shlex.quote(url)
             chrome_q = shlex.quote(_cw_chrome_exe())
@@ -9397,20 +9475,13 @@ echo "CHANGED_END"
                 except Exception:
                     pass
 
-                watch_cid = _cw_channel_id()
-                if not watch_cid:
-                    return
-                try:
-                    cid = int(getattr(message.channel, "id", 0) or 0)
-                except Exception:
-                    cid = 0
-                if cid != watch_cid:
+                if not _cw_channel_matches(message):
                     return
 
                 if not _cw_post_back():
                     return
 
-                url = _extract_first_url(getattr(message, "content", "") or "")
+                url = _extract_first_url(_cw_gather_text_for_urls(message) or "")
                 if not url:
                     return
 
@@ -9419,6 +9490,15 @@ echo "CHANGED_END"
                 async with self._chromerrunner_lock:
                     last = float(self._chromerrunner_last_url_ts.get(url, 0.0) or 0.0)
                     if cooldown and (now - last) < cooldown:
+                        remain = max(0.0, cooldown - (now - last))
+                        try:
+                            await message.reply(
+                                f"⏳ Chromerrunner cooldown (~{int(remain) + 1}s left for this URL). "
+                                f"Paste a different link or wait.",
+                                mention_author=False,
+                            )
+                        except Exception:
+                            pass
                         return
                     self._chromerrunner_last_url_ts[url] = now
 
