@@ -288,6 +288,11 @@ def search_monitor_data(
         channel_key, obj = _load_channel_json(path)
         if channel_key in excl:
             continue
+        # Saved file metadata
+        try:
+            channel_id = int(obj.get("channel_id") or 0) if isinstance(obj, dict) else 0
+        except Exception:
+            channel_id = 0
         items = obj.get("items_by_key")
         if not isinstance(items, dict):
             continue
@@ -304,6 +309,7 @@ def search_monitor_data(
             dt = _parse_ts(last_raw)
             stock = _clean_ws(_extract_stock_display(human))
             embed_type = _clean_ws(_extract_type_field(human))
+            source_message_id = str(item.get("last_message_id") or latest.get("id") or "").strip()
             pid = item.get("product_id") if isinstance(item.get("product_id"), dict) else {}
             pid_label = ""
             if str(pid.get("kind") or "") in {"field", "derived"} and str(pid.get("value") or "").strip():
@@ -317,6 +323,8 @@ def search_monitor_data(
                     "channel": channel_key,
                     "file": path.name,
                     "item_key": str(ik),
+                    "source_channel_id": channel_id,
+                    "source_message_id": source_message_id,
                     "product_id": pid_label,
                     "title": title,
                     "url": url,

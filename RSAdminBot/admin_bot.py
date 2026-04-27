@@ -8093,6 +8093,16 @@ echo "CHANGED_END"
                     if hasattr(self, 'logger') and self.logger:
                         self.logger.log_config_validation("config_secrets", "missing", f"Missing config.secrets.json: {secrets_path}", {"secrets_path": str(secrets_path)})
                 print(f"{Colors.GREEN}[Config] Loaded configuration{Colors.RESET}")
+                # Always print Chromerrunner watcher config at startup so “no response” is diagnosable from journal.
+                try:
+                    cw = (self.config or {}).get("chromerrunner_watcher") if isinstance(self.config, dict) else None
+                    cw = cw if isinstance(cw, dict) else {}
+                    print(
+                        f"{Colors.CYAN}[Chromerrunner][Config] enabled={bool(cw.get('enabled'))} "
+                        f"watch_channel_id={cw.get('watch_channel_id')}{Colors.RESET}"
+                    )
+                except Exception:
+                    pass
                 if hasattr(self, 'logger') and self.logger:
                     self.logger.log_config_validation("config_load", "valid", "Configuration loaded successfully", {"config_path": str(self.config_path)})
             except Exception as e:
@@ -8988,8 +8998,82 @@ echo "CHANGED_END"
             # Mark startup as in progress - commands are already registered, so mark complete even if sequences fail
             self._startup_complete = True
 
+            # Chromerrunner watcher debug (startup): print config snapshot so “no response” is diagnosable from journal.
+            try:
+                raw = self.config.get("chromerrunner_watcher") if isinstance(self.config, dict) else None
+                cfg = raw if isinstance(raw, dict) else {}
+                print(
+                    f"{Colors.CYAN}[Chromerrunner][WatchChannel] startup cfg enabled={bool(cfg.get('enabled'))} "
+                    f"watch_channel_id={cfg.get('watch_channel_id')}{Colors.RESET}"
+                )
+            except Exception:
+                pass
+
             # Wrap entire startup sequence in try/except to ensure on_ready always completes
             try:
+                # Chromerrunner watcher: verify the bot can see the configured watch channel ASAP.
+                # This gives a definitive backend signal when the watcher “does nothing”.
+                try:
+                    cfg = {}
+                    try:
+                        raw = self.config.get("chromerrunner_watcher") if isinstance(self.config, dict) else None
+                        cfg = raw if isinstance(raw, dict) else {}
+                    except Exception:
+                        cfg = {}
+
+                    enabled = bool(cfg.get("enabled")) if isinstance(cfg, dict) else False
+                    try:
+                        watch_cid = int((cfg or {}).get("watch_channel_id") or 0)
+                    except Exception:
+                        watch_cid = 0
+
+                    if enabled:
+
+                        async def _cw_verify_watch_channel_access() -> None:
+                            if not watch_cid:
+                                print(f"{Colors.YELLOW}[Chromerrunner][WatchChannel] invalid watch_channel_id=0{Colors.RESET}")
+                                return
+                            try:
+                                ch = self.bot.get_channel(watch_cid)
+                                if ch is None:
+                                    ch = await self.bot.fetch_channel(watch_cid)
+                                guild = getattr(ch, "guild", None)
+                                me = getattr(guild, "me", None) if guild else None
+                                perms = None
+                                try:
+                                    if guild and me and hasattr(ch, "permissions_for"):
+                                        perms = ch.permissions_for(me)
+                                except Exception:
+                                    perms = None
+                                if perms is None:
+                                    print(f"{Colors.GREEN}[Chromerrunner][WatchChannel] OK channel_id={watch_cid}{Colors.RESET}")
+                                else:
+                                    print(
+                                        f"{Colors.GREEN}[Chromerrunner][WatchChannel] OK channel_id={watch_cid} "
+                                        f"view={getattr(perms,'view_channel',None)} send={getattr(perms,'send_messages',None)} "
+                                        f"history={getattr(perms,'read_message_history',None)} embeds={getattr(perms,'embed_links',None)} "
+                                        f"threads={getattr(perms,'send_messages_in_threads',None)}{Colors.RESET}"
+                                    )
+                            except discord.Forbidden:
+                                print(
+                                    f"{Colors.RED}[Chromerrunner][WatchChannel] FORBIDDEN channel_id={watch_cid} "
+                                    f"(bot cannot view that channel; it will not receive messages there){Colors.RESET}"
+                                )
+                            except discord.NotFound:
+                                print(f"{Colors.RED}[Chromerrunner][WatchChannel] NOT_FOUND channel_id={watch_cid}{Colors.RESET}")
+                            except Exception as e:
+                                print(f"{Colors.RED}[Chromerrunner][WatchChannel] ERROR channel_id={watch_cid} {type(e).__name__}: {e}{Colors.RESET}")
+
+                        try:
+                            await asyncio.wait_for(_cw_verify_watch_channel_access(), timeout=10.0)
+                        except Exception as e:
+                            print(
+                                f"{Colors.RED}[Chromerrunner][WatchChannel] ERROR channel_id={watch_cid} "
+                                f"wait_for: {type(e).__name__}: {e}{Colors.RESET}"
+                            )
+                except Exception:
+                    pass
+
                 # Best-effort runtime shims (Ubuntu local-exec only)
                 try:
                     await self._ensure_botctl_symlink()
@@ -9110,6 +9194,8 @@ echo "CHANGED_END"
             # Always log completion
             print(f"{Colors.GREEN}[Startup] ✓ on_ready completed successfully{Colors.RESET}")
             print(f"{Colors.GREEN}[Startup] ✓ Bot is ready and accepting commands{Colors.RESET}\n")
+
+            # (Chromerrunner watch-channel verification runs near the start of startup.)
         
         # No on_message-based tracking: RSAdminBot is slash-only and avoids channel spam.
         # Exception: config-gated Chromerrunner watcher for a single operator channel.
@@ -9345,6 +9431,113 @@ echo "CHANGED_END"
                 return ""
             return best
 
+        def _extract_urls(text: str, *, limit: int = 3) -> List[str]:
+            """
+            Extract up to `limit` URLs from a message, best-first.
+            Uses the same normalization + scoring as `_extract_first_url`.
+            """
+            t = str(text or "")
+            if not t.strip():
+                return []
+
+            # Keep logic in one place: reuse the same candidate extraction by calling _extract_first_url's internals
+            # (duplicated minimally to return multiple results).
+            t = (
+                t.replace("\u200b", "")
+                .replace("\u200c", "")
+                .replace("\u200d", "")
+                .replace("\ufeff", "")
+            )
+
+            def _fuse_split_retail_hosts(s: str) -> str:
+                out = s
+                out = re.sub(r"(https?://(?:www\.)?game)\s*\n?\s*(stop\.com)", r"\1\2", out, flags=re.IGNORECASE)
+                out = re.sub(r"(https?://(?:www\.)?wal)\s*\n?\s*(mart\.com)", r"\1\2", out, flags=re.IGNORECASE)
+                return out
+
+            t = _fuse_split_retail_hosts(t)
+
+            def _host_of(u: str) -> str:
+                try:
+                    return (urlparse(u).hostname or "").lower()
+                except Exception:
+                    return ""
+
+            def _looks_real_host(host: str) -> bool:
+                if not host or "." not in host:
+                    return False
+                hl = host.lower()
+                labels = hl.split(".")
+                if not labels:
+                    return False
+                tld = labels[-1]
+                if len(tld) < 2:
+                    return False
+                if tld == "game" and "gamestop" not in hl:
+                    return False
+                return True
+
+            def _score(u: str) -> tuple:
+                h = _host_of(u)
+                if not _looks_real_host(h):
+                    return (-1, 0, u)
+                preferred = (
+                    "walmart.com",
+                    "gamestop.com",
+                    "target.com",
+                    "homedepot.com",
+                    "lowes.com",
+                    "bestbuy.com",
+                    "costco.com",
+                    "samsclub.com",
+                )
+                pref = 1 if any(h == p or h.endswith("." + p) for p in preferred) else 0
+                return (pref, len(u), u)
+
+            candidates: list[str] = []
+            for m in re.finditer(r"\]\((https?://[^)\s]+)\)", t, flags=re.IGNORECASE):
+                candidates.append(m.group(1).strip())
+            for m in re.finditer(r"<(https?://[^>\s]+)>", t, flags=re.IGNORECASE):
+                candidates.append(m.group(1).strip())
+            for m in re.finditer(r"https?://", t, flags=re.IGNORECASE):
+                start = m.start()
+                i = start + len(m.group(0))
+                buf = [m.group(0)]
+                while i < len(t):
+                    ch = t[i]
+                    if ch in " \t\r\n<>\"'":
+                        break
+                    if ch in "),.;]":
+                        break
+                    buf.append(ch)
+                    i += 1
+                candidates.append("".join(buf).strip())
+            for m in re.finditer(
+                r"https?://(?:[\w.-]+\.)*(?:gamestop|walmart|target|bestbuy|homedepot|lowes|costco|samsclub)"
+                r"\.com[^\s<>\")\]]+",
+                t,
+                flags=re.IGNORECASE,
+            ):
+                candidates.append(m.group(0).strip())
+
+            cleaned: list[str] = []
+            seen = set()
+            for u in candidates:
+                u = u.strip().rstrip(").,;]")
+                if not u:
+                    continue
+                key = u.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                if _score(u)[0] < 0:
+                    continue
+                cleaned.append(u)
+
+            cleaned.sort(key=_score, reverse=True)
+            lim = max(1, min(int(limit or 0), 10))
+            return cleaned[:lim]
+
         def _cw_channel_matches(message: discord.Message) -> bool:
             """True if this message is in the configured watch channel or a thread under it."""
             watch_cid = _cw_channel_id()
@@ -9543,11 +9736,6 @@ echo "CHANGED_END"
                     emb.add_field(name="Captured JSON", value=payloads[:1024], inline=True)
                 if image and image.lower().startswith("http"):
                     emb.set_image(url=image)
-
-                raw = out.strip()
-                if raw:
-                    raw = raw[:900] + ("..." if len(raw) > 900 else "")
-                    emb.add_field(name="Log (truncated)", value=raw, inline=False)
                 return emb
             except Exception:
                 return None
@@ -9629,8 +9817,8 @@ echo "CHANGED_END"
                 return
 
             blob = _cw_gather_text_for_urls(message) or ""
-            url = _extract_first_url(blob)
-            if not url:
+            urls = _extract_urls(blob, limit=3)
+            if not urls:
                 # Make “silent ignore” actionable: reply occasionally with the reason.
                 now = time.time()
                 ch = getattr(message, "channel", None)
@@ -9660,41 +9848,35 @@ echo "CHANGED_END"
                             pass
                 return
 
-            now = time.time()
+            if len(urls) > 1:
+                try:
+                    await message.reply(
+                        f"⏳ Chromerrunner queued: {len(urls)} link(s). Running now…",
+                        mention_author=False,
+                    )
+                except Exception:
+                    pass
+
             cooldown = _cw_cooldown_s()
-            async with self._chromerrunner_lock:
-                last = float(self._chromerrunner_last_url_ts.get(url, 0.0) or 0.0)
-                if cooldown and (now - last) < cooldown:
-                    remain = max(0.0, cooldown - (now - last))
-                    try:
-                        await message.reply(
-                            f"⏳ Chromerrunner cooldown (~{int(remain) + 1}s left for this URL). "
-                            f"Paste a different link or wait.",
-                            mention_author=False,
-                        )
-                    except discord.Forbidden:
-                        try:
-                            await message.channel.send(
-                                f"⏳ Chromerrunner cooldown (~{int(remain) + 1}s left for this URL)."
-                            )
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-                    return
-                self._chromerrunner_last_url_ts[url] = now
+            for idx, url in enumerate(urls, start=1):
+                now = time.time()
+                async with self._chromerrunner_lock:
+                    last = float(self._chromerrunner_last_url_ts.get(url, 0.0) or 0.0)
+                    if cooldown and (now - last) < cooldown:
+                        continue
+                    self._chromerrunner_last_url_ts[url] = now
 
-            ack = await _chromerrunner_reply_start(message, url)
-
-            ok, output = await _run_chromerrunner_url(url)
-            max_chars = _cw_max_chars()
-            prefix, summary = _summarize_output(url, ok, output)
-            summary = summary.strip()
-            if len(summary) > max_chars:
-                summary = summary[: max_chars - 3] + "..."
-
-            final_txt = f"{prefix} Chromerrunner done\n{summary}"
-            await _chromerrunner_reply_final(message, ack, final_txt, embed=_build_chromerrunner_embed(url, ok, output))
+                # Keep Discord output compact: content is minimal, details live in embed.
+                ack = await _chromerrunner_reply_start(message, url) if idx == 1 else None
+                ok, output = await _run_chromerrunner_url(url)
+                prefix, summary = _summarize_output(url, ok, output)
+                final_txt = f"{prefix} Chromerrunner done"
+                await _chromerrunner_reply_final(
+                    message,
+                    ack,
+                    final_txt,
+                    embed=_build_chromerrunner_embed(url, ok, output),
+                )
 
         @self.bot.event
         async def on_message(message: discord.Message):

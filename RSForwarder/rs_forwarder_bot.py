@@ -4043,7 +4043,21 @@ class RSForwarderBot:
                 unix = int(h.get("last_seen_unix") or 0)
                 rel = f"<t:{unix}:R>" if unix else "-"
                 t_short = (title[:80] + "...") if len(title) > 83 else title
+                # Build jump link to the original monitor message (where this cached data came from)
+                try:
+                    src_ch = int(h.get("source_channel_id") or 0)
+                except Exception:
+                    src_ch = 0
+                src_mid = str(h.get("source_message_id") or "").strip()
+                try:
+                    g_id = int(getattr(getattr(message, "guild", None), "id", 0) or 0) or int((self.config or {}).get("guild_id") or 0)
+                except Exception:
+                    g_id = 0
+                jump = f"https://discord.com/channels/{g_id}/{src_ch}/{src_mid}" if (g_id and src_ch and src_mid) else ""
+
                 line = f"- **{ch}** | stock={stock} | type={typ} | seen={rel}"
+                if src_ch:
+                    line += f"\n  source: <#{src_ch}>" + (f" ([jump]({jump}))" if jump else "")
                 if url:
                     line += f"\n  {url}"
                 if t_short:
