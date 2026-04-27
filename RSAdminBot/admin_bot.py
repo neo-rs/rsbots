@@ -9498,6 +9498,27 @@ echo "CHANGED_END"
                 pref = 1 if any(h == p or h.endswith("." + p) for p in preferred) else 0
                 return (pref, len(u), u)
 
+            def _skip_chromerrunner_noise_url(u: str) -> bool:
+                """
+                Discord link previews embed CDN/thumbnail URLs next to real product links.
+                Opening these in Chromerrunner looks like 'wrong URL' and adds useless runs.
+                """
+                try:
+                    p = urlparse(u)
+                    h = (p.hostname or "").lower()
+                    path = (p.path or "").lower()
+                except Exception:
+                    return False
+                if "scene7.com" in h or "scene7.net" in h:
+                    return True
+                if "target" in h and "/is/image/" in path:
+                    return True
+                if h.endswith("pinimg.com") or "cdninstagram.com" in h:
+                    return True
+                if h in ("pbs.twimg.com", "i.imgur.com") or "discordapp.com/attachments" in u.lower():
+                    return True
+                return False
+
             # Collect candidates with their position so we can preserve the paste order.
             candidates: list[tuple[int, str]] = []
             for m in re.finditer(r"\]\((https?://[^)\s]+)\)", t, flags=re.IGNORECASE):
@@ -9535,6 +9556,8 @@ echo "CHANGED_END"
                 if key in seen:
                     continue
                 seen.add(key)
+                if _skip_chromerrunner_noise_url(u):
+                    continue
                 sc = _score(u)
                 if sc[0] < 0:
                     continue

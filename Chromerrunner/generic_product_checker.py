@@ -348,6 +348,12 @@ async def check_url(
 
         context = browser.contexts[0] if browser.contexts else await browser.new_context()
         page = await context.new_page()
+        if connect_over_cdp:
+            # Make the automated tab active in the real Chrome window (noVNC / CDP debugging).
+            try:
+                await page.bring_to_front()
+            except Exception:
+                pass
 
         policy = (screenshot_policy or "ebay_only").strip().lower()
         if policy not in ("never", "ebay_only", "always"):
@@ -409,6 +415,11 @@ async def check_url(
         if nav_url != url.strip():
             print(f"(normalized eBay search URL for grid view: _dmd=2)")
         await page.goto(nav_url, wait_until="domcontentloaded", timeout=int(max(1000, goto_timeout_ms)))
+        if connect_over_cdp:
+            try:
+                await page.bring_to_front()
+            except Exception:
+                pass
         if not skip_networkidle:
             try:
                 await page.wait_for_load_state("networkidle", timeout=int(max(0, networkidle_timeout_ms)))
