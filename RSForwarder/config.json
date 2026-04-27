@@ -28,7 +28,7 @@
   "monitor_data_search_listen_channel_ids": [
     "1497910279164395723"
   ],
-  "monitor_data_search_ignore_bot_messages": true,
+  "monitor_data_search_ignore_bot_messages": false,
   "channels": [
     {
       "source_channel_id": "1446174806981480578",
