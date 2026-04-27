@@ -9646,6 +9646,18 @@ echo "CHANGED_END"
             except Exception:
                 skip_networkidle = False
             skip_flag = "--skip-networkidle" if skip_networkidle else ""
+            sp = str(cfg.get("screenshot_policy") or "ebay_only").strip().lower()
+            if sp not in ("never", "ebay_only", "always"):
+                sp = "ebay_only"
+            try:
+                clip_h = int(cfg.get("ebay_sch_clip_height_px") or 1150)
+            except Exception:
+                clip_h = 1150
+            clip_h = max(400, min(clip_h, 4000))
+            lazy_scroll = bool(cfg.get("lazy_wheel_scroll", False))
+            extra_flags = f" --screenshot-policy {shlex.quote(sp)} --ebay-sch-clip-height {clip_h}"
+            if lazy_scroll:
+                extra_flags += " --lazy-wheel-scroll"
 
             # Two modes:
             # - headless: launch system chrome headless (still may be blocked by strict retailers on Oracle IP)
@@ -9660,7 +9672,8 @@ echo "CHANGED_END"
                 f"cd {runner_dir_q}"
                 " && source .venv/bin/activate"
                 # Reduce noisy Node/Playwright warnings in Discord output.
-                f" && NODE_NO_WARNINGS=1 NODE_OPTIONS=--no-deprecation python generic_product_checker.py --url {url_q} {runner_flags} --auto-wait-s {auto_wait} --goto-timeout-ms {goto_timeout_ms} --networkidle-timeout-ms {networkidle_timeout_ms} {skip_flag}"
+                f" && NODE_NO_WARNINGS=1 NODE_OPTIONS=--no-deprecation python generic_product_checker.py --url {url_q} {runner_flags}"
+                f" --auto-wait-s {auto_wait} --goto-timeout-ms {goto_timeout_ms} --networkidle-timeout-ms {networkidle_timeout_ms} {skip_flag}{extra_flags}"
             )
 
             loop = asyncio.get_running_loop()

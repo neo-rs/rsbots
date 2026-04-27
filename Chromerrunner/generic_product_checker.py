@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -95,6 +95,41 @@ def _safe_host(url: str) -> str:
     host = (urlparse(url).hostname or "unknown").lower()
     host = re.sub(r"[^a-z0-9._-]+", "_", host)
     return host or "unknown"
+
+
+def _is_ebay(url: str) -> bool:
+    try:
+        h = (urlparse(url).hostname or "").lower()
+        return "ebay." in h or h.endswith("ebay.com")
+    except Exception:
+        return False
+
+
+def _is_ebay_sch(url: str) -> bool:
+    try:
+        if not _is_ebay(url):
+            return False
+        path = (urlparse(url).path or "").lower()
+        return "/sch/" in path
+    except Exception:
+        return False
+
+
+def _ebay_ensure_grid_param(url: str) -> str:
+    """Prefer grid-style results (`_dmd=2`) on eBay search URLs when missing."""
+    if not _is_ebay_sch(url):
+        return url
+    try:
+        p = urlparse(url)
+        pairs = parse_qsl(p.query, keep_blank_values=True)
+        keys_lower = {k.lower() for k, _ in pairs}
+        if "_dmd" in keys_lower:
+            return url
+        pairs.append(("_dmd", "2"))
+        new_query = urlencode(pairs, doseq=True)
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
+    except Exception:
+        return url
 
 
 def _now_ts() -> int:
@@ -291,6 +326,9 @@ async def check_url(
     goto_timeout_ms: int = 90000,
     networkidle_timeout_ms: int = 15000,
     skip_networkidle: bool = False,
+    screenshot_policy: str = "ebay_only",
+    lazy_wheel_scroll: bool = False,
+    ebay_sch_clip_height_px: int = 1150,
 ) -> Dict[str, Any]:
     async with async_playwright() as p:
         browser = None
@@ -310,6 +348,12 @@ async def check_url(
 
         context = browser.contexts[0] if browser.contexts else await browser.new_context()
         page = await context.new_page()
+
+        policy = (screenshot_policy or "ebay_only").strip().lower()
+        if policy not in ("never", "ebay_only", "always"):
+            policy = "ebay_only"
+
+        nav_url = _ebay_ensure_grid_param(url.strip())
 
         captured: List[Any] = []
         captured_urls: List[str] = []
@@ -361,8 +405,10 @@ async def check_url(
 
         page.on("response", on_response)
 
-        print(f"\nOpening: {url}")
-        await page.goto(url, wait_until="domcontentloaded", timeout=int(max(1000, goto_timeout_ms)))
+        print(f"\nOpening: {nav_url}")
+        if nav_url != url.strip():
+            print(f"(normalized eBay search URL for grid view: _dmd=2)")
+        await page.goto(nav_url, wait_until="domcontentloaded", timeout=int(max(1000, goto_timeout_ms)))
         if not skip_networkidle:
             try:
                 await page.wait_for_load_state("networkidle", timeout=int(max(0, networkidle_timeout_ms)))
@@ -376,13 +422,16 @@ async def check_url(
             input("Press ENTER here when ready to extract...")
             await page.wait_for_timeout(2000)
         else:
-            # Headless/server-friendly: do a small scroll + wait to trigger lazy loads.
+            # Default: wait only — automatic wheel scrolling + full-page screenshots both look bot-like
+            # and (for screenshots) force long vertical traversal. Optional lazy-wheel restores old behavior.
             try:
                 await page.wait_for_timeout(int(max(0.0, auto_wait_s) * 1000))
-                await page.mouse.wheel(0, 1200)
-                await page.wait_for_timeout(750)
-                await page.mouse.wheel(0, 1200)
-                await page.wait_for_timeout(750)
+                await page.evaluate("window.scrollTo(0, 0)")
+                if lazy_wheel_scroll:
+                    await page.mouse.wheel(0, 1200)
+                    await page.wait_for_timeout(750)
+                    await page.mouse.wheel(0, 1200)
+                    await page.wait_for_timeout(750)
             except Exception:
                 pass
 
@@ -416,8 +465,9 @@ async def check_url(
         )
 
         result = {
-            "url": url,
-            "host": _safe_host(url),
+            "url": url.strip(),
+            "opened_url": (nav_url if nav_url != url.strip() else None),
+            "host": _safe_host(nav_url),
             "page_title": clean(await page.title()),
             "title": clean(_first(None if title_dom == "N/A" else title_dom, meta.get("og:title"), meta.get("twitter:title"), jsonld_summary.get("jsonld_title"))),
             "price": clean(price_best),
@@ -441,9 +491,34 @@ async def check_url(
         (Path(str(prefix) + "_raw_payloads.json")).write_text(json.dumps(captured, indent=2, ensure_ascii=False), encoding="utf-8")
         (Path(str(prefix) + "_jsonld_raw.json")).write_text(json.dumps(jsonld_raw[:40], indent=2, ensure_ascii=False), encoding="utf-8")
 
+        want_shot = policy == "always" or (policy == "ebay_only" and _is_ebay(nav_url))
+        shot_path = str(prefix) + ".png"
         try:
-            await page.screenshot(path=str(prefix) + ".png", full_page=True)
-            result["screenshot"] = str(prefix) + ".png"
+            if want_shot:
+                await page.evaluate("window.scrollTo(0, 0)")
+                await page.wait_for_timeout(400)
+                vw = 1280
+                vh = 900
+                try:
+                    vs = page.viewport_size
+                    if isinstance(vs, dict):
+                        vw = int(vs.get("width") or vw)
+                        vh = int(vs.get("height") or vh)
+                except Exception:
+                    pass
+                clip_h = max(400, min(int(ebay_sch_clip_height_px or 1150), 4000))
+                if _is_ebay_sch(nav_url):
+                    # Sold-search grid: top region ~first two rows (no full-page stitching scroll).
+                    clip = {"x": 0, "y": 0, "width": vw, "height": min(clip_h, vh)}
+                    await page.screenshot(path=shot_path, full_page=False, clip=clip)
+                    print(f"Screenshot (eBay search top clip): {shot_path}")
+                else:
+                    # Other pages: single viewport only (no full_page scroll traversal).
+                    await page.screenshot(path=shot_path, full_page=False)
+                    print(f"Screenshot (viewport): {shot_path}")
+                result["screenshot"] = shot_path
+            else:
+                result["screenshot"] = "N/A"
         except Exception:
             result["screenshot"] = "N/A"
 
@@ -455,7 +530,10 @@ async def check_url(
 
 def print_result(r: Dict[str, Any]) -> None:
     print("\n" + "=" * 78)
+    ou = r.get("opened_url")
     print(f"URL: {r.get('url')}")
+    if ou:
+        print(f"Opened: {ou}")
     print(f"Title: {r.get('title')}")
     print(f"Price: {r.get('price')}")
     print(f"Brand: {r.get('brand')}")
@@ -477,6 +555,24 @@ async def main_async() -> None:
     ap.add_argument("--goto-timeout-ms", type=int, default=90000, help="Timeout for page.goto (milliseconds).")
     ap.add_argument("--networkidle-timeout-ms", type=int, default=15000, help="Timeout for wait_for_load_state('networkidle') (milliseconds).")
     ap.add_argument("--skip-networkidle", action="store_true", help="Skip networkidle wait (faster, but may reduce extraction reliability).")
+    ap.add_argument(
+        "--screenshot-policy",
+        choices=["never", "ebay_only", "always"],
+        default="ebay_only",
+        help="Screenshots: never | ebay_only (default: eBay URLs only, viewport / clipped) | always (viewport only).",
+    )
+    ap.add_argument(
+        "--lazy-wheel-scroll",
+        action="store_true",
+        help="Legacy: wheel-scroll down after load (was default; triggers more bot-like motion).",
+    )
+    ap.add_argument(
+        "--ebay-sch-clip-height",
+        type=int,
+        default=1150,
+        metavar="PX",
+        help="eBay /sch/ pages: screenshot clip height from top (default 1150 ~ two grid rows).",
+    )
     args = ap.parse_args()
 
     urls: List[str] = []
@@ -514,6 +610,9 @@ async def main_async() -> None:
                 goto_timeout_ms=args.goto_timeout_ms,
                 networkidle_timeout_ms=args.networkidle_timeout_ms,
                 skip_networkidle=bool(args.skip_networkidle),
+                screenshot_policy=str(args.screenshot_policy or "ebay_only"),
+                lazy_wheel_scroll=bool(args.lazy_wheel_scroll),
+                ebay_sch_clip_height_px=int(args.ebay_sch_clip_height or 1150),
             )
             print_result(r)
             batch_results.append(r)

@@ -171,7 +171,10 @@
     "chrome_exe": "/usr/bin/google-chrome",
     "headless": true,
     "post_back_enabled": true,
-    "max_response_chars": 1600
+    "max_response_chars": 1600,
+    "screenshot_policy": "ebay_only",
+    "lazy_wheel_scroll": false,
+    "ebay_sch_clip_height_px": 1150
   }
 }
 
