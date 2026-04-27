@@ -92,7 +92,7 @@
       }
     },
     {
-      "source_channel_id": "",
+      "source_channel_id": "1487446697146712296",
       "source_channel_name": "price-error-glitched",
       "dedupe_priority": 200,
       "role_mention": {
