@@ -288,6 +288,9 @@ async def check_url(
     manual_checkpoint: bool,
     chrome_exe: Optional[str],
     auto_wait_s: float,
+    goto_timeout_ms: int = 90000,
+    networkidle_timeout_ms: int = 15000,
+    skip_networkidle: bool = False,
 ) -> Dict[str, Any]:
     async with async_playwright() as p:
         browser = None
@@ -359,11 +362,12 @@ async def check_url(
         page.on("response", on_response)
 
         print(f"\nOpening: {url}")
-        await page.goto(url, wait_until="domcontentloaded", timeout=90000)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=15000)
-        except PlaywrightTimeoutError:
-            pass
+        await page.goto(url, wait_until="domcontentloaded", timeout=int(max(1000, goto_timeout_ms)))
+        if not skip_networkidle:
+            try:
+                await page.wait_for_load_state("networkidle", timeout=int(max(0, networkidle_timeout_ms)))
+            except PlaywrightTimeoutError:
+                pass
 
         if manual_checkpoint:
             print("\nManual checkpoint:")
@@ -470,6 +474,9 @@ async def main_async() -> None:
     ap.add_argument("--manual", action="store_true", help="Pause for manual fixes/scroll before extraction.")
     ap.add_argument("--chrome-exe", help="Path to system Chrome (e.g. /usr/bin/google-chrome). Used when NOT using --connect-cdp.")
     ap.add_argument("--auto-wait-s", type=float, default=3.0, help="Extra wait (seconds) before extraction when not using --manual.")
+    ap.add_argument("--goto-timeout-ms", type=int, default=90000, help="Timeout for page.goto (milliseconds).")
+    ap.add_argument("--networkidle-timeout-ms", type=int, default=15000, help="Timeout for wait_for_load_state('networkidle') (milliseconds).")
+    ap.add_argument("--skip-networkidle", action="store_true", help="Skip networkidle wait (faster, but may reduce extraction reliability).")
     args = ap.parse_args()
 
     urls: List[str] = []
@@ -504,6 +511,9 @@ async def main_async() -> None:
                 manual_checkpoint=args.manual,
                 chrome_exe=chrome_exe,
                 auto_wait_s=args.auto_wait_s,
+                goto_timeout_ms=args.goto_timeout_ms,
+                networkidle_timeout_ms=args.networkidle_timeout_ms,
+                skip_networkidle=bool(args.skip_networkidle),
             )
             print_result(r)
             batch_results.append(r)

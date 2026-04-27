@@ -9430,6 +9430,20 @@ echo "CHANGED_END"
             headless_flag = "--headless" if _cw_headless() else ""
             mode = _cw_mode()
             cdp_url_q = shlex.quote(_cw_cdp_url())
+            cfg = _cw_cfg()
+            try:
+                goto_timeout_ms = int(cfg.get("goto_timeout_ms") or 90000)
+            except Exception:
+                goto_timeout_ms = 90000
+            try:
+                networkidle_timeout_ms = int(cfg.get("networkidle_timeout_ms") or 15000)
+            except Exception:
+                networkidle_timeout_ms = 15000
+            try:
+                skip_networkidle = bool(cfg.get("skip_networkidle", False))
+            except Exception:
+                skip_networkidle = False
+            skip_flag = "--skip-networkidle" if skip_networkidle else ""
 
             # Two modes:
             # - headless: launch system chrome headless (still may be blocked by strict retailers on Oracle IP)
@@ -9444,7 +9458,7 @@ echo "CHANGED_END"
                 f"cd {runner_dir_q}"
                 " && source .venv/bin/activate"
                 # Reduce noisy Node/Playwright warnings in Discord output.
-                f" && NODE_NO_WARNINGS=1 NODE_OPTIONS=--no-deprecation python generic_product_checker.py --url {url_q} {runner_flags} --auto-wait-s {auto_wait}"
+                f" && NODE_NO_WARNINGS=1 NODE_OPTIONS=--no-deprecation python generic_product_checker.py --url {url_q} {runner_flags} --auto-wait-s {auto_wait} --goto-timeout-ms {goto_timeout_ms} --networkidle-timeout-ms {networkidle_timeout_ms} {skip_flag}"
             )
 
             loop = asyncio.get_running_loop()
@@ -9493,6 +9507,49 @@ echo "CHANGED_END"
             # Otherwise, treat normal output as success/failure.
             return ("✅" if ok else "⚠️"), f"URL: {url}\n\n{out.strip() or 'No output.'}"
 
+        def _build_chromerrunner_embed(url: str, ok: bool, output: str) -> Optional[discord.Embed]:
+            """
+            Build a compact Discord embed from generic_product_checker.py output.
+            Falls back to None if parsing fails.
+            """
+            try:
+                out = (output or "").replace("\r\n", "\n").replace("\r", "\n")
+
+                def _m(pat: str) -> str:
+                    m = re.search(pat, out, flags=re.IGNORECASE | re.MULTILINE)
+                    return (m.group(1).strip() if m else "")
+
+                title = _m(r"^Title:\s*(.+)$")
+                price = _m(r"^Price:\s*(.+)$")
+                brand = _m(r"^Brand:\s*(.+)$")
+                image = _m(r"^Image:\s*(.+)$")
+                payloads = _m(r"^Captured JSON Payloads:\s*(.+)$")
+
+                emb = discord.Embed(
+                    title=("Chromerrunner done" if ok else "Chromerrunner done (warning)"),
+                    url=url,
+                    color=(0x2ECC71 if ok else 0xF1C40F),
+                )
+                if title:
+                    emb.add_field(name="Title", value=title[:1024], inline=False)
+                emb.add_field(name="URL", value=url[:1024], inline=False)
+                if price:
+                    emb.add_field(name="Price", value=price[:1024], inline=True)
+                if brand:
+                    emb.add_field(name="Brand", value=brand[:1024], inline=True)
+                if payloads:
+                    emb.add_field(name="Captured JSON", value=payloads[:1024], inline=True)
+                if image and image.lower().startswith("http"):
+                    emb.set_image(url=image)
+
+                raw = out.strip()
+                if raw:
+                    raw = raw[:900] + ("..." if len(raw) > 900 else "")
+                    emb.add_field(name="Log (truncated)", value=raw, inline=False)
+                return emb
+            except Exception:
+                return None
+
         async def _chromerrunner_reply_start(message: discord.Message, url: str):
             try:
                 return await message.reply(f"⏳ Chromerrunner starting…\nURL: {url}", mention_author=False)
@@ -9505,18 +9562,23 @@ echo "CHANGED_END"
             except Exception:
                 return None
 
-        async def _chromerrunner_reply_final(message: discord.Message, ack: Any, final_txt: str):
+        async def _chromerrunner_reply_final(
+            message: discord.Message,
+            ack: Any,
+            final_txt: str,
+            embed: Optional[discord.Embed] = None,
+        ):
             if ack:
                 try:
-                    await ack.edit(content=final_txt)
+                    await ack.edit(content=final_txt, embed=embed)
                     return
                 except Exception:
                     pass
             try:
-                await message.reply(final_txt, mention_author=False)
+                await message.reply(final_txt, mention_author=False, embed=embed)
             except discord.Forbidden:
                 try:
-                    await message.channel.send(final_txt[:1900])
+                    await message.channel.send(final_txt[:1900], embed=embed)
                 except Exception:
                     pass
             except Exception:
@@ -9593,7 +9655,7 @@ echo "CHANGED_END"
                 summary = summary[: max_chars - 3] + "..."
 
             final_txt = f"{prefix} Chromerrunner done\n{summary}"
-            await _chromerrunner_reply_final(message, ack, final_txt)
+            await _chromerrunner_reply_final(message, ack, final_txt, embed=_build_chromerrunner_embed(url, ok, output))
 
         @self.bot.event
         async def on_message(message: discord.Message):
