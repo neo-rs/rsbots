@@ -56,6 +56,7 @@ _URL_RE = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
 _SUPPORTED_STORES: set[str] = {
     "bestbuy",
     "lowes",
+    "target",
     "walmart",
     "bjs",
     "snipes",
