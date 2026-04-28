@@ -3412,6 +3412,8 @@ class RSAdminBot:
         # Discord fires on_message then on_message_edit when link previews attach — same URLs re-run unless deduped.
         self._chromerrunner_urls_done_for_message_id: Dict[int, Set[str]] = {}
         self._chromerrunner_msg_registry_ts: Dict[int, float] = {}
+        # Prevent concurrent duplicate dispatch when the same message triggers both on_message and on_message_edit.
+        self._chromerrunner_inflight_message_ids: Set[int] = set()
 
         # Journal live streaming + webhooks (test server only; webhooks are stored server-side in config.secrets.json)
         self._http_session: Optional[aiohttp.ClientSession] = None
@@ -10055,59 +10057,90 @@ echo "CHANGED_END"
                         return
                 urls = pending_urls
 
-            if len(urls) > 1:
-                try:
-                    await message.reply(
-                        "⏳ Chromerrunner queued:\n" + "\n".join(f"{i}. <{u}>" for i, u in enumerate(urls, start=1)),
-                        mention_author=False,
-                    )
-                except Exception:
-                    pass
-
-            cooldown = _cw_cooldown_s()
-            for idx, url in enumerate(urls, start=1):
-                now = time.time()
+            # If we have a message_id, ensure only one handler (create/edit) processes it at a time.
+            # Otherwise, a fast MESSAGE_EDIT can run concurrently and duplicate queued/result posts.
+            if mid:
                 async with self._chromerrunner_lock:
-                    last = float(self._chromerrunner_last_url_ts.get(url, 0.0) or 0.0)
-                    if cooldown and (now - last) < cooldown:
+                    if mid in self._chromerrunner_inflight_message_ids:
                         try:
-                            rem = max(0.0, cooldown - (now - last))
                             print(
-                                f"{Colors.YELLOW}[Chromerrunner][Cooldown] skip url={url[:200]} "
-                                f"retry_in_s={rem:.1f}{Colors.RESET}"
+                                f"{Colors.DIM}[Chromerrunner][Inflight] msg_id={mid} "
+                                f"skip (already being processed){Colors.RESET}"
                             )
                         except Exception:
                             pass
-                        continue
-                    self._chromerrunner_last_url_ts[url] = now
-
-                # Keep Discord output compact: content is minimal, details live in embed.
-                ack = await _chromerrunner_reply_start(message, url) if idx == 1 else None
-                ok_ssh, output = await _run_chromerrunner_url(url)
-                semantic_ok = _chromerrunner_semantic_ok(ok_ssh, output)
-                prefix, summary = _summarize_output(url, semantic_ok, output)
-                cap = 1900
-                combined = f"{prefix}\n{summary}"
-                final_txt = combined if len(combined) <= cap else (combined[: cap - 28] + "\n…(truncated)")
-                await _chromerrunner_reply_final(
-                    message,
-                    ack,
-                    final_txt,
-                    embed=_build_chromerrunner_embed(url, semantic_ok, output),
-                )
-                if mid and _chromerrunner_should_record_url_done(output):
+                        return
+                    self._chromerrunner_inflight_message_ids.add(mid)
+            try:
+                if len(urls) > 1:
                     try:
-                        async with self._chromerrunner_lock:
-                            self._chromerrunner_urls_done_for_message_id.setdefault(mid, set()).add(url)
-                            self._chromerrunner_msg_registry_ts[mid] = time.time()
+                        await message.reply(
+                            "⏳ Chromerrunner queued:\n"
+                            + "\n".join(f"{i}. <{u}>" for i, u in enumerate(urls, start=1)),
+                            mention_author=False,
+                        )
                     except Exception:
                         pass
-                elif mid:
+
+                cooldown = _cw_cooldown_s()
+                for idx, url in enumerate(urls, start=1):
+                    now = time.time()
+                    async with self._chromerrunner_lock:
+                        last = float(self._chromerrunner_last_url_ts.get(url, 0.0) or 0.0)
+                        if cooldown and (now - last) < cooldown:
+                            try:
+                                rem = max(0.0, cooldown - (now - last))
+                                print(
+                                    f"{Colors.YELLOW}[Chromerrunner][Cooldown] skip url={url[:200]} "
+                                    f"retry_in_s={rem:.1f}{Colors.RESET}"
+                                )
+                            except Exception:
+                                pass
+                            # Treat cooldown-skipped URLs as handled for this *message_id* so MESSAGE_EDIT
+                            # doesn't re-queue/re-run them immediately.
+                            if mid:
+                                try:
+                                    self._chromerrunner_urls_done_for_message_id.setdefault(mid, set()).add(url)
+                                    self._chromerrunner_msg_registry_ts[mid] = time.time()
+                                except Exception:
+                                    pass
+                            continue
+                        self._chromerrunner_last_url_ts[url] = now
+
+                    # Keep Discord output compact: content is minimal, details live in embed.
+                    ack = await _chromerrunner_reply_start(message, url) if idx == 1 else None
+                    ok_ssh, output = await _run_chromerrunner_url(url)
+                    semantic_ok = _chromerrunner_semantic_ok(ok_ssh, output)
+                    prefix, summary = _summarize_output(url, semantic_ok, output)
+                    cap = 1900
+                    combined = f"{prefix}\n{summary}"
+                    final_txt = combined if len(combined) <= cap else (combined[: cap - 28] + "\n…(truncated)")
+                    await _chromerrunner_reply_final(
+                        message,
+                        ack,
+                        final_txt,
+                        embed=_build_chromerrunner_embed(url, semantic_ok, output),
+                    )
+                    if mid and _chromerrunner_should_record_url_done(output):
+                        try:
+                            async with self._chromerrunner_lock:
+                                self._chromerrunner_urls_done_for_message_id.setdefault(mid, set()).add(url)
+                                self._chromerrunner_msg_registry_ts[mid] = time.time()
+                        except Exception:
+                            pass
+                    elif mid:
+                        try:
+                            print(
+                                f"{Colors.YELLOW}[Chromerrunner] msg_id={mid} not marking URL done "
+                                f"(checker did not run — deploy Chromerrunner/generic_product_checker.py on server){Colors.RESET}"
+                            )
+                        except Exception:
+                            pass
+            finally:
+                if mid:
                     try:
-                        print(
-                            f"{Colors.YELLOW}[Chromerrunner] msg_id={mid} not marking URL done "
-                            f"(checker did not run — deploy Chromerrunner/generic_product_checker.py on server){Colors.RESET}"
-                        )
+                        async with self._chromerrunner_lock:
+                            self._chromerrunner_inflight_message_ids.discard(mid)
                     except Exception:
                         pass
 
