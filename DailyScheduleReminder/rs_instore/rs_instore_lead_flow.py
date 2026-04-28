@@ -479,6 +479,56 @@ def _wait_for_message_to_gain_embeds(
         f"Timed out waiting for resolver message to gain embeds. last_preview={last_preview!r}"
     )
 
+
+def _extract_details_from_first_embed(reply: dict) -> tuple[str, str, str]:
+    """
+    Extract (title, price, img) from a resolver reply message.
+    Raises if required parts are missing.
+    """
+    embeds = reply.get("embeds") or []
+    if not isinstance(embeds, list) or not embeds:
+        raise RuntimeError("no embeds")
+    e0 = embeds[0] if isinstance(embeds[0], dict) else {}
+    title = str(e0.get("title") or "").strip()
+    if not title:
+        title = str(e0.get("description") or "").splitlines()[0].strip()
+    fm = _field_map(e0)
+    msrp = _clean_price(_get_field(fm, "msrp", "retail", "price"))
+    low = _clean_price(_get_field(fm, "as low as", "as low", "low"))
+    price = msrp or low
+    img = _embed_image_url(e0)
+    if not (title and price and img):
+        raise RuntimeError(f"missing(title={bool(title)} price={bool(price)} img={bool(img)})")
+    return title, price, img
+
+
+def _wait_for_message_to_have_details(
+    *,
+    channel_id: str,
+    message_id: str,
+    token: str,
+    timeout_s: float,
+) -> dict:
+    """
+    Resolver bots often edit their initial status message multiple times.
+    Poll the message id until the embed has title+price+image.
+    """
+    deadline = time.time() + float(timeout_s)
+    last_preview = ""
+    while time.time() < deadline:
+        m = _fetch_message_by_id(channel_id, message_id, token)
+        if isinstance(m, dict):
+            last_preview = _message_debug_preview(m) or last_preview
+            try:
+                _extract_details_from_first_embed(m)
+                return m
+            except Exception:
+                pass
+        time.sleep(1.2)
+    raise TimeoutError(
+        f"Timed out waiting for resolver message to have details. last_preview={last_preview!r}"
+    )
+
 def _message_debug_preview(m: dict) -> str:
     parts: list[str] = []
     c = str(m.get("content") or "").strip()
@@ -682,11 +732,11 @@ def _resolve_url_to_details(
                 print(f"  link->resolver: status: {_console_safe(preview)}")
                 # Many runs are edited in-place. Poll this message id for the final embed.
                 try:
-                    reply = _wait_for_message_to_gain_embeds(
+                    reply = _wait_for_message_to_have_details(
                         channel_id=resolver_channel_id,
                         message_id=str(m.get("id") or ""),
                         token=token,
-                        timeout_s=max(5.0, deadline - time.time()),
+                        timeout_s=max(10.0, deadline - time.time()),
                     )
                     break
                 except TimeoutError:
@@ -696,11 +746,11 @@ def _resolve_url_to_details(
             if "processing" in blob and "url:" in blob:
                 print(f"  link->resolver: status: {_console_safe(preview)}")
                 try:
-                    reply = _wait_for_message_to_gain_embeds(
+                    reply = _wait_for_message_to_have_details(
                         channel_id=resolver_channel_id,
                         message_id=str(m.get("id") or ""),
                         token=token,
-                        timeout_s=max(5.0, deadline - time.time()),
+                        timeout_s=max(10.0, deadline - time.time()),
                     )
                     break
                 except TimeoutError:
@@ -709,8 +759,15 @@ def _resolve_url_to_details(
 
             embeds = m.get("embeds") or []
             if isinstance(embeds, list) and embeds:
-                reply = m
-                break
+                # If this is already a full reply (not an in-place edited one), accept only when it has details.
+                try:
+                    _extract_details_from_first_embed(m)
+                    reply = m
+                    break
+                except Exception:
+                    # Still evolving; keep waiting.
+                    last_preview = preview or last_preview
+                    continue
             # If it matched our host but still has no embeds and isn't a known status line,
             # keep waiting (but log once so it's visible).
             if preview:
@@ -723,23 +780,7 @@ def _resolve_url_to_details(
     else:
         raise TimeoutError(f"Timed out waiting for link resolver embed. last_preview={last_preview!r}")
 
-    embeds = reply.get("embeds") or []
-    if not isinstance(embeds, list) or not embeds:
-        raise RuntimeError(
-            "Link resolver finished without embeds. "
-            f"reply_preview={_message_debug_preview(reply)!r}"
-        )
-    e0 = embeds[0] if isinstance(embeds[0], dict) else {}
-    title = str(e0.get("title") or "").strip()
-    fm = _field_map(e0)
-    msrp = _clean_price(_get_field(fm, "msrp", "retail", "price"))
-    low = _clean_price(_get_field(fm, "as low as", "as low", "low"))
-    price = msrp or low
-    img = _embed_image_url(e0)
-    if not title:
-        title = str(e0.get("description") or "").splitlines()[0].strip()
-    if not (title and price and img):
-        raise RuntimeError(f"Missing required details (title={bool(title)} price={bool(price)} img={bool(img)}).")
+    title, price, img = _extract_details_from_first_embed(reply)
     return title, price, img
 
 
