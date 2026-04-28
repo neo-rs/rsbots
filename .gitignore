@@ -180,6 +180,16 @@ catalog_nav_bot/data/
 Mavelytest/audit_logs/
 Mavelytest/*_report.json
 
+# MWBots (tracked code only; secrets remain ignored by rules below)
+!MWBots/
+!MWBots/**/
+!MWBots/Instorebotforwarder/
+!MWBots/Instorebotforwarder/**/
+!MWBots/Instorebotforwarder/*.py
+!MWBots/Instorebotforwarder/**/*.py
+!MWBots/Instorebotforwarder/*.bat
+!MWBots/Instorebotforwarder/config.json
+
 # Tester (local Playwright profile; keep scripts tracked)
 Tester/pw_profile/
 

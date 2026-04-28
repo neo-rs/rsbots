@@ -80,6 +80,18 @@ if exist "Instorebotforwarder\retail_product_link_listener.py" (
 
 )
 
+if exist "Instorebotforwarder\audit_conversational_deals_forward.py" (
+
+  git add -- "Instorebotforwarder/audit_conversational_deals_forward.py"
+
+)
+
+if exist "Instorebotforwarder\conversational_deals_forwarder.py" (
+
+  git add -- "Instorebotforwarder/conversational_deals_forwarder.py"
+
+)
+
 
 
 REM If nothing is staged, exit cleanly (reminders still print at :pause_exit)
