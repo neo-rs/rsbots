@@ -196,6 +196,15 @@ telnyx_sms/inbound.json
 !amazon_asin_promo_checker/.env.example
 !amazon_asin_promo_checker/settings.example.json
 
+# Discord slash command inspector (local token store under _data/ is never committed)
+!discord_slash_tool/
+!discord_slash_tool/**/
+!discord_slash_tool/*.py
+!discord_slash_tool/**/*.py
+!discord_slash_tool/*.bat
+!discord_slash_tool/requirements.txt
+discord_slash_tool/_data/
+
 # Chromerrunner (real-chrome / headless product capture tool; no secrets in tracked scripts)
 !Chromerrunner/
 !Chromerrunner/**/

@@ -259,6 +259,17 @@ class RSVouchBot:
         self.vouches_data["vouches"].append(vouch_entry)
         self.save_vouches_data()
 
+        channel = self.bot.get_channel(vouch_channel_id)
+        if not channel:
+            await interaction.response.send_message("❌ Vouch channel not found.", ephemeral=True)
+            return
+
+        # Discord requires an initial response within ~3s. Channel post + optional DM can exceed that,
+        # which surfaces as "The application did not respond" for the owning app (often shown as the
+        # primary bot name even when the Success bot handles the logic).
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+
         color = self.get_embed_color(rating)
         embed = discord.Embed(
             title="New Vouch Received",
@@ -272,12 +283,16 @@ class RSVouchBot:
         embed.set_thumbnail(url=user.display_avatar.url)
         embed.set_footer(text=self.vouch_config.get("footer_text", "Reselling Secrets Vouch System"))
 
-        channel = self.bot.get_channel(vouch_channel_id)
-        if not channel:
-            await interaction.response.send_message("❌ Vouch channel not found.", ephemeral=True)
+        try:
+            public_msg = await channel.send(embed=embed, view=VouchView(user, self))
+        except Exception as e:
+            print(f"{Colors.RED}[Vouch] Failed to post vouch to channel: {e}{Colors.RESET}")
+            await interaction.followup.send(
+                "❌ Could not post the vouch to the configured channel (permissions or network). Staff has been notified via logs.",
+                ephemeral=True,
+            )
             return
 
-        public_msg = await channel.send(embed=embed, view=VouchView(user, self))
         message_link = f"https://discord.com/channels/{guild_id}/{vouch_channel_id}/{public_msg.id}"
 
         try:
@@ -293,7 +308,7 @@ class RSVouchBot:
         except discord.Forbidden:
             print(f"{Colors.YELLOW}[Vouch] Could not DM user {user}{Colors.RESET}")
 
-        await interaction.response.send_message("✅ Successfully vouched for the user!", ephemeral=True)
+        await interaction.followup.send("✅ Successfully vouched for the user!", ephemeral=True)
 
         mp = getattr(self, "_marketplace_bot", None)
         if mp is not None:
