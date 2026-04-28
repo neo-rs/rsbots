@@ -607,6 +607,14 @@ class RSSuccessBot:
                         
                         # Sync to guild (instant)
                         try:
+                            # Commands are defined without guild=..., i.e. as *global* definitions in the tree.
+                            # When we want guild-only visibility (to avoid duplicates and allow fast updates),
+                            # we must copy the global definitions into the guild command set before syncing.
+                            try:
+                                self.bot.tree.copy_global_to(guild=discord.Object(id=guild_id))
+                            except Exception as e:
+                                print(f"{Colors.YELLOW}[Commands] copy_global_to failed (continuing): {e}{Colors.RESET}")
+
                             synced = await self.bot.tree.sync(guild=discord.Object(id=guild_id))
                             if synced:
                                 print(f"{Colors.GREEN}[Commands] Synced {len(synced)} slash command(s) to guild{Colors.RESET}")
@@ -1655,6 +1663,10 @@ class RSSuccessBot:
                 print(f"{Colors.CYAN}[Sync] Found {len(all_commands)} registered command(s){Colors.RESET}")
                 
                 # Sync to guild (instant). Do not also sync globally — Discord shows both and every command appears twice.
+                try:
+                    self.bot.tree.copy_global_to(guild=discord.Object(id=guild_id))
+                except Exception as e:
+                    print(f"{Colors.YELLOW}[Sync] copy_global_to failed (continuing): {e}{Colors.RESET}")
                 synced = await self.bot.tree.sync(guild=discord.Object(id=guild_id))
                 print(f"{Colors.GREEN}[Sync] Guild sync returned {len(synced)} command(s){Colors.RESET}")
 
