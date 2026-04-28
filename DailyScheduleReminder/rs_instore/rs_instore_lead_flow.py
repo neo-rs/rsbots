@@ -982,7 +982,8 @@ def _process_breakdown_message(
             price=price,
             product_id=r.id_value,
             image_url=img,
-            store_slug=r.store_name.strip().lower().replace(" ", "-"),
+            # Use URL-derived store key (canonical). The bracket label in breakdowns is often product name.
+            store_slug=store_key,
             destination_channel_id=dest_ch,
         )
         print(f"  !m lead: {cmd_line}")
@@ -1002,7 +1003,7 @@ def _process_breakdown_message(
             price=price,
             product_id=r.id_value,
             image_url=img,
-            store_slug=r.store_name.strip().lower().replace(" ", "-"),
+            store_slug=store_key,
             destination_channel_id=dest_ch,
         )
         cmd_id = str(sent_cmd.get("id") or "")

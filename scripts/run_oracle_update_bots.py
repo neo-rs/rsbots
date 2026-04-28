@@ -248,12 +248,10 @@ def _restart_services_snippet(*, service_names: List[str]) -> str:
         parts.append(
             f"""
 echo "Restarting {shlex.quote(name)}..."
-if systemctl list-unit-files | grep -Fq {shlex.quote(name)}; then
-  sudo systemctl restart {shlex.quote(name)} || true
-  sudo systemctl is-active {shlex.quote(name)} || true
-else
-  echo "WARN: unit not found: {shlex.quote(name)}"
-fi
+# Do not try to "detect" existence via list-unit-files (can be stale or filtered).
+# Attempt restart and then show active state. If unit truly does not exist, systemctl prints a clear error.
+sudo systemctl restart {shlex.quote(name)} || true
+sudo systemctl is-active {shlex.quote(name)} || true
 """
         )
     return "\n".join(parts)
