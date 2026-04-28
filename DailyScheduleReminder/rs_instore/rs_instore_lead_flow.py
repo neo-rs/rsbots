@@ -413,6 +413,42 @@ def _apply_removals_to_breakdown(original: str, ids_to_remove: set[str]) -> str:
     return "\n".join(out)
 
 
+def _truncate_for_discord(content: str, *, max_len: int = 2000) -> str:
+    s = str(content or "")
+    if len(s) <= max_len:
+        return s
+    # Keep a hard cap with a clear tail marker.
+    return s[: max(0, max_len - 20)].rstrip() + "\n... (truncated)"
+
+
+def _build_minimal_breakdown_edit(updated: str) -> str:
+    """
+    To fit within Discord's 2000-char limit, drop long narrative sections.
+    Keep everything until the first '**Info:**' or '**Notes**' header (inclusive stop).
+    """
+    lines = (updated or "").splitlines()
+    out: list[str] = []
+    for ln in lines:
+        low = ln.strip().lower()
+        if low.startswith("**info:**") or low.startswith("**notes"):
+            break
+        out.append(ln)
+    return "\n".join(out).rstrip()
+
+
+def _render_link_mapping_lines(rows: list["BreakdownRow"], jump_by_id: dict[str, str]) -> str:
+    """
+    Reply-friendly mapping list when we cannot edit the original message.
+    """
+    lines: list[str] = []
+    for r in rows:
+        j = jump_by_id.get(r.id_value) or ""
+        if not j:
+            continue
+        lines.append(f"- {r.id_type}:{r.id_value} -> {j}")
+    return "\n".join(lines)
+
+
 def _is_only_bots_single_message_403(resp) -> bool:
     """
     Discord returns 403 + code 20002 for user tokens on GET .../messages/{message_id}.
@@ -917,6 +953,7 @@ def _process_breakdown_message(
     my_id: str,
     max_rows: int,
     no_send: bool,
+    preview_edit_only: bool = False,
 ) -> int:
     product_ids_ch = _cfg_channel_id(cfg, "product_ids")
     link_values_ch = _cfg_channel_id(cfg, "product_links")
@@ -1030,21 +1067,40 @@ def _process_breakdown_message(
         print("\nNo breakdown edits applied (lines may already have URLs).")
         return 0
 
+    minimal = _build_minimal_breakdown_edit(updated)
+    chosen_edit = updated
+    if len(chosen_edit) > 2000 and minimal and len(minimal) <= 2000:
+        chosen_edit = minimal
+
     print("\n--- breakdown preview (first 40 lines) ---")
-    for ln in updated.splitlines()[:40]:
+    for ln in chosen_edit.splitlines()[:40]:
         print(ln)
-    if len(updated.splitlines()) > 40:
+    if len(chosen_edit.splitlines()) > 40:
         print("... (truncated)")
+    print(f"[edit length] {len(chosen_edit)} chars")
+
+    if preview_edit_only:
+        print("(preview-only) skipping Discord edit/post.")
+        return 0
 
     # Edit the original breakdown only if we authored it; otherwise reply with the cleaned version.
     if author_id and author_id == my_id:
-        _edit_message_content(
-            channel_id=source_channel_id,
-            message_id=source_message_id,
-            token=token,
-            new_content=updated,
-        )
-        print("\nUpdated the original breakdown message with jump links.")
+        try:
+            if len(chosen_edit) > 2000:
+                raise RuntimeError("EDIT_TOO_LONG: exceeds 2000 chars")
+            _edit_message_content(
+                channel_id=source_channel_id,
+                message_id=source_message_id,
+                token=token,
+                new_content=chosen_edit,
+            )
+            print("\nUpdated the original breakdown message with jump links.")
+        except RuntimeError as e:
+            # If too long or cannot edit, fall back to a reply.
+            if "BASE_TYPE_MAX_LENGTH" in str(e) or "EDIT_TOO_LONG" in str(e) or _is_cannot_edit_other_user_403(e):
+                author_id = ""  # fall through to reply
+            else:
+                raise
     else:
         snippet_lines = updated.splitlines()
         snippet = "\n".join(snippet_lines[:40]) + ("\n... (truncated)" if len(snippet_lines) > 40 else "")
@@ -1056,6 +1112,19 @@ def _process_breakdown_message(
             + snippet,
         )
         print("\nPosted a reply with the cleaned breakdown (cannot edit original).")
+
+    # If we couldn't edit (too long or permissions), also reply with a compact mapping list.
+    if not (author_id and author_id == my_id):
+        mapping = _render_link_mapping_lines(rows, jump_by_id)
+        if mapping.strip():
+            _send_reply(
+                source_channel_id,
+                token,
+                reply_to_message_id=source_message_id,
+                content=_truncate_for_discord(
+                    "Jump links (for stock check):\n\n" + mapping, max_len=2000
+                ),
+            )
     return 0
 
 
@@ -1074,6 +1143,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--watch",
         action="store_true",
         help="Watch the configured source channel and auto-process new breakdown messages.",
+    )
+    ap.add_argument(
+        "--preview-edit",
+        action="store_true",
+        help="Build and print the would-edit content + length, but do not post/edit anything.",
     )
     args = ap.parse_args(argv)
 
@@ -1135,6 +1209,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                         my_id=my_id,
                         max_rows=int(args.max_rows or 0),
                         no_send=bool(args.no_send),
+                        preview_edit_only=bool(args.preview_edit),
                     )
                 except Exception as e:
                     print(f"WATCH: ERROR msg_id={mid}: {e}", file=sys.stderr)
@@ -1172,6 +1247,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         my_id=my_id,
         max_rows=int(args.max_rows or 0),
         no_send=bool(args.no_send),
+        preview_edit_only=bool(args.preview_edit),
     )
 
 
