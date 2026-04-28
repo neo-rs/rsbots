@@ -9873,6 +9873,10 @@ echo "CHANGED_END"
                 title = _m(r"^Title:\s*(.+)$")
                 page_tab = _m(r"^Page title:\s*(.+)$")
                 price = _m(r"^Price:\s*(.+)$")
+                msrp = _m(r"^MSRP:\s*(.+)$")
+                as_low_as = _m(r"^As low as:\s*(.+)$")
+                pid = _m(r"^ID:\s*(.+)$")
+                pid_label = _m(r"^ID label:\s*(.+)$")
                 brand = _m(r"^Brand:\s*(.+)$")
                 image = _m(r"^Image:\s*(.+)$")
                 payloads = _m(r"^Captured JSON Payloads:\s*(.+)$")
@@ -9891,17 +9895,17 @@ echo "CHANGED_END"
                     url=url,
                     color=(0x2ECC71 if ok else 0xF1C40F),
                 )
-                if title and title.strip():
-                    emb.add_field(name="Title", value=title[:1024], inline=False)
-                elif page_tab and page_tab.strip():
-                    emb.add_field(name="Page title", value=page_tab[:1024], inline=False)
-                emb.add_field(name="URL", value=url[:1024], inline=False)
-                if price:
-                    emb.add_field(name="Price", value=price[:1024], inline=True)
-                if brand:
-                    emb.add_field(name="Brand", value=brand[:1024], inline=True)
-                if payloads:
-                    emb.add_field(name="Captured JSON", value=payloads[:1024], inline=True)
+
+                # Apple iPad-style layout (all stores):
+                # - 3 inline fields: MSRP / As low as / ID
+                # - MSRP and As low as are ALWAYS the same as Price (by design).
+                # - Title is the embed title; URL is the embed url; no redundant Title/URL fields.
+                v_price = (price or "N/A").strip() or "N/A"
+                emb.add_field(name="MSRP", value=v_price[:1024], inline=True)
+                emb.add_field(name="As low as", value=v_price[:1024], inline=True)
+                id_name = (pid_label or "ID").strip() or "ID"
+                emb.add_field(name=id_name[:256], value=(pid or "N/A")[:1024], inline=True)
+
                 if image and image.lower().startswith("http"):
                     emb.set_image(url=image)
                 return emb

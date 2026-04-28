@@ -172,6 +172,62 @@ def _extract_price_candidates(text: str) -> List[str]:
     return out
 
 
+def _extract_target_tcin(url: str) -> str:
+    """
+    Target TCIN often appears in the canonical product URL path:
+      https://www.target.com/p/-/A-91467769  ->  91467769
+    """
+    try:
+        path = (urlparse(url).path or "")
+        m = re.search(r"/A-(\d{6,12})", path)
+        return (m.group(1) if m else "") or "N/A"
+    except Exception:
+        return "N/A"
+
+
+def _extract_generic_id(url: str) -> Tuple[str, str]:
+    """
+    Return (id_label, id_value) best-effort from URL.
+    We keep this simple + deterministic (URL-only) to avoid brittle DOM selectors.
+    """
+    try:
+        u = str(url or "").strip()
+        p = urlparse(u)
+        host = (p.hostname or "").lower()
+        path = p.path or ""
+        if "target.com" in host:
+            tcin = _extract_target_tcin(u)
+            return ("TCIN", tcin if tcin != "N/A" else "N/A")
+        if "amazon." in host:
+            m = re.search(r"/dp/([A-Z0-9]{10})(?:/|$)", path, flags=re.IGNORECASE)
+            if not m:
+                m = re.search(r"/gp/product/([A-Z0-9]{10})(?:/|$)", path, flags=re.IGNORECASE)
+            return ("ASIN", (m.group(1).upper() if m else "N/A"))
+        if "bestbuy." in host:
+            # Typical: /site/.../1234567.p
+            m = re.search(r"/(\d{5,10})\.p(?:\?|$)", path)
+            return ("SKU", (m.group(1) if m else "N/A"))
+        if "walmart." in host:
+            # Typical: /ip/.../123456789 or item=<id>
+            m = re.search(r"/ip/[^/]+/(\d{6,12})(?:/|$)", path)
+            if not m:
+                q = dict(parse_qsl(p.query or "", keep_blank_values=True))
+                if q.get("item"):
+                    return ("Item", clean(q.get("item")))
+            return ("Item", (m.group(1) if m else "N/A"))
+        if "ebay." in host:
+            # Typical: /itm/<title>/123456789012 or /itm/123456789012
+            m = re.search(r"/itm/(?:[^/]+/)?(\d{9,14})(?:/|$)", path)
+            return ("Item", (m.group(1) if m else "N/A"))
+        if "homedepot." in host:
+            # Typical: /p/.../<productId>
+            m = re.search(r"/p/[^/]+/(\d{6,12})(?:/|$)", path)
+            return ("ID", (m.group(1) if m else "N/A"))
+    except Exception:
+        pass
+    return ("ID", "N/A")
+
+
 def _jsonld_product_summary(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Returns a best-effort summary from JSON-LD Product graphs.
@@ -475,6 +531,13 @@ async def check_url(
             next((p for p in price_candidates_sorted if _looks_like_price(p)), None),
         )
 
+        # Apple-style UI fields:
+        # - ID: best-effort parse from URL path when present (store-specific, else N/A).
+        # - MSRP / As low as: ALWAYS equal to the best-effort Price (by design).
+        id_label, id_value = _extract_generic_id(nav_url)
+        msrp = clean(price_best)
+        as_low_as = clean(price_best)
+
         result = {
             "url": url.strip(),
             "opened_url": (nav_url if nav_url != url.strip() else None),
@@ -482,6 +545,10 @@ async def check_url(
             "page_title": clean(await page.title()),
             "title": clean(_first(None if title_dom == "N/A" else title_dom, meta.get("og:title"), meta.get("twitter:title"), jsonld_summary.get("jsonld_title"))),
             "price": clean(price_best),
+            "msrp": clean(msrp),
+            "as_low_as": clean(as_low_as),
+            "id_label": clean(id_label),
+            "id": clean(id_value),
             "price_candidates": price_candidates[:12] or ["N/A"],
             "image": clean(_first(meta.get("og:image"), meta.get("twitter:image"), None if image_dom == "N/A" else image_dom, jsonld_summary.get("jsonld_image"))),
             "brand": clean(_first(meta.get("product:brand"), jsonld_summary.get("jsonld_brand"))),
@@ -548,6 +615,10 @@ def print_result(r: Dict[str, Any]) -> None:
     print(f"Title: {r.get('title')}")
     print(f"Page title: {r.get('page_title')}")
     print(f"Price: {r.get('price')}")
+    print(f"MSRP: {r.get('msrp')}")
+    print(f"As low as: {r.get('as_low_as')}")
+    print(f"ID: {r.get('id')}")
+    print(f"ID label: {r.get('id_label')}")
     print(f"Brand: {r.get('brand')}")
     print(f"Image: {r.get('image')}")
     print(f"Captured JSON Payloads: {r.get('captured_json_payload_count')}")
