@@ -1,0 +1,54 @@
+{
+  "_comment": "forward_reply_done + forward_reply_done_text: menu-style mirror_forward_queue.py only (no --store/--url/--all-stores on cmdline); one Discord reply after a batch when no newer Mirror messages exist after the last completed deal. routes: destination_channel_id = <#id> in the !m line. Default command is !m lead (Walmart/Target/Lowes/Home Depot store clearance). \"command\": \"hdnation\" only for hd-clearance restock (SKU / Internet Number). command_post_channel_id = where the script POSTs the line. Optional: \"forward_delay_random_minutes\": \"1-2\" or [1,2] for mirror_forward_queue.py when --delay-random-minutes not passed. post_confirmation: timeout_seconds_hdnation (long wait for !m hdnation), success_substrings / failure_substrings (comma list or JSON array, substrings case-insensitive). forward_all_stores_order: mirror_label strings for mirror_forward_queue.py --all-stores (remaining routes append sorted by label). Checkpoints are stored per Mirror channel under mirror_forward_checkpoint.json by_channel.",
+  "command_post_channel_id": "892518619215462400",
+  "forward_reply_done": false,
+  "forward_reply_done_text": "done",
+  "forward_all_stores_order": [
+    "walmart",
+    "target",
+    "lowes",
+    "homedepot",
+    "hd-clearance stock"
+  ],
+  "post_confirmation": {
+    "author_user_id": "1255835799552004138",
+    "text_substring": "Lead posted",
+    "timeout_seconds": 50,
+    "timeout_seconds_hdnation": 360,
+    "poll_interval_seconds": 2,
+    "success_substrings": "nationwide stock check, lead has been posted",
+    "failure_substrings": "could not fetch stock, check you have entered the correct sku",
+    "_comment_maintenance": "If Tempo/monitor is updating, the bot posts 'being updated' then later 'has been updated'. These needles extend the wait window instead of timing out.",
+    "maintenance_start_substrings": "is being updated, will be back in",
+    "maintenance_done_substrings": "has been updated",
+    "maintenance_extend_seconds": 600
+  },
+  "routes": {
+    "1435308747416141857": {
+      "mirror_label": "walmart",
+      "m_lead_slug": "walmart",
+      "destination_channel_id": "1263736465012293754"
+    },
+    "1435308842387767356": {
+      "mirror_label": "lowes",
+      "m_lead_slug": "lowes",
+      "destination_channel_id": "1249194932774764616"
+    },
+    "1435308863795626014": {
+      "mirror_label": "target",
+      "m_lead_slug": "target",
+      "destination_channel_id": "1367596987603488849"
+    },
+    "1435308770128298044": {
+      "mirror_label": "homedepot",
+      "m_lead_slug": "homedepot",
+      "destination_channel_id": "1268475526977290291"
+    },
+    "1484118129402450041": {
+      "mirror_label": "hd-clearance stock",
+      "m_lead_slug": "homedepot",
+      "destination_channel_id": "1268475526977290291",
+      "command": "hdnation"
+    }
+  }
+}

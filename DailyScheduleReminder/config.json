@@ -1,0 +1,11 @@
+{
+  "enabled": false,
+  "category_id": "1313260017989713981",
+  "reminder_channel_id": "1313575695267663893",
+  "reminder_mins_before": 30,
+  "mention_role_id": "876569612085518376",
+  "ticket_startup": {
+    "_comment": "When enabled, send RSCheckerbot ticket startup (checking-in) messages as the Discord user. Reads RSCheckerbot/data/pending_ticket_startup_messages.json; requires same repo as RSCheckerbot.",
+    "enabled": false
+  }
+}

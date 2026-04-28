@@ -1,0 +1,4 @@
+# Timezone data for America/New_York (zoneinfo)
+tzdata
+# Discord user-token client (used by reminder_bot.py; also in repo root requirements.txt)
+discum

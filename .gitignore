@@ -69,6 +69,29 @@
 !RSForwarder/run_rs_fs_resolve_and_sync.bat
 !RSForwarder/run_monitor_data_search.bat
 
+# DailyScheduleReminder (tracked scripts + docs; secrets/runtime remain ignored below)
+!DailyScheduleReminder/
+!DailyScheduleReminder/**/
+!DailyScheduleReminder/*.py
+!DailyScheduleReminder/**/*.py
+!DailyScheduleReminder/*.bat
+!DailyScheduleReminder/**/*.bat
+!DailyScheduleReminder/*.sh
+!DailyScheduleReminder/**/*.sh
+!DailyScheduleReminder/*.md
+!DailyScheduleReminder/**/*.md
+!DailyScheduleReminder/requirements.txt
+!DailyScheduleReminder/config.json
+!DailyScheduleReminder/config.secrets.example.json
+!DailyScheduleReminder/m_lead_routes.json
+
+# DailyScheduleReminder local-only / runtime (never commit)
+DailyScheduleReminder/config.secrets.json
+DailyScheduleReminder/manual_send_payload.json
+DailyScheduleReminder/rs_instore/_watch_state.json
+DailyScheduleReminder/rs_instore/_temp_rs_instore_send.json
+DailyScheduleReminder/rs_instore/temp_send.json
+
 !RSMentionPinger/
 !RSMentionPinger/**/
 !RSMentionPinger/*.py
