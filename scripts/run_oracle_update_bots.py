@@ -43,6 +43,15 @@ BOT_KEY_TO_FOLDER: Dict[str, str] = {
 # Some update targets are folders/tools without a systemd service.
 BOT_KEY_RESTARTABLE: Dict[str, bool] = {
     "chromerrunner": False,
+    # DailyScheduleReminder main service is intentionally disabled on Oracle; do not restart it here.
+    # The always-on piece is the separate rs_instore watcher systemd unit.
+    "dailyschedulereminder": False,
+}
+
+
+BOT_KEY_EXTRA_RESTART_SERVICES: Dict[str, List[str]] = {
+    # When updating DailyScheduleReminder, restart the rs_instore watcher service if present.
+    "dailyschedulereminder": ["mirror-world-rs-instore-watch.service"],
 }
 
 
@@ -228,6 +237,28 @@ bash {live_root_q}/RSAdminBot/botctl.sh restart {shlex.quote(bot_key)}
 """
 
 
+def _restart_services_snippet(*, service_names: List[str]) -> str:
+    if not service_names:
+        return ""
+    parts: List[str] = []
+    for s in service_names:
+        name = str(s or "").strip()
+        if not name:
+            continue
+        parts.append(
+            f"""
+echo "Restarting {shlex.quote(name)}..."
+if systemctl list-unit-files | grep -Fq {shlex.quote(name)}; then
+  sudo systemctl restart {shlex.quote(name)} || true
+  sudo systemctl is-active {shlex.quote(name)} || true
+else
+  echo "WARN: unit not found: {shlex.quote(name)}"
+fi
+"""
+        )
+    return "\n".join(parts)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Update MW/RS bots on Oracle from GitHub checkouts via SSH.")
     ap.add_argument("--group", choices=["mw", "rs"], required=True, help="Update group: mw=mirror_bots, rs=rs_bots + rsadminbot")
@@ -336,12 +367,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             bot_folder=bot_folder,
             destructive_git_clean=destructive,
         )
+        remote_cmd = update_cmd
+
         restartable = BOT_KEY_RESTARTABLE.get(bot_key, True)
         if restartable:
             restart_cmd = _restart_snippet(live_root=remote_root, bot_key=bot_key)
-            remote_cmd = f"{update_cmd}\n{restart_cmd}"
-        else:
-            remote_cmd = update_cmd
+            remote_cmd = f"{remote_cmd}\n{restart_cmd}"
+
+        extra_services = BOT_KEY_EXTRA_RESTART_SERVICES.get(bot_key, [])
+        extra_cmd = _restart_services_snippet(service_names=extra_services)
+        if extra_cmd.strip():
+            remote_cmd = f"{remote_cmd}\n{extra_cmd}"
 
         ssh_cmd = _build_ssh_cmd(
             user=user,
