@@ -234,6 +234,40 @@ def _send_plain(channel_id: str, token: str, content: str) -> dict:
     return data
 
 
+def _send_reply(channel_id: str, token: str, *, reply_to_message_id: str, content: str) -> dict:
+    """
+    Post a message reply. Used when we cannot edit the original breakdown message.
+    """
+    body = {
+        "content": str(content or ""),
+        "tts": False,
+        "message_reference": {"message_id": str(reply_to_message_id or "").strip()},
+        "allowed_mentions": {"parse": []},
+    }
+    r = discord_post(f"{DISCORD_API}/channels/{channel_id}/messages", token, body)
+    if r.status_code != 200:
+        raise RuntimeError(f"POST reply failed HTTP {r.status_code}: {(r.text or '')[:240]}")
+    data = r.json()
+    return data if isinstance(data, dict) else {}
+
+
+def _send_reply(channel_id: str, token: str, *, reply_to_message_id: str, content: str) -> dict:
+    """
+    Post a message reply. Used when we cannot edit the original breakdown message.
+    """
+    body = {
+        "content": str(content or ""),
+        "tts": False,
+        "message_reference": {"message_id": str(reply_to_message_id or "").strip()},
+        "allowed_mentions": {"parse": []},
+    }
+    r = discord_post(f"{DISCORD_API}/channels/{channel_id}/messages", token, body)
+    if r.status_code != 200:
+        raise RuntimeError(f"POST reply failed HTTP {r.status_code}: {(r.text or '')[:240]}")
+    data = r.json()
+    return data if isinstance(data, dict) else {}
+
+
 def _wait_for_reply(
     *,
     channel_id: str,
@@ -321,6 +355,8 @@ def _store_key_from_url(url: str) -> str:
         return "bestbuy"
     if "lowes." in hh:
         return "lowes"
+    if "target." in hh:
+        return "target"
     if "walmart." in hh or "walmartimages." in hh:
         return "walmart"
     if "bjs." in hh or "bjswholesale" in hh:
@@ -819,6 +855,16 @@ def _edit_message_content(*, channel_id: str, message_id: str, token: str, new_c
         raise RuntimeError(f"PATCH message failed HTTP {r.status_code}: {(r.text or '')[:240]}")
 
 
+def _is_cannot_edit_other_user_403(err: BaseException) -> bool:
+    s = str(err)
+    return ("Cannot edit a message authored by another user" in s) or ('"code": 50005' in s)
+
+
+def _is_cannot_edit_other_user_403(err: BaseException) -> bool:
+    s = str(err)
+    return ("Cannot edit a message authored by another user" in s) or ('"code": 50005' in s)
+
+
 def _process_breakdown_message(
     *,
     cfg: dict,
@@ -837,6 +883,8 @@ def _process_breakdown_message(
 
     msg, _ch, _label, _tok_used = fetch_message_with_token_fallback(guild_id, source_channel_id, source_message_id)
     original_text = str(msg.get("content") or "")
+    author = msg.get("author") if isinstance(msg.get("author"), dict) else {}
+    author_id = str(author.get("id") or "").strip()
     if not original_text.strip():
         print("ERROR: source message has no content text (embed-only breakdown not supported yet).", file=sys.stderr)
         return 2
@@ -870,9 +918,11 @@ def _process_breakdown_message(
                 ids_to_remove.add(r.id_value)
                 continue
 
-        store_key = _store_key_from_url(store_url) or re.sub(r"[^a-z0-9]+", "", (r.store_name or "").lower())
-        if store_key and store_key not in _SUPPORTED_STORES:
-            print(f"  store gate: UNSUPPORTED store_key={store_key!r} host={_url_host(store_url)!r} -> remove placeholder")
+        store_key = _store_key_from_url(store_url)
+        if not store_key or store_key not in _SUPPORTED_STORES:
+            print(
+                f"  store gate: UNSUPPORTED store_key={store_key!r} host={_url_host(store_url)!r} -> remove placeholder"
+            )
             ids_to_remove.add(r.id_value)
             continue
 
@@ -943,13 +993,26 @@ def _process_breakdown_message(
     if len(updated.splitlines()) > 40:
         print("... (truncated)")
 
-    _edit_message_content(
-        channel_id=source_channel_id,
-        message_id=source_message_id,
-        token=token,
-        new_content=updated,
-    )
-    print("\nUpdated the original breakdown message with jump links.")
+    # Edit the original breakdown only if we authored it; otherwise reply with the cleaned version.
+    if author_id and author_id == my_id:
+        _edit_message_content(
+            channel_id=source_channel_id,
+            message_id=source_message_id,
+            token=token,
+            new_content=updated,
+        )
+        print("\nUpdated the original breakdown message with jump links.")
+    else:
+        snippet_lines = updated.splitlines()
+        snippet = "\n".join(snippet_lines[:40]) + ("\n... (truncated)" if len(snippet_lines) > 40 else "")
+        _send_reply(
+            source_channel_id,
+            token,
+            reply_to_message_id=source_message_id,
+            content="I can't edit the original breakdown message (not my message). Cleaned version:\n\n"
+            + snippet,
+        )
+        print("\nPosted a reply with the cleaned breakdown (cannot edit original).")
     return 0
 
 
@@ -1018,21 +1081,28 @@ def main(argv: Optional[list[str]] = None) -> int:
                 print("\n" + "=" * 72)
                 print(f"WATCH: processing msg_id={mid}")
                 url = _jump_link(gid, source_channel_id, mid)
-                rc = _process_breakdown_message(
-                    cfg=cfg,
-                    guild_id=gid,
-                    source_channel_id=source_channel_id,
-                    source_message_id=mid,
-                    token=token,
-                    my_id=my_id,
-                    max_rows=int(args.max_rows or 0),
-                    no_send=bool(args.no_send),
-                )
+                rc: int = 1
+                try:
+                    rc = _process_breakdown_message(
+                        cfg=cfg,
+                        guild_id=gid,
+                        source_channel_id=source_channel_id,
+                        source_message_id=mid,
+                        token=token,
+                        my_id=my_id,
+                        max_rows=int(args.max_rows or 0),
+                        no_send=bool(args.no_send),
+                    )
+                except Exception as e:
+                    print(f"WATCH: ERROR msg_id={mid}: {e}", file=sys.stderr)
+                    rc = 1
+                finally:
+                    # Always advance state so one bad message doesn't crash-loop forever.
+                    last_id = mid
+                    state["guild_id"] = gid
+                    state["last_processed_message_id"] = last_id
+                    _save_state(state)
                 print(f"WATCH: done rc={rc} url={url}")
-                last_id = mid
-                state["guild_id"] = gid
-                state["last_processed_message_id"] = last_id
-                _save_state(state)
 
             time.sleep(poll_s)
 
