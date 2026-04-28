@@ -540,9 +540,26 @@ async def setup(bot: commands.Bot) -> None:
     """
     For discord.py extension loader:
       await bot.load_extension("RSNotes.rsnote")
+
+    `/rsnote` is registered only on the Reselling Secrets guild (`rs_server_guild_id` on
+    `bot.rsadmin_instance`), via `add_cog(..., guild=...)`, so it does not appear on Neo Test Server.
     """
+    rsadmin = getattr(bot, "rsadmin_instance", None)
+    rs_gid = 0
+    if rsadmin is not None:
+        try:
+            cfg_dict = getattr(rsadmin, "config", None)
+            if isinstance(cfg_dict, dict):
+                rs_gid = int(cfg_dict.get("rs_server_guild_id") or 0)
+        except Exception:
+            rs_gid = 0
+
+    if not rs_gid:
+        print("[RSNotes] No rs_server_guild_id in RSAdminBot config; /rsnote will not be registered.")
+        return
+
     root = _module_root_dir()
     cfg = RSNoteConfig(root_dir=root)
     store = RSNoteStore(db_path=cfg.db_path(), max_notes_per_user=cfg.max_notes_per_user)
-    await bot.add_cog(RSNoteCog(bot, cfg, store))
+    await bot.add_cog(RSNoteCog(bot, cfg, store), guild=discord.Object(id=rs_gid))
 

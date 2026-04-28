@@ -6,18 +6,18 @@ RSAdminBot is the central administrative bot for managing all RS/MW bots on the 
 
 **Current policy (enforced in code):**
 
-- **Slash-only**: no `!` prefix commands.
-- **Ephemeral-only**: command responses are visible only to you.
-- **Owner-only**: commands run only for the **Discord server owner**.
-- **Guild-scoped**: commands are registered and allowed only in the configured guild(s):
-  - **Reselling Secrets**: `RSAdminBot/config.json:rs_server_guild_id`
-  - **Neo Test Server**: `RSAdminBot/config.json:test_server_guild_id`
+- **Guild-specific registration**: Discord `tree.sync(guild=…)` only uploads commands placed in that guild’s bucket. RSAdmin binds **admin slash** to **Neo Test Server** (`test_server_guild_id`) via `add_cog(..., guild=…)`, and binds **`/rsnote`** to **Reselling Secrets** (`rs_server_guild_id`) the same way — so `/rsnote` appears only on RS and `/ping`, `/botstatus`, etc. only on Neo Test Server.
+- **Ephemeral-only** (admin suite): command responses are visible only to you.
+- **Owner/admin** (admin suite): **guild owner**, `admin_user_ids`, or `admin_role_ids` (not “Administrator” unless those roles are listed).
+- **`/rsnote`**: ephemeral notes UI; **not** owner-gated (any member in RS can open their own panel).
+- **RS prefix**: `!delete` / `!transfer` / `!archive` remain RS-guild-only (message content intent).
 
 ## Slash commands
 
 ### Notes
 
 #### `/rsnote`
+- **Where**: **Reselling Secrets** only (`rs_server_guild_id`)
 - **What**: private notes panel (SKU / links / anything)
 - **Visibility**: ephemeral
 - **Storage**: `RSAdminBot/RSNotes/data/rsnotes.json` (runtime; not committed)
@@ -159,4 +159,4 @@ These are **not** slash commands. They are **message listeners** scoped to a sin
 - **Oracle data tooling**: `oracledatasync`, `oracledataanalyze`, `oracledatadoc`, `oracledatasample`
 - **Test-server tooling**: `setupmonitoring`, `testcards`
 - **Deploy / proc health**: `deploy`, `rspids`, `moneyflowcheck`, `codehash`
-- **Prefix commands**: all `!` commands are retired
+- **Legacy prefix suites**: broad `!` admin commands are retired; **Reselling Secrets** retains only `!delete` / `!transfer` / `!archive` (RS-guild-only; see `admin_bot.py`).

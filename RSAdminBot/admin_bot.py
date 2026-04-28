@@ -5720,13 +5720,15 @@ echo "TARGET=$TARGET"
         await self._send_webhook(url, embed=embed)
 
     async def _initialize_rsnotes(self) -> None:
-        """Load RSNotes module (private `/rsnote`) and sync app commands to configured guild(s)."""
-        # If we already initialized (e.g. via setup_hook), do NOT overwrite the prior status line.
-        # (We want to preserve sync results like status=sync_done.)
+        """Load RSNotes extension (`/rsnote` is bound to RS guild in RSNotes/rsnote.py setup).
+
+        Discord push: `bot.tree.sync(guild=...)` runs in `_initialize_admin_slash_commands` after
+        both guild-scoped cog loads. Guild sync only uploads `_guild_commands[guild_id]`; do not use
+        `copy_global_to` here or it can mask a stale guild command set.
+        """
         if getattr(self, "_rsnotes_initialized", False):
             return
 
-        # Always keep a short status line for end-of-startup visibility (journal-live truncates earlier logs).
         try:
             self._rsnotes_status_line = "[RSNotes] status=init_start"
         except Exception:
@@ -5747,12 +5749,12 @@ echo "TARGET=$TARGET"
 
         try:
             import sys
+
             sp0 = str(sys.path[0]) if sys.path else ""
             print(f"{Colors.CYAN}[RSNotes] Init: starting (sys.path[0]={sp0}){Colors.RESET}")
         except Exception:
             pass
 
-        # Load extension from RSAdminBot/RSNotes (import root includes this folder).
         try:
             await self.bot.load_extension("RSNotes.rsnote")
         except commands.ExtensionAlreadyLoaded:
@@ -5768,103 +5770,37 @@ echo "TARGET=$TARGET"
                 pass
             return
 
-        # RSNotes should only be available in the neo-test-server.
-        # (Reselling Secrets should only have /delete /transfer /archive.)
         try:
-            test_gid = int(self.config.get("test_server_guild_id") or 0)
+            rs_gid = int(self.config.get("rs_server_guild_id") or 0)
         except Exception:
-            test_gid = 0
-        guild_ids: List[int] = [test_gid] if test_gid else []
+            rs_gid = 0
 
-        # Debug: do we actually have the command in the tree?
         try:
-            tree_names = []
-            try:
-                tree_names = [c.name for c in (self.bot.tree.get_commands() or [])]
-            except Exception:
-                tree_names = []
+            tree_names: List[str] = []
+            if rs_gid:
+                tree_names = [
+                    c.name for c in (self.bot.tree.get_commands(guild=discord.Object(id=rs_gid)) or []) if getattr(c, "name", None)
+                ]
             has_rsnote = "rsnote" in set(tree_names)
-            print(f"{Colors.CYAN}[RSNotes] Extension loaded. tree.has_rsnote={has_rsnote} tree.count={len(tree_names)} guild_ids={guild_ids}{Colors.RESET}")
+            print(
+                f"{Colors.CYAN}[RSNotes] Extension loaded. rs_guild={rs_gid} "
+                f"tree.has_rsnote={has_rsnote} tree.count={len(tree_names)} (sync follows){Colors.RESET}"
+            )
         except Exception:
             pass
 
-        synced_any = False
-        synced_ok: Dict[int, bool] = {}
-        for gid in guild_ids:
-            try:
-                # `/rsnote` is defined as a global app command.
-                # To make it appear quickly (guild-scope), copy global commands into this guild before syncing.
-                try:
-                    self.bot.tree.copy_global_to(guild=discord.Object(id=gid))
-                except Exception:
-                    pass
-                synced = await self.bot.tree.sync(guild=discord.Object(id=gid))
-                synced_any = True
-                try:
-                    names = [getattr(x, "name", "") for x in (synced or [])]
-                    ok = "rsnote" in set(names)
-                    synced_ok[int(gid)] = bool(ok)
-                    print(f"{Colors.GREEN}[RSNotes] Sync OK: guild={gid} commands={len(names)} has_rsnote={ok}{Colors.RESET}")
-                except Exception:
-                    pass
-            except Exception as e:
-                # If Discord blocks new app-command creates (daily cap), avoid retry loops on every restart.
-                msg = str(e)
-                if "30034" in msg or "Max number of daily application command creates" in msg:
-                    try:
-                        print(
-                            f"{Colors.YELLOW}[RSNotes] Sync blocked by Discord daily limit (30034). "
-                            f"Skipping further slash sync attempts until limit resets.{Colors.RESET}"
-                        )
-                    except Exception:
-                        pass
-                    break
-                try:
-                    print(f"{Colors.YELLOW}[RSNotes] Sync failed: guild={gid} err={type(e).__name__}: {str(e)[:160]}{Colors.RESET}")
-                except Exception:
-                    pass
-                try:
-                    synced_ok[int(gid)] = False
-                except Exception:
-                    pass
-
-        if synced_any:
-            try:
-                print(f"{Colors.GREEN}[RSNotes] Loaded + synced `/rsnote` to {len(guild_ids)} guild(s){Colors.RESET}")
-            except Exception:
-                pass
-            try:
-                ext_loaded = "RSNotes.rsnote" in set(getattr(self.bot, "extensions", {}).keys())
-                self._rsnotes_status_line = (
-                    f"[RSNotes] status=sync_done ext_loaded={ext_loaded} "
-                    f"tree_has_rsnote={has_rsnote} guild_results={synced_ok}"
-                )
-            except Exception:
-                pass
-        else:
-            try:
-                ext_loaded = "RSNotes.rsnote" in set(getattr(self.bot, "extensions", {}).keys())
-                self._rsnotes_status_line = f"[RSNotes] status=no_guilds ext_loaded={ext_loaded} guild_ids={guild_ids}"
-            except Exception:
-                pass
+        try:
+            ext_loaded = "RSNotes.rsnote" in set(getattr(self.bot, "extensions", {}).keys())
+            self._rsnotes_status_line = f"[RSNotes] status=loaded ext_loaded={ext_loaded} (awaiting Slash sync)"
+        except Exception:
+            pass
 
     async def _initialize_admin_slash_commands(self) -> None:
-        """Register RSAdminBot slash commands and sync to allowed guild(s)."""
+        """Register RSAdmin slash cog on Neo Test Server only; sync guild command trees for test + RS."""
         if getattr(self, "_admin_slash_initialized", False):
             return
         self._admin_slash_initialized = True
 
-        try:
-            await self.bot.add_cog(RSAdminSlashCog(self))
-        except Exception as e:
-            try:
-                print(f"{Colors.YELLOW}[Slash] Failed to add slash cog: {type(e).__name__}: {str(e)[:200]}{Colors.RESET}")
-            except Exception:
-                pass
-
-        # Slash commands are ONLY enabled in neo-test-server.
-        # Reselling Secrets should NOT have any slash commands from RSAdminBot.
-        # (RS uses prefix: !delete / !transfer / !archive.)
         try:
             test_gid = int(self.config.get("test_server_guild_id") or 0)
         except Exception:
@@ -5874,46 +5810,66 @@ echo "TARGET=$TARGET"
         except Exception:
             rs_gid = 0
 
-        # 1) Reselling Secrets should have NO RSAdminBot slash commands.
-        # IMPORTANT: Do NOT clear/recreate commands in production guilds — it can trigger Discord daily limits
-        # and make commands “disappear” for the entire day. We simply never sync RSAdminBot slash commands there.
-        if rs_gid:
+        if test_gid:
             try:
-                print(f"{Colors.GREEN}[Slash] RS guild: skipping slash sync (rs_gid={rs_gid}){Colors.RESET}")
-            except Exception:
-                pass
-
-        # 2) Sync ALL slash commands to neo-test-server.
-        if not test_gid:
-            try:
-                print(f"{Colors.YELLOW}[Slash] Missing test_server_guild_id; skipping slash sync{Colors.RESET}")
-            except Exception:
-                pass
-            return
-
-        try:
-            gobj = discord.Object(id=int(test_gid))
-            synced = await self.bot.tree.sync(guild=gobj)
-            try:
-                names = sorted({str(getattr(x, "name", "") or "") for x in (synced or []) if getattr(x, "name", None)})
-                print(f"{Colors.GREEN}[Slash] Sync OK: guild={test_gid} commands={len(names)}{Colors.RESET}")
-            except Exception:
-                pass
-        except Exception as e:
-            msg = str(e)
-            if "30034" in msg or "Max number of daily application command creates" in msg:
+                await self.bot.add_cog(RSAdminSlashCog(self), guild=discord.Object(id=test_gid))
+            except Exception as e:
                 try:
-                    print(
-                        f"{Colors.YELLOW}[Slash] Sync blocked by Discord daily limit (30034). "
-                        f"Commands may be invisible until the limit resets. Avoid restarts.{Colors.RESET}"
-                    )
+                    print(f"{Colors.YELLOW}[Slash] Failed to add admin slash cog: {type(e).__name__}: {str(e)[:200]}{Colors.RESET}")
                 except Exception:
                     pass
-                return
+        else:
             try:
-                print(f"{Colors.YELLOW}[Slash] Sync failed: guild={test_gid} err={type(e).__name__}: {str(e)[:200]}{Colors.RESET}")
+                print(f"{Colors.YELLOW}[Slash] Missing test_server_guild_id; admin slash commands not registered.{Colors.RESET}")
             except Exception:
                 pass
+
+        # Older builds registered globals + copy_global_to; clear Discord global commands so stale /rsnote etc. disappear.
+        try:
+            await self.bot.tree.sync()
+        except Exception as e:
+            try:
+                print(f"{Colors.YELLOW}[Slash] Global sync (cleanup) failed (non-fatal): {type(e).__name__}: {str(e)[:160]}{Colors.RESET}")
+            except Exception:
+                pass
+
+        guild_targets = sorted({int(g) for g in (test_gid, rs_gid) if g})
+
+        synced_summary: Dict[int, int] = {}
+        for gid in guild_targets:
+            try:
+                gobj = discord.Object(id=int(gid))
+                synced = await self.bot.tree.sync(guild=gobj)
+                names = sorted({str(getattr(x, "name", "") or "") for x in (synced or []) if getattr(x, "name", None)})
+                synced_summary[int(gid)] = len(names)
+                try:
+                    print(f"{Colors.GREEN}[Slash] Sync OK: guild={gid} commands={len(names)}{Colors.RESET}")
+                except Exception:
+                    pass
+            except Exception as e:
+                msg = str(e)
+                if "30034" in msg or "Max number of daily application command creates" in msg:
+                    try:
+                        print(
+                            f"{Colors.YELLOW}[Slash] guild={gid}: Sync blocked by Discord daily limit (30034). "
+                            f"Commands may be incomplete until reset; avoid frequent restarts.{Colors.RESET}"
+                        )
+                    except Exception:
+                        pass
+                    continue
+                try:
+                    print(f"{Colors.YELLOW}[Slash] Sync failed: guild={gid} err={type(e).__name__}: {str(e)[:200]}{Colors.RESET}")
+                except Exception:
+                    pass
+
+        try:
+            ext_loaded = "RSNotes.rsnote" in set(getattr(self.bot, "extensions", {}).keys())
+            self._rsnotes_status_line = (
+                f"[RSNotes] status=sync_done ext_loaded={ext_loaded} "
+                f"rs_guild_cmds={synced_summary.get(rs_gid)} test_guild_cmds={synced_summary.get(test_gid)}"
+            )
+        except Exception:
+            pass
     
     async def _initialize_monitor_channels(self) -> None:
         """Initialize monitor category and per-bot channels in test server."""
@@ -8081,6 +8037,11 @@ echo "CHANGED_END"
                 "headless": True,
                 "post_back_enabled": True,
                 "max_response_chars": 1600,
+                # When mode=cdp and nothing listens on CDP: fall back to headless Playwright for that URL.
+                "cdp_unreachable_fallback": True,
+                # If true, RSAdminBot runs start_chrome_oracle_cdp.sh --headed once when CDP is down, then re-probes.
+                "auto_start_chrome_if_cdp_down": False,
+                "auto_start_chrome_wait_seconds": 8.0,
             },
         }
         
@@ -8170,13 +8131,16 @@ echo "CHANGED_END"
             return 0
 
     def _get_allowed_slash_guild_ids(self) -> List[int]:
-        """Guild ids where RSAdminBot slash commands are enabled."""
-        # Slash commands are only enabled in neo-test-server.
-        try:
-            gid = int(self.config.get("test_server_guild_id") or 0)
-        except Exception:
-            gid = 0
-        return [gid] if gid else []
+        """Guild ids where this bot's slash commands are allowed (RS: /rsnote; Neo Test: admin suite)."""
+        out: List[int] = []
+        for key in ("test_server_guild_id", "rs_server_guild_id"):
+            try:
+                g = int(self.config.get(key) or 0)
+            except Exception:
+                g = 0
+            if g and g not in out:
+                out.append(g)
+        return out
 
     async def _slash_owner_guard(self, interaction: discord.Interaction) -> tuple[bool, str]:
         """Guard for all RSAdminBot slash commands: allowed guild(s) + owner/admin only.
@@ -9292,6 +9256,24 @@ echo "CHANGED_END"
             except Exception:
                 return 1600
 
+        def _cw_cdp_unreachable_fallback() -> bool:
+            try:
+                return bool(_cw_cfg().get("cdp_unreachable_fallback", True))
+            except Exception:
+                return True
+
+        def _cw_auto_start_chrome_if_cdp_down() -> bool:
+            try:
+                return bool(_cw_cfg().get("auto_start_chrome_if_cdp_down", False))
+            except Exception:
+                return False
+
+        def _cw_auto_start_chrome_wait_s() -> float:
+            try:
+                return float(max(2.0, min(float(_cw_cfg().get("auto_start_chrome_wait_seconds") or 8.0), 60.0)))
+            except Exception:
+                return 8.0
+
         def _extract_first_url(text: str) -> str:
             """
             Extract a product URL from a Discord message.
@@ -9659,6 +9641,7 @@ echo "CHANGED_END"
             mode = _cw_mode()
             cdp_url_q = shlex.quote(_cw_cdp_url())
             cfg = _cw_cfg()
+            loop = asyncio.get_running_loop()
             try:
                 goto_timeout_ms = int(cfg.get("goto_timeout_ms") or 90000)
             except Exception:
@@ -9686,11 +9669,75 @@ echo "CHANGED_END"
             if lazy_scroll:
                 extra_flags += " --lazy-wheel-scroll"
 
+            banner_lines: List[str] = []
+            effective_mode = mode
+
+            # CDP requires a long-lived Chrome on Oracle (:9222). If it is down, optionally auto-start it,
+            # else fall back to headless Playwright for this URL (config `cdp_unreachable_fallback`, default on).
+            if mode == "cdp":
+                cdp_base = str(_cw_cdp_url() or "http://127.0.0.1:9222").strip().rstrip("/")
+                probe_url = f"{cdp_base}/json/version"
+                probe_cmd = f"curl -sf --connect-timeout 2 --max-time 6 {shlex.quote(probe_url)} | head -c 40"
+                ok_p, out_p, _ = await loop.run_in_executor(
+                    None, lambda p=probe_cmd: self._execute_ssh_command(p, timeout=45, log_it=False)
+                )
+                snippet = (out_p or "").strip()
+                cdp_ok = bool(ok_p) and snippet.startswith("{")
+
+                if not cdp_ok and _cw_auto_start_chrome_if_cdp_down():
+                    try:
+                        print(
+                            f"{Colors.YELLOW}[Chromerrunner][CDP] down — auto-start Chrome "
+                            f"(start_chrome_oracle_cdp.sh --headed){Colors.RESET}"
+                        )
+                    except Exception:
+                        pass
+                    autostart = (
+                        f"cd {runner_dir_q} && chmod +x start_chrome_oracle_cdp.sh && "
+                        f"nohup env CHROME_BIN={chrome_q} bash ./start_chrome_oracle_cdp.sh --headed "
+                        f">>/tmp/chromerrunner_cdp_autostart.log 2>&1 & echo started"
+                    )
+                    await loop.run_in_executor(
+                        None, lambda c=autostart: self._execute_ssh_command(c, timeout=90, log_it=True)
+                    )
+                    await asyncio.sleep(_cw_auto_start_chrome_wait_s())
+                    ok_p2, out_p2, _ = await loop.run_in_executor(
+                        None, lambda p=probe_cmd: self._execute_ssh_command(p, timeout=45, log_it=False)
+                    )
+                    snippet2 = (out_p2 or "").strip()
+                    cdp_ok = bool(ok_p2) and snippet2.startswith("{")
+                    if cdp_ok:
+                        banner_lines.append(
+                            "[Chromerrunner] Chrome CDP is up after auto-start on Oracle."
+                        )
+
+                if not cdp_ok and _cw_cdp_unreachable_fallback():
+                    effective_mode = "headless"
+                    banner_lines.append(
+                        "[Chromerrunner] CDP not listening on port 9222 — using **headless** Playwright Chrome "
+                        "for this URL. For Target sessions/cookies, start CDP Chrome on Oracle: "
+                        "`cd Chromerrunner && bash start_chrome_oracle_cdp.sh --headed` "
+                        "(or enable `auto_start_chrome_if_cdp_down` in RSAdminBot config)."
+                    )
+                    try:
+                        print(f"{Colors.YELLOW}[Chromerrunner][CDP] fallback=headless{Colors.RESET}")
+                    except Exception:
+                        pass
+
+                if not cdp_ok and effective_mode == "cdp":
+                    msg = (
+                        "Chrome CDP is not running on Oracle (127.0.0.1:9222 refused connection).\n\n"
+                        "**Fix:** SSH to Oracle and run:\n"
+                        "`cd ~/bots/mirror-world/Chromerrunner && bash start_chrome_oracle_cdp.sh --headed`\n\n"
+                        "Or set `chromerrunner_watcher.cdp_unreachable_fallback` to true (default) so the bot "
+                        "falls back to headless automatically."
+                    )
+                    return False, msg
+
             # Two modes:
             # - headless: launch system chrome headless (still may be blocked by strict retailers on Oracle IP)
             # - cdp: attach to a long-running Chrome with remote debugging + persistent profile
-            #        (closest to your local manual flow; still needs a solved session if Cloudflare challenges)
-            if mode == "cdp":
+            if effective_mode == "cdp":
                 runner_flags = f"--connect-cdp --cdp-url {cdp_url_q}"
             else:
                 runner_flags = f"{headless_flag} --chrome-exe {chrome_q}"
@@ -9704,7 +9751,6 @@ echo "CHANGED_END"
                 f" --auto-wait-s {auto_wait} --goto-timeout-ms {goto_timeout_ms} --networkidle-timeout-ms {networkidle_timeout_ms} {skip_flag}{extra_flags}"
             )
 
-            loop = asyncio.get_running_loop()
             ok, out, err = await loop.run_in_executor(None, lambda: self._execute_ssh_command(cmd, timeout=timeout_s, log_it=True))
             txt = ""
             if out:
@@ -9716,6 +9762,8 @@ echo "CHANGED_END"
             txt = (txt or "").strip()
             if not txt:
                 txt = "No output."
+            if banner_lines:
+                txt = "\n".join(banner_lines) + "\n\n" + txt
             return bool(ok), txt
 
         def _chromerrunner_title_line(output: str) -> str:
