@@ -531,6 +531,48 @@ class RSSuccessBot:
             print(f"{Colors.YELLOW}[Commands] Could not clear global application commands: {e}{Colors.RESET}")
             return False
 
+    async def _fetch_discord_registered_commands(self, *, guild_id: Optional[int]) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+        """
+        Fetch live registered command counts from Discord (authoritative), not from the in-memory tree.
+
+        Returns (global_count, guild_count, error). If an error occurs, counts may be None.
+        """
+        app_id = self.bot.application_id
+        if not app_id:
+            return None, None, "bot.application_id is not available yet"
+        try:
+            # discord.py HTTP client exposes these endpoints; names vary by version so guard carefully.
+            http = getattr(self.bot, "http", None)
+            if http is None:
+                return None, None, "bot.http missing"
+            global_cmds = []
+            guild_cmds = []
+            if hasattr(http, "get_global_commands"):
+                global_cmds = await http.get_global_commands(app_id)
+            elif hasattr(http, "get_global_commands_application"):
+                global_cmds = await http.get_global_commands_application(app_id)  # type: ignore[attr-defined]
+            elif hasattr(http, "get_application_commands"):
+                global_cmds = await http.get_application_commands(app_id)  # type: ignore[attr-defined]
+            else:
+                # Fallback: don't fail the whole proof just because global fetch name changed.
+                global_cmds = []
+
+            if guild_id:
+                if hasattr(http, "get_guild_commands"):
+                    guild_cmds = await http.get_guild_commands(app_id, guild_id)
+                elif hasattr(http, "get_guild_commands_application"):
+                    guild_cmds = await http.get_guild_commands_application(app_id, guild_id)  # type: ignore[attr-defined]
+                elif hasattr(http, "get_application_commands"):
+                    guild_cmds = await http.get_application_commands(app_id, guild_id=guild_id)  # type: ignore[call-arg]
+                else:
+                    guild_cmds = []
+
+            g_count = len(global_cmds) if isinstance(global_cmds, list) else None
+            gd_count = len(guild_cmds) if isinstance(guild_cmds, list) else None
+            return g_count, gd_count, None
+        except Exception as e:
+            return None, None, f"{type(e).__name__}: {e}"
+
     def _setup_events(self):
         """Setup Discord event handlers"""
         
@@ -571,9 +613,17 @@ class RSSuccessBot:
                                 for cmd in synced:
                                     print(f"{Colors.GREEN}   • /{cmd.name}{Colors.RESET}")
                             else:
-                                # Commands already synced or no changes needed
-                                print(f"{Colors.YELLOW}[Commands] Sync returned 0 commands (likely already synced){Colors.RESET}")
-                                print(f"{Colors.YELLOW}[Commands] Registered {len(all_commands)} commands should be available{Colors.RESET}")
+                                # Sync can return 0 even when Discord didn't persist anything; prove live state via REST fetch.
+                                print(f"{Colors.YELLOW}[Commands] Sync returned 0 commands (no changes reported){Colors.RESET}")
+                                print(f"{Colors.YELLOW}[Commands] Verifying live Discord registrations...{Colors.RESET}")
+                                g_count, gd_count, err = await self._fetch_discord_registered_commands(guild_id=guild_id)
+                                if err:
+                                    print(f"{Colors.YELLOW}[Commands] Live verification failed: {err}{Colors.RESET}")
+                                else:
+                                    print(
+                                        f"{Colors.CYAN}[Commands] Live Discord state:{Colors.RESET} "
+                                        f"global={g_count} guild={gd_count} (guild_id={guild_id})"
+                                    )
                                 print(f"{Colors.YELLOW}[Commands] If commands don't appear, use !sync to force re-sync{Colors.RESET}")
                         except discord.HTTPException as http_e:
                             print(f"{Colors.RED}[Commands] HTTP Error during sync: {http_e.status} - {http_e.text}{Colors.RESET}")
@@ -1611,6 +1661,16 @@ class RSSuccessBot:
                 cleared_global = await self._clear_global_slash_command_registrations()
                 if cleared_global:
                     print(f"{Colors.GREEN}[Sync] Cleared global slash registrations (guild-only).{Colors.RESET}")
+
+                # Authoritative proof: what Discord says is currently registered for this app+guild.
+                g_count, gd_count, err = await self._fetch_discord_registered_commands(guild_id=guild_id)
+                if err:
+                    print(f"{Colors.YELLOW}[Sync] Live verification failed: {err}{Colors.RESET}")
+                else:
+                    print(
+                        f"{Colors.CYAN}[Sync] Live Discord state:{Colors.RESET} "
+                        f"global={g_count} guild={gd_count} (guild_id={guild_id})"
+                    )
 
                 # Note: get_commands() is synchronous, not async
                 # We can't easily check existing commands without making API calls
