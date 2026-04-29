@@ -92,6 +92,31 @@ if exist "Instorebotforwarder\conversational_deals_forwarder.py" (
 
 )
 
+REM MWDataManagerBot: universal resolver fallback + audits (new paths must be staged once)
+if exist "MWDataManagerBot\universal_resolver_client.py" (
+
+  git add -- "MWDataManagerBot/universal_resolver_client.py"
+
+)
+
+if exist "MWDataManagerBot\link_logic_audit.py" (
+
+  git add -- "MWDataManagerBot/link_logic_audit.py"
+
+)
+
+if exist "MWDataManagerBot\run_link_logic_audit.bat" (
+
+  git add -- "MWDataManagerBot/run_link_logic_audit.bat"
+
+)
+
+if exist "MWDataManagerBot\universal_link_resolver_v2_ready\universal_link_resolver.py" (
+
+  git add -- "MWDataManagerBot/universal_link_resolver_v2_ready/universal_link_resolver.py" "MWDataManagerBot/universal_link_resolver_v2_ready/README.txt" "MWDataManagerBot/universal_link_resolver_v2_ready/requirements.txt" "MWDataManagerBot/universal_link_resolver_v2_ready/install_requirements.bat" "MWDataManagerBot/universal_link_resolver_v2_ready/RUN_RESOLVER.bat" "MWDataManagerBot/universal_link_resolver_v2_ready/RUN_RESOLVER_FAST_NO_BROWSER.bat" "MWDataManagerBot/universal_link_resolver_v2_ready/RUN_URLS_FILE.bat" "MWDataManagerBot/universal_link_resolver_v2_ready/run_resolver.ps1"
+
+)
+
 
 
 REM If nothing is staged, exit cleanly (reminders still print at :pause_exit)
