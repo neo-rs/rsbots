@@ -514,5 +514,39 @@ class TestServerOrganizer:
                         self.channels_data["journal_channels"][map_key] = found.id
                         self._save_channels_data()
 
+        # RSForwarder: optional secondary journal for stdout lines containing `[MonitorData]`.
+        if isinstance(cfg, dict) and cfg.get("rsforwarder_split_monitordata_journal") and "rsforwarder" in result:
+            md_key = "rsforwarder_monitordata"
+            md_name = f"{channel_prefix}rsforwarder-monitordata".lower()
+
+            have_md = False
+            existing_md_id = self.channels_data["journal_channels"].get(md_key)
+            if existing_md_id:
+                ch = guild.get_channel(int(existing_md_id))
+                if ch and isinstance(ch, discord.TextChannel):
+                    result[md_key] = ch.id
+                    have_md = True
+
+            if not have_md:
+                found = discord.utils.get(guild.text_channels, name=md_name, category=category)
+                if not found:
+                    found = discord.utils.get(guild.text_channels, name=md_name)
+                if not found:
+                    try:
+                        found = await guild.create_text_channel(
+                            md_name,
+                            category=category,
+                            reason="RSAdminBot RSForwarder MonitorData journal (test server only)",
+                        )
+                    except discord.Forbidden:
+                        found = None
+                    except Exception:
+                        found = None
+
+                if found:
+                    result[md_key] = found.id
+                    self.channels_data["journal_channels"][md_key] = found.id
+                    self._save_channels_data()
+
         return result
 

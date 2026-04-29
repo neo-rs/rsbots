@@ -5502,10 +5502,12 @@ echo "TARGET=$TARGET"
         webhook_url: str,
         *,
         fetch_webhook_url: Optional[str] = None,
+        monitordata_webhook_url: Optional[str] = None,
     ) -> None:
         """Follow journald for a unit and stream batched lines to the bot's journal channel webhook(s).
 
         For discumbot with fetch_webhook_url set, lines containing [FETCHALL] go to the fetch webhook; others to the primary (D2D).
+        For rsforwarder with monitordata_webhook_url set, lines containing [MonitorData] go to the MonitorData webhook; others primary.
         """
         cfg = self._get_journal_live_config()
         backfill = max(0, min(int(cfg.get("startup_backfill_lines") or 20), 200))
@@ -5559,7 +5561,11 @@ echo "TARGET=$TARGET"
                     except asyncio.TimeoutError:
                         if buf:
                             await self._flush_journal_batch(
-                                bot_key, webhook_url, buf, fetch_webhook_url=fetch_webhook_url
+                                bot_key,
+                                webhook_url,
+                                buf,
+                                fetch_webhook_url=fetch_webhook_url,
+                                monitordata_webhook_url=monitordata_webhook_url,
                             )
                             buf = []
                             buf_chars = 0
@@ -5593,7 +5599,11 @@ echo "TARGET=$TARGET"
                     now = time.time()
                     if buf and (buf_chars >= max_chars or (now - last_flush) >= flush_seconds):
                         await self._flush_journal_batch(
-                            bot_key, webhook_url, buf, fetch_webhook_url=fetch_webhook_url
+                            bot_key,
+                            webhook_url,
+                            buf,
+                            fetch_webhook_url=fetch_webhook_url,
+                            monitordata_webhook_url=monitordata_webhook_url,
                         )
                         buf = []
                         buf_chars = 0
@@ -5602,7 +5612,11 @@ echo "TARGET=$TARGET"
                 # Process ended; flush any remaining buffer
                 if buf:
                     await self._flush_journal_batch(
-                        bot_key, webhook_url, buf, fetch_webhook_url=fetch_webhook_url
+                        bot_key,
+                        webhook_url,
+                        buf,
+                        fetch_webhook_url=fetch_webhook_url,
+                        monitordata_webhook_url=monitordata_webhook_url,
                     )
                     buf = []
                     buf_chars = 0
@@ -5624,6 +5638,7 @@ echo "TARGET=$TARGET"
         lines: List[str],
         *,
         fetch_webhook_url: Optional[str] = None,
+        monitordata_webhook_url: Optional[str] = None,
     ) -> None:
         try:
             if not lines:
@@ -5646,6 +5661,22 @@ echo "TARGET=$TARGET"
                 if isinstance(sw, dict):
                     await self._flush_rscheckerbot_journal_split(bot_key, webhook_url, sw, lines)
                     return
+            mdw = str(monitordata_webhook_url or "").strip()
+            if bot_key == "rsforwarder" and mdw:
+                main_lines: List[str] = []
+                monitor_lines: List[str] = []
+                for ln in lines:
+                    if "[MonitorData]" in (ln or ""):
+                        monitor_lines.append(ln)
+                    else:
+                        main_lines.append(ln)
+                if main_lines:
+                    await self._flush_journal_batch_plain(bot_key, webhook_url, main_lines, stream="log")
+                if monitor_lines:
+                    await self._flush_journal_batch_plain(
+                        bot_key, mdw, monitor_lines, stream="monitordata"
+                    )
+                return
             fw = str(fetch_webhook_url or "").strip()
             if bot_key == "discumbot" and fw:
                 d2d_lines: List[str] = []
@@ -5966,6 +5997,8 @@ echo "TARGET=$TARGET"
             )
             if cfg.get("rscheckerbot_split_flow_journals") and rc_split_ch:
                 extra += f" | RSCheckerbot `[RSCheckerbot][FLOW]` split -> {rc_split_ch} extra channel(s)"
+            if cfg.get("rsforwarder_split_monitordata_journal") and channel_map.get("rsforwarder_monitordata"):
+                extra += " | RSForwarder `[MonitorData]` split -> #journal-rsforwarder-monitordata"
             print(
                 f"{Colors.GREEN}[Journal Live] Enabled. Channels: {len(channel_map)} "
                 f"(category_id={cfg.get('category_id')}){extra}{Colors.RESET}"
@@ -6183,12 +6216,16 @@ echo "TARGET=$TARGET"
                 and getattr(self, "_journal_discumbot_split_fetch", False)
             ):
                 fetch_wh = str(self._journal_webhook_urls_by_bot.get("discumbot_fetch") or "").strip()
+            md_wh = ""
+            if bot_key == "rsforwarder" and cfg.get("rsforwarder_split_monitordata_journal"):
+                md_wh = str(self._journal_webhook_urls_by_bot.get("rsforwarder_monitordata") or "").strip()
             self._journal_tasks[bot_key] = asyncio.create_task(
                 self._journal_follow_loop(
                     bot_key,
                     svc,
                     url,
                     fetch_webhook_url=fetch_wh or None,
+                    monitordata_webhook_url=md_wh or None,
                 )
             )
     

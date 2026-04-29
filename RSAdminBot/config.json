@@ -140,7 +140,8 @@
       "startup"
     ],
     "rscheckerbot_journal_max_chars": 6000,
-    "rscheckerbot_journal_flush_seconds": 2
+    "rscheckerbot_journal_flush_seconds": 2,
+    "rsforwarder_split_monitordata_journal": true
   },
   "whop_webhook": {
     "enabled": true,
