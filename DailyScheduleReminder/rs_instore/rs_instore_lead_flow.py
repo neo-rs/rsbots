@@ -252,23 +252,6 @@ def _send_reply(channel_id: str, token: str, *, reply_to_message_id: str, conten
     return data if isinstance(data, dict) else {}
 
 
-def _send_reply(channel_id: str, token: str, *, reply_to_message_id: str, content: str) -> dict:
-    """
-    Post a message reply. Used when we cannot edit the original breakdown message.
-    """
-    body = {
-        "content": str(content or ""),
-        "tts": False,
-        "message_reference": {"message_id": str(reply_to_message_id or "").strip()},
-        "allowed_mentions": {"parse": []},
-    }
-    r = discord_post(f"{DISCORD_API}/channels/{channel_id}/messages", token, body)
-    if r.status_code != 200:
-        raise RuntimeError(f"POST reply failed HTTP {r.status_code}: {(r.text or '')[:240]}")
-    data = r.json()
-    return data if isinstance(data, dict) else {}
-
-
 def _wait_for_reply(
     *,
     channel_id: str,
@@ -490,44 +473,12 @@ def _fetch_message_by_id(channel_id: str, message_id: str, token: str) -> dict |
     return None
 
 
-def _wait_for_message_to_gain_embeds(
-    *,
-    channel_id: str,
-    message_id: str,
-    token: str,
-    timeout_s: float,
-) -> dict:
-    """
-    Some resolver bots edit their initial status message (same message id) to add the final embed.
-    Poll that message id until embeds appear.
-    """
-    deadline = time.time() + float(timeout_s)
-    last_preview = ""
-    while time.time() < deadline:
-        m = _fetch_message_by_id(channel_id, message_id, token)
-        if isinstance(m, dict):
-            last_preview = _message_debug_preview(m) or last_preview
-            embeds = m.get("embeds") or []
-            if isinstance(embeds, list) and embeds:
-                return m
-        time.sleep(1.0)
-    raise TimeoutError(
-        f"Timed out waiting for resolver message to gain embeds. last_preview={last_preview!r}"
-    )
-
-
-def _extract_details_from_first_embed(reply: dict) -> tuple[str, str, str]:
-    """
-    Extract (title, price, img) from a resolver reply message.
-    Raises if required parts are missing.
-    """
-    embeds = reply.get("embeds") or []
-    if not isinstance(embeds, list) or not embeds:
-        raise RuntimeError("no embeds")
-    e0 = embeds[0] if isinstance(embeds[0], dict) else {}
+def _extract_details_from_single_embed(e0: dict) -> tuple[str, str, str]:
     title = str(e0.get("title") or "").strip()
     if not title:
-        title = str(e0.get("description") or "").splitlines()[0].strip()
+        desc = str(e0.get("description") or "").strip()
+        if desc:
+            title = desc.splitlines()[0].strip()
     fm = _field_map(e0)
     msrp = _clean_price(_get_field(fm, "msrp", "retail", "price"))
     low = _clean_price(_get_field(fm, "as low as", "as low", "low"))
@@ -538,32 +489,58 @@ def _extract_details_from_first_embed(reply: dict) -> tuple[str, str, str]:
     return title, price, img
 
 
-def _wait_for_message_to_have_details(
-    *,
-    channel_id: str,
-    message_id: str,
-    token: str,
-    timeout_s: float,
-) -> dict:
+def _extract_details_from_plaintext_block(content: str) -> tuple[str, str, str]:
     """
-    Resolver bots often edit their initial status message multiple times.
-    Poll the message id until the embed has title+price+image.
+    Chromerrunner-style plaintext block (when embed fields differ): **Title:** / **Price:** / **Image:** lines.
     """
-    deadline = time.time() + float(timeout_s)
-    last_preview = ""
-    while time.time() < deadline:
-        m = _fetch_message_by_id(channel_id, message_id, token)
-        if isinstance(m, dict):
-            last_preview = _message_debug_preview(m) or last_preview
-            try:
-                _extract_details_from_first_embed(m)
-                return m
-            except Exception:
-                pass
-        time.sleep(1.2)
-    raise TimeoutError(
-        f"Timed out waiting for resolver message to have details. last_preview={last_preview!r}"
+    text = str(content or "")
+    if not text.strip():
+        return "", "", ""
+    title = ""
+    m = re.search(r"(?im)^\s*(?:\*\*)?(?:title)(?:\*\*)?\s*:\s*(.+)$", text)
+    if m:
+        title = re.sub(r"[`_*]", "", (m.group(1) or "").strip()).strip()
+    price = ""
+    m = re.search(
+        r"(?im)^\s*(?:\*\*)?(?:msrp|price|retail|as low as|as low)(?:\*\*)?\s*:\s*([^\n]+)",
+        text,
     )
+    if m:
+        price = _clean_price(m.group(1))
+    img = ""
+    m = re.search(r"(?im)^\s*(?:\*\*)?(?:image)(?:\*\*)?\s*:\s*(https?://\S+)", text)
+    if m:
+        img = (m.group(1) or "").strip().rstrip(").,]")
+    if not img:
+        m2 = re.search(r"(https?://[^\s<>\[\]()\"']+\.(?:png|jpe?g|webp|gif)(?:\?[^\s\"']*)?)", text, re.I)
+        if m2:
+            img = m2.group(1).strip()
+    return title, price, img
+
+
+def _try_extract_resolver_details(reply: dict) -> tuple[str, str, str]:
+    """
+    Full extraction: try every embed, then plaintext (Chromerrunner often edits one message in-place).
+    """
+    embeds = reply.get("embeds") or []
+    if isinstance(embeds, list):
+        for e in embeds:
+            if not isinstance(e, dict):
+                continue
+            try:
+                return _extract_details_from_single_embed(e)
+            except Exception:
+                continue
+    t2, p2, i2 = _extract_details_from_plaintext_block(str(reply.get("content") or ""))
+    if t2 and p2 and i2:
+        return t2, p2, i2
+    raise RuntimeError("resolver message had no complete embed + plaintext did not parse")
+
+
+def _extract_details_from_first_embed(reply: dict) -> tuple[str, str, str]:
+    """Backward-compatible name; delegates to multi-embed + plaintext resolver."""
+    return _try_extract_resolver_details(reply)
+
 
 def _message_debug_preview(m: dict) -> str:
     parts: list[str] = []
@@ -740,15 +717,45 @@ def _resolve_url_to_details(
     sent_id = str(sent.get("id") or "")
     host = _url_host(store_url)
     print(f"  link->resolver: posted url (host={host or '-'}) msg_id={sent_id}")
-    # The link resolver may emit one or more status lines (e.g. "Chromerrunner starting…")
-    # before posting the final embed. Keep scanning until we find an embed.
+    # The link resolver may post "Chromerrunner starting…" and then edit the *same* message id.
+    # A single one-shot wait is not enough: if that wait ends before the edit lands, the next
+    # list_messages_after() often returns an empty batch (no new ids), and we would never
+    # re-fetch the same message. Track pending message ids and re-poll them
+    # every loop until the global deadline.
     deadline = time.time() + float(timeout_s)
     cursor = sent_id
     last_preview = ""
+    pending_ids: list[str] = []
+    seen_pending: set[str] = set()
+    reply: dict | None = None
+
+    def _add_pending(mid: str) -> None:
+        mid = str(mid or "").strip()
+        if not mid.isdigit() or mid in seen_pending:
+            return
+        seen_pending.add(mid)
+        pending_ids.append(mid)
+
     while time.time() < deadline:
+        # 1) Re-fetch known resolver messages (same id, edited in place).
+        for mid in list(pending_ids):
+            m = _fetch_message_by_id(resolver_channel_id, mid, token)
+            if not isinstance(m, dict):
+                continue
+            last_preview = _message_debug_preview(m) or last_preview
+            try:
+                _try_extract_resolver_details(m)
+                reply = m
+                break
+            except Exception:
+                pass
+        if reply is not None:
+            break
+
         batch = list_messages_after(resolver_channel_id, cursor, token, limit=50)
         if batch:
             cursor = str(batch[-1].get("id") or cursor)
+
         for m in batch:
             author = m.get("author") if isinstance(m.get("author"), dict) else {}
             aid = str(author.get("id") or "").strip()
@@ -760,63 +767,41 @@ def _resolve_url_to_details(
 
             blob = preview.lower()
             if host and host not in blob:
-                # Not about our URL run (could be other traffic in the channel).
                 continue
 
-            # Skip known "starting" / progress lines.
-            if "chromerrunner starting" in blob or "starting" in blob and "chromerrunner" in blob:
+            mid = str(m.get("id") or "").strip()
+            if (
+                "chromerrunner starting" in blob
+                or ("starting" in blob and "chromerrunner" in blob)
+                or ("processing" in blob and "url:" in blob)
+            ):
                 print(f"  link->resolver: status: {_console_safe(preview)}")
-                # Many runs are edited in-place. Poll this message id for the final embed.
-                try:
-                    reply = _wait_for_message_to_have_details(
-                        channel_id=resolver_channel_id,
-                        message_id=str(m.get("id") or ""),
-                        token=token,
-                        timeout_s=max(10.0, deadline - time.time()),
-                    )
-                    break
-                except TimeoutError:
-                    # Keep scanning other messages; maybe the bot posts a new one instead.
-                    continue
-                continue
-            if "processing" in blob and "url:" in blob:
-                print(f"  link->resolver: status: {_console_safe(preview)}")
-                try:
-                    reply = _wait_for_message_to_have_details(
-                        channel_id=resolver_channel_id,
-                        message_id=str(m.get("id") or ""),
-                        token=token,
-                        timeout_s=max(10.0, deadline - time.time()),
-                    )
-                    break
-                except TimeoutError:
-                    continue
+                if mid:
+                    _add_pending(mid)
                 continue
 
             embeds = m.get("embeds") or []
             if isinstance(embeds, list) and embeds:
-                # If this is already a full reply (not an in-place edited one), accept only when it has details.
+                if mid:
+                    _add_pending(mid)
                 try:
-                    _extract_details_from_first_embed(m)
+                    _try_extract_resolver_details(m)
                     reply = m
                     break
                 except Exception:
-                    # Still evolving; keep waiting.
                     last_preview = preview or last_preview
                     continue
-            # If it matched our host but still has no embeds and isn't a known status line,
-            # keep waiting (but log once so it's visible).
             if preview:
                 print(f"  link->resolver: non-embed update: {_console_safe(preview)}")
-        else:
-            time.sleep(0.8)
-            continue
-        break
+        if reply is not None:
+            break
 
-    else:
+        time.sleep(1.0)
+
+    if reply is None:
         raise TimeoutError(f"Timed out waiting for link resolver embed. last_preview={last_preview!r}")
 
-    title, price, img = _extract_details_from_first_embed(reply)
+    title, price, img = _try_extract_resolver_details(reply)
     return title, price, img
 
 
@@ -938,11 +923,6 @@ def _is_cannot_edit_other_user_403(err: BaseException) -> bool:
     return ("Cannot edit a message authored by another user" in s) or ('"code": 50005' in s)
 
 
-def _is_cannot_edit_other_user_403(err: BaseException) -> bool:
-    s = str(err)
-    return ("Cannot edit a message authored by another user" in s) or ('"code": 50005' in s)
-
-
 def _process_breakdown_message(
     *,
     cfg: dict,
@@ -959,6 +939,11 @@ def _process_breakdown_message(
     link_values_ch = _cfg_channel_id(cfg, "product_links")
     command_post_ch = _cfg_channel_id(cfg, "command_post_channel_id")
     dest_ch = _cfg_channel_id(cfg, "destination_channel_id")
+    try:
+        link_timeout = float(cfg.get("link_resolver_timeout_seconds") or 180.0)
+    except Exception:
+        link_timeout = 180.0
+    link_timeout = max(30.0, min(600.0, link_timeout))
 
     msg, _ch, _label, _tok_used = fetch_message_with_token_fallback(guild_id, source_channel_id, source_message_id)
     original_text = str(msg.get("content") or "")
@@ -1010,7 +995,7 @@ def _process_breakdown_message(
             resolver_channel_id=link_values_ch,
             token=token,
             my_user_id=my_id,
-            timeout_s=90.0,
+            timeout_s=link_timeout,
         )
         print(f"  url->details: title={title[:70]!r} price={price} img={(img[:60] + '...') if len(img) > 60 else img}")
 
