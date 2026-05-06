@@ -99,6 +99,14 @@
         "role_id": "1139628383853101166",
         "text": ""
       }
+    },
+    {
+      "source_channel_id": "1484473267031904287",
+      "source_channel_name": "conversational-deals",
+      "role_mention": {
+        "role_id": "",
+        "text": ""
+      }
     }
   ],
   "rs_server_icon_url": "https://cdn.discordapp.com/icons/876528050081251379/a_a9a346601bbd93532d931e5280616797.gif?size=256",
