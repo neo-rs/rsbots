@@ -8577,19 +8577,6 @@ async def delayed_assign_former_member(member: discord.Member):
                 except Exception as e:
                     await log_role_event(f"⚠️ **Failed to assign Former Member role** to {_fmt_user(refreshed)}\n   ❌ Error: `{e}`")
 
-        extra_role = guild.get_role(1224748748920328384)
-        if extra_role and extra_role not in refreshed.roles:
-            try:
-                await refreshed.add_roles(extra_role, reason="Lost member role; add extra role")
-                e = _make_dyno_embed(
-                    member=refreshed,
-                    description=f"{refreshed.mention} was given the {extra_role.name} role",
-                    footer=f"ID: {refreshed.id}",
-                    color=0xFEE75C,
-                )
-                await log_role_event(embed=e)
-            except Exception as e:
-                await log_role_event(f"⚠️ **Failed to assign extra role** to {_fmt_user(refreshed)}\n   ❌ Error: `{e}`")
     finally:
         pending_former_checks.discard(member.id)
 

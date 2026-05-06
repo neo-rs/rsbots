@@ -179,7 +179,7 @@
     "headless": true,
     "post_back_enabled": true,
     "max_response_chars": 1600,
-    "screenshot_policy": "ebay_only",
+    "screenshot_policy": "never",
     "lazy_wheel_scroll": false,
     "ebay_sch_clip_height_px": 1150
   }
