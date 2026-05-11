@@ -16,19 +16,57 @@ mkdir -p "$PROFILE_DIR"
 HEADED="no"
 START_URL="https://www.google.com/"
 DISPLAY_OVERRIDE=""
-if [[ "${1:-}" == "--headed" ]]; then
-  HEADED="yes"
-  shift || true
-fi
-if [[ "${1:-}" == "--display" ]]; then
-  shift || true
-  DISPLAY_OVERRIDE="${1:-}"
-  shift || true
-fi
-if [[ "${1:-}" == "--url" ]]; then
-  shift || true
-  START_URL="${1:-$START_URL}"
-  shift || true
+WITH_XVFB="no"
+# Defaults match Instorebotforwarder/config.json (ebay_first8_xvfb_*) so the
+# bot's CDP-attach scrapes see a viewport identical to what manual warmup used.
+XVFB_DISPLAY_ARG="${XVFB_DISPLAY:-:99}"
+XVFB_SCREEN_ARG="${XVFB_SCREEN:-1680x1500x24}"
+
+# Order-independent flag parser. Replaces the previous fixed-position parsing
+# so --with-xvfb / --headed / --display / --url can appear in any order. This
+# also keeps a single source of truth for flag handling on this script.
+while [[ $# -gt 0 ]]; do
+  case "${1:-}" in
+    --headed)
+      HEADED="yes"; shift ;;
+    --with-xvfb)
+      # --with-xvfb implies headed: only useful when we want a real DISPLAY.
+      HEADED="yes"; WITH_XVFB="yes"; shift ;;
+    --display)
+      shift || true; DISPLAY_OVERRIDE="${1:-}"; shift || true ;;
+    --url)
+      shift || true; START_URL="${1:-$START_URL}"; shift || true ;;
+    "")
+      shift || true ;;
+    *)
+      echo "WARNING: ignoring unknown arg: $1"
+      shift || true ;;
+  esac
+done
+
+# When --with-xvfb is set, this script owns the Xvfb lifecycle. We start it
+# idempotently (skip if already running on the same display) so re-running the
+# script or letting systemd restart it doesn't leak X servers.
+if [[ "$WITH_XVFB" == "yes" ]]; then
+  if pgrep -f "Xvfb[[:space:]]+${XVFB_DISPLAY_ARG}([[:space:]]|$)" >/dev/null 2>&1; then
+    echo "Xvfb already running on ${XVFB_DISPLAY_ARG}; reusing"
+  else
+    if ! command -v Xvfb >/dev/null 2>&1; then
+      echo "ERROR: --with-xvfb requested but Xvfb is not installed."
+      echo "Install with:  sudo apt-get update && sudo apt-get install -y xvfb"
+      exit 1
+    fi
+    echo "Starting Xvfb ${XVFB_DISPLAY_ARG} -screen 0 ${XVFB_SCREEN_ARG}"
+    nohup Xvfb "${XVFB_DISPLAY_ARG}" -screen 0 "${XVFB_SCREEN_ARG}" \
+      >/tmp/mirror-world-xvfb-${XVFB_DISPLAY_ARG#:}.log 2>&1 &
+    # Brief wait for the socket; the bot uses the same wait window.
+    sleep "${XVFB_WAIT_S:-2}"
+  fi
+  # Always export DISPLAY so the chrome launch below uses it without relying
+  # on --display.
+  if [[ -z "${DISPLAY_OVERRIDE:-}" ]]; then
+    DISPLAY_OVERRIDE="${XVFB_DISPLAY_ARG}"
+  fi
 fi
 
 is_chrome_for_testing() {
