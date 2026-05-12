@@ -86,10 +86,9 @@ These commands open a **dropdown** to pick a bot. All outputs are ephemeral.
 - **Where**: **Reselling Secrets** (`rs_server_guild_id`), in the **source** text channel to archive; owner/admin gated (same as `!delete` / `!transfer`).
 - **Scope**: Archives **only the channel where you ran `!archive`** (`#current-channel` history → one new forum thread). It does **not** scan or archive other channels.
 - **What**: Creates a **new forum thread** under `archive.forum_channel_id`, then **webhook-replays** that channel’s history into the thread (avatars, embeds, attachments, stickers; original UTC time appended per message). Does **not** create a new guild text channel.
-- **Modes**: **Delete source** after replay, or **Lock + move** (locks channel, then moves it to `archive.lock_move_category_id`).
-- **Forum tags**: Button **Pick tags (private)** opens an **ephemeral** message listing tag **names and IDs** from Discord (`ForumChannel.available_tags`, refreshed via API fetch). Multi-select up to **5** tags (Discord limit), then **Save**; that choice overrides `archive.applied_tag_ids` for this run only. Optional static `archive.applied_tag_ids` remains the default when you skip the picker.
-- **Webhook**: A **temporary** webhook is created on the forum for replay and deleted afterward; **no webhook URL** is stored in config.
-- **Config**: `RSAdminBot/config.json` → `archive`: `forum_channel_id`, optional `lock_move_category_id`, `replay_delay_ms` (0–2000), optional `applied_tag_ids`. **`RSAdminBot/config.secrets.json`** (merged) → `archive.replay_webhook_url`: **required** full webhook URL for the **forum** channel (same channel as `forum_channel_id`); `!archive` replays only through this webhook (no per-run webhook create/delete).
+- **After replay**: The source channel is **always deleted** on success (no lock/move mode).
+- **UI**: One public button — **Pick forum tags** — opens an **ephemeral** panel: optional **string select** (up to **5** forum tags; choose **Use config tag defaults** alone to use `archive.applied_tag_ids`), then **Start archive**. If the forum reports no tags, only **Start archive** is shown (uses config defaults).
+- **Config**: `RSAdminBot/config.json` → `archive`: `forum_channel_id`, `replay_delay_ms` (0–2000), optional `applied_tag_ids`. **`RSAdminBot/config.secrets.json`** (merged) → `archive.replay_webhook_url`: **required** full webhook URL for the **forum** channel (same channel as `forum_channel_id`).
 
 #### `/details`
 - **What**: systemd details for a bot

@@ -186,7 +186,6 @@
   },
   "archive": {
     "forum_channel_id": "1385360488476704768",
-    "lock_move_category_id": "",
     "replay_delay_ms": 350,
     "applied_tag_ids": []
   }

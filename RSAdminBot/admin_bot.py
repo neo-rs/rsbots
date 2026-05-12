@@ -3440,8 +3440,6 @@ class RSAdminBot:
         self._journal_rschecker_active_flow: str = "default"
         self._journal_rscheckerbot_buf_max_chars: int = 0
         self._journal_rscheckerbot_flush_seconds: float = 0.0
-        # !archive forum tag picks (ephemeral UI); key "{user_id}:{source_channel_id}" -> list of ForumTag snowflakes
-        self._archive_tag_overrides: Dict[str, List[int]] = {}
 
         # Setup bot with required intents
         intents = discord.Intents.default()
@@ -4152,22 +4150,6 @@ class RSAdminBot:
                 pass
 
             try:
-                lock_cat_id = int(str(archive_cfg.get("lock_move_category_id") or "").strip() or 0)
-            except Exception:
-                lock_cat_id = 0
-            lock_cat: Optional[discord.CategoryChannel] = None
-            if lock_cat_id:
-                raw_lock = ctx.guild.get_channel(lock_cat_id)
-                if isinstance(raw_lock, discord.CategoryChannel):
-                    lock_cat = raw_lock
-                else:
-                    await _deny(
-                        ctx,
-                        f"❌ `archive.lock_move_category_id` must be a **category** (or empty). Resolved: <#{lock_cat_id}>",
-                    )
-                    return
-
-            try:
                 delay_ms = int(archive_cfg.get("replay_delay_ms") or 350)
             except Exception:
                 delay_ms = 350
@@ -4182,46 +4164,98 @@ class RSAdminBot:
                     except Exception:
                         continue
 
-            tag_session_key = f"{ctx.author.id}:{src.id}"
-            self._archive_tag_overrides.pop(tag_session_key, None)
+            tag_syn = "__archive_cfg_defaults__"
 
-            rs_admin = self
-
-            class _ArchiveForumTagView(ui.View):
-                """Ephemeral: multi-select forum tags (Discord max 5 per thread) from API `available_tags`."""
+            class _ArchiveTagRunView(ui.View):
+                """Ephemeral: string-select MUST have a callback (Discord sends an interaction per use)."""
 
                 def __init__(
                     self,
-                    admin_instance: Any,
-                    session_key: str,
+                    *,
+                    forum: discord.ForumChannel,
                     tags: List[discord.ForumTag],
+                    config_tag_ids: List[int],
+                    delay_ms: int,
                     author_id: int,
                 ):
-                    super().__init__(timeout=120)
-                    self.admin = admin_instance
-                    self.session_key = session_key
+                    super().__init__(timeout=600)
+                    self.forum = forum
+                    self.src_ch = src
+                    self.config_tag_ids = list(config_tag_ids)
+                    self.delay_ms = delay_ms
                     self.author_id = int(author_id)
+                    self._picked_ids: Optional[List[int]] = None
+
                     if tags:
                         opts: List[discord.SelectOption] = []
-                        for t in tags[:25]:
+                        opts.append(
+                            discord.SelectOption(
+                                label="Use config tag defaults",
+                                value=tag_syn,
+                                description="archive.applied_tag_ids from config",
+                            )
+                        )
+                        for t in tags[:24]:
                             tid = int(t.id)
                             nm = str(t.name or "tag")[:90]
                             opts.append(
-                                discord.SelectOption(
-                                    label=nm,
-                                    value=str(tid),
-                                    description=f"ID {tid}"[:100],
-                                )
+                                discord.SelectOption(label=nm, value=str(tid), description=f"id {tid}"[:100])
                             )
-                        max_sel = min(5, len(opts))
+                        n_opt = len(opts)
+                        max_sel = min(5, n_opt)
                         sel = ui.Select(
-                            placeholder="Pick tags (0–5), then Save",
+                            placeholder="Pick 1–5 tags (or defaults row)",
                             options=opts,
-                            min_values=0,
+                            min_values=1,
                             max_values=max_sel,
                             row=0,
                         )
+
+                        async def _on_select(interaction: discord.Interaction) -> None:
+                            raw = [str(v) for v in sel.values]
+                            if len(raw) == 1 and raw[0] == tag_syn:
+                                self._picked_ids = list(self.config_tag_ids)
+                            else:
+                                self._picked_ids = [int(x) for x in raw if x != tag_syn]
+                            await interaction.response.defer(ephemeral=True)
+
+                        sel.callback = _on_select
                         self.add_item(sel)
+
+                    async def _start_archive_impl(i: discord.Interaction) -> None:
+                        tag_ids = (
+                            list(self._picked_ids)
+                            if self._picked_ids is not None
+                            else list(self.config_tag_ids)
+                        )
+                        for ch in self.children:
+                            if isinstance(ch, (ui.Button, ui.Select)):
+                                ch.disabled = True
+                        try:
+                            await i.response.edit_message(
+                                content="📦 Starting forum archive…",
+                                embed=None,
+                                view=self,
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            await i.followup.send("⏳ Mirroring messages into a forum thread…", ephemeral=False)
+                        except Exception:
+                            pass
+                        await _archive_replay(
+                            interaction=i,
+                            src=self.src_ch,
+                            forum=self.forum,
+                            lock_move_category=None,
+                            mode="delete",
+                            delay_ms=self.delay_ms,
+                            applied_tag_ids=tag_ids,
+                        )
+
+                    btn = ui.Button(label="Start archive", style=discord.ButtonStyle.success, row=(1 if tags else 0))
+                    btn.callback = _start_archive_impl
+                    self.add_item(btn)
 
                 async def interaction_check(self, interaction: discord.Interaction) -> bool:
                     try:
@@ -4229,35 +4263,11 @@ class RSAdminBot:
                     except Exception:
                         return False
 
-                @ui.button(label="Save tag selection", style=discord.ButtonStyle.success, row=1)
-                async def save_tags(self, i: discord.Interaction, button: ui.Button) -> None:
-                    picked: List[int] = []
-                    for child in self.children:
-                        if isinstance(child, ui.Select):
-                            for v in child.values:
-                                try:
-                                    picked.append(int(v))
-                                except Exception:
-                                    continue
-                    self.admin._archive_tag_overrides[self.session_key] = picked
-                    await i.response.edit_message(
-                        content=(
-                            f"✅ Saved **{len(picked)}** tag(s) for this archive. "
-                            f"Return to the panel and click **Start archive**."
-                        ),
-                        embed=None,
-                        view=None,
-                    )
+            class _ArchiveMainView(ui.View):
+                """Single button: open ephemeral tag picker + start (always deletes source after replay)."""
 
-            class _ArchiveView(ui.View):
                 def __init__(self):
-                    super().__init__(timeout=180)
-                    self.mode: str = ""  # "lock_move" | "delete"
-                    if not lock_cat:
-                        for c in self.children:
-                            if isinstance(c, ui.Button) and getattr(c, "label", None) == "Archive (lock + move)":
-                                c.disabled = True
-                    self._refresh_buttons()
+                    super().__init__(timeout=300)
 
                 async def interaction_check(self, interaction: discord.Interaction) -> bool:
                     try:
@@ -4265,102 +4275,48 @@ class RSAdminBot:
                     except Exception:
                         return False
 
-                def _refresh_buttons(self) -> None:
-                    self.start_btn.disabled = not bool(self.mode)  # type: ignore[attr-defined]
-
-                @ui.button(label="Pick tags (private)", style=discord.ButtonStyle.secondary, row=1)
-                async def pick_tags_private(self, i: discord.Interaction, button: ui.Button) -> None:
+                @ui.button(label="Pick forum tags", style=discord.ButtonStyle.primary)
+                async def open_archive_panel(self, i: discord.Interaction, button: ui.Button) -> None:
                     tags = list(getattr(forum_ch, "available_tags", None) or [])
+                    desc_parts = [
+                        f"Archive **#{src.name}** → {forum_ch.mention}.",
+                        "After a successful replay, this channel is **deleted**.",
+                        f"Replay delay: **{delay_ms}** ms.",
+                        "",
+                        "**Forum tags** (optional): use the menu below, then **Start archive**.",
+                        "Pick **Use config tag defaults** alone to use `archive.applied_tag_ids` from config.",
+                    ]
                     if not tags:
-                        await i.response.send_message(
-                            "This forum reports **no tags** (`available_tags` empty after refresh). "
-                            "Set `archive.applied_tag_ids` in config if Discord still requires tags.",
-                            ephemeral=True,
+                        desc_parts.extend(
+                            [
+                                "",
+                                "This forum reported **no tags** here — using config defaults unless you only need Start.",
+                            ]
                         )
-                        return
-                    desc_lines = [f"• **{t.name}** — `{t.id}`" for t in tags[:20]]
-                    if len(tags) > 20:
-                        desc_lines.append(f"*…and {len(tags) - 20} more in the menu below.*")
                     emb = discord.Embed(
-                        title="Forum tags (from Discord)",
-                        description=(
-                            "Choose up to **5** tags (forum limit), then **Save tag selection**.\n\n"
-                            + "\n".join(desc_lines)
-                        )[:4000],
+                        title="Forum archive",
+                        description="\n".join(desc_parts)[:4000],
                         color=discord.Color.blurple(),
                     )
-                    view = _ArchiveForumTagView(rs_admin, tag_session_key, tags, ctx.author.id)
-                    await i.response.send_message(embed=emb, view=view, ephemeral=True)
-
-                @ui.button(label="Archive (lock + move)", style=discord.ButtonStyle.primary)
-                async def archive_lock_move(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
-                    self.mode = "lock_move"
-                    self._refresh_buttons()
-                    await i.response.edit_message(view=self)
-
-                @ui.button(label="Archive (delete source)", style=discord.ButtonStyle.danger)
-                async def archive_delete(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
-                    self.mode = "delete"
-                    self._refresh_buttons()
-                    await i.response.edit_message(view=self)
-
-                @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-                async def cancel_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
-                    for child in self.children:
-                        if isinstance(child, ui.Button):
-                            child.disabled = True
-                    await i.response.edit_message(content="Cancelled.", view=self)
-
-                @ui.button(label="Start archive", style=discord.ButtonStyle.success)
-                async def start_btn(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
-                    if not self.mode:
-                        return
-                    for child in self.children:
-                        if isinstance(child, ui.Button):
-                            child.disabled = True
-                    try:
-                        await i.response.edit_message(content="📦 Starting forum archive…", view=self)
-                    except Exception:
-                        pass
-                    try:
-                        await i.followup.send("⏳ Mirroring messages into a forum thread…", ephemeral=False)
-                    except Exception:
-                        pass
-                    tag_ids_for_thread: List[int]
-                    if tag_session_key in rs_admin._archive_tag_overrides:
-                        tag_ids_for_thread = rs_admin._archive_tag_overrides.pop(tag_session_key)
-                    else:
-                        tag_ids_for_thread = list(applied_tag_ids)
-                    await _archive_replay(
-                        interaction=i,
-                        src=src,
+                    ev = _ArchiveTagRunView(
                         forum=forum_ch,
-                        lock_move_category=lock_cat,
-                        mode=self.mode,
+                        tags=tags,
+                        config_tag_ids=applied_tag_ids,
                         delay_ms=delay_ms,
-                        applied_tag_ids=tag_ids_for_thread,
+                        author_id=int(ctx.author.id),
                     )
+                    await i.response.send_message(embed=emb, view=ev, ephemeral=True)
 
-            lock_line = (
-                f"- **Lock + move** parks the source under <#{lock_cat_id}> after replay.\n"
-                if lock_cat
-                else "- **Lock + move** needs `archive.lock_move_category_id` (a category) in config.\n"
-            )
             embed = discord.Embed(
                 title="Forum archive",
                 description=(
-                    f"Mirror-archive **#{src.name}** into {forum_ch.mention} (new forum thread).\n"
-                    f"Choose lock+move vs delete, then click **Start archive**.\n"
-                    f"Delay: {delay_ms}ms\n"
-                    f"{lock_line}"
-                    f"- Tags: use **Pick tags (private)** for an ephemeral menu (from Discord `available_tags`), "
-                    f"or set `archive.applied_tag_ids` in config.\n"
-                    f"- Replay uses **`archive.replay_webhook_url`** in `RSAdminBot/config.secrets.json` "
-                    f"(webhook on this forum; not stored in `config.json`)."
+                    f"Mirror **#{src.name}** into {forum_ch.mention} (new thread), then **delete this channel**.\n\n"
+                    f"Click **Pick forum tags** for an ephemeral panel (optional tags + **Start archive**).\n"
+                    f"Replay delay: **{delay_ms}** ms. Requires **`archive.replay_webhook_url`** in secrets."
                 ),
                 color=discord.Color.blurple(),
             )
-            await ctx.send(embed=embed, view=_ArchiveView())
+            await ctx.send(embed=embed, view=_ArchiveMainView())
 
         @self.bot.command(name="clear")
         async def _cmd_clear(ctx: commands.Context, include_pins: bool = False) -> None:
