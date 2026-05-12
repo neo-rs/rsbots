@@ -89,7 +89,7 @@ These commands open a **dropdown** to pick a bot. All outputs are ephemeral.
 - **Modes**: **Delete source** after replay, or **Lock + move** (locks channel, then moves it to `archive.lock_move_category_id`).
 - **Forum tags**: Button **Pick tags (private)** opens an **ephemeral** message listing tag **names and IDs** from Discord (`ForumChannel.available_tags`, refreshed via API fetch). Multi-select up to **5** tags (Discord limit), then **Save**; that choice overrides `archive.applied_tag_ids` for this run only. Optional static `archive.applied_tag_ids` remains the default when you skip the picker.
 - **Webhook**: A **temporary** webhook is created on the forum for replay and deleted afterward; **no webhook URL** is stored in config.
-- **Config** (`RSAdminBot/config.json` → `archive`): `forum_channel_id`, optional `lock_move_category_id`, `replay_delay_ms` (0–2000), optional `applied_tag_ids`.
+- **Config**: `RSAdminBot/config.json` → `archive`: `forum_channel_id`, optional `lock_move_category_id`, `replay_delay_ms` (0–2000), optional `applied_tag_ids`. **`RSAdminBot/config.secrets.json`** (merged) → `archive.replay_webhook_url`: **required** full webhook URL for the **forum** channel (same channel as `forum_channel_id`); `!archive` replays only through this webhook (no per-run webhook create/delete).
 
 #### `/details`
 - **What**: systemd details for a bot

@@ -3613,18 +3613,44 @@ class RSAdminBot:
             if not src.permissions_for(me).manage_channels:
                 await interaction.followup.send("❌ Missing permission: Manage Channels.", ephemeral=False)
                 return
-            if not src.permissions_for(me).manage_webhooks:
-                await interaction.followup.send("❌ Missing permission: Manage Webhooks.", ephemeral=False)
+            archive_cfg = self.config.get("archive") if isinstance(self.config, dict) else {}
+            if not isinstance(archive_cfg, dict):
+                archive_cfg = {}
+            replay_webhook_url = str(archive_cfg.get("replay_webhook_url") or "").strip()
+            if not replay_webhook_url:
+                await interaction.followup.send(
+                    "❌ **`!archive` requires `archive.replay_webhook_url`** in `RSAdminBot/config.secrets.json` "
+                    "(full webhook URL for the **forum** channel; must match `archive.forum_channel_id`). "
+                    "Create one webhook on that forum in Discord, then paste the URL there.",
+                    ephemeral=False,
+                )
                 return
             fp = forum.permissions_for(me)
             if not fp.create_public_threads:
                 await interaction.followup.send("❌ Missing permission: Create Public Threads (forum).", ephemeral=False)
                 return
-            if not fp.manage_webhooks:
-                await interaction.followup.send("❌ Missing permission: Manage Webhooks (forum).", ephemeral=False)
-                return
             if not fp.send_messages_in_threads:
                 await interaction.followup.send("❌ Missing permission: Send Messages in Threads (forum).", ephemeral=False)
+                return
+
+            try:
+                webhook = discord.Webhook.from_url(replay_webhook_url, client=self.bot)
+            except Exception as e:
+                await interaction.followup.send(
+                    f"❌ Invalid `archive.replay_webhook_url` in `config.secrets.json`: {str(e)[:200]}",
+                    ephemeral=False,
+                )
+                return
+            try:
+                wh_ch_id = int(getattr(webhook, "channel_id", 0) or 0)
+            except Exception:
+                wh_ch_id = 0
+            if wh_ch_id != int(forum.id):
+                await interaction.followup.send(
+                    "❌ `archive.replay_webhook_url` must be a webhook for the **same** channel as "
+                    "`archive.forum_channel_id` (the forum).",
+                    ephemeral=False,
+                )
                 return
 
             base = f"arch-{src.name}".lower()
@@ -3675,20 +3701,6 @@ class RSAdminBot:
                 return
 
             thread = twm.thread
-            webhook: Optional[discord.Webhook] = None
-            try:
-                webhook = await forum.create_webhook(
-                    name="RSAdminBot Archive Mirror",
-                    reason="Temporary webhook for forum archive replay",
-                )
-            except Exception as e:
-                try:
-                    await thread.send(f"❌ Failed to create webhook: {str(e)[:200]}")
-                except Exception:
-                    pass
-                await interaction.followup.send(f"❌ Failed to create webhook: {str(e)[:200]}", ephemeral=False)
-                return
-
             try:
                 await thread.send(
                     embed=discord.Embed(
@@ -3738,7 +3750,9 @@ class RSAdminBot:
                     for att in (msg.attachments or []):
                         ct = str(getattr(att, "content_type", "") or "").lower()
                         fn = str(getattr(att, "filename", "") or "").lower()
-                        is_img = ct.startswith("image/") or fn.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+                        is_img = ct.startswith("image/") or fn.endswith(
+                            (".png", ".jpg", ".jpeg", ".gif", ".webp")
+                        )
                         if is_img:
                             image_urls.append(att.url)
                         else:
@@ -3781,11 +3795,6 @@ class RSAdminBot:
                         pass
 
             try:
-                await webhook.delete(reason="RSAdminBot forum archive replay finished")
-            except Exception:
-                pass
-
-            try:
                 await thread.send(
                     embed=discord.Embed(
                         title="✅ Mirror archive completed",
@@ -3800,11 +3809,17 @@ class RSAdminBot:
             try:
                 if mode == "delete":
                     await asyncio.sleep(1)
-                    await src.delete(reason=f"Forum archived by {interaction.user} via RSAdminBot → thread {thread.id}")
+                    await src.delete(
+                        reason=f"Forum archived by {interaction.user} via RSAdminBot → thread {thread.id}"
+                    )
                 else:
                     overwrites = src.overwrites_for(guild.default_role)
                     overwrites.send_messages = False
-                    await src.set_permissions(guild.default_role, overwrite=overwrites, reason="Locked after forum archive")
+                    await src.set_permissions(
+                        guild.default_role,
+                        overwrite=overwrites,
+                        reason="Locked after forum archive",
+                    )
                     await src.edit(
                         category=lock_move_category,
                         sync_permissions=True,
@@ -4340,7 +4355,8 @@ class RSAdminBot:
                     f"{lock_line}"
                     f"- Tags: use **Pick tags (private)** for an ephemeral menu (from Discord `available_tags`), "
                     f"or set `archive.applied_tag_ids` in config.\n"
-                    f"- Replay uses a **temporary webhook** on the forum (no URL stored in config)."
+                    f"- Replay uses **`archive.replay_webhook_url`** in `RSAdminBot/config.secrets.json` "
+                    f"(webhook on this forum; not stored in `config.json`)."
                 ),
                 color=discord.Color.blurple(),
             )
