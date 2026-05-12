@@ -81,7 +81,8 @@
     },
     "log_ssh_commands": true,
     "log_config_validation": true,
-    "log_all_commands": true
+    "log_all_commands": true,
+    "log_command_not_found": false
   },
   "systemd_events": {
     "enabled": false,

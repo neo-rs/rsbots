@@ -10488,13 +10488,14 @@ echo "CHANGED_END"
             """Handle command errors"""
             if isinstance(error, commands.CommandNotFound):
                 try:
-                    msg_txt = (getattr(getattr(ctx, "message", None), "content", "") or "")[:500]
-                    who = str(getattr(ctx, "author", "") or "")
-                    where = str(getattr(getattr(ctx, "channel", None), "name", "") or "")
-                    print(f"{Colors.YELLOW}[CommandNotFound] user={who} channel={where} msg={msg_txt}{Colors.RESET}")
+                    if bool((self.config.get("logging") or {}).get("log_command_not_found", False)):
+                        msg_txt = (getattr(getattr(ctx, "message", None), "content", "") or "")[:500]
+                        who = str(getattr(ctx, "author", "") or "")
+                        where = str(getattr(getattr(ctx, "channel", None), "name", "") or "")
+                        print(f"{Colors.YELLOW}[CommandNotFound] user={who} channel={where} msg={msg_txt}{Colors.RESET}")
                 except Exception:
                     pass
-                return  # Ignore unknown commands (but log to terminal)
+                return  # Unknown command — usually another bot's !prefix in the same guild
             elif isinstance(error, commands.CheckFailure):
                 # Most admin-gated commands use commands.check(self.is_admin), which raises CheckFailure (not MissingPermissions).
                 print(f"{Colors.YELLOW}[Command Error] CheckFailure: {ctx.author} tried to use {ctx.command}{Colors.RESET}")
