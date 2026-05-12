@@ -2,9 +2,12 @@
 """
 Fetch a Mirror World Discord message by jump link, parse a Deal-Soldier-style embed, print:
 
-  !m lead <title> <MSRP> <As low as> <UPC|TCIN|SKU> <image url> <slug> <destination>
+  !m lead <title> <MSRP> <As low as> <UPC|TCIN|SKU> <image url> <slug> [<destination>]
+  Routes with \"lead_trailing_template\": order is … <slug> <trailing text> <destination>
+  <lead_after_dest_suffix e.g. Y for barcode>. Plain routes omit trailing/suffix: … <slug> <destination>.
+  Placeholders {inventory} / {total_inventory} come from embed (Total Inventory by default).
 
-  Routes with \"command\": \"hdnation\" (e.g. hd-clearance restock) output instead:
+  Routes with \"command\": \"hdnation\" (e.g. legacy SKU-only) output instead:
   !m hdnation <SKU> <#destination>
   SKU is taken from embed fields \"SKU\" or \"Internet Number\".
 
@@ -589,12 +592,70 @@ def format_destination(dest: str) -> str:
     return d
 
 
-def build_m_lead_line(parts: dict[str, str], source_slug: str, destination: str) -> str:
+def build_m_lead_line(
+    parts: dict[str, str],
+    source_slug: str,
+    destination: str,
+    trailing: str = "",
+    after_dest_suffix: str = "",
+) -> str:
     dest = format_destination(destination)
-    return (
+    base = (
         f"!m lead {parts['title']} {parts['msrp']} {parts['as_low_as']} {parts['upc']} "
-        f"{parts['image']} {source_slug} {dest}"
+        f"{parts['image']} {source_slug}"
     )
+    extra = (trailing or "").strip()
+    suf = (after_dest_suffix or "").strip()
+    if extra:
+        out = f"{base} {extra} {dest}"
+        if suf:
+            out = f"{out} {suf}"
+        return out
+    return f"{base} {dest}"
+
+
+def _extract_inventory_for_trailing(embed: dict, route: dict | None) -> str:
+    fm = _field_map(embed)
+    names: list[str] = []
+    if route:
+        raw = route.get("inventory_field_names")
+        if isinstance(raw, list):
+            names = [str(x).strip().lower() for x in raw if str(x).strip()]
+    if not names:
+        names = ["total inventory", "inventory"]
+    for n in names:
+        v = _get_field(fm, n)
+        if not v:
+            continue
+        v = re.sub(r"^[*_`]+|[*_`]+$", "", str(v).strip())
+        v = re.sub(r"\s+", " ", v).strip()
+        if v:
+            return v
+    return ""
+
+
+def route_lead_after_dest_suffix(route: dict | None, *, has_trailing: bool) -> str:
+    """Optional token after <#dest> when lead_trailing_template is used (e.g. Y for barcode)."""
+    if not route or not has_trailing:
+        return ""
+    return str(route.get("lead_after_dest_suffix") or "").strip()
+
+
+def format_route_lead_trailing(route: dict | None, embed: dict) -> str:
+    """
+    When route sets lead_trailing_template, that text goes between <slug> and <destination>.
+    Substitutes {inventory} / {total_inventory} from embed (Total Inventory field by default).
+    """
+    if not route:
+        return ""
+    tpl = str(route.get("lead_trailing_template") or "").strip()
+    if not tpl:
+        return ""
+    inv = _extract_inventory_for_trailing(embed, route)
+    if not inv:
+        inv = str(route.get("lead_trailing_inventory_fallback") or "N/A").strip() or "N/A"
+    out = tpl.replace("{inventory}", inv).replace("{total_inventory}", inv)
+    return out.strip()
 
 
 def build_hdnation_line(sku: str, destination: str) -> str:
@@ -817,7 +878,9 @@ def build_command_line_for_route(
         sku = extract_hdnation_sku(embed)
         return build_hdnation_line(sku, dest_raw)
     parts = extract_lead_parts(embed, message)
-    return build_m_lead_line(parts, slug, dest_raw)
+    trail = format_route_lead_trailing(route, embed)
+    suf = route_lead_after_dest_suffix(route, has_trailing=bool(trail))
+    return build_m_lead_line(parts, slug, dest_raw, trail, suf)
 
 
 def message_dedupe_key(message: dict, route: dict | None) -> str | None:
@@ -1113,6 +1176,7 @@ def print_message_preview(
     dest_raw: str,
     slug: str,
     sku: str = "",
+    lead_trailing_preview: str = "",
 ) -> None:
     print()
     print("=" * 60)
@@ -1145,6 +1209,10 @@ def print_message_preview(
     print()
     print(f"  !m lead slug:      {slug}")
     print(f"  RS destination:   {dest_line}")
+    lt = (lead_trailing_preview or "").strip()
+    if lt:
+        disp = lt if len(lt) <= 220 else lt[:220] + "..."
+        print(f"  Trailing (between slug and <#dest>): {disp}")
     print("=" * 60)
     print()
 
@@ -1261,6 +1329,9 @@ def main() -> int:
 
     ch_name = str((channel or {}).get("name") or "unknown")
     slug = resolve_slug(route, channel, args.source_slug)
+    lead_trailing_preview = ""
+    if cmd != "hdnation":
+        lead_trailing_preview = format_route_lead_trailing(route, embed)
 
     def _dest_from_override_or_route() -> str:
         if dest_override:
@@ -1286,6 +1357,9 @@ def main() -> int:
         else:
             assert parts is not None
             out.update(parts)
+            lt = format_route_lead_trailing(route, embed)
+            out["lead_trailing"] = lt
+            out["lead_after_dest_suffix"] = route_lead_after_dest_suffix(route, has_trailing=bool(lt))
         print(json.dumps(out, indent=2, ensure_ascii=False))
         return 0
 
@@ -1301,6 +1375,7 @@ def main() -> int:
             dest_raw=dest_raw,
             slug=slug,
             sku=sku,
+            lead_trailing_preview=lead_trailing_preview,
         )
         if not dest_raw.strip():
             print(
@@ -1328,7 +1403,8 @@ def main() -> int:
         line = build_hdnation_line(sku, dest_raw)
     else:
         assert parts is not None
-        line = build_m_lead_line(parts, slug, dest_raw)
+        suf = route_lead_after_dest_suffix(route, has_trailing=bool((lead_trailing_preview or "").strip()))
+        line = build_m_lead_line(parts, slug, dest_raw, lead_trailing_preview, suf)
     print(line)
     return 0
 

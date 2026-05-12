@@ -283,6 +283,8 @@
       "_comment": "Auto-assign roles when a ticket is OPEN; remove on close.",
       "billing_role_id": 1354146761853108225,
       "cancellation_role_id": 1467494664088064174,
+      "_comment_churn_role_id": "When the cancellation ticket channel is moved to the churn category: remove cancellation_role_id and assign this role.",
+      "churn_role_id": 1503729445477814395,
       "free_pass_no_whop_role_id": 1467718805365981456,
       "_comment_no_whop_link_role_id": "Role to apply for no_whop_link tickets (Members role present but no Whop linkage recorded).",
       "no_whop_link_role_id": 1467718805365981456,

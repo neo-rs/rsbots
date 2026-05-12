@@ -87,6 +87,7 @@ class SupportTicketConfig:
     audit_include_transcript_category: bool
     billing_role_id: int
     cancellation_role_id: int
+    churn_role_id: int
     free_pass_no_whop_role_id: int
     no_whop_link_role_id: int
     no_whop_remove_role_ids_on_add: list[int]
@@ -422,6 +423,7 @@ def initialize(
         audit_include_transcript_category=_as_bool(al.get("include_transcript_category")),
         billing_role_id=_as_int(tr.get("billing_role_id")),
         cancellation_role_id=_as_int(tr.get("cancellation_role_id")),
+        churn_role_id=_as_int(tr.get("churn_role_id")),
         free_pass_no_whop_role_id=_as_int(tr.get("free_pass_no_whop_role_id")),
         no_whop_link_role_id=_as_int(tr.get("no_whop_link_role_id")),
         no_whop_remove_role_ids_on_add=_int_list(tr.get("remove_role_ids_on_no_whop") or tr.get("no_whop_remove_role_ids_on_add") or []),
@@ -3426,6 +3428,67 @@ async def _set_ticket_role_for_member(*, guild: discord.Guild, member: discord.M
             await _log(f"❌ support_tickets: failed to remove role_id={rid} from user_id={int(member.id)} ({str(ex)[:200]})")
 
 
+async def _swap_cancellation_roles_for_churn(*, guild: discord.Guild, member: discord.Member) -> None:
+    """When a cancellation ticket is in the churn category: remove Cancelling role; add Churned role (config IDs). Idempotent."""
+    if not isinstance(guild, discord.Guild) or not isinstance(member, discord.Member):
+        return
+    cfg = _cfg()
+    if not cfg:
+        return
+    cancel_rid = int(cfg.cancellation_role_id or 0)
+    churn_rid = int(cfg.churn_role_id or 0)
+    if cancel_rid <= 0 and churn_rid <= 0:
+        return
+
+    m = guild.get_member(int(member.id))
+    if m is None:
+        with suppress(Exception):
+            m = await guild.fetch_member(int(member.id))
+    if not isinstance(m, discord.Member):
+        return
+
+    me = getattr(guild, "me", None) or guild.get_member(int(getattr(getattr(_BOT, "user", None), "id", 0) or 0))
+    if not isinstance(me, discord.Member):
+        return
+    with suppress(Exception):
+        if not bool(getattr(me.guild_permissions, "manage_roles", False)):
+            await _log("❌ support_tickets: bot lacks manage_roles (churn role swap skipped)")
+            return
+
+    def _can_modify_role(role: discord.Role | None) -> bool:
+        if not role:
+            return False
+        try:
+            return bool(me.top_role and role.position < me.top_role.position)
+        except Exception:
+            return False
+
+    if cancel_rid > 0:
+        cr = guild.get_role(cancel_rid)
+        if cr and cr in m.roles:
+            if not _can_modify_role(cr):
+                with suppress(Exception):
+                    await _log(
+                        f"❌ support_tickets: hierarchy prevents removing cancellation role_id={cancel_rid} "
+                        f"user_id={int(m.id)}"
+                    )
+            else:
+                with suppress(Exception):
+                    await m.remove_roles(cr, reason="RSCheckerbot: churn ticket — remove Cancelling role")
+
+    if churn_rid > 0:
+        hr = guild.get_role(churn_rid)
+        if hr and hr not in m.roles:
+            if not _can_modify_role(hr):
+                with suppress(Exception):
+                    await _log(
+                        f"❌ support_tickets: hierarchy prevents adding churn role_id={churn_rid} user_id={int(m.id)}"
+                    )
+            else:
+                with suppress(Exception):
+                    await m.add_roles(hr, reason="RSCheckerbot: churn ticket — add Churned role")
+
+
 async def post_resolution_followup_and_remove_role(
     *,
     discord_id: int,
@@ -3905,6 +3968,14 @@ async def _run_cancellation_countdown_daily_pass() -> None:
             if isinstance(db.get("tickets"), dict):
                 db["tickets"][tid] = cur  # type: ignore[index]
             _index_save(db)
+
+        # Churn category: swap Cancelling → Churned for the ticket owner (also repairs existing churn channels).
+        if rem == 0 and churn_effective_id and isinstance(member, discord.Member):
+            ch_chk = guild.get_channel(ch_id)
+            if isinstance(ch_chk, discord.TextChannel):
+                if int(getattr(ch_chk, "category_id", 0) or 0) == churn_effective_id:
+                    with suppress(Exception):
+                        await _swap_cancellation_roles_for_churn(guild=guild, member=member)
 
     with suppress(Exception):
         await _log(
@@ -5049,24 +5120,33 @@ async def open_cancellation_ticket(
                 if bool(cfg.cancellation_countdown_churn_prefix_channel_name):
                     if not new_ch_name.strip().lower().startswith("churn-"):
                         new_ch_name = _slug_channel_name(f"churn-{new_ch_name}", max_len=90) or "churn-ticket"
-                with suppress(Exception):
+                churn_move_ok = False
+                try:
                     await ch.edit(
                         category=churn_cat,
                         name=new_ch_name,
                         reason="RSCheckerbot: membership deactivated → churn category",
                     )
-                # Persist the move time in the ticket index (best-effort, same field as countdown job).
-                with suppress(Exception):
-                    async with _INDEX_LOCK:
-                        db = _index_load()
-                        # Find the open cancellation ticket for this owner+fingerprint.
-                        tid, rec = _ticket_find_open(db, ticket_type="cancellation", user_id=int(member.id), fingerprint=str(fingerprint or ""))
-                        if tid and isinstance(rec, dict) and _ticket_is_open(rec):
-                            rec["cancellation_moved_to_churn_at_iso"] = _now_iso()
-                            rec["channel_name"] = str(new_ch_name or "")
-                            if isinstance(db.get("tickets"), dict):
-                                db["tickets"][str(tid)] = rec  # type: ignore[index]
-                            _index_save(db)
+                    churn_move_ok = int(getattr(ch, "category_id", 0) or 0) == churn_effective_id
+                except Exception as e:
+                    with suppress(Exception):
+                        await _log(f"⚠️ open_cancellation_ticket: churn move failed channel_id={ch.id} err={str(e)[:200]}")
+                if churn_move_ok:
+                    # Persist the move time in the ticket index (best-effort, same field as countdown job).
+                    with suppress(Exception):
+                        async with _INDEX_LOCK:
+                            db = _index_load()
+                            tid, rec = _ticket_find_open(
+                                db, ticket_type="cancellation", user_id=int(member.id), fingerprint=str(fingerprint or "")
+                            )
+                            if tid and isinstance(rec, dict) and _ticket_is_open(rec):
+                                rec["cancellation_moved_to_churn_at_iso"] = _now_iso()
+                                rec["channel_name"] = str(new_ch_name or "")
+                                if isinstance(db.get("tickets"), dict):
+                                    db["tickets"][str(tid)] = rec  # type: ignore[index]
+                                _index_save(db)
+                    with suppress(Exception):
+                        await _swap_cancellation_roles_for_churn(guild=guild, member=member)
     return ch
 
 
