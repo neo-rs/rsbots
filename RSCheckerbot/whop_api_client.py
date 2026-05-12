@@ -14,7 +14,7 @@ import os
 from contextlib import suppress
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Union, Tuple
 from aiohttp import ContentTypeError
 
 log = logging.getLogger("rs-checker")
@@ -222,7 +222,7 @@ class WhopAPIClient:
         self, 
         method: str, 
         endpoint: str, 
-        params: Optional[Dict] = None,
+        params: Optional[Union[Dict, List[Tuple[str, str]]]] = None,
         json_data: Optional[Dict] = None
     ) -> Dict:
         """
@@ -272,6 +272,66 @@ class WhopAPIClient:
                     return data
         except aiohttp.ClientError as e:
             raise WhopAPIError(f"Network error: {e}")
+
+    async def list_waitlist_entries_page(
+        self,
+        *,
+        status: str,
+        first: int = 100,
+        after: Optional[str] = None,
+    ) -> Tuple[List[Dict], Dict]:
+        """GET /entries — waitlist entries for company (filter by single EntryStatus)."""
+        st = str(status or "").strip().lower()
+        if not st:
+            return ([], {})
+        pairs: List[Tuple[str, str]] = [
+            ("company_id", self.company_id),
+            ("first", str(max(1, min(100, int(first))))),
+            ("statuses", st),
+        ]
+        if after:
+            pairs.append(("after", str(after)))
+        try:
+            response = await self._request("GET", "/entries", params=pairs)
+            data = response.get("data", []) if isinstance(response, dict) else []
+            page_info = response.get("page_info", {}) if isinstance(response, dict) else {}
+            rows: List[Dict] = data if isinstance(data, list) else []
+            page_info = page_info if isinstance(page_info, dict) else {}
+            return (rows, page_info)
+        except WhopAPIError as e:
+            log.warning(f"Failed to list waitlist entries status={st}: {e}")
+            return ([], {})
+
+    async def count_waitlist_entries_by_status(self, status: str, *, max_pages: int = 120) -> int:
+        """Paginate /entries until exhausted; used for dashboard-aligned totals (pending/approved/denied)."""
+        total = 0
+        after: Optional[str] = None
+        pages = 0
+        while pages < int(max_pages):
+            batch, pi = await self.list_waitlist_entries_page(status=status, first=100, after=after)
+            n = len(batch)
+            total += n
+            has_next = bool(pi.get("has_next_page")) if isinstance(pi, dict) else False
+            after = str(pi.get("end_cursor") or "") if isinstance(pi, dict) else ""
+            if not has_next or not after or n <= 0:
+                break
+            pages += 1
+        return total
+
+    async def fetch_waitlist_entry_counts(self) -> Tuple[Dict[str, int], str]:
+        """Return counts for pending / approved / denied (Whop dashboard semantics).
+
+        Requires API scopes including plan:waitlist:read and member:email:read per Whop docs.
+        """
+        out: Dict[str, int] = {}
+        err = ""
+        for st in ("pending", "approved", "denied"):
+            try:
+                out[st] = await self.count_waitlist_entries_by_status(st)
+            except WhopAPIError as e:
+                err = str(e)[:240]
+                return ({}, err)
+        return (out, "")
     
     async def get_membership_by_discord_id(self, discord_id: str) -> Optional[Dict]:
         """

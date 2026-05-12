@@ -224,6 +224,7 @@ from whop_webhook_handler import (
 )
 import whop_discord_ingest
 import member_status_logs_ingest
+import waitlist_logging
 
 # Import Whop API client
 from whop_api_client import WhopAPIClient, WhopAPIError
@@ -3687,6 +3688,7 @@ TEST_INTERVAL_SECONDS = DM_CONFIG.get("test_interval_seconds", 10.0)
 LOG_FIRST_CHANNEL_ID = DM_CONFIG.get("log_first_channel_id")
 LOG_OTHER_CHANNEL_ID = DM_CONFIG.get("log_other_channel_id")
 MEMBER_STATUS_LOGS_CHANNEL_ID = DM_CONFIG.get("member_status_logs_channel_id")
+WAITLIST_LOGGING_CFG = waitlist_logging.load_cfg_from_dict(config.get("waitlist_logging") or {})
 
 # Future Member audit config (Discord-only role audit helper)
 FUTURE_MEMBER_AUDIT_CONFIG = config.get("future_member_audit", {}) if isinstance(config, dict) else {}
@@ -5137,6 +5139,19 @@ async def _trial_abuse_workflow_alert(message: discord.Message, event_data: dict
         return
 
 
+async def _waitlist_fetch_counts_if_enabled() -> tuple[dict[str, int], str]:
+    """Whop /entries aggregate counts for waitlist staff card footers."""
+    if not bool(getattr(WAITLIST_LOGGING_CFG, "api_counts_enabled", False)):
+        return ({}, "counts_disabled")
+    global whop_api_client
+    if not whop_api_client:
+        return ({}, "no_whop_api_client")
+    try:
+        return await whop_api_client.fetch_waitlist_entry_counts()
+    except Exception as e:
+        return ({}, str(e)[:200])
+
+
 @tasks.loop(seconds=300)
 async def member_history_ingest_loop() -> None:
     """Tail whop-membership-logs into member_history.json (resume-safe).
@@ -5209,6 +5224,15 @@ async def member_history_ingest_loop() -> None:
                         jump_url=jump,
                         created_at_iso=created_iso,
                     )
+                with suppress(Exception):
+                    if bool(getattr(WAITLIST_LOGGING_CFG, "enabled", False)):
+                        await waitlist_logging.process_membership_logs_message(
+                            bot,
+                            m,
+                            guild_id=int(GUILD_ID or 0),
+                            cfg=WAITLIST_LOGGING_CFG,
+                            fetch_counts=_waitlist_fetch_counts_if_enabled,
+                        )
             if newest_seen and int(newest_seen) > int(after_id or 0):
                 _ingest_set_after_id(st, int(cid), int(newest_seen))
             if processed > 0 and by_email:
@@ -11561,6 +11585,15 @@ async def on_message(message: discord.Message):
     if WHOP_LOGS_CHANNEL_ID and int(getattr(getattr(message, "channel", None), "id", 0) or 0) == int(WHOP_LOGS_CHANNEL_ID):
         with suppress(Exception):
             await _ingest_whop_logs_live(message)
+        with suppress(Exception):
+            if bool(getattr(WAITLIST_LOGGING_CFG, "enabled", False)):
+                await waitlist_logging.process_whop_logs_message(
+                    bot,
+                    message,
+                    guild_id=int(GUILD_ID or 0),
+                    cfg=WAITLIST_LOGGING_CFG,
+                    fetch_counts=_waitlist_fetch_counts_if_enabled,
+                )
 
     # Also allow non-bot messages in member-status-logs to be ignored (tickets trigger only from bot cards).
 
@@ -11570,7 +11603,16 @@ async def on_message(message: discord.Message):
 
     # Check if this is a Whop message (from either channel).
     # Channel ID is the source of truth; Whop app messages may not be flagged as bot/webhook.
-    if (WHOP_WEBHOOK_CHANNEL_ID and message.channel.id == WHOP_WEBHOOK_CHANNEL_ID):
+    if WHOP_WEBHOOK_CHANNEL_ID and message.channel.id == WHOP_WEBHOOK_CHANNEL_ID:
+        with suppress(Exception):
+            if bool(getattr(WAITLIST_LOGGING_CFG, "enabled", False)):
+                await waitlist_logging.process_membership_logs_message(
+                    bot,
+                    message,
+                    guild_id=int(GUILD_ID or 0),
+                    cfg=WAITLIST_LOGGING_CFG,
+                    fetch_counts=_waitlist_fetch_counts_if_enabled,
+                )
         await handle_whop_webhook_message(message)
         return
 

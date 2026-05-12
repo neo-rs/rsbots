@@ -170,6 +170,17 @@
     "_comment": "Discord-only role audit helper. Excludes members with these role IDs from candidate selection.",
     "exclude_role_ids": [1406731518969385220]
   },
+  "waitlist_logging": {
+    "_comment": "Staff waitlist channel (main guild): correlate #whop-logs New waitlist entry with #whop-membership-logs lifecycle. Footer counts use Whop GET /entries (plan:waitlist:read + member:email:read).",
+    "enabled": true,
+    "output_channel_id": 1503732335667839119,
+    "whop_logs_channel_id": 1076440941814091787,
+    "membership_logs_channel_id": 1453146723324133477,
+    "waitlist_role_id": 1491273354387394570,
+    "api_counts_enabled": true,
+    "api_counts_cache_seconds": 900,
+    "dedupe_max_keys": 4000
+  },
   "paths": {
     "whop_history": "../RSAdminBot/whop_data/whop_history.json"
   },

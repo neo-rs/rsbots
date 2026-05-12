@@ -37,6 +37,7 @@ git add RSCheckerbot\rschecker_journal.py >nul 2>&1
 git add RSCheckerbot\whop_discord_ingest.py >nul 2>&1
 git add RSCheckerbot\whop_std_webhook_kinds.py >nul 2>&1
 git add RSCheckerbot\member_status_logs_ingest.py >nul 2>&1
+git add RSCheckerbot\waitlist_logging.py >nul 2>&1
 git add RSCheckerbot\scripts\analyze_msl_vs_tickets.py >nul 2>&1
 git add RSCheckerbot\scripts\audit_ticket_index_vs_discord.py >nul 2>&1
 git add RSCheckerbot\scripts\scan_member_status_logs_ledger.py >nul 2>&1
