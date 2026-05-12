@@ -3632,21 +3632,25 @@ class RSAdminBot:
                 return
 
             try:
-                webhook = discord.Webhook.from_url(replay_webhook_url, client=self.bot)
+                wh_partial = discord.Webhook.from_url(replay_webhook_url, client=self.bot)
+                # from_url() is partial — channel_id is NOT in the URL; must fetch before validating.
+                webhook = await wh_partial.fetch()
             except Exception as e:
                 await interaction.followup.send(
-                    f"❌ Invalid `archive.replay_webhook_url` in `config.secrets.json`: {str(e)[:200]}",
+                    f"❌ Invalid or unreachable `archive.replay_webhook_url` in `config.secrets.json`: "
+                    f"{str(e)[:200]}",
                     ephemeral=False,
                 )
                 return
             try:
-                wh_ch_id = int(getattr(webhook, "channel_id", 0) or 0)
+                wh_ch_id = int(webhook.channel_id) if webhook.channel_id is not None else 0
             except Exception:
                 wh_ch_id = 0
             if wh_ch_id != int(forum.id):
                 await interaction.followup.send(
                     "❌ `archive.replay_webhook_url` must be a webhook for the **same** channel as "
-                    "`archive.forum_channel_id` (the forum).",
+                    "`archive.forum_channel_id` (the forum). "
+                    f"(Webhook channel id: `{wh_ch_id}`, configured forum: `{int(forum.id)}`.)",
                     ephemeral=False,
                 )
                 return
