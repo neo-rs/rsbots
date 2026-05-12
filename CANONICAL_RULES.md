@@ -91,7 +91,7 @@ Example (MWBots /discum): `_format_channel_mention(channel_id)` in `MWDiscumBot/
 
 - **Single consumer of user token:** Only **MWDiscumBot** (discumbot process) must run a discum `Client` or make API calls with the user token (e.g. reading source channels, fetchall, channel list for UI). DataManagerBot must **not** use the user token at all.
 - **Fetchall:** All fetchall logic (and `fetchall_mappings.json` usage) must live **only in MWDiscumBot**. DataManagerBot must not run fetchall or use the user token for bulk/source-channel reads.
-- **DataManagerBot’s only role for /discum:** Register the slash command by importing `discum_command_bot` and calling `register_discum_commands_to_bot(bot)` once before `bot.run()`. The handler code runs in DataManagerBot’s process when users invoke /discum; that code path must **not** call the Discord API with the user token (use bot token or read from files DiscumBot maintains, e.g. `source_channels.json` / `channel_map_info.json`).
+- **`/discum` registration:** Only the bot process that owns channel mapping registers **`register_discum_commands_to_bot`** — **`MWDiscumBot`** (not MWDataManagerBot). DataManagerBot must not import `discum_command_bot` or register `/discum`.
 - **Scripts:** `verify_discum_channel_ids.py` and any other script that uses the user token should not be run while DiscumBot is running, or use minimal use.
 
 | Responsibility | Canonical owner | Must NOT appear in |
@@ -99,17 +99,16 @@ Example (MWBots /discum): `_format_channel_mention(channel_id)` in `MWDiscumBot/
 | `/discum` slash command and handler | `MWDiscumBot/discum_command_bot.py` | MWDataManagerBot |
 | Channel-mapping UI (View Current Mappings, Browse source & map, Remove/Update Webhook) | `MWDiscumBot/discum_command_bot.py` | MWDataManagerBot |
 | Channel display (`_format_channel_mention`; guild name from `source_channels.json` for sorting only) | `MWDiscumBot/discum_command_bot.py` | MWDataManagerBot |
-| `channel_map.json` / `source_channels.json` load/save and usage | `MWDiscumBot` (discum_config.py + discum_command_bot.py) | MWDataManagerBot (except via the imported module) |
+| `channel_map.json` / `source_channels.json` load/save and usage | `MWDiscumBot` (discum_config.py + discum_command_bot.py) | MWDataManagerBot |
 | **Fetchall (user-token reads of source channels)** | **MWDiscumBot only** (`fetchall_mappings.json`, discum Client) | **MWDataManagerBot** (must not use user token or run fetchall) |
-| Registering `/discum` on a bot | `MWDiscumBot/discum_command_bot.py` → **`register_discum_commands_to_bot(bot)`** only (single registration path; no duplicate decorator) | — |
-| **DataManagerBot’s only role for /discum** | Import `discum_command_bot` and call `register_discum_commands_to_bot(bot)` once before `bot.run()`; no copy of handlers, views, or channel logic; **no user token usage** | — |
+| Registering `/discum` on a bot | `MWDiscumBot/discum_command_bot.py` → **`register_discum_commands_to_bot(bot)`** only (single registration path; no duplicate decorator) | MWDataManagerBot must not register `/discum` |
 
 **Enforcement:**
 
-- MWDataManagerBot must **not** implement any /discum handler, channel list UI, or channel name resolution. It must only import the canonical module and call `register_discum_commands_to_bot(bot)` **once** (no duplicate registration; otherwise two messages appear for one /discum trigger).
+- MWDataManagerBot must **not** implement any `/discum` handler, channel list UI, channel name resolution, or **`register_discum_commands_to_bot`** — mapping slash + UI live only on the dedicated mapping bot (**MWDiscumBot**).
 - **MWDataManagerBot must not use the user token or run fetchall.** All user-token API usage and fetchall must be in MWDiscumBot only.
 - All enhancements to /discum behavior (new buttons, new views, channel display) must be made **only** in `MWDiscumBot/discum_command_bot.py` (and MWDiscumBot config/helpers). Do not add parallel logic in MWDataManagerBot.
-- Deploy/sync must keep both MWDiscumBot and MWDataManagerBot in sync so that the imported `discum_command_bot.py` is the same code that would run in a standalone DiscumBot.
+- Deploy **MWDiscumBot** when mapping or `/discum` behavior changes; MWDataManagerBot deploys no longer need to bundle MWDiscumBot solely for a DataManager-side `/discum` import.
 
 ### Oracle server vs local (fetchall and config)
 

@@ -3440,6 +3440,8 @@ class RSAdminBot:
         self._journal_rschecker_active_flow: str = "default"
         self._journal_rscheckerbot_buf_max_chars: int = 0
         self._journal_rscheckerbot_flush_seconds: float = 0.0
+        # !archive forum tag picks (ephemeral UI); key "{user_id}:{source_channel_id}" -> list of ForumTag snowflakes
+        self._archive_tag_overrides: Dict[str, List[int]] = {}
 
         # Setup bot with required intents
         intents = discord.Intents.default()
@@ -3586,14 +3588,24 @@ class RSAdminBot:
             *,
             interaction: discord.Interaction,
             src: discord.TextChannel,
-            cat: discord.CategoryChannel,
+            forum: discord.ForumChannel,
+            lock_move_category: Optional[discord.CategoryChannel],
             mode: str,
             delay_ms: int,
+            applied_tag_ids: List[int],
         ) -> None:
+            """Mirror source channel history into a new forum thread via webhook (same visual model as before)."""
             guild = src.guild
             me = guild.me
             if not me:
                 await interaction.followup.send("❌ Cannot resolve bot member in this guild.", ephemeral=False)
+                return
+            if mode == "lock_move" and lock_move_category is None:
+                await interaction.followup.send(
+                    "❌ **Archive (lock + move)** needs `archive.lock_move_category_id` in `RSAdminBot/config.json` "
+                    "(category where the locked source channel is moved; it cannot live inside the forum).",
+                    ephemeral=False,
+                )
                 return
             if not src.permissions_for(me).read_message_history:
                 await interaction.followup.send("❌ Missing permission: Read Message History.", ephemeral=False)
@@ -3604,41 +3616,94 @@ class RSAdminBot:
             if not src.permissions_for(me).manage_webhooks:
                 await interaction.followup.send("❌ Missing permission: Manage Webhooks.", ephemeral=False)
                 return
+            fp = forum.permissions_for(me)
+            if not fp.create_public_threads:
+                await interaction.followup.send("❌ Missing permission: Create Public Threads (forum).", ephemeral=False)
+                return
+            if not fp.manage_webhooks:
+                await interaction.followup.send("❌ Missing permission: Manage Webhooks (forum).", ephemeral=False)
+                return
+            if not fp.send_messages_in_threads:
+                await interaction.followup.send("❌ Missing permission: Send Messages in Threads (forum).", ephemeral=False)
+                return
 
             base = f"arch-{src.name}".lower()
             safe = "".join(ch if (ch.isalnum() or ch == "-") else "-" for ch in base).strip("-")
             safe = safe[:90] or "arch-channel"
-            dest_name = safe
-            n = 1
-            while discord.utils.get(guild.text_channels, name=dest_name):
-                n += 1
-                dest_name = f"{safe}-{n}"[:100]
+            thread_name = safe[:100]
+
+            header = (
+                f"**Forum archive** of {src.mention}\n"
+                f"**By:** {interaction.user.mention}\n"
+                f"**Source id:** `{src.id}`\n"
+                f"Discord cannot backdate timestamps; each replayed line includes the original time."
+            )
+            if len(header) > 1900:
+                header = header[:1890] + "…"
+
+            applied_tags: List[discord.ForumTag] = []
+            if applied_tag_ids:
+                avail = getattr(forum, "available_tags", None) or []
+                id_set = {int(x) for x in applied_tag_ids}
+                for t in avail:
+                    try:
+                        if int(t.id) in id_set:
+                            applied_tags.append(t)
+                    except Exception:
+                        continue
 
             try:
-                dest = await guild.create_text_channel(name=dest_name, category=cat, reason=f"Archived by {interaction.user} via RSAdminBot")
-                await dest.edit(sync_permissions=True)
+                if applied_tags:
+                    twm = await forum.create_thread(
+                        name=thread_name,
+                        content=header,
+                        applied_tags=applied_tags,
+                        reason=f"Forum archive by {interaction.user} via RSAdminBot",
+                    )
+                else:
+                    twm = await forum.create_thread(
+                        name=thread_name,
+                        content=header,
+                        reason=f"Forum archive by {interaction.user} via RSAdminBot",
+                    )
             except Exception as e:
-                await interaction.followup.send(f"❌ Failed to create archive channel: {str(e)[:200]}", ephemeral=False)
+                await interaction.followup.send(
+                    f"❌ Failed to create forum thread (if this forum requires tags, set `archive.applied_tag_ids`): "
+                    f"{str(e)[:200]}",
+                    ephemeral=False,
+                )
                 return
 
+            thread = twm.thread
+            webhook: Optional[discord.Webhook] = None
             try:
-                webhook = await dest.create_webhook(name="RSAdminBot Archive Mirror", reason="Mirror archive webhook")
+                webhook = await forum.create_webhook(
+                    name="RSAdminBot Archive Mirror",
+                    reason="Temporary webhook for forum archive replay",
+                )
             except Exception as e:
+                try:
+                    await thread.send(f"❌ Failed to create webhook: {str(e)[:200]}")
+                except Exception:
+                    pass
                 await interaction.followup.send(f"❌ Failed to create webhook: {str(e)[:200]}", ephemeral=False)
                 return
 
-            await dest.send(
-                embed=discord.Embed(
-                    title="🗄️ Mirror Archive Started",
-                    description=(
-                        f"**Source:** {src.mention}\n"
-                        f"**Archived By:** {interaction.user.mention}\n"
-                        f"Note: Discord cannot backdate timestamps; original timestamps are appended to each message."
-                    ),
-                    color=discord.Color.blurple(),
-                    timestamp=discord.utils.utcnow(),
+            try:
+                await thread.send(
+                    embed=discord.Embed(
+                        title="🗄️ Mirror replay starting",
+                        description=(
+                            f"**Source:** {src.mention}\n"
+                            f"**Thread:** {thread.mention}\n"
+                            f"Replaying messages into this thread…"
+                        ),
+                        color=discord.Color.blurple(),
+                        timestamp=discord.utils.utcnow(),
+                    )
                 )
-            )
+            except Exception:
+                pass
 
             replayed = 0
             failed = 0
@@ -3702,6 +3767,7 @@ class RSAdminBot:
                         avatar_url=avatar_url,
                         embeds=embeds_to_send[:10] if embeds_to_send else None,
                         allowed_mentions=discord.AllowedMentions.none(),
+                        thread=thread,
                     )
                     replayed += 1
                 except Exception:
@@ -3710,33 +3776,53 @@ class RSAdminBot:
                     await asyncio.sleep(delay_ms / 1000.0)
                 if replayed and replayed % 100 == 0:
                     try:
-                        await dest.send(f"…progress… replayed={replayed} failed={failed}")
+                        await thread.send(f"…progress… replayed={replayed} failed={failed}")
                     except Exception:
                         pass
 
-            await dest.send(
-                embed=discord.Embed(
-                    title="✅ Mirror Archive Completed",
-                    description=f"Replayed: **{replayed}**\nFailed: **{failed}**",
-                    color=discord.Color.green(),
-                    timestamp=discord.utils.utcnow(),
+            try:
+                await webhook.delete(reason="RSAdminBot forum archive replay finished")
+            except Exception:
+                pass
+
+            try:
+                await thread.send(
+                    embed=discord.Embed(
+                        title="✅ Mirror archive completed",
+                        description=f"Replayed: **{replayed}**\nFailed: **{failed}**",
+                        color=discord.Color.green(),
+                        timestamp=discord.utils.utcnow(),
+                    )
                 )
-            )
+            except Exception:
+                pass
 
             try:
                 if mode == "delete":
                     await asyncio.sleep(1)
-                    await src.delete(reason=f"Mirror archived by {interaction.user} via RSAdminBot → {dest.id}")
+                    await src.delete(reason=f"Forum archived by {interaction.user} via RSAdminBot → thread {thread.id}")
                 else:
                     overwrites = src.overwrites_for(guild.default_role)
                     overwrites.send_messages = False
-                    await src.set_permissions(guild.default_role, overwrite=overwrites, reason="Locked after mirror archive")
-                    await src.edit(category=cat, sync_permissions=True, reason="Moved after mirror archive")
+                    await src.set_permissions(guild.default_role, overwrite=overwrites, reason="Locked after forum archive")
+                    await src.edit(
+                        category=lock_move_category,
+                        sync_permissions=True,
+                        reason="Moved after forum archive",
+                    )
             except Exception as e:
                 try:
-                    await dest.send(f"⚠️ Post-archive source handling failed: `{str(e)[:200]}`")
+                    await thread.send(f"⚠️ Post-archive source handling failed: `{str(e)[:200]}`")
                 except Exception:
                     pass
+
+            try:
+                await interaction.followup.send(
+                    f"✅ Forum archive finished: {thread.jump_url}",
+                    ephemeral=False,
+                )
+            except Exception:
+                pass
 
         @self.bot.command(name="delete")
         async def _cmd_delete(ctx: commands.Context, channel: Optional[discord.TextChannel] = None) -> None:
@@ -4022,25 +4108,140 @@ class RSAdminBot:
                 return
             src: discord.TextChannel = ctx.channel  # type: ignore[assignment]
 
-            cfg = self.config.get("archive") if isinstance(self.config, dict) else {}
-            if not isinstance(cfg, dict):
-                cfg = {}
-            delay_ms = int(cfg.get("replay_delay_ms") or 350)
+            archive_cfg = self.config.get("archive") if isinstance(self.config, dict) else {}
+            if not isinstance(archive_cfg, dict):
+                archive_cfg = {}
+            try:
+                forum_id = int(str(archive_cfg.get("forum_channel_id") or "").strip() or 0)
+            except Exception:
+                forum_id = 0
+            if not forum_id:
+                await _deny(
+                    ctx,
+                    "❌ Set `archive.forum_channel_id` in `RSAdminBot/config.json` (Discord forum channel ID).",
+                )
+                return
+            forum_ch = ctx.guild.get_channel(forum_id)
+            if not isinstance(forum_ch, discord.ForumChannel):
+                await _deny(
+                    ctx,
+                    f"❌ `archive.forum_channel_id` must be a **forum** channel. Resolved: <#{forum_id}>",
+                )
+                return
+
+            try:
+                fetched_forum = await ctx.guild.fetch_channel(forum_id)
+                if isinstance(fetched_forum, discord.ForumChannel):
+                    forum_ch = fetched_forum
+            except Exception:
+                pass
+
+            try:
+                lock_cat_id = int(str(archive_cfg.get("lock_move_category_id") or "").strip() or 0)
+            except Exception:
+                lock_cat_id = 0
+            lock_cat: Optional[discord.CategoryChannel] = None
+            if lock_cat_id:
+                raw_lock = ctx.guild.get_channel(lock_cat_id)
+                if isinstance(raw_lock, discord.CategoryChannel):
+                    lock_cat = raw_lock
+                else:
+                    await _deny(
+                        ctx,
+                        f"❌ `archive.lock_move_category_id` must be a **category** (or empty). Resolved: <#{lock_cat_id}>",
+                    )
+                    return
+
+            try:
+                delay_ms = int(archive_cfg.get("replay_delay_ms") or 350)
+            except Exception:
+                delay_ms = 350
             delay_ms = max(0, min(delay_ms, 2000))
 
-            # Default archive category ID
-            DEFAULT_ARCHIVE_CATEGORY_ID = 1385360488476704768
-            
-            # Get the default category
-            cat = ctx.guild.get_channel(DEFAULT_ARCHIVE_CATEGORY_ID)
-            if not isinstance(cat, discord.CategoryChannel):
-                await _deny(ctx, f"❌ Default archive category not found (ID: {DEFAULT_ARCHIVE_CATEGORY_ID}).")
-                return
+            applied_tag_ids: List[int] = []
+            raw_tags = archive_cfg.get("applied_tag_ids")
+            if isinstance(raw_tags, list):
+                for x in raw_tags:
+                    try:
+                        applied_tag_ids.append(int(x))
+                    except Exception:
+                        continue
+
+            tag_session_key = f"{ctx.author.id}:{src.id}"
+            self._archive_tag_overrides.pop(tag_session_key, None)
+
+            rs_admin = self
+
+            class _ArchiveForumTagView(ui.View):
+                """Ephemeral: multi-select forum tags (Discord max 5 per thread) from API `available_tags`."""
+
+                def __init__(
+                    self,
+                    admin_instance: Any,
+                    session_key: str,
+                    tags: List[discord.ForumTag],
+                    author_id: int,
+                ):
+                    super().__init__(timeout=120)
+                    self.admin = admin_instance
+                    self.session_key = session_key
+                    self.author_id = int(author_id)
+                    if tags:
+                        opts: List[discord.SelectOption] = []
+                        for t in tags[:25]:
+                            tid = int(t.id)
+                            nm = str(t.name or "tag")[:90]
+                            opts.append(
+                                discord.SelectOption(
+                                    label=nm,
+                                    value=str(tid),
+                                    description=f"ID {tid}"[:100],
+                                )
+                            )
+                        max_sel = min(5, len(opts))
+                        sel = ui.Select(
+                            placeholder="Pick tags (0–5), then Save",
+                            options=opts,
+                            min_values=0,
+                            max_values=max_sel,
+                            row=0,
+                        )
+                        self.add_item(sel)
+
+                async def interaction_check(self, interaction: discord.Interaction) -> bool:
+                    try:
+                        return int(getattr(getattr(interaction, "user", None), "id", 0) or 0) == self.author_id
+                    except Exception:
+                        return False
+
+                @ui.button(label="Save tag selection", style=discord.ButtonStyle.success, row=1)
+                async def save_tags(self, i: discord.Interaction, button: ui.Button) -> None:
+                    picked: List[int] = []
+                    for child in self.children:
+                        if isinstance(child, ui.Select):
+                            for v in child.values:
+                                try:
+                                    picked.append(int(v))
+                                except Exception:
+                                    continue
+                    self.admin._archive_tag_overrides[self.session_key] = picked
+                    await i.response.edit_message(
+                        content=(
+                            f"✅ Saved **{len(picked)}** tag(s) for this archive. "
+                            f"Return to the panel and click **Start archive**."
+                        ),
+                        embed=None,
+                        view=None,
+                    )
 
             class _ArchiveView(ui.View):
                 def __init__(self):
                     super().__init__(timeout=180)
                     self.mode: str = ""  # "lock_move" | "delete"
+                    if not lock_cat:
+                        for c in self.children:
+                            if isinstance(c, ui.Button) and getattr(c, "label", None) == "Archive (lock + move)":
+                                c.disabled = True
                     self._refresh_buttons()
 
                 async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -4051,6 +4252,30 @@ class RSAdminBot:
 
                 def _refresh_buttons(self) -> None:
                     self.start_btn.disabled = not bool(self.mode)  # type: ignore[attr-defined]
+
+                @ui.button(label="Pick tags (private)", style=discord.ButtonStyle.secondary, row=1)
+                async def pick_tags_private(self, i: discord.Interaction, button: ui.Button) -> None:
+                    tags = list(getattr(forum_ch, "available_tags", None) or [])
+                    if not tags:
+                        await i.response.send_message(
+                            "This forum reports **no tags** (`available_tags` empty after refresh). "
+                            "Set `archive.applied_tag_ids` in config if Discord still requires tags.",
+                            ephemeral=True,
+                        )
+                        return
+                    desc_lines = [f"• **{t.name}** — `{t.id}`" for t in tags[:20]]
+                    if len(tags) > 20:
+                        desc_lines.append(f"*…and {len(tags) - 20} more in the menu below.*")
+                    emb = discord.Embed(
+                        title="Forum tags (from Discord)",
+                        description=(
+                            "Choose up to **5** tags (forum limit), then **Save tag selection**.\n\n"
+                            + "\n".join(desc_lines)
+                        )[:4000],
+                        color=discord.Color.blurple(),
+                    )
+                    view = _ArchiveForumTagView(rs_admin, tag_session_key, tags, ctx.author.id)
+                    await i.response.send_message(embed=emb, view=view, ephemeral=True)
 
                 @ui.button(label="Archive (lock + move)", style=discord.ButtonStyle.primary)
                 async def archive_lock_move(self, i: discord.Interaction, button: ui.Button):  # type: ignore[override]
@@ -4079,21 +4304,43 @@ class RSAdminBot:
                         if isinstance(child, ui.Button):
                             child.disabled = True
                     try:
-                        await i.response.edit_message(content="📦 Starting mirror archive…", view=self)
+                        await i.response.edit_message(content="📦 Starting forum archive…", view=self)
                     except Exception:
                         pass
                     try:
-                        await i.followup.send("⏳ Mirroring messages…", ephemeral=False)
+                        await i.followup.send("⏳ Mirroring messages into a forum thread…", ephemeral=False)
                     except Exception:
                         pass
-                    await _archive_replay(interaction=i, src=src, cat=cat, mode=self.mode, delay_ms=delay_ms)
+                    tag_ids_for_thread: List[int]
+                    if tag_session_key in rs_admin._archive_tag_overrides:
+                        tag_ids_for_thread = rs_admin._archive_tag_overrides.pop(tag_session_key)
+                    else:
+                        tag_ids_for_thread = list(applied_tag_ids)
+                    await _archive_replay(
+                        interaction=i,
+                        src=src,
+                        forum=forum_ch,
+                        lock_move_category=lock_cat,
+                        mode=self.mode,
+                        delay_ms=delay_ms,
+                        applied_tag_ids=tag_ids_for_thread,
+                    )
 
+            lock_line = (
+                f"- **Lock + move** parks the source under <#{lock_cat_id}> after replay.\n"
+                if lock_cat
+                else "- **Lock + move** needs `archive.lock_move_category_id` (a category) in config.\n"
+            )
             embed = discord.Embed(
-                title="Mirror archive",
+                title="Forum archive",
                 description=(
-                    f"Mirror-archive **#{src.name}** to **{cat.name}**.\n"
+                    f"Mirror-archive **#{src.name}** into {forum_ch.mention} (new forum thread).\n"
                     f"Choose lock+move vs delete, then click **Start archive**.\n"
-                    f"Delay: {delay_ms}ms"
+                    f"Delay: {delay_ms}ms\n"
+                    f"{lock_line}"
+                    f"- Tags: use **Pick tags (private)** for an ephemeral menu (from Discord `available_tags`), "
+                    f"or set `archive.applied_tag_ids` in config.\n"
+                    f"- Replay uses a **temporary webhook** on the forum (no URL stored in config)."
                 ),
                 color=discord.Color.blurple(),
             )

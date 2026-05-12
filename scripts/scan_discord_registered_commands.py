@@ -352,17 +352,17 @@ def print_scan_results(
         if len(seen_app_ids) < total and total > 1:
             print(_yellow("  If two bots show the SAME Application id, they share a token."))
             print(_yellow("  Only the last process that ran tree.sync(guild=...) sets what appears in the server."))
-        # Check: Data Manager app (discumbot/datamanagerbot) should have /discum; if missing, say so
+        # Check: MWDiscumBot (mapping bot token) should expose /discum when that app syncs guild commands
         for r in results:
-            label, ok, app_id, app_name, global_cmds, guild_cmds = r[0], r[1], r[2], r[3], r[4], r[5]
-            if not ok or not app_id or app_name != "Data Manager":
+            label, ok, app_id, app_name, global_cmds, guild_cmds = r[:6]
+            if label != "discumbot" or not ok or not app_id:
                 continue
-            names = {c.get("name", "") for c in (guild_cmds or [])}
+            names = {c.get("name", "") for c in (guild_cmds or [])} | {c.get("name", "") for c in (global_cmds or [])}
             if "discum" not in names:
                 print()
-                print(_red("  /discum is NOT registered for the Data Manager app (discumbot/datamanagerbot)."))
-                print(_yellow("  Fix: Deploy MWDataManagerBot/live_forwarder.py that calls register_discum_commands_to_bot(bot),"))
-                print(_yellow("  then restart the DataManagerBot service on the server so one sync pushes /discum + DataManager commands."))
+                print(_red("  /discum is NOT registered for the Discum bot application (MWDiscumBot token)."))
+                print(_yellow("  Fix: Deploy MWDiscumBot and ensure its slash sync runs for this guild (or global),"))
+                print(_yellow("  then restart that bot. If Data Manager shares this token, give MWDiscumBot its own bot token."))
                 break
     print()
 

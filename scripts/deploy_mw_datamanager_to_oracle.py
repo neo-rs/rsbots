@@ -116,17 +116,6 @@ BACKUP_TAR="$BACKUP_DIR/${{SAFE_BOT}}_preupdate_${{TS}}.tar.gz"
 
 env -u TAR_OPTIONS /bin/tar -cf - -T "$TMP_SYNC_LIST" | (cd "$LIVE_ROOT" && env -u TAR_OPTIONS /bin/tar -xf - --overwrite)
 
-# Sync MWDiscumBot into mirror-world so DataManagerBot can import discum_command_bot.py (for /discum)
-DISCUM_FOLDER="MWDiscumBot"
-if [ -d "$CODE_ROOT/$DISCUM_FOLDER" ]; then
-  TMP_D="$(mktemp -d)"
-  git ls-files "$DISCUM_FOLDER" 2>/dev/null | grep -E '(\\.py$|\\.md$|\\.json$)' | grep -v -E '(^|/)config\\.secrets\\.json$' > "$TMP_D/list" || true
-  if [ -s "$TMP_D/list" ]; then
-    (cd "$CODE_ROOT" && env -u TAR_OPTIONS /bin/tar -cf - -T "$TMP_D/list") | (cd "$LIVE_ROOT" && env -u TAR_OPTIONS /bin/tar -xf - --overwrite)
-  fi
-  rm -rf "$TMP_D"
-fi
-
 echo "OK=1"
 echo "OLD=$OLD"
 echo "NEW=$NEW"

@@ -82,9 +82,14 @@ These commands open a **dropdown** to pick a bot. All outputs are ephemeral.
 #### `/transfer`
 - **What**: move a selected channel into a selected category (dropdowns + confirm)
 
-#### `/archive`
-- **What**: “true mirror” archive (webhook replay) into an archive category
-- **Notes**: Discord can’t backdate timestamps; RSAdminBot appends the original timestamp to each replayed message.
+#### `!archive` (RS guild prefix only)
+- **Where**: **Reselling Secrets** (`rs_server_guild_id`), in the **source** text channel to archive; owner/admin gated (same as `!delete` / `!transfer`).
+- **Scope**: Archives **only the channel where you ran `!archive`** (`#current-channel` history → one new forum thread). It does **not** scan or archive other channels.
+- **What**: Creates a **new forum thread** under `archive.forum_channel_id`, then **webhook-replays** that channel’s history into the thread (avatars, embeds, attachments, stickers; original UTC time appended per message). Does **not** create a new guild text channel.
+- **Modes**: **Delete source** after replay, or **Lock + move** (locks channel, then moves it to `archive.lock_move_category_id`).
+- **Forum tags**: Button **Pick tags (private)** opens an **ephemeral** message listing tag **names and IDs** from Discord (`ForumChannel.available_tags`, refreshed via API fetch). Multi-select up to **5** tags (Discord limit), then **Save**; that choice overrides `archive.applied_tag_ids` for this run only. Optional static `archive.applied_tag_ids` remains the default when you skip the picker.
+- **Webhook**: A **temporary** webhook is created on the forum for replay and deleted afterward; **no webhook URL** is stored in config.
+- **Config** (`RSAdminBot/config.json` → `archive`): `forum_channel_id`, optional `lock_move_category_id`, `replay_delay_ms` (0–2000), optional `applied_tag_ids`.
 
 #### `/details`
 - **What**: systemd details for a bot
