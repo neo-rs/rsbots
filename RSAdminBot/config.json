@@ -190,6 +190,10 @@
     "applied_tag_ids": []
   },
   "review_rs_listener": {
+    "daily_reminder_channel_id": "1313575695267663893",
+    "daily_reminder_timezone": "America/New_York",
+    "daily_reminder_history_limit": 30,
+    "review_rs_channel_blurb_max_chars": 200,
     "instore_daily_role_label": "In Store Flips",
     "instore_daily_ping_user_ids": [],
     "instore_daily_category_id": "1341477669682024588",

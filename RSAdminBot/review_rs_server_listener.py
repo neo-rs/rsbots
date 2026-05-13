@@ -8,6 +8,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import discord
 from discord.ext import commands
 
+from review_rs_daily_blurbs import blurb_for_channel_id, fetch_today_reminder_blurbs
+
 try:
     from zoneinfo import ZoneInfo
 except ImportError:  # pragma: no cover
@@ -51,6 +53,10 @@ class ReviewRSConfig:
     )
     instore_daily_max_messages_per_channel: int = 100
     instore_daily_timezone: str = "America/New_York"
+
+    # Daily reminder channel (RS) — blurbs for `review rs` when header MM/DD matches trigger day (EST)
+    daily_reminder_channel_id: int = 1313575695267663893
+    daily_reminder_timezone: str = "America/New_York"
 
 
 def _content_requests_instore_daily(content: str) -> bool:
@@ -294,7 +300,15 @@ class ReviewRSServerListener(commands.Cog):
             return None
         return None
 
-    async def _format_category_channels(self, guild: discord.Guild, category_id: int, *, title: str) -> list[str]:
+    async def _format_category_channels(
+        self,
+        guild: discord.Guild,
+        category_id: int,
+        *,
+        title: str,
+        reminder_blurbs: Dict[int, str],
+        blurb_max: int,
+    ) -> list[str]:
         lines: list[str] = [f"**{title}**"]
         cat = guild.get_channel(int(category_id))
         if not isinstance(cat, discord.CategoryChannel):
@@ -326,15 +340,25 @@ class ReviewRSServerListener(commands.Cog):
             return lines
 
         for i, ch in enumerate(text_channels, start=1):
-            lines.append(f"{i}. <#{int(ch.id)}>")
+            extra = blurb_for_channel_id(int(ch.id), str(ch.name), reminder_blurbs, max_blurb_chars=blurb_max)
+            lines.append(f"{i}. <#{int(ch.id)}> - {extra}")
         return lines
 
-    async def _format_recent_links(self, guild: discord.Guild, channel_id: int) -> list[str]:
+    async def _format_recent_links(
+        self,
+        guild: discord.Guild,
+        channel_id: int,
+        *,
+        reminder_blurbs: Dict[int, str],
+        blurb_max: int,
+    ) -> list[str]:
         ch = await self._get_text_channel(guild, int(channel_id))
         if not ch:
             return [f"**<#{int(channel_id)}>**: (channel not found / not accessible)"]
 
-        lines: list[str] = [f"**<#{int(ch.id)}>**"]
+        lines: list[str] = []
+        extra = blurb_for_channel_id(int(ch.id), str(ch.name), reminder_blurbs, max_blurb_chars=blurb_max)
+        lines.append(f"**<#{int(ch.id)}>** - {extra}")
         try:
             msgs = []
             async for m in ch.history(limit=3, oldest_first=False):
@@ -368,6 +392,33 @@ class ReviewRSServerListener(commands.Cog):
             await message.reply("❌ Could not resolve RS server guild in cache.", mention_author=False)
             return
 
+        merged = self._review_listener_merged_config()
+        try:
+            rem_ch = int(str(merged.get("daily_reminder_channel_id", self.cfg.daily_reminder_channel_id)).strip())
+        except Exception:
+            rem_ch = int(self.cfg.daily_reminder_channel_id)
+        try:
+            rem_hist = int(merged.get("daily_reminder_history_limit", 30))
+        except Exception:
+            rem_hist = 30
+        rem_tz = str(merged.get("daily_reminder_timezone", self.cfg.daily_reminder_timezone) or "").strip()
+        try:
+            blurb_max = int(merged.get("review_rs_channel_blurb_max_chars", 200))
+        except Exception:
+            blurb_max = 200
+        blurb_max = max(40, min(blurb_max, 600))
+
+        reminder_blurbs: Dict[int, str] = {}
+        try:
+            reminder_blurbs = await fetch_today_reminder_blurbs(
+                self.bot,
+                reminder_channel_id=rem_ch,
+                timezone_name=rem_tz or "America/New_York",
+                history_limit=rem_hist,
+            )
+        except Exception:
+            reminder_blurbs = {}
+
         header = "\n".join(
             [
                 "**RS Server Review**",
@@ -390,7 +441,9 @@ class ReviewRSServerListener(commands.Cog):
             (int(self.cfg.category_instore_important_id), "Instore Important"),
         ]
         for cat_id, _title in category_specs:
-            block = await self._format_category_channels(rs_guild, cat_id, title=_title)
+            block = await self._format_category_channels(
+                rs_guild, cat_id, title=_title, reminder_blurbs=reminder_blurbs, blurb_max=blurb_max
+            )
             await self._send_review_rs_chunks(message, block)
 
         try:
@@ -399,7 +452,9 @@ class ReviewRSServerListener(commands.Cog):
             pass
 
         for cid in self.cfg.important_channel_ids:
-            block = await self._format_recent_links(rs_guild, int(cid))
+            block = await self._format_recent_links(
+                rs_guild, int(cid), reminder_blurbs=reminder_blurbs, blurb_max=blurb_max
+            )
             await self._send_review_rs_chunks(message, block)
 
     def _review_listener_merged_config(self) -> Dict[str, Any]:
