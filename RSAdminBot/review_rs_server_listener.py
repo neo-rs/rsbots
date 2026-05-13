@@ -352,6 +352,56 @@ class ReviewRSServerListener(commands.Cog):
             lines.append(f"- {link}")
         return lines
 
+    async def _send_review_rs_chunks(self, message: discord.Message, lines: List[str], *, max_chars: int = 1900) -> None:
+        for chunk in _chunk_lines(lines, max_chars=max_chars):
+            if not chunk.strip():
+                continue
+            try:
+                await message.channel.send(chunk)
+            except Exception:
+                pass
+
+    async def _handle_review_rs(self, message: discord.Message) -> None:
+        """Neo Test `review rs`: one Discord message per RS category + one per important-channel link block."""
+        rs_guild = await self._get_rs_guild()
+        if not rs_guild:
+            await message.reply("❌ Could not resolve RS server guild in cache.", mention_author=False)
+            return
+
+        header = "\n".join(
+            [
+                "**RS Server Review**",
+                f"- **Guild**: `{rs_guild.name}` (`{rs_guild.id}`)",
+                "",
+                "**Categories → Channels** (clickable)",
+            ]
+        )
+        try:
+            await message.reply(header, mention_author=False)
+        except Exception:
+            try:
+                await message.channel.send(header)
+            except Exception:
+                return
+
+        category_specs: List[Tuple[int, str]] = [
+            (int(self.cfg.category_weekly_guides_upcoming_id), "Weekly Guides / Upcoming"),
+            (int(self.cfg.category_daily_schedule_id), "Daily Schedule"),
+            (int(self.cfg.category_instore_important_id), "Instore Important"),
+        ]
+        for cat_id, _title in category_specs:
+            block = await self._format_category_channels(rs_guild, cat_id, title=_title)
+            await self._send_review_rs_chunks(message, block)
+
+        try:
+            await message.channel.send("**Recent messages (last 3): links**")
+        except Exception:
+            pass
+
+        for cid in self.cfg.important_channel_ids:
+            block = await self._format_recent_links(rs_guild, int(cid))
+            await self._send_review_rs_chunks(message, block)
+
     def _review_listener_merged_config(self) -> Dict[str, Any]:
         try:
             rs = getattr(self.bot, "rsadmin_instance", None)
@@ -850,58 +900,9 @@ class ReviewRSServerListener(commands.Cog):
                     pass
                 return
 
-            rs_guild = await self._get_rs_guild()
-            if not rs_guild:
-                await message.reply("❌ Could not resolve RS server guild in cache.", mention_author=False)
-                return
+            await self._handle_review_rs(message)
+            return
 
-            out_lines: list[str] = []
-            out_lines.append("**RS Server Review**")
-            out_lines.append(f"- **Guild**: `{rs_guild.name}` (`{rs_guild.id}`)")
-            out_lines.append("")
-            out_lines.append("**Categories → Channels** (clickable)")
-            out_lines.append("")
-
-            out_lines.extend(
-                await self._format_category_channels(
-                    rs_guild,
-                    int(self.cfg.category_weekly_guides_upcoming_id),
-                    title="Weekly Guides / Upcoming",
-                )
-            )
-            out_lines.append("")
-            out_lines.extend(
-                await self._format_category_channels(
-                    rs_guild,
-                    int(self.cfg.category_daily_schedule_id),
-                    title="Daily Schedule",
-                )
-            )
-            out_lines.append("")
-            out_lines.extend(
-                await self._format_category_channels(
-                    rs_guild,
-                    int(self.cfg.category_instore_important_id),
-                    title="Instore Important",
-                )
-            )
-
-            out_lines.append("")
-            out_lines.append("**Recent messages (last 3): links**")
-            out_lines.append("")
-
-            for cid in self.cfg.important_channel_ids:
-                out_lines.extend(await self._format_recent_links(rs_guild, int(cid)))
-                out_lines.append("")
-
-            chunks = _chunk_lines(out_lines, max_chars=1900)
-            first = True
-            for chunk in chunks:
-                if first:
-                    await message.reply(chunk, mention_author=False)
-                    first = False
-                else:
-                    await message.channel.send(chunk)
         except Exception:
             return
 

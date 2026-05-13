@@ -143,9 +143,7 @@ These are **not** slash commands. They are **message listeners** scoped to a sin
 #### `review rs` (in-channel trigger)
 - **Where**: Neo Test Server channel `1496065906923540561`
 - **Who**: Owner/Admin-only (uses RSAdminBot's canonical admin checks)
-- **What**: replies with:
-  - channel lists for RS categories (clickable `<#channel_id>` mentions only)
-  - the last 3 message links for each configured RS “important” channel
+- **What**: replies with a **header** (guild summary + “Categories → Channels”), then **one message per RS category** (Weekly Guides / Upcoming, Daily Schedule, Instore Important; each line is a clickable `<#channel_id>`), then **one message per configured “important” channel** with the last 3 message links. If a category list is unusually long, it may be split into multiple messages to stay under Discord’s length limit.
 
 #### Instore daily digest (in-channel trigger, same channel)
 - **Where**: Neo Test Server channel `1496065906923540561` (same as `review rs`)
