@@ -157,6 +157,10 @@ def _parse_instore_plaintext_lead(content: str) -> Tuple[str, str]:
         if m:
             store = _strip_inline_md(m.group(1))
             break
+    if not store:
+        m2 = re.search(r"(?im)where:\s*([^\n\r]+)", raw)
+        if m2:
+            store = _strip_inline_md(m2.group(1))
 
     product = ""
     for ln in stripped_nonempty:
@@ -166,6 +170,36 @@ def _parse_instore_plaintext_lead(content: str) -> Tuple[str, str]:
         break
 
     return (store, product)
+
+
+def _flatten_instore_message_text(msg: discord.Message, *, max_embeds: int = 5) -> str:
+    """Join message content + embed title/description/fields for parsing (embed-only posts)."""
+    parts: List[str] = []
+    c = str(getattr(msg, "content", None) or "").strip()
+    if c:
+        parts.append(c)
+    try:
+        embs = (getattr(msg, "embeds", None) or [])[:max_embeds]
+    except Exception:
+        embs = []
+    for emb in embs:
+        if emb is None:
+            continue
+        t = str(getattr(emb, "title", None) or "").strip()
+        if t:
+            parts.append(t)
+        d = str(getattr(emb, "description", None) or "").strip()
+        if d:
+            parts.append(d)
+        try:
+            for f in getattr(emb, "fields", None) or []:
+                nm = str(getattr(f, "name", None) or "").strip()
+                vl = str(getattr(f, "value", None) or "").strip()
+                if nm or vl:
+                    parts.append(f"{nm}: {vl}".strip())
+        except Exception:
+            continue
+    return "\n".join(parts).strip()
 
 
 def _instore_digest_bullet_line(
@@ -401,16 +435,55 @@ class ReviewRSServerListener(commands.Cog):
         text_channels.sort(key=lambda c: (c.position, int(c.id)))
         return text_channels
 
+    def _instore_digest_role_prefix_and_mentions(
+        self,
+        *,
+        reply_guild: Optional[discord.Guild],
+        role_id: int,
+        ping_user_ids: List[int],
+        merged: Dict[str, Any],
+    ) -> Tuple[str, discord.AllowedMentions]:
+        """Role <@&id> only works in the guild that owns the role; Neo Test posts use **label** + optional user pings."""
+        users_clean: List[int] = []
+        for u in ping_user_ids:
+            try:
+                ui = int(u)
+                if ui > 0:
+                    users_clean.append(ui)
+            except Exception:
+                continue
+        user_prefix = "".join(f"<@{uid}> " for uid in users_clean)
+        user_objs = [discord.Object(id=uid) for uid in users_clean]
+
+        if role_id and reply_guild is not None and reply_guild.get_role(role_id) is not None:
+            prefix = f"{user_prefix}<@&{role_id}> "
+            if user_objs:
+                am = discord.AllowedMentions(
+                    everyone=False,
+                    users=user_objs,
+                    roles=[discord.Object(id=role_id)],
+                )
+            else:
+                am = discord.AllowedMentions(everyone=False, roles=[discord.Object(id=role_id)])
+            return prefix, am
+
+        label = str(merged.get("instore_daily_role_label", "In Store Flips")).strip() or "In Store Flips"
+        prefix = f"{user_prefix}**{label}** "
+        if user_objs:
+            am = discord.AllowedMentions(everyone=False, users=user_objs)
+        else:
+            am = discord.AllowedMentions.none()
+        return prefix, am
+
     async def _handle_instore_daily_report(self, message: discord.Message) -> None:
         """Build per-channel digest messages for Instore category (human plain-text leads).
 
-        Example output for one channel (when `instore_daily_role_id` is set and both store+title parse):
+        Example when the role exists in the reply guild (Neo has a matching role id):
 
         <@&1234567890> new leads posted for today **May 13, 2026** - <#1317271282139533353>
-        **6** post(s).
 
-        - https://discord.com/channels/876528050081251379/1317271282139533353/1504057386573369424 - Ross - Nike KD V AS All-Star Area 72 Extraterrestrial
-        - https://discord.com/channels/876528050081251379/1317271282139533353/1504059576973135882 - Home Depot - 6.5ft Animated Maleficent & 5.5ft Skeleton Pony
+        When the role only exists in RS (digest is posted in Neo Test), use **label** from
+        `instore_daily_role_label` instead of `<@&...>` (Discord cannot resolve cross-guild roles).
 
         If store or product cannot be parsed, that row is `- <url>` only.
         """
@@ -469,24 +542,33 @@ class ReviewRSServerListener(commands.Cog):
                 pass
             return
 
-        role_prefix = f"<@&{role_id}> " if role_id else ""
-        am_role = (
-            discord.AllowedMentions(everyone=False, users=False, roles=[discord.Object(id=role_id)])
-            if role_id
-            else discord.AllowedMentions.none()
-        )
+        merged = self._review_listener_merged_config()
+        ping_raw = merged.get("instore_daily_ping_user_ids")
+        ping_user_ids: List[int] = []
+        if isinstance(ping_raw, list):
+            for x in ping_raw:
+                try:
+                    ping_user_ids.append(int(x))
+                except Exception:
+                    continue
 
-        d_trunc = self._review_listener_merged_config()
         try:
-            pmc = int(d_trunc.get("instore_daily_product_max_chars", 120))
+            pmc = int(merged.get("instore_daily_product_max_chars", 120))
         except Exception:
             pmc = 120
         try:
-            smc = int(d_trunc.get("instore_daily_store_max_chars", 60))
+            smc = int(merged.get("instore_daily_store_max_chars", 60))
         except Exception:
             smc = 60
         pmc = max(20, min(pmc, 300))
         smc = max(8, min(smc, 120))
+
+        role_prefix, am_role = self._instore_digest_role_prefix_and_mentions(
+            reply_guild=message.guild,
+            role_id=role_id,
+            ping_user_ids=ping_user_ids,
+            merged=merged,
+        )
 
         sent_any = False
         for ch in channels:
@@ -521,7 +603,8 @@ class ReviewRSServerListener(commands.Cog):
             header_line2 = f"**{len(msgs)}** post(s)."
             link_lines: List[str] = []
             for m in msgs:
-                st, pr = _parse_instore_plaintext_lead(str(getattr(m, "content", "") or ""))
+                flat = _flatten_instore_message_text(m)
+                st, pr = _parse_instore_plaintext_lead(flat)
                 link_lines.append(
                     _instore_digest_bullet_line(
                         int(rs_guild.id),
