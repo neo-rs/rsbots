@@ -443,7 +443,7 @@ class ReviewRSServerListener(commands.Cog):
         ping_user_ids: List[int],
         merged: Dict[str, Any],
     ) -> Tuple[str, discord.AllowedMentions]:
-        """Role <@&id> only works in the guild that owns the role; Neo Test posts use **label** + optional user pings."""
+        """Optional same-guild <@&id> ping; otherwise plain @Label (not a real role mention) + optional user pings."""
         users_clean: List[int] = []
         for u in ping_user_ids:
             try:
@@ -468,7 +468,11 @@ class ReviewRSServerListener(commands.Cog):
             return prefix, am
 
         label = str(merged.get("instore_daily_role_label", "In Store Flips")).strip() or "In Store Flips"
-        prefix = f"{user_prefix}**{label}** "
+        if label.startswith("@"):
+            at_label = f"{label} "
+        else:
+            at_label = f"@{label} "
+        prefix = f"{user_prefix}{at_label}"
         if user_objs:
             am = discord.AllowedMentions(everyone=False, users=user_objs)
         else:
@@ -482,8 +486,9 @@ class ReviewRSServerListener(commands.Cog):
 
         <@&1234567890> new leads posted for today **May 13, 2026** - <#1317271282139533353>
 
-        When the role only exists in RS (digest is posted in Neo Test), use **label** from
-        `instore_daily_role_label` instead of `<@&...>` (Discord cannot resolve cross-guild roles).
+        When no same-guild role ping is used, the header uses plain text from `instore_daily_role_label`,
+        e.g. `@In Store Flips` (decorative; not a Discord role mention unless `instore_daily_role_id`
+        resolves in the reply guild).
 
         If store or product cannot be parsed, that row is `- <url>` only.
         """

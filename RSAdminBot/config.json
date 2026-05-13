@@ -190,7 +190,6 @@
     "applied_tag_ids": []
   },
   "review_rs_listener": {
-    "instore_daily_role_id": "1227647933579526144",
     "instore_daily_role_label": "In Store Flips",
     "instore_daily_ping_user_ids": [],
     "instore_daily_category_id": "1341477669682024588",
