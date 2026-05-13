@@ -129,6 +129,8 @@ _LEFT_LABEL_PREFIX_RE = re.compile(
 
 def _strip_inline_md(s: str) -> str:
     t = (s or "").strip()
+    # Discord / markdown embed titles often use "### Product name"
+    t = re.sub(r"^\s*#{2,6}\s*", "", t)
     while "**" in t:
         t = t.replace("**", "")
     t = t.strip("*").strip()
