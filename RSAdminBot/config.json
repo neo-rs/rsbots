@@ -188,6 +188,16 @@
     "forum_channel_id": "1385360488476704768",
     "replay_delay_ms": 350,
     "applied_tag_ids": []
+  },
+  "review_rs_listener": {
+    "instore_daily_role_id": "0",
+    "instore_daily_category_id": "1341477669682024588",
+    "instore_daily_skip_channel_ids": [
+      "1341494432868073612",
+      "1498603902445293608"
+    ],
+    "instore_daily_max_messages_per_channel": 100,
+    "instore_daily_timezone": "America/New_York"
   }
 }
 

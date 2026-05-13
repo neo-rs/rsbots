@@ -147,6 +147,12 @@ These are **not** slash commands. They are **message listeners** scoped to a sin
   - channel lists for RS categories (clickable `<#channel_id>` mentions only)
   - the last 3 message links for each configured RS “important” channel
 
+#### Instore daily digest (in-channel trigger, same channel)
+- **Where**: Neo Test Server channel `1496065906923540561` (same as `review rs`)
+- **Who**: Owner/Admin-only
+- **Input**: any message whose text matches a fuzzy **instore** check (e.g. contains `instore`, or `in store`, or common typos like `instroe` / `isntore`). Exact `review rs` still runs the original RS review only.
+- **What**: for Reselling Secrets category `1341477669682024588` (configurable via `review_rs_listener.instore_daily_category_id`), lists **today’s posts** (US Eastern midnight to now, configurable timezone) per **text channel** in that category. **Skips** channels with no posts today and skips monitor/chat channel IDs from config (defaults in code). Sends **one Discord message per channel** that had posts (jump links only), with optional `<@&role>` on the first chunk when `review_rs_listener.instore_daily_role_id` is set (use `0` to disable). Caps links per channel via `instore_daily_max_messages_per_channel` (default 100, max 500).
+
 #### Catalog formatting (message-link trigger)
 - **Where**: Neo Test Server channel `1496075487452069920`
 - **Input**: paste one or more Discord message links (supports `discord.com` and `ptb.discord.com`)

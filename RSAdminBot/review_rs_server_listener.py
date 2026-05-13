@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import re
-from typing import Optional, Sequence, Iterable, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import discord
 from discord.ext import commands
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover
+    ZoneInfo = None  # type: ignore[misc, assignment]
 
 
 @dataclass(frozen=True)
@@ -36,6 +42,30 @@ class ReviewRSConfig:
 
     # Max links to process per trigger message (spam safety)
     catalog_max_links: int = 8
+
+    # Instore category daily digest (RS): today's posts per text channel (one Discord message per channel)
+    instore_daily_category_id: int = 1341477669682024588
+    instore_daily_skip_channel_ids: Sequence[int] = (
+        1341494432868073612,
+        1498603902445293608,
+    )
+    instore_daily_max_messages_per_channel: int = 100
+    instore_daily_timezone: str = "America/New_York"
+
+
+def _content_requests_instore_daily(content: str) -> bool:
+    """True if message should run the Instore daily digest (fuzzy 'instore')."""
+    s = (content or "").strip().lower()
+    if not s:
+        return False
+    if "instore" in s:
+        return True
+    if re.search(r"in\s+store", s):
+        return True
+    for needle in ("instroe", "isntore"):
+        if needle in s:
+            return True
+    return False
 
 
 def _chunk_lines(lines: list[str], *, max_chars: int = 1900) -> list[str]:
@@ -221,6 +251,213 @@ class ReviewRSServerListener(commands.Cog):
             lines.append(f"- {link}")
         return lines
 
+    def _review_listener_merged_config(self) -> Dict[str, Any]:
+        try:
+            rs = getattr(self.bot, "rsadmin_instance", None)
+            cfg = getattr(rs, "config", None) if rs else None
+            if isinstance(cfg, dict):
+                raw = cfg.get("review_rs_listener")
+                if isinstance(raw, dict):
+                    return raw
+        except Exception:
+            pass
+        return {}
+
+    def _instore_daily_category_id_resolved(self) -> int:
+        d = self._review_listener_merged_config()
+        try:
+            v = d.get("instore_daily_category_id", self.cfg.instore_daily_category_id)
+            return int(str(v).strip())
+        except Exception:
+            return int(self.cfg.instore_daily_category_id)
+
+    def _instore_daily_skip_ids_resolved(self) -> Set[int]:
+        d = self._review_listener_merged_config()
+        raw = d.get("instore_daily_skip_channel_ids")
+        if isinstance(raw, list) and raw:
+            out: Set[int] = set()
+            for x in raw:
+                try:
+                    out.add(int(x))
+                except Exception:
+                    continue
+            return out
+        return {int(x) for x in self.cfg.instore_daily_skip_channel_ids}
+
+    def _instore_daily_max_messages_resolved(self) -> int:
+        d = self._review_listener_merged_config()
+        try:
+            n = int(d.get("instore_daily_max_messages_per_channel", self.cfg.instore_daily_max_messages_per_channel))
+            return max(1, min(n, 500))
+        except Exception:
+            return max(1, min(int(self.cfg.instore_daily_max_messages_per_channel), 500))
+
+    def _instore_daily_role_id_resolved(self) -> int:
+        d = self._review_listener_merged_config()
+        try:
+            v = d.get("instore_daily_role_id", 0)
+            s = str(v).strip()
+            if not s or s == "0":
+                return 0
+            return int(s)
+        except Exception:
+            return 0
+
+    def _instore_daily_timezone_name(self) -> str:
+        d = self._review_listener_merged_config()
+        t = d.get("instore_daily_timezone", self.cfg.instore_daily_timezone)
+        s = str(t or "").strip()
+        return s or str(self.cfg.instore_daily_timezone)
+
+    async def _list_text_channels_in_category(self, guild: discord.Guild, category_id: int) -> List[discord.TextChannel]:
+        cat = guild.get_channel(int(category_id))
+        if not isinstance(cat, discord.CategoryChannel):
+            try:
+                fetched = await self.bot.fetch_channel(int(category_id))
+                if isinstance(fetched, discord.CategoryChannel):
+                    cat = fetched
+            except Exception:
+                cat = None
+        if not isinstance(cat, discord.CategoryChannel):
+            return []
+        text_channels: List[discord.TextChannel] = [
+            c for c in (cat.channels or []) if isinstance(c, discord.TextChannel)
+        ]
+        if not text_channels:
+            try:
+                all_channels = await guild.fetch_channels()
+                text_channels = [
+                    c
+                    for c in all_channels
+                    if isinstance(c, discord.TextChannel) and getattr(c, "category_id", None) == int(cat.id)
+                ]
+            except Exception:
+                text_channels = []
+        text_channels.sort(key=lambda c: (c.position, int(c.id)))
+        return text_channels
+
+    async def _handle_instore_daily_report(self, message: discord.Message) -> None:
+        if not self._is_allowed_author(message):
+            try:
+                await message.reply("Owner/Admin-only.", mention_author=False)
+            except Exception:
+                pass
+            return
+
+        if ZoneInfo is None:
+            try:
+                await message.reply("Instore daily report needs Python zoneinfo (tzdata).", mention_author=False)
+            except Exception:
+                pass
+            return
+
+        rs_guild = await self._get_rs_guild()
+        if not rs_guild:
+            try:
+                await message.reply("Could not resolve RS server guild in cache.", mention_author=False)
+            except Exception:
+                pass
+            return
+
+        tz_name = self._instore_daily_timezone_name()
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            try:
+                await message.reply(f"Bad timezone in config: `{tz_name}`.", mention_author=False)
+            except Exception:
+                pass
+            return
+
+        cat_id = self._instore_daily_category_id_resolved()
+        skip_ids = self._instore_daily_skip_ids_resolved()
+        max_n = self._instore_daily_max_messages_resolved()
+        role_id = self._instore_daily_role_id_resolved()
+
+        now_local = datetime.now(tz)
+        start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_utc = start_local.astimezone(timezone.utc)
+        date_label = start_local.strftime("%B %d, %Y")
+
+        channels = await self._list_text_channels_in_category(rs_guild, cat_id)
+        channels = [c for c in channels if int(c.id) not in skip_ids]
+
+        if not channels:
+            try:
+                await message.reply(
+                    f"No text channels under category `{cat_id}` after skips.",
+                    mention_author=False,
+                )
+            except Exception:
+                pass
+            return
+
+        role_line = f"<@&{role_id}>\n" if role_id else ""
+        am_role = (
+            discord.AllowedMentions(everyone=False, users=False, roles=[discord.Object(id=role_id)])
+            if role_id
+            else discord.AllowedMentions.none()
+        )
+
+        sent_any = False
+        for ch in channels:
+            msgs: List[discord.Message] = []
+            try:
+                async for m in ch.history(limit=None, after=start_utc, oldest_first=True):
+                    ts = m.created_at
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    else:
+                        ts = ts.astimezone(timezone.utc)
+                    if ts < start_utc:
+                        continue
+                    msgs.append(m)
+                    if len(msgs) >= max_n:
+                        break
+            except Exception:
+                continue
+
+            if not msgs:
+                continue
+
+            sent_any = True
+            truncated = len(msgs) >= max_n
+            cap_note = ""
+            if truncated:
+                cap_note = " (list capped; raise `review_rs_listener.instore_daily_max_messages_per_channel` if needed)"
+
+            header = (
+                f"{role_line}**#{ch.name}** new posts on **{date_label}** "
+                f"(US Eastern, midnight to now). **{len(msgs)}** post(s){cap_note}."
+            )
+            link_lines = [f"- https://discord.com/channels/{rs_guild.id}/{ch.id}/{m.id}" for m in msgs]
+            all_lines = [header, ""] + link_lines
+            parts = _chunk_lines(all_lines, max_chars=1900)
+            for idx, part in enumerate(parts):
+                prefix = ""
+                if idx > 0:
+                    prefix = f"**#{ch.name}** (continued {idx + 1}/{len(parts)})\n\n"
+                body = prefix + part
+                if idx == 0:
+                    try:
+                        await message.reply(body, mention_author=False, allowed_mentions=am_role)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        await message.channel.send(body, allowed_mentions=discord.AllowedMentions.none())
+                    except Exception:
+                        pass
+
+        if not sent_any:
+            try:
+                await message.reply(
+                    f"No posts today ({date_label}, US Eastern) in scanned Instore text channels under `{cat_id}`.",
+                    mention_author=False,
+                )
+            except Exception:
+                pass
+
     def _extract_catalog_fields(self, msg: discord.Message) -> tuple[str, list[str], str]:
         """
         Returns (product_title, id_lines, image_url)
@@ -397,8 +634,21 @@ class ReviewRSServerListener(commands.Cog):
 
             if not getattr(message, "content", None):
                 return
-            content = str(message.content or "").strip().lower()
-            if content != "review rs":
+            raw_content = str(message.content or "").strip()
+            content_lower = raw_content.lower()
+
+            # Instore category daily digest (message contains "instore", etc.)
+            if _content_requests_instore_daily(raw_content):
+                if not self._is_allowed_author(message):
+                    try:
+                        await message.reply("❌ Owner/Admin-only.", mention_author=False)
+                    except Exception:
+                        pass
+                    return
+                await self._handle_instore_daily_report(message)
+                return
+
+            if content_lower != "review rs":
                 return
 
             if not self._is_allowed_author(message):
@@ -445,7 +695,7 @@ class ReviewRSServerListener(commands.Cog):
             )
 
             out_lines.append("")
-            out_lines.append("**Recent messages (last 3) — links**")
+            out_lines.append("**Recent messages (last 3): links**")
             out_lines.append("")
 
             for cid in self.cfg.important_channel_ids:
