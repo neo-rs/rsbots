@@ -121,6 +121,71 @@ def _digits_only(s: str) -> str:
     return "".join(ch for ch in (s or "") if ch.isdigit())
 
 
+_LEFT_LABEL_PREFIX_RE = re.compile(
+    r"^\s*(where|retail|resell|ebay|online|returns|notes|market)\s*:",
+    re.IGNORECASE,
+)
+
+
+def _strip_inline_md(s: str) -> str:
+    t = (s or "").strip()
+    while "**" in t:
+        t = t.replace("**", "")
+    t = t.strip("*").strip()
+    return t.strip()
+
+
+def _truncate_visible(s: str, max_len: int) -> str:
+    s = (s or "").strip()
+    if max_len <= 0:
+        return ""
+    if len(s) <= max_len:
+        return s
+    if max_len == 1:
+        return "…"
+    return s[: max_len - 1].rstrip() + "…"
+
+
+def _parse_instore_plaintext_lead(content: str) -> Tuple[str, str]:
+    """Parse human instore lead posts: (store from `Where:`, product from first non-label line)."""
+    raw = str(content or "")
+    stripped_nonempty = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+
+    store = ""
+    for ln in stripped_nonempty:
+        m = re.match(r"^\s*where:\s*(.+)$", ln, re.IGNORECASE)
+        if m:
+            store = _strip_inline_md(m.group(1))
+            break
+
+    product = ""
+    for ln in stripped_nonempty:
+        if _LEFT_LABEL_PREFIX_RE.match(ln):
+            continue
+        product = _strip_inline_md(ln)
+        break
+
+    return (store, product)
+
+
+def _instore_digest_bullet_line(
+    guild_id: int,
+    channel_id: int,
+    message_id: int,
+    store: str,
+    product: str,
+    *,
+    product_max: int = 120,
+    store_max: int = 60,
+) -> str:
+    url = f"https://discord.com/channels/{int(guild_id)}/{int(channel_id)}/{int(message_id)}"
+    ps = _truncate_visible(store, store_max)
+    pt = _truncate_visible(product, product_max)
+    if ps and pt:
+        return f"- {url} - {ps} - {pt}"
+    return f"- {url}"
+
+
 class ReviewRSServerListener(commands.Cog):
     """
     Neo Test Server: watch a single channel; on "review rs", reply with:
@@ -337,6 +402,18 @@ class ReviewRSServerListener(commands.Cog):
         return text_channels
 
     async def _handle_instore_daily_report(self, message: discord.Message) -> None:
+        """Build per-channel digest messages for Instore category (human plain-text leads).
+
+        Example output for one channel (when `instore_daily_role_id` is set and both store+title parse):
+
+        <@&1234567890> new leads posted for today **May 13, 2026** - <#1317271282139533353>
+        **6** post(s).
+
+        - https://discord.com/channels/876528050081251379/1317271282139533353/1504057386573369424 - Ross - Nike KD V AS All-Star Area 72 Extraterrestrial
+        - https://discord.com/channels/876528050081251379/1317271282139533353/1504059576973135882 - Home Depot - 6.5ft Animated Maleficent & 5.5ft Skeleton Pony
+
+        If store or product cannot be parsed, that row is `- <url>` only.
+        """
         if not self._is_allowed_author(message):
             try:
                 await message.reply("Owner/Admin-only.", mention_author=False)
@@ -392,12 +469,24 @@ class ReviewRSServerListener(commands.Cog):
                 pass
             return
 
-        role_line = f"<@&{role_id}>\n" if role_id else ""
+        role_prefix = f"<@&{role_id}> " if role_id else ""
         am_role = (
             discord.AllowedMentions(everyone=False, users=False, roles=[discord.Object(id=role_id)])
             if role_id
             else discord.AllowedMentions.none()
         )
+
+        d_trunc = self._review_listener_merged_config()
+        try:
+            pmc = int(d_trunc.get("instore_daily_product_max_chars", 120))
+        except Exception:
+            pmc = 120
+        try:
+            smc = int(d_trunc.get("instore_daily_store_max_chars", 60))
+        except Exception:
+            smc = 60
+        pmc = max(20, min(pmc, 300))
+        smc = max(8, min(smc, 120))
 
         sent_any = False
         for ch in channels:
@@ -426,17 +515,30 @@ class ReviewRSServerListener(commands.Cog):
             if truncated:
                 cap_note = " (list capped; raise `review_rs_listener.instore_daily_max_messages_per_channel` if needed)"
 
-            header = (
-                f"{role_line}**#{ch.name}** new posts on **{date_label}** "
-                f"(US Eastern, midnight to now). **{len(msgs)}** post(s){cap_note}."
+            header_line1 = (
+                f"{role_prefix}new leads posted for today **{date_label}** - <#{ch.id}>{cap_note}"
             )
-            link_lines = [f"- https://discord.com/channels/{rs_guild.id}/{ch.id}/{m.id}" for m in msgs]
-            all_lines = [header, ""] + link_lines
+            header_line2 = f"**{len(msgs)}** post(s)."
+            link_lines: List[str] = []
+            for m in msgs:
+                st, pr = _parse_instore_plaintext_lead(str(getattr(m, "content", "") or ""))
+                link_lines.append(
+                    _instore_digest_bullet_line(
+                        int(rs_guild.id),
+                        int(ch.id),
+                        int(m.id),
+                        st,
+                        pr,
+                        product_max=pmc,
+                        store_max=smc,
+                    )
+                )
+            all_lines = [header_line1, header_line2, ""] + link_lines
             parts = _chunk_lines(all_lines, max_chars=1900)
             for idx, part in enumerate(parts):
                 prefix = ""
                 if idx > 0:
-                    prefix = f"**#{ch.name}** (continued {idx + 1}/{len(parts)})\n\n"
+                    prefix = f"<#{ch.id}> (continued {idx + 1}/{len(parts)})\n\n"
                 body = prefix + part
                 if idx == 0:
                     try:
@@ -452,7 +554,7 @@ class ReviewRSServerListener(commands.Cog):
         if not sent_any:
             try:
                 await message.reply(
-                    f"No posts today ({date_label}, US Eastern) in scanned Instore text channels under `{cat_id}`.",
+                    f"No posts today (**{date_label}**) in scanned Instore text channels under `{cat_id}`.",
                     mention_author=False,
                 )
             except Exception:

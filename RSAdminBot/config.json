@@ -197,7 +197,9 @@
       "1498603902445293608"
     ],
     "instore_daily_max_messages_per_channel": 100,
-    "instore_daily_timezone": "America/New_York"
+    "instore_daily_timezone": "America/New_York",
+    "instore_daily_product_max_chars": 120,
+    "instore_daily_store_max_chars": 60
   }
 }
 
