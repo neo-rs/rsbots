@@ -27,6 +27,7 @@
   "ignore_bot_messages": false,
   "mirror_attachments": true,
   "mirror_embeds": true,
+  "use_multiimage_embed_grid": true,
   "include_jump_to_original": true,
   "max_body_chars": 1600,
   "channel_map_filename": "relay_channel_map.json",

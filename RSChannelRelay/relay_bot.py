@@ -243,6 +243,146 @@ def _clone_embed_redacted(
     return out, total_redactions
 
 
+def _embed_has_substantive_text(emb: discord.Embed) -> bool:
+    if emb.title or emb.description or emb.fields:
+        return True
+    return False
+
+
+def _collect_embed_image_urls(embeds: List[discord.Embed]) -> List[str]:
+    """Unique image/thumbnail URLs in embed order (for Discord same-url grid)."""
+    urls: List[str] = []
+    seen: set[str] = set()
+    for emb in embeds:
+        for candidate in (
+            str(emb.image.url) if emb.image and emb.image.url else None,
+            str(emb.thumbnail.url) if emb.thumbnail and emb.thumbnail.url else None,
+        ):
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                urls.append(candidate)
+    return urls
+
+
+def _should_mirror_as_multiimage_grid(embeds: List[discord.Embed]) -> bool:
+    """True when source likely uses Discord's same-url multi-embed image grid."""
+    if len(embeds) < 2:
+        return False
+    image_urls = _collect_embed_image_urls(embeds)
+    if len(image_urls) < 2:
+        return False
+    non_empty_urls = [str(getattr(e, "url", None) or "").strip() for e in embeds if getattr(e, "url", None)]
+    if len(non_empty_urls) >= 2 and len(set(non_empty_urls)) == 1:
+        return True
+    if all(not _embed_has_substantive_text(e) for e in embeds[1:]):
+        return True
+    embeds_with_image = sum(1 for e in embeds if e.image and e.image.url)
+    return embeds_with_image >= 2
+
+
+def _resolve_shared_embed_url(
+    embeds: List[discord.Embed],
+    *,
+    jump_url: str,
+    preserve_ebay: bool,
+) -> tuple[str, int]:
+    """URL every embed in a grid must share (exact string) so Discord merges the card."""
+    redactions = 0
+    non_empty = [str(getattr(e, "url", None) or "").strip() for e in embeds]
+    non_empty = [u for u in non_empty if u]
+    if len(non_empty) >= 2 and len(set(non_empty)) == 1:
+        shared = non_empty[0]
+        if _url_preserved(shared, preserve_ebay=preserve_ebay):
+            return shared, 0
+        redactions += 1
+    if jump_url.strip():
+        return jump_url.strip(), redactions
+    for e in embeds:
+        u = str(getattr(e, "url", None) or "").strip()
+        if u and _url_preserved(u, preserve_ebay=preserve_ebay):
+            return u, redactions
+    return "", redactions
+
+
+def _copy_embed_metadata(dst: discord.Embed, src: discord.Embed) -> None:
+    if src.timestamp:
+        dst.timestamp = src.timestamp
+    if src.author and (src.author.name or src.author.icon_url):
+        dst.set_author(
+            name=src.author.name or "\u200b",
+            icon_url=str(src.author.icon_url or "").strip() or None,
+        )
+    if src.footer and (src.footer.text or src.footer.icon_url):
+        dst.set_footer(
+            text=src.footer.text or "\u200b",
+            icon_url=str(src.footer.icon_url or "").strip() or None,
+        )
+    for field in src.fields[:25]:
+        dst.add_field(name=field.name, value=field.value, inline=bool(field.inline))
+
+
+def _build_multiimage_grid_embeds(
+    message: discord.Message,
+    *,
+    jump_url: str,
+    placeholder: str,
+    preserve_ebay: bool,
+    where_snipe_emoji: str,
+) -> tuple[List[discord.Embed], int] | None:
+    """
+    Rebuild N source embeds as one Discord grid card: all embeds share the same url;
+    first carries text + first image; the rest are image-only (client merge quirk).
+    """
+    raw = list(message.embeds or [])[:10]
+    if not _should_mirror_as_multiimage_grid(raw):
+        return None
+
+    image_urls = _collect_embed_image_urls(raw)
+    for att in message.attachments or []:
+        if not att.content_type or not str(att.content_type).startswith("image/"):
+            continue
+        u = str(att.url or "").strip()
+        if u and u not in image_urls:
+            image_urls.append(u)
+    if len(image_urls) < 2:
+        return None
+
+    shared_url, url_redactions = _resolve_shared_embed_url(
+        raw, jump_url=jump_url, preserve_ebay=preserve_ebay
+    )
+
+    primary = raw[0]
+    for emb in raw:
+        if _embed_has_substantive_text(emb):
+            primary = emb
+            break
+
+    cloned, n = _clone_embed_redacted(
+        primary,
+        placeholder=placeholder,
+        preserve_ebay=preserve_ebay,
+        where_snipe_emoji=where_snipe_emoji,
+    )
+    redactions = n + url_redactions
+
+    first = discord.Embed(
+        title=cloned.title,
+        description=cloned.description,
+        colour=cloned.colour,
+    )
+    if shared_url:
+        first.url = shared_url
+    first.set_image(url=image_urls[0])
+    _copy_embed_metadata(first, cloned)
+
+    out: List[discord.Embed] = [first]
+    for img_url in image_urls[1:10]:
+        tail = discord.Embed(url=shared_url) if shared_url else discord.Embed()
+        tail.set_image(url=img_url)
+        out.append(tail)
+    return out, redactions
+
+
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -283,6 +423,7 @@ class RelayBot(commands.Bot):
         self._ignore_bots = bool(cfg.get("ignore_bot_messages", True))
         self._mirror_attach = bool(cfg.get("mirror_attachments", True))
         self._mirror_embeds = bool(cfg.get("mirror_embeds", True))
+        self._multiimage_grid = bool(cfg.get("use_multiimage_embed_grid", True))
         self._jump = bool(cfg.get("include_jump_to_original", True))
         self._max_body = int(cfg.get("max_body_chars") or 1600)
         self._map: dict[str, str] = {}
@@ -439,8 +580,10 @@ class RelayBot(commands.Bot):
                 )
             return created
 
-    def _build_mirror_payload(self, message: discord.Message) -> Tuple[Optional[str], List[discord.Embed], int, bool]:
-        """Content (no flattened embed text), mirrored embeds, redaction count, content truncated flag."""
+    def _build_mirror_payload(
+        self, message: discord.Message
+    ) -> Tuple[Optional[str], List[discord.Embed], int, bool, bool]:
+        """Content, embeds, redactions, body truncated, used multi-image embed grid."""
         redactions = 0
         content = ""
         if (message.content or "").strip():
@@ -453,23 +596,38 @@ class RelayBot(commands.Bot):
             redactions += n
 
         embeds: List[discord.Embed] = []
+        used_grid = False
         if self._mirror_embeds:
-            for emb in (message.embeds or [])[:10]:
-                cloned, n = _clone_embed_redacted(
-                    emb,
+            jump_for_grid = message.jump_url or ""
+            if self._multiimage_grid:
+                grid = _build_multiimage_grid_embeds(
+                    message,
+                    jump_url=jump_for_grid,
                     placeholder=self._placeholder,
                     preserve_ebay=self._preserve_ebay,
                     where_snipe_emoji=self._where_snipe_emoji,
                 )
-                redactions += n
-                embeds.append(cloned)
+                if grid is not None:
+                    embeds, n = grid
+                    redactions += n
+                    used_grid = True
+            if not used_grid:
+                for emb in (message.embeds or [])[:10]:
+                    cloned, n = _clone_embed_redacted(
+                        emb,
+                        placeholder=self._placeholder,
+                        preserve_ebay=self._preserve_ebay,
+                        where_snipe_emoji=self._where_snipe_emoji,
+                    )
+                    redactions += n
+                    embeds.append(cloned)
 
         truncated = False
         if content and len(content) > self._max_body:
             content = content[: self._max_body - 1] + "…"
             truncated = True
 
-        return (content or None), embeds, redactions, truncated
+        return (content or None), embeds, redactions, truncated, used_grid
 
     def _finalize_content(
         self,
@@ -671,12 +829,15 @@ class RelayBot(commands.Bot):
                     flush=True,
                 )
             return
-        content, embeds, n_red, body_trunc = self._build_mirror_payload(message)
+        content, embeds, n_red, body_trunc, used_grid = self._build_mirror_payload(message)
         out, out_trunc = self._finalize_content(content, jump_url=message.jump_url or "")
         files: list[discord.File] = []
         attach_notes: list[str] = []
         atts = list(message.attachments or [])[:8]
         for att in atts:
+            if used_grid and att.content_type and str(att.content_type).startswith("image/"):
+                attach_notes.append(f"skipped {att.filename!r}: image used in embed grid")
+                continue
             if not self._mirror_attach:
                 attach_notes.append(f"skipped {att.filename!r}: mirror_attachments is false in config")
                 continue
