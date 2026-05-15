@@ -26,6 +26,7 @@
   "webhook_urls_filename": "relay_webhook_urls.json",
   "ignore_bot_messages": false,
   "mirror_attachments": true,
+  "mirror_embeds": true,
   "include_jump_to_original": true,
   "max_body_chars": 1600,
   "channel_map_filename": "relay_channel_map.json",

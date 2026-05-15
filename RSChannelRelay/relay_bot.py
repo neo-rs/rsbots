@@ -1,7 +1,8 @@
 """
-Standalone relay: copy messages from configured source channels (e.g. RS paid)
-to destination channels under a category (e.g. Test Center), redacting
-external URLs while keeping Discord message links. Optional attachments + CTA.
+Standalone relay: mirror messages from configured source channels into destination
+channels (same or other guild). Preserves message content, embeds, and attachments;
+redacts external URLs in text (and embed title links). Discord message links and
+embed images/thumbnails are kept so the post still looks like the original.
 """
 from __future__ import annotations
 
@@ -29,6 +30,11 @@ _EBAY_URL_START_RE = re.compile(
     r"^https?://(?:[\w-]+\.)*ebay\.(?:com|co\.uk|com\.au|de|fr|it|es|ca|at|ch|ie|nl|be|pl|ph|us)(?:/|$|\?|:|\#)",
     re.IGNORECASE,
 )
+_DISCORD_CDN_URL_RE = re.compile(
+    r"^https?://(?:cdn\.discordapp\.com|media\.discordapp\.net|images-ext-\d+\.discordapp\.net)/",
+    re.IGNORECASE,
+)
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", re.IGNORECASE)
 _WHERE_LINE_RE = re.compile(
     r"^(?P<indent>\s*)"
     r"(?P<prefix>\*{0,2}\s*where\s*\*{0,2}\s*:\s*\*{0,2}\s*)"
@@ -82,6 +88,16 @@ def _mirror_dest_channel_name(display: str, fallback: str) -> str:
     return out[:100]
 
 
+def _url_preserved(u: str, *, preserve_ebay: bool) -> bool:
+    if _DISCORD_MSG_LINK_RE.match(u):
+        return True
+    if _DISCORD_CDN_URL_RE.match(u):
+        return True
+    if preserve_ebay and _EBAY_URL_START_RE.match(u):
+        return True
+    return False
+
+
 def _redact_urls(text: str, placeholder: str, *, preserve_ebay: bool) -> tuple[str, int]:
     redactions = 0
 
@@ -93,9 +109,7 @@ def _redact_urls(text: str, placeholder: str, *, preserve_ebay: bool) -> tuple[s
         while u and u[-1] in ".,);]`>":
             tail = u[-1] + tail
             u = u[:-1]
-        if _DISCORD_MSG_LINK_RE.match(u):
-            return raw
-        if preserve_ebay and _EBAY_URL_START_RE.match(u):
+        if _url_preserved(u, preserve_ebay=preserve_ebay):
             return raw
         redactions += 1
         return placeholder + tail
@@ -103,19 +117,130 @@ def _redact_urls(text: str, placeholder: str, *, preserve_ebay: bool) -> tuple[s
     return _URL_RE.sub(repl, text), redactions
 
 
-def _flatten_embeds(message: discord.Message, *, limit: int = 5) -> str:
-    parts: list[str] = []
-    for emb in (message.embeds or [])[:limit]:
-        if emb.title:
-            parts.append(str(emb.title).strip())
-        if emb.description:
-            parts.append(str(emb.description).strip())
-        for f in (emb.fields or [])[:6]:
-            n = str(getattr(f, "name", "") or "").strip()
-            v = str(getattr(f, "value", "") or "").strip()
-            if n or v:
-                parts.append(f"{n}: {v}".strip(": ").strip())
-    return "\n".join(p for p in parts if p)
+def _redact_markdown_links(text: str, placeholder: str, *, preserve_ebay: bool) -> tuple[str, int]:
+    """[label](url) → label only when url is redacted (avoids broken markdown)."""
+    redactions = 0
+
+    def repl(m: re.Match[str]) -> str:
+        nonlocal redactions
+        label = m.group(1)
+        u = m.group(2).rstrip(".,);]`>")
+        if _url_preserved(u, preserve_ebay=preserve_ebay):
+            return m.group(0)
+        redactions += 1
+        return label
+
+    return _MD_LINK_RE.sub(repl, text), redactions
+
+
+def _sanitize_text_block(
+    text: str,
+    placeholder: str,
+    *,
+    preserve_ebay: bool,
+    where_snipe_emoji: str = "",
+) -> tuple[str, int]:
+    raw = (text or "").strip()
+    if not raw:
+        return "", 0
+    if where_snipe_emoji:
+        raw = _snipe_where_lines(raw, where_snipe_emoji)
+    raw, n1 = _redact_markdown_links(raw, placeholder, preserve_ebay=preserve_ebay)
+    raw, n2 = _redact_urls(raw, placeholder, preserve_ebay=preserve_ebay)
+    return raw, n1 + n2
+
+
+def _truncate(s: str, limit: int) -> str:
+    s = (s or "").strip()
+    if limit <= 0 or len(s) <= limit:
+        return s
+    if limit == 1:
+        return "…"
+    return s[: limit - 1] + "…"
+
+
+def _clone_embed_redacted(
+    emb: discord.Embed,
+    *,
+    placeholder: str,
+    preserve_ebay: bool,
+    where_snipe_emoji: str,
+) -> tuple[discord.Embed, int]:
+    total_redactions = 0
+    title = None
+    if emb.title:
+        title, n = _sanitize_text_block(
+            str(emb.title), placeholder, preserve_ebay=preserve_ebay, where_snipe_emoji=where_snipe_emoji
+        )
+        total_redactions += n
+        title = _truncate(title, 256) or None
+
+    description = None
+    if emb.description:
+        description, n = _sanitize_text_block(
+            str(emb.description), placeholder, preserve_ebay=preserve_ebay, where_snipe_emoji=where_snipe_emoji
+        )
+        total_redactions += n
+        description = _truncate(description, 4096) or None
+
+    out = discord.Embed(title=title, description=description, colour=emb.colour)
+
+    embed_url = str(getattr(emb, "url", None) or "").strip()
+    if embed_url:
+        if _url_preserved(embed_url, preserve_ebay=preserve_ebay):
+            out.url = embed_url
+        else:
+            total_redactions += 1
+
+    if emb.timestamp:
+        out.timestamp = emb.timestamp
+
+    if emb.image and emb.image.url:
+        out.set_image(url=emb.image.url)
+    if emb.thumbnail and emb.thumbnail.url:
+        out.set_thumbnail(url=emb.thumbnail.url)
+
+    if emb.author and (emb.author.name or emb.author.icon_url):
+        author_name = ""
+        if emb.author.name:
+            author_name, n = _sanitize_text_block(
+                str(emb.author.name), placeholder, preserve_ebay=preserve_ebay
+            )
+            total_redactions += n
+            author_name = _truncate(author_name, 256)
+        icon = str(emb.author.icon_url or "").strip() or None
+        if author_name or icon:
+            out.set_author(name=author_name or "\u200b", icon_url=icon)
+
+    if emb.footer and (emb.footer.text or emb.footer.icon_url):
+        footer_text = ""
+        if emb.footer.text:
+            footer_text, n = _sanitize_text_block(
+                str(emb.footer.text), placeholder, preserve_ebay=preserve_ebay
+            )
+            total_redactions += n
+            footer_text = _truncate(footer_text, 2048)
+        icon = str(emb.footer.icon_url or "").strip() or None
+        if footer_text or icon:
+            out.set_footer(text=footer_text or "\u200b", icon_url=icon)
+
+    for field in emb.fields[:25]:
+        fname = ""
+        fval = ""
+        if field.name:
+            fname, n = _sanitize_text_block(str(field.name), placeholder, preserve_ebay=preserve_ebay)
+            total_redactions += n
+            fname = _truncate(fname, 256)
+        if field.value:
+            fval, n = _sanitize_text_block(
+                str(field.value), placeholder, preserve_ebay=preserve_ebay, where_snipe_emoji=where_snipe_emoji
+            )
+            total_redactions += n
+            fval = _truncate(fval, 1024)
+        if fname or fval:
+            out.add_field(name=fname or "\u200b", value=fval or "\u200b", inline=bool(field.inline))
+
+    return out, total_redactions
 
 
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
@@ -157,6 +282,7 @@ class RelayBot(commands.Bot):
         self._end_footer = str(cfg.get("mirror_end_footer") or "")
         self._ignore_bots = bool(cfg.get("ignore_bot_messages", True))
         self._mirror_attach = bool(cfg.get("mirror_attachments", True))
+        self._mirror_embeds = bool(cfg.get("mirror_embeds", True))
         self._jump = bool(cfg.get("include_jump_to_original", True))
         self._max_body = int(cfg.get("max_body_chars") or 1600)
         self._map: dict[str, str] = {}
@@ -313,33 +439,81 @@ class RelayBot(commands.Bot):
                 )
             return created
 
-    def _compose_body(self, message: discord.Message) -> Tuple[str, int, bool]:
-        chunks: list[str] = []
-        c = (message.content or "").strip()
-        if c:
-            chunks.append(c)
-        emb_txt = _flatten_embeds(message)
-        if emb_txt:
-            chunks.append(emb_txt)
-        raw = "\n\n".join(chunks).strip()
-        if self._where_snipe_emoji:
-            raw = _snipe_where_lines(raw, self._where_snipe_emoji)
-        body, redactions = _redact_urls(raw, self._placeholder, preserve_ebay=self._preserve_ebay)
+    def _build_mirror_payload(self, message: discord.Message) -> Tuple[Optional[str], List[discord.Embed], int, bool]:
+        """Content (no flattened embed text), mirrored embeds, redaction count, content truncated flag."""
+        redactions = 0
+        content = ""
+        if (message.content or "").strip():
+            content, n = _sanitize_text_block(
+                message.content,
+                self._placeholder,
+                preserve_ebay=self._preserve_ebay,
+                where_snipe_emoji=self._where_snipe_emoji,
+            )
+            redactions += n
+
+        embeds: List[discord.Embed] = []
+        if self._mirror_embeds:
+            for emb in (message.embeds or [])[:10]:
+                cloned, n = _clone_embed_redacted(
+                    emb,
+                    placeholder=self._placeholder,
+                    preserve_ebay=self._preserve_ebay,
+                    where_snipe_emoji=self._where_snipe_emoji,
+                )
+                redactions += n
+                embeds.append(cloned)
+
         truncated = False
-        if len(body) > self._max_body:
-            body = body[: self._max_body - 1] + "…"
+        if content and len(content) > self._max_body:
+            content = content[: self._max_body - 1] + "…"
             truncated = True
-        return body, redactions, truncated
+
+        return (content or None), embeds, redactions, truncated
+
+    def _finalize_content(
+        self,
+        content: Optional[str],
+        *,
+        jump_url: str,
+    ) -> Tuple[Optional[str], bool]:
+        parts: List[str] = []
+        if content and content.strip():
+            parts.append(content.strip())
+        if self._jump and jump_url:
+            parts.append(f"[Open original]({jump_url})")
+        if self._cta.strip():
+            parts.append(self._cta.strip())
+        if not parts:
+            return None, False
+        pre = "\n\n".join(parts)
+        end_f = self._end_footer.strip()
+        out_trunc = False
+        if end_f:
+            suffix_block = "\n\n" + end_f
+            max_pre = max(1, 2000 - len(suffix_block))
+            if len(pre) > max_pre:
+                pre = pre[: max(0, max_pre - 1)] + "…"
+                out_trunc = True
+            return pre + suffix_block, out_trunc
+        if len(pre) > 2000:
+            pre = pre[:1997] + "…"
+            out_trunc = True
+        return pre, out_trunc
 
     async def _post_mirror(
         self,
         dest: discord.TextChannel,
         message: discord.Message,
         *,
-        content: str,
+        content: Optional[str],
+        embeds: List[discord.Embed],
         files: list[discord.File],
     ) -> tuple[bool, bool, Optional[str]]:
         """Returns (success, used_webhook_impersonation, error_detail)."""
+        if not content and not embeds and not files:
+            content = "_[no content]_"
+
         if self._use_webhook:
             try:
                 wh = await self._ensure_relay_webhook(dest)
@@ -348,7 +522,10 @@ class RelayBot(commands.Bot):
                         "content": content,
                         "username": self._webhook_display_name(message.author),
                         "avatar_url": message.author.display_avatar.url,
+                        "allowed_mentions": discord.AllowedMentions.none(),
                     }
+                    if embeds:
+                        kwargs["embeds"] = embeds
                     if files:
                         kwargs["files"] = files
                     await wh.send(**kwargs)
@@ -362,7 +539,12 @@ class RelayBot(commands.Bot):
             except Exception as e:
                 print(f"[relay] WARNING: webhook execute {type(e).__name__}: {e} — falling back to bot", flush=True)
         try:
-            kwargs2: dict[str, Any] = {"content": content}
+            kwargs2: dict[str, Any] = {
+                "content": content,
+                "allowed_mentions": discord.AllowedMentions.none(),
+            }
+            if embeds:
+                kwargs2["embeds"] = embeds
             if files:
                 kwargs2["files"] = files
             await dest.send(**kwargs2)
@@ -406,6 +588,7 @@ class RelayBot(commands.Bot):
         attachment_lines: List[str],
         mirrored_files: int,
         total_attachments: int,
+        mirrored_embeds: int,
         posted_via_webhook: bool,
     ) -> None:
         if not self._human_log:
@@ -425,6 +608,7 @@ class RelayBot(commands.Bot):
         print(f"- External URLs redacted (non-Discord links): {redactions}", flush=True)
         print(f"- Text body truncated to max_body_chars: {'yes' if truncated else 'no'}", flush=True)
         print(f"- Final Discord payload truncated to 2000 chars: {'yes' if out_truncated else 'no'}", flush=True)
+        print(f"- Embeds mirrored: {mirrored_embeds}", flush=True)
         print(f"- Attachments on original message: {total_attachments}", flush=True)
         print(f"- Attachments mirrored: {mirrored_files}", flush=True)
         print("", flush=True)
@@ -487,31 +671,8 @@ class RelayBot(commands.Bot):
                     flush=True,
                 )
             return
-        body, n_red, body_trunc = self._compose_body(message)
-        pre_parts: List[str] = []
-        if body:
-            pre_parts.append(body)
-        else:
-            pre_parts.append("_[no text]_")
-        if self._jump and message.jump_url:
-            pre_parts.append(f"[Open original]({message.jump_url})")
-        if self._cta.strip():
-            pre_parts.append(self._cta.strip())
-        pre = "\n\n".join(pre_parts)
-        end_f = self._end_footer.strip()
-        out_trunc = False
-        if end_f:
-            suffix_block = "\n\n" + end_f
-            max_pre = max(1, 2000 - len(suffix_block))
-            if len(pre) > max_pre:
-                pre = pre[: max(0, max_pre - 1)] + "…"
-                out_trunc = True
-            out = pre + suffix_block
-        else:
-            out = pre
-            if len(out) > 2000:
-                out = out[:1997] + "…"
-                out_trunc = True
+        content, embeds, n_red, body_trunc = self._build_mirror_payload(message)
+        out, out_trunc = self._finalize_content(content, jump_url=message.jump_url or "")
         files: list[discord.File] = []
         attach_notes: list[str] = []
         atts = list(message.attachments or [])[:8]
@@ -528,37 +689,45 @@ class RelayBot(commands.Bot):
                 attach_notes.append(f"ok {att.filename!r} ({len(data)} bytes)")
             except Exception as e:
                 attach_notes.append(f"FAILED {att.filename!r}: {type(e).__name__}: {e}")
-        ok, used_wh, err = await self._post_mirror(dest, message, content=out, files=files)
+        ok, used_wh, err = await self._post_mirror(
+            dest, message, content=out, embeds=embeds, files=files
+        )
         if ok:
             self._log_mirror_success(
                 message,
                 dest=dest,
-                body=body,
+                body=content or "",
                 redactions=n_red,
                 truncated=body_trunc,
-                out_chars=len(out),
+                out_chars=len(out or ""),
                 out_truncated=out_trunc,
                 attachment_lines=attach_notes,
                 mirrored_files=len(files),
                 total_attachments=len(atts),
+                mirrored_embeds=len(embeds),
                 posted_via_webhook=used_wh,
             )
             return
         print(f"[relay] ERROR: mirror post failed ({err!r}) — retrying text-only as bot", flush=True)
         try:
-            await dest.send(content=out[: min(len(out), 2000)])
-            print("[relay] PARTIAL: text-only as bot (attachments dropped)", flush=True)
+            await dest.send(
+                content=(out or "")[: min(len(out or ""), 2000)] or None,
+                embeds=embeds or None,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            print("[relay] PARTIAL: retry as bot (attachments may be dropped)", flush=True)
             self._log_mirror_success(
                 message,
                 dest=dest,
-                body=body,
+                body=content or "",
                 redactions=n_red,
                 truncated=body_trunc,
-                out_chars=min(len(out), 2000),
+                out_chars=min(len(out or ""), 2000),
                 out_truncated=out_trunc,
-                attachment_lines=attach_notes + ["note: primary post failed; attachments not retried"],
+                attachment_lines=attach_notes + ["note: primary post failed; attachments may be missing"],
                 mirrored_files=0,
                 total_attachments=len(atts),
+                mirrored_embeds=len(embeds),
                 posted_via_webhook=False,
             )
         except Exception as e2:
