@@ -24,7 +24,17 @@ echo "[1/4] bootstrap venv (includes RSChannelRelay/requirements.txt)..."
 bash "$ROOT_DIR/RSAdminBot/bootstrap_venv.sh"
 
 echo "[2/4] install systemd unit..."
-sudo cp -f "$UNIT_SRC" "$UNIT_DST"
+unit_src="$UNIT_SRC"
+if [ ! -f "$unit_src" ]; then
+  unit_src="$ROOT_DIR/RSChannelRelay/mirror-world-rschannelrelay.service"
+fi
+if [ ! -f "$unit_src" ]; then
+  echo "ERROR: missing unit file (expected under systemd/ or RSChannelRelay/)."
+  exit 1
+fi
+sudo cp -f "$unit_src" "$UNIT_DST"
+# install_services.sh reads from repo systemd/ (often root-owned — use sudo).
+sudo cp -f "$unit_src" "$ROOT_DIR/systemd/mirror-world-rschannelrelay.service" 2>/dev/null || true
 sudo systemctl daemon-reload
 sudo systemctl enable mirror-world-rschannelrelay.service
 
