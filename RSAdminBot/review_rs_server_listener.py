@@ -2,13 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import discord
 from discord.ext import commands
 
-from review_rs_daily_blurbs import blurb_for_channel_id, fetch_today_reminder_blurbs
+from review_rs_daily_blurbs import (
+    blurb_for_channel_id,
+    fetch_today_reminder_blurbs,
+    message_is_daily_reminder,
+    _flatten_message_content,
+)
+from review_rs_free_preview import run_free_preview_for_reminder
 
 try:
     from zoneinfo import ZoneInfo
@@ -375,6 +382,128 @@ class ReviewRSServerListener(commands.Cog):
             link = f"https://discord.com/channels/{int(guild.id)}/{int(ch.id)}/{int(m.id)}"
             lines.append(f"- {link}")
         return lines
+
+    def _rsadmin_base_path(self) -> Path:
+        try:
+            rs = getattr(self.bot, "rsadmin_instance", None)
+            bp = getattr(rs, "base_path", None) if rs else None
+            if bp is not None:
+                return Path(bp)
+        except Exception:
+            pass
+        return Path(__file__).resolve().parent
+
+    def _free_preview_config(self) -> Dict[str, Any]:
+        merged = self._review_listener_merged_config()
+        raw = merged.get("free_preview")
+        return raw if isinstance(raw, dict) else {}
+
+    def _free_preview_webhook_url(self) -> str:
+        merged = self._review_listener_merged_config()
+        fp = self._free_preview_config()
+        for key in ("webhook_url", "free_preview_webhook_url"):
+            v = fp.get(key) if isinstance(fp, dict) else None
+            if not v and key == "free_preview_webhook_url":
+                v = merged.get(key)
+            s = str(v or "").strip()
+            if s:
+                return s
+        return ""
+
+    async def _post_free_preview_error(self, text: str) -> None:
+        fp = self._free_preview_config()
+        try:
+            err_ch = int(str(fp.get("error_channel_id", self.cfg.trigger_channel_id)).strip())
+        except Exception:
+            err_ch = int(self.cfg.trigger_channel_id)
+        ch = self.bot.get_channel(err_ch)
+        if ch is None:
+            try:
+                ch = await self.bot.fetch_channel(err_ch)
+            except Exception:
+                return
+        try:
+            await ch.send(str(text)[:1900])
+        except Exception:
+            pass
+
+    async def _list_category_text_channels_sync(
+        self, guild: discord.Guild, category_id: int
+    ) -> List[discord.TextChannel]:
+        return await self._list_text_channels_in_category(guild, int(category_id))
+
+    async def _maybe_run_free_preview_from_reminder(self, message: discord.Message) -> None:
+        fp = self._free_preview_config()
+        if not bool(fp.get("enabled", True)):
+            return
+        g = getattr(message, "guild", None)
+        if not g or int(getattr(g, "id", 0) or 0) != int(self.cfg.rs_server_guild_id):
+            return
+        try:
+            rem_ch = int(
+                str(
+                    self._review_listener_merged_config().get(
+                        "daily_reminder_channel_id", self.cfg.daily_reminder_channel_id
+                    )
+                ).strip()
+            )
+        except Exception:
+            rem_ch = int(self.cfg.daily_reminder_channel_id)
+        if int(getattr(message.channel, "id", 0) or 0) != rem_ch:
+            return
+        blob = _flatten_message_content(message)
+        if not message_is_daily_reminder(blob):
+            return
+
+        webhook_url = self._free_preview_webhook_url()
+        if not webhook_url:
+            await self._post_free_preview_error(
+                "❌ Free RS preview: missing `review_rs_listener.free_preview.webhook_url` "
+                "(or `free_preview_webhook_url`) in `RSAdminBot/config.secrets.json`."
+            )
+            return
+
+        rs_guild = await self._get_rs_guild()
+        if not rs_guild:
+            await self._post_free_preview_error("❌ Free RS preview: could not resolve RS guild.")
+            return
+
+        try:
+            blurb_max = int(self._review_listener_merged_config().get("review_rs_channel_blurb_max_chars", 200))
+        except Exception:
+            blurb_max = 200
+        blurb_max = max(40, min(blurb_max, 600))
+
+        username = str(fp.get("webhook_username", "Neo") or "Neo").strip() or "Neo"
+        try:
+            avatar_uid = int(str(fp.get("webhook_avatar_user_id", "0")).strip())
+        except Exception:
+            avatar_uid = 0
+        siren_id = str(fp.get("intro_siren_emoji_id", "1408979316536115260") or "").strip()
+        locked_id = str(fp.get("footer_locked_emoji_id", "1350271155822395413") or "").strip()
+        try:
+            paid_ch = int(str(fp.get("paid_channel_id", "1155729485048594483")).strip())
+        except Exception:
+            paid_ch = 1155729485048594483
+        footer = str(fp.get("footer_message", "") or "").strip()
+
+        ok, detail = await run_free_preview_for_reminder(
+            self.bot,
+            message,
+            base_path=self._rsadmin_base_path(),
+            rs_guild=rs_guild,
+            webhook_url=webhook_url,
+            username=username,
+            avatar_user_id=avatar_uid,
+            siren_emoji_id=siren_id,
+            locked_emoji_id=locked_id,
+            paid_channel_id=paid_ch,
+            footer_template=footer,
+            blurb_max=blurb_max,
+            list_text_channels=self._list_category_text_channels_sync,
+        )
+        if not ok:
+            await self._post_free_preview_error(f"❌ Free RS preview failed: {detail}")
 
     async def _send_review_rs_chunks(self, message: discord.Message, lines: List[str], *, max_chars: int = 1900) -> None:
         for chunk in _chunk_lines(lines, max_chars=max_chars):
@@ -901,6 +1030,15 @@ class ReviewRSServerListener(commands.Cog):
                 await message.channel.send(chunk)
 
     @commands.Cog.listener()
+    async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
+        try:
+            if not after or (after.author and getattr(after.author, "bot", False)):
+                return
+            await self._maybe_run_free_preview_from_reminder(after)
+        except Exception:
+            return
+
+    @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         try:
             if not message:
@@ -911,6 +1049,9 @@ class ReviewRSServerListener(commands.Cog):
             ch_id = int(getattr(getattr(message, "channel", None), "id", 0) or 0)
             if not ch_id:
                 return
+
+            # Auto free-member preview when staff posts/edits Daily Reminder (RS guild)
+            await self._maybe_run_free_preview_from_reminder(message)
 
             # Catalog formatting trigger (Neo Test Server)
             if ch_id == int(self.cfg.catalog_trigger_channel_id):

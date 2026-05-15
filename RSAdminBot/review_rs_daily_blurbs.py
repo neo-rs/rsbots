@@ -120,8 +120,9 @@ def schedule_style_label(channel_name: str, *, max_len: int = 200) -> str:
 
 # --- daily reminder body parsing ---------------------------------------------------------
 
+# TODAY'S / TOMORROW'S / plain DAILY REMINDER - MM/DD
 _REMINDER_HEADER_RE = re.compile(
-    r"(?is)TOMORROW'?S\s+DAILY\s+REMINDER\s*[-–]\s*(\d{1,2})/(\d{1,2})",
+    r"(?is)DAILY\s+REMINDER\s*[-–:]\s*(\d{1,2})\s*/\s*(\d{1,2})",
 )
 _INSTORE_SECTION_STOP = re.compile(
     r"(?is)^\s*(\*\*ALWAYS\b|Sneaker\s+Flipping:|Instore\s+Flipping:|Watch\s+our\b|\*\*LET\'?S\b|If\s+you\'?re\s+done\s+reading\b)",
@@ -133,6 +134,32 @@ def parse_reminder_header_mmdd(text: str) -> Optional[Tuple[int, int]]:
     if not m:
         return None
     return int(m.group(1)), int(m.group(2))
+
+
+def format_reminder_date_label(month: int, day: int) -> str:
+    return f"{int(month):02d}/{int(day):02d}"
+
+
+def format_free_preview_intro(*, month: int, day: int, siren_emoji_id: str) -> str:
+    date_s = format_reminder_date_label(month, day)
+    eid = str(siren_emoji_id or "").strip()
+    if not eid:
+        return f"# DAILY REMINDER - {date_s}"
+    tag = f"<a:blue_siren:{eid}>"
+    return f"# {tag}  DAILY REMINDER - {date_s}{tag}"
+
+
+def message_is_daily_reminder(text: str) -> bool:
+    u = (text or "").upper()
+    return "DAILY REMINDER" in u and parse_reminder_header_mmdd(text or "") is not None
+
+
+def blurbs_from_reminder_message(msg: discord.Message) -> Tuple[Optional[Tuple[int, int]], Dict[int, str]]:
+    blob = _flatten_message_content(msg)
+    parsed = parse_reminder_header_mmdd(blob)
+    if not parsed:
+        return None, {}
+    return parsed, extract_reminder_blurbs(blob)
 
 
 def _flatten_message_content(msg: discord.Message, *, max_embeds: int = 3) -> str:
@@ -247,7 +274,7 @@ async def fetch_today_reminder_blurbs(
             if not blob:
                 continue
             u = blob.upper()
-            if "TOMORROW" not in u or "DAILY REMINDER" not in u:
+            if "DAILY REMINDER" not in u:
                 continue
             parsed = parse_reminder_header_mmdd(blob)
             if not parsed:

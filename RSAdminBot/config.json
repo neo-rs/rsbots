@@ -194,6 +194,16 @@
     "daily_reminder_timezone": "America/New_York",
     "daily_reminder_history_limit": 30,
     "review_rs_channel_blurb_max_chars": 200,
+    "free_preview": {
+      "enabled": true,
+      "output_channel_id": "1504893057693388870",
+      "error_channel_id": "1496065906923540561",
+      "webhook_username": "Neo",
+      "webhook_avatar_user_id": "971528709876113478",
+      "intro_siren_emoji_id": "1408979316536115260",
+      "footer_locked_emoji_id": "1350271155822395413",
+      "paid_channel_id": "1155729485048594483"
+    },
     "instore_daily_role_label": "In Store Flips",
     "instore_daily_ping_user_ids": [],
     "instore_daily_category_id": "1341477669682024588",
