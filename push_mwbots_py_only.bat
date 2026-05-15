@@ -111,6 +111,12 @@ if exist "MWDataManagerBot\run_link_logic_audit.bat" (
 
 )
 
+if exist "MWPingBot\dm_notify_embeds.py" (
+
+  git add -- "MWPingBot/dm_notify_embeds.py"
+
+)
+
 if exist "MWDataManagerBot\universal_link_resolver_v2_ready\universal_link_resolver.py" (
 
   git add -- "MWDataManagerBot/universal_link_resolver_v2_ready/universal_link_resolver.py" "MWDataManagerBot/universal_link_resolver_v2_ready/README.txt" "MWDataManagerBot/universal_link_resolver_v2_ready/requirements.txt" "MWDataManagerBot/universal_link_resolver_v2_ready/install_requirements.bat" "MWDataManagerBot/universal_link_resolver_v2_ready/RUN_RESOLVER.bat" "MWDataManagerBot/universal_link_resolver_v2_ready/RUN_RESOLVER_FAST_NO_BROWSER.bat" "MWDataManagerBot/universal_link_resolver_v2_ready/RUN_URLS_FILE.bat" "MWDataManagerBot/universal_link_resolver_v2_ready/run_resolver.ps1"
