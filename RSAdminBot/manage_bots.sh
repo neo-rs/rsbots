@@ -27,6 +27,7 @@ declare -A SERVICES=(
     ["rssuccessbot"]="mirror-world-rssuccessbot.service"
     ["rspromobot"]="mirror-world-rspromobot.service"
     ["rscashoutbot"]="mirror-world-rscashoutbot.service"
+    ["rschannelrelay"]="mirror-world-rschannelrelay.service"
     ["datamanagerbot"]="mirror-world-datamanagerbot.service"
     ["discumbot"]="mirror-world-discumbot.service"
     ["pingbot"]="mirror-world-pingbot.service"

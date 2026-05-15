@@ -27,6 +27,7 @@ BOT_KEY_TO_FOLDER: Dict[str, str] = {
     "rssuccessbot": "RSuccessBot",
     "rspromobot": "RSPromoBot",
     "rscashoutbot": "RSCashoutBot",
+    "rschannelrelay": "RSChannelRelay",
     "whopmembershipsync": "WhopMembershipSync",
     "catalognavbot": "catalog_nav_bot",
     "amazonasinchecker": "amazon_asin_promo_checker",

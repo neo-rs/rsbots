@@ -2,8 +2,10 @@
 rem Pick store -> paste start Mirror World link -> send !m to RS -> wait for monitor -> react on MW.
 rem Uses the same token chain as mirror_message_to_m_lead / manual_batch_send.
 rem
-rem Double-click: interactive + random 1-2 min pause between completed forwards (see --delay-random-minutes).
+rem Double-click: interactive; pause between forwards from m_lead_routes.json
+rem   forward_delay_random_minutes (e.g. "0.083333-0.166667" = ~5-10s) or omit for --delay default.
 rem Or pass args, e.g.:
+rem   run_mirror_forward_queue.bat --delay-random-minutes 1-2   (override JSON: 1-2 minutes)
 rem   run_mirror_forward_queue.bat --store walmart --url "https://discord.com/channels/..." --yes --max 25
 rem   --max 0 = unlimited messages (default in mirror_forward_queue.py)
 rem   All clearance stores (checkpoint resume each, then next):  --all-stores --yes
@@ -30,7 +32,7 @@ if "%~1"=="" (
   echo  Mirror forward queue  ^(store + start link -^> RS sends + check reactions^)
   echo  ---------------------------------------------------------------------------
   echo.
-  py -3 mirror_forward_queue.py --delay-random-minutes 1-2
+  py -3 mirror_forward_queue.py
 ) else (
   py -3 mirror_forward_queue.py %*
 )

@@ -1,6 +1,7 @@
 {
   "_comment": "forward_reply_done + forward_reply_done_text: menu-style mirror_forward_queue.py only (no --store/--url/--all-stores on cmdline); one Discord reply after a batch when no newer Mirror messages exist after the last completed deal. routes: destination_channel_id = <#id> in the !m line. Default command is !m lead. Optional per-route \"command\": \"hdnation\" forces !m hdnation (SKU-only); hd-clearance stock uses default lead like homedepot. command_post_channel_id = where the script POSTs the line. Optional: \"forward_delay_random_minutes\": \"1-2\" or [1,2] for mirror_forward_queue.py when --delay-random-minutes not passed. post_confirmation: timeout_seconds (lead), timeout_seconds_hdnation (only if a route uses hdnation). forward_all_stores_order: mirror_label strings for mirror_forward_queue.py --all-stores (remaining routes append sorted by label). Checkpoints are stored per Mirror channel under mirror_forward_checkpoint.json by_channel.",
   "command_post_channel_id": "892518619215462400",
+  "forward_delay_random_minutes": "0.083333-0.166667",
   "forward_reply_done": false,
   "forward_reply_done_text": "done",
   "forward_all_stores_order": [

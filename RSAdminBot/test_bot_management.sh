@@ -23,6 +23,7 @@ BOTS[rsmentionpinger]="RSMentionPinger:mirror-world-rsmentionpinger.service:rs_m
 BOTS[rsuccessbot]="RSuccessBot:mirror-world-rsuccessbot.service:rs_success_bot.py"
 BOTS[rspromobot]="RSPromoBot:mirror-world-rspromobot.service:promo_bot.py"
 BOTS[rscashoutbot]="RSCashoutBot:mirror-world-rscashoutbot.service:bot.py"
+BOTS[rschannelrelay]="RSChannelRelay:mirror-world-rschannelrelay.service:relay_bot.py"
 BOTS[rsadminbot]="RSAdminBot:mirror-world-rsadminbot.service:admin_bot.py"
 
 BOT_NAME="${1:-rsadminbot}"

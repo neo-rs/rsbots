@@ -3313,6 +3313,12 @@ class RSAdminBot:
             "folder": "RSCashoutBot",
             "script": "bot.py"
         },
+        "rschannelrelay": {
+            "name": "RS Channel Relay",
+            "service": "mirror-world-rschannelrelay.service",
+            "folder": "RSChannelRelay",
+            "script": "relay_bot.py",
+        },
         "rsadminbot": {
             "name": "RSAdminBot",
             "service": "mirror-world-rsadminbot.service",
@@ -7464,10 +7470,13 @@ fi
 # - exclude: config.secrets.json (even if tracked by mistake)
 # - exclude: tokens.env (never overwrite server secrets)
 # - exclude: member_history.json (RSCheckerbot runtime; server-owned)
+# - exclude: relay_channel_map.json / relay_webhook_urls.json (RSChannelRelay runtime; server-owned)
 TMP_SYNC_LIST="/tmp/mw_sync_${{BOT_FOLDER}}.txt"
 grep -E \"(\\\\.py$|\\\\.md$|\\\\.json$|\\\\.txt$|(^|/)requirements\\\\.txt$)\" "$TMP_ALL_LIST" | grep -v -E \"(^|/)config\\\\.secrets\\\\.json$\" > "$TMP_SYNC_LIST" || true
 grep -v -E \"(^|/)tokens\\\\.env$\" "$TMP_SYNC_LIST" > "$TMP_SYNC_LIST.ex" 2>/dev/null && mv "$TMP_SYNC_LIST.ex" "$TMP_SYNC_LIST" || true
 grep -v -E \"(^|/)member_history\\\\.json$\" "$TMP_SYNC_LIST" > "$TMP_SYNC_LIST.ex" 2>/dev/null && mv "$TMP_SYNC_LIST.ex" "$TMP_SYNC_LIST" || true
+grep -v -E \"(^|/)relay_channel_map\\\\.json$\" "$TMP_SYNC_LIST" > "$TMP_SYNC_LIST.ex" 2>/dev/null && mv "$TMP_SYNC_LIST.ex" "$TMP_SYNC_LIST" || true
+grep -v -E \"(^|/)relay_webhook_urls\\\\.json$\" "$TMP_SYNC_LIST" > "$TMP_SYNC_LIST.ex" 2>/dev/null && mv "$TMP_SYNC_LIST.ex" "$TMP_SYNC_LIST" || true
 sort -u "$TMP_SYNC_LIST" -o "$TMP_SYNC_LIST" || true
 
 # Also include shared utilities if present (repo-level, not in BOT_FOLDER)

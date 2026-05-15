@@ -33,6 +33,8 @@ REM NOTE: git add -u does NOT stage brand-new untracked files — add explicit l
 git add -u
 REM New bot folders / modules (git add -u skips untracked paths).
 git add RSCashoutBot >nul 2>&1
+git add RSChannelRelay >nul 2>&1
+git add systemd\mirror-world-rschannelrelay.service >nul 2>&1
 git add RSCheckerbot\rschecker_journal.py >nul 2>&1
 git add RSCheckerbot\whop_discord_ingest.py >nul 2>&1
 git add RSCheckerbot\whop_std_webhook_kinds.py >nul 2>&1

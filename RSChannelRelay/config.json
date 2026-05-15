@@ -1,0 +1,30 @@
+{
+  "source_guild_id": 876528050081251379,
+  "destination_guild_id": 876528050081251379,
+  "destination_category_id": 1504381617064378439,
+  "source_channel_ids": [
+    "1400615121415438446",
+    "1344378714368118794",
+    "1290040086905360405",
+    "1356465938614059079",
+    "1479273016423612536",
+    "1399088859245051954",
+    "1356465977214111905"
+  ],
+  "link_redaction_placeholder": "<a:rsevil:910339367577452644> no link for you <a:Why2:1420877275242565723>",
+  "preserve_ebay_urls": true,
+  "where_line_snipe_emoji": "<:sniped:1350271143822753873>",
+  "cta_footer": "",
+  "mirror_end_footer": "-# Get access to full links, locations, and premium leads here <#1155729485048594483> <a:lockedup:1350271155822395413>",
+  "use_webhook_impersonation": true,
+  "relay_webhook_name": "RSChannelRelay",
+  "webhook_urls_filename": "relay_webhook_urls.json",
+  "ignore_bot_messages": false,
+  "mirror_attachments": true,
+  "include_jump_to_original": true,
+  "max_body_chars": 1600,
+  "channel_map_filename": "relay_channel_map.json",
+  "human_readable_logging": true,
+  "log_skip_bot_messages": false,
+  "show_technical_trace": false
+}

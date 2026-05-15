@@ -156,6 +156,7 @@ rs_folders=(
   "RSOnboarding"
   "RSPromoBot"
   "RSCashoutBot"
+  "RSChannelRelay"
 )
 
 for d in "${rs_folders[@]}"; do

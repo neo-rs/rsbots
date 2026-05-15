@@ -17,6 +17,7 @@ DEFAULT_RS_BOT_FOLDERS = [
     "RSuccessBot",
     "RSOnboarding",
     "RSCashoutBot",
+    "RSChannelRelay",
 ]
 
 
@@ -55,6 +56,8 @@ DEFAULT_EXCLUDE_GLOBS = [
     "payment_cache.json",
     "missed_onboarding_report.json",
     "ticket_history_report.json",
+    "relay_channel_map.json",
+    "relay_webhook_urls.json",
 ]
 
 

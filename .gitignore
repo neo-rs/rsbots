@@ -131,6 +131,15 @@ DailyScheduleReminder/rs_instore/temp_send.json
 !RSPromoBot/README.md
 !RSPromoBot/requirements.txt
 
+!RSChannelRelay/
+!RSChannelRelay/**/
+!RSChannelRelay/*.py
+!RSChannelRelay/config.json
+!RSChannelRelay/config.secrets.example.json
+!RSChannelRelay/requirements.txt
+!RSChannelRelay/*.sh
+!RSChannelRelay/*.bat
+
 !RSCashoutBot/
 !RSCashoutBot/**/
 !RSCashoutBot/*.py

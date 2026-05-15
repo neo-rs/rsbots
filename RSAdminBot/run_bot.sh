@@ -121,6 +121,10 @@ case "$BOT_KEY" in
     cd "$ROOT_DIR/RSCashoutBot"
     exec "$PY" -u "bot.py"
     ;;
+  rschannelrelay)
+    cd "$ROOT_DIR/RSChannelRelay"
+    exec "$PY" -u "relay_bot.py"
+    ;;
   datamanagerbot)
     cd "$ROOT_DIR/MWDataManagerBot"
     exec "$PY" -u "datamanagerbot.py"
@@ -155,7 +159,7 @@ case "$BOT_KEY" in
     ;;
   *)
     echo "ERROR: Unknown bot_key: $BOT_KEY"
-    echo "Valid bot_key values: rsadminbot rsforwarder rsonboarding rscheckerbot rsmentionpinger rssuccessbot rspromobot rscashoutbot datamanagerbot discumbot instorebotforwarder pingbot dailyschedulereminder whopmembershipsync catalognavbot amazonasinchecker"
+    echo "Valid bot_key values: rsadminbot rsforwarder rsonboarding rscheckerbot rsmentionpinger rssuccessbot rspromobot rscashoutbot rschannelrelay datamanagerbot discumbot instorebotforwarder pingbot dailyschedulereminder whopmembershipsync catalognavbot amazonasinchecker"
     exit 1
     ;;
 esac
