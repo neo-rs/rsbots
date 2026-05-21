@@ -92,6 +92,12 @@ if exist "Instorebotforwarder\conversational_deals_forwarder.py" (
 
 )
 
+if exist "Instorebotforwarder\amazon_buybox_dom_screenshot.py" (
+
+  git add -- "Instorebotforwarder/amazon_buybox_dom_screenshot.py"
+
+)
+
 REM MWDataManagerBot: universal resolver fallback + audits (new paths must be staged once)
 if exist "MWDataManagerBot\universal_resolver_client.py" (
 
