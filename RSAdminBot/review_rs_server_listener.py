@@ -486,6 +486,11 @@ class ReviewRSServerListener(commands.Cog):
         except Exception:
             paid_ch = 1155729485048594483
         footer = str(fp.get("footer_message", "") or "").strip()
+        if not footer:
+            await self._post_free_preview_error(
+                "❌ Free RS preview: set `review_rs_listener.free_preview.footer_message` in `RSAdminBot/config.json`."
+            )
+            return
 
         ok, detail = await run_free_preview_for_reminder(
             self.bot,

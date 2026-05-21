@@ -36,13 +36,6 @@ DEFAULT_FREE_CATEGORIES: Tuple[FreePreviewCategorySpec, ...] = (
     ),
 )
 
-DEFAULT_FOOTER = (
-    "## Want the full breakdowns, direct links, and hidden instore locations? "
-    "Join the <#1155729485048594483> for full access "
-    "<a:lockedup:1350271155822395413> @everyone"
-)
-
-
 def _state_file_path(base_path: Path) -> Path:
     data = base_path / "data"
     data.mkdir(parents=True, exist_ok=True)
@@ -113,10 +106,10 @@ async def build_free_preview_bodies(
 ) -> List[str]:
     """One string per webhook message (already chunked under 1900 by caller)."""
     intro = format_free_preview_intro(month=month, day=day, siren_emoji_id=siren_emoji_id)
-    footer = str(footer_template or DEFAULT_FOOTER).strip()
+    footer = str(footer_template or "").strip()
     if paid_channel_id:
         footer = footer.replace("<#1155729485048594483>", f"<#{int(paid_channel_id)}>")
-    if locked_emoji_id and "<a:lockedup:" not in footer:
+    if locked_emoji_id and footer and "<a:lockedup:" not in footer:
         footer = footer + f" <a:lockedup:{locked_emoji_id}>"
 
     bodies: List[str] = [intro]
@@ -130,7 +123,8 @@ async def build_free_preview_bodies(
             list_text_channels=list_text_channels,
         )
         bodies.append("\n".join(block))
-    bodies.append(footer)
+    if footer:
+        bodies.append(footer)
     return bodies
 
 
