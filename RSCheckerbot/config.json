@@ -364,6 +364,7 @@
         "enabled": true,
         "inactivity_seconds": 86400,
         "check_interval_seconds": 600,
+        "_comment_delete_on_whop_linked": "While ticket is still active (<24h idle): post Whop-linked follow-up on that channel. Stale tickets always close on inactivity first (No Whop role is unrelated).",
         "delete_on_whop_linked": true
       }
     },

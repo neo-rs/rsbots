@@ -3495,6 +3495,7 @@ async def post_resolution_followup_and_remove_role(
     ticket_type: str,
     resolution_event: str,
     reference_jump_url: str = "",
+    channel_id: int = 0,
 ) -> bool:
     """Mark an open ticket as resolved, remove its role, and post follow-up inside the ticket channel."""
     if not _ensure_cfg_loaded() or not _BOT:
@@ -3518,7 +3519,20 @@ async def post_resolution_followup_and_remove_role(
     already_sent = False
     async with _INDEX_LOCK:
         db = _index_load()
-        found = _ticket_find_open(db, ticket_type=ttype, user_id=uid, fingerprint="")
+        found: tuple[str, dict] | None = None
+        cid_hint = int(channel_id or 0)
+        if cid_hint > 0:
+            found = _ticket_by_channel_id(db, cid_hint)
+            if found:
+                _tid_chk, rec_chk = found
+                if (
+                    not _ticket_is_open(rec_chk)
+                    or str(rec_chk.get("ticket_type") or "").strip().lower() != ttype
+                    or _as_int(rec_chk.get("user_id")) != uid
+                ):
+                    found = None
+        if not found:
+            found = _ticket_find_open(db, ticket_type=ttype, user_id=uid, fingerprint="")
         if not found:
             return False
         tid, rec = found
@@ -6386,7 +6400,7 @@ async def sweep_no_whop_link_cleanup(*, force: bool = False) -> str:
 
 
 async def sweep_free_pass_tickets() -> None:
-    """Periodic sweeper: inactivity and whop-linked closure for Free Pass tickets."""
+    """Periodic sweeper: 24h inactivity close for Free Pass tickets; optional Whop-linked follow-up only while still active."""
     if not _ensure_cfg_loaded():
         return
     # Always run startup-message sweeper (config-gated; restart-safe).
@@ -6423,25 +6437,33 @@ async def sweep_free_pass_tickets() -> None:
                 candidates.append((ch_id, uid, last_iso))
 
     for ch_id, uid, last_iso in candidates:
-        # Condition B: Whop-linked
+        last_dt = _parse_iso(last_iso) or now
+        idle_s = (now - last_dt).total_seconds()
+
+        # Condition A (canonical): 24h since last human message, or since ticket creation if none.
+        # Runs even when the member is Whop-linked — "No Whop" role ≠ skip auto-delete.
+        if idle_s >= float(int(cfg.inactivity_seconds)):
+            await close_ticket_by_channel_id(
+                int(ch_id),
+                close_reason="inactivity",
+                do_transcript=True,
+                delete_channel=True,
+            )
+            continue
+
+        # Condition B: Whop-linked follow-up only while the ticket is still inside the activity window.
         if cfg.delete_on_whop_linked and _IS_WHOP_LINKED:
             linked = False
             with suppress(Exception):
                 linked = bool(_IS_WHOP_LINKED(int(uid)))
             if linked:
-                # Post follow-up + role removal; channel will be auto-closed by resolved sweeper.
                 with suppress(Exception):
                     await post_resolution_followup_and_remove_role(
                         discord_id=int(uid),
                         ticket_type="free_pass",
                         resolution_event="whop_linked",
+                        channel_id=int(ch_id),
                     )
-                continue
-
-        # Condition A: inactivity
-        last_dt = _parse_iso(last_iso) or now
-        if (now - last_dt) >= timedelta(seconds=int(cfg.inactivity_seconds)):
-            await close_ticket_by_channel_id(int(ch_id), close_reason="inactivity", do_transcript=True, delete_channel=True)
 
     # Note: sweep_resolved_tickets() is called near the top so it runs even when free-pass auto-delete is disabled.
 
