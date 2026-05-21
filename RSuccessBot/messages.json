@@ -102,6 +102,8 @@
     "title": "📸 Image Required",
     "description": "Hi {member}!\n\nTo earn success points, please **attach an image** to your message in the success channel.\n\nYour message without an image has been removed from the channel.",
     "footer": "Only messages with image attachments earn points"
-  }
+  },
+  "important_success_nudge_online": "-# If you hit, drop it in <#876628405645369344> and earn points <:rslgoat1:1247633099450486844>",
+  "important_success_nudge_instore": "-# If you hit, drop it in <#1359314655797055691> and earn points <:rslgoat1:1247633099450486844>"
 }
 

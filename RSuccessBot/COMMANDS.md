@@ -327,6 +327,7 @@ RSSuccessBot manages the success points system for Reselling Secrets. Members ea
 - Points are stored in `success_points.json` (JSON-only, no databases)
 - Duplicate images are automatically detected and prevented
 - Points are awarded automatically when valid success images are posted in success channels
+- Configured **important** alert channels (`important_channel_success_nudges` in `config.json`) receive a plain-text subtext follow-up on every message (including bot/webhook posts) pointing members to the matching success channel; copy lives in `messages.json` via `message_key`
 - Redemption requires staff approval (points are not auto-deducted)
 - All point movements are logged to a points log channel if configured
 - Tier names must be unique (case-insensitive check)

@@ -1,5 +1,24 @@
 {
   "guild_id": 876528050081251379,
+  "important_channel_success_nudges": {
+    "enabled": true,
+    "groups": [
+      {
+        "channel_ids": [
+          1255590577144201358,
+          1400615121415438446,
+          1499559757873156296
+        ],
+        "message_key": "important_success_nudge_online"
+      },
+      {
+        "channel_ids": [
+          1344378714368118794
+        ],
+        "message_key": "important_success_nudge_instore"
+      }
+    ]
+  },
   "success_channel_ids": [
     876628405645369344,
     1359314655797055691,

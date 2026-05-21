@@ -244,6 +244,49 @@ class RSSuccessBot:
             except (KeyError, AttributeError) as e:
                 return f"[Missing key in message {key}: {e}]"
         return f"[Invalid message format: {key}]"
+
+    def _important_channel_nudge_content(self, channel_id: int) -> Optional[str]:
+        """Plain-text success nudge for configured important alert channels."""
+        cfg = self.config.get("important_channel_success_nudges") or {}
+        if not cfg.get("enabled", True):
+            return None
+        for group in cfg.get("groups") or []:
+            channel_ids = group.get("channel_ids") or []
+            if channel_id not in channel_ids:
+                continue
+            message_key = (group.get("message_key") or "").strip()
+            if not message_key:
+                return None
+            text = self.get_message(message_key)
+            if text.startswith("[Message not found") or text.startswith("[Invalid message format"):
+                return None
+            return text
+        return None
+
+    async def _send_important_channel_success_nudge(self, message: discord.Message) -> None:
+        """Post a subtext follow-up under every alert in configured important channels."""
+        if isinstance(message.channel, discord.Thread):
+            return
+        if message.author.id == self.bot.user.id:
+            return
+
+        content = self._important_channel_nudge_content(message.channel.id)
+        if not content:
+            return
+
+        try:
+            await message.channel.send(content=content)
+            print(
+                f"{Colors.GREEN}[Important Channel] Success nudge sent in <#{message.channel.id}> "
+                f"(trigger msg {message.id}){Colors.RESET}"
+            )
+        except discord.Forbidden:
+            print(
+                f"{Colors.RED}[Important Channel] Missing permission to send nudge in "
+                f"<#{message.channel.id}>{Colors.RESET}"
+            )
+        except Exception as e:
+            print(f"{Colors.RED}[Important Channel] Failed to send success nudge: {e}{Colors.RESET}")
     
     def log_point_movement(self, user_id: int, change_amount: int, reason: str, admin_user_id: int = None):
         """Log a point movement to JSON (call before updating points)"""
@@ -672,6 +715,24 @@ class RSSuccessBot:
                         print(f"   • {Colors.RED}❌ Not found{Colors.RESET} <#{ch_id}>")
                 if len(success_channel_ids) > 3:
                     print(f"   ... and {len(success_channel_ids) - 3} more")
+
+                nudge_cfg = self.config.get("important_channel_success_nudges") or {}
+                if nudge_cfg.get("enabled", True):
+                    nudge_channel_ids: list[int] = []
+                    for group in nudge_cfg.get("groups") or []:
+                        nudge_channel_ids.extend(group.get("channel_ids") or [])
+                    print(
+                        f"{Colors.GREEN}📣 Important Channel Nudges:{Colors.RESET} "
+                        f"{len(nudge_channel_ids)} channel(s)"
+                    )
+                    for ch_id in nudge_channel_ids[:5]:
+                        ch = guild.get_channel(ch_id)
+                        if ch:
+                            print(f"   • {Colors.BOLD}{ch.name}{Colors.RESET} <#{ch_id}>")
+                        else:
+                            print(f"   • {Colors.RED}❌ Not found{Colors.RESET} <#{ch_id}>")
+                    if len(nudge_channel_ids) > 5:
+                        print(f"   ... and {len(nudge_channel_ids) - 5} more")
                 
                 role_id = self.config.get("role_id_to_watch")
                 if role_id:
@@ -687,12 +748,18 @@ class RSSuccessBot:
         
         @self.bot.event
         async def on_message(message: discord.Message):
-            if message.author.bot or message.guild is None:
+            if message.guild is None:
                 await self.bot.process_commands(message)
                 return
-            
+
             guild_id = self.config.get("guild_id")
             if message.guild.id != guild_id:
+                await self.bot.process_commands(message)
+                return
+
+            await self._send_important_channel_success_nudge(message)
+
+            if message.author.bot:
                 await self.bot.process_commands(message)
                 return
 
@@ -1769,6 +1836,21 @@ class RSSuccessBot:
                 name="📢 Success Channels",
                 value=channels_text or "None configured",
                 inline=False
+            )
+
+            nudge_cfg = self.config.get("important_channel_success_nudges") or {}
+            nudge_lines = []
+            if nudge_cfg.get("enabled", True):
+                for group in nudge_cfg.get("groups") or []:
+                    message_key = group.get("message_key") or "?"
+                    for ch_id in group.get("channel_ids") or []:
+                        ch = guild.get_channel(ch_id)
+                        label = ch.mention if ch else f"❌ `{ch_id}`"
+                        nudge_lines.append(f"• {label} → `{message_key}`")
+            embed.add_field(
+                name="📣 Important Channel Nudges",
+                value="\n".join(nudge_lines) if nudge_lines else "Disabled or none configured",
+                inline=False,
             )
             
             role_id = self.config.get("role_id_to_watch")
