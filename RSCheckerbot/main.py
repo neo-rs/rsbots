@@ -2565,6 +2565,8 @@ def _extract_reporting_from_member_status_embed(
         kind = "member_role_added"
     elif "membership activated (pending)" in t_low or "activated (pending)" in t_low:
         kind = "membership_activated_pending"
+    elif "cancellation removed" in t_low:
+        kind = "cancellation_removed"
     elif "cancellation scheduled" in t_low:
         kind = "cancellation_scheduled"
     elif "payment failed" in t_low:
@@ -3159,8 +3161,36 @@ async def _maybe_open_tickets_from_member_status_logs(msg: discord.Message) -> N
                 await _whop_movement_send(content="", embed=e)
         return
 
+    # Uncancel / cancel-at-period-end reversed: resolve open cancellation ticket (never open a new one).
+    if kind == "cancellation_removed" or "cancellation removed" in title_low:
+        if has_member_role(member):
+            with suppress(Exception):
+                await support_tickets.post_resolution_followup_and_remove_role(
+                    discord_id=int(did_i),
+                    ticket_type="cancellation",
+                    resolution_event="cancellation_removed",
+                    reference_jump_url=ref_url,
+                )
+                with suppress(Exception):
+                    e = _fmt_whop_movement_trace(
+                        trace_id=trace_id,
+                        stage="TICKET_AUTOMATION_ACTION",
+                        evt="member-status-logs",
+                        kind=str(kind or "").strip(),
+                        membership_id=str((whop_brief or {}).get("membership_id") or "").strip() if isinstance(whop_brief, dict) else "",
+                        discord_id=int(did_i),
+                        reads=["Cancellation removed / uncancel signal on staff card"],
+                        decisions=["post resolution follow-up (cancellation) + remove Cancelling role"],
+                        actions=["post_resolution_followup_and_remove_role(ticket_type=cancellation, resolution_event=cancellation_removed) called"],
+                        result=[],
+                    )
+                    await _whop_movement_send(content="", embed=e)
+        return
+
     # Cancellation
-    if kind in {"cancellation_scheduled", "deactivated"} or ("cancellation" in title_low) or ("deactivated" in title_low):
+    if kind in {"cancellation_scheduled", "deactivated"} or (
+        ("cancellation" in title_low) and ("cancellation removed" not in title_low)
+    ) or ("deactivated" in title_low):
         mid = _membership_id_from_history(int(did_i))
         fp = f"{mid or int(did_i)}|cancel|{occurred_at.date().isoformat()}"
         reason = ""
@@ -11054,7 +11084,13 @@ async def on_member_remove(member: discord.Member):
 
     if member.guild.id == GUILD_ID and not member.bot:
         rec = _touch_leave(member.id, member)
-        
+
+        with suppress(Exception):
+            await support_tickets.close_billing_and_cancellation_on_member_left(
+                int(member.id),
+                member=member,
+            )
+
         # Log to member-status-logs channel
         if MEMBER_STATUS_LOGS_CHANNEL_ID:
             ch = bot.get_channel(MEMBER_STATUS_LOGS_CHANNEL_ID)

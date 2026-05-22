@@ -123,6 +123,8 @@ class SupportTicketConfig:
     cancellation_countdown_churn_category_name: str
     cancellation_countdown_churn_prefix_channel_name: bool
     cancellation_countdown_run_pass_on_startup: bool
+    close_on_member_left_enabled: bool
+    close_on_member_left_reason: str
 
 
 _BOT: commands.Bot | None = None
@@ -362,6 +364,7 @@ def initialize(
     nw = st.get("no_whop_link") if isinstance(st.get("no_whop_link"), dict) else {}
     ml = st.get("member_lookup") if isinstance(st.get("member_lookup"), dict) else {}
     cc = st.get("cancellation_countdown") if isinstance(st.get("cancellation_countdown"), dict) else {}
+    col = st.get("close_on_member_left") if isinstance(st.get("close_on_member_left"), dict) else {}
     wh_api = root.get("whop_api") if isinstance(root.get("whop_api"), dict) else {}
     dm = root.get("dm_sequence") if isinstance(root.get("dm_sequence"), dict) else {}
     inv = root.get("invite_tracking") if isinstance(root.get("invite_tracking"), dict) else {}
@@ -463,6 +466,8 @@ def initialize(
         cancellation_countdown_churn_category_name=str(cc.get("churn_category_name") or "").strip(),
         cancellation_countdown_churn_prefix_channel_name=_as_bool(cc.get("churn_prefix_channel_name", True)),
         cancellation_countdown_run_pass_on_startup=_as_bool(cc.get("run_pass_on_startup", False)),
+        close_on_member_left_enabled=_as_bool(col.get("enabled", True)),
+        close_on_member_left_reason=str(col.get("close_reason") or "member_left_server").strip() or "member_left_server",
     )
 
     # Register persistent view so buttons survive restarts.
@@ -6179,6 +6184,94 @@ async def close_ticket_by_channel_id(
                 await _set_ticket_role_for_member(guild=guild, member=mobj, ticket_type=ticket_type, add=False)
 
     return True
+
+
+async def _remove_cancellation_and_churn_roles(
+    *,
+    guild: discord.Guild,
+    member: discord.Member,
+) -> None:
+    """Best-effort: strip Cancelling + Churned roles while member is still in guild (e.g. on leave)."""
+    cfg = _cfg()
+    if not cfg:
+        return
+    role_ids: list[int] = []
+    for rid in (int(cfg.cancellation_role_id or 0), int(cfg.churn_role_id or 0)):
+        if rid > 0 and rid not in role_ids:
+            role_ids.append(rid)
+    if not role_ids:
+        return
+    m = guild.get_member(int(member.id))
+    if not isinstance(m, discord.Member):
+        m = member
+    try:
+        member_role_ids = {int(getattr(r, "id", 0) or 0) for r in (m.roles or [])}
+    except Exception:
+        return
+    to_remove: list[discord.Role] = []
+    for rid in role_ids:
+        if rid not in member_role_ids:
+            continue
+        r = guild.get_role(rid)
+        if isinstance(r, discord.Role):
+            to_remove.append(r)
+    if not to_remove:
+        return
+    with suppress(Exception):
+        await m.remove_roles(*to_remove, reason="RSCheckerbot: member left server — remove ticket roles")
+
+
+async def close_billing_and_cancellation_on_member_left(
+    discord_id: int,
+    *,
+    member: discord.Member | None = None,
+    close_reason: str = "",
+) -> dict[str, object]:
+    """Close OPEN billing + cancellation tickets (includes churn-moved channels) when the user leaves the guild."""
+    out: dict[str, object] = {
+        "billing": False,
+        "cancellation": False,
+        "closed": [],
+        "skipped": True,
+    }
+    if not _ensure_cfg_loaded():
+        return out
+    cfg = _cfg()
+    if not cfg or not cfg.close_on_member_left_enabled:
+        return out
+    uid = int(discord_id or 0)
+    if uid <= 0:
+        return out
+    out["skipped"] = False
+    reason = str(close_reason or cfg.close_on_member_left_reason or "member_left_server").strip() or "member_left_server"
+    guild = _BOT.get_guild(int(cfg.guild_id)) if _BOT else None
+    if isinstance(guild, discord.Guild) and isinstance(member, discord.Member):
+        with suppress(Exception):
+            await _remove_cancellation_and_churn_roles(guild=guild, member=member)
+    for ttype in ("billing", "cancellation"):
+        ok = False
+        with suppress(Exception):
+            ok = bool(
+                await close_open_ticket_for_user(
+                    uid,
+                    ticket_type=ttype,
+                    close_reason=reason,
+                    do_transcript=True,
+                    delete_channel=True,
+                )
+            )
+        out[ttype] = ok
+        if ok:
+            closed = out.get("closed")
+            if isinstance(closed, list):
+                closed.append(ttype)
+    closed_list = out.get("closed")
+    if isinstance(closed_list, list) and closed_list:
+        with suppress(Exception):
+            await _log(
+                f"🚪 support_tickets: member_left user_id={uid} closed={','.join(str(x) for x in closed_list)} reason={reason}"
+            )
+    return out
 
 
 async def close_open_ticket_for_user(
