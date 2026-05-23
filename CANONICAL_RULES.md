@@ -41,6 +41,57 @@ When enhancing, fixing, or refactoring code:
 
 ---
 
+## 🎯 Generalized filters vs literal guards (repo-wide)
+
+This rule applies to **any** bot, script, or pipeline in this repo — not only Instorebotforwarder.
+
+When the task involves **routing**, **classification**, **filtering**, **stripping**, **blocking**, **allowlists/denylists**, or similar “should this pass / which bucket?” logic:
+
+### Ask the user before coding (when applicable)
+
+Before implementing a **specific** guard (fixed word list, single-example regex, hardcoded channel/product name, one-off strip for a phrase seen in chat), **ask the user**:
+
+- Do you want a **specific** guard tied to this example (narrow, explicit, config-listed), or a **generalized** rule that covers the **category** (semantic / pattern / structured classifier)?
+- Only skip the question when the user has **already** stated “specific only” or “generalize this” for that task.
+
+Default bias when the user has not decided: **generalize** the intent (what class of thing are we detecting?), not the literal string from one screenshot.
+
+### Do not literalize examples
+
+- User-provided messages, screenshots, and sample phrases are **test cases**, not the production allowlist.
+- **Forbidden:** fixing a misroute by adding only the exact tokens from that message (e.g. adding `tuna` because one tuna post failed) without addressing **why** (missing product context, wrong input blob, no edible-vs-equipment reasoning).
+- **Required:** implement behavior that would also handle **unseen** similar items (another fish brand, another supplement SKU, another “kitchen” shelving title).
+
+### Preferred implementation order
+
+1. **Generalized mechanism** — category rules, structured config (types/enums), regex **patterns** (mentions, URLs, markup), shared helpers, or a single classifier step (e.g. one LLM call with `is_food` + reason) using **full** message context (content + embed title/description + URL host when relevant).
+2. **Specific overrides only when requested** — explicit config entries, feature flags, or channel-scoped exceptions the user asked for.
+3. **One source of truth** — no parallel keyword lists for the same decision (see **NO CODE LEFT BEHIND**).
+
+### Explainability
+
+Critical paths must log **why** a filter fired (route reason, matched rule id, classifier output). No silent routing.
+
+### Reference: affiliated food vs personal (Instorebotforwarder)
+
+Canonical owner: `MWBots/Instorebotforwarder/conversational_deals_forwarder.py` + `automatedParaphrase/gemini_paraphraser.py` (`classify_affiliated_food_route`). Affiliated routing uses **Gemini JSON** edible-vs-equipment classification on **full message context** (body + embed + link host), not a growing keyword list. Legacy `affiliated_food_keywords` applies only when `affiliated_food_classifier` is `keywords`.
+
+**Operator definition (confirmed by user):**
+
+| Route | What belongs |
+|-------|----------------|
+| **Food** | Human **consumables**: grocery, snacks, ingredients, **all beverages** (soda, energy drinks, coffee **beans/grounds/pods as product**, juice, etc.), **supplements** (powder, gummies, vitamins consumed as product), **pet food**, protein/nutrition bars, typical pantry/fridge/freezer items. |
+| **Personal** | **Non-ingestible** or **equipment**: electronics, furniture, storage, appliances (**coffee makers / Keurig / air fryers / hot dog makers / pancake shapers** — food words in the name but the product is a machine, not something you eat), BBQ **fuel** (wood pellets, charcoal), topical/personal care (e.g. aloe gel), anything that is not eaten or drunk. |
+
+**False-positive traps to design against (generalized, not more keywords):**
+
+- Room/use words in titles (“kitchen”, “pantry”) on **non-food** products.
+- Cooking verbs (“cook”, “meals”) on **appliances**.
+- Flavor words on **BBQ fuel** (hickory, cherry, maple).
+- Product names living only in **embeds** while routing reads **short message body only** — classification input must include embed + link context.
+
+---
+
 ## 🧠 CANONICAL OWNERSHIP
 
 | Responsibility | Canonical Owner |
