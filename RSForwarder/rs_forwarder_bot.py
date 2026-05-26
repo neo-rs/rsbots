@@ -5601,8 +5601,8 @@ class RSForwarderBot:
             Add a forwarding job.
 
             Preferred workflow (DiscumBot-style):
-              - run `!rsadd` in the destination channel
-              - select source guild/category/channels
+              - run `!rsadd` in the destination server
+              - pick guild (page list), then searchable category/channel pickers
               - click "Map → destination" (auto-creates/uses a webhook)
 
             Manual mode:
@@ -5640,12 +5640,15 @@ class RSForwarderBot:
                         self.src_channel_page = 0
 
                         # Current selections
-                        self.dest_guild_id = int(getattr(getattr(ctx, "guild", None), "id", 0) or 0)
-                        self.dest_category_index = 0  # index into categories list (+0 == all)
+                        self._ctx_guild_id = int(getattr(getattr(ctx, "guild", None), "id", 0) or 0)
+                        self.dest_guild_id = int(self._ctx_guild_id or 0)
+                        self.dest_category_index = 0  # legacy page browse when guild != command guild
+                        self.dest_category_id = 0  # 0 = all channels; native category ChannelSelect
                         self.dest_channel_id = 0
 
-                        self.src_guild_id = int(getattr(getattr(ctx, "guild", None), "id", 0) or 0)
+                        self.src_guild_id = int(self._ctx_guild_id or 0)
                         self.src_category_index = 0
+                        self.src_category_id = 0
                         self.selected_src_channel_ids: Set[int] = set()
 
                         self._rebuild()
@@ -5658,6 +5661,30 @@ class RSForwarderBot:
                         except Exception:
                             return False
                         return True
+
+                    def _native_channel_select_guild(self, guild_id: int) -> bool:
+                        """Discord ChannelSelect only lists channels in the command's guild."""
+                        gid = int(guild_id or 0)
+                        return gid > 0 and gid == int(self._ctx_guild_id or 0)
+
+                    def _rsadd_text_channel_types(self) -> List[discord.ChannelType]:
+                        return [discord.ChannelType.text, discord.ChannelType.news]
+
+                    async def _resolve_text_channel_from_select(
+                        self, interaction: discord.Interaction, channel_id: int
+                    ) -> Optional[discord.TextChannel]:
+                        ch_obj = None
+                        try:
+                            if interaction.guild:
+                                ch_obj = interaction.guild.get_channel(int(channel_id))
+                        except Exception:
+                            ch_obj = None
+                        if ch_obj is None:
+                            try:
+                                ch_obj = await interaction.client.fetch_channel(int(channel_id))
+                            except Exception:
+                                ch_obj = None
+                        return ch_obj if isinstance(ch_obj, discord.TextChannel) else None
 
                     def _all_guilds(self) -> List[discord.Guild]:
                         try:
@@ -5723,19 +5750,51 @@ class RSForwarderBot:
                             emb.description = "Pick a **destination** guild/category/channel."
                             g = self._guild_by_id(self.dest_guild_id)
                             emb.add_field(name="Destination guild", value=f"`{g.name}` ({g.id})" if g else f"`unknown` ({self.dest_guild_id})", inline=False)
+                            if self.step in ("dest_category", "dest_channel", "src_guild", "src_category", "src_channel"):
+                                if int(self.dest_category_id or 0) > 0:
+                                    emb.add_field(name="Destination category", value=f"<#{self.dest_category_id}>", inline=False)
+                                else:
+                                    emb.add_field(name="Destination category", value="All channels", inline=False)
                             emb.add_field(name="Destination channel", value=f"<#{self.dest_channel_id}>" if self.dest_channel_id else "Not set", inline=False)
-                            emb.set_footer(text="Destination browse → Next")
+                            if self.step in ("dest_category", "dest_channel") and not self._native_channel_select_guild(self.dest_guild_id):
+                                emb.add_field(
+                                    name="Note",
+                                    value="Run `!rsadd` **in the destination server** to use searchable category/channel pickers. Using page browse here.",
+                                    inline=False,
+                                )
+                            if self.step == "dest_category" and self._native_channel_select_guild(self.dest_guild_id):
+                                emb.set_footer(text="Search category below, or All channels to skip the filter")
+                            elif self.step == "dest_channel" and self._native_channel_select_guild(self.dest_guild_id):
+                                emb.set_footer(text="Type to search destination channels")
+                            else:
+                                emb.set_footer(text="Destination browse → Next")
                         else:
                             emb.description = "Pick a **source** guild/category/channel(s)."
                             g = self._guild_by_id(self.src_guild_id)
                             emb.add_field(name="Source guild", value=f"`{g.name}` ({g.id})" if g else f"`unknown` ({self.src_guild_id})", inline=False)
+                            if self.step in ("src_category", "src_channel"):
+                                if int(self.src_category_id or 0) > 0:
+                                    emb.add_field(name="Source category", value=f"<#{self.src_category_id}>", inline=False)
+                                else:
+                                    emb.add_field(name="Source category", value="All channels", inline=False)
                             if self.selected_src_channel_ids:
                                 shown = ", ".join([f"<#{cid}>" for cid in list(self.selected_src_channel_ids)[:12]])
                                 emb.add_field(name="Selected source", value=shown, inline=False)
                             else:
                                 emb.add_field(name="Selected source", value="None", inline=False)
                             emb.add_field(name="Destination", value=f"<#{self.dest_channel_id}>" if self.dest_channel_id else "Not set", inline=False)
-                            emb.set_footer(text="Source browse → Map → destination")
+                            if self.step in ("src_category", "src_channel") and not self._native_channel_select_guild(self.src_guild_id):
+                                emb.add_field(
+                                    name="Note",
+                                    value="Run `!rsadd` **in the source server** to use searchable category/channel pickers. Using page browse here.",
+                                    inline=False,
+                                )
+                            if self.step == "src_category" and self._native_channel_select_guild(self.src_guild_id):
+                                emb.set_footer(text="Search category below, or All channels to skip the filter")
+                            elif self.step == "src_channel" and self._native_channel_select_guild(self.src_guild_id):
+                                emb.set_footer(text="Type to search source channels (multi-select up to 25)")
+                            else:
+                                emb.set_footer(text="Source browse → Map → destination")
                         return emb
 
                     def _rebuild(self) -> None:
@@ -5770,6 +5829,54 @@ class RSForwarderBot:
                             return
 
                         if self.step == "dest_category":
+                            if self._native_channel_select_guild(self.dest_guild_id):
+                                cat_sel = discord.ui.ChannelSelect(
+                                    custom_id="rsadd_dest_category",
+                                    placeholder="Search destination category…",
+                                    channel_types=[discord.ChannelType.category],
+                                    min_values=1,
+                                    max_values=1,
+                                    row=0,
+                                )
+
+                                async def _dest_pick_category_native(interaction: discord.Interaction):
+                                    if not await self._guard(interaction):
+                                        return
+                                    raw = (interaction.data.get("values") or [None])[0]  # type: ignore[union-attr]
+                                    try:
+                                        cid = int(raw)
+                                    except Exception:
+                                        await interaction.response.send_message("❌ Bad category id.", ephemeral=True)
+                                        return
+                                    self.dest_category_id = cid if cid > 0 else 0
+                                    self.dest_channel_id = 0
+                                    self.step = "dest_channel"
+                                    self._rebuild()
+                                    await self._edit_message(interaction)
+
+                                cat_sel.callback = _dest_pick_category_native  # type: ignore[assignment]
+                                self.add_item(cat_sel)
+
+                                skip_btn = discord.ui.Button(label="All channels", style=discord.ButtonStyle.secondary, row=1)
+
+                                async def _dest_skip_category(interaction: discord.Interaction):
+                                    if not await self._guard(interaction):
+                                        return
+                                    self.dest_category_id = 0
+                                    self.dest_channel_id = 0
+                                    self.step = "dest_channel"
+                                    self._rebuild()
+                                    await self._edit_message(interaction)
+
+                                skip_btn.callback = _dest_skip_category  # type: ignore[assignment]
+                                self.add_item(skip_btn)
+
+                                back_btn = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary, row=4)
+                                back_btn.callback = self._back  # type: ignore[assignment]
+                                self.add_item(back_btn)
+                                self.add_item(cancel_btn)
+                                return
+
                             g = self._guild_by_id(self.dest_guild_id)
                             cats = self._categories_for(g) if g else [None]
                             idx = max(0, min(int(self.dest_category_index), len(cats) - 1))
@@ -5796,6 +5903,77 @@ class RSForwarderBot:
                             return
 
                         if self.step == "dest_channel":
+                            if self._native_channel_select_guild(self.dest_guild_id):
+                                g = self._guild_by_id(self.dest_guild_id)
+                                if int(self.dest_category_id or 0) > 0:
+                                    cat_ch = g.get_channel(int(self.dest_category_id)) if g else None
+                                    cat_label = str(getattr(cat_ch, "name", "") or self.dest_category_id)[:75]
+                                    cat_info = discord.ui.Button(
+                                        label=f"Category: {cat_label}",
+                                        style=discord.ButtonStyle.secondary,
+                                        row=0,
+                                        disabled=True,
+                                    )
+                                else:
+                                    cat_info = discord.ui.Button(
+                                        label="Category: All channels",
+                                        style=discord.ButtonStyle.secondary,
+                                        row=0,
+                                        disabled=True,
+                                    )
+                                self.add_item(cat_info)
+
+                                ch_sel = discord.ui.ChannelSelect(
+                                    custom_id="rsadd_dest_channel",
+                                    placeholder="Search destination channel…",
+                                    channel_types=self._rsadd_text_channel_types(),
+                                    min_values=1,
+                                    max_values=1,
+                                    row=1,
+                                )
+
+                                async def _dest_pick_channel_native(interaction: discord.Interaction):
+                                    if not await self._guard(interaction):
+                                        return
+                                    raw = (interaction.data.get("values") or [None])[0]  # type: ignore[union-attr]
+                                    try:
+                                        cid = int(raw)
+                                    except Exception:
+                                        await interaction.response.send_message("❌ Bad channel id.", ephemeral=True)
+                                        return
+                                    ch_obj = await self._resolve_text_channel_from_select(interaction, cid)
+                                    if ch_obj is None:
+                                        await interaction.response.send_message("❌ Pick a text channel.", ephemeral=True)
+                                        return
+                                    if int(self.dest_category_id or 0) > 0:
+                                        parent_id = int(getattr(ch_obj, "category_id", 0) or 0)
+                                        if parent_id != int(self.dest_category_id):
+                                            await interaction.response.send_message(
+                                                "❌ That channel is not in the selected category. Clear category (Back) or pick another channel.",
+                                                ephemeral=True,
+                                            )
+                                            return
+                                    self.dest_channel_id = int(ch_obj.id)
+                                    self._rebuild()
+                                    await self._edit_message(interaction)
+
+                                ch_sel.callback = _dest_pick_channel_native  # type: ignore[assignment]
+                                self.add_item(ch_sel)
+
+                                back_btn = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary, row=4)
+                                back_btn.callback = self._back  # type: ignore[assignment]
+                                go_btn = discord.ui.Button(
+                                    label="Next (source)",
+                                    style=discord.ButtonStyle.primary,
+                                    row=4,
+                                    disabled=(int(self.dest_channel_id or 0) <= 0),
+                                )
+                                go_btn.callback = self._to_src_guild  # type: ignore[assignment]
+                                self.add_item(back_btn)
+                                self.add_item(go_btn)
+                                self.add_item(cancel_btn)
+                                return
+
                             g = self._guild_by_id(self.dest_guild_id)
                             cats = self._categories_for(g) if g else [None]
                             cat = cats[max(0, min(int(self.dest_category_index), len(cats) - 1))] if cats else None
@@ -5854,6 +6032,54 @@ class RSForwarderBot:
                             return
 
                         if self.step == "src_category":
+                            if self._native_channel_select_guild(self.src_guild_id):
+                                cat_sel = discord.ui.ChannelSelect(
+                                    custom_id="rsadd_src_category",
+                                    placeholder="Search source category…",
+                                    channel_types=[discord.ChannelType.category],
+                                    min_values=1,
+                                    max_values=1,
+                                    row=0,
+                                )
+
+                                async def _src_pick_category_native(interaction: discord.Interaction):
+                                    if not await self._guard(interaction):
+                                        return
+                                    raw = (interaction.data.get("values") or [None])[0]  # type: ignore[union-attr]
+                                    try:
+                                        cid = int(raw)
+                                    except Exception:
+                                        await interaction.response.send_message("❌ Bad category id.", ephemeral=True)
+                                        return
+                                    self.src_category_id = cid if cid > 0 else 0
+                                    self.selected_src_channel_ids = set()
+                                    self.step = "src_channel"
+                                    self._rebuild()
+                                    await self._edit_message(interaction)
+
+                                cat_sel.callback = _src_pick_category_native  # type: ignore[assignment]
+                                self.add_item(cat_sel)
+
+                                skip_btn = discord.ui.Button(label="All channels", style=discord.ButtonStyle.secondary, row=1)
+
+                                async def _src_skip_category(interaction: discord.Interaction):
+                                    if not await self._guard(interaction):
+                                        return
+                                    self.src_category_id = 0
+                                    self.selected_src_channel_ids = set()
+                                    self.step = "src_channel"
+                                    self._rebuild()
+                                    await self._edit_message(interaction)
+
+                                skip_btn.callback = _src_skip_category  # type: ignore[assignment]
+                                self.add_item(skip_btn)
+
+                                back_btn = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary, row=4)
+                                back_btn.callback = self._back  # type: ignore[assignment]
+                                self.add_item(back_btn)
+                                self.add_item(cancel_btn)
+                                return
+
                             g = self._guild_by_id(self.src_guild_id)
                             cats = self._categories_for(g) if g else [None]
                             idx = max(0, min(int(self.src_category_index), len(cats) - 1))
@@ -5880,6 +6106,82 @@ class RSForwarderBot:
                             return
 
                         # src_channel
+                        if self._native_channel_select_guild(self.src_guild_id):
+                            g = self._guild_by_id(self.src_guild_id)
+                            if int(self.src_category_id or 0) > 0:
+                                cat_ch = g.get_channel(int(self.src_category_id)) if g else None
+                                cat_label = str(getattr(cat_ch, "name", "") or self.src_category_id)[:75]
+                                cat_info = discord.ui.Button(
+                                    label=f"Category: {cat_label}",
+                                    style=discord.ButtonStyle.secondary,
+                                    row=0,
+                                    disabled=True,
+                                )
+                            else:
+                                cat_info = discord.ui.Button(
+                                    label="Category: All channels",
+                                    style=discord.ButtonStyle.secondary,
+                                    row=0,
+                                    disabled=True,
+                                )
+                            self.add_item(cat_info)
+
+                            ch_sel = discord.ui.ChannelSelect(
+                                custom_id="rsadd_src_channels",
+                                placeholder="Search source channel(s)…",
+                                channel_types=self._rsadd_text_channel_types(),
+                                min_values=1,
+                                max_values=25,
+                                row=1,
+                            )
+
+                            async def _src_pick_channels_native(interaction: discord.Interaction):
+                                if not await self._guard(interaction):
+                                    return
+                                vals = interaction.data.get("values", [])  # type: ignore[union-attr]
+                                picked: Set[int] = set()
+                                for raw in vals or []:
+                                    try:
+                                        cid = int(raw)
+                                    except Exception:
+                                        continue
+                                    if cid <= 0:
+                                        continue
+                                    ch_obj = await self._resolve_text_channel_from_select(interaction, cid)
+                                    if ch_obj is None:
+                                        continue
+                                    if int(self.src_category_id or 0) > 0:
+                                        parent_id = int(getattr(ch_obj, "category_id", 0) or 0)
+                                        if parent_id != int(self.src_category_id):
+                                            continue
+                                    picked.add(int(ch_obj.id))
+                                if not picked:
+                                    await interaction.response.send_message(
+                                        "❌ No valid source channels selected (check category filter).",
+                                        ephemeral=True,
+                                    )
+                                    return
+                                self.selected_src_channel_ids = picked
+                                self._rebuild()
+                                await self._edit_message(interaction)
+
+                            ch_sel.callback = _src_pick_channels_native  # type: ignore[assignment]
+                            self.add_item(ch_sel)
+
+                            back_btn = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary, row=4)
+                            back_btn.callback = self._back  # type: ignore[assignment]
+                            map_btn = discord.ui.Button(
+                                label="Map → destination",
+                                style=discord.ButtonStyle.success,
+                                row=4,
+                                disabled=(int(self.dest_channel_id or 0) <= 0),
+                            )
+                            map_btn.callback = self._map  # type: ignore[assignment]
+                            self.add_item(back_btn)
+                            self.add_item(map_btn)
+                            self.add_item(cancel_btn)
+                            return
+
                         g = self._guild_by_id(self.src_guild_id)
                         cats = self._categories_for(g) if g else [None]
                         cat = cats[max(0, min(int(self.src_category_index), len(cats) - 1))] if cats else None
@@ -5925,6 +6227,7 @@ class RSForwarderBot:
                             v = int(interaction.data.get("values", ["0"])[0])  # type: ignore[union-attr]
                             self.dest_guild_id = v if v > 0 else 0
                             self.dest_category_index = 0
+                            self.dest_category_id = 0
                             self.dest_channel_id = 0
                             self.dest_channel_page = 0
                         except Exception:
@@ -6022,6 +6325,7 @@ class RSForwarderBot:
                             v = int(interaction.data.get("values", ["0"])[0])  # type: ignore[union-attr]
                             self.src_guild_id = v if v > 0 else 0
                             self.src_category_index = 0
+                            self.src_category_id = 0
                             self.src_channel_page = 0
                             self.selected_src_channel_ids = set()
                         except Exception:
@@ -6136,6 +6440,8 @@ class RSForwarderBot:
                         self.step = "dest_guild"
                         self.selected_src_channel_ids = set()
                         self.dest_channel_id = 0
+                        self.dest_category_id = 0
+                        self.src_category_id = 0
                         self._rebuild()
                         try:
                             emb = await self._build_embed()
