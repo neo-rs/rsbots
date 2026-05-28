@@ -1258,8 +1258,8 @@ def _expand_hosts_from_env() -> set:
     return hosts
 
 
-# Redirector / tracker hosts (canonical for expand eligibility). Keyword match catches many
-# networks without adding every shortener to a fixed list (same idea as universal_link_resolver).
+# Legacy redirector hints (scoring/HTML paths). HTTP unwrap uses RSForwarder/outbound_url_resolve.py
+# (chain-best pick + heuristics), not this list as a gate.
 _COMMON_QUERY_REDIRECT_KEYS: Tuple[str, ...] = (
     "url",
     "u",
@@ -1923,71 +1923,32 @@ async def _http_expand_resolve_url(
     dbg_chain: Optional[List[str]] = None,
 ) -> str:
     """
-    Universal-style resolve: always HTTP-follow + score redirect chain for best merchant URL.
-    Host lists classify/score only — they do not skip HTTP expand for unknown shorteners.
+    Canonical outbound resolve: RSForwarder/outbound_url_resolve.py (chain-best pick, heuristic shorteners).
     """
-    current = _iterative_resolve_unwrap((start_u or "").strip())
-    if dbg_chain is not None:
-        if not dbg_chain:
-            dbg_chain.append(current)
-        elif dbg_chain[-1] != current:
-            dbg_chain.append(current)
+    del session, max_redirects
+    try:
+        from RSForwarder.outbound_url_resolve import resolve_outbound_url
+    except ImportError:
+        from outbound_url_resolve import resolve_outbound_url
 
-    seen: set = set()
-    for _depth in range(8):
-        if not current or current in seen:
-            break
-        seen.add(current)
+    start = (start_u or "").strip()
+    if dbg_chain is not None and start:
+        dbg_chain.append(start)
 
-        pre_peel = extract_generic_url_from_query(current) or unwrap_known_query_redirects(current)
-        if pre_peel and pre_peel != current and not _is_cloudflare_or_cdn_error_landing(pre_peel):
-            current = _iterative_resolve_unwrap(pre_peel)
-            if dbg_chain is not None and dbg_chain[-1] != current:
-                dbg_chain.append(current)
-            continue
+    def _run() -> str:
+        return resolve_outbound_url(start, timeout_s=max(5, int(timeout_s)))
 
-        hop = current
-        final_u, http_chain = await expand_url_with_chain(
-            session, hop, timeout_s=timeout_s, max_redirects=max_redirects
-        )
-        if _is_cloudflare_or_cdn_error_landing(final_u):
-            final_u = hop
-            http_chain = [hop]
-
-        chain_urls: List[str] = []
-        for cu in list(http_chain or []) + [final_u]:
-            cu = (cu or "").strip()
-            if cu and cu not in chain_urls:
-                chain_urls.append(cu)
-
-        murl = _try_extract_murl_from_redirect_chain(chain_urls)
-        if murl and murl not in chain_urls:
-            chain_urls.append(murl)
-
-        candidates = _collect_resolve_candidates_from_urls(chain_urls)
-        best = _pick_best_merchant_url_from_candidates(candidates)
-        if best:
-            best = _iterative_resolve_unwrap(_expand_gatekeeper_url(best) or best)
-
-        next_u = best or _iterative_resolve_unwrap(final_u)
-        if dbg_chain is not None:
-            for cu in chain_urls:
-                if cu not in dbg_chain:
-                    dbg_chain.append(cu)
-            if next_u and next_u not in dbg_chain:
-                dbg_chain.append(next_u)
-
-        if not next_u or next_u == current:
-            current = next_u or current
-            break
-
-        if _affiliate_merchant_resolution_acceptable(next_u) and not is_redirector_host(_affiliate_host(next_u)):
-            current = next_u
-            break
-
-        current = next_u
-
-    return current
+    try:
+        out = await asyncio.to_thread(_run)
+    except Exception:
+        out = start
+    out = _normalize_expanded_url(_expand_gatekeeper_url(out) or out)
+    out = _iterative_resolve_unwrap(out)
+    if dbg_chain is not None and out and out not in dbg_chain:
+        dbg_chain.append(out)
+    if _is_cloudflare_or_cdn_error_landing(out):
+        return start
+    return out or start
 
 
 def _mavely_cookie_file_path() -> Path:
@@ -2266,6 +2227,7 @@ async def _mavely_rewrap_short_link_from_merchant_url(
     For mavely.app.link: once a real merchant URL is known (unwrap, etc.),
     apply Amazon tagging or Mavely create_link / fallbacks (same as successful Playwright unwrap).
     """
+    merchant_url = _normalize_expanded_url(_expand_gatekeeper_url(merchant_url) or merchant_url)
     target_for_mavely = _strip_tracking_params(merchant_url) or merchant_url
     _aff_flow(
         cfg,
@@ -2626,6 +2588,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
     for u in candidates:
         raw = (normalized.get(u) or u).strip()
         target = (resolved.get(u) or raw).strip()
+        target = _normalize_expanded_url(_expand_gatekeeper_url(target) or target)
         if _is_cloudflare_or_cdn_error_landing(target):
             target = raw
             resolved[u] = target
