@@ -107,6 +107,22 @@
         "role_id": "886824827745337374",
         "text": ""
       }
+    },
+    {
+      "source_channel_id": "1484599902863622195",
+      "source_channel_name": "deals-personal",
+      "role_mention": {
+        "role_id": "886824827745337374",
+        "text": ""
+      }
+    },
+    {
+      "source_channel_id": "1507052351188373615",
+      "source_channel_name": "deals-food",
+      "role_mention": {
+        "role_id": "886824827745337374",
+        "text": ""
+      }
     }
   ],
   "rs_server_icon_url": "https://cdn.discordapp.com/icons/876528050081251379/a_a9a346601bbd93532d931e5280616797.gif?size=256",

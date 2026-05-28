@@ -27,8 +27,10 @@ If GraphQL rejects the app.link host, we optionally call create_link once with t
 (`MAVELY_GRAPHQL_BRIDGE_FALLBACK`, default on).
 
 When affiliate/Mavely cannot produce a link, `affiliate_keep_original_on_fail` (default true) leaves the
-message URL unchanged (no Skim/bizrate pass-through). Redirectors are detected by host keywords + env
-`AUTO_AFFILIATE_EXPAND_HOSTS`, not only a fixed shortener list.
+message URL unchanged (no Skim/bizrate pass-through).
+
+Resolve (unwrap): HTTP redirect follow runs for every candidate URL when expand is enabled — not gated on a
+shortener allowlist. Host lists/keywords classify redirectors vs merchants for scoring only (MW universal V2 style).
 """
 
 from __future__ import annotations
@@ -929,9 +931,17 @@ def _score_merchant_outbound_url(url: str) -> int:
         return -1
     if _host_matches_deny_outbound(host):
         return -1
+    if _is_noisy_resolve_host(host):
+        return -1
     if path.endswith((".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".woff", ".woff2")):
         return -1
     score = min(len(path) + len(p.query or ""), 500)
+    if is_redirector_host(host):
+        score -= 45
+    elif not _is_noisy_resolve_host(host):
+        score += 15
+    if any(x in path for x in ("/ip/", "/p/", "/product", "/products/", "/dp/", "/itm/", "/sku", "/shop/")):
+        score += 25
     hl = host.lower()
     if "amazon." in hl or hl.endswith("amazon.com") or "amzn.to" in hl:
         score += 130
@@ -1320,6 +1330,35 @@ _REDIRECTOR_KEYWORDS: Tuple[str, ...] = (
     "walmrt.us",
     "viglink",
     "sovrn",
+    "dotomi",
+    "emjcd",
+    "shopmy",
+    "pepperjam",
+    "cj.com",
+)
+
+_NOISY_RESOLVE_DOMAINS: frozenset = frozenset(
+    {
+        "facebook.com",
+        "www.facebook.com",
+        "instagram.com",
+        "www.instagram.com",
+        "twitter.com",
+        "x.com",
+        "www.x.com",
+        "youtube.com",
+        "www.youtube.com",
+        "google.com",
+        "www.google.com",
+        "doubleclick.net",
+        "www.doubleclick.net",
+        "googletagmanager.com",
+        "www.googletagmanager.com",
+        "w3.org",
+        "www.w3.org",
+        "schema.org",
+        "www.schema.org",
+    }
 )
 
 _REDIRECTOR_EXACT_HOSTS: frozenset = frozenset(
@@ -1389,6 +1428,82 @@ def is_redirector_host(host: str) -> bool:
     if h in _REDIRECTOR_EXACT_HOSTS:
         return True
     return any(_host_matches_keyword(h, kw) for kw in _REDIRECTOR_KEYWORDS)
+
+
+def _is_noisy_resolve_host(host: str) -> bool:
+    h = (host or "").strip().lower()
+    if not h:
+        return False
+    if h in _NOISY_RESOLVE_DOMAINS:
+        return True
+    return any(h.endswith("." + d) for d in _NOISY_RESOLVE_DOMAINS)
+
+
+def _try_extract_linksynergy_murl(url: str) -> Optional[str]:
+    """LinkSynergy / Rakuten deeplinks embed merchant URL in murl=."""
+    u = (url or "").strip()
+    if not u.startswith(("http://", "https://")):
+        return None
+    host = _affiliate_host(u)
+    if "linksynergy.com" not in host and "anrdoezrs.net" not in host:
+        return None
+    try:
+        q = dict(parse_qsl(urlparse(u).query, keep_blank_values=True))
+    except Exception:
+        return None
+    cand = (q.get("murl") or q.get("url") or "").strip()
+    if not cand:
+        return None
+    for _ in range(3):
+        nxt = unquote(cand)
+        if nxt == cand:
+            break
+        cand = nxt
+    if _looks_like_http_url(cand):
+        return cand
+    return None
+
+
+def _try_extract_murl_from_redirect_chain(chain: List[str]) -> Optional[str]:
+    seen: set = set()
+    for u in reversed(chain or []):
+        uu = (u or "").strip()
+        if not uu or uu in seen:
+            continue
+        seen.add(uu)
+        m = _try_extract_linksynergy_murl(uu)
+        if m:
+            return m
+    return None
+
+
+def _collect_resolve_candidates_from_urls(urls: List[str]) -> List[str]:
+    """Gather merchant candidates from redirect chain URLs (query peel + embedded URLs)."""
+    out: List[str] = []
+    seen: set = set()
+    for raw in urls or []:
+        u = (raw or "").strip()
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+        peeled = _iterative_resolve_unwrap(u)
+        if peeled and peeled not in seen:
+            seen.add(peeled)
+            out.append(peeled)
+        for step_fn in (unwrap_known_query_redirects, extract_generic_url_from_query):
+            try:
+                extra = step_fn(u)
+            except Exception:
+                extra = None
+            if extra and extra not in seen:
+                seen.add(extra)
+                out.append(extra)
+        murl = _try_extract_linksynergy_murl(u)
+        if murl and murl not in seen:
+            seen.add(murl)
+            out.append(murl)
+    return out
 
 
 def _looks_like_http_url(url: str) -> bool:
@@ -1496,6 +1611,7 @@ def _affiliate_passthrough_url(raw: str, resolved_target: str, cfg: Optional[dic
 
 
 def should_expand_url(url: str) -> bool:
+    """Diagnostic: whether host looks like a known redirector. HTTP expand is not gated on this."""
     host = _affiliate_host(url)
     if not host:
         return False
@@ -1733,13 +1849,19 @@ def _first_production_outbound_from_hub_html(html: str) -> Optional[str]:
     return o
 
 
-async def expand_url(session: aiohttp.ClientSession, url: str, *, timeout_s: float = 8.0, max_redirects: int = 8) -> str:
+async def expand_url_with_chain(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    timeout_s: float = 8.0,
+    max_redirects: int = 8,
+) -> Tuple[str, List[str]]:
+    """Follow HTTP redirects; return final URL and every hop URL (for merchant scoring)."""
     u = (url or "").strip()
     if not (u.startswith("http://") or u.startswith("https://")):
-        return u
+        return u, [u]
     timeout = aiohttp.ClientTimeout(total=timeout_s)
     headers = _expand_redirect_headers(u)
-    # Branch / Mavely often omit or mishandle HEAD; follow with GET + document headers (same idea as hub GET).
     mavely_like = _url_is_mavely_bridge_surface(u)
     if not mavely_like:
         try:
@@ -1751,7 +1873,8 @@ async def expand_url(session: aiohttp.ClientSession, url: str, *, timeout_s: flo
                 timeout=timeout,
                 headers=headers,
             ) as resp:
-                return _normalize_expanded_url(str(resp.url) or u)
+                chain = [str(h.url) for h in (resp.history or [])] + [str(resp.url or u)]
+                return _normalize_expanded_url(str(resp.url) or u), chain
         except Exception:
             pass
     try:
@@ -1766,20 +1889,29 @@ async def expand_url(session: aiohttp.ClientSession, url: str, *, timeout_s: flo
                 await resp.content.read(0)
             except Exception:
                 pass
-            return _normalize_expanded_url(str(resp.url) or u)
+            chain = [str(h.url) for h in (resp.history or [])] + [str(resp.url or u)]
+            return _normalize_expanded_url(str(resp.url) or u), chain
     except Exception:
         pass
     try:
         import requests
 
-        def _do() -> str:
+        def _do() -> Tuple[str, List[str]]:
             r = requests.get(u, allow_redirects=True, timeout=max(5, int(timeout_s)), headers=dict(headers))
-            return r.url or u
+            chain = [str(h.url) for h in (r.history or [])] + [str(r.url or u)]
+            return r.url or u, chain
 
-        final = await asyncio.to_thread(_do)
-        return _normalize_expanded_url(final or u)
+        final, chain = await asyncio.to_thread(_do)
+        return _normalize_expanded_url(final or u), chain
     except Exception:
-        return u
+        return u, [u]
+
+
+async def expand_url(session: aiohttp.ClientSession, url: str, *, timeout_s: float = 8.0, max_redirects: int = 8) -> str:
+    final, _chain = await expand_url_with_chain(
+        session, url, timeout_s=timeout_s, max_redirects=max_redirects
+    )
+    return final
 
 
 async def _http_expand_resolve_url(
@@ -1791,38 +1923,70 @@ async def _http_expand_resolve_url(
     dbg_chain: Optional[List[str]] = None,
 ) -> str:
     """
-    HTTP redirect follow + iterative query unwrap until stable or no longer a redirector.
-  """
+    Universal-style resolve: always HTTP-follow + score redirect chain for best merchant URL.
+    Host lists classify/score only — they do not skip HTTP expand for unknown shorteners.
+    """
     current = _iterative_resolve_unwrap((start_u or "").strip())
-    if dbg_chain is not None and (not dbg_chain or dbg_chain[-1] != current):
-        dbg_chain.append(current)
-    for _outer in range(6):
-        if not should_expand_url(current):
+    if dbg_chain is not None:
+        if not dbg_chain:
+            dbg_chain.append(current)
+        elif dbg_chain[-1] != current:
+            dbg_chain.append(current)
+
+    seen: set = set()
+    for _depth in range(8):
+        if not current or current in seen:
             break
+        seen.add(current)
+
+        pre_peel = extract_generic_url_from_query(current) or unwrap_known_query_redirects(current)
+        if pre_peel and pre_peel != current and not _is_cloudflare_or_cdn_error_landing(pre_peel):
+            current = _iterative_resolve_unwrap(pre_peel)
+            if dbg_chain is not None and dbg_chain[-1] != current:
+                dbg_chain.append(current)
+            continue
+
         hop = current
-        final_u = await expand_url(session, hop, timeout_s=timeout_s, max_redirects=max_redirects)
+        final_u, http_chain = await expand_url_with_chain(
+            session, hop, timeout_s=timeout_s, max_redirects=max_redirects
+        )
         if _is_cloudflare_or_cdn_error_landing(final_u):
             final_u = hop
-        else:
-            for _chain in range(4):
-                if not should_expand_url(final_u):
-                    break
-                nxt = await expand_url(session, final_u, timeout_s=timeout_s, max_redirects=max_redirects)
-                if _is_cloudflare_or_cdn_error_landing(nxt) or not nxt or nxt == final_u:
-                    break
-                final_u = nxt
-                if dbg_chain is not None:
-                    dbg_chain.append(final_u)
-            final_u = _normalize_expanded_url(final_u)
-        unwrapped = _iterative_resolve_unwrap(final_u)
-        if dbg_chain is not None and unwrapped != (dbg_chain[-1] if dbg_chain else ""):
-            dbg_chain.append(unwrapped)
-        if unwrapped == current and not should_expand_url(unwrapped):
-            current = unwrapped
+            http_chain = [hop]
+
+        chain_urls: List[str] = []
+        for cu in list(http_chain or []) + [final_u]:
+            cu = (cu or "").strip()
+            if cu and cu not in chain_urls:
+                chain_urls.append(cu)
+
+        murl = _try_extract_murl_from_redirect_chain(chain_urls)
+        if murl and murl not in chain_urls:
+            chain_urls.append(murl)
+
+        candidates = _collect_resolve_candidates_from_urls(chain_urls)
+        best = _pick_best_merchant_url_from_candidates(candidates)
+        if best:
+            best = _iterative_resolve_unwrap(_expand_gatekeeper_url(best) or best)
+
+        next_u = best or _iterative_resolve_unwrap(final_u)
+        if dbg_chain is not None:
+            for cu in chain_urls:
+                if cu not in dbg_chain:
+                    dbg_chain.append(cu)
+            if next_u and next_u not in dbg_chain:
+                dbg_chain.append(next_u)
+
+        if not next_u or next_u == current:
+            current = next_u or current
             break
-        current = unwrapped
-        if not should_expand_url(current):
+
+        if _affiliate_merchant_resolution_acceptable(next_u) and not is_redirector_host(_affiliate_host(next_u)):
+            current = next_u
             break
+
+        current = next_u
+
     return current
 
 
@@ -2278,29 +2442,28 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                 dbg_chain: Optional[List[str]] = (
                     [start_u] if affiliate_rewrite_debug_on(cfg) and affiliate_rewrite_debug_verbose_on(cfg) else None
                 )
-                if should_expand_url(start_u):
-                    final_u = await _http_expand_resolve_url(
-                        session,
-                        start_u,
-                        timeout_s=timeout_s,
-                        max_redirects=max_redirects,
-                        dbg_chain=dbg_chain,
+                final_u = await _http_expand_resolve_url(
+                    session,
+                    start_u,
+                    timeout_s=timeout_s,
+                    max_redirects=max_redirects,
+                    dbg_chain=dbg_chain,
+                )
+                resolved[u] = final_u
+                if dbg_chain is not None and len(dbg_chain) > 1:
+                    _aff_dbg_verbose(
+                        cfg,
+                        "  expand %r: %s"
+                        % (_aff_dbg_clip(u, 72), " -> ".join(_aff_dbg_clip(x, 88) for x in dbg_chain)),
                     )
-                    resolved[u] = final_u
-                    if dbg_chain is not None and len(dbg_chain) > 1:
-                        _aff_dbg_verbose(
-                            cfg,
-                            "  expand %r: %s"
-                            % (_aff_dbg_clip(u, 72), " -> ".join(_aff_dbg_clip(x, 88) for x in dbg_chain)),
-                        )
-                    elif dbg_chain is not None:
-                        _aff_dbg_verbose(
-                            cfg,
-                            "  expand %r: single hop (no further shortener chain) -> %r"
-                            % (_aff_dbg_clip(u, 72), _aff_dbg_clip(final_u, 88)),
-                        )
+                elif dbg_chain is not None:
+                    _aff_dbg_verbose(
+                        cfg,
+                        "  expand %r: resolved -> %r"
+                        % (_aff_dbg_clip(u, 72), _aff_dbg_clip(final_u, 88)),
+                    )
 
-                    special_html_hosts = {
+                special_html_hosts = {
                         "deals.pennyexplorer.com",
                         "ringinthedeals.com",
                         "dmflip.com",
@@ -2319,147 +2482,141 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                         "www.hiddendealsociety.com",
                     }
 
-                    # Some hubs require 2 steps:
-                    # pricedoffers.com -> saveyourdeals.com -> amazon.com (Go to Deal)
-                    candidate = final_u
-                    # Mavely: same as Mavelytest — headless Chromium only (no aiohttp hub fetch / persistent browser).
-                    short_norm = (normalized.get(u) or u).strip()
-                    if _mavely_bridge_playwright_enabled():
-                        try_urls: List[str] = []
-                        if is_mavely_app_short_link(short_norm):
-                            try_urls.append(short_norm)
-                        try:
-                            _cand_host = (urlparse(candidate).netloc or "").lower()
-                        except Exception:
-                            _cand_host = ""
-                        if _mavely_bridge_host(_cand_host) and candidate not in try_urls:
-                            try_urls.append(candidate)
-                        for try_u in try_urls:
+                # Some hubs require 2 steps:
+                # pricedoffers.com -> saveyourdeals.com -> amazon.com (Go to Deal)
+                candidate = final_u
+                # Mavely: same as Mavelytest — headless Chromium only (no aiohttp hub fetch / persistent browser).
+                short_norm = (normalized.get(u) or u).strip()
+                if _mavely_bridge_playwright_enabled():
+                    try_urls: List[str] = []
+                    if is_mavely_app_short_link(short_norm):
+                        try_urls.append(short_norm)
+                    try:
+                        _cand_host = (urlparse(candidate).netloc or "").lower()
+                    except Exception:
+                        _cand_host = ""
+                    if _mavely_bridge_host(_cand_host) and candidate not in try_urls:
+                        try_urls.append(candidate)
+                    for try_u in try_urls:
+                        if affiliate_rewrite_debug_verbose_on(cfg):
+                            _aff_dbg_verbose(
+                                cfg,
+                                "  mavely_playwright try %r timeout_s=%s"
+                                % (_aff_dbg_clip(try_u, 72), int(hub_html_timeout_s)),
+                            )
+                        async with _playwright_mavely_async_lock():
+                            pw_html = await asyncio.to_thread(
+                                _fetch_mavely_html_via_playwright_sync,
+                                try_u,
+                                int(hub_html_timeout_s),
+                                flow_log=flow_on,
+                                label="unwrap",
+                                flow_cfg=cfg,
+                            )
+                        out_m = (
+                            _first_production_outbound_from_hub_html(pw_html)
+                            if pw_html
+                            else None
+                        )
+                        if out_m:
+                            out_abs_m = out_m
+                            if out_abs_m.startswith("/"):
+                                out_abs_m = urljoin(try_u, out_abs_m)
+                            out_abs_m = _iterative_resolve_unwrap(unwrap_known_query_redirects(out_abs_m) or out_abs_m)
+                            candidate = out_abs_m
                             if affiliate_rewrite_debug_verbose_on(cfg):
                                 _aff_dbg_verbose(
                                     cfg,
-                                    "  mavely_playwright try %r timeout_s=%s"
-                                    % (_aff_dbg_clip(try_u, 72), int(hub_html_timeout_s)),
+                                    "  mavely_playwright ok %r -> %r"
+                                    % (_aff_dbg_clip(try_u, 72), _aff_dbg_clip(candidate, 88)),
                                 )
-                            async with _playwright_mavely_async_lock():
-                                pw_html = await asyncio.to_thread(
-                                    _fetch_mavely_html_via_playwright_sync,
-                                    try_u,
-                                    int(hub_html_timeout_s),
-                                    flow_log=flow_on,
-                                    label="unwrap",
-                                    flow_cfg=cfg,
+                            break
+                for _ in range(3):
+                    try:
+                        parsed = urlparse(candidate)
+                        host = (parsed.netloc or "").lower()
+                    except Exception:
+                        host = ""
+                    if host not in special_html_hosts:
+                        break
+                    try:
+                        _hub_headers = _html_fetch_headers_for_hub(candidate)
+                        async with session.get(
+                            candidate,
+                            headers=_hub_headers,
+                            timeout=aiohttp.ClientTimeout(total=float(hub_html_timeout_s)),
+                        ) as resp:
+                            status = int(resp.status or 0)
+                            txt = await resp.text(errors="ignore")
+                        out = _first_production_outbound_from_hub_html(txt)
+                        if not out:
+                            break
+                        # Resolve relative links found in HTML against the current page.
+                        out_abs = out
+                        if out_abs.startswith("/"):
+                            out_abs = urljoin(candidate, out_abs)
+                        out_abs = _iterative_resolve_unwrap(unwrap_known_query_redirects(out_abs) or out_abs)
+                        candidate = out_abs
+                        _aff_dbg_verbose(
+                            cfg,
+                            "  html_unwrap %r: host=%r -> %r"
+                            % (_aff_dbg_clip(u, 72), _aff_dbg_clip(host, 48), _aff_dbg_clip(candidate, 88)),
+                        )
+                    except Exception:
+                        break
+
+                if _outbound_persistent_playwright_enabled(cfg) and (
+                    not _affiliate_merchant_resolution_acceptable(candidate)
+                ):
+                    entry = short_norm if short_norm.startswith("http") else candidate
+                    profile = _outbound_playwright_profile_dir_resolved(cfg)
+                    headed = _outbound_playwright_headed_from_cfg(cfg)
+                    settle = _outbound_playwright_settle_ms(cfg)
+                    poll = _outbound_playwright_poll_s(cfg)
+                    t_ms_pw = _outbound_playwright_navigation_timeout_ms(cfg, hub_html_timeout_s)
+                    if flow_on:
+                        print(
+                            "[OutboundResolve] resolver_unresolved_wrapper in=%r candidate=%r "
+                            "-> resolver_playwright_persistent_started profile=%s headed=%s"
+                            % (
+                                _aff_dbg_clip(entry, 88),
+                                _aff_dbg_clip(candidate, 88),
+                                profile,
+                                headed,
+                            ),
+                            flush=True,
+                        )
+                    async with _playwright_mavely_async_lock():
+                        pw_out = await asyncio.to_thread(
+                            _mavely_resolve.playwright_resolve_outbound_persistent_sync,
+                            entry,
+                            timeout_ms=t_ms_pw,
+                            profile_dir=profile,
+                            headed=headed,
+                            settle_ms=settle,
+                            poll_s=poll,
+                            accept_merchant=_affiliate_merchant_resolution_acceptable,
+                        )
+                    if flow_on:
+                        print(
+                            "[OutboundResolve] resolver_playwright_persistent_result out=%r"
+                            % (_aff_dbg_clip(pw_out or "", 120),),
+                            flush=True,
+                        )
+                    if pw_out:
+                        cand_pw = _iterative_resolve_unwrap(unwrap_known_query_redirects(pw_out) or pw_out)
+                        if _affiliate_merchant_resolution_acceptable(cand_pw):
+                            candidate = cand_pw
+                            if flow_on:
+                                print(
+                                    "[OutboundResolve] resolver_merchant_accepted url=%r"
+                                    % (_aff_dbg_clip(candidate, 120),),
+                                    flush=True,
                                 )
-                            out_m = (
-                                _first_production_outbound_from_hub_html(pw_html)
-                                if pw_html
-                                else None
-                            )
-                            if out_m:
-                                out_abs_m = out_m
-                                if out_abs_m.startswith("/"):
-                                    out_abs_m = urljoin(try_u, out_abs_m)
-                                out_abs_m = _iterative_resolve_unwrap(unwrap_known_query_redirects(out_abs_m) or out_abs_m)
-                                candidate = out_abs_m
-                                if affiliate_rewrite_debug_verbose_on(cfg):
-                                    _aff_dbg_verbose(
-                                        cfg,
-                                        "  mavely_playwright ok %r -> %r"
-                                        % (_aff_dbg_clip(try_u, 72), _aff_dbg_clip(candidate, 88)),
-                                    )
-                                break
-                    for _ in range(3):
-                        try:
-                            parsed = urlparse(candidate)
-                            host = (parsed.netloc or "").lower()
-                        except Exception:
-                            host = ""
-                        if host not in special_html_hosts:
-                            break
-                        try:
-                            _hub_headers = _html_fetch_headers_for_hub(candidate)
-                            async with session.get(
-                                candidate,
-                                headers=_hub_headers,
-                                timeout=aiohttp.ClientTimeout(total=float(hub_html_timeout_s)),
-                            ) as resp:
-                                status = int(resp.status or 0)
-                                txt = await resp.text(errors="ignore")
-                            out = _first_production_outbound_from_hub_html(txt)
-                            if not out:
-                                break
-                            # Resolve relative links found in HTML against the current page.
-                            out_abs = out
-                            if out_abs.startswith("/"):
-                                out_abs = urljoin(candidate, out_abs)
-                            out_abs = _iterative_resolve_unwrap(unwrap_known_query_redirects(out_abs) or out_abs)
-                            candidate = out_abs
-                            _aff_dbg_verbose(
-                                cfg,
-                                "  html_unwrap %r: host=%r -> %r"
-                                % (_aff_dbg_clip(u, 72), _aff_dbg_clip(host, 48), _aff_dbg_clip(candidate, 88)),
-                            )
-                        except Exception:
-                            break
 
-                    if _outbound_persistent_playwright_enabled(cfg) and (
-                        not _affiliate_merchant_resolution_acceptable(candidate)
-                    ):
-                        entry = short_norm if short_norm.startswith("http") else candidate
-                        profile = _outbound_playwright_profile_dir_resolved(cfg)
-                        headed = _outbound_playwright_headed_from_cfg(cfg)
-                        settle = _outbound_playwright_settle_ms(cfg)
-                        poll = _outbound_playwright_poll_s(cfg)
-                        t_ms_pw = _outbound_playwright_navigation_timeout_ms(cfg, hub_html_timeout_s)
-                        if flow_on:
-                            print(
-                                "[OutboundResolve] resolver_unresolved_wrapper in=%r candidate=%r "
-                                "-> resolver_playwright_persistent_started profile=%s headed=%s"
-                                % (
-                                    _aff_dbg_clip(entry, 88),
-                                    _aff_dbg_clip(candidate, 88),
-                                    profile,
-                                    headed,
-                                ),
-                                flush=True,
-                            )
-                        async with _playwright_mavely_async_lock():
-                            pw_out = await asyncio.to_thread(
-                                _mavely_resolve.playwright_resolve_outbound_persistent_sync,
-                                entry,
-                                timeout_ms=t_ms_pw,
-                                profile_dir=profile,
-                                headed=headed,
-                                settle_ms=settle,
-                                poll_s=poll,
-                                accept_merchant=_affiliate_merchant_resolution_acceptable,
-                            )
-                        if flow_on:
-                            print(
-                                "[OutboundResolve] resolver_playwright_persistent_result out=%r"
-                                % (_aff_dbg_clip(pw_out or "", 120),),
-                                flush=True,
-                            )
-                        if pw_out:
-                            cand_pw = _iterative_resolve_unwrap(unwrap_known_query_redirects(pw_out) or pw_out)
-                            if _affiliate_merchant_resolution_acceptable(cand_pw):
-                                candidate = cand_pw
-                                if flow_on:
-                                    print(
-                                        "[OutboundResolve] resolver_merchant_accepted url=%r"
-                                        % (_aff_dbg_clip(candidate, 120),),
-                                        flush=True,
-                                    )
-
-                    if _is_cloudflare_or_cdn_error_landing(candidate):
-                        candidate = start_u
-                    resolved[u] = candidate
-                elif affiliate_rewrite_debug_verbose_on(cfg):
-                    _aff_dbg_verbose(
-                        cfg,
-                        "  expand skip %r: host not in shortener/env list (still may affiliate if already merchant URL)"
-                        % _aff_dbg_clip(start_u, 100),
-                    )
+                if _is_cloudflare_or_cdn_error_landing(candidate):
+                    candidate = start_u
+                resolved[u] = candidate
     elif affiliate_rewrite_debug_on(cfg) and affiliate_rewrite_debug_verbose_on(cfg):
         _aff_dbg_verbose(
             cfg,
