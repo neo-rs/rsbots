@@ -85,7 +85,7 @@ These commands open a **dropdown** to pick a bot. All outputs are ephemeral.
 #### `!archive` (RS guild prefix only)
 - **Where**: **Reselling Secrets** (`rs_server_guild_id`), in the **source** text channel to archive; owner/admin gated (same as `!delete` / `!transfer`).
 - **Scope**: Archives **only the channel where you ran `!archive`** (`#current-channel` history → one new forum thread). It does **not** scan or archive other channels.
-- **What**: Creates a **new forum thread** under `archive.forum_channel_id`, then **webhook-replays** that channel’s history into the thread (avatars, embeds, attachments, stickers; original UTC time appended per message). Does **not** create a new guild text channel.
+- **What**: Creates a **new forum thread** under `archive.forum_channel_id` (thread name matches the source channel name), then **webhook-replays** that channel’s history into the thread **oldest → newest** (avatars, embeds, attachments, stickers). Does **not** create a new guild text channel.
 - **After replay**: The source channel is **always deleted** on success (no lock/move mode).
 - **UI**: One public button — **Pick forum tags** — opens an **ephemeral** panel: optional **string select** (up to **5** forum tags; choose **Use config tag defaults** alone to use `archive.applied_tag_ids`), then **Start archive**. If the forum reports no tags, only **Start archive** is shown (uses config defaults).
 - **Config**: `RSAdminBot/config.json` → `archive`: `forum_channel_id`, `replay_delay_ms` (0–2000), optional `applied_tag_ids`. **`RSAdminBot/config.secrets.json`** (merged) → `archive.replay_webhook_url`: **required** full webhook URL for the **forum** channel (same channel as `forum_channel_id`).

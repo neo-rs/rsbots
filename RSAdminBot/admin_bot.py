@@ -3661,16 +3661,14 @@ class RSAdminBot:
                 )
                 return
 
-            base = f"arch-{src.name}".lower()
-            safe = "".join(ch if (ch.isalnum() or ch == "-") else "-" for ch in base).strip("-")
-            safe = safe[:90] or "arch-channel"
-            thread_name = safe[:100]
+            # Thread name: match the source channel name exactly (including emojis / pipe separators).
+            # Forum thread names are capped; truncate rather than sanitizing.
+            thread_name = (str(getattr(src, "name", "") or "").strip() or "archived-channel")[:100]
 
             header = (
                 f"**Forum archive** of {src.mention}\n"
                 f"**By:** {interaction.user.mention}\n"
-                f"**Source id:** `{src.id}`\n"
-                f"Discord cannot backdate timestamps; each replayed line includes the original time."
+                f"**Source id:** `{src.id}`"
             )
             if len(header) > 1900:
                 header = header[:1890] + "…"
@@ -3727,6 +3725,7 @@ class RSAdminBot:
 
             replayed = 0
             failed = 0
+            # Replay oldest -> newest so the thread reads naturally.
             async for msg in src.history(limit=None, oldest_first=True):
                 try:
                     author_name = getattr(msg.author, "display_name", None) or getattr(msg.author, "name", "Unknown")
@@ -3736,15 +3735,9 @@ class RSAdminBot:
                     except Exception:
                         avatar_url = None
 
-                    ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
                     content = (msg.content or "").strip()
-                    stamp = f"`(original: {ts})`"
-                    if content:
-                        content = f"{content}\n{stamp}"
-                    else:
-                        content = stamp
                     if len(content) > 1900:
-                        content = content[:1800] + "\n…(truncated)…\n" + stamp
+                        content = content[:1800] + "\n…(truncated)…"
 
                     embeds_to_send: List[discord.Embed] = []
                     for e in (msg.embeds or [])[:6]:
@@ -3755,6 +3748,7 @@ class RSAdminBot:
 
                     file_links: List[str] = []
                     image_urls: List[str] = []
+                    image_files: List[discord.File] = []
                     for att in (msg.attachments or []):
                         ct = str(getattr(att, "content_type", "") or "").lower()
                         fn = str(getattr(att, "filename", "") or "").lower()
@@ -3762,7 +3756,11 @@ class RSAdminBot:
                             (".png", ".jpg", ".jpeg", ".gif", ".webp")
                         )
                         if is_img:
-                            image_urls.append(att.url)
+                            # Prefer re-uploading the image into the archive thread so it always renders.
+                            try:
+                                image_files.append(await att.to_file())
+                            except Exception:
+                                image_urls.append(att.url)
                         else:
                             file_links.append(att.url)
                     if file_links:
@@ -3788,6 +3786,7 @@ class RSAdminBot:
                         username=author_name,
                         avatar_url=avatar_url,
                         embeds=embeds_to_send[:10] if embeds_to_send else None,
+                        files=image_files[:10] if image_files else None,
                         allowed_mentions=discord.AllowedMentions.none(),
                         thread=thread,
                     )
