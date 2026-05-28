@@ -14199,7 +14199,10 @@ class _FutureMemberAuditView(discord.ui.View):
 @bot.command(name="futurememberaudit", aliases=["futureaudit", "auditfuture"])
 @commands.has_permissions(administrator=True)
 async def future_member_audit(ctx):
-    """Scan Discord members missing the Member role and (after confirmation) add Future Member role."""
+    """Scan Discord members missing the Member role and (after confirmation) add Future Member role.
+
+    Preview also reports members who have both Member and Future Member (report-only; Confirm does not change them).
+    """
     # Restrict to the configured primary guild.
     if ctx.guild and GUILD_ID and int(ctx.guild.id) != int(GUILD_ID):
         await ctx.send("❌ This command is only allowed in the main server.", delete_after=12)
@@ -14289,10 +14292,12 @@ async def future_member_audit(ctx):
     staff_skipped = 0
     staff_role_skipped = 0
     has_member = 0
+    has_member_and_future = 0
     missing_member = 0
     already_future = 0
     candidates: list[int] = []
     sample_lines: list[str] = []
+    dual_sample_lines: list[str] = []
 
     # Fetch members for correctness (cache can be partial on large guilds).
     try:
@@ -14314,11 +14319,21 @@ async def future_member_audit(ctx):
                     pass
                 continue
             role_ids = {r.id for r in (m.roles or [])}
-            if member_role_id in role_ids:
+            has_m = member_role_id in role_ids
+            has_f = future_role_id in role_ids
+            if has_m and has_f:
+                has_member += 1
+                has_member_and_future += 1
+                if len(dual_sample_lines) < 20:
+                    disp = str(getattr(m, "display_name", "") or "").strip() or str(getattr(m, "name", "") or "").strip() or f"user_{int(m.id)}"
+                    disp = disp.replace("\n", " ").strip()
+                    dual_sample_lines.append(f"- {m.mention} {disp} ({_plain_user(m)}) • `{m.id}`")
+                continue
+            if has_m:
                 has_member += 1
                 continue
             missing_member += 1
-            if future_role_id in role_ids:
+            if has_f:
                 already_future += 1
                 continue
             candidates.append(int(m.id))
@@ -14339,6 +14354,7 @@ async def future_member_audit(ctx):
         "staff_skipped": staff_skipped,
         "missing_member": missing_member,
         "already_future": already_future,
+        "has_member_and_future": has_member_and_future,
         "candidates": len(candidates),
     }
 
@@ -14346,9 +14362,10 @@ async def future_member_audit(ctx):
         title="Future Member Audit — preview",
         description=(
             "This will add the Future Member role to members who are missing the Member role.\n"
+            "Members with **both** Member and Future Member are listed for review only (Confirm does not remove Future Member from them).\n"
             "No changes happen until Confirm."
         ),
-        color=0xFEE75C if candidates else 0x5865F2,
+        color=0xFEE75C if (candidates or has_member_and_future) else 0x5865F2,
         timestamp=datetime.now(timezone.utc),
     )
     e.add_field(name="Member role", value=_fmt_role(member_role_id, guild), inline=False)
@@ -14360,11 +14377,16 @@ async def future_member_audit(ctx):
     e.add_field(name="Skipped (staff role)", value=str(staff_role_skipped), inline=True)
     e.add_field(name="Missing Member role", value=str(missing_member), inline=True)
     e.add_field(name="Already has Future role", value=str(already_future), inline=True)
+    e.add_field(name="Member + Future (both)", value=str(has_member_and_future), inline=True)
     e.add_field(name="Will add Future role to", value=str(len(candidates)), inline=True)
     sample_txt = "\n".join(sample_lines) if sample_lines else "—"
     if len(candidates) > len(sample_lines):
         sample_txt += f"\n… and {len(candidates) - len(sample_lines)} more"
-    e.add_field(name="Sample", value=sample_txt[:1024], inline=False)
+    e.add_field(name="Sample (will add Future)", value=sample_txt[:1024], inline=False)
+    dual_txt = "\n".join(dual_sample_lines) if dual_sample_lines else "—"
+    if has_member_and_future > len(dual_sample_lines):
+        dual_txt += f"\n… and {has_member_and_future - len(dual_sample_lines)} more"
+    e.add_field(name="Sample (Member + Future — review only)", value=dual_txt[:1024], inline=False)
     e.set_footer(text="RSCheckerbot • futurememberaudit")
 
     view = _FutureMemberAuditView(

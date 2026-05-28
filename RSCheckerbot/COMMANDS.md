@@ -231,7 +231,7 @@ RSOnboarding never removes the Member role.
 - **Note**: Command message is auto-deleted
 
 #### `.checker futurememberaudit`
-- **Description**: Scan Discord members missing the Member role and (after an explicit confirmation in `member-status-logs`) add the Future Member role
+- **Description**: Scan Discord members missing the Member role and (after an explicit confirmation in `member-status-logs`) add the Future Member role. Preview also reports members who have **both** Member and Future Member at the same time (report-only; Confirm does not remove Future Member from them).
 - **Aliases**: `futureaudit`, `auditfuture`
 - **Parameters**: None
 - **Usage**: `.checker futurememberaudit`
@@ -240,7 +240,8 @@ RSOnboarding never removes the Member role.
 - **Notes**:
   - Role IDs come from `config.json` (`dm_sequence.role_cancel_a` = Member role, `dm_sequence.role_to_assign` = Future Member role)
   - Staff/admins are skipped (administrator/manage-guild/manage-roles permissions) and members with any role listed in `config.json -> future_member_audit.exclude_role_ids`
-  - Sample list includes clickable member mentions (WILL ping) and also shows plain `@username` text
+  - Preview fields include **Member + Future (both)** count plus a **Sample (Member + Future — review only)** list (up to 20 members; may ping)
+  - Sample list for Future adds includes clickable member mentions (WILL ping) and also shows plain `@username` text
   - No roles are ever mentioned (no `<@&...>`); output is plain text names + IDs
 
 ### Direct Message Controls
