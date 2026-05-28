@@ -3723,8 +3723,49 @@ class RSAdminBot:
             except Exception:
                 pass
 
+            async def _archive_webhook_send(
+                *,
+                content: str,
+                embeds: Optional[List[discord.Embed]],
+                files: Optional[List[discord.File]],
+                username: str,
+                avatar_url: Optional[str],
+            ) -> None:
+                """Webhook execute: never mix files + embeds (Discord 400)."""
+                wh_kw: Dict[str, Any] = {
+                    "username": username[:80] if username else None,
+                    "allowed_mentions": discord.AllowedMentions.none(),
+                    "thread": thread,
+                }
+                if avatar_url:
+                    wh_kw["avatar_url"] = avatar_url
+                body = (content or "").strip()
+                emb = list(embeds or [])[:10]
+                fl = list(files or [])[:10]
+                if not body and not emb and not fl:
+                    body = "\u200b"
+                if fl and emb:
+                    await webhook.send(
+                        content=body[:2000] if body else "\u200b",
+                        embeds=emb,
+                        **wh_kw,
+                    )
+                    await webhook.send(
+                        content=None,
+                        files=fl,
+                        **wh_kw,
+                    )
+                    return
+                await webhook.send(
+                    content=body[:2000] if body else None,
+                    embeds=emb if emb else None,
+                    files=fl if fl else None,
+                    **wh_kw,
+                )
+
             replayed = 0
             failed = 0
+            fail_samples: List[str] = []
             # Replay oldest -> newest so the thread reads naturally.
             async for msg in src.history(limit=None, oldest_first=True):
                 try:
@@ -3742,9 +3783,12 @@ class RSAdminBot:
                     embeds_to_send: List[discord.Embed] = []
                     for e in (msg.embeds or [])[:6]:
                         try:
-                            embeds_to_send.append(e)
+                            embeds_to_send.append(discord.Embed.from_dict(e.to_dict()))
                         except Exception:
-                            pass
+                            try:
+                                embeds_to_send.append(e)
+                            except Exception:
+                                pass
 
                     file_links: List[str] = []
                     image_urls: List[str] = []
@@ -3756,7 +3800,6 @@ class RSAdminBot:
                             (".png", ".jpg", ".jpeg", ".gif", ".webp")
                         )
                         if is_img:
-                            # Prefer re-uploading the image into the archive thread so it always renders.
                             try:
                                 image_files.append(await att.to_file())
                             except Exception:
@@ -3781,18 +3824,20 @@ class RSAdminBot:
                     if msg.reference and msg.reference.message_id:
                         content = f"↪️ *replying to message ID {msg.reference.message_id}*\n" + content
 
-                    await webhook.send(
+                    await _archive_webhook_send(
                         content=content,
+                        embeds=embeds_to_send,
+                        files=image_files,
                         username=author_name,
                         avatar_url=avatar_url,
-                        embeds=embeds_to_send[:10] if embeds_to_send else None,
-                        files=image_files[:10] if image_files else None,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                        thread=thread,
                     )
                     replayed += 1
-                except Exception:
+                except Exception as e:
                     failed += 1
+                    if len(fail_samples) < 5:
+                        fail_samples.append(
+                            f"- msg `{msg.id}`: {type(e).__name__}: {str(e)[:220]}"
+                        )
                 if delay_ms:
                     await asyncio.sleep(delay_ms / 1000.0)
                 if replayed and replayed % 100 == 0:
@@ -3801,12 +3846,16 @@ class RSAdminBot:
                     except Exception:
                         pass
 
+            done_desc = f"Replayed: **{replayed}**\nFailed: **{failed}**"
+            if fail_samples:
+                done_desc += "\n\n**First failures:**\n" + "\n".join(fail_samples)
+            done_color = discord.Color.green() if failed == 0 else discord.Color.orange()
             try:
                 await thread.send(
                     embed=discord.Embed(
-                        title="✅ Mirror archive completed",
-                        description=f"Replayed: **{replayed}**\nFailed: **{failed}**",
-                        color=discord.Color.green(),
+                        title="✅ Mirror archive completed" if failed == 0 else "⚠️ Mirror archive completed (with errors)",
+                        description=done_desc[:4000],
+                        color=done_color,
                         timestamp=discord.utils.utcnow(),
                     )
                 )
