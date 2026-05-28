@@ -3733,35 +3733,35 @@ class RSAdminBot:
             ) -> None:
                 """Webhook execute: never mix files + embeds (Discord 400)."""
                 wh_kw: Dict[str, Any] = {
-                    "username": username[:80] if username else None,
+                    "username": (username[:80] if username else "Unknown"),
                     "allowed_mentions": discord.AllowedMentions.none(),
                     "thread": thread,
                 }
                 if avatar_url:
                     wh_kw["avatar_url"] = avatar_url
-                body = (content or "").strip()
+                body = (content or "").strip()[:2000]
                 emb = list(embeds or [])[:10]
                 fl = list(files or [])[:10]
                 if not body and not emb and not fl:
                     body = "\u200b"
+
+                def _wh_payload(*, text: str, emb_list: List[discord.Embed], file_list: List[discord.File]) -> Dict[str, Any]:
+                    # discord.py calls len(content) and iterates embeds — never pass None.
+                    payload: Dict[str, Any] = {
+                        **wh_kw,
+                        "content": text if text else "\u200b",
+                    }
+                    if emb_list:
+                        payload["embeds"] = emb_list
+                    if file_list:
+                        payload["files"] = file_list
+                    return payload
+
                 if fl and emb:
-                    await webhook.send(
-                        content=body[:2000] if body else "\u200b",
-                        embeds=emb,
-                        **wh_kw,
-                    )
-                    await webhook.send(
-                        content=None,
-                        files=fl,
-                        **wh_kw,
-                    )
+                    await webhook.send(**_wh_payload(text=body, emb_list=emb, file_list=[]))
+                    await webhook.send(**_wh_payload(text="\u200b", emb_list=[], file_list=fl))
                     return
-                await webhook.send(
-                    content=body[:2000] if body else None,
-                    embeds=emb if emb else None,
-                    files=fl if fl else None,
-                    **wh_kw,
-                )
+                await webhook.send(**_wh_payload(text=body, emb_list=emb, file_list=fl))
 
             replayed = 0
             failed = 0

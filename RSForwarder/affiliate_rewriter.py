@@ -25,6 +25,10 @@ Mavely short links (`mavely.app.link`) are not bit.ly-style “pure redirects”
 aiohttp HTML unwrap here; `mavely_client.py` creates new links via GraphQL and does not unwrap HTML.
 If GraphQL rejects the app.link host, we optionally call create_link once with the expanded hub URL
 (`MAVELY_GRAPHQL_BRIDGE_FALLBACK`, default on).
+
+When affiliate/Mavely cannot produce a link, `affiliate_keep_original_on_fail` (default true) leaves the
+message URL unchanged (no Skim/bizrate pass-through). Redirectors are detected by host keywords + env
+`AUTO_AFFILIATE_EXPAND_HOSTS`, not only a fixed shortener list.
 """
 
 from __future__ import annotations
@@ -1244,17 +1248,82 @@ def _expand_hosts_from_env() -> set:
     return hosts
 
 
-def should_expand_url(url: str) -> bool:
-    try:
-        host = (urlparse(url).netloc or "").lower()
-    except Exception:
-        return False
-    if not host:
-        return False
-    env_hosts = _expand_hosts_from_env()
-    if host in env_hosts:
-        return True
-    common = {
+# Redirector / tracker hosts (canonical for expand eligibility). Keyword match catches many
+# networks without adding every shortener to a fixed list (same idea as universal_link_resolver).
+_COMMON_QUERY_REDIRECT_KEYS: Tuple[str, ...] = (
+    "url",
+    "u",
+    "uri",
+    "target",
+    "dest",
+    "destination",
+    "redirect",
+    "redirect_url",
+    "returnUrl",
+    "return_url",
+    "merchant_url",
+    "out",
+    "to",
+    "r",
+    "q",
+    "link",
+    "href",
+    "t",
+    "l",
+    "product",
+    "murl",
+    "deep_link_value",
+    "fallback_url",
+    "canonical_url",
+    "redirectUrl",
+    "clickurl",
+    "adurl",
+    "camp",
+)
+
+_REDIRECTOR_KEYWORDS: Tuple[str, ...] = (
+    "mavely",
+    "app.link",
+    "branch",
+    "bit.ly",
+    "tinyurl",
+    "skimlinks",
+    "skimresources",
+    "sylikes",
+    "bizrate",
+    "linksynergy",
+    "impact.com",
+    "impactradius",
+    "rakuten",
+    "shareasale",
+    "anrdoezrs",
+    "tkqlhce",
+    "dpbolvw",
+    "redirectingat",
+    "awin1",
+    "shop-links",
+    "pricedoffers",
+    "joylink",
+    "dealshacks",
+    "howl.",
+    "pennyexplorer",
+    "dealsabove",
+    "trackcm",
+    "fkd.deals",
+    "ringinthedeals",
+    "dmflip",
+    "rebrand.ly",
+    "cutt.ly",
+    "rb.gy",
+    "is.gd",
+    "linktr.ee",
+    "walmrt.us",
+    "viglink",
+    "sovrn",
+)
+
+_REDIRECTOR_EXACT_HOSTS: frozenset = frozenset(
+    {
         "dealshacks.com",
         "www.dealshacks.com",
         "bit.ly",
@@ -1273,11 +1342,11 @@ def should_expand_url(url: str) -> bool:
         "a.co",
         "www.a.co",
         "mavely.app.link",
+        "www.mavely.app.link",
         "mavelyinfluencer.com",
         "www.mavelyinfluencer.com",
         "mavelylife.com",
         "www.mavelylife.com",
-        # Redirect chains seen from go.sylikes.com -> rd.bizrate.com -> go.skimresources.com -> merchant
         "go.sylikes.com",
         "rd.bizrate.com",
         "go.skimresources.com",
@@ -1292,8 +1361,147 @@ def should_expand_url(url: str) -> bool:
         "fkd.deals",
         "ringinthedeals.com",
         "dmflip.com",
+        "joinmavely.com",
+        "www.joinmavely.com",
     }
-    return host in common
+)
+
+
+def _affiliate_host(url: str) -> str:
+    try:
+        return (urlparse(url).netloc or "").lower()
+    except Exception:
+        return ""
+
+
+def _host_matches_keyword(host: str, keyword: str) -> bool:
+    host = (host or "").lower()
+    keyword = (keyword or "").lower()
+    if not host or not keyword:
+        return False
+    return host == keyword or host.endswith("." + keyword) or keyword in host
+
+
+def is_redirector_host(host: str) -> bool:
+    h = (host or "").strip().lower()
+    if not h:
+        return False
+    if h in _REDIRECTOR_EXACT_HOSTS:
+        return True
+    return any(_host_matches_keyword(h, kw) for kw in _REDIRECTOR_KEYWORDS)
+
+
+def _looks_like_http_url(url: str) -> bool:
+    u = (url or "").strip()
+    if not u.startswith(("http://", "https://")):
+        return False
+    try:
+        p = urlparse(u)
+        host = (p.netloc or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return bool(host) and "." in host and len(host) <= 200
+    except Exception:
+        return False
+
+
+def _pick_best_unwrap_candidate(candidates: List[str]) -> Optional[str]:
+    if not candidates:
+        return None
+    ranked: List[Tuple[int, str]] = []
+    for c in candidates:
+        if not _looks_like_http_url(c):
+            continue
+        h = _affiliate_host(c)
+        score = int(_score_merchant_outbound_url(c))
+        if is_redirector_host(h):
+            score -= 40
+        else:
+            score += 35
+        ranked.append((score, c))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return ranked[0][1]
+
+
+def extract_generic_url_from_query(url: str) -> Optional[str]:
+    """Generic query-param unwrap after host-specific rules in unwrap_known_query_redirects."""
+    u = (url or "").strip()
+    if not u:
+        return None
+    try:
+        qs = dict(parse_qsl(urlparse(u).query, keep_blank_values=True))
+    except Exception:
+        return None
+    candidates: List[str] = []
+    for key in _COMMON_QUERY_REDIRECT_KEYS:
+        cand = (qs.get(key) or "").strip()
+        if not cand:
+            continue
+        for _ in range(4):
+            nxt = unquote(cand)
+            if nxt == cand:
+                break
+            cand = nxt
+        if _looks_like_http_url(cand):
+            candidates.append(cand)
+    for val in qs.values():
+        for m in re.findall(r"https?://[^\s\"'<>\\]+", str(val or "")):
+            c = (m or "").strip().strip("'\"").rstrip("),;]")
+            if _looks_like_http_url(c):
+                candidates.append(c)
+    return _pick_best_unwrap_candidate(candidates)
+
+
+def _unwrap_one_step(url: str) -> Optional[str]:
+    u = (url or "").strip()
+    if not u:
+        return None
+    cand = unwrap_known_query_redirects(u)
+    if cand and cand != u:
+        return cand
+    cand = extract_generic_url_from_query(u)
+    if cand and cand != u:
+        return cand
+    return None
+
+
+def _iterative_resolve_unwrap(url: str, *, max_steps: int = 8) -> str:
+    """Repeatedly peel query/embed redirects until stable (Skim -> merchant, etc.)."""
+    current = (url or "").strip()
+    if not current:
+        return current
+    for _ in range(max(1, int(max_steps))):
+        nxt = _unwrap_one_step(current)
+        if not nxt or nxt == current:
+            break
+        if _is_cloudflare_or_cdn_error_landing(nxt):
+            break
+        current = nxt
+    return current
+
+
+def _keep_original_on_affiliate_fail(cfg: Optional[dict]) -> bool:
+    """When True (default), failed affiliate/Mavely does not replace the message URL."""
+    return _bool_or_default((cfg or {}).get("affiliate_keep_original_on_fail"), True)
+
+
+def _affiliate_passthrough_url(raw: str, resolved_target: str, cfg: Optional[dict]) -> str:
+    """URL to show when we resolved but did not produce our affiliate link."""
+    r = (raw or "").strip()
+    if _keep_original_on_affiliate_fail(cfg) and r:
+        return r
+    return _strip_tracking_params(resolved_target) or resolved_target or r
+
+
+def should_expand_url(url: str) -> bool:
+    host = _affiliate_host(url)
+    if not host:
+        return False
+    if host in _expand_hosts_from_env():
+        return True
+    return is_redirector_host(host)
 
 
 def unwrap_known_query_redirects(url: str) -> Optional[str]:
@@ -1572,6 +1780,50 @@ async def expand_url(session: aiohttp.ClientSession, url: str, *, timeout_s: flo
         return _normalize_expanded_url(final or u)
     except Exception:
         return u
+
+
+async def _http_expand_resolve_url(
+    session: aiohttp.ClientSession,
+    start_u: str,
+    *,
+    timeout_s: float,
+    max_redirects: int,
+    dbg_chain: Optional[List[str]] = None,
+) -> str:
+    """
+    HTTP redirect follow + iterative query unwrap until stable or no longer a redirector.
+  """
+    current = _iterative_resolve_unwrap((start_u or "").strip())
+    if dbg_chain is not None and (not dbg_chain or dbg_chain[-1] != current):
+        dbg_chain.append(current)
+    for _outer in range(6):
+        if not should_expand_url(current):
+            break
+        hop = current
+        final_u = await expand_url(session, hop, timeout_s=timeout_s, max_redirects=max_redirects)
+        if _is_cloudflare_or_cdn_error_landing(final_u):
+            final_u = hop
+        else:
+            for _chain in range(4):
+                if not should_expand_url(final_u):
+                    break
+                nxt = await expand_url(session, final_u, timeout_s=timeout_s, max_redirects=max_redirects)
+                if _is_cloudflare_or_cdn_error_landing(nxt) or not nxt or nxt == final_u:
+                    break
+                final_u = nxt
+                if dbg_chain is not None:
+                    dbg_chain.append(final_u)
+            final_u = _normalize_expanded_url(final_u)
+        unwrapped = _iterative_resolve_unwrap(final_u)
+        if dbg_chain is not None and unwrapped != (dbg_chain[-1] if dbg_chain else ""):
+            dbg_chain.append(unwrapped)
+        if unwrapped == current and not should_expand_url(unwrapped):
+            current = unwrapped
+            break
+        current = unwrapped
+        if not should_expand_url(current):
+            break
+    return current
 
 
 def _mavely_cookie_file_path() -> Path:
@@ -2008,14 +2260,14 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
     resolved: Dict[str, str] = {u: normalized.get(u) or u for u in candidates}
 
     for u in candidates:
-        cand = unwrap_known_query_redirects(resolved.get(u) or u)
-        if cand:
+        before = (resolved.get(u) or u).strip()
+        after = _iterative_resolve_unwrap(before)
+        if after != before:
             _aff_dbg_verbose(
                 cfg,
-                "  query_unwrap %r -> %r"
-                % (_aff_dbg_clip(resolved.get(u) or u, 88), _aff_dbg_clip(cand, 88)),
+                "  query_unwrap %r -> %r" % (_aff_dbg_clip(before, 88), _aff_dbg_clip(after, 88)),
             )
-            resolved[u] = cand
+        resolved[u] = after
 
     if expand_enabled:
         _apply_env_from_cfg(cfg)
@@ -2027,29 +2279,13 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                     [start_u] if affiliate_rewrite_debug_on(cfg) and affiliate_rewrite_debug_verbose_on(cfg) else None
                 )
                 if should_expand_url(start_u):
-                    final_u = await expand_url(session, start_u, timeout_s=timeout_s, max_redirects=max_redirects)
-                    # Mavely / App Links sometimes 302 to Cloudflare's generic 5xx page when origin fails.
-                    if _is_cloudflare_or_cdn_error_landing(final_u):
-                        if dbg_chain is not None:
-                            _aff_dbg_verbose(
-                                cfg,
-                                "  expand %r: cloudflare/cdn error landing; reverting to pre-expand" % _aff_dbg_clip(u, 72),
-                            )
-                        final_u = start_u
-                    if dbg_chain is not None and final_u != dbg_chain[-1]:
-                        dbg_chain.append(final_u)
-                    # Chain-expand: redirect stacks often land on another shortener first (e.g. bit.ly -> amzn.to).
-                    for _chain in range(4):
-                        if not should_expand_url(final_u):
-                            break
-                        nxt = await expand_url(session, final_u, timeout_s=timeout_s, max_redirects=max_redirects)
-                        if _is_cloudflare_or_cdn_error_landing(nxt):
-                            break
-                        if not nxt or nxt == final_u:
-                            break
-                        final_u = nxt
-                        if dbg_chain is not None:
-                            dbg_chain.append(final_u)
+                    final_u = await _http_expand_resolve_url(
+                        session,
+                        start_u,
+                        timeout_s=timeout_s,
+                        max_redirects=max_redirects,
+                        dbg_chain=dbg_chain,
+                    )
                     resolved[u] = final_u
                     if dbg_chain is not None and len(dbg_chain) > 1:
                         _aff_dbg_verbose(
@@ -2063,12 +2299,6 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                             "  expand %r: single hop (no further shortener chain) -> %r"
                             % (_aff_dbg_clip(u, 72), _aff_dbg_clip(final_u, 88)),
                         )
-
-                    cand2 = unwrap_known_query_redirects(final_u)
-                    if cand2:
-                        if not _is_cloudflare_or_cdn_error_landing(cand2):
-                            resolved[u] = cand2
-                            final_u = cand2
 
                     special_html_hosts = {
                         "deals.pennyexplorer.com",
@@ -2129,7 +2359,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                 out_abs_m = out_m
                                 if out_abs_m.startswith("/"):
                                     out_abs_m = urljoin(try_u, out_abs_m)
-                                out_abs_m = unwrap_known_query_redirects(out_abs_m) or out_abs_m
+                                out_abs_m = _iterative_resolve_unwrap(unwrap_known_query_redirects(out_abs_m) or out_abs_m)
                                 candidate = out_abs_m
                                 if affiliate_rewrite_debug_verbose_on(cfg):
                                     _aff_dbg_verbose(
@@ -2162,7 +2392,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                             out_abs = out
                             if out_abs.startswith("/"):
                                 out_abs = urljoin(candidate, out_abs)
-                            out_abs = unwrap_known_query_redirects(out_abs) or out_abs
+                            out_abs = _iterative_resolve_unwrap(unwrap_known_query_redirects(out_abs) or out_abs)
                             candidate = out_abs
                             _aff_dbg_verbose(
                                 cfg,
@@ -2211,7 +2441,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                                 flush=True,
                             )
                         if pw_out:
-                            cand_pw = unwrap_known_query_redirects(pw_out) or pw_out
+                            cand_pw = _iterative_resolve_unwrap(unwrap_known_query_redirects(pw_out) or pw_out)
                             if _affiliate_merchant_resolution_acceptable(cand_pw):
                                 candidate = cand_pw
                                 if flow_on:
@@ -2252,8 +2482,8 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
             host = ""
         if host and _host_matches_skip(host):
             if target and (target != raw):
-                mapped[u] = target
-                notes[u] = "expanded only (marketplace skipped)"
+                mapped[u] = _affiliate_passthrough_url(raw, target, cfg)
+                notes[u] = "marketplace skipped; kept original link"
             else:
                 notes[u] = "marketplace skipped"
             continue
@@ -2378,12 +2608,16 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
                 else:
                     notes[u] = "mavely failed; not forwarding intermediate Mavely URL as fallback"
             else:
-                mapped[u] = _strip_tracking_params(target) or target
+                mapped[u] = _affiliate_passthrough_url(raw, target, cfg)
                 if _is_mavely_unsupported(err):
-                    notes[u] = "expanded only (merchant not supported by Mavely)"
+                    notes[u] = "expanded only (merchant not supported by Mavely); kept original link"
                 else:
                     reason = _aff_short_err(err)
-                    notes[u] = f"expanded only (mavely failed: {reason})" if reason else "expanded only"
+                    notes[u] = (
+                        f"expanded only (mavely failed: {reason}); kept original link"
+                        if reason
+                        else "expanded only; kept original link"
+                    )
         else:
             if _is_mavely_unsupported(err):
                 notes[u] = "merchant not supported by Mavely"
