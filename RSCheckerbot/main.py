@@ -11137,6 +11137,15 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     if roles_added or roles_removed:
         asyncio.create_task(log_role_audit(after, roles_added, roles_removed))
 
+    if LIFETIME_ROLE_IDS and roles_added.intersection(LIFETIME_ROLE_IDS):
+        with suppress(Exception):
+            n_closed = await support_tickets.close_support_tickets_if_lifetime_member(after)
+        if n_closed and log_other:
+            with suppress(Exception):
+                await log_other(
+                    f"⏭️ **Support tickets closed** for {_fmt_user(after)} — lifetime role added (closed={int(n_closed)})"
+                )
+
     # When Welcome role is added, log to join-logs (canonical channel 1144408172757536768) so it appears there.
     if (
         not suppress_logs

@@ -270,10 +270,10 @@
   }
   ,
   "support_tickets": {
-    "_comment": "Discord-native Support CRM tickets (main RS server for now). All IDs are config-driven.",
+    "_comment": "Discord-native Support CRM tickets (main RS server for now). All IDs are config-driven. Members with dm_sequence.lifetime_role_ids never get support tickets opened (billing/cancellation/free_pass/no_whop_link/member_welcome); any open tickets are closed when automation would open one.",
     "guild_id": 876528050081251379,
     "cancellation": {
-      "_comment_min_total_spent_usd": "Guard: do not open cancellation tickets unless Total Spent (lifetime) >= this amount. Lifetime-role members are always excluded separately.",
+      "_comment_min_total_spent_usd": "Guard: do not open cancellation tickets unless Total Spent (lifetime) >= this amount. Lifetime-role members are excluded for all ticket types via _open_or_update_ticket.",
       "min_total_spent_usd": 30.0
     },
     "permissions": {

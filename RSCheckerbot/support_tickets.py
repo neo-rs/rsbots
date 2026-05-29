@@ -4162,6 +4162,66 @@ def _ticket_find_open(
     return None
 
 
+def _member_has_lifetime_role(member: discord.Member) -> bool:
+    """True when the member has any role ID from dm_sequence.lifetime_role_ids (config)."""
+    cfg = _cfg()
+    if not cfg or not isinstance(member, discord.Member):
+        return False
+    try:
+        life_ids = {int(x) for x in (cfg.lifetime_role_ids or []) if int(x) > 0}
+    except Exception:
+        life_ids = set()
+    if not life_ids:
+        return False
+    try:
+        return any(int(getattr(r, "id", 0) or 0) in life_ids for r in (getattr(member, "roles", None) or []))
+    except Exception:
+        return False
+
+
+async def _close_all_open_support_tickets_for_user(
+    *,
+    member: discord.Member,
+    close_reason: str,
+) -> int:
+    """Close every OPEN support ticket for this Discord user (best-effort)."""
+    if not _ensure_cfg_loaded() or not isinstance(member, discord.Member):
+        return 0
+    uid = int(member.id or 0)
+    if uid <= 0:
+        return 0
+    ch_ids: list[int] = []
+    async with _INDEX_LOCK:
+        db = _index_load()
+        for _tid, rec in _ticket_iter(db):
+            if not _ticket_is_open(rec):
+                continue
+            if _as_int(rec.get("user_id")) != uid:
+                continue
+            ch_id = _as_int(rec.get("channel_id"))
+            if ch_id > 0:
+                ch_ids.append(int(ch_id))
+    closed = 0
+    reason = str(close_reason or "lifetime_member").strip() or "lifetime_member"
+    for ch_id in sorted(set(ch_ids)):
+        with suppress(Exception):
+            if await close_ticket_by_channel_id(
+                int(ch_id),
+                close_reason=reason,
+                do_transcript=True,
+                delete_channel=True,
+            ):
+                closed += 1
+    return closed
+
+
+async def close_support_tickets_if_lifetime_member(member: discord.Member) -> int:
+    """Close all OPEN support tickets when the member has a lifetime role (returns count closed)."""
+    if not _member_has_lifetime_role(member):
+        return 0
+    return await _close_all_open_support_tickets_for_user(member=member, close_reason="lifetime_member")
+
+
 async def _open_or_update_ticket(
     *,
     ticket_type: str,
@@ -4180,6 +4240,19 @@ async def _open_or_update_ticket(
     if not cfg or not _BOT:
         return None
     if not isinstance(owner, discord.Member):
+        return None
+    if _member_has_lifetime_role(owner):
+        n_closed = 0
+        with suppress(Exception):
+            n_closed = await _close_all_open_support_tickets_for_user(
+                member=owner,
+                close_reason="lifetime_member",
+            )
+        with suppress(Exception):
+            await _log(
+                f"⏭️ support_tickets: skipped {str(ticket_type or '').strip().lower()} ticket for user_id={int(owner.id)} "
+                f"(lifetime role; closed_open={int(n_closed)})"
+            )
         return None
     if int(category_id or 0) <= 0:
         await _log(f"⚠️ support_tickets: category_id is not configured for type={ticket_type}")
@@ -5078,17 +5151,6 @@ async def open_cancellation_ticket(
     cfg = _cfg()
     if not cfg:
         return None
-    # Lifetime members: never open cancellation tickets (explicit operator rule).
-    try:
-        life_ids = set(int(x) for x in (cfg.lifetime_role_ids or []) if int(x) > 0)
-    except Exception:
-        life_ids = set()
-    if life_ids:
-        try:
-            if any(int(getattr(r, "id", 0) or 0) in life_ids for r in (getattr(member, "roles", None) or [])):
-                return None
-        except Exception:
-            pass
     if _is_lite_membership(whop_brief):
         return None
     # Spend guard: apply only for cancellation_scheduled (trial cancels / $0 spend noise).
