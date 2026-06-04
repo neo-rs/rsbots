@@ -12,7 +12,7 @@ import os
 import sys
 import json
 from pathlib import Path
-from typing import Any, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 # Type alias to avoid deep nesting that can trigger SyntaxError on older Python
 _MonitorEntry = Tuple[int, str, Optional[Any]]
@@ -31,6 +31,9 @@ from mirror_world_config import is_placeholder_secret, mask_secret
 
 # Max buttons per Discord message (5 rows x 5)
 MONITOR_BUTTONS_PER_VIEW = 25
+MONITOR_ROLE_PREFIX = "Monitor | "
+MONITOR_GRANULARITY_CATEGORY = "category"
+MONITOR_GRANULARITY_CHANNEL = "channel"
 
 # Colors for terminal
 class Colors:
@@ -102,7 +105,70 @@ class RSMentionPinger:
         if not mr or not mr.get("picker_channel_id"):
             return None
         return mr
-    
+
+    def _monitor_granularity(self, mr: dict) -> str:
+        """category = one role/button per config category; channel = one per text channel (legacy)."""
+        g = (mr.get("granularity") or MONITOR_GRANULARITY_CATEGORY).strip().lower()
+        if g == MONITOR_GRANULARITY_CHANNEL:
+            return MONITOR_GRANULARITY_CHANNEL
+        return MONITOR_GRANULARITY_CATEGORY
+
+    @staticmethod
+    def _category_monitor_role_name(cat_title: str) -> str:
+        name = f"{MONITOR_ROLE_PREFIX}{cat_title}".strip()
+        return name[:100]
+
+    @staticmethod
+    def _channel_monitor_role_name(channel_name: str) -> str:
+        name = f"{MONITOR_ROLE_PREFIX}{channel_name}".strip()
+        return name[:100]
+
+    def _iter_monitor_category_configs(
+        self, guild: discord.Guild, mr: dict
+    ) -> Iterator[Tuple[discord.CategoryChannel, str, Set[int], Optional[Any]]]:
+        """Yield (category, title, excluded_channel_ids, button_emoji) for each valid categories entry."""
+        for cat_cfg in mr.get("categories") or []:
+            if isinstance(cat_cfg, dict):
+                cat_id = cat_cfg.get("id")
+                cat_title = str(cat_cfg.get("title") or "Monitor channels").strip()
+                emoji = cat_cfg.get("emoji")
+                excluded_ids: Set[int] = set()
+                for cid in cat_cfg.get("excluded_channel_ids") or []:
+                    excluded_ids.add(int(cid))
+            else:
+                cat_id = cat_cfg
+                cat_title = "Monitor channels"
+                emoji = None
+                excluded_ids = set()
+            if not cat_id:
+                continue
+            category = guild.get_channel(int(cat_id))
+            if not category or not isinstance(category, discord.CategoryChannel):
+                continue
+            yield category, cat_title, excluded_ids, emoji
+
+    def _iter_monitor_text_channels(
+        self, category: discord.CategoryChannel, excluded_ids: Set[int]
+    ) -> Iterator[discord.TextChannel]:
+        for ch in category.text_channels:
+            if ch.id not in excluded_ids:
+                yield ch
+
+    async def _apply_monitor_channel_overwrites(
+        self,
+        ch: discord.TextChannel,
+        access_role: discord.Role,
+        members_role: Optional[discord.Role],
+    ) -> None:
+        await ch.set_permissions(ch.guild.default_role, view_channel=False)
+        if members_role:
+            await ch.set_permissions(members_role, view_channel=False)
+        await ch.set_permissions(
+            access_role,
+            view_channel=True,
+            read_message_history=True,
+        )
+
     def _channel_display_name(self, ch_name: str) -> str:
         """Human-readable label from channel name; strip -monitor, use config map or heuristic."""
         mr = self._monitor_roles_config()
@@ -137,28 +203,22 @@ class RSMentionPinger:
             return []
         entries_cfg = mr.get("entries")
         if entries_cfg:
-            flat: List[_MonitorEntry] = [(int(e["role_id"]), e.get("label") or str(e.get("role_id", "")), None) for e in entries_cfg]
+            flat: List[_MonitorEntry] = [
+                (int(e["role_id"]), e.get("label") or str(e.get("role_id", "")), None) for e in entries_cfg
+            ]
             return [("Monitor channels", flat)]
-        categories_cfg = mr.get("categories") or []
+        granularity = self._monitor_granularity(mr)
         out: _MonitorEntriesByCategory = []
-        for cat_cfg in categories_cfg:
-            cat_id = cat_cfg.get("id") if isinstance(cat_cfg, dict) else cat_cfg
-            if not cat_id:
-                continue
-            cat_title = cat_cfg.get("title", "Monitor channels") if isinstance(cat_cfg, dict) else "Monitor channels"
-            excluded_ids: Set[int] = set()
-            if isinstance(cat_cfg, dict):
-                for cid in cat_cfg.get("excluded_channel_ids") or []:
-                    excluded_ids.add(int(cid))
-            category = guild.get_channel(int(cat_id))
-            if not category or not isinstance(category, discord.CategoryChannel):
+        for category, cat_title, excluded_ids, cat_emoji in self._iter_monitor_category_configs(guild, mr):
+            if granularity == MONITOR_GRANULARITY_CATEGORY:
+                role_name = self._category_monitor_role_name(cat_title)
+                role = discord.utils.get(guild.roles, name=role_name)
+                if role:
+                    out.append((cat_title, [(role.id, cat_title, cat_emoji)]))
                 continue
             cat_entries: List[_MonitorEntry] = []
-            for ch in category.text_channels:
-                if ch.id in excluded_ids:
-                    continue
-                role_name = f"Monitor | {ch.name}"
-                role = discord.utils.get(guild.roles, name=role_name)
+            for ch in self._iter_monitor_text_channels(category, excluded_ids):
+                role = discord.utils.get(guild.roles, name=self._channel_monitor_role_name(ch.name))
                 if role:
                     label = self._channel_display_name(ch.name)
                     emoji = self._resolve_button_emoji(guild, ch.name)
@@ -172,48 +232,118 @@ class RSMentionPinger:
         by_cat = self._build_monitor_entries_by_category(guild)
         return [e for _, entries in by_cat for e in entries]
     
+    async def _get_or_create_monitor_role(
+        self, guild: discord.Guild, role_name: str, *, reason: str
+    ) -> Optional[discord.Role]:
+        role = discord.utils.get(guild.roles, name=role_name)
+        if role:
+            return role
+        try:
+            role = await guild.create_role(
+                name=role_name,
+                permissions=discord.Permissions.none(),
+                reason=reason,
+            )
+            print(f"{Colors.GREEN}[MonitorRoles] Created role: {role.name}{Colors.RESET}")
+            return role
+        except Exception as e:
+            print(f"{Colors.RED}[MonitorRoles] Failed to create role {role_name}: {e}{Colors.RESET}")
+            return None
+
     async def _ensure_monitor_roles_and_overwrites(self, guild: discord.Guild) -> None:
-        """Create missing 'Monitor | channel' roles and set channel overwrites. Members role gets no view by default."""
+        """Create monitor roles and channel overwrites (per category or per channel per granularity)."""
         mr = self._monitor_roles_config()
-        if not mr:
+        if not mr or mr.get("entries"):
             return
         members_role_id = mr.get("members_role_id")
         members_role = guild.get_role(int(members_role_id)) if members_role_id else None
-        categories_cfg = mr.get("categories") or []
-        for cat_cfg in categories_cfg:
-            cat_id = cat_cfg.get("id") if isinstance(cat_cfg, dict) else cat_cfg
-            if not cat_id:
-                continue
-            excluded_ids: Set[int] = set()
-            if isinstance(cat_cfg, dict):
-                for cid in cat_cfg.get("excluded_channel_ids") or []:
-                    excluded_ids.add(int(cid))
-            category = guild.get_channel(int(cat_id))
-            if not category or not isinstance(category, discord.CategoryChannel):
-                continue
-            for ch in category.text_channels:
-                if ch.id in excluded_ids:
+        granularity = self._monitor_granularity(mr)
+        for category, cat_title, excluded_ids, _ in self._iter_monitor_category_configs(guild, mr):
+            if granularity == MONITOR_GRANULARITY_CATEGORY:
+                role_name = self._category_monitor_role_name(cat_title)
+                access_role = await self._get_or_create_monitor_role(
+                    guild,
+                    role_name,
+                    reason="Monitor category subscription",
+                )
+                if not access_role:
                     continue
-                role_name = f"Monitor | {ch.name}"
-                role = discord.utils.get(guild.roles, name=role_name)
-                if not role:
+                for ch in self._iter_monitor_text_channels(category, excluded_ids):
                     try:
-                        role = await guild.create_role(
-                            name=role_name,
-                            permissions=discord.Permissions.none(),
-                            reason="Monitor role for channel subscription",
-                        )
-                        print(f"{Colors.GREEN}[MonitorRoles] Created role: {role.name}{Colors.RESET}")
+                        await self._apply_monitor_channel_overwrites(ch, access_role, members_role)
                     except Exception as e:
-                        print(f"{Colors.RED}[MonitorRoles] Failed to create role {role_name}: {e}{Colors.RESET}")
-                        continue
+                        print(
+                            f"{Colors.RED}[MonitorRoles] Failed overwrites for #{ch.name} "
+                            f"({cat_title}): {e}{Colors.RESET}"
+                        )
+                continue
+            for ch in self._iter_monitor_text_channels(category, excluded_ids):
+                role_name = self._channel_monitor_role_name(ch.name)
+                access_role = await self._get_or_create_monitor_role(
+                    guild,
+                    role_name,
+                    reason="Monitor role for channel subscription",
+                )
+                if not access_role:
+                    continue
                 try:
-                    await ch.set_permissions(guild.default_role, view_channel=False)
-                    if members_role:
-                        await ch.set_permissions(members_role, view_channel=False)
-                    await ch.set_permissions(role, view_channel=True, read_message_history=True)
+                    await self._apply_monitor_channel_overwrites(ch, access_role, members_role)
                 except Exception as e:
                     print(f"{Colors.RED}[MonitorRoles] Failed to set overwrites for #{ch.name}: {e}{Colors.RESET}")
+
+    async def _migrate_legacy_channel_monitor_roles(self, guild: discord.Guild) -> None:
+        """If member had any per-channel Monitor role in a category, grant category role and remove legacy roles."""
+        mr = self._monitor_roles_config()
+        if not mr or not mr.get("migrate_channel_roles_on_post", True):
+            return
+        if self._monitor_granularity(mr) != MONITOR_GRANULARITY_CATEGORY:
+            return
+        if mr.get("entries"):
+            return
+        migrated_members = 0
+        for category, cat_title, excluded_ids, _ in self._iter_monitor_category_configs(guild, mr):
+            cat_role = discord.utils.get(guild.roles, name=self._category_monitor_role_name(cat_title))
+            if not cat_role:
+                continue
+            legacy_roles: List[discord.Role] = []
+            for ch in self._iter_monitor_text_channels(category, excluded_ids):
+                legacy_role = discord.utils.get(
+                    guild.roles, name=self._channel_monitor_role_name(ch.name)
+                )
+                if legacy_role:
+                    legacy_roles.append(legacy_role)
+            if not legacy_roles:
+                continue
+            legacy_ids = {r.id for r in legacy_roles}
+            members_to_update: Dict[int, discord.Member] = {}
+            for legacy_role in legacy_roles:
+                for member in legacy_role.members:
+                    members_to_update[member.id] = member
+            for member in members_to_update.values():
+                try:
+                    to_remove = [r for r in member.roles if r.id in legacy_ids]
+                    to_add = cat_role not in member.roles
+                    if not to_add and not to_remove:
+                        continue
+                    if to_add:
+                        await member.add_roles(
+                            cat_role, reason="Migrate monitor subscription to category role"
+                        )
+                    if to_remove:
+                        await member.remove_roles(
+                            *to_remove,
+                            reason="Migrate off per-channel monitor role",
+                        )
+                    migrated_members += 1
+                except Exception as e:
+                    print(
+                        f"{Colors.RED}[MonitorRoles] Migration failed for {member.display_name}: {e}{Colors.RESET}"
+                    )
+        if migrated_members:
+            print(
+                f"{Colors.GREEN}[MonitorRoles] Migrated {migrated_members} member(s) "
+                f"to category monitor roles{Colors.RESET}"
+            )
     
     def _first_image_from_message(self, message: discord.Message) -> Optional[str]:
         """Extract first image URL from message attachments or embeds."""
@@ -253,13 +383,25 @@ class MonitorRoleView(discord.ui.View):
         if not role:
             await interaction.response.send_message(f"Role for **{label}** no longer exists.", ephemeral=True)
             return
+        mr = self.pinger._monitor_roles_config()
+        category_mode = (
+            mr is not None and self.pinger._monitor_granularity(mr) == MONITOR_GRANULARITY_CATEGORY
+        )
         try:
             if role in member.roles:
                 await member.remove_roles(role, reason="Monitor role toggle (unsubscribe)")
-                await interaction.response.send_message(f"Unsubscribed from **{label}**. Channel hidden.", ephemeral=True)
+                if category_mode:
+                    msg = f"Unsubscribed from **{label}**. Monitor channels in this category are hidden."
+                else:
+                    msg = f"Unsubscribed from **{label}**. Channel hidden."
+                await interaction.response.send_message(msg, ephemeral=True)
             else:
                 await member.add_roles(role, reason="Monitor role toggle (subscribe)")
-                await interaction.response.send_message(f"Subscribed to **{label}**. Channel visible.", ephemeral=True)
+                if category_mode:
+                    msg = f"Subscribed to **{label}**. All monitor channels in this category are visible."
+                else:
+                    msg = f"Subscribed to **{label}**. Channel visible."
+                await interaction.response.send_message(msg, ephemeral=True)
         except discord.Forbidden:
             await interaction.response.send_message("I don't have permission to manage that role.", ephemeral=True)
         except Exception as e:
@@ -736,6 +878,7 @@ class _RSMentionPingerImpl:
                 pass
             try:
                 await self._ensure_monitor_roles_and_overwrites(guild)
+                await self._migrate_legacy_channel_monitor_roles(guild)
                 by_category = self._build_monitor_entries_by_category(guild)
                 if not by_category:
                     await picker_channel.send("No monitor entries found. Check `monitor_roles.categories` or `monitor_roles.entries` in config.")
@@ -747,7 +890,10 @@ class _RSMentionPingerImpl:
                             await msg.delete()
                 except Exception:
                     pass
-                default_desc = "Choose the channels you want alerts from by clicking the buttons below. **ADD** or **REMOVE** roles to receive notifications when new items drop or restocks occur."
+                default_desc = (
+                    "Subscribe to a monitor **category** below. **ADD** grants access to all monitor "
+                    "channels in that category; **REMOVE** hides them."
+                )
                 desc = (mr.get("embed_description") or default_desc).strip()
                 footer = mr.get("embed_footer") or "RS Monitor Roles"
                 for cat_title, entries in by_category:
