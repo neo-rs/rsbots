@@ -258,7 +258,16 @@ class RSMentionPinger:
         members_role_id = mr.get("members_role_id")
         members_role = guild.get_role(int(members_role_id)) if members_role_id else None
         granularity = self._monitor_granularity(mr)
+        print(
+            f"{Colors.CYAN}[MonitorRoles] Setting up overwrites (granularity={granularity})…{Colors.RESET}"
+        )
         for category, cat_title, excluded_ids, _ in self._iter_monitor_category_configs(guild, mr):
+            channels = list(self._iter_monitor_text_channels(category, excluded_ids))
+            if not channels:
+                print(
+                    f"{Colors.YELLOW}[MonitorRoles] No text channels in category {cat_title!r}{Colors.RESET}"
+                )
+                continue
             if granularity == MONITOR_GRANULARITY_CATEGORY:
                 role_name = self._category_monitor_role_name(cat_title)
                 access_role = await self._get_or_create_monitor_role(
@@ -268,16 +277,27 @@ class RSMentionPinger:
                 )
                 if not access_role:
                     continue
-                for ch in self._iter_monitor_text_channels(category, excluded_ids):
+                print(
+                    f"{Colors.CYAN}[MonitorRoles] {cat_title}: applying overwrites to "
+                    f"{len(channels)} channel(s)…{Colors.RESET}"
+                )
+                ok, failed = 0, 0
+                for ch in channels:
                     try:
                         await self._apply_monitor_channel_overwrites(ch, access_role, members_role)
+                        ok += 1
+                        print(f"{Colors.GREEN}[MonitorRoles]   ✓ #{ch.name}{Colors.RESET}")
                     except Exception as e:
+                        failed += 1
                         print(
-                            f"{Colors.RED}[MonitorRoles] Failed overwrites for #{ch.name} "
-                            f"({cat_title}): {e}{Colors.RESET}"
+                            f"{Colors.RED}[MonitorRoles]   ✗ #{ch.name} ({cat_title}): {e}{Colors.RESET}"
                         )
+                print(
+                    f"{Colors.GREEN}[MonitorRoles] {cat_title}: overwrites done "
+                    f"({ok} ok, {failed} failed){Colors.RESET}"
+                )
                 continue
-            for ch in self._iter_monitor_text_channels(category, excluded_ids):
+            for ch in channels:
                 role_name = self._channel_monitor_role_name(ch.name)
                 access_role = await self._get_or_create_monitor_role(
                     guild,
@@ -290,6 +310,7 @@ class RSMentionPinger:
                     await self._apply_monitor_channel_overwrites(ch, access_role, members_role)
                 except Exception as e:
                     print(f"{Colors.RED}[MonitorRoles] Failed to set overwrites for #{ch.name}: {e}{Colors.RESET}")
+        print(f"{Colors.GREEN}[MonitorRoles] Overwrite setup finished{Colors.RESET}")
 
     async def _migrate_legacy_channel_monitor_roles(self, guild: discord.Guild) -> None:
         """If member had any per-channel Monitor role in a category, grant category role and remove legacy roles."""
@@ -344,6 +365,8 @@ class RSMentionPinger:
                 f"{Colors.GREEN}[MonitorRoles] Migrated {migrated_members} member(s) "
                 f"to category monitor roles{Colors.RESET}"
             )
+        else:
+            print(f"{Colors.CYAN}[MonitorRoles] Member migration: nothing to change{Colors.RESET}")
     
     def _first_image_from_message(self, message: discord.Message) -> Optional[str]:
         """Extract first image URL from message attachments or embeds."""
@@ -877,7 +900,9 @@ class _RSMentionPingerImpl:
             except Exception:
                 pass
             try:
+                print(f"{Colors.CYAN}[MonitorRoles] !postmonitorroles started{Colors.RESET}")
                 await self._ensure_monitor_roles_and_overwrites(guild)
+                print(f"{Colors.CYAN}[MonitorRoles] Running member migration…{Colors.RESET}")
                 await self._migrate_legacy_channel_monitor_roles(guild)
                 by_category = self._build_monitor_entries_by_category(guild)
                 if not by_category:
@@ -914,6 +939,11 @@ class _RSMentionPingerImpl:
                         if guild.icon:
                             embed.set_thumbnail(url=guild.icon.url)
                         await picker_channel.send(embed=embed, view=view)
+                        print(
+                            f"{Colors.GREEN}[MonitorRoles] Posted picker for {cat_title} "
+                            f"({len(chunk)} button(s)){Colors.RESET}"
+                        )
+                print(f"{Colors.GREEN}[MonitorRoles] !postmonitorroles finished{Colors.RESET}")
             except Exception as e:
                 print(f"{Colors.RED}[MonitorRoles] postmonitorroles error: {e}{Colors.RESET}")
                 await picker_channel.send(f"❌ Error: {e}")
