@@ -134,6 +134,61 @@ def _path_of(url: Optional[str]) -> str:
         return ""
 
 
+# Amazon retail vs CDN (m.media-amazon.com, video preview JSON, etc.) — not "amazon." substring on host.
+_AMAZON_CDN_HOST_MARKERS = (
+    "media-amazon",
+    "images-amazon",
+    "ssl-images-amazon",
+    "fls-na",
+    "ecx.images-amazon",
+)
+
+
+def is_amazon_cdn_or_asset_url(url: str) -> bool:
+    """True for video preview, captions, images CDN — never a product page."""
+    u = (url or "").strip()
+    if not u:
+        return False
+    try:
+        host = _host_of(u)
+        path = _path_of(u)
+    except Exception:
+        return True
+    if any(m in host for m in _AMAZON_CDN_HOST_MARKERS):
+        return True
+    if "vse-vms" in path or "closedcaptions" in path or "videopreview" in path:
+        return True
+    if "influencer-profile-image" in path:
+        return True
+    if path.endswith((".vtt", ".m3u8", ".mp4")) and "amazon" in host:
+        return True
+    return False
+
+
+def is_amazon_retail_host(host: str) -> bool:
+    h = (host or "").strip().lower()
+    if not h:
+        return False
+    if any(m in h for m in _AMAZON_CDN_HOST_MARKERS):
+        return False
+    if h in ("amzn.to", "a.co", "www.a.co"):
+        return True
+    if h == "amazon.com" or h.endswith(".amazon.com"):
+        return True
+    if h.endswith(".amazon.co.uk") or h.endswith(".amazon.de"):
+        return True
+    return False
+
+
+def is_amazon_retail_page_url(url: str) -> bool:
+    u = (url or "").strip()
+    if not _looks_like_http_url(u):
+        return False
+    if is_amazon_cdn_or_asset_url(u):
+        return False
+    return is_amazon_retail_host(_host_of(u))
+
+
 def _looks_like_http_url(url: str) -> bool:
     u = (url or "").strip()
     if not u.startswith(("http://", "https://")):
@@ -266,13 +321,18 @@ def score_outbound_candidate(url: str) -> int:
     path = _path_of(u)
     if re.search(r"\.(png|jpg|jpeg|gif|webp|svg|css|js|ico|woff2?)(\?|$)", path):
         return -60
+    if is_amazon_cdn_or_asset_url(u):
+        return -95
     if is_intermediate_url(u):
         return -25
     score = min(len(path) + len(urlparse(u).query or ""), 500) + 40
     if any(x in path for x in ("/ip/", "/p/", "/product", "/products/", "/dp/", "/itm/", "/sku", "/shop/", "/offers/")):
         score += 30
-    if "amazon." in host or host.endswith("amazon.com"):
-        score += 25
+    if is_amazon_retail_host(host):
+        if "/dp/" in path or "/gp/" in path:
+            score += 85
+        else:
+            score += 20
     if any(
         store in host
         for store in (
@@ -314,7 +374,7 @@ def find_urls_in_text(text: str) -> List[str]:
     for pattern in patterns:
         for match in re.findall(pattern, text, flags=re.IGNORECASE):
             c = clean_candidate_url(match)
-            if _looks_like_http_url(c):
+            if _looks_like_http_url(c) and not is_amazon_cdn_or_asset_url(c):
                 candidates.append(c)
     return candidates
 

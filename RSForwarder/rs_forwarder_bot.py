@@ -2998,12 +2998,21 @@ class RSForwarderBot:
                         flush=True,
                     )
                 shown = 0
-                limit = 4 if affiliate_changed else 2
+                limit = 8
                 for u, note in list(affiliate_notes.items()):
                     if shown >= limit:
+                        if shown == limit:
+                            print(
+                                f"{Colors.CYAN}[Affiliate] {src_ch_ref} … +{len(affiliate_notes) - limit} more url(s){Colors.RESET}",
+                                flush=True,
+                            )
                         break
                     print(
-                        f"{Colors.CYAN}[Affiliate] {src_ch_ref} - {u} ({note}){Colors.RESET}",
+                        f"{Colors.CYAN}[Affiliate] {src_ch_ref} in: {u}{Colors.RESET}",
+                        flush=True,
+                    )
+                    print(
+                        f"{Colors.CYAN}[Affiliate] {src_ch_ref} {note}{Colors.RESET}",
                         flush=True,
                     )
                     shown += 1

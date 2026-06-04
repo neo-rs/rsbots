@@ -129,6 +129,35 @@ def _aff_dbg_verbose(cfg: Optional[dict], msg: str) -> None:
     print(f"[AffiliateDebug] {msg}", flush=True)
 
 
+def affiliate_journal_log_on(cfg: Optional[dict]) -> bool:
+    """
+    Enrich affiliate notes for RSForwarder journal (resolve target + outcome + posted URL).
+    Uses ASCII "->" so Windows/journal encodings do not choke on Unicode arrows.
+    Config `affiliate_journal_log` (default on) or env AFFILIATE_JOURNAL_LOG=0 to disable.
+    """
+    try:
+        if cfg is not None and "affiliate_journal_log" in cfg:
+            return _bool_or_default(cfg.get("affiliate_journal_log"), True)
+    except Exception:
+        pass
+    raw = (os.getenv("AFFILIATE_JOURNAL_LOG", "") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    return True
+
+
+def _format_affiliate_journal_line(raw: str, resolved_target: str, outcome: str) -> str:
+    """Single-line summary for systemd/journal: what we resolved vs what we did."""
+    raw_s = (raw or "").strip()
+    target = (resolved_target or raw_s).strip()
+    outcome_s = (outcome or "no change").strip()
+    if target and target != raw_s:
+        resolve_bit = f"resolve-> {_aff_dbg_clip(target, 220)}"
+    else:
+        resolve_bit = "resolve-> (same as input)"
+    return f"{resolve_bit} | outcome-> {outcome_s}"
+
+
 def affiliate_rewrite_flow_log_on(cfg: Optional[dict]) -> bool:
     """
     Structured phase logs ([AffiliateFlow]) with timings and outcomes.
@@ -933,7 +962,15 @@ def _score_merchant_outbound_url(url: str) -> int:
         return -1
     if _is_noisy_resolve_host(host):
         return -1
-    if path.endswith((".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".woff", ".woff2")):
+    try:
+        from RSForwarder.outbound_url_resolve import is_amazon_cdn_or_asset_url, is_amazon_retail_host
+    except ImportError:
+        from outbound_url_resolve import is_amazon_cdn_or_asset_url, is_amazon_retail_host
+    if is_amazon_cdn_or_asset_url(u):
+        return -1
+    if path.endswith((".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".woff", ".woff2", ".vtt", ".m3u8", ".mp4")):
+        return -1
+    if "vse-vms" in path or "closedcaptions" in path or "videopreview" in path:
         return -1
     score = min(len(path) + len(p.query or ""), 500)
     if is_redirector_host(host):
@@ -943,8 +980,13 @@ def _score_merchant_outbound_url(url: str) -> int:
     if any(x in path for x in ("/ip/", "/p/", "/product", "/products/", "/dp/", "/itm/", "/sku", "/shop/")):
         score += 25
     hl = host.lower()
-    if "amazon." in hl or hl.endswith("amazon.com") or "amzn.to" in hl:
-        score += 130
+    if is_amazon_retail_host(hl):
+        if "/dp/" in path or "/gp/" in path:
+            score += 150
+        else:
+            score += 50
+    elif hl in ("amzn.to", "a.co", "www.a.co"):
+        score += 80
     elif any(
         x in hl
         for x in (
@@ -1101,18 +1143,23 @@ def _is_cloudflare_or_cdn_error_landing(url: str) -> bool:
 
 
 def is_amazon_like_url(url: str) -> bool:
+    """Retail Amazon / shorteners only — not m.media-amazon.com or video asset CDN URLs."""
+    u = (url or "").strip()
+    if not u:
+        return False
     try:
-        host = (urlparse(url).netloc or "").lower()
+        from RSForwarder.outbound_url_resolve import is_amazon_cdn_or_asset_url, is_amazon_retail_host
+    except ImportError:
+        from outbound_url_resolve import is_amazon_cdn_or_asset_url, is_amazon_retail_host
+    if is_amazon_cdn_or_asset_url(u):
+        return False
+    try:
+        host = (urlparse(u).netloc or "").lower()
     except Exception:
-        host = ""
-    return (
-        ("amazon." in host)
-        or host.endswith("amazon.com")
-        or host.endswith("amazon.co.uk")
-        or ("amzn.to" in host)
-        or host == "a.co"
-        or host.endswith(".a.co")
-    )
+        return False
+    if host in ("amzn.to", "a.co", "www.a.co"):
+        return True
+    return is_amazon_retail_host(host)
 
 
 def extract_asin(text_or_url: str) -> Optional[str]:
@@ -1147,6 +1194,10 @@ def build_amazon_affiliate_url(cfg: dict, raw_url: str) -> Optional[str]:
     u = (raw_url or "").strip()
     if not u:
         return None
+    try:
+        from RSForwarder.outbound_url_resolve import is_amazon_cdn_or_asset_url, is_amazon_retail_host
+    except ImportError:
+        from outbound_url_resolve import is_amazon_cdn_or_asset_url, is_amazon_retail_host
     associate_tag = _cfg_or_env_str(cfg, "amazon_associate_tag", "AMAZON_ASSOCIATE_TAG")
 
     asin = extract_asin(u)
@@ -1159,7 +1210,9 @@ def build_amazon_affiliate_url(cfg: dict, raw_url: str) -> Optional[str]:
             host = (urlparse(u).netloc or "").lower()
         except Exception:
             host = ""
-        if ("amazon." in host) or host.endswith("amazon.com") or host.endswith("amazon.co.uk"):
+        if is_amazon_cdn_or_asset_url(u):
+            return None
+        if is_amazon_retail_host(host):
             return _add_query_param(u, "tag", associate_tag)
         # a.co is Amazon's shortener; without expansion we cannot tag reliably.
         if host == "a.co" or host.endswith(".a.co"):
@@ -2744,6 +2797,14 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
             else:
                 notes[u] = _aff_short_err(err, 220) or "no change"
 
+    if affiliate_journal_log_on(cfg):
+        for u in candidates:
+            raw_u = (normalized.get(u) or u).strip()
+            tgt = (resolved.get(u) or raw_u).strip()
+            tgt = _normalize_expanded_url(_expand_gatekeeper_url(tgt) or tgt)
+            outcome = (notes.get(u) or "").strip() or ("no change" if u not in mapped else "rewritten")
+            notes[u] = _format_affiliate_journal_line(raw_u, tgt, outcome)
+
     if affiliate_rewrite_debug_on(cfg):
         if affiliate_rewrite_debug_verbose_on(cfg):
             for u in candidates:
@@ -2877,13 +2938,16 @@ async def rewrite_text(cfg: dict, text: str) -> Tuple[str, bool, Dict[str, str]]
         out = out[:start] + rep_out + out[end:]
         changed = True
 
-        # Add a human-friendly mapping hint in notes so callers can log: original -> rewritten
+        # Journal: keep resolve/outcome line; add what was actually posted in the message.
         try:
             note = (notes or {}).get(u) or "changed"
             rep_short = (rep_out or "").replace("\r", " ").replace("\n", " ").strip()
             if len(rep_short) > 220:
                 rep_short = rep_short[:220] + "..."
-            notes[u] = f"{note} -> {rep_short}"
+            if rep_short and rep_short != u:
+                notes[u] = f"{note} | posted-> {rep_short}"
+            else:
+                notes[u] = note
         except Exception:
             pass
 

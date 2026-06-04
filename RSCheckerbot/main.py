@@ -212,6 +212,9 @@ from ticket_channels import ensure_ticket_like_channel as _ensure_whop_case_chan
 # Support CRM tickets (Neo)
 import support_tickets
 
+# Whop dispute / resolution per-case channels (not support_tickets CRM)
+import whop_dispute_cases
+
 # Import Whop webhook handler
 from whop_webhook_handler import (
     initialize as init_whop_handler,
@@ -8144,44 +8147,17 @@ async def _process_whop_standard_webhook(
                     )
                 )
             with suppress(Exception):
-                issue_override = ""
-                case_key_override = ""
-                extra_topic = ""
-                extra_fields: list[tuple[str, str]] = []
-                always_post = False
-                if evt_l.startswith("dispute."):
-                    dspt = str(_deep_get(payload, "data.id") or "").strip()
-                    if dspt.startswith("dspt_"):
-                        dstatus = str(_deep_get(payload, "data.status") or "").strip()
-                        dreason = str(_deep_get(payload, "data.reason") or "").strip()
-                        dby = str(_deep_get(payload, "data.needs_response_by") or "").strip()
-                        damt = str(_deep_get(payload, "data.amount") or "").strip()
-                        dcur = str(_deep_get(payload, "data.currency") or "").strip()
-                        issue_override = _bucket_for_dispute_status(dstatus)
-                        case_key_override = f"rschecker_whop_case:dspt={dspt}"
-                        extra_topic = f"dspt={dspt}\nstatus={dstatus or '—'}\nreason={dreason or '—'}"
-                        always_post = True
-                        extra_fields = [
-                            ("Dispute ID", dspt),
-                            ("Dispute status", dstatus),
-                            ("Reason", dreason),
-                            ("Needs response by", dby),
-                            ("Amount", (f"{damt} {dcur}".strip() if (damt or dcur) else "")),
-                            ("Event", evt_l),
-                        ]
-                await _maybe_open_dispute_resolution_case(
+                await _whop_dispute_case_from_std_webhook(
                     guild=guild,
-                    mid=mid2,
+                    evt=str(evt or ""),
+                    evt_l=evt_l,
+                    payload=payload,
+                    membership_id=mid2,
                     updated_at=str(cur.get("updated_at") or ""),
                     brief=brief,
                     cases=cases,
-                    did=did,
+                    discord_id=(int(did) if str(did or "").strip().isdigit() else 0),
                     member_obj=None,
-                    issue_override=issue_override,
-                    case_key_override=case_key_override,
-                    extra_topic=extra_topic,
-                    always_post=always_post,
-                    extra_fields=extra_fields,
                 )
         if member_obj is not None:
             relevant = coerce_role_ids(ROLE_TRIGGER, WELCOME_ROLE_ID, ROLE_CANCEL_A, ROLE_CANCEL_B)
@@ -8269,44 +8245,17 @@ async def _process_whop_standard_webhook(
                     )
                 )
             with suppress(Exception):
-                issue_override = ""
-                case_key_override = ""
-                extra_topic = ""
-                extra_fields: list[tuple[str, str]] = []
-                always_post = False
-                if evt_l.startswith("dispute."):
-                    dspt = str(_deep_get(payload, "data.id") or "").strip()
-                    if dspt.startswith("dspt_"):
-                        dstatus = str(_deep_get(payload, "data.status") or "").strip()
-                        dreason = str(_deep_get(payload, "data.reason") or "").strip()
-                        dby = str(_deep_get(payload, "data.needs_response_by") or "").strip()
-                        damt = str(_deep_get(payload, "data.amount") or "").strip()
-                        dcur = str(_deep_get(payload, "data.currency") or "").strip()
-                        issue_override = _bucket_for_dispute_status(dstatus)
-                        case_key_override = f"rschecker_whop_case:dspt={dspt}"
-                        extra_topic = f"dspt={dspt}\nstatus={dstatus or '—'}\nreason={dreason or '—'}"
-                        always_post = True
-                        extra_fields = [
-                            ("Dispute ID", dspt),
-                            ("Dispute status", dstatus),
-                            ("Reason", dreason),
-                            ("Needs response by", dby),
-                            ("Amount", (f"{damt} {dcur}".strip() if (damt or dcur) else "")),
-                            ("Event", evt_l),
-                        ]
-                await _maybe_open_dispute_resolution_case(
+                await _whop_dispute_case_from_std_webhook(
                     guild=guild,
-                    mid=mid2,
+                    evt=str(evt or ""),
+                    evt_l=evt_l,
+                    payload=payload,
+                    membership_id=mid2,
                     updated_at=str(cur.get("updated_at") or ""),
                     brief=brief,
                     cases=cases,
-                    did=member_obj.id,
+                    discord_id=int(getattr(member_obj, "id", 0) or 0),
                     member_obj=member_obj,
-                    issue_override=issue_override,
-                    case_key_override=case_key_override,
-                    extra_topic=extra_topic,
-                    always_post=always_post,
-                    extra_fields=extra_fields,
                 )
 
         state["memberships"] = memberships
@@ -9512,168 +9461,40 @@ def _extract_discord_id_from_connected(s: str) -> int:
         return 0
 
 
-def _payment_issue_bucket_from_payment(p: dict) -> str:
-    """Return 'dispute' | 'resolution' | '' for a payment record (best-effort)."""
-    if not isinstance(p, dict) or not p:
-        return ""
-    txt = " ".join(
-        [
-            str(p.get("status") or ""),
-            str(p.get("substatus") or ""),
-            str(p.get("billing_reason") or ""),
-            str(p.get("failure_message") or ""),
-            str(p.get("reason") or ""),
-            str(p.get("note") or ""),
-        ]
-    ).strip()
-    low = txt.lower()
-    # Dispute-ish
-    if any(k in low for k in ("dispute", "disputed", "chargeback", "under review", "under_review")):
-        return "dispute"
-    # Resolution-ish
-    if any(k in low for k in ("resolution", "resolved", "won", "lost")):
-        return "resolution"
-    return ""
-
-
-def _bucket_for_dispute_status(status: str) -> str:
-    s = str(status or "").strip().lower()
-    if not s:
-        return "dispute"
-    if any(k in s for k in ("won", "lost", "resolved", "closed", "settled", "completed")):
-        return "resolution"
-    return "dispute"
-
-
-def _payment_id_any(p: dict) -> str:
-    try:
-        pid = str(p.get("id") or p.get("payment_id") or p.get("payment") or "").strip()
-        if isinstance(p.get("payment"), dict):
-            pid = str(p["payment"].get("id") or p["payment"].get("payment_id") or "").strip() or pid
-        return pid
-    except Exception:
-        return ""
-
-
-async def _maybe_open_dispute_resolution_case(
+async def _whop_dispute_case_from_std_webhook(
     *,
     guild: discord.Guild,
-    mid: str,
+    evt: str,
+    evt_l: str,
+    payload: dict,
+    membership_id: str,
     updated_at: str,
     brief: dict,
     cases: dict,
-    did: int = 0,
+    discord_id: int = 0,
     member_obj: discord.Member | None = None,
-    issue_override: str = "",
-    case_key_override: str = "",
-    pay_override: dict | None = None,
-    extra_topic: str = "",
-    always_post: bool = False,
-    extra_fields: list[tuple[str, str]] | None = None,
 ) -> None:
-    """Open a per-case channel for dispute/resolution payments (best-effort)."""
+    """Canonical dispute.created / dispute.updated → per-case channel (whop_dispute_cases)."""
     if not isinstance(cases, dict):
         return
-    if int(DISPUTE_CASE_CATEGORY_ID or 0) <= 0 and int(RESOLUTION_CASE_CATEGORY_ID or 0) <= 0:
+    p = whop_dispute_cases.params_from_dispute_webhook(payload if isinstance(payload, dict) else {}, evt_l)
+    if not p.case_key_override:
         return
-    mid_s = str(mid or "").strip()
-    if not mid_s:
-        return
-
-    pay = pay_override if isinstance(pay_override, dict) else None
-    if pay is None:
-        pay = await _best_payment_for_membership(mid_s, limit=25)
-    issue = str(issue_override or "").strip().lower() or (_payment_issue_bucket_from_payment(pay) if isinstance(pay, dict) else "")
-    if issue not in {"dispute", "resolution"}:
-        return
-
-    cat_id = int(DISPUTE_CASE_CATEGORY_ID) if issue == "dispute" else int(RESOLUTION_CASE_CATEGORY_ID)
-    if cat_id <= 0:
-        return
-    pid = _payment_id_any(pay) if isinstance(pay, dict) else ""
-    key = str(case_key_override or "").strip() or f"rschecker_whop_case:{issue}:mid={mid_s}:pid={pid or updated_at or 'unknown'}"
-
-    # Resolve Discord ID if missing
-    did_i = int(did or 0)
-    if did_i <= 0:
-        did_i = _extract_discord_id_from_connected(str((brief or {}).get("connected_discord") or ""))
-
-    suffix = (pid[-6:] if pid else mid_s[-6:]).lower()
-    ch_name = f"{issue}-{suffix}"
-    topic = (
-        f"rschecker_whop_case issue={issue}\n"
-        f"mid={mid_s}\n"
-        f"pid={pid or '—'}\n"
-        f"did={did_i or '—'}\n"
-        f"email={str((brief or {}).get('email') or '—').strip()}\n"
-        f"product={str((brief or {}).get('product') or '—').strip()}\n"
-    )
-    if extra_topic and str(extra_topic).strip():
-        topic = (topic + "\n" + str(extra_topic).strip()).strip()
-    case_ch = await _ensure_whop_case_channel(
+    if not str(p.payment_id or "").strip():
+        _, ctx = await _resolve_membership_id_for_std_webhook(evt, payload if isinstance(payload, dict) else {})
+        pay_id = str((ctx or {}).get("payment_id") or "").strip()
+        if pay_id:
+            p.payment_id = pay_id
+    await whop_dispute_cases.maybe_open_case(
         guild=guild,
-        category_id=cat_id,
-        case_key=key,
-        channel_name=ch_name,
-        topic=topic,
+        membership_id=str(membership_id or "").strip(),
+        updated_at=updated_at,
+        brief=brief if isinstance(brief, dict) else {},
+        cases=cases,
+        discord_id=int(discord_id or 0),
+        member_obj=member_obj,
+        params=p,
     )
-    if not isinstance(case_ch, discord.TextChannel):
-        return
-
-    first_seen = key not in cases
-    cases[key] = int(case_ch.id)
-
-    # Starter / update card (silent)
-    if (first_seen or always_post):
-        with suppress(Exception):
-            ecase = discord.Embed(
-                title=("⚠️ Dispute Case" if issue == "dispute" else "🟡 Resolution Case"),
-                color=(0xED4245 if issue == "dispute" else 0xFEE75C),
-                timestamp=datetime.now(timezone.utc),
-            )
-            mname = str(getattr(member_obj, "display_name", "") or "").strip() if member_obj else ""
-            if not mname:
-                mname = str((brief or {}).get("user_name") or "").strip() or "—"
-            ecase.add_field(name="Member", value=mname[:1024], inline=True)
-            ecase.add_field(
-                name="Discord ID",
-                value=(f"`{int(member_obj.id)}`" if member_obj else (f"`{did_i}`" if did_i else "—")),
-                inline=True,
-            )
-            ecase.add_field(name="Membership ID", value=str(mid_s)[:1024], inline=False)
-            ecase.add_field(name="Membership", value=str((brief or {}).get("product") or "—")[:1024], inline=True)
-            ecase.add_field(name="Status", value=str((brief or {}).get("status") or "—")[:1024], inline=True)
-            pay_txt = " ".join(
-                [
-                    str((pay or {}).get("status") or ""),
-                    str((pay or {}).get("substatus") or ""),
-                    str((pay or {}).get("billing_reason") or ""),
-                    str((pay or {}).get("failure_message") or ""),
-                ]
-            ).strip()
-            if pay_txt:
-                ecase.add_field(name="Payment", value=pay_txt[:1024], inline=False)
-            dash = str((brief or {}).get("dashboard_url") or "").strip()
-            if dash and dash != "—":
-                ecase.add_field(name="Whop Dashboard", value=dash[:1024], inline=False)
-            if isinstance(extra_fields, list):
-                for k, v in extra_fields:
-                    kk = str(k or "").strip()
-                    vv = str(v or "").strip()
-                    if kk and vv:
-                        ecase.add_field(name=kk[:256], value=vv[:1024], inline=False)
-            ecase.set_footer(text="RSCheckerbot • Whop API")
-            # Only mention when the member is in-guild (avoids @unknown-user).
-            mention = f"<@{int(member_obj.id)}>" if member_obj else ""
-            await case_ch.send(
-                content=mention,
-                embed=ecase,
-                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
-                silent=True,
-            )
-    if first_seen:
-        with suppress(Exception):
-            await _whop_api_events_log(f"[Whop Case] opened issue={issue} mid={mid_s} ch=#{case_ch.name} ({case_ch.id})")
 
 
 async def _whop_api_events_log(msg: str) -> None:
@@ -10400,6 +10221,19 @@ async def on_ready():
             timezone_name=tz_name,
             whop_api_client=whop_api_client,
             run_membership_report_callback=run_whop_membership_report_for_user,
+        )
+        whop_dispute_cases.initialize(
+            bot=bot,
+            whop_api_client=whop_api_client,
+            dispute_category_id=int(DISPUTE_CASE_CATEGORY_ID or 0),
+            resolution_category_id=int(RESOLUTION_CASE_CATEGORY_ID or 0),
+            company_id=str(WHOP_API_CONFIG.get("company_id") or ""),
+            ensure_channel=_ensure_whop_case_channel,
+            fetch_brief_by_membership=_fetch_whop_brief_by_membership_id,
+            best_payment_for_membership=_best_payment_for_membership,
+            deep_get=_deep_get,
+            extract_discord_id_from_connected=_extract_discord_id_from_connected,
+            log_func=_whop_api_events_log,
         )
     except Exception as e:
         # Don't silently disable the whole ticket system.
@@ -14413,6 +14247,57 @@ async def future_member_audit(ctx):
     except Exception as ex:
         await ctx.send(f"❌ Failed to post preview in member-status-logs: {ex}", delete_after=15)
 
+    with suppress(Exception):
+        await ctx.message.delete()
+
+
+@bot.command(name="previewwhopcase", aliases=["preview-whop-case", "whopcasepreview"])
+@commands.has_permissions(administrator=True)
+async def preview_whop_case(ctx, membership_id: str = "", dispute_id: str = ""):
+    """Post [PREVIEW] dispute + resolution case embeds to member-status-logs (live Whop API)."""
+    status_ch = bot.get_channel(MEMBER_STATUS_LOGS_CHANNEL_ID) if MEMBER_STATUS_LOGS_CHANNEL_ID else None
+    if not isinstance(status_ch, discord.TextChannel):
+        await ctx.send("❌ member-status-logs channel not found / not configured.", delete_after=15)
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+    mid_s = str(membership_id or "").strip()
+    dspt_s = str(dispute_id or "").strip()
+    with suppress(Exception):
+        await ctx.send(
+            "🔍 Building Whop dispute/resolution case previews from API… posting to member-status-logs.",
+            delete_after=15,
+        )
+    embeds = await whop_dispute_cases.preview_case_embeds_from_api(
+        membership_id=mid_s,
+        dispute_id=dspt_s,
+    )
+    if not embeds:
+        await ctx.send(
+            "❌ Could not build previews (Whop API client not ready, or no membership/dispute resolved). "
+            "Try: `.checker previewwhopcase <mem_...> [dspt_...]`",
+            delete_after=20,
+        )
+        with suppress(Exception):
+            await ctx.message.delete()
+        return
+    header = discord.Embed(
+        title="Whop dispute / resolution case — preview",
+        description=(
+            "Sample cards below mirror what opens in the **dispute** vs **resolution** categories "
+            "(same `dspt_*` channel key; category moves on terminal dispute status).\n"
+            "Does **not** create case channels."
+        ),
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    header.set_footer(text="RSCheckerbot • previewwhopcase")
+    try:
+        await status_ch.send(embed=header, silent=True)
+        for emb in embeds:
+            await status_ch.send(embed=emb, silent=True)
+    except Exception as ex:
+        await ctx.send(f"❌ Failed to post preview in member-status-logs: {ex}", delete_after=15)
     with suppress(Exception):
         await ctx.message.delete()
 

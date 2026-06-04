@@ -244,6 +244,17 @@ RSOnboarding never removes the Member role.
   - Sample list for Future adds includes clickable member mentions (WILL ping) and also shows plain `@username` text
   - No roles are ever mentioned (no `<@&...>`); output is plain text names + IDs
 
+#### `.checker previewwhopcase`
+- **Description**: Post `[PREVIEW]` dispute and resolution case embeds to `member-status-logs` using live Whop API data (does not open case channels)
+- **Aliases**: `preview-whop-case`, `whopcasepreview`
+- **Parameters**:
+  - `membership_id`: Optional Whop membership id (`mem_...`)
+  - `dispute_id`: Optional Whop dispute id (`dspt_...`); if omitted, uses the latest dispute from API when possible
+- **Usage**: `.checker previewwhopcase` or `.checker previewwhopcase mem_abc123 dspt_xyz`
+- **Admin Only**: Yes (requires administrator permissions)
+- **Returns**: Header + two sample embeds in `member-status-logs` (open dispute category vs resolved/resolution category)
+- **Note**: Separate from `support_tickets` CRM; canonical owner is `whop_dispute_cases.py` (webhook-driven live cases use the same embed builder)
+
 ### Direct Message Controls
 
 #### `.checker dmenable`
@@ -339,10 +350,10 @@ These commands are only available **inside an OPEN support ticket channel** and 
 
 ## Command Summary
 
-- **Total Commands**: 25
-- **Admin Commands**: 22 (the `.checker` commands require administrator permissions)
+- **Total Commands**: 26
+- **Admin Commands**: 23 (the `.checker` commands require administrator permissions)
 - **Public Commands**: 0
-- **Commands with Aliases**: 12
+- **Commands with Aliases**: 13
 - **Command Prefix**: `.checker` (dot prefix) + `!` (ticket channels only)
 
 ## Notes
