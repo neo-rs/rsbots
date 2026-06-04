@@ -1,7 +1,7 @@
 {
   "guild_id": 876528050081251379,
   "important_channel_success_nudges": {
-    "enabled": true,
+    "enabled": false,
     "groups": [
       {
         "channel_ids": [
@@ -37,7 +37,7 @@
   "suggestions_min_chars": 20,
   "suggestions_cooldown_seconds": 300,
   "suggestions_warn_delete_seconds": 10,
-  "suggestions_react_in_threads": true,
+  "suggestions_react_in_threads": false,
   "reaction_emoji": "\ud83e\udd11",
   "role_id_to_watch": 876569612085518376,
   "log_channel_id": 1452258047362859178,
