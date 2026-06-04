@@ -134,7 +134,7 @@ def _path_of(url: Optional[str]) -> str:
         return ""
 
 
-# Amazon retail vs CDN (m.media-amazon.com, video preview JSON, etc.) — not "amazon." substring on host.
+# Amazon retail vs CDN / ad click tracking (not www.amazon.com/dp product pages).
 _AMAZON_CDN_HOST_MARKERS = (
     "media-amazon",
     "images-amazon",
@@ -142,6 +142,31 @@ _AMAZON_CDN_HOST_MARKERS = (
     "fls-na",
     "ecx.images-amazon",
 )
+
+_AMAZON_AD_TRACKING_HOST_MARKERS = (
+    "aax-",
+    "retail-direct",
+    "advertising",
+    "unagi",
+    "omtrdc",
+    "assoc-redirect",
+)
+
+_ASIN_DP_RE = re.compile(r"/dp/([A-Z0-9]{10})(?:[/?]|$)", re.IGNORECASE)
+
+
+def is_amazon_ad_or_tracking_url(url: str) -> bool:
+    """Amazon ad click / beacon hosts (e.g. aax-us-east-retail-direct.amazon.com/x/c/...)."""
+    u = (url or "").strip()
+    if not u:
+        return False
+    host = _host_of(u)
+    path = _path_of(u)
+    if any(m in host for m in _AMAZON_AD_TRACKING_HOST_MARKERS):
+        return True
+    if host.endswith(".amazon.com") and ("/x/c/" in path or "/x/click" in path):
+        return True
+    return False
 
 
 def is_amazon_cdn_or_asset_url(url: str) -> bool:
@@ -162,22 +187,44 @@ def is_amazon_cdn_or_asset_url(url: str) -> bool:
         return True
     if path.endswith((".vtt", ".m3u8", ".mp4")) and "amazon" in host:
         return True
+    if is_amazon_ad_or_tracking_url(u):
+        return True
     return False
 
 
 def is_amazon_retail_host(host: str) -> bool:
+    """Storefront hosts only — not *.amazon.com ad/tracking subdomains."""
     h = (host or "").strip().lower()
     if not h:
         return False
     if any(m in h for m in _AMAZON_CDN_HOST_MARKERS):
         return False
+    if any(m in h for m in _AMAZON_AD_TRACKING_HOST_MARKERS):
+        return False
     if h in ("amzn.to", "a.co", "www.a.co"):
         return True
-    if h == "amazon.com" or h.endswith(".amazon.com"):
+    if h in ("amazon.com", "www.amazon.com", "smile.amazon.com"):
         return True
-    if h.endswith(".amazon.co.uk") or h.endswith(".amazon.de"):
+    if re.match(r"^amazon\.(com|co\.uk|de|ca|fr|it|es|nl|com\.au|com\.mx|com\.br|in|jp)$", h):
+        return True
+    if re.match(r"^www\.amazon\.(com|co\.uk|de|ca|fr|it|es|nl|com\.au|com\.mx|com\.br|in|jp)$", h):
         return True
     return False
+
+
+def amazon_canonical_dp_url(url: str) -> Optional[str]:
+    """https://www.amazon.com/dp/ASIN when input is a retail Amazon product link."""
+    u = (url or "").strip()
+    if not _looks_like_http_url(u):
+        return None
+    m = _ASIN_DP_RE.search(u)
+    if not m:
+        return None
+    host = _host_of(u)
+    if not is_amazon_retail_host(host):
+        return None
+    asin = (m.group(1) or "").upper()
+    return f"https://www.amazon.com/dp/{asin}"
 
 
 def is_amazon_retail_page_url(url: str) -> bool:
@@ -321,7 +368,7 @@ def score_outbound_candidate(url: str) -> int:
     path = _path_of(u)
     if re.search(r"\.(png|jpg|jpeg|gif|webp|svg|css|js|ico|woff2?)(\?|$)", path):
         return -60
-    if is_amazon_cdn_or_asset_url(u):
+    if is_amazon_cdn_or_asset_url(u) or is_amazon_ad_or_tracking_url(u):
         return -95
     if is_intermediate_url(u):
         return -25
@@ -452,7 +499,7 @@ def try_extract_murl_from_chain(chain: List[str]) -> Optional[str]:
     return None
 
 
-def pick_best_from_candidates(urls: List[str]) -> Optional[str]:
+def pick_best_from_candidates(urls: List[str], *, prefer_url: str = "") -> Optional[str]:
     best_u = ""
     best_s = -10_000
     for raw in urls or []:
@@ -463,6 +510,22 @@ def pick_best_from_candidates(urls: List[str]) -> Optional[str]:
         if s > best_s:
             best_s = s
             best_u = u
+    if best_s < 0:
+        best_u = ""
+    pref = (prefer_url or "").strip()
+    if pref:
+        canon = amazon_canonical_dp_url(pref)
+        if canon:
+            return canon
+        for raw in urls or []:
+            c = amazon_canonical_dp_url((raw or "").strip())
+            if c:
+                return c
+    if best_u and is_amazon_ad_or_tracking_url(best_u):
+        for raw in urls or []:
+            c = amazon_canonical_dp_url((raw or "").strip())
+            if c:
+                return c
     if best_s < 0:
         return None
     return best_u or None
@@ -515,6 +578,9 @@ def resolve_outbound_url(
     Does not depend on the host being pre-registered in a shortener list.
     """
     original = clean_candidate_url(input_url)
+    canon_dp = amazon_canonical_dp_url(original)
+    if canon_dp:
+        return canon_dp
     current = normalize_merchant_url(original)
     seen: Set[str] = set()
 
@@ -549,7 +615,7 @@ def resolve_outbound_url(
         # HTML from 403/bot pages often points back to shorteners; prefer redirect chain only.
         use_html = html_text if (resp.status_code and int(resp.status_code) < 400) else ""
         candidates = collect_candidates_from_chain(chain, html=use_html)
-        best = pick_best_from_candidates(candidates)
+        best = pick_best_from_candidates(candidates, prefer_url=original)
         final_resp = normalize_merchant_url(str(resp.url or current))
 
         if best and score_outbound_candidate(best) >= score_outbound_candidate(final_resp):
@@ -576,11 +642,22 @@ def resolve_outbound_url(
             break
 
     out = normalize_merchant_url(current or original)
+    canon_in = amazon_canonical_dp_url(original)
+    if canon_in:
+        if is_amazon_ad_or_tracking_url(out) or not is_amazon_retail_page_url(out):
+            return canon_in
+        out_asin = _ASIN_DP_RE.search(out)
+        in_asin = _ASIN_DP_RE.search(canon_in)
+        if out_asin and in_asin and (out_asin.group(1) or "").upper() != (in_asin.group(1) or "").upper():
+            return canon_in
     if is_intermediate_url(out):
         _, chain, _err = request_once(original, int(timeout_s))
         if chain:
-            retry_best = pick_best_from_candidates(collect_candidates_from_chain(chain, html=""))
+            retry_best = pick_best_from_candidates(
+                collect_candidates_from_chain(chain, html=""),
+                prefer_url=original,
+            )
             if retry_best and not is_intermediate_url(retry_best) and score_outbound_candidate(retry_best) > 0:
                 return retry_best
-        return original
+        return canon_in or original
     return out

@@ -963,10 +963,18 @@ def _score_merchant_outbound_url(url: str) -> int:
     if _is_noisy_resolve_host(host):
         return -1
     try:
-        from RSForwarder.outbound_url_resolve import is_amazon_cdn_or_asset_url, is_amazon_retail_host
+        from RSForwarder.outbound_url_resolve import (
+            is_amazon_ad_or_tracking_url,
+            is_amazon_cdn_or_asset_url,
+            is_amazon_retail_host,
+        )
     except ImportError:
-        from outbound_url_resolve import is_amazon_cdn_or_asset_url, is_amazon_retail_host
-    if is_amazon_cdn_or_asset_url(u):
+        from outbound_url_resolve import (
+            is_amazon_ad_or_tracking_url,
+            is_amazon_cdn_or_asset_url,
+            is_amazon_retail_host,
+        )
+    if is_amazon_cdn_or_asset_url(u) or is_amazon_ad_or_tracking_url(u):
         return -1
     if path.endswith((".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".woff", ".woff2", ".vtt", ".m3u8", ".mp4")):
         return -1
@@ -1148,10 +1156,18 @@ def is_amazon_like_url(url: str) -> bool:
     if not u:
         return False
     try:
-        from RSForwarder.outbound_url_resolve import is_amazon_cdn_or_asset_url, is_amazon_retail_host
+        from RSForwarder.outbound_url_resolve import (
+            is_amazon_ad_or_tracking_url,
+            is_amazon_cdn_or_asset_url,
+            is_amazon_retail_host,
+        )
     except ImportError:
-        from outbound_url_resolve import is_amazon_cdn_or_asset_url, is_amazon_retail_host
-    if is_amazon_cdn_or_asset_url(u):
+        from outbound_url_resolve import (
+            is_amazon_ad_or_tracking_url,
+            is_amazon_cdn_or_asset_url,
+            is_amazon_retail_host,
+        )
+    if is_amazon_cdn_or_asset_url(u) or is_amazon_ad_or_tracking_url(u):
         return False
     try:
         host = (urlparse(u).netloc or "").lower()
@@ -2645,6 +2661,26 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
         if _is_cloudflare_or_cdn_error_landing(target):
             target = raw
             resolved[u] = target
+        try:
+            from RSForwarder.outbound_url_resolve import (
+                amazon_canonical_dp_url,
+                is_amazon_ad_or_tracking_url,
+                is_amazon_retail_page_url,
+            )
+        except ImportError:
+            from outbound_url_resolve import (
+                amazon_canonical_dp_url,
+                is_amazon_ad_or_tracking_url,
+                is_amazon_retail_page_url,
+            )
+        canon_dp = amazon_canonical_dp_url(raw) or amazon_canonical_dp_url(target)
+        if canon_dp and (
+            is_amazon_ad_or_tracking_url(target)
+            or not is_amazon_retail_page_url(target)
+            or target != canon_dp
+        ):
+            target = canon_dp
+            resolved[u] = canon_dp
 
         # Skip affiliate rewriting for configured marketplace domains.
         # Still allow expansion/unwrapping to surface the final destination when available.
