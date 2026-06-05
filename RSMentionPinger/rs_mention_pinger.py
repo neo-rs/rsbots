@@ -916,8 +916,8 @@ class _RSMentionPingerImpl:
                 except Exception:
                     pass
                 default_desc = (
-                    "Subscribe to a monitor **category** below. **ADD** grants access to all monitor "
-                    "channels in that category; **REMOVE** hides them."
+                    "Pick a category below to turn monitor alerts on or off. **ADD** shows every "
+                    "channel in that category; **REMOVE** hides them."
                 )
                 desc = (mr.get("embed_description") or default_desc).strip()
                 footer = mr.get("embed_footer") or "RS Monitor Roles"

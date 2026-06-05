@@ -6,7 +6,7 @@
     "migrate_channel_roles_on_post": true,
     "members_role_id": 876569612085518376,
     "picker_channel_id": 1345505161409335389,
-    "embed_description": "Subscribe to a monitor **category** below. **ADD** grants access to all monitor channels in that category; **REMOVE** hides them. Re-run `!postmonitorroles` after adding new channels to a category.",
+    "embed_description": "Pick a category below to turn monitor alerts on or off. **ADD** shows every channel in that category; **REMOVE** hides them.",
     "embed_footer": "RS Monitor Roles",
     "channel_display_names": {
       "homedepot-monitor": "Home Depot",
