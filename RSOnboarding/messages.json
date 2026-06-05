@@ -2,7 +2,7 @@
   "steps": [
     {
       "title": "Welcome to Reselling Secrets Membership",
-      "description": "{progress}\n\nHey {member.mention},\n\nThis is a quick walkthrough to make sure you are ready to take advantage of Reselling Secrets membership.\n\nClick **Continue** after completing each step to move on.\n\n_(You will not have full access to the server until completing these steps)_",
+      "description": "**{member.display_name}**\n\nHey {member.mention},\n\nThis is a quick walkthrough to make sure you are ready to take advantage of Reselling Secrets membership.\n\nClick **Continue** after completing each step to move on.\n\n_(You will not have full access to the server until completing these steps)_",
       "image_url": null
     },
     {
