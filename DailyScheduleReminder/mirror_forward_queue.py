@@ -14,6 +14,10 @@ a stock fetch failure (matched failure_substrings), the script reacts with an X 
 message, appends a line to mirror_forward_hdnation_failures.jsonl for a later retry run, and
 continues to the next Mirror message without advancing the checkpoint.
 
+When post_confirmation is enabled, monitor waits use a session window: monitor-bot messages after
+our !m command until the next !m hdnation/lead in the channel (covers Lead posted and multi-message
+hdnation stock checks without reply chains).
+
 Consecutive duplicate guard (default on): skips when the previous channel message had the same
 parsed UPC/TCIN/SKU (!m lead) or SKU (!m hdnation). A non-deal message in between resets the chain.
 On dedupe skip, reacts with cross mark on the skipped Mirror message (unless --no-react).
@@ -398,9 +402,10 @@ def _monitor_needles_for_command(cmd: str, pc: dict) -> tuple[list[str], list[st
     if cmd == "hdnation":
         timeout = float(pc.get("timeout_seconds_hdnation") or pc["timeout_seconds"])
         for extra in (
-            "nationwide stock check",
-            "lead has been posted",
-            "home depot nationwide",
+            "home depot nationwide stock check",
+            "lowest store price",
+            "lowest online price",
+            "powered by tempomonitors",
         ):
             if extra not in seen:
                 seen[extra] = None
@@ -595,11 +600,12 @@ def _run_forward_batch(
             succ_needles, fail_needles, mon_timeout = _monitor_needles_for_command(
                 route_cmd, post_confirm
             )
+            wait_label = "hdnation stock-check" if route_cmd == "hdnation" else "lead posted"
             print(
-                f"  waiting for monitor (author {post_confirm['author_user_id']!r}, "
-                f"timeout {mon_timeout:.0f}s, successes={succ_needles[:3]!r}…)"
+                f"  waiting for {wait_label} (author {post_confirm['author_user_id']!r}, "
+                f"timeout {mon_timeout:.0f}s, session until next !m)…"
             )
-            outcome, mon_detail = mm.wait_for_monitor_outcome(
+            outcome, mon_detail = mm.wait_for_m_command_monitor_session(
                 post_ch,
                 posted_mid,
                 token,

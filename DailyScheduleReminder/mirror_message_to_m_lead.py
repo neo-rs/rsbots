@@ -663,6 +663,25 @@ def build_hdnation_line(sku: str, destination: str) -> str:
     return f"!m hdnation {sku} {dest}"
 
 
+def monitor_correlation_substring(command_line: str, *, route_cmd: str = "lead") -> str:
+    """
+    Product id embedded in a posted !m line. Used with wait_for_monitor_outcome
+    (reply_to_message_id + must_contain_in_blob) so a busy shared command channel
+    does not treat another staff member's monitor reply as ours.
+    """
+    s = str(command_line or "").strip()
+    cmd = (route_cmd or "lead").strip().lower()
+    if cmd == "hdnation":
+        m = re.match(r"!m\s+hdnation\s+(\S+)", s, re.IGNORECASE)
+        if not m:
+            return ""
+        raw = (m.group(1) or "").strip()
+        digits = re.sub(r"\D", "", raw)
+        return digits or raw
+    m = re.search(r"(\d{5,20})\s+(https?://)", s, re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
 def _discord_error_body(resp: requests.Response) -> dict:
     try:
         j = resp.json()
@@ -956,6 +975,11 @@ def _message_text_blob(msg: dict) -> str:
         foot = emb.get("footer")
         if isinstance(foot, dict) and isinstance(foot.get("text"), str):
             parts.append(foot["text"])
+    for att in msg.get("attachments") or []:
+        if isinstance(att, dict):
+            fn = att.get("filename")
+            if isinstance(fn, str) and fn.strip():
+                parts.append(fn)
     return "\n".join(parts).lower()
 
 
@@ -994,6 +1018,181 @@ def message_matches_post_confirmation(
     return False
 
 
+def _message_replies_to(msg: dict, parent_message_id: str) -> bool:
+    """True if Discord message_reference (or referenced_message) points at parent_message_id."""
+    pid = str(parent_message_id or "").strip()
+    if not pid.isdigit():
+        return False
+    ref = msg.get("message_reference")
+    if isinstance(ref, dict):
+        rid = str(ref.get("message_id") or "").strip()
+        if rid == pid:
+            return True
+    refm = msg.get("referenced_message")
+    if isinstance(refm, dict):
+        rid = str(refm.get("id") or "").strip()
+        if rid == pid:
+            return True
+    return False
+
+
+def _message_correlates_to_command(
+    msg: dict,
+    *,
+    reply_to_message_id: str = "",
+    must_contain_in_blob: str = "",
+    anchor_message_ids: set[str] | None = None,
+) -> bool:
+    """
+    When watching a busy shared channel, ignore monitor-bot posts meant for someone else's command.
+    Accept if the message replies to our command id (or a prior correlated bot message in the same
+    thread), and/or embed/content/attachment filename contains our SKU (etc.).
+    If neither filter is set, every message from the monitor author is eligible (legacy behavior).
+    """
+    anchors: set[str] = set(anchor_message_ids or [])
+    reply_to = str(reply_to_message_id or "").strip()
+    if reply_to:
+        anchors.add(reply_to)
+    needle = str(must_contain_in_blob or "").strip().lower()
+    if not anchors and not needle:
+        return True
+    if anchors and any(_message_replies_to(msg, a) for a in anchors if a):
+        return True
+    if needle and needle in _message_text_blob(msg):
+        return True
+    return False
+
+
+_M_COMMAND_STOP_RE = re.compile(r"^!m\s+(?:hdnation|lead)\b", re.IGNORECASE)
+
+
+def _hdnation_session_monitor_messages(
+    messages: list[dict],
+    *,
+    after_message_id: int,
+    command_message_id: str,
+    monitor_author_id: str,
+) -> list[dict]:
+    """
+    Monitor-bot messages after our command until the next !m hdnation/lead from anyone.
+    Tempo posts Processing, stock embed, and CSV as separate messages with no reply chain.
+    """
+    cmd_id = str(command_message_id or "").strip()
+    ordered = sorted(
+        (m for m in messages if isinstance(m, dict) and m.get("id")),
+        key=lambda m: int(str(m.get("id") or 0)),
+    )
+    stop_at: int | None = None
+    for m in ordered:
+        mid = int(str(m.get("id") or 0))
+        if mid <= after_message_id:
+            continue
+        if cmd_id and str(mid) == cmd_id:
+            continue
+        content = str(m.get("content") or "").strip()
+        if _M_COMMAND_STOP_RE.match(content):
+            stop_at = mid
+            break
+    session: list[dict] = []
+    for m in ordered:
+        mid = int(str(m.get("id") or 0))
+        if mid <= after_message_id:
+            continue
+        if stop_at is not None and mid >= stop_at:
+            break
+        if _message_author_user_id(m) == monitor_author_id:
+            session.append(m)
+    return session
+
+
+def wait_for_m_command_monitor_session(
+    observation_channel_id: str,
+    command_message_id: str,
+    token: str,
+    *,
+    author_user_id: str,
+    success_needles: list[str],
+    failure_needles: list[str],
+    maintenance_start_needles: list[str] | None = None,
+    maintenance_done_needles: list[str] | None = None,
+    maintenance_extend_seconds: float = 600.0,
+    timeout_seconds: float,
+    poll_interval_seconds: float = 2.0,
+) -> tuple[str, str]:
+    """
+    Wait for monitor-bot completion after !m lead or !m hdnation.
+
+    Tempo often posts multiple messages with no reply chain (Processing, embed, CSV for
+    hdnation; standalone Lead posted for lead). Collect monitor messages after our command
+    until the next !m hdnation/lead from anyone, then match success/failure needles.
+    """
+    aid = str(author_user_id or "").strip()
+    after = str(command_message_id or "").strip()
+    succ = [s.strip().lower() for s in success_needles if (s or "").strip()]
+    fail = [s.strip().lower() for s in failure_needles if (s or "").strip()]
+    maint_start = [
+        s.strip().lower()
+        for s in (maintenance_start_needles or [])
+        if (s or "").strip()
+    ]
+    maint_done = [
+        s.strip().lower()
+        for s in (maintenance_done_needles or [])
+        if (s or "").strip()
+    ]
+    if not aid or not after.isdigit():
+        return "error", "missing author_user_id or command_message_id"
+    if not succ:
+        return "error", "no success_substrings"
+    timeout = max(1.0, float(timeout_seconds))
+    poll = max(0.4, float(poll_interval_seconds))
+    deadline = time.monotonic() + timeout
+    maint_extend = max(0.0, float(maintenance_extend_seconds))
+    maint_active_until = 0.0
+    base = f"https://discord.com/api/v10/channels/{observation_channel_id.strip()}/messages"
+    after_i = int(after)
+    while time.monotonic() < deadline:
+        url = f"{base}?after={after}&limit=100"
+        r = discord_get(url, token)
+        if r.status_code != 200:
+            time.sleep(poll)
+            continue
+        data = r.json()
+        if not isinstance(data, list):
+            time.sleep(poll)
+            continue
+        session = _hdnation_session_monitor_messages(
+            data,
+            after_message_id=after_i,
+            command_message_id=after,
+            monitor_author_id=aid,
+        )
+        if maint_start or maint_done:
+            combined = "\n".join(_message_text_blob(m) for m in session)
+            if maint_start and any(x in combined for x in maint_start):
+                now = time.monotonic()
+                maint_active_until = max(maint_active_until, now + maint_extend)
+                deadline = max(deadline, maint_active_until)
+            if maint_done and any(x in combined for x in maint_done):
+                maint_active_until = 0.0
+        for m in session:
+            blob = _message_text_blob(m)
+            for fneedle in fail:
+                if fneedle in blob:
+                    return "fail", f"monitor: matched {fneedle!r}"
+        for m in session:
+            blob = _message_text_blob(m)
+            for sneedle in succ:
+                if sneedle in blob:
+                    return "ok", ""
+        time.sleep(poll)
+    return "timeout", f"timeout after {timeout:.0f}s waiting for monitor"
+
+
+# Backwards-compatible alias (hdnation_bulk_sender).
+wait_for_hdnation_stock_check = wait_for_m_command_monitor_session
+
+
 def wait_for_monitor_outcome(
     observation_channel_id: str,
     after_message_id: str,
@@ -1007,12 +1206,18 @@ def wait_for_monitor_outcome(
     maintenance_extend_seconds: float = 600.0,
     timeout_seconds: float,
     poll_interval_seconds: float = 2.0,
+    reply_to_message_id: str = "",
+    must_contain_in_blob: str = "",
 ) -> tuple[str, str]:
     """
     Poll for the monitor bot's next message(s) after after_message_id.
 
     For each new message from author_user_id (oldest first), checks failure_needles in the
     full text blob first, then success_needles.
+
+    Optional reply_to_message_id / must_contain_in_blob: ignore monitor messages that are not
+    replies to our command and do not mention the correlation substring (e.g. SKU) — for busy
+    shared command channels where other staff run commands at the same time.
 
     Returns:
       ("ok", "") — matched a success substring
@@ -1045,6 +1250,10 @@ def wait_for_monitor_outcome(
     maint_active_until = 0.0
     base = f"https://discord.com/api/v10/channels/{observation_channel_id.strip()}/messages"
     after_i = int(after)
+    anchor_ids: set[str] = set()
+    rt = str(reply_to_message_id or "").strip()
+    if rt:
+        anchor_ids.add(rt)
     while time.monotonic() < deadline:
         url = f"{base}?after={after}&limit=100"
         r = discord_get(url, token)
@@ -1063,6 +1272,16 @@ def wait_for_monitor_outcome(
                 continue
             if _message_author_user_id(m) != aid:
                 continue
+            if not _message_correlates_to_command(
+                m,
+                reply_to_message_id=reply_to_message_id,
+                must_contain_in_blob=must_contain_in_blob,
+                anchor_message_ids=anchor_ids,
+            ):
+                continue
+            mid_str = str(m.get("id") or "").strip()
+            if mid_str:
+                anchor_ids.add(mid_str)
             blob = _message_text_blob(m)
             # Maintenance / update mode: Tempo assistant can post "being updated" then later "has been updated".
             # When we see the start needle, extend the deadline and keep waiting instead of timing out.
