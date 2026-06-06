@@ -96,7 +96,7 @@
     "sms_number": "888222",
     "mention_everyone": true,
     "min_code_length": 6,
-    "max_code_length": 12,
+    "max_code_length": 24,
     "animated_emoji": "<a:pepevbcook:1412558017089503253>",
     "embed_title": "CODE DROPPED! ✅",
     "instruction": "**Click the link above on a mobile device!**"

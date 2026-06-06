@@ -412,20 +412,22 @@ class RSMentionPinger:
         if not text or not text.strip():
             return None
         min_len = int(cd.get("min_code_length", 6))
-        max_len = int(cd.get("max_code_length", 12))
+        max_len = int(cd.get("max_code_length", 24))
 
-        for match in re.finditer(
-            r"(?:sms://[^\s]*[?&]body=|(?:^|[?&])body=)([A-Za-z0-9]+)",
-            text,
+        # sms:888222?&body=CODE, sms://888222/?body=CODE, ?body=CODE, etc.
+        sms_body_re = re.compile(
+            r"(?:sms:?/+?[^\s]*[?&]body=|(?:^|[?&])body=)([A-Za-z0-9]+)",
             re.IGNORECASE,
-        ):
+        )
+        for match in sms_body_re.finditer(text):
             candidate = match.group(1).upper()
             if self._looks_like_promo_code(candidate, min_len=min_len, max_len=max_len):
                 return candidate
 
         upper = text.upper()
         candidates: List[str] = []
-        for match in re.finditer(r"(?<![A-Z0-9])([A-Z0-9]{6,12})(?![A-Z0-9])", upper):
+        token_re = re.compile(rf"(?<![A-Z0-9])([A-Z0-9]{{{min_len},{max_len}}})(?![A-Z0-9])")
+        for match in token_re.finditer(upper):
             token = match.group(1)
             if self._looks_like_promo_code(token, min_len=min_len, max_len=max_len):
                 candidates.append(token)
