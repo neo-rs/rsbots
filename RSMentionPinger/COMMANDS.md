@@ -73,6 +73,7 @@ RSMentionPinger monitors Discord channels for mentions of specific roles and sen
 - Help command does not auto-delete
 - Bot monitors channels for mentions of watched roles
 - Mentions in excluded categories are ignored
+- **Code drops:** In `code_drops.channel_id`, staff with `allowed_role_ids` can post a promo code (plain text, `code drop! XYZ`, `sms://888222/?body=XYZ`, etc.). The bot posts a formatted `@everyone` embed with SMS link, staff name/avatar, then deletes the original message.
 - Alerts are sent to the configured log channel
 - Configuration is stored in `config.json`
 - Bot requires `message_content` intent to read messages

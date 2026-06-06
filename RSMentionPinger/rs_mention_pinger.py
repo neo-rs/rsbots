@@ -11,6 +11,7 @@ Configuration is split across:
 import os
 import sys
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
@@ -34,6 +35,13 @@ MONITOR_BUTTONS_PER_VIEW = 25
 MONITOR_ROLE_PREFIX = "Monitor | "
 MONITOR_GRANULARITY_CATEGORY = "category"
 MONITOR_GRANULARITY_CHANNEL = "channel"
+
+# Tokens that look like promo codes but are normal words / noise in staff messages.
+_CODE_DROP_BLOCKLIST = frozenset({
+    "CHIPOTLE", "CODE", "DROP", "DROPPED", "TEXT", "MOBILE", "DEVICE", "CLICK",
+    "LINK", "ABOVE", "EVERYONE", "HTTPS", "HTTP", "SMS", "BODY", "GO", "FREE",
+    "PROMO", "REDEEM", "ALERT", "STAFF", "ADMIN", "TEST", "HELLO", "THANKS",
+})
 
 # Colors for terminal
 class Colors:
@@ -367,6 +375,192 @@ class RSMentionPinger:
             )
         else:
             print(f"{Colors.CYAN}[MonitorRoles] Member migration: nothing to change{Colors.RESET}")
+
+    # ----- Chipotle / promo code drop (staff posts code → formatted embed) -----
+
+    def _code_drops_config(self) -> Optional[dict]:
+        cd = self.config.get("code_drops")
+        if not isinstance(cd, dict) or not cd.get("enabled"):
+            return None
+        if not cd.get("channel_id"):
+            return None
+        return cd
+
+    def _code_drop_channel_id(self) -> Optional[int]:
+        cd = self._code_drops_config()
+        if not cd:
+            return None
+        try:
+            return int(cd["channel_id"])
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _looks_like_promo_code(token: str, *, min_len: int, max_len: int) -> bool:
+        if not (min_len <= len(token) <= max_len):
+            return False
+        if not re.fullmatch(r"[A-Z0-9]+", token):
+            return False
+        if not re.search(r"[A-Z]", token) or not re.search(r"[0-9]", token):
+            return False
+        if token in _CODE_DROP_BLOCKLIST:
+            return False
+        return True
+
+    def _extract_promo_code(self, text: str, cd: dict) -> Optional[str]:
+        """Find a Chipotle-style promo token in free-form staff text or sms:// links."""
+        if not text or not text.strip():
+            return None
+        min_len = int(cd.get("min_code_length", 6))
+        max_len = int(cd.get("max_code_length", 12))
+
+        for match in re.finditer(
+            r"(?:sms://[^\s]*[?&]body=|(?:^|[?&])body=)([A-Za-z0-9]+)",
+            text,
+            re.IGNORECASE,
+        ):
+            candidate = match.group(1).upper()
+            if self._looks_like_promo_code(candidate, min_len=min_len, max_len=max_len):
+                return candidate
+
+        upper = text.upper()
+        candidates: List[str] = []
+        for match in re.finditer(r"(?<![A-Z0-9])([A-Z0-9]{6,12})(?![A-Z0-9])", upper):
+            token = match.group(1)
+            if self._looks_like_promo_code(token, min_len=min_len, max_len=max_len):
+                candidates.append(token)
+        if not candidates:
+            return None
+        return max(candidates, key=len)
+
+    def _member_has_code_drop_role(self, member: discord.Member, cd: dict) -> bool:
+        allowed = cd.get("allowed_role_ids") or []
+        allowed_ids = {int(rid) for rid in allowed}
+        if not allowed_ids:
+            return False
+        return any(role.id in allowed_ids for role in member.roles)
+
+    def _build_code_drop_embed(
+        self,
+        code: str,
+        staff: discord.Member,
+        guild: discord.Guild,
+        cd: dict,
+    ) -> discord.Embed:
+        sms_number = str(cd.get("sms_number") or "888222")
+        animated_emoji = str(cd.get("animated_emoji") or "").strip()
+        title = str(cd.get("embed_title") or "CODE DROPPED! ✅")
+        instruction = str(
+            cd.get("instruction") or "**Click the link above on a mobile device!**"
+        )
+        sms_link = f"sms://{sms_number}/?body={code}"
+        line = f"[Text {code} to {sms_number}]({sms_link})"
+        description_parts = []
+        if animated_emoji:
+            description_parts.append(animated_emoji)
+        description_parts.append(line)
+        description_parts.append("")
+        description_parts.append(instruction)
+
+        embed = discord.Embed(
+            title=title,
+            description="\n".join(description_parts),
+            color=self.get_embed_color(),
+        )
+        embed.set_author(
+            name=str(staff.display_name),
+            icon_url=staff.display_avatar.url,
+        )
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+        footer = cd.get("embed_footer") or guild.name
+        if footer:
+            embed.set_footer(text=str(footer))
+        return embed
+
+    async def _handle_code_drop_message(self, message: discord.Message) -> bool:
+        """
+        Handle staff promo code posts in the configured drop channel.
+        Returns True if this channel is the code-drop channel (skip command processing).
+        """
+        cd = self._code_drops_config()
+        if not cd:
+            return False
+        try:
+            drop_channel_id = int(cd["channel_id"])
+        except (TypeError, ValueError):
+            return False
+        if message.channel.id != drop_channel_id:
+            return False
+
+        if message.author.bot:
+            print(
+                f"{Colors.CYAN}[CodeDrop] Ignored bot message id={message.id} in "
+                f"<#{drop_channel_id}>{Colors.RESET}"
+            )
+            return True
+
+        member = message.author if isinstance(message.author, discord.Member) else None
+        if member is None and message.guild:
+            member = message.guild.get_member(message.author.id)
+        if not isinstance(member, discord.Member):
+            print(
+                f"{Colors.YELLOW}[CodeDrop] Skipped message id={message.id}: author not a member{Colors.RESET}"
+            )
+            return True
+
+        preview = (message.content or "").replace("\n", " ")[:120]
+        print(
+            f"{Colors.CYAN}[CodeDrop] Saw message id={message.id} from {member.display_name} "
+            f"({member.id}) in <#{drop_channel_id}>: {preview!r}{Colors.RESET}"
+        )
+
+        if not self._member_has_code_drop_role(member, cd):
+            print(
+                f"{Colors.CYAN}[CodeDrop] Skipped message id={message.id}: "
+                f"{member.display_name} lacks allowed drop role{Colors.RESET}"
+            )
+            return True
+
+        code = self._extract_promo_code(message.content or "", cd)
+        if not code:
+            print(
+                f"{Colors.CYAN}[CodeDrop] Skipped message id={message.id}: "
+                f"no promo code detected{Colors.RESET}"
+            )
+            return True
+
+        sms_number = str(cd.get("sms_number") or "888222")
+        print(
+            f"{Colors.GREEN}[CodeDrop] Detected code {code!r} from {member.display_name} "
+            f"→ sms://{sms_number}/?body={code}{Colors.RESET}"
+        )
+
+        embed = self._build_code_drop_embed(code, member, message.guild, cd)
+        content = "@everyone" if cd.get("mention_everyone", True) else None
+        try:
+            await message.channel.send(content=content, embed=embed)
+            print(
+                f"{Colors.GREEN}[CodeDrop] Posted drop embed for {code!r} "
+                f"(staff={member.display_name}){Colors.RESET}"
+            )
+        except Exception as e:
+            print(
+                f"{Colors.RED}[CodeDrop] Failed to post drop for {code!r}: {e}{Colors.RESET}"
+            )
+            return True
+
+        try:
+            await message.delete()
+            print(
+                f"{Colors.GREEN}[CodeDrop] Deleted original message id={message.id}{Colors.RESET}"
+            )
+        except Exception as e:
+            print(
+                f"{Colors.RED}[CodeDrop] Posted drop but failed to delete original "
+                f"id={message.id}: {e}{Colors.RESET}"
+            )
+        return True
     
     def _first_image_from_message(self, message: discord.Message) -> Optional[str]:
         """Extract first image URL from message attachments or embeds."""
@@ -602,6 +796,20 @@ class _RSMentionPingerImpl:
                 print(f"   • Sends DM to users when they're mentioned")
                 print(f"   • Skips DMs in excluded categories")
                 print(f"   • Ignores bot mentions")
+
+                cd = self._code_drops_config()
+                if cd:
+                    drop_ch = guild.get_channel(int(cd["channel_id"]))
+                    ch_label = (
+                        f"{drop_ch.name} <#{cd['channel_id']}>"
+                        if drop_ch
+                        else f"not found <#{cd['channel_id']}>"
+                    )
+                    roles = cd.get("allowed_role_ids") or []
+                    print(f"{Colors.GREEN}🌯 Code Drops:{Colors.RESET} {Colors.BOLD}Enabled{Colors.RESET}")
+                    print(f"   Channel: {ch_label}")
+                    print(f"   Allowed roles: {len(roles)} role(s)")
+                    print(f"   SMS: {cd.get('sms_number', '888222')}")
             else:
                 print(f"{Colors.YELLOW}⚠️  Guild not found Guild-ID: {guild_id}{Colors.RESET}")
             
@@ -618,6 +826,15 @@ class _RSMentionPingerImpl:
             print(f"{Colors.CYAN}{'='*60}{Colors.RESET}\n")
         
         @self.bot.event
+        async def on_command_error(ctx, error):
+            # Mirror/lead tools post !m … lines into channels this bot reads; not our commands.
+            if isinstance(error, commands.CommandNotFound):
+                return
+            if isinstance(error, commands.NotOwner):
+                return
+            print(f"{Colors.RED}[Command] Error in {getattr(ctx.command, 'name', '?')}: {error}{Colors.RESET}")
+
+        @self.bot.event
         async def on_message(message: discord.Message):
             # Ignore bot messages and DMs
             if message.author.bot or message.guild is None:
@@ -628,6 +845,10 @@ class _RSMentionPingerImpl:
             guild_id = self.config.get("guild_id")
             if guild_id and message.guild.id != guild_id:
                 await self.bot.process_commands(message)
+                return
+
+            in_code_drop_channel = await self._handle_code_drop_message(message)
+            if in_code_drop_channel:
                 return
             
             # Log role mentions
