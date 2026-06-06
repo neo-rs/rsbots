@@ -455,16 +455,15 @@ class RSMentionPinger:
         )
         sms_link = f"sms://{sms_number}/?body={code}"
         line = f"[Text {code} to {sms_number}]({sms_link})"
-        description_parts = []
         if animated_emoji:
-            description_parts.append(animated_emoji)
-        description_parts.append(line)
-        description_parts.append("")
-        description_parts.append(instruction)
+            drop_line = f"{animated_emoji} {line}"
+        else:
+            drop_line = line
+        description = f"{drop_line}\n\n{instruction}"
 
         embed = discord.Embed(
             title=title,
-            description="\n".join(description_parts),
+            description=description,
             color=self.get_embed_color(),
         )
         embed.set_author(
