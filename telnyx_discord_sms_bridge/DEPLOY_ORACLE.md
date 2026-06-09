@@ -22,6 +22,27 @@ nano /home/rsadmin/bots/mirror-world/telnyx_discord_sms_bridge/.env
 
 Required keys: `TELNYX_API_KEY`, `TELNYX_FROM_NUMBER`, `DISCORD_WEBHOOK_URL`, `BRIDGE_API_KEY`.
 
+Conversation mode (phone-style threads + buttons) also needs:
+
+```env
+DISCORD_BOT_TOKEN=your_bot_token
+DISCORD_CHANNEL_ID_2540=channel_id_for_local_line
+DISCORD_CHANNEL_ID_2119=channel_id_for_toll_free_line
+```
+
+Optional legacy webhook fallback per line (if bot token missing):
+
+```env
+DISCORD_WEBHOOK_URL_2540=...
+DISCORD_WEBHOOK_URL_2119=...
+```
+
+Upload secrets without git:
+
+```bat
+scp_env_oracle.bat
+```
+
 ## Deploy workflow (Windows → Oracle)
 
 ### 1) Push code to GitHub

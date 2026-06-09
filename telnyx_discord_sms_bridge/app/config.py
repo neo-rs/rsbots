@@ -26,6 +26,8 @@ class AppConfig:
     telnyx_public_key: str | None
     telnyx_require_signature: bool
     discord_webhook_url: str
+    discord_bot_token: str | None
+    discord_line_channels: dict[str, int]
     bridge_api_key: str
     app_host: str
     app_port: int
@@ -51,6 +53,8 @@ class AppConfig:
             raise RuntimeError(f"Missing required environment value(s): {joined}")
 
         telnyx_from_number = normalize_e164(required["TELNYX_FROM_NUMBER"])
+        discord_bot_token = os.getenv("DISCORD_BOT_TOKEN", "").strip() or None
+        discord_line_channels = _load_line_channels(settings=settings)
 
         return cls(
             telnyx_api_key=required["TELNYX_API_KEY"],
@@ -60,6 +64,8 @@ class AppConfig:
             telnyx_public_key=os.getenv("TELNYX_PUBLIC_KEY", "").strip() or None,
             telnyx_require_signature=_bool_from_env(os.getenv("TELNYX_REQUIRE_SIGNATURE"), False),
             discord_webhook_url=required["DISCORD_WEBHOOK_URL"],
+            discord_bot_token=discord_bot_token,
+            discord_line_channels=discord_line_channels,
             bridge_api_key=required["BRIDGE_API_KEY"],
             app_host=os.getenv("APP_HOST", "0.0.0.0").strip(),
             app_port=int(os.getenv("APP_PORT", "8787")),
@@ -103,6 +109,43 @@ class AppConfig:
             joined = ", ".join(allowed)
             raise ValueError(f"from number not allowed: {normalized}. Allowed: {joined}")
         return normalized
+
+    def channel_id_for_line(self, our_line: str) -> int | None:
+        normalized = normalize_e164(our_line)
+        channel_id = self.discord_line_channels.get(normalized)
+        if channel_id:
+            return int(channel_id)
+        return None
+
+
+def _load_line_channels(*, settings: dict[str, Any]) -> dict[str, int]:
+    channels: dict[str, int] = {}
+    discord_cfg = settings.get("discord", {})
+    lines = discord_cfg.get("lines", {})
+    if isinstance(lines, dict):
+        for raw_number, entry in lines.items():
+            try:
+                number = normalize_e164(str(raw_number))
+            except ValueError:
+                continue
+            channel_id = 0
+            if isinstance(entry, dict):
+                channel_id = int(entry.get("channel_id") or 0)
+            if channel_id <= 0:
+                env_key = f"DISCORD_CHANNEL_ID_{''.join(ch for ch in number if ch.isdigit())}"
+                channel_id = int(os.getenv(env_key, "0") or "0")
+            if channel_id > 0:
+                channels[number] = channel_id
+
+    # Optional explicit env pair for the two known lines
+    for env_name, number in (
+        ("DISCORD_CHANNEL_ID_2540", "+15419202540"),
+        ("DISCORD_CHANNEL_ID_2119", "+18334882119"),
+    ):
+        raw = os.getenv(env_name, "").strip()
+        if raw.isdigit():
+            channels[normalize_e164(number)] = int(raw)
+    return channels
 
 
 def _load_json_config(path: Path) -> dict[str, Any]:

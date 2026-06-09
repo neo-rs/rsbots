@@ -1,4 +1,10 @@
 {
+  "conversations": {
+    "enabled": true,
+    "max_lines": 40,
+    "max_content_chars": 1900,
+    "data_file": "data/conversations.json"
+  },
   "discord": {
     "username": "Telnyx SMS Bridge",
     "avatar_url": "",
@@ -10,7 +16,19 @@
     "redact_phone_numbers": false,
     "inbound_color": 3066993,
     "outbound_color": 3447003,
-    "test_color": 5763719
+    "test_color": 5763719,
+    "lines": {
+      "+15419202540": {
+        "label": "Local line",
+        "channel_id": 0,
+        "webhook_url": ""
+      },
+      "+18334882119": {
+        "label": "Toll-free line",
+        "channel_id": 0,
+        "webhook_url": ""
+      }
+    }
   },
   "logging": {
     "redact_phone_numbers": true,

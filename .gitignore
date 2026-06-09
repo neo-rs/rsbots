@@ -246,6 +246,7 @@ telnyx_sms/inbound.json
 telnyx_discord_sms_bridge/.env
 telnyx_discord_sms_bridge/.venv/
 telnyx_discord_sms_bridge/logs/
+telnyx_discord_sms_bridge/data/
 
 # Amazon ASIN promo checker (standalone tool; secrets in .env)
 !amazon_asin_promo_checker/

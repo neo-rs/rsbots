@@ -1,24 +1,37 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import httpx
 
 from app.config import AppConfig
 from app.discord_format import format_message_block, format_party_line, format_route_summary
+from app.phone import normalize_e164
+
+if TYPE_CHECKING:
+    from app.conversation_service import ConversationService
 
 log = logging.getLogger("discord")
 
 
 class DiscordClient:
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig, *, conversations: "ConversationService | None" = None):
         self.config = config
+        self.conversations = conversations
 
-    async def post_inbound(self, *, telnyx_data: dict[str, Any]) -> None:
+    async def post_inbound(self, *, telnyx_data: dict[str, Any], from_number: str, to_number: str, text: str) -> None:
+        if self._use_conversations():
+            await self.conversations.record_inbound(  # type: ignore[union-attr]
+                our_line=normalize_e164(to_number),
+                remote_party=normalize_e164(from_number),
+                text=text,
+            )
+            return
         payload = self._build_inbound_payload(telnyx_data)
-        await self._post(payload=payload, reason="inbound_message_forwarded")
+        await self._post_webhook(payload=payload, webhook_url=self._webhook_for_line(to_number), reason="inbound_message_forwarded")
 
     async def post_outbound_notice(
         self,
@@ -28,13 +41,21 @@ class DiscordClient:
         telnyx_response: dict[str, Any],
         from_number: str | None = None,
     ) -> None:
+        sender = from_number or self.config.telnyx_from_number
+        if self._use_conversations():
+            await self.conversations.record_outbound(  # type: ignore[union-attr]
+                our_line=normalize_e164(sender),
+                remote_party=normalize_e164(to_number),
+                text=text,
+            )
+            return
         payload = self._build_outbound_payload(
             to_number=to_number,
             text=text,
             telnyx_response=telnyx_response,
-            from_number=from_number,
+            from_number=sender,
         )
-        await self._post(payload=payload, reason="outbound_send_logged")
+        await self._post_webhook(payload=payload, webhook_url=self._webhook_for_line(sender), reason="outbound_send_logged")
 
     async def post_test(self) -> None:
         discord_cfg = self.config.settings.get("discord", {})
@@ -45,26 +66,47 @@ class DiscordClient:
                 {
                     "title": "✅ Bridge Connected",
                     "description": (
-                        "Discord webhook is working.\n"
-                        "Outbound SMS can post here.\n"
-                        "For inbound SMS, point your Telnyx Messaging Profile webhook to "
-                        "`https://YOUR_PUBLIC_DOMAIN/webhooks/telnyx`."
+                        "Discord is configured.\n"
+                        "Conversation mode uses the bot token when set.\n"
+                        "Inbound Telnyx webhook: `https://YOUR_PUBLIC_DOMAIN/webhooks/telnyx`"
                     ),
                     "color": int(discord_cfg.get("test_color", 5763719)),
                     "fields": [
                         {"name": "Status", "value": "OK", "inline": True},
-                        {"name": "Check", "value": "Discord delivery", "inline": True},
+                        {"name": "Bot mode", "value": "on" if self.config.discord_bot_token else "off", "inline": True},
                     ],
                     "footer": {"text": "Telnyx SMS Bridge • setup test"},
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
             ],
         }
-        await self._post(payload=payload, reason="manual_discord_test")
+        await self._post_webhook(payload=payload, webhook_url=self.config.discord_webhook_url, reason="manual_discord_test")
 
-    async def _post(self, *, payload: dict[str, Any], reason: str) -> None:
+    def _use_conversations(self) -> bool:
+        return bool(self.conversations and self.conversations.conversations_enabled())
+
+    def _webhook_for_line(self, our_line: str) -> str:
+        number = normalize_e164(our_line)
+        discord_cfg = self.config.settings.get("discord", {})
+        lines = discord_cfg.get("lines", {})
+        if isinstance(lines, dict):
+            entry = lines.get(number)
+            if isinstance(entry, dict):
+                url = str(entry.get("webhook_url") or "").strip()
+                if url:
+                    return url
+        digits = "".join(ch for ch in number if ch.isdigit())
+        for suffix in (digits, digits[-4:] if len(digits) >= 4 else ""):
+            if not suffix:
+                continue
+            env_url = os.getenv(f"DISCORD_WEBHOOK_URL_{suffix}", "").strip()
+            if env_url:
+                return env_url
+        return self.config.discord_webhook_url
+
+    async def _post_webhook(self, *, payload: dict[str, Any], webhook_url: str, reason: str) -> None:
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(self.config.discord_webhook_url, json=payload)
+            response = await client.post(webhook_url, json=payload)
 
         if response.status_code >= 400:
             log.error(
@@ -75,11 +117,7 @@ class DiscordClient:
             )
             raise RuntimeError(f"Discord webhook failed with status {response.status_code}")
 
-        log.info(
-            "event=discord_post_success reason=%s status=%s",
-            reason,
-            response.status_code,
-        )
+        log.info("event=discord_post_success reason=%s status=%s", reason, response.status_code)
 
     def _discord_display_settings(self) -> dict[str, Any]:
         discord_cfg = self.config.settings.get("discord", {})

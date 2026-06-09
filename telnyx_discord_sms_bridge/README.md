@@ -70,6 +70,8 @@ https://YOUR_PUBLIC_DOMAIN/webhooks/telnyx
 
 ## Discord setup
 
+### Webhook (legacy / fallback)
+
 1. Open Discord channel settings.
 2. Go to Integrations -> Webhooks.
 3. Create a webhook.
@@ -78,6 +80,30 @@ https://YOUR_PUBLIC_DOMAIN/webhooks/telnyx
 ```env
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 ```
+
+### Conversation mode (recommended — phone-style threads + buttons)
+
+Use a **Discord bot** so each contact gets one editable message with **Send message** and **Edit name** buttons.
+
+1. [Discord Developer Portal](https://discord.com/developers/applications) → New Application → Bot → copy token.
+2. Invite the bot to your server (needs **View Channel**, **Send Messages**, **Read Message History** in both SMS channels).
+3. Enable Developer Mode in Discord → right-click each SMS channel → **Copy Channel ID**.
+4. Add to `.env`:
+
+```env
+DISCORD_BOT_TOKEN=your_bot_token
+DISCORD_CHANNEL_ID_2540=channel_id_for_+15419202540
+DISCORD_CHANNEL_ID_2119=channel_id_for_+18334882119
+```
+
+Optional per-line webhook fallback if the bot is offline:
+
+```env
+DISCORD_WEBHOOK_URL_2540=...
+DISCORD_WEBHOOK_URL_2119=...
+```
+
+With conversation mode on (`config/settings.json` → `conversations.enabled: true`), inbound SMS appends to the contact’s thread and outbound replies update the same card. Thread state is stored in `data/conversations.json` (not synced to git).
 
 ## Outbound SMS
 
@@ -121,6 +147,11 @@ LOG_LEVEL=INFO
 TELNYX_PUBLIC_KEY=
 TELNYX_REQUIRE_SIGNATURE=false
 TELNYX_MESSAGING_PROFILE_ID=
+DISCORD_BOT_TOKEN=
+DISCORD_CHANNEL_ID_2540=
+DISCORD_CHANNEL_ID_2119=
+DISCORD_WEBHOOK_URL_2540=
+DISCORD_WEBHOOK_URL_2119=
 ```
 
 ## Webhook signature verification
@@ -167,4 +198,4 @@ This is a new standalone bridge, so no existing code was removed or replaced.
 
 - Removed: none
 - Replaced: none
-- Canonical owner now: `app/main.py` for inbound/outbound routing, `app/config.py` for config, `app/discord_client.py` for Discord posting, `app/telnyx_client.py` for Telnyx sends
+- Canonical owner now: `app/main.py` for inbound/outbound routing, `app/config.py` for config, `app/discord_client.py` for Discord posting (webhook fallback), `app/conversation_service.py` + `app/discord_bot_runner.py` for bot threads/buttons, `app/telnyx_client.py` for Telnyx sends

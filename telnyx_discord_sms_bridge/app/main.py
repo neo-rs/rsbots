@@ -1,18 +1,37 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from app.config import AppConfig
-from app.discord_client import DiscordClient
 from app.logging_setup import setup_logging
 from app.redact import redact_phone, safe_preview
-from app.telnyx_client import TelnyxClient
+from app.runtime import BridgeRuntime
 from app.telnyx_signature import verify_telnyx_signature
+
+runtime = BridgeRuntime.build()
+setup_logging(runtime.config.log_level)
+
+log = logging.getLogger("main")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    log.info(
+        "event=bridge_startup conversation_mode=%s discord_bot=%s",
+        runtime.conversations.conversations_enabled(),
+        bool(runtime.discord_bot),
+    )
+    await runtime.start_discord_bot()
+    yield
+    await runtime.stop_discord_bot()
+
+
+app = FastAPI(title="Telnyx Discord SMS Bridge", lifespan=lifespan)
 
 
 class SendSmsRequest(BaseModel):
@@ -22,16 +41,6 @@ class SendSmsRequest(BaseModel):
         default=None,
         description="Optional Telnyx sender number. Defaults to TELNYX_FROM_NUMBER.",
     )
-
-
-config = AppConfig.load()
-setup_logging(config.log_level)
-
-log = logging.getLogger("main")
-app = FastAPI(title="Telnyx Discord SMS Bridge")
-
-telnyx = TelnyxClient(config)
-discord = DiscordClient(config)
 
 
 @app.get("/health")
@@ -48,11 +57,11 @@ async def telnyx_webhook(
     raw_body = await request.body()
 
     signature_ok = verify_telnyx_signature(
-        public_key_hex=config.telnyx_public_key,
+        public_key_hex=runtime.config.telnyx_public_key,
         timestamp=telnyx_timestamp,
         signature_hex=telnyx_signature_ed25519,
         raw_body=raw_body,
-        require_signature=config.telnyx_require_signature,
+        require_signature=runtime.config.telnyx_require_signature,
     )
     if not signature_ok:
         raise HTTPException(status_code=401, detail="Invalid Telnyx webhook signature")
@@ -69,7 +78,7 @@ async def telnyx_webhook(
     from_number = _extract_from_number(payload_data)
     to_number = _extract_to_number(payload_data)
 
-    redaction_cfg = config.settings.get("logging", {})
+    redaction_cfg = runtime.config.settings.get("logging", {})
     redact_enabled = bool(redaction_cfg.get("redact_phone_numbers", True))
     visible_digits = int(redaction_cfg.get("phone_visible_last_digits", 4))
 
@@ -81,7 +90,12 @@ async def telnyx_webhook(
         safe_preview(text),
     )
 
-    await discord.post_inbound(telnyx_data=data)
+    await runtime.discord.post_inbound(
+        telnyx_data=data,
+        from_number=from_number,
+        to_number=to_number,
+        text=text,
+    )
     return {"status": "ok"}
 
 
@@ -90,22 +104,22 @@ async def send_sms(
     body: SendSmsRequest,
     x_bridge_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    if not x_bridge_key or x_bridge_key != config.bridge_api_key:
+    if not x_bridge_key or x_bridge_key != runtime.config.bridge_api_key:
         log.warning("event=outbound_rejected reason=invalid_bridge_key")
         raise HTTPException(status_code=401, detail="Invalid bridge key")
 
     try:
-        from_number = config.resolve_from_number(body.from_number)
+        from_number = runtime.config.resolve_from_number(body.from_number)
     except ValueError as exc:
         log.warning("event=outbound_rejected reason=invalid_from_number error=%s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    telnyx_response = await telnyx.send_sms(
+    telnyx_response = await runtime.telnyx.send_sms(
         to_number=body.to,
         text=body.text,
         from_number=from_number,
     )
-    await discord.post_outbound_notice(
+    await runtime.discord.post_outbound_notice(
         to_number=body.to,
         text=body.text,
         telnyx_response=telnyx_response,
@@ -115,8 +129,6 @@ async def send_sms(
 
 
 def _extract_telnyx_data(event: dict[str, Any]) -> dict[str, Any]:
-    # Telnyx webhooks usually place message data under data.
-    # This helper is the single source of truth for accepting either full event or direct data payload.
     if isinstance(event.get("data"), dict):
         return event["data"]
     return event
@@ -143,9 +155,10 @@ def _extract_to_number(payload_data: dict[str, Any]) -> str:
 
 if __name__ == "__main__":
     log.info(
-        "event=server_start reason=operator_started_bridge host=%s port=%s signature_required=%s",
-        config.app_host,
-        config.app_port,
-        config.telnyx_require_signature,
+        "event=server_start reason=operator_started_bridge host=%s port=%s signature_required=%s bot_mode=%s",
+        runtime.config.app_host,
+        runtime.config.app_port,
+        runtime.config.telnyx_require_signature,
+        runtime.conversations.conversations_enabled(),
     )
-    uvicorn.run("app.main:app", host=config.app_host, port=config.app_port, reload=False)
+    uvicorn.run("app.main:app", host=runtime.config.app_host, port=runtime.config.app_port, reload=False)
