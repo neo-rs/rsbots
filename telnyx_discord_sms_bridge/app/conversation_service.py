@@ -30,16 +30,12 @@ class ConversationService:
         return bool(conv.get("enabled", True)) and bool(self.config.discord_bot_token)
 
     async def record_inbound(self, *, our_line: str, remote_party: str, text: str) -> None:
-        our = normalize_e164(our_line)
-        remote = normalize_e164(remote_party)
-        if self._is_own_line_echo_inbound(our_line=our, remote_party=remote, text=text):
-            log.info(
-                "event=inbound_skipped reason=own_line_delivery_echo from=%s to=%s",
-                remote,
-                our,
-            )
-            return
-        await self._record(our_line=our, remote_party=remote, text=text, direction="in")
+        await self._record(
+            our_line=normalize_e164(our_line),
+            remote_party=normalize_e164(remote_party),
+            text=text,
+            direction="in",
+        )
 
     async def record_outbound(self, *, our_line: str, remote_party: str, text: str) -> None:
         await self._record(our_line=our_line, remote_party=remote_party, text=text, direction="out")
@@ -167,24 +163,6 @@ class ConversationService:
             await self._sync_discord_message(our_line=our_line, remote_party=remote_party)
             count += 1
         return count
-
-    def _is_own_line_echo_inbound(self, *, our_line: str, remote_party: str, text: str) -> bool:
-        """Skip inbound when another Telnyx line we own just sent the same text."""
-        allowed = set(self.config.allowed_from_numbers())
-        if remote_party not in allowed:
-            return False
-        sender_key = thread_key(our_line=remote_party, remote_party=our_line)
-        thread = self.store.get_thread(sender_key)
-        if not thread:
-            return False
-        lines = list(thread.get("lines") or [])
-        if not lines:
-            return False
-        last = lines[-1]
-        return (
-            str(last.get("direction") or "") == "out"
-            and str(last.get("text") or "").strip() == str(text or "").strip()
-        )
 
     def parse_custom_id(self, custom_id: str) -> tuple[str, str] | None:
         # telnyx:send:5419202540|5551234567  or telnyx:rename:...
