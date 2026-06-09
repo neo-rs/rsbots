@@ -1,0 +1,19 @@
+{
+  "data": {
+    "event_type": "message.received",
+    "id": "example-event-id",
+    "payload": {
+      "id": "example-message-id",
+      "from": {
+        "phone_number": "+15550001111"
+      },
+      "to": [
+        {
+          "phone_number": "+15550002222"
+        }
+      ],
+      "text": "This is a sample inbound SMS.",
+      "media": []
+    }
+  }
+}

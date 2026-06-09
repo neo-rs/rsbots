@@ -37,6 +37,7 @@ units=(
   "mirror-world-whopmembershipsync.service"
   "mirror-world-catalognavbot.service"
   "mirror-world-amazonasinchecker.service"
+  "mirror-world-telnyx-discord-sms-bridge.service"
 )
 
 echo "Bootstrapping shared venv..."

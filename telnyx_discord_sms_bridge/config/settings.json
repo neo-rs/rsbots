@@ -1,0 +1,33 @@
+{
+  "discord": {
+    "username": "Telnyx SMS Bridge",
+    "avatar_url": "",
+    "inbound_title": "📨 Inbound SMS",
+    "outbound_title": "📤 Outbound SMS Sent",
+    "include_telnyx_ids": true,
+    "show_number_labels": true,
+    "show_formatted_numbers": true,
+    "redact_phone_numbers": false,
+    "inbound_color": 3066993,
+    "outbound_color": 3447003,
+    "test_color": 5763719
+  },
+  "logging": {
+    "redact_phone_numbers": true,
+    "phone_visible_last_digits": 4
+  },
+  "sms": {
+    "allow_mms_notice": true,
+    "max_discord_text_chars": 1800,
+    "from_numbers": [
+      {
+        "label": "Local line",
+        "number": "+15419202540"
+      },
+      {
+        "label": "Toll-free line",
+        "number": "+18334882119"
+      }
+    ]
+  }
+}

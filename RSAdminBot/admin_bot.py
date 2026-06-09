@@ -3271,6 +3271,12 @@ class RSAdminBot:
             "folder": "amazon_asin_promo_checker",
             "script": "discord_bot.py",
         },
+        "telnyxsmsbridge": {
+            "name": "Telnyx SMS Bridge",
+            "service": "mirror-world-telnyx-discord-sms-bridge.service",
+            "folder": "telnyx_discord_sms_bridge",
+            "script": "app/main.py",
+        },
         "rsforwarder": {
             "name": "RS Forwarder",
             "service": "mirror-world-rsforwarder.service",

@@ -139,9 +139,38 @@ $CHROME_BIN --version || true
 echo "Profile: $PROFILE_DIR"
 echo "CDP: http://127.0.0.1:9222"
 
+cdp_listening() {
+  curl -sf http://127.0.0.1:9222/json/version >/dev/null 2>&1
+}
+
+profile_chrome_running() {
+  pgrep -af -- "--user-data-dir=${PROFILE_DIR}" 2>/dev/null | grep -q 'remote-debugging-port=9222'
+}
+
+# Never launch a second Chrome for the same profile (causes stacked blank windows in noVNC).
+if cdp_listening; then
+  echo "OK: CDP already on :9222; not launching another Chrome."
+  exit 0
+fi
+if profile_chrome_running; then
+  echo "Chrome with this profile is already running; waiting for CDP (not starting a duplicate)..."
+  for _ in $(seq 1 20); do
+    if cdp_listening; then
+      echo "OK: CDP is up."
+      exit 0
+    fi
+    sleep 1
+  done
+  echo "WARNING: Profile Chrome running but CDP not ready; exiting without a duplicate launch."
+  exit 0
+fi
+
 EXTRA_ARGS=()
+NAV_ARGS=()
 if [[ "$HEADED" == "yes" ]]; then
   echo "Mode: HEADED (requires DISPLAY/noVNC/X11)"
+  # Fill the Xvfb desktop in noVNC (otherwise Chrome opens a small window in a corner).
+  EXTRA_ARGS+=(--start-maximized --window-size=1680,1500)
   detect_xvfb_display() {
     # Example: Xvfb :1 -screen 0 ...
     local line disp
@@ -172,6 +201,15 @@ else
   EXTRA_ARGS+=(--headless=new)
 fi
 
+# Opening a URL on every restart adds a Google tab + "Restore pages?" noise in noVNC.
+# Only navigate on first profile creation; existing profiles keep their session/tabs.
+if [[ ! -f "$PROFILE_DIR/Default/Preferences" ]]; then
+  NAV_ARGS=("$START_URL")
+  echo "First-run profile: opening $START_URL"
+else
+  echo "Existing profile: not forcing $START_URL (avoids extra tab on restart)"
+fi
+
 $CHROME_BIN \
   "${EXTRA_ARGS[@]}" \
   --remote-debugging-address=127.0.0.1 \
@@ -181,5 +219,5 @@ $CHROME_BIN \
   --no-default-browser-check \
   --disable-dev-shm-usage \
   --no-sandbox \
-  "$START_URL"
+  "${NAV_ARGS[@]}"
 

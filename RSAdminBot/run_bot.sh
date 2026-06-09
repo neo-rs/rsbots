@@ -157,9 +157,13 @@ case "$BOT_KEY" in
     cd "$ROOT_DIR/amazon_asin_promo_checker"
     exec "$PY" -u "discord_bot.py"
     ;;
+  telnyxsmsbridge)
+    cd "$ROOT_DIR/telnyx_discord_sms_bridge"
+    exec "$ROOT_DIR/telnyx_discord_sms_bridge/.venv/bin/python" -m app.main
+    ;;
   *)
     echo "ERROR: Unknown bot_key: $BOT_KEY"
-    echo "Valid bot_key values: rsadminbot rsforwarder rsonboarding rscheckerbot rsmentionpinger rssuccessbot rspromobot rscashoutbot rschannelrelay datamanagerbot discumbot instorebotforwarder pingbot dailyschedulereminder whopmembershipsync catalognavbot amazonasinchecker"
+    echo "Valid bot_key values: rsadminbot rsforwarder rsonboarding rscheckerbot rsmentionpinger rssuccessbot rspromobot rscashoutbot rschannelrelay datamanagerbot discumbot instorebotforwarder pingbot dailyschedulereminder whopmembershipsync catalognavbot amazonasinchecker telnyxsmsbridge"
     exit 1
     ;;
 esac

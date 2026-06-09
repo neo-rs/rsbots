@@ -1,0 +1,93 @@
+# Oracle deploy (canonical)
+
+Live path on Oracle:
+
+```txt
+/home/rsadmin/bots/mirror-world/telnyx_discord_sms_bridge
+```
+
+Public inbound webhook URL (already wired via nginx on this server):
+
+```txt
+https://137.131.14.157.sslip.io/webhooks/telnyx
+```
+
+## One-time server secrets
+
+Create `.env` on the server (never commit):
+
+```bash
+nano /home/rsadmin/bots/mirror-world/telnyx_discord_sms_bridge/.env
+```
+
+Required keys: `TELNYX_API_KEY`, `TELNYX_FROM_NUMBER`, `DISCORD_WEBHOOK_URL`, `BRIDGE_API_KEY`.
+
+## Deploy workflow (Windows → Oracle)
+
+### 1) Push code to GitHub
+
+From repo root:
+
+```bat
+push_rsbots_py_only.bat
+```
+
+### 2) Deploy to Oracle
+
+Fast path (upload from this PC):
+
+```bat
+update_telnyx_bridge.bat
+```
+
+Git-based path (after push, uses `rsbots-code` on server):
+
+```bat
+py -3 scripts\run_oracle_update_bots.py --group rs --bot telnyxsmsbridge
+```
+
+Then on server (first time or after unit/nginx changes):
+
+```bash
+bash /home/rsadmin/bots/mirror-world/telnyx_discord_sms_bridge/install_oracle.sh
+```
+
+### 3) Restart / status
+
+```bash
+sudo systemctl restart mirror-world-telnyx-discord-sms-bridge.service
+sudo systemctl status mirror-world-telnyx-discord-sms-bridge.service
+journalctl -u mirror-world-telnyx-discord-sms-bridge -f
+```
+
+Or via RSAdminBot:
+
+```txt
+!botctl restart telnyxsmsbridge
+```
+
+## Telnyx Messaging Profile webhook
+
+In Telnyx → Messaging → **Reselling Secrets SMS** → set:
+
+| Field | Value |
+|-------|-------|
+| Webhook URL | `https://137.131.14.157.sslip.io/webhooks/telnyx` |
+| Webhook API version | `2` |
+
+This replaces the old n8n URL (`https://n8n.ie-manage.com/webhook/send-message`) if you want inbound SMS in Discord.
+
+## Verify
+
+```bash
+curl http://127.0.0.1:8787/health
+curl -i https://137.131.14.157.sslip.io/webhooks/telnyx
+```
+
+Send a test SMS to either Telnyx number; Discord should show an **📨 Inbound SMS** embed.
+
+## Cleanup report
+
+- **Removed:** manual-only deploy notes without git/update path
+- **Replaced:** ad-hoc systemd paste with `install_oracle.sh` + `mirror-world-telnyx-discord-sms-bridge.service`
+- **Canonical:** `scripts/run_oracle_deploy_telnyx_bridge.py`, `update_telnyx_bridge.bat`, `install_oracle.sh`

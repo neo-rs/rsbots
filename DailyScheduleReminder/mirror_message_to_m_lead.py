@@ -45,9 +45,9 @@ import os
 import re
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from datetime import date, datetime, time as dt_time, timezone
 from pathlib import Path
-from typing import Iterator
 from urllib.parse import quote
 
 _BOT_DIR = Path(__file__).resolve().parent
@@ -816,6 +816,118 @@ def list_messages_after(
     return out
 
 
+DISCORD_EPOCH_MS = 1420070400000
+
+
+def snowflake_to_datetime_utc(snowflake_id: str | int) -> datetime | None:
+    """Discord snowflake -> UTC datetime (for checkpoint / date display)."""
+    s = str(snowflake_id or "").strip()
+    if not s.isdigit():
+        return None
+    ms = (int(s) >> 22) + DISCORD_EPOCH_MS
+    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+
+
+def snowflake_to_local_date_str(snowflake_id: str | int) -> str:
+    """Local calendar date for a Discord message id, or \"\"."""
+    dt = snowflake_to_datetime_utc(snowflake_id)
+    if not dt:
+        return ""
+    return dt.astimezone().strftime("%Y-%m-%d")
+
+
+def message_timestamp_local(msg: dict) -> datetime | None:
+    """Parse Discord message timestamp to local timezone."""
+    raw = str(msg.get("timestamp") or "").strip()
+    if not raw:
+        mid = str(msg.get("id") or "").strip()
+        if mid.isdigit():
+            return snowflake_to_datetime_utc(mid)
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        return None
+
+
+def list_messages_before(
+    channel_id: str,
+    token: str,
+    *,
+    before_message_id: str = "",
+    limit: int = 100,
+) -> list[dict]:
+    """
+    Channel history page, newest first (Discord default order).
+    Optional before_message_id for pagination into older messages.
+    """
+    lim = max(1, min(100, int(limit)))
+    base = f"https://discord.com/api/v10/channels/{channel_id.strip()}/messages?limit={lim}"
+    before = str(before_message_id or "").strip()
+    if before.isdigit():
+        base += f"&before={before}"
+    r = discord_get(base, token)
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"list_messages_before HTTP {r.status_code}: {(r.text or '')[:280]}"
+        )
+    data = r.json()
+    if not isinstance(data, list):
+        return []
+    return [m for m in data if isinstance(m, dict) and m.get("id")]
+
+
+def find_first_message_on_or_after_date(
+    channel_id: str,
+    target_date: date,
+    token: str,
+) -> dict | None:
+    """
+    First Mirror channel message on or after local midnight on target_date.
+    Paginates backward from newest until history before that day is found.
+    """
+    tz = datetime.now().astimezone().tzinfo
+    day_start = datetime.combine(target_date, dt_time.min, tzinfo=tz)
+    before_id = ""
+    best: dict | None = None
+    while True:
+        batch = list_messages_before(channel_id, token, before_message_id=before_id, limit=100)
+        if not batch:
+            return best
+        hit_before_day = False
+        for m in batch:
+            dt = message_timestamp_local(m)
+            if dt is None:
+                continue
+            if dt >= day_start:
+                best = m
+            else:
+                hit_before_day = True
+                break
+        if hit_before_day:
+            return best
+        before_id = str(batch[-1].get("id") or "")
+        if not before_id.isdigit():
+            return best
+
+
+def resolve_channel_guild_id(channel_id: str, token: str) -> str:
+    """Guild id for a Mirror World channel (for jump links / checkpoint)."""
+    cid = str(channel_id or "").strip()
+    if not cid.isdigit():
+        return ""
+    r = discord_get(f"https://discord.com/api/v10/channels/{cid}", token)
+    if r.status_code != 200:
+        return ""
+    try:
+        data = r.json()
+        if isinstance(data, dict):
+            return str(data.get("guild_id") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
 def iter_channel_forward_from_start(
     start_message: dict,
     channel_id: str,
@@ -1065,6 +1177,53 @@ def _message_correlates_to_command(
 
 _M_COMMAND_STOP_RE = re.compile(r"^!m\s+(?:hdnation|lead)\b", re.IGNORECASE)
 
+# Tempo monitor update banners (not lead/stock-check completion).
+_TEMPO_UPDATE_BLOB_NEEDLES = (
+    "new update",
+    "stock checker updated",
+    "tempo monitors",
+    "tempo assistant",
+)
+
+_discord_user_id_cache: dict[str, str] = {}
+
+
+def resolve_discord_user_id(token: str) -> str:
+    """GET /users/@me once per token; returns user id string or \"\"."""
+    t = (token or "").strip()
+    if not t:
+        return ""
+    if t in _discord_user_id_cache:
+        return _discord_user_id_cache[t]
+    r = discord_get("https://discord.com/api/v10/users/@me", t)
+    if r.status_code != 200:
+        return ""
+    try:
+        data = r.json()
+        uid = str(data.get("id") or "").strip() if isinstance(data, dict) else ""
+    except Exception:
+        uid = ""
+    if uid:
+        _discord_user_id_cache[t] = uid
+    return uid
+
+
+def _message_is_tempo_maintenance_or_update(
+    blob: str,
+    *,
+    maint_start: list[str],
+    maint_done: list[str],
+) -> bool:
+    """True for Tempo update/maintenance banners — never treat as lead/stock success."""
+    b = (blob or "").lower()
+    if any(x in b for x in maint_start):
+        return True
+    if any(x in b for x in maint_done):
+        return True
+    if any(x in b for x in _TEMPO_UPDATE_BLOB_NEEDLES):
+        return True
+    return False
+
 
 def _hdnation_session_monitor_messages(
     messages: list[dict],
@@ -1072,10 +1231,14 @@ def _hdnation_session_monitor_messages(
     after_message_id: int,
     command_message_id: str,
     monitor_author_id: str,
+    stop_on_command_author_id: str = "",
 ) -> list[dict]:
     """
     Monitor-bot messages after our command until the next !m hdnation/lead from anyone.
     Tempo posts Processing, stock embed, and CSV as separate messages with no reply chain.
+
+    When stop_on_command_author_id is set, only that user's !m commands end the session
+    (ignores other staff posting in the same channel during our wait).
     """
     cmd_id = str(command_message_id or "").strip()
     ordered = sorted(
@@ -1091,6 +1254,9 @@ def _hdnation_session_monitor_messages(
             continue
         content = str(m.get("content") or "").strip()
         if _M_COMMAND_STOP_RE.match(content):
+            stop_author = str(stop_on_command_author_id or "").strip()
+            if stop_author and _message_author_user_id(m) != stop_author:
+                continue
             stop_at = mid
             break
     session: list[dict] = []
@@ -1116,18 +1282,25 @@ def wait_for_m_command_monitor_session(
     maintenance_start_needles: list[str] | None = None,
     maintenance_done_needles: list[str] | None = None,
     maintenance_extend_seconds: float = 600.0,
+    maintenance_post_done_grace_seconds: float = 180.0,
     timeout_seconds: float,
     poll_interval_seconds: float = 2.0,
+    command_author_user_id: str = "",
+    on_status: Callable[[str], None] | None = None,
 ) -> tuple[str, str]:
     """
     Wait for monitor-bot completion after !m lead or !m hdnation.
 
     Tempo often posts multiple messages with no reply chain (Processing, embed, CSV for
     hdnation; standalone Lead posted for lead). Collect monitor messages after our command
-    until the next !m hdnation/lead from anyone, then match success/failure needles.
+    until the next !m hdnation/lead (from command_author_user_id when set), then match
+    success/failure needles.
+
+    Tempo maintenance/update banners extend the deadline instead of counting as success.
     """
     aid = str(author_user_id or "").strip()
     after = str(command_message_id or "").strip()
+    cmd_author = str(command_author_user_id or "").strip()
     succ = [s.strip().lower() for s in success_needles if (s or "").strip()]
     fail = [s.strip().lower() for s in failure_needles if (s or "").strip()]
     maint_start = [
@@ -1146,11 +1319,19 @@ def wait_for_m_command_monitor_session(
         return "error", "no success_substrings"
     timeout = max(1.0, float(timeout_seconds))
     poll = max(0.4, float(poll_interval_seconds))
-    deadline = time.monotonic() + timeout
     maint_extend = max(0.0, float(maintenance_extend_seconds))
-    maint_active_until = 0.0
+    post_done_grace = max(30.0, float(maintenance_post_done_grace_seconds))
+    deadline = time.monotonic() + timeout
+    started_at = time.monotonic()
     base = f"https://discord.com/api/v10/channels/{observation_channel_id.strip()}/messages"
     after_i = int(after)
+    seen_monitor_ids: set[str] = set()
+    maintenance_extended = False
+
+    def _status(msg: str) -> None:
+        if on_status:
+            on_status(msg)
+
     while time.monotonic() < deadline:
         url = f"{base}?after={after}&limit=100"
         r = discord_get(url, token)
@@ -1166,27 +1347,46 @@ def wait_for_m_command_monitor_session(
             after_message_id=after_i,
             command_message_id=after,
             monitor_author_id=aid,
+            stop_on_command_author_id=cmd_author,
         )
-        if maint_start or maint_done:
-            combined = "\n".join(_message_text_blob(m) for m in session)
-            if maint_start and any(x in combined for x in maint_start):
-                now = time.monotonic()
-                maint_active_until = max(maint_active_until, now + maint_extend)
-                deadline = max(deadline, maint_active_until)
-            if maint_done and any(x in combined for x in maint_done):
-                maint_active_until = 0.0
         for m in session:
+            mid_str = str(m.get("id") or "").strip()
+            if not mid_str:
+                continue
             blob = _message_text_blob(m)
+            is_new = mid_str not in seen_monitor_ids
+            if is_new:
+                seen_monitor_ids.add(mid_str)
+            if _message_is_tempo_maintenance_or_update(
+                blob, maint_start=maint_start, maint_done=maint_done
+            ):
+                if is_new:
+                    now = time.monotonic()
+                    if maint_start and any(x in blob for x in maint_start):
+                        deadline = max(deadline, now + maint_extend)
+                        maintenance_extended = True
+                        _status(
+                            f"monitor maintenance started; extended wait "
+                            f"(total budget ~{deadline - started_at:.0f}s)"
+                        )
+                    else:
+                        deadline = max(deadline, now + post_done_grace)
+                        maintenance_extended = True
+                        _status(
+                            f"monitor update notice; extended wait by {post_done_grace:.0f}s"
+                        )
+                continue
             for fneedle in fail:
                 if fneedle in blob:
                     return "fail", f"monitor: matched {fneedle!r}"
-        for m in session:
-            blob = _message_text_blob(m)
             for sneedle in succ:
                 if sneedle in blob:
                     return "ok", ""
         time.sleep(poll)
-    return "timeout", f"timeout after {timeout:.0f}s waiting for monitor"
+    extra = ""
+    if maintenance_extended:
+        extra = f" (maintenance extended; waited ~{deadline - started_at:.0f}s total)"
+    return "timeout", f"timeout after {timeout:.0f}s waiting for monitor{extra}"
 
 
 # Backwards-compatible alias (hdnation_bulk_sender).

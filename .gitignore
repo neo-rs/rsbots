@@ -15,6 +15,7 @@
 !/oracle_repo_drift_scan.bat
 !/update_rs_bots.bat
 !/update_mw_bots.bat
+!/update_telnyx_bridge.bat
 
 # Allow canonical docs at repo root
 !/CANONICAL_RULES.md
@@ -227,6 +228,24 @@ kit/*.csv
 !telnyx_sms/.env.example
 telnyx_sms/sent_ids.json
 telnyx_sms/inbound.json
+
+# Telnyx Discord SMS bridge (standalone service; secrets in .env)
+!telnyx_discord_sms_bridge/
+!telnyx_discord_sms_bridge/**/
+!telnyx_discord_sms_bridge/**/*.py
+!telnyx_discord_sms_bridge/*.py
+!telnyx_discord_sms_bridge/*.md
+!telnyx_discord_sms_bridge/*.bat
+!telnyx_discord_sms_bridge/*.sh
+!telnyx_discord_sms_bridge/*.json
+!telnyx_discord_sms_bridge/**/*.json
+!telnyx_discord_sms_bridge/deploy/
+!telnyx_discord_sms_bridge/deploy/**
+!telnyx_discord_sms_bridge/requirements.txt
+!telnyx_discord_sms_bridge/.env.example
+telnyx_discord_sms_bridge/.env
+telnyx_discord_sms_bridge/.venv/
+telnyx_discord_sms_bridge/logs/
 
 # Amazon ASIN promo checker (standalone tool; secrets in .env)
 !amazon_asin_promo_checker/

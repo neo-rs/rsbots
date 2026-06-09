@@ -15,8 +15,8 @@ message, appends a line to mirror_forward_hdnation_failures.jsonl for a later re
 continues to the next Mirror message without advancing the checkpoint.
 
 When post_confirmation is enabled, monitor waits use a session window: monitor-bot messages after
-our !m command until the next !m hdnation/lead in the channel (covers Lead posted and multi-message
-hdnation stock checks without reply chains).
+our !m command until our next !m hdnation/lead (other staff commands are ignored). Tempo
+maintenance/update banners extend the wait instead of counting as success or failure.
 
 Consecutive duplicate guard (default on): skips when the previous channel message had the same
 parsed UPC/TCIN/SKU (!m lead) or SKU (!m hdnation). A non-deal message in between resets the chain.
@@ -24,19 +24,11 @@ On dedupe skip, reacts with cross mark on the skipped Mirror message (unless --n
 Use --no-dedupe to turn off.
 
 Checkpoint: mirror_forward_checkpoint.json stores last fully completed Mirror message per
-Mirror channel (by_channel map). Legacy single-object files are read and merged on save.
-Interactive runs can resume from the next message after that. Use --no-checkpoint to disable.
-
-Optional: when forward_reply_done / --reply-done is on, only for menu-style runs (no --store/--url
-/--all-stores on the command line): after the batch ends cleanly, if there are no newer Mirror
-messages after the last fully completed deal, POST a single reply (forward_reply_done_text, default
-done) to that deal message. CLI seeding (--store + --url) never sends this reply.
+Mirror channel (by_channel map). Interactive runs can resume from checkpoint or start from a
+calendar date (same date for all stores in --all-stores). Use --no-checkpoint to disable writes.
 
 --all-stores: run every route in forward_all_stores_order from m_lead_routes.json; each store
-resumes only from its checkpoint, then continues to the next store (--max is global). A hard
-failure in one store (e.g. network error, send fail) no longer stops the rest; the run continues
-and final exit is still non-zero if any store had failures. Requires --yes unless --dry-run.
-Interactive menu: choose 0 for the same all-stores run (confirm prompt).
+resumes from checkpoint or from --from-date (first message on/after that local calendar day).
 
 Auth: same token chain as mirror_message_to_m_lead (DailyScheduleReminder + optional MWDiscumBot).
 """
@@ -46,11 +38,12 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 _BOT_DIR = Path(__file__).resolve().parent
@@ -69,6 +62,229 @@ DEDUPE_SKIP_EMOJI = "\u274c"  # cross mark (X) on dedupe skip
 CHECKMARK_EMOJI = "\u2705"
 # Sentinel channel id from _pick_store_interactive when user chooses "0. Run ALL stores".
 ALL_STORES_MENU_SENTINEL = "__all_stores_menu__"
+START_MODE_CHECKPOINT = "checkpoint"
+START_MODE_DATE = "date"
+
+
+@dataclass
+class ForwardStartPlan:
+    mode: str  # checkpoint | date
+    start_date: date | None = None
+
+
+def parse_calendar_date(text: str, *, today: date | None = None) -> date:
+    """
+    Parse calendar date only (local). Accepts:
+      2026-03-15   03-15-26   03-15   03/15
+    Month-day without year uses current year; if that date is still in the future, use last year.
+    """
+    s = (text or "").strip()
+    if not s:
+        raise ValueError("Empty date.")
+    today = today or date.today()
+    iso = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", s)
+    if iso:
+        y, mo, d = int(iso.group(1)), int(iso.group(2)), int(iso.group(3))
+        return date(y, mo, d)
+    mdy2 = re.fullmatch(r"(\d{1,2})[-/](\d{1,2})[-/](\d{2})", s)
+    if mdy2:
+        mo, d, yy = int(mdy2.group(1)), int(mdy2.group(2)), int(mdy2.group(3))
+        y = 2000 + yy if yy < 100 else yy
+        return date(y, mo, d)
+    md = re.fullmatch(r"(\d{1,2})[-/](\d{1,2})", s)
+    if md:
+        mo, d = int(md.group(1)), int(md.group(2))
+        y = today.year
+        candidate = date(y, mo, d)
+        if candidate > today:
+            candidate = date(y - 1, mo, d)
+        return candidate
+    raise ValueError(
+        f"Unrecognized date {text!r}. Use YYYY-MM-DD, MM-DD-YY, MM-DD, or MM/DD."
+    )
+
+
+def _format_checkpoint_saved_at(iso_s: str) -> str:
+    raw = (iso_s or "").strip()
+    if not raw:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return raw[:16]
+
+
+def _checkpoint_row_summary(entry: dict | None, channel_id: str) -> tuple[str, str, str]:
+    """(deal_date_display, saved_display, message_id) for one store."""
+    if not entry:
+        return ("—", "—", "")
+    mid = str(entry.get("last_completed_message_id") or "").strip()
+    deal_d = mm.snowflake_to_local_date_str(mid) if mid.isdigit() else "—"
+    saved = _format_checkpoint_saved_at(str(entry.get("updated_at_iso") or ""))
+    return (deal_d, saved, mid)
+
+
+def print_checkpoint_summary(
+    ordered_rows: list[tuple[str, str, dict]],
+    root: dict | None = None,
+) -> None:
+    """Print last completed forward per store (deal message date + when checkpoint was saved)."""
+    root = root if root is not None else _load_checkpoint_root()
+    print("\nCheckpoint summary (last fully completed forward per store):\n")
+    print(f"  {'Store':<22}  {'Last deal (local)':<18}  {'Checkpoint saved':<18}  Message id")
+    print(f"  {'-' * 22}  {'-' * 18}  {'-' * 18}  {'-' * 10}")
+    for cid, lab, _r in ordered_rows:
+        ent = _get_channel_checkpoint(root, str(cid))
+        deal_d, saved, mid = _checkpoint_row_summary(ent, str(cid))
+        mid_disp = mid if mid else "—"
+        print(f"  {lab:<22}  {deal_d:<18}  {saved:<18}  {mid_disp}")
+    print()
+
+
+def _prompt_calendar_date() -> date:
+    while True:
+        raw = input(
+            "Enter start date (YYYY-MM-DD, MM-DD-YY, MM-DD, or MM/DD): "
+        ).strip()
+        if not raw:
+            print("Cancelled.")
+            raise KeyboardInterrupt
+        try:
+            d = parse_calendar_date(raw)
+            print(f"  -> {d.isoformat()} (local calendar day; first message on/after midnight)\n")
+            return d
+        except ValueError as e:
+            print(f"  {e}")
+
+
+def prompt_forward_start_plan(
+    *,
+    interactive: bool,
+    cli_from_date: str,
+    for_all_stores: bool,
+) -> ForwardStartPlan | None:
+    """
+    Resolve checkpoint vs date start. CLI: --from-date forces date mode.
+    Interactive: menu after checkpoint summary.
+    """
+    if (cli_from_date or "").strip():
+        try:
+            d = parse_calendar_date(cli_from_date)
+            return ForwardStartPlan(mode=START_MODE_DATE, start_date=d)
+        except ValueError as e:
+            print(f"Invalid --from-date: {e}", file=sys.stderr)
+            return None
+    if not interactive:
+        return ForwardStartPlan(mode=START_MODE_CHECKPOINT)
+    print("How should this run start?\n")
+    print("  1. Resume from checkpoint (next message after last completed forward)")
+    print("  2. Start from a calendar date (first message on/after that day, all stores)")
+    print()
+    raw = input("Enter 1 or 2 [default 1]: ").strip()
+    if not raw or raw == "1":
+        return ForwardStartPlan(mode=START_MODE_CHECKPOINT)
+    if raw == "2":
+        try:
+            d = _prompt_calendar_date()
+            return ForwardStartPlan(mode=START_MODE_DATE, start_date=d)
+        except KeyboardInterrupt:
+            return None
+    print("Invalid choice.", file=sys.stderr)
+    return None
+
+
+def _guild_id_from_checkpoint_entry(entry: dict | None) -> str:
+    if not entry:
+        return ""
+    gid = str(entry.get("guild_id") or "").strip()
+    if gid:
+        return gid
+    lj = str(entry.get("last_jump_url") or "").strip()
+    if lj:
+        try:
+            gid, _, _ = mm.parse_jump_url(lj)
+            return str(gid).strip()
+        except ValueError:
+            pass
+    return ""
+
+
+def _resolve_store_start_from_checkpoint(
+    *,
+    store_label: str,
+    link_ch: str,
+    entry: dict,
+    token: str,
+) -> tuple[dict, dict, str, str] | None:
+    """(start_msg, channel, token, guild_id) or None if nothing to do."""
+    last_id = str(entry.get("last_completed_message_id") or "").strip()
+    if not last_id.isdigit():
+        print(f"\n[{store_label}] invalid checkpoint; skipping.", file=sys.stderr)
+        return None
+    guild_id = _guild_id_from_checkpoint_entry(entry)
+    if not guild_id:
+        guild_id = mm.resolve_channel_guild_id(link_ch, token)
+    if not guild_id:
+        print(f"\n[{store_label}] checkpoint missing guild_id; skipping.", file=sys.stderr)
+        return None
+    try:
+        _anchor, channel, _lab, token = mm.fetch_message_with_token_fallback(
+            guild_id, link_ch, last_id
+        )
+    except RuntimeError as e:
+        print(f"\n[{store_label}] cannot read channel: {e}", file=sys.stderr)
+        return None
+    try:
+        nxt = mm.list_messages_after(link_ch, last_id, token, limit=50)
+    except RuntimeError as e:
+        print(f"\n[{store_label}] list after checkpoint: {e}", file=sys.stderr)
+        return None
+    if not nxt:
+        print(f"\n[{store_label}] no newer messages after checkpoint; skipping.")
+        return None
+    start_msg = nxt[0]
+    if not str(start_msg.get("id") or "").isdigit():
+        print(f"\n[{store_label}] invalid resume message; skipping.", file=sys.stderr)
+        return None
+    return start_msg, channel, token, guild_id
+
+
+def _resolve_store_start_from_date(
+    *,
+    store_label: str,
+    link_ch: str,
+    start_date: date,
+    token: str,
+    entry: dict | None,
+) -> tuple[dict, dict, str, str] | None:
+    """(start_msg, channel, token, guild_id) or None if nothing to do."""
+    try:
+        start_msg = mm.find_first_message_on_or_after_date(link_ch, start_date, token)
+    except RuntimeError as e:
+        print(f"\n[{store_label}] date search failed: {e}", file=sys.stderr)
+        return None
+    if not start_msg:
+        print(f"\n[{store_label}] no messages on or after {start_date.isoformat()}; skipping.")
+        return None
+    start_mid = str(start_msg.get("id") or "")
+    guild_id = _guild_id_from_checkpoint_entry(entry)
+    if not guild_id:
+        guild_id = mm.resolve_channel_guild_id(link_ch, token)
+    if not guild_id:
+        print(f"\n[{store_label}] could not resolve guild_id; skipping.", file=sys.stderr)
+        return None
+    try:
+        start_msg, channel, _lab, token = mm.fetch_message_with_token_fallback(
+            guild_id, link_ch, start_mid
+        )
+    except RuntimeError as e:
+        print(f"\n[{store_label}] cannot load start message: {e}", file=sys.stderr)
+        return None
+    dt = mm.message_timestamp_local(start_msg)
+    when = dt.strftime("%Y-%m-%d %H:%M") if dt else start_mid
+    print(f"\n[{store_label}] date start {start_date.isoformat()}: first message {start_mid} ({when})")
+    return start_msg, channel, token, guild_id
 
 
 def _read_checkpoint_file_raw() -> dict | None:
@@ -375,6 +591,10 @@ def _parse_post_confirmation_settings(raw: object) -> dict | None:
         maint_extend_s = float(raw.get("maintenance_extend_seconds", 600))
     except (TypeError, ValueError):
         maint_extend_s = 600.0
+    try:
+        maint_post_done_s = float(raw.get("maintenance_post_done_grace_seconds", 180))
+    except (TypeError, ValueError):
+        maint_post_done_s = 180.0
     return {
         "author_user_id": aid,
         "text_substring": sub,
@@ -386,20 +606,21 @@ def _parse_post_confirmation_settings(raw: object) -> dict | None:
         "maintenance_start_substrings": maint_start,
         "maintenance_done_substrings": maint_done,
         "maintenance_extend_seconds": max(0.0, maint_extend_s),
+        "maintenance_post_done_grace_seconds": max(30.0, maint_post_done_s),
     }
 
 
 def _monitor_needles_for_command(cmd: str, pc: dict) -> tuple[list[str], list[str], float]:
     """(success_needles, failure_needles, timeout_seconds) for wait_for_monitor_outcome."""
     primary = (pc.get("text_substring") or "Lead posted").strip().lower()
-    seen: dict[str, None] = {}
-    success: list[str] = []
-    for s in [primary, *[x.strip().lower() for x in pc.get("success_substrings_extra") or []]]:
-        if s and s not in seen:
-            seen[s] = None
-            success.append(s)
     timeout = float(pc["timeout_seconds"])
     if cmd == "hdnation":
+        seen: dict[str, None] = {}
+        success: list[str] = []
+        for s in [primary, *[x.strip().lower() for x in pc.get("success_substrings_extra") or []]]:
+            if s and s not in seen:
+                seen[s] = None
+                success.append(s)
         timeout = float(pc.get("timeout_seconds_hdnation") or pc["timeout_seconds"])
         for extra in (
             "home depot nationwide stock check",
@@ -418,7 +639,8 @@ def _monitor_needles_for_command(cmd: str, pc: dict) -> tuple[list[str], list[st
             ]
         fail_norm = [str(x).strip().lower() for x in fails if str(x).strip()]
         return success, fail_norm, max(1.0, timeout)
-    return success, [], max(1.0, timeout)
+    # !m lead: only "Lead posted" — not hdnation/stock-check phrases or update banners.
+    return [primary] if primary else ["lead posted"], [], max(1.0, timeout)
 
 
 def _append_hdnation_failure_record(
@@ -514,6 +736,7 @@ def _run_forward_batch(
     route_cmd = mm.route_command(route_for_build)
     prev_msg_deal_key: str | None = None
     last_completed_for_reply: str | None = None
+    command_author_id = mm.resolve_discord_user_id(token)
 
     if not skip_start_prompt and not args.yes and not args.dry_run:
         max_disp = "unlimited" if max_messages <= 0 else str(max_messages)
@@ -603,7 +826,7 @@ def _run_forward_batch(
             wait_label = "hdnation stock-check" if route_cmd == "hdnation" else "lead posted"
             print(
                 f"  waiting for {wait_label} (author {post_confirm['author_user_id']!r}, "
-                f"timeout {mon_timeout:.0f}s, session until next !m)…"
+                f"timeout {mon_timeout:.0f}s, session until our next !m)…"
             )
             outcome, mon_detail = mm.wait_for_m_command_monitor_session(
                 post_ch,
@@ -615,8 +838,13 @@ def _run_forward_batch(
                 maintenance_start_needles=post_confirm.get("maintenance_start_substrings") or [],
                 maintenance_done_needles=post_confirm.get("maintenance_done_substrings") or [],
                 maintenance_extend_seconds=float(post_confirm.get("maintenance_extend_seconds") or 0.0),
+                maintenance_post_done_grace_seconds=float(
+                    post_confirm.get("maintenance_post_done_grace_seconds") or 180.0
+                ),
                 timeout_seconds=mon_timeout,
                 poll_interval_seconds=post_confirm["poll_interval_seconds"],
+                command_author_user_id=command_author_id,
+                on_status=lambda msg: print(f"  {msg}"),
             )
             if outcome == "ok":
                 print("  monitor confirmed")
@@ -723,7 +951,7 @@ def _run_forward_batch(
 def _pick_store_interactive(rows: list[tuple[str, str, dict]]) -> tuple[str, str, dict] | None:
     print("\nStores (from m_lead_routes.json):\n")
     print(
-        "  0. Run ALL stores  (checkpoint resume per channel; order: forward_all_stores_order "
+        "  0. Run ALL stores  (checkpoint or calendar date; order: forward_all_stores_order "
         "in m_lead_routes.json)"
     )
     for i, (cid, lab, _r) in enumerate(rows, start=1):
@@ -752,10 +980,11 @@ def _run_all_stores(
     mlead_full: dict,
     post_confirm: dict | None,
     rows: list[tuple[str, str, dict]],
+    start_plan: ForwardStartPlan,
 ) -> int:
-    """Run every route in order; each store resumes from checkpoint only."""
+    """Run every route in order; each store starts from checkpoint or a shared calendar date."""
     if args.no_checkpoint:
-        print("--all-stores requires checkpoints (omit --no-checkpoint).", file=sys.stderr)
+        print("--all-stores requires checkpoints for saving progress (omit --no-checkpoint).", file=sys.stderr)
         return 2
     if (args.store or "").strip() or (args.url or "").strip():
         print("--all-stores cannot be used with --store or --url.", file=sys.stderr)
@@ -813,81 +1042,72 @@ def _run_all_stores(
     reply_done_text = _reply_done_text(mlead_full)
     labels = " → ".join(lab for _cid, lab, _r in ordered)
     max_disp = "unlimited" if max_n <= 0 else str(max_n)
-    print(
-        f"\n--all-stores: checkpoint resume only.\nOrder: {labels}\n"
-        f"Global --max: {max_disp} (every message walked, including skips/dedupes).\n"
-        f"POST !m to channel id: {post_ch}\n"
-    )
-
     root0 = _load_checkpoint_root()
-    with_cp: list[str] = []
-    without_cp: list[str] = []
-    for cid, lab, _r in ordered:
-        if _get_channel_checkpoint(root0, str(cid)):
-            with_cp.append(lab)
-        else:
-            without_cp.append(lab)
-    if with_cp:
-        print(f"Checkpoints found: {', '.join(with_cp)}")
-    if without_cp:
+    print_checkpoint_summary(ordered, root0)
+    if start_plan.mode == START_MODE_DATE and start_plan.start_date:
         print(
-            f"No checkpoint in mirror_forward_checkpoint.json for: {', '.join(without_cp)} "
-            f"(those channels are skipped).\n"
-            "Checkpoint = last fully completed Mirror forward from this script (not every !m in Discord). "
-            "Older builds kept one global cursor in this file, so the last store you finished overwrote "
-            "the others; today’s file merges by_channel and keeps every store you complete from here on.\n"
+            f"\n--all-stores: start from date {start_plan.start_date.isoformat()} "
+            f"(local day, every store).\nOrder: {labels}\n"
+            f"Global --max: {max_disp} (every message walked, including skips/dedupes).\n"
+            f"POST !m to channel id: {post_ch}\n"
         )
+    else:
+        print(
+            f"\n--all-stores: resume from checkpoint.\nOrder: {labels}\n"
+            f"Global --max: {max_disp} (every message walked, including skips/dedupes).\n"
+            f"POST !m to channel id: {post_ch}\n"
+        )
+        without_cp: list[str] = []
+        for cid, lab, _r in ordered:
+            if not _get_channel_checkpoint(root0, str(cid)):
+                without_cp.append(lab)
+        if without_cp:
+            print(
+                f"Stores with no checkpoint (skipped in checkpoint mode): {', '.join(without_cp)}\n"
+                "Tip: use start mode 2 (calendar date) to include stores without a checkpoint.\n"
+            )
 
     budget: int | None = None if max_n <= 0 else max_n
     agg = ForwardBatchResult()
-    token = ""
+    chain = mm.load_fetch_token_chain()
+    if not chain:
+        print(
+            "No Discord token: configure DailyScheduleReminder/config.secrets.json.",
+            file=sys.stderr,
+        )
+        return 1
+    token = chain[0][1]
 
     for sel in ordered:
         mw_channel_id, store_label, route_for_build = sel[0], sel[1], sel[2]
         if budget is not None and budget <= 0:
             print("\nGlobal --max exhausted; stopping.")
             break
-        root = _load_checkpoint_root()
-        entry = _get_channel_checkpoint(root, str(mw_channel_id))
-        if not entry:
-            print(f"\n[{store_label}] no checkpoint for channel {mw_channel_id}; skipping.")
-            continue
-        last_id = str(entry.get("last_completed_message_id") or "").strip()
-        if not last_id.isdigit():
-            print(f"\n[{store_label}] invalid checkpoint; skipping.", file=sys.stderr)
-            continue
-        guild_id = str(entry.get("guild_id") or "").strip()
-        lj = str(entry.get("last_jump_url") or "").strip()
-        if not guild_id and lj:
-            try:
-                guild_id, _, _ = mm.parse_jump_url(lj)
-            except ValueError:
-                guild_id = ""
-        if not guild_id:
-            print(f"\n[{store_label}] checkpoint missing guild_id; skipping.", file=sys.stderr)
-            continue
         link_ch = str(mw_channel_id)
-        resume_after = last_id
-        try:
-            _anchor, channel, _lab, token = mm.fetch_message_with_token_fallback(
-                guild_id, link_ch, resume_after
+        root = _load_checkpoint_root()
+        entry = _get_channel_checkpoint(root, link_ch)
+        resolved: tuple[dict, dict, str, str] | None = None
+        if start_plan.mode == START_MODE_DATE and start_plan.start_date:
+            resolved = _resolve_store_start_from_date(
+                store_label=store_label,
+                link_ch=link_ch,
+                start_date=start_plan.start_date,
+                token=token,
+                entry=entry,
             )
-        except RuntimeError as e:
-            print(f"\n[{store_label}] cannot read channel: {e}", file=sys.stderr)
+        else:
+            if not entry:
+                print(f"\n[{store_label}] no checkpoint for channel {mw_channel_id}; skipping.")
+                continue
+            resolved = _resolve_store_start_from_checkpoint(
+                store_label=store_label,
+                link_ch=link_ch,
+                entry=entry,
+                token=token,
+            )
+        if not resolved:
             continue
-        try:
-            nxt = mm.list_messages_after(link_ch, resume_after, token, limit=50)
-        except RuntimeError as e:
-            print(f"\n[{store_label}] list after checkpoint: {e}", file=sys.stderr)
-            continue
-        if not nxt:
-            print(f"\n[{store_label}] no newer messages after checkpoint; skipping.")
-            continue
-        start_msg = nxt[0]
-        start_mid = str(start_msg.get("id") or "")
-        if not start_mid.isdigit():
-            print(f"\n[{store_label}] invalid resume message; skipping.", file=sys.stderr)
-            continue
+        start_msg, channel, token, guild_id = resolved
         dest_command = str(route_for_build.get("destination_channel_id") or "").strip()
         if not dest_command:
             print(
@@ -1021,11 +1241,19 @@ def main() -> int:
         help="Do not read or write mirror_forward_checkpoint.json (no resume from last run).",
     )
     ap.add_argument(
+        "--from-date",
+        default="",
+        metavar="DATE",
+        help="Start from first Mirror message on/after this local calendar day (all stores or "
+        "single store). Formats: YYYY-MM-DD, MM-DD-YY, MM-DD, MM/DD. Implies date mode; "
+        "checkpoints still update on each success.",
+    )
+    ap.add_argument(
         "--all-stores",
         action="store_true",
-        help="Run every route in forward_all_stores_order (m_lead_routes.json): each store resumes "
-        "from its checkpoint only, then continues to the next store (per-store errors do not stop "
-        "later stores). --max counts messages across all stores. Requires --yes unless --dry-run. "
+        help="Run every route in forward_all_stores_order (m_lead_routes.json). Each store starts "
+        "from checkpoint or --from-date. Per-store errors do not stop later stores. "
+        "--max counts messages across all stores. Requires --yes unless --dry-run. "
         "Incompatible with --store, --url, --dest, and --no-checkpoint.",
     )
     args = ap.parse_args()
@@ -1041,7 +1269,14 @@ def main() -> int:
         return 1
 
     if args.all_stores:
-        return _run_all_stores(args, routes, mlead_full, post_confirm, rows)
+        plan = prompt_forward_start_plan(
+            interactive=not args.yes and not (args.from_date or "").strip(),
+            cli_from_date=(args.from_date or ""),
+            for_all_stores=True,
+        )
+        if plan is None:
+            return 2
+        return _run_all_stores(args, routes, mlead_full, post_confirm, rows, plan)
 
     sel: tuple[str, str, dict] | None = None
     store_key = (args.store or "").strip()
@@ -1057,17 +1292,23 @@ def main() -> int:
             print("Cancelled.")
             return 0
         if sel[0] == ALL_STORES_MENU_SENTINEL:
+            ordered = _ordered_store_rows(rows, _forward_all_stores_order(mlead_full))
+            print_checkpoint_summary(ordered)
+            plan = prompt_forward_start_plan(
+                interactive=True,
+                cli_from_date="",
+                for_all_stores=True,
+            )
+            if not plan:
+                print("Cancelled.")
+                return 0
             if not args.dry_run:
-                if not _prompt_yes(
-                    "Run ALL stores in order (each channel resumes from its checkpoint only). "
-                    "This can take a long time. Proceed?",
-                    default_yes=False,
-                ):
+                if not _prompt_yes("Proceed with this all-stores run?", default_yes=False):
                     print("Cancelled.")
                     return 0
             args.yes = True
             args.all_stores = True
-            return _run_all_stores(args, routes, mlead_full, post_confirm, rows)
+            return _run_all_stores(args, routes, mlead_full, post_confirm, rows, plan)
 
     mw_channel_id, store_label, _ = sel
     dest_override = (args.dest or "").strip()
@@ -1132,104 +1373,111 @@ def main() -> int:
             return 1
     else:
         print(f"\nSelected: {store_label}  (Mirror channel {mw_channel_id})\n")
-        resume_next = False
-        cp_root = _load_checkpoint_root() if use_checkpoint else None
-        r_cp: dict | None = (
-            _get_channel_checkpoint(cp_root, str(mw_channel_id)) if cp_root else None
-        )
-        last_id = str((r_cp or {}).get("last_completed_message_id") or "").strip()
-        if r_cp and last_id.isdigit():
-            lj = str(r_cp.get("last_jump_url") or "").strip()
-            if args.yes:
-                resume_next = True
-                guild_id = str(r_cp.get("guild_id") or "").strip()
-                if not guild_id and lj:
-                    try:
-                        guild_id, _, _ = mm.parse_jump_url(lj)
-                    except ValueError:
-                        guild_id = ""
-                if not guild_id:
-                    print(
-                        "Checkpoint has no guild_id and no parseable last_jump_url; "
-                        "paste a start link instead.\n",
-                        file=sys.stderr,
-                    )
-                    resume_next = False
-            else:
-                upd = str(r_cp.get("updated_at_iso") or "").strip()
-                print("Saved checkpoint for this store (last fully completed forward):")
-                print(f"  message id: {last_id}")
-                if lj:
-                    print(f"  link: {lj}")
-                if upd:
-                    print(f"  saved at: {upd}")
-                if _prompt_yes("Start from the next message after that one?", default_yes=True):
-                    resume_next = True
-                    guild_id = str(r_cp.get("guild_id") or "").strip()
-                    if not guild_id and lj:
-                        try:
-                            guild_id, _, _ = mm.parse_jump_url(lj)
-                        except ValueError:
-                            guild_id = ""
-                    if not guild_id:
-                        print(
-                            "Checkpoint has no guild_id and no parseable last_jump_url; "
-                            "paste a start link instead.\n",
-                            file=sys.stderr,
-                        )
-                        resume_next = False
-        if resume_next:
-            link_ch = str(mw_channel_id)
-            resume_after = last_id
+        cp_root = _load_checkpoint_root() if use_checkpoint else {"by_channel": {}}
+        r_cp = _get_channel_checkpoint(cp_root, str(mw_channel_id))
+        deal_d, saved, mid = _checkpoint_row_summary(r_cp, str(mw_channel_id))
+        print("Checkpoint for this store:")
+        print(f"  last deal (local): {deal_d}   checkpoint saved: {saved}   message id: {mid or '—'}\n")
+
+        chain = mm.load_fetch_token_chain()
+        if not chain:
+            print("No Discord token.", file=sys.stderr)
+            return 1
+        token = chain[0][1]
+        link_ch = str(mw_channel_id)
+        start_plan: ForwardStartPlan | None = None
+
+        if (args.from_date or "").strip():
             try:
-                _anchor, channel, _lab, token = mm.fetch_message_with_token_fallback(
-                    guild_id, link_ch, resume_after
-                )
-            except RuntimeError as e:
-                print(str(e), file=sys.stderr)
-                return 1
-            try:
-                nxt = mm.list_messages_after(link_ch, resume_after, token, limit=50)
-            except RuntimeError as e:
-                print(str(e), file=sys.stderr)
-                return 1
-            if not nxt:
-                print("No newer messages after the checkpoint; nothing to do.")
-                return 0
-            start_msg = nxt[0]
-            start_mid = str(start_msg.get("id") or "")
-            if not start_mid.isdigit():
-                print("Invalid message in channel history after checkpoint.", file=sys.stderr)
-                return 1
-            url = f"https://discord.com/channels/{guild_id}/{link_ch}/{start_mid}"
-            print(f"Resuming after id {resume_after}; first message this run: {start_mid}\n")
-        else:
-            print("Paste the Discord jump link for the FIRST deal message to process.\n")
-            url = input("Start message link: ").strip()
-            if not url.strip():
-                print("Cancelled.")
-                return 0
-            try:
-                guild_id, link_ch, start_mid = mm.parse_jump_url(url.strip())
+                d = parse_calendar_date(args.from_date)
+                start_plan = ForwardStartPlan(mode=START_MODE_DATE, start_date=d)
             except ValueError as e:
-                print(e, file=sys.stderr)
+                print(f"Invalid --from-date: {e}", file=sys.stderr)
                 return 1
-            if str(link_ch) != str(mw_channel_id):
+        elif args.yes:
+            if r_cp:
+                start_plan = ForwardStartPlan(mode=START_MODE_CHECKPOINT)
+            else:
                 print(
-                    f"\n[WARN] Link channel id {link_ch} != selected store channel {mw_channel_id}.\n"
-                    f"        Selected store: {store_label}\n",
+                    "ERROR: --yes with no saved checkpoint for this store — use --url, "
+                    "--from-date, or run interactively.",
                     file=sys.stderr,
                 )
-                if not _prompt_yes("Continue anyway?", default_yes=False):
+                return 1
+        elif not args.yes:
+            print("How should this run start?\n")
+            print("  1. Resume from checkpoint (next message after last completed)")
+            print("  2. Start from a calendar date (first message on/after that day)")
+            print("  3. Paste a Discord jump link")
+            print()
+            choice = input("Enter 1, 2, or 3 [default 1]: ").strip()
+            if not choice or choice == "1":
+                if r_cp:
+                    start_plan = ForwardStartPlan(mode=START_MODE_CHECKPOINT)
+                else:
+                    print("No checkpoint saved; paste a jump link instead.\n")
+                    choice = "3"
+            if choice == "2":
+                try:
+                    d = _prompt_calendar_date()
+                    start_plan = ForwardStartPlan(mode=START_MODE_DATE, start_date=d)
+                except KeyboardInterrupt:
                     print("Cancelled.")
                     return 0
-            try:
-                start_msg, channel, _lab, token = mm.fetch_message_with_token_fallback(
-                    guild_id, link_ch, start_mid
+            if choice == "3" or start_plan is None:
+                print("\nPaste the Discord jump link for the FIRST deal message to process.\n")
+                url = input("Start message link: ").strip()
+                if not url.strip():
+                    print("Cancelled.")
+                    return 0
+                try:
+                    guild_id, link_ch, start_mid = mm.parse_jump_url(url.strip())
+                except ValueError as e:
+                    print(e, file=sys.stderr)
+                    return 1
+                if str(link_ch) != str(mw_channel_id):
+                    print(
+                        f"\n[WARN] Link channel id {link_ch} != selected store channel {mw_channel_id}.\n"
+                        f"        Selected store: {store_label}\n",
+                        file=sys.stderr,
+                    )
+                    if not _prompt_yes("Continue anyway?", default_yes=False):
+                        print("Cancelled.")
+                        return 0
+                try:
+                    start_msg, channel, _lab, token = mm.fetch_message_with_token_fallback(
+                        guild_id, link_ch, start_mid
+                    )
+                except RuntimeError as e:
+                    print(str(e), file=sys.stderr)
+                    return 1
+                start_plan = None  # already resolved via url
+
+        if start_plan is not None:
+            resolved: tuple[dict, dict, str, str] | None = None
+            if start_plan.mode == START_MODE_DATE and start_plan.start_date:
+                resolved = _resolve_store_start_from_date(
+                    store_label=store_label,
+                    link_ch=link_ch,
+                    start_date=start_plan.start_date,
+                    token=token,
+                    entry=r_cp,
                 )
-            except RuntimeError as e:
-                print(str(e), file=sys.stderr)
-                return 1
+            elif start_plan.mode == START_MODE_CHECKPOINT and r_cp:
+                resolved = _resolve_store_start_from_checkpoint(
+                    store_label=store_label,
+                    link_ch=link_ch,
+                    entry=r_cp,
+                    token=token,
+                )
+            if not resolved:
+                return 0
+            start_msg, channel, token, guild_id = resolved
+            start_mid = str(start_msg.get("id") or "")
+            url = f"https://discord.com/channels/{guild_id}/{link_ch}/{start_mid}"
+        elif not start_msg:
+            print("No start message resolved.", file=sys.stderr)
+            return 1
 
     route_for_build = mm.route_for_channel(routes, str(link_ch))
     if route_for_build is None:

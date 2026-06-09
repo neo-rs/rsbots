@@ -22,7 +22,8 @@
     "_comment_maintenance": "If Tempo/monitor is updating, the bot posts 'being updated' then later 'has been updated'. These needles extend the wait window instead of timing out.",
     "maintenance_start_substrings": "is being updated, will be back in",
     "maintenance_done_substrings": "has been updated",
-    "maintenance_extend_seconds": 600
+    "maintenance_extend_seconds": 600,
+    "maintenance_post_done_grace_seconds": 180
   },
   "routes": {
     "1435308747416141857": {

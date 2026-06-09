@@ -101,19 +101,22 @@ def lookup_via_browser(upc: str, zip_codes: list[str], headless: bool = False, d
 
     upc = str(upc).strip()
     all_rows: list[dict] = []
-    options = uc.ChromeOptions()
-    if headless:
-        options.add_argument("--headless=new")
+
+    def _chrome_options() -> "uc.ChromeOptions":
+        opts = uc.ChromeOptions()
+        if headless:
+            opts.add_argument("--headless=new")
+        return opts
+
     # Match installed Chrome major version to avoid SessionNotCreatedException
     try:
-        driver = uc.Chrome(options=options, version_main=145)
+        driver = uc.Chrome(options=_chrome_options(), version_main=145)
     except Exception as e:
         msg = str(e)
         if "Current browser version is" in msg:
-            import re
             m = re.search(r"Current browser version is (\d+)", msg)
             if m:
-                driver = uc.Chrome(options=options, version_main=int(m.group(1)))
+                driver = uc.Chrome(options=_chrome_options(), version_main=int(m.group(1)))
             else:
                 raise
         else:

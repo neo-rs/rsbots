@@ -8,9 +8,9 @@ rem Or pass args, e.g.:
 rem   run_mirror_forward_queue.bat --delay-random-minutes 1-2   (override JSON: 1-2 minutes)
 rem   run_mirror_forward_queue.bat --store walmart --url "https://discord.com/channels/..." --yes --max 25
 rem   --max 0 = unlimited messages (default in mirror_forward_queue.py)
-rem   All clearance stores (checkpoint resume each, then next):  --all-stores --yes
-rem     (or interactive: run the .bat with no args, enter 0 at the store list)
-rem     (see forward_all_stores_order in m_lead_routes.json; --max counts across all stores)
+rem   All stores:  --all-stores --yes
+rem     Interactive menu: enter 0 — shows checkpoint dates, then checkpoint vs calendar date
+rem     Date start (all stores):  --all-stores --yes --from-date 2026-03-15
 rem Fixed pause instead:  run_mirror_forward_queue.bat --delay 5
 rem Optional: --no-wait-confirm  (skip monitor wait; see m_lead_routes post_confirmation)
 rem Optional: --no-checkpoint   (no resume file / no mirror_forward_checkpoint.json)

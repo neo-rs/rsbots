@@ -31,6 +31,7 @@ BOT_KEY_TO_FOLDER: Dict[str, str] = {
     "whopmembershipsync": "WhopMembershipSync",
     "catalognavbot": "catalog_nav_bot",
     "amazonasinchecker": "amazon_asin_promo_checker",
+    "telnyxsmsbridge": "telnyx_discord_sms_bridge",
     # Tools (deployed into live mirror-world tree; no systemd service)
     "chromerrunner": "Chromerrunner",
     # Mirror-world bots (mwbots-code checkout)

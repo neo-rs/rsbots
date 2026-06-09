@@ -31,6 +31,11 @@ del /f /q ".git\index.lock" >nul 2>&1
 REM Update tracked files (faster + avoids scanning for new untracked files).
 REM NOTE: git add -u does NOT stage brand-new untracked files — add explicit lines below for new modules.
 git add -u
+if errorlevel 1 (
+  echo ERROR: git add -u failed.
+  set EC=1
+  goto :pause_exit
+)
 REM New bot folders / modules (git add -u skips untracked paths).
 git add RSCashoutBot >nul 2>&1
 git add RSChannelRelay >nul 2>&1
@@ -49,11 +54,11 @@ REM Also stage RSForwarder manual override json (was previously git-ignored).
 git add RSForwarder\rs_fs_manual_overrides.json >nul 2>&1
 git add catalog_nav_bot >nul 2>&1
 git add Chromerrunner >nul 2>&1
-if errorlevel 1 (
-  echo ERROR: git add failed.
-  set EC=1
-  goto :pause_exit
-)
+git add telnyx_discord_sms_bridge >nul 2>&1
+git add systemd\mirror-world-telnyx-discord-sms-bridge.service >nul 2>&1
+git add scripts\run_oracle_deploy_telnyx_bridge.py >nul 2>&1
+git add update_telnyx_bridge.bat >nul 2>&1
+REM Optional paths above may be ignored until .gitignore is updated; only fail on git add -u.
 REM Never push runtime data (server-owned)
 git reset HEAD -- RSCheckerbot/member_history.json 2>nul
 
