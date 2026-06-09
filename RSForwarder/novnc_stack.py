@@ -148,6 +148,89 @@ def _proc_cmdline(pid: int) -> list:
         return []
 
 
+def _iter_proc_cmdlines() -> list:
+    out = []
+    if os.name == "nt":
+        return out
+    try:
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            cmd = _proc_cmdline(pid)
+            if cmd:
+                out.append((pid, cmd))
+    except Exception:
+        pass
+    return out
+
+
+def _detect_websockify_backend_vnc_port(web_port: int) -> Optional[int]:
+    """
+    When noVNC is already listening on web_port, find which localhost VNC port
+    websockify forwards to (e.g. 6080 -> localhost:5900).
+    """
+    want = int(web_port)
+    for _pid, cmd in _iter_proc_cmdlines():
+        base = Path((cmd[0] or "")).name.lower()
+        if "websockify" not in base and "websockify" not in " ".join(cmd).lower():
+            continue
+        listen_port = None
+        backend_port = None
+        for tok in cmd:
+            t = (tok or "").strip()
+            if t.isdigit():
+                try:
+                    listen_port = int(t)
+                except Exception:
+                    pass
+            if ":" in t:
+                _host, _sep, port_s = t.rpartition(":")
+                try:
+                    p = int(port_s)
+                except Exception:
+                    continue
+                if p == want and listen_port is None:
+                    listen_port = p
+                elif 5900 <= p < 6000:
+                    backend_port = p
+        if listen_port == want and backend_port is not None:
+            return int(backend_port)
+        # Fallback: last host:port token is often the VNC backend.
+        for tok in reversed(cmd):
+            if ":" not in tok:
+                continue
+            _host, _sep, port_s = tok.rpartition(":")
+            try:
+                p = int(port_s)
+            except Exception:
+                continue
+            if 5900 <= p < 6000:
+                return p
+    return None
+
+
+def _detect_display_for_vnc_port(vnc_port: int) -> Optional[str]:
+    """Map an x11vnc -rfbport to its -display (e.g. 5900 -> :99)."""
+    want = int(vnc_port)
+    for _pid, cmd in _iter_proc_cmdlines():
+        if Path((cmd[0] or "")).name.lower() != "x11vnc":
+            continue
+        rfbport = None
+        disp = None
+        for i, tok in enumerate(cmd):
+            if tok == "-rfbport" and i + 1 < len(cmd):
+                try:
+                    rfbport = int(cmd[i + 1])
+                except Exception:
+                    rfbport = None
+            if tok == "-display" and i + 1 < len(cmd):
+                disp = (cmd[i + 1] or "").strip()
+        if rfbport == want and disp:
+            return disp
+    return None
+
+
 def _detect_running_display(state_dir: Path, fallback_display: str) -> str:
     """
     Best-effort: when the noVNC stack is already running, detect the *actual*
@@ -287,8 +370,16 @@ def ensure_novnc(cfg: dict) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     screen = _cfg_or_env_str(cfg, "mavely_novnc_screen", "MAVELY_NOVNC_SCREEN", "1280x720x24")
     state_dir = Path(_cfg_or_env_str(cfg, "mavely_novnc_state_dir", "MAVELY_NOVNC_STATE_DIR", "/tmp/rsforwarder_mavely_novnc"))
 
-    if _port_listening("127.0.0.1", int(web_port)) and _port_listening("127.0.0.1", int(vnc_port)):
-        running_display = _detect_running_display(state_dir, display)
+    if _port_listening("127.0.0.1", int(web_port)):
+        # Port 6080 may be owned by an older stack (e.g. :99/5900) while state_dir
+        # PID files still point at a different display (:1/5901). Prefer the display
+        # that matches what websockify actually exports.
+        backend_port = _detect_websockify_backend_vnc_port(int(web_port))
+        if backend_port is None and _port_listening("127.0.0.1", int(vnc_port)):
+            backend_port = int(vnc_port)
+        running_display = _detect_display_for_vnc_port(int(backend_port)) if backend_port else None
+        if not running_display:
+            running_display = _detect_running_display(state_dir, display)
         return {
             "display": running_display,
             "vnc_port": int(vnc_port),
@@ -442,8 +533,8 @@ def start_cookie_refresher(cfg: dict, *, display: str, wait_login_s: int = 900) 
         "--wait-login",
         str(max(30, int(wait_login_s))),
     ]
-    if env.get("MAVELY_LOGIN_EMAIL") and env.get("MAVELY_LOGIN_PASSWORD"):
-        cmd.append("--auto-login")
+    # Interactive noVNC: operator logs in manually in the visible browser.
+    # Headless --auto-login is only used by run_cookie_refresher_headless().
 
     try:
         with open(log_file, "a", encoding="utf-8", errors="replace") as lf:
