@@ -18,13 +18,13 @@ TESTS = [
         "label": "local_2540",
         "our_line": LOCAL,
         "remote": TOLL_FREE,
-        "text": f"Test inbound to local line from toll-free at {STAMP}",
+        "text": f"Fresh test — toll-free to local at {STAMP}",
     },
     {
         "label": "tollfree_2119",
         "our_line": TOLL_FREE,
         "remote": LOCAL,
-        "text": f"Test inbound to toll-free from local line at {STAMP}",
+        "text": f"Fresh test — local to toll-free at {STAMP}",
     },
 ]
 

@@ -120,9 +120,16 @@ class ConversationService:
                     log.info("event=conversation_updated key=%s channel_id=%s message_id=%s", key, channel_id, message_id)
                 except Exception as exc:
                     err = str(exc).lower()
-                    if "forbidden" in err or "50005" in err or "cannot edit" in err:
+                    if (
+                        "forbidden" in err
+                        or "50005" in err
+                        or "cannot edit" in err
+                        or "not found" in err
+                        or "10008" in err
+                        or "unknown message" in err
+                    ):
                         log.warning(
-                            "event=conversation_recreate reason=cannot_edit_existing key=%s message_id=%s",
+                            "event=conversation_recreate reason=missing_or_stale_message key=%s message_id=%s",
                             key,
                             message_id,
                         )
