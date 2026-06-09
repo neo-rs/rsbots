@@ -73,7 +73,16 @@ async def telnyx_webhook(
         raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
 
     data = _extract_telnyx_data(event)
+    event_type = str(data.get("event_type") or "")
+    if event_type and event_type != "message.received":
+        log.info("event=webhook_ignored reason=not_inbound_sms event_type=%s", event_type)
+        return {"status": "ignored"}
+
     payload_data = data.get("payload", data)
+    if not str(payload_data.get("text") or payload_data.get("body") or "").strip():
+        log.info("event=webhook_ignored reason=empty_sms_body event_type=%s", event_type or "unknown")
+        return {"status": "ignored"}
+
     text = str(payload_data.get("text") or payload_data.get("body") or "")
     from_number = _extract_from_number(payload_data)
     to_number = _extract_to_number(payload_data)

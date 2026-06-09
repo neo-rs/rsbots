@@ -61,10 +61,18 @@ class ConversationStore:
             threads = data.setdefault("threads", {})
             current = dict(threads.get(key) or {})
             lines = list(current.get("lines") or [])
+            normalized_text = str(text or "")
+            if lines:
+                last = lines[-1]
+                if (
+                    str(last.get("direction") or "") == direction
+                    and str(last.get("text") or "") == normalized_text
+                ):
+                    return dict(current)
             lines.append(
                 {
                     "direction": direction,
-                    "text": str(text or ""),
+                    "text": normalized_text,
                     "at": _iso_now(),
                 }
             )

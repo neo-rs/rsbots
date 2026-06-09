@@ -49,8 +49,10 @@ class SendMessageModal(discord.ui.Modal, title="Send SMS"):
             )
             await interaction.followup.send("Sent.", ephemeral=True)
         except Exception as exc:
+            from app.telnyx_errors import format_send_error
+
             log.exception("event=discord_send_modal_failed our_line=%s remote=%s", self.our_line, self.remote_party)
-            await interaction.followup.send(f"Send failed: {exc}", ephemeral=True)
+            await interaction.followup.send(format_send_error(exc), ephemeral=True)
 
 
 class EditNameModal(discord.ui.Modal, title="Edit contact name"):
