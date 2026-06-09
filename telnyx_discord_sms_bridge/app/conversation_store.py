@@ -27,6 +27,11 @@ class ConversationStore:
         if not self.path.exists():
             self._write({"threads": {}, "updated_at": _iso_now()})
 
+    def list_threads(self) -> dict[str, dict[str, Any]]:
+        data = self._read()
+        threads = data.get("threads", {})
+        return {k: dict(v) for k, v in threads.items() if isinstance(v, dict)}
+
     def get_thread(self, key: str) -> dict[str, Any] | None:
         data = self._read()
         thread = data.get("threads", {}).get(key)

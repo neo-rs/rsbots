@@ -44,19 +44,10 @@ class BridgeRuntime:
         )
 
     async def start_discord_bot(self) -> None:
-        import asyncio
-
         if not self.discord_bot:
             return
-        self._bot_task = asyncio.create_task(self.discord_bot.run())
+        self.discord_bot.start_background()
 
     async def stop_discord_bot(self) -> None:
-        import asyncio
-
         if self.discord_bot:
             await self.discord_bot.close()
-        if self._bot_task:
-            try:
-                await asyncio.wait_for(self._bot_task, timeout=15)
-            except Exception:
-                self._bot_task.cancel()

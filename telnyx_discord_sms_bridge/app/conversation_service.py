@@ -86,7 +86,14 @@ class ConversationService:
         lock = self._locks.setdefault(key, asyncio.Lock())
 
         async with lock:
-            await self._bot.wait_ready()
+            try:
+                await self._bot.wait_ready(timeout=30)
+            except TimeoutError:
+                log.error(
+                    "event=conversation_sync_failed reason=discord_bot_not_ready "
+                    "hint=use_a_dedicated_bot_token_not_rsadminbot"
+                )
+                return
             thread = self.store.get_thread(key) or {}
             channel_id = int(thread.get("channel_id") or self.config.channel_id_for_line(our) or 0)
             if channel_id <= 0:
@@ -98,14 +105,27 @@ class ConversationService:
             custom = digits_key(key)
 
             if message_id:
-                await self._bot.edit_thread_message(
-                    channel_id=channel_id,
-                    message_id=int(message_id),
-                    content=content,
-                    custom_id_key=custom,
-                )
-                log.info("event=conversation_updated key=%s channel_id=%s message_id=%s", key, channel_id, message_id)
-            else:
+                try:
+                    await self._bot.edit_thread_message(
+                        channel_id=channel_id,
+                        message_id=int(message_id),
+                        content=content,
+                        custom_id_key=custom,
+                    )
+                    log.info("event=conversation_updated key=%s channel_id=%s message_id=%s", key, channel_id, message_id)
+                except Exception as exc:
+                    err = str(exc).lower()
+                    if "forbidden" in err or "50005" in err or "cannot edit" in err:
+                        log.warning(
+                            "event=conversation_recreate reason=cannot_edit_existing key=%s message_id=%s",
+                            key,
+                            message_id,
+                        )
+                        self.store.upsert_thread(key, {"message_id": None})
+                        message_id = None
+                    else:
+                        raise
+            if not message_id:
                 new_id = await self._bot.post_thread_message(
                     channel_id=channel_id,
                     content=content,
@@ -126,6 +146,18 @@ class ConversationService:
             from_numbers=sms_cfg.get("from_numbers", []),
             max_chars=max_chars,
         )
+
+    async def refresh_all_threads(self) -> int:
+        """Re-render every stored thread (e.g. after format changes)."""
+        count = 0
+        for key, thread in self.store.list_threads().items():
+            our_line = str(thread.get("our_line") or key.split("|", 1)[0])
+            remote_party = str(thread.get("remote_party") or key.split("|", 1)[-1])
+            if not thread.get("message_id"):
+                continue
+            await self._sync_discord_message(our_line=our_line, remote_party=remote_party)
+            count += 1
+        return count
 
     def parse_custom_id(self, custom_id: str) -> tuple[str, str] | None:
         # telnyx:send:5419202540|5551234567  or telnyx:rename:...

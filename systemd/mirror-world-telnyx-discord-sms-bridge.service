@@ -10,6 +10,8 @@ WorkingDirectory=/home/rsadmin/bots/mirror-world/telnyx_discord_sms_bridge
 ExecStart=/home/rsadmin/bots/mirror-world/telnyx_discord_sms_bridge/.venv/bin/python -m app.main
 Restart=always
 RestartSec=5
+TimeoutStopSec=15
+KillMode=mixed
 Environment=PYTHONUNBUFFERED=1
 
 [Install]

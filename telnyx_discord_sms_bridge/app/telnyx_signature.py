@@ -46,8 +46,8 @@ def verify_telnyx_signature(
     timestamp + "|" + raw request body.
     """
 
-    if not require_signature and not public_key_hex:
-        log.info("event=signature_skipped reason=verification_not_configured")
+    if not require_signature:
+        log.info("event=signature_skipped reason=require_signature_disabled")
         return True
 
     if not public_key_hex:

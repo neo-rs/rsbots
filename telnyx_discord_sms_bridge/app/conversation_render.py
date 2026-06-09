@@ -15,18 +15,24 @@ def render_thread_content(
     from_numbers: list[dict[str, Any]] | list[Any],
     max_chars: int,
 ) -> str:
-    remote_display = (display_name or "").strip() or format_phone_display(remote_party)
-    our_label = resolve_number_label(our_line, from_numbers) or format_phone_display(our_line)
+    remote_fmt = format_phone_display(remote_party)
+    our_fmt = format_phone_display(our_line)
+    our_label = resolve_number_label(our_line, from_numbers) or our_fmt
+    remote_short = _short_label(remote_party)
 
-    header = [
-        f"**{remote_display}**",
-        f"`{format_phone_display(remote_party)}`",
-        f"Your line: **{our_label}** (`{format_phone_display(our_line)}`)",
-        "—" * 28,
-    ]
+    header: list[str] = []
+    if (display_name or "").strip():
+        header.append(f"**{(display_name or '').strip()}**")
+    header.extend(
+        [
+            f"**From:** {remote_fmt}",
+            f"**To:** {our_label} (`{our_fmt}`)",
+            "",
+            "**Messages:**",
+        ]
+    )
 
     body_lines: list[str] = []
-    remote_short = _short_label(remote_party)
     for entry in lines:
         direction = str(entry.get("direction") or "in")
         text = str(entry.get("text") or "").strip() or "[empty]"
@@ -38,15 +44,14 @@ def render_thread_content(
     if not body_lines:
         body_lines.append("_(no messages yet — use **Send message**)_")
 
-    content = "\n".join(header + [""] + body_lines)
+    content = "\n".join(header + body_lines)
     if len(content) <= max_chars:
         return content
 
-    # Trim oldest chat lines until we fit.
     trimmed = list(body_lines)
     while len(trimmed) > 1:
         trimmed.pop(0)
-        candidate = "\n".join(header + ["", "_(older messages truncated)_", ""] + trimmed)
+        candidate = "\n".join(header + ["_(older messages truncated)_", ""] + trimmed)
         if len(candidate) <= max_chars:
             return candidate
     return content[: max_chars - 20] + "\n...[truncated]"
