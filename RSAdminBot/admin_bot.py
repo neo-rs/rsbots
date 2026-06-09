@@ -581,21 +581,48 @@ class ServiceManager:
     Uses .sh scripts as single source of truth.
     """
     
-    def __init__(self, script_executor, bot_group_getter):
+    def __init__(self, script_executor, bot_group_getter, bots_getter=None):
         """Initialize ServiceManager with script executor functions.
         
         Args:
             script_executor: Function to execute .sh scripts (script_name, action, bot_name, *args) -> (success, stdout, stderr)
             bot_group_getter: Function to get bot group (bot_name) -> group_name
+            bots_getter: Optional callable returning the canonical BOTS dict for service->bot_key lookup
         """
         self._execute_script = script_executor
         self._get_bot_group = bot_group_getter
+        self._bots_getter = bots_getter
 
         self._script_map = {
             "rsadminbot": "manage_rsadminbot.sh",
             "rs_bots": "manage_rs_bots.sh",
             "mirror_bots": "manage_mirror_bots.sh",
         }
+
+    def infer_bot_name_from_service(self, service_name: str) -> Optional[str]:
+        """Map a systemd unit name to the canonical bot_key used by botctl/manage scripts."""
+        svc = str(service_name or "").strip()
+        if not svc:
+            return None
+        if not svc.endswith(".service"):
+            svc = f"{svc}.service"
+
+        bots_getter = self._bots_getter
+        if callable(bots_getter):
+            bots = bots_getter() or {}
+            if isinstance(bots, dict):
+                for bot_key, info in bots.items():
+                    if str((info or {}).get("service") or "").strip() == svc:
+                        return str(bot_key)
+
+        stem = svc[:-8] if svc.endswith(".service") else svc
+        if stem.startswith("mirror-world-"):
+            slug = stem[len("mirror-world-") :]
+            bots = (bots_getter() or {}) if callable(bots_getter) else {}
+            if isinstance(bots, dict) and slug in bots:
+                return slug
+            return slug
+        return None
 
     def _script_for_bot(self, bot_name: str) -> Tuple[Optional[str], Optional[str]]:
         """Resolve the canonical management script for a bot name."""
@@ -640,14 +667,7 @@ class ServiceManager:
             (success, output, error_msg) where output is always a string (empty if error)
         """
         # Use canonical .sh scripts (single source of truth) instead of direct SSH/systemctl here.
-        bot_name = None
-        if service_name:
-            # Attempt to infer bot name from service name for compatibility
-            svc = service_name
-            if svc.endswith(".service"):
-                svc = svc[:-8]
-            if svc.startswith("mirror-world-"):
-                bot_name = svc[len("mirror-world-"):]
+        bot_name = self.infer_bot_name_from_service(service_name)
         if not bot_name:
             return False, "", "Could not infer bot_name from service name"
         success, stdout, stderr = self._execute_script("botctl.sh", "details", bot_name)
@@ -659,13 +679,7 @@ class ServiceManager:
         Returns:
             PID as int, or None if not running or error
         """
-        bot_name = None
-        if service_name:
-            svc = service_name
-            if svc.endswith(".service"):
-                svc = svc[:-8]
-            if svc.startswith("mirror-world-"):
-                bot_name = svc[len("mirror-world-"):]
+        bot_name = self.infer_bot_name_from_service(service_name)
         if not bot_name:
             return None
         success, stdout, _ = self._execute_script("botctl.sh", "pid", bot_name)
@@ -737,13 +751,7 @@ class ServiceManager:
         Returns:
             Log output as string (empty string if error)
         """
-        bot_name = None
-        if service_name:
-            svc = service_name
-            if svc.endswith(".service"):
-                svc = svc[:-8]
-            if svc.startswith("mirror-world-"):
-                bot_name = svc[len("mirror-world-"):]
+        bot_name = self.infer_bot_name_from_service(service_name)
         if not bot_name:
             return ""
         success, stdout, _ = self._execute_script("botctl.sh", "logs", bot_name, str(lines))
@@ -3387,7 +3395,8 @@ class RSAdminBot:
             # Pass script executor and bot group getter to ServiceManager
             self.service_manager = ServiceManager(
                 self._execute_sh_script,
-                self._get_bot_group
+                self._get_bot_group,
+                lambda: self.BOTS,
             )
         
         # Initialize bot inspector (pass BOTS dict as canonical source)
@@ -8267,14 +8276,14 @@ echo "CHANGED_END"
         Returns:
             Bot name (e.g., "rsforwarder") or None if not found
         """
-        # Remove .service suffix and mirror-world- prefix
-        if service_name.endswith(".service"):
-            service_name = service_name[:-8]
-        if service_name.startswith("mirror-world-"):
-            bot_name = service_name[13:]  # Remove "mirror-world-" prefix
-            # Check if bot exists in BOTS dict
-            if bot_name in self.BOTS:
-                return bot_name
+        if self.service_manager:
+            return self.service_manager.infer_bot_name_from_service(service_name)
+        svc = str(service_name or "").strip()
+        if not svc.endswith(".service"):
+            svc = f"{svc}.service"
+        for bot_key, info in (self.BOTS or {}).items():
+            if str((info or {}).get("service") or "").strip() == svc:
+                return str(bot_key)
         return None
     
     def _is_rs_bot(self, bot_name: str) -> bool:
