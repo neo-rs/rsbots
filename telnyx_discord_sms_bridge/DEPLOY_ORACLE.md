@@ -46,13 +46,29 @@ Git-based path (after push, uses `rsbots-code` on server):
 py -3 scripts\run_oracle_update_bots.py --group rs --bot telnyxsmsbridge
 ```
 
-Then on server (first time or after unit/nginx changes):
+### 3) RSAdminBot + journal logging (required for `!botctl` + `#journal-telnyxsmsbridge`)
+
+The bridge folder update alone does **not** sync `RSAdminBot`. For journal live logs and `botctl` routing:
+
+```bat
+py -3 scripts\run_oracle_update_bots.py --group rs --bot rsadminbot
+```
+
+RSAdminBot restarts on its own schedule (staged apply). After it reloads, run in TestCenter:
+
+```txt
+!setupmonitoring
+```
+
+That creates/refreshes `#journal-telnyxsmsbridge` and starts `journalctl -u mirror-world-telnyx-discord-sms-bridge` streaming.
+
+First-time service/nginx on server:
 
 ```bash
 bash /home/rsadmin/bots/mirror-world/telnyx_discord_sms_bridge/install_oracle.sh
 ```
 
-### 3) Restart / status
+### 4) Restart / status
 
 ```bash
 sudo systemctl restart mirror-world-telnyx-discord-sms-bridge.service

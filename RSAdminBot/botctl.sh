@@ -100,7 +100,7 @@ case "$ACTION" in
           exit 0
         fi
         ;;
-      rsforwarder|rsonboarding|rsmentionpinger|rscheckerbot|rssuccessbot|rspromobot|rscashoutbot|rschannelrelay|catalognavbot)
+      rsforwarder|rsonboarding|rsmentionpinger|rscheckerbot|rssuccessbot|rspromobot|rscashoutbot|rschannelrelay|catalognavbot|amazonasinchecker|telnyxsmsbridge)
         if [ -f "$ROOT_DIR/manage_rs_bots.sh" ]; then
           bash "$ROOT_DIR/manage_rs_bots.sh" "$ACTION" "$bot"
           exit 0

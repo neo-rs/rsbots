@@ -48,12 +48,15 @@ BOT_KEY_RESTARTABLE: Dict[str, bool] = {
     # DailyScheduleReminder main service is intentionally disabled on Oracle; do not restart it here.
     # The always-on piece is the separate rs_instore watcher systemd unit.
     "dailyschedulereminder": False,
+    # Uses its own venv + systemd unit; restart directly (botctl routing may lag until RSAdminBot sync).
+    "telnyxsmsbridge": False,
 }
 
 
 BOT_KEY_EXTRA_RESTART_SERVICES: Dict[str, List[str]] = {
     # When updating DailyScheduleReminder, restart the rs_instore watcher service if present.
     "dailyschedulereminder": ["mirror-world-rs-instore-watch.service"],
+    "telnyxsmsbridge": ["mirror-world-telnyx-discord-sms-bridge.service"],
 }
 
 
