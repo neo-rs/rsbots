@@ -26,7 +26,7 @@ from collections import OrderedDict
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 from RSForwarder import affiliate_rewriter
-from RSForwarder import novnc_stack
+from RSForwarder import mavely_cdp_session
 from RSForwarder import rs_fs_sheet_sync
 from RSForwarder.rs_fs_monitor_data_resolver import RsFsMonitorDataResolver
 from RSForwarder import fetch_monitor_channels as _fetch_monitor_channels
@@ -1255,11 +1255,9 @@ class RSForwarderBot:
         self._mavely_last_preflight_status: Optional[int] = None
         self._mavely_last_preflight_err: Optional[str] = None
         self._mavely_last_alert_ts: float = 0.0
-        self._mavely_last_autologin_ts: float = 0.0
-        self._mavely_last_autologin_ok: Optional[bool] = None
-        self._mavely_last_autologin_msg: Optional[str] = None
-        self._mavely_last_refresher_pid: Optional[int] = None
-        self._mavely_last_refresher_log_path: Optional[str] = None
+        self._mavely_last_harvest_ts: float = 0.0
+        self._mavely_last_harvest_ok: Optional[bool] = None
+        self._mavely_last_harvest_msg: Optional[str] = None
 
         # Global dedupe (cross-source) state for forwarding (not RS-FS sheet).
         # - pending_by_key: winner candidate within the dedupe window
@@ -1380,52 +1378,24 @@ class RSForwarderBot:
             v = 1800
         return max(300, min(v, 24 * 3600))
 
-    def _mavely_autologin_enabled(self) -> bool:
+    def _mavely_cdp_harvest_enabled(self) -> bool:
         try:
-            v = (self.config or {}).get("mavely_autologin_on_fail")
+            v = (self.config or {}).get("mavely_cdp_harvest_on_fail")
             if v is None:
-                v = os.getenv("MAVELY_AUTOLOGIN_ON_FAIL", "")
+                v = (self.config or {}).get("mavely_autologin_on_fail")
+            if v is None:
+                v = os.getenv("MAVELY_CDP_HARVEST_ON_FAIL", "") or os.getenv("MAVELY_AUTOLOGIN_ON_FAIL", "")
             if isinstance(v, str):
                 return v.strip().lower() in {"1", "true", "yes", "y", "on"}
             return bool(v) if v is not None else True
         except Exception:
             return True
 
-    def _mavely_login_creds(self) -> Tuple[str, str]:
-        """
-        Resolve Mavely login credentials for auto-login.
-
-        Priority:
-        1) merged config (config.json + config.secrets.json)
-        2) env vars
-        3) secrets file directly (server-only)
-        """
-        email = ""
-        password = ""
-        try:
-            email = str((self.config or {}).get("mavely_login_email") or "").strip()
-            password = str((self.config or {}).get("mavely_login_password") or "").strip()
-        except Exception:
-            email, password = "", ""
-
-        if not (email and password):
-            try:
-                e2 = (os.getenv("MAVELY_LOGIN_EMAIL", "") or "").strip()
-                p2 = (os.getenv("MAVELY_LOGIN_PASSWORD", "") or "").strip()
-                if e2 and p2:
-                    email, password = e2, p2
-            except Exception:
-                pass
-
-        if not (email and password):
-            try:
-                s = self._load_secrets_dict()
-                email = email or str((s or {}).get("mavely_login_email") or "").strip()
-                password = password or str((s or {}).get("mavely_login_password") or "").strip()
-            except Exception:
-                pass
-
-        return email, password
+    def _mavely_harvest_cookies_sync(self, *, wait_login_s: int = 0) -> Tuple[bool, str]:
+        return mavely_cdp_session.harvest_mavely_cookies_from_cdp(
+            cfg=self.config,
+            wait_login_s=int(wait_login_s or 0),
+        )
 
     def _rsfs_auto_write_current_list(self) -> bool:
         try:
@@ -2144,25 +2114,25 @@ class RSForwarderBot:
 
         return emb
 
-    def _mavely_autologin_cooldown_s(self) -> int:
+    def _mavely_cdp_harvest_cooldown_s(self) -> int:
         try:
-            v = int((self.config or {}).get("mavely_autologin_cooldown_s") or 300)
+            v = int(
+                (self.config or {}).get("mavely_cdp_harvest_cooldown_s")
+                or (self.config or {}).get("mavely_autologin_cooldown_s")
+                or 300
+            )
         except Exception:
             v = 300
         return max(30, min(v, 6 * 3600))
 
     def _mavely_state_dir(self) -> Path:
-        """
-        Local durable state/log directory for Mavely automation.
-        - On Oracle/Linux: defaults to the same dir used by noVNC stack.
-        - Else: keep it local under RSForwarder/.tmp (git-ignored).
-        """
+        """State/log directory for Mavely CDP harvest + monitor."""
         try:
             if self._is_local_exec():
                 raw = (
-                    str((self.config or {}).get("mavely_novnc_state_dir") or "").strip()
-                    or (os.getenv("MAVELY_NOVNC_STATE_DIR", "") or "").strip()
-                    or "/tmp/rsforwarder_mavely_novnc"
+                    str((self.config or {}).get("mavely_state_dir") or "").strip()
+                    or (os.getenv("MAVELY_STATE_DIR", "") or "").strip()
+                    or "/tmp/rsforwarder_mavely"
                 )
                 p = Path(raw)
             else:
@@ -2216,11 +2186,11 @@ class RSForwarderBot:
                 "preflight_status": self._mavely_last_preflight_status,
                 "preflight_err": _short(self._mavely_last_preflight_err, 500),
                 "last_alert_ts": float(self._mavely_last_alert_ts or 0.0),
-                "last_autologin_ts": float(self._mavely_last_autologin_ts or 0.0),
-                "last_autologin_ok": self._mavely_last_autologin_ok,
-                "last_autologin_msg": _short(self._mavely_last_autologin_msg, 1200),
-                "last_refresher_pid": self._mavely_last_refresher_pid,
-                "last_refresher_log_path": self._mavely_last_refresher_log_path,
+                "last_harvest_ts": float(self._mavely_last_harvest_ts or 0.0),
+                "last_harvest_ok": self._mavely_last_harvest_ok,
+                "last_harvest_msg": _short(self._mavely_last_harvest_msg, 1200),
+                "chrome_cdp_url": mavely_cdp_session.resolve_chrome_cdp_url(self.config),
+                "chrome_profile_dir": str(mavely_cdp_session.resolve_chrome_profile_dir(self.config)),
             }
             if isinstance(extra, dict):
                 for k, v in extra.items():
@@ -2368,28 +2338,18 @@ class RSForwarderBot:
         except Exception:
             return False
 
-    def _build_tunnel_instructions(self, web_port: int, url_path: str) -> str:
-        host_hint = "<oracle-host>"
-        user_hint = "rsadmin"
-        try:
-            oraclekeys_path = _REPO_ROOT / "oraclekeys"
-            servers_json = oraclekeys_path / "servers.json"
-            if servers_json.exists():
-                servers = json.loads(servers_json.read_text(encoding="utf-8", errors="replace") or "[]")
-                if isinstance(servers, list) and servers:
-                    host_hint = str((servers[0] or {}).get("host") or host_hint)
-                    user_hint = str((servers[0] or {}).get("user") or user_hint)
-        except Exception:
-            pass
-        tunnel_cmd = f"ssh -i <YOUR_KEY> -L {int(web_port)}:127.0.0.1:{int(web_port)} {user_hint}@{host_hint}"
+    def _build_cdp_novnc_instructions(self) -> str:
+        base = mavely_cdp_session.resolve_mavely_base_url(self.config)
+        profile = mavely_cdp_session.resolve_chrome_profile_dir(self.config)
         return (
-            "✅ noVNC is running (localhost-only on the server).\n\n"
-            f"- If you already keep a tunnel running, just open:\n`http://localhost:{int(web_port)}{url_path}`\n\n"
-            "Otherwise:\n"
-            f"1) On your PC, open an SSH tunnel:\n```{tunnel_cmd}```\n"
-            f"2) In your PC browser, open:\n`http://localhost:{int(web_port)}{url_path}`\n"
-            "3) Log into Mavely in the Chromium window on that desktop.\n\n"
-            "When you're done, run `!rsmavelycheck` to confirm the session is valid."
+            "**Mavely login uses the shared CDP Chrome** (same as Instore / eBay / Amazon warmup).\n\n"
+            "1) On your PC, from the mirror-world repo root, run:\n"
+            "`oracle_novnc_tunnel.bat`\n"
+            "2) Open `http://127.0.0.1:6080/vnc.html` and log into "
+            f"`{base}` in the Chrome window if needed.\n"
+            f"3) Profile: `{profile}`\n"
+            "4) Back in Discord, run `!rsmavelysync` then `!rsmavelycheck`.\n\n"
+            "Cookies stay in that one Chrome profile for all CDP-attached bots."
         )
 
     async def _mavely_monitor_loop(self):
@@ -2420,44 +2380,34 @@ class RSForwarderBot:
                 except Exception:
                     pass
 
-                # If credentials are configured, try a headless auto-login first.
-                # If it succeeds, we recover without requiring user action.
-                email, password = self._mavely_login_creds()
-
                 now = time.time()
-                autologin_attempted = False
-                # Log (once per fail-streak) why auto-login didn't run; otherwise it looks "stuck".
+                harvest_attempted = False
                 try:
                     if prev_ok is not False:
                         reasons = []
                         if not self._is_local_exec():
                             reasons.append("not running on the Linux host")
-                        if not self._mavely_autologin_enabled():
+                        if not self._mavely_cdp_harvest_enabled():
                             reasons.append(
-                                "auto-login disabled (set mavely_autologin_on_fail=true in RSForwarder/config.json OR MAVELY_AUTOLOGIN_ON_FAIL=1)"
+                                "CDP harvest disabled (set mavely_cdp_harvest_on_fail=true in RSForwarder/config.json)"
                             )
-                        if not (email and password):
-                            reasons.append("missing mavely_login_email/password in config.secrets.json")
                         if reasons:
-                            self._mavely_append_log("auto-login skipped: " + "; ".join(reasons))
+                            self._mavely_append_log("CDP harvest skipped: " + "; ".join(reasons))
                 except Exception:
                     pass
 
-                if self._is_local_exec() and self._mavely_autologin_enabled() and email and password:
-                    cooldown2 = self._mavely_autologin_cooldown_s()
-                    if (now - float(self._mavely_last_autologin_ts or 0.0)) >= float(cooldown2):
-                        autologin_attempted = True
-                        self._mavely_last_autologin_ts = now
-                        self._mavely_append_log("preflight FAIL -> attempting headless auto-login (cookie refresher)")
-                        cfg_run = dict(self.config or {})
-                        cfg_run["mavely_login_email"] = email
-                        cfg_run["mavely_login_password"] = password
-                        ok_run, out = await asyncio.to_thread(novnc_stack.run_cookie_refresher_headless, cfg_run, wait_login_s=180)
+                if self._is_local_exec() and self._mavely_cdp_harvest_enabled():
+                    cooldown2 = self._mavely_cdp_harvest_cooldown_s()
+                    if (now - float(self._mavely_last_harvest_ts or 0.0)) >= float(cooldown2):
+                        harvest_attempted = True
+                        self._mavely_last_harvest_ts = now
+                        self._mavely_append_log("preflight FAIL -> harvesting Mavely cookies from CDP Chrome")
+                        ok_run, out = await asyncio.to_thread(self._mavely_harvest_cookies_sync, wait_login_s=0)
                         out_s = (out or "").strip()
                         if len(out_s) > 4000:
                             out_s = out_s[:4000] + "\n... (truncated)"
-                        self._mavely_last_autologin_ok = bool(ok_run)
-                        self._mavely_last_autologin_msg = out_s or ("ok" if ok_run else "failed")
+                        self._mavely_last_harvest_ok = bool(ok_run)
+                        self._mavely_last_harvest_msg = out_s or ("ok" if ok_run else "failed")
                         self._mavely_write_status()
                         if ok_run:
                             ok2, status2, err2 = await affiliate_rewriter.mavely_preflight(self.config)
@@ -2465,12 +2415,11 @@ class RSForwarderBot:
                             self._mavely_last_preflight_err = (err2 or "").strip() if not ok2 else ""
                             self._mavely_write_status()
                             if ok2:
-                                self._mavely_append_log(f"auto-login recovered session (preflight OK status={status2})")
+                                self._mavely_append_log(f"CDP harvest recovered session (preflight OK status={status2})")
                                 self._mavely_last_preflight_ok = True
                                 await asyncio.sleep(interval)
                                 continue
 
-                # Failure path: alert (rate-limited) and optionally start noVNC + refresher automatically.
                 cooldown = self._mavely_alert_cooldown_s()
                 should_alert = (self._mavely_last_preflight_ok is True) or ((now - float(self._mavely_last_alert_ts)) >= float(cooldown))
                 self._mavely_last_preflight_ok = False
@@ -2479,58 +2428,24 @@ class RSForwarderBot:
                     await asyncio.sleep(interval)
                     continue
 
-                info = None
-                pid = None
-                log_path = None
-                start_err = None
-                # Only start noVNC if someone can be alerted (otherwise there's no human to complete login).
-                if self._is_local_exec() and targets:
-                    info, start_err = await asyncio.to_thread(novnc_stack.ensure_novnc, self.config)
-                    if info and not start_err:
-                        pid, log_path, _err2 = await asyncio.to_thread(
-                            novnc_stack.start_cookie_refresher,
-                            self.config,
-                            display=str((info or {}).get("display") or ":99"),
-                            wait_login_s=900,
-                        )
-                        self._mavely_last_refresher_pid = int(pid) if pid else None
-                        self._mavely_last_refresher_log_path = str(log_path) if log_path else None
-                        self._mavely_write_status(
-                            {
-                                "novnc_display": str((info or {}).get("display") or ""),
-                                "novnc_web_port": int((info or {}).get("web_port") or 0),
-                                "novnc_url_path": str((info or {}).get("url_path") or ""),
-                            }
-                        )
-
                 msg = (err or "unknown error").replace("\n", " ").strip()
                 if len(msg) > 240:
                     msg = msg[:240] + "..."
                 header = f"⚠️ Mavely session check FAILED (status={status}).\n{msg}\n\n"
-                if autologin_attempted:
-                    if self._mavely_last_autologin_ok:
-                        header = "⚠️ Mavely session check FAILED, but auto-login ran.\n(Preflight still failing; manual login may be required.)\n\n" + header
+                if harvest_attempted:
+                    if self._mavely_last_harvest_ok:
+                        header = (
+                            "⚠️ Mavely session check FAILED after CDP cookie harvest.\n"
+                            "Log into Mavely in the shared CDP Chrome, then run `!rsmavelysync`.\n\n"
+                        ) + header
                     else:
-                        header = "⚠️ Mavely session check FAILED and headless auto-login did NOT recover.\nManual login required.\n\n" + header
+                        header = (
+                            "⚠️ Mavely session check FAILED and CDP harvest did NOT recover.\n"
+                            "Manual login in CDP Chrome is required.\n\n"
+                        ) + header
 
-                if start_err:
-                    body = (
-                        f"noVNC auto-start failed: {str(start_err)[:300]}\n\n"
-                        "To try headless Playwright auto-login now, run `!rsmavelyautologin`.\n"
-                        "To start manual login via noVNC, run `!rsmavelylogin`."
-                    )
-                else:
-                    web_port = int((info or {}).get("web_port") or 6080)
-                    url_path = str((info or {}).get("url_path") or "/vnc.html")
-                    body = (
-                        "Optional (fast): try headless Playwright auto-login now with `!rsmavelyautologin`.\n"
-                        "Auto-login can be enabled for future failures by setting `mavely_autologin_on_fail=true` in RSForwarder/config.json.\n\n"
-                        + self._build_tunnel_instructions(web_port, url_path)
-                    )
-                    if pid:
-                        body += f"\n\nCookie refresher PID: `{pid}`"
-                    if log_path:
-                        body += f"\nRefresher log (server path): `{log_path}`"
+                body = self._build_cdp_novnc_instructions()
+                body += "\n\nOr run `!rsmavelylogin` for the same steps in Discord."
 
                 # DM only if enabled, targets exist; automation still runs regardless.
                 dm_enabled = (self.config or {}).get("mavely_alert_dm_enabled", True)
@@ -8930,76 +8845,18 @@ class RSForwarderBot:
 
         @self.bot.command(name="rsmavelylogin", aliases=["mavelylogin", "refreshtoken"])
         async def mavely_login(ctx, wait_seconds: str = None):
-            """Start/ensure noVNC desktop and launch interactive Mavely cookie refresher (admin only).
-
-            Usage:
-              !rsmavelylogin
-              !rsmavelylogin 900
-
-            Notes:
-            - This does NOT log in automatically; it opens a browser on the server desktop.
-            - You connect via SSH tunnel to noVNC and log in manually.
-            """
+            """Show how to log into Mavely via the shared CDP Chrome + oracle_novnc_tunnel.bat (admin only)."""
             if not self._is_mavely_admin_ctx(ctx):
                 await ctx.send("❌ You don't have permission to use this command.")
                 return
 
-            if not self._is_local_exec():
-                await ctx.send("❌ This command only works when RSForwarder is running on the Linux host (Oracle).")
-                return
-
-            try:
-                wait_s = int((wait_seconds or "").strip() or "900")
-            except Exception:
-                wait_s = 900
-            wait_s = max(60, min(wait_s, 3600))
-
-            # Auto-enroll invoker for alerts + DM admin (guild-only).
             try:
                 if getattr(ctx, "guild", None) is not None:
                     self._ensure_mavely_user(int(ctx.author.id))
             except Exception:
                 pass
 
-            # Best effort: delete the command message (keeps channels clean)
-            try:
-                if getattr(ctx, "guild", None) is not None:
-                    await ctx.message.delete()
-            except Exception:
-                pass
-
-            channel_ack = None
-            try:
-                if getattr(ctx, "guild", None) is not None:
-                    channel_ack = await ctx.send("🔄 Starting noVNC desktop + launching Mavely login browser... I’ll DM you the tunnel + URL.")
-            except Exception:
-                channel_ack = None
-
-            info, err = await asyncio.to_thread(novnc_stack.ensure_novnc, self.config)
-            if err or not info:
-                await ctx.send(f"❌ noVNC start failed: {str(err)[:500]}")
-                return
-
-            pid, log_path, err2 = await asyncio.to_thread(
-                novnc_stack.start_cookie_refresher,
-                self.config,
-                display=str(info.get("display") or ":99"),
-                wait_login_s=int(wait_s),
-            )
-            if err2:
-                await ctx.send(f"❌ Failed to launch cookie refresher: {str(err2)[:500]}")
-                return
-
-            web_port = int(info.get("web_port") or 6080)
-            url_path = str(info.get("url_path") or "/vnc.html")
-
-            msg = self._build_tunnel_instructions(web_port, url_path)
-            if pid:
-                msg += f"\n\nCookie refresher PID: `{pid}`"
-            if log_path:
-                msg += f"\nRefresher log (server path): `{log_path}`"
-
-            # Prefer DM. If DM fails, fall back to channel.
+            msg = self._build_cdp_novnc_instructions()
             sent_dm = False
             try:
                 await ctx.author.send(msg)
@@ -9007,103 +8864,45 @@ class RSForwarderBot:
             except Exception:
                 sent_dm = False
 
-            if getattr(ctx, "guild", None) is not None:
-                try:
-                    if sent_dm:
-                        done = await ctx.send("✅ Sent you a DM with the noVNC tunnel + URL. Run `!rsmavelycheck` after you log in.")
-                    else:
-                        done = await ctx.send(msg)
-                    try:
-                        await done.delete(delay=20)  # type: ignore[arg-type]
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-                try:
-                    if channel_ack:
-                        await channel_ack.delete(delay=5)  # type: ignore[arg-type]
-                except Exception:
-                    pass
+            if sent_dm and getattr(ctx, "guild", None) is not None:
+                await ctx.send("✅ Sent you a DM with CDP Chrome / noVNC login steps. After login, run `!rsmavelysync`.")
             else:
-                # DM channel: we already sent details (or failed). Keep a short confirmation.
-                if sent_dm:
-                    await ctx.send("✅ Sent. After logging in, run `!rsmavelycheck`.")
+                await ctx.send(msg)
 
-        @self.bot.command(name="rsmavelyautologin", aliases=["mavelyautologin", "mavelyheadless", "headlesslogin"])
-        async def mavely_autologin(ctx, wait_seconds: str = None):
-            """Run headless Playwright auto-login now (admin only).
-
-            Notes:
-            - Requires mavely_login_email/password to be configured (ideally in config.secrets.json).
-            - This is a one-shot attempt; it does NOT start noVNC.
-            """
+        @self.bot.command(name="rsmavelysync", aliases=["mavelysync", "mavelyharvest", "rsmavelyautologin", "mavelyautologin"])
+        async def mavely_sync(ctx):
+            """Harvest Mavely cookies from the shared CDP Chrome into mavely_cookies.txt (admin only)."""
             if not self._is_mavely_admin_ctx(ctx):
                 await ctx.send("❌ You don't have permission to use this command.")
                 return
-
             if not self._is_local_exec():
                 await ctx.send("❌ This command only works when RSForwarder is running on the Linux host (Oracle).")
                 return
 
-            try:
-                wait_s = int((wait_seconds or "").strip() or "180")
-            except Exception:
-                wait_s = 180
-            wait_s = max(30, min(wait_s, 1800))
-
-            # Best effort: delete the command message (keeps channels clean)
-            try:
-                if getattr(ctx, "guild", None) is not None:
-                    await ctx.message.delete()
-            except Exception:
-                pass
-
-            email, password = self._mavely_login_creds()
-            if not (email and password):
-                await ctx.send("❌ Missing Mavely creds. Add `mavely_login_email/password` to RSForwarder/config.secrets.json on the server.")
-                return
-
-            await ctx.send("🔄 Running headless Playwright auto-login now (this can take ~1–3 minutes)...")
+            await ctx.send("🔄 Harvesting Mavely cookies from CDP Chrome...")
             now = time.time()
-            self._mavely_last_autologin_ts = now
-            self._mavely_last_autologin_ok = None
-            self._mavely_last_autologin_msg = ""
+            self._mavely_last_harvest_ts = now
+            ok_run, out = await asyncio.to_thread(self._mavely_harvest_cookies_sync, wait_login_s=0)
+            self._mavely_last_harvest_ok = bool(ok_run)
+            self._mavely_last_harvest_msg = (out or "").strip()
             self._mavely_write_status()
 
-            cfg_run = dict(self.config or {})
-            cfg_run["mavely_login_email"] = email
-            cfg_run["mavely_login_password"] = password
-            ok_run, out = await asyncio.to_thread(novnc_stack.run_cookie_refresher_headless, cfg_run, wait_login_s=int(wait_s))
-            out_s = (out or "").strip()
-            if len(out_s) > 2500:
-                out_s = out_s[:2500] + "\n... (truncated)"
-            self._mavely_last_autologin_ok = bool(ok_run)
-            self._mavely_last_autologin_msg = out_s or ("ok" if ok_run else "failed")
+            ok2, status2, err2 = await affiliate_rewriter.mavely_preflight(self.config)
+            self._mavely_last_preflight_ok = bool(ok2)
+            self._mavely_last_preflight_status = int(status2 or 0)
+            self._mavely_last_preflight_err = (err2 or "").strip() if not ok2 else ""
             self._mavely_write_status()
-
-            # Verify result with preflight
-            try:
-                ok2, status2, err2 = await affiliate_rewriter.mavely_preflight(self.config)
-                self._mavely_last_preflight_ok = bool(ok2)
-                self._mavely_last_preflight_status = int(status2 or 0)
-                self._mavely_last_preflight_err = (err2 or "").strip() if not ok2 else ""
-                self._mavely_write_status()
-            except Exception:
-                ok2, status2, err2 = False, None, "preflight threw an exception"
 
             if ok_run and ok2:
-                await ctx.send(f"✅ Headless auto-login finished, and preflight is OK (status={status2}).")
+                await ctx.send(f"✅ CDP harvest OK and Mavely preflight OK (status={status2}).")
                 return
 
-            msg = (str(err2 or "")).replace("\n", " ").strip()
+            msg = (str(err2 or out or "")).replace("\n", " ").strip()
             if len(msg) > 220:
                 msg = msg[:220] + "..."
-            tail = f"\n\nAuto-login output (truncated):\n```{out_s[-1200:]}```" if out_s else ""
             await ctx.send(
-                "⚠️ Headless auto-login ran but session still looks invalid.\n"
-                f"Preflight: {'✅ OK' if ok2 else '❌ FAIL'} (status={status2}) {msg}\n\n"
-                "Next: run `!rsmavelylogin` to do a manual login via noVNC, then run `!rsmavelycheck`."
-                + tail
+                f"⚠️ Harvest/preflight: harvest={'✅' if ok_run else '❌'} preflight={'✅' if ok2 else '❌'} (status={status2}) {msg}\n\n"
+                + self._build_cdp_novnc_instructions()
             )
 
         @self.bot.command(name="rsmavelyalertme", aliases=["mavelyalertme"])
@@ -9138,16 +8937,30 @@ class RSForwarderBot:
 
         @self.bot.command(name="rsmavelycheck", aliases=["mavelycheck"])
         async def mavely_check(ctx):
-            """Run a non-mutating Mavely auth preflight check (safe)."""
+            """Harvest cookies from CDP Chrome (if on Oracle), then run Mavely preflight."""
             try:
+                if self._is_local_exec():
+                    await ctx.send("🔄 Syncing Mavely cookies from CDP Chrome, then checking session...")
+                    ok_h, _out = await asyncio.to_thread(self._mavely_harvest_cookies_sync, wait_login_s=0)
+                    self._mavely_last_harvest_ok = bool(ok_h)
+                    self._mavely_last_harvest_msg = (_out or "").strip()
+                    self._mavely_last_harvest_ts = time.time()
+                    self._mavely_write_status()
                 ok, status, err = await affiliate_rewriter.mavely_preflight(self.config)
+                self._mavely_last_preflight_ok = bool(ok)
+                self._mavely_last_preflight_status = int(status or 0)
+                self._mavely_last_preflight_err = (err or "").strip() if not ok else ""
+                self._mavely_write_status()
                 if ok:
                     await ctx.send(f"✅ Mavely preflight OK (status={status})")
                 else:
                     msg = (err or "unknown error").replace("\n", " ").strip()
                     if len(msg) > 180:
                         msg = msg[:180] + "..."
-                    await ctx.send(f"❌ Mavely preflight FAIL (status={status}) {msg}")
+                    await ctx.send(
+                        f"❌ Mavely preflight FAIL (status={status}) {msg}\n\n"
+                        + self._build_cdp_novnc_instructions()
+                    )
             except Exception as e:
                 await ctx.send(f"❌ Mavely preflight FAIL ({str(e)[:300]})")
 
@@ -9171,27 +8984,29 @@ class RSForwarderBot:
                 pre_ok = bool(data.get("preflight_ok"))
                 pre_status = data.get("preflight_status")
                 pre_err = str(data.get("preflight_err") or "").strip()
-                al_ts = float(data.get("last_autologin_ts") or 0.0)
-                al_ok = data.get("last_autologin_ok")
-                al_msg = str(data.get("last_autologin_msg") or "").strip()
-                pid = data.get("last_refresher_pid")
-                lp = str(data.get("last_refresher_log_path") or "").strip()
+                hv_ts = float(data.get("last_harvest_ts") or data.get("last_autologin_ts") or 0.0)
+                hv_ok = data.get("last_harvest_ok", data.get("last_autologin_ok"))
+                hv_msg = str(data.get("last_harvest_msg") or data.get("last_autologin_msg") or "").strip()
+                cdp_url = str(data.get("chrome_cdp_url") or mavely_cdp_session.resolve_chrome_cdp_url(self.config))
+                profile = str(
+                    data.get("chrome_profile_dir") or mavely_cdp_session.resolve_chrome_profile_dir(self.config)
+                )
+                cdp_up = mavely_cdp_session.cdp_is_up(cdp_url)
 
                 lines = []
-                lines.append(f"**Mavely status** (from `{p}`)")
+                lines.append(f"**Mavely status** (CDP Chrome — from `{p}`)")
+                lines.append(f"- CDP: {'✅ up' if cdp_up else '❌ down'} `{cdp_url}`")
+                lines.append(f"- profile: `{profile}`")
                 lines.append(f"- preflight: {'✅ OK' if pre_ok else '❌ FAIL'} (status={pre_status})")
                 if (not pre_ok) and pre_err:
                     lines.append(f"- error: `{pre_err[:240]}`")
-                if al_ts > 0:
-                    ts_str = datetime.utcfromtimestamp(al_ts).isoformat(timespec="seconds") + "Z"
-                    lines.append(f"- last auto-login: {ts_str} (ok={al_ok})")
-                if al_msg:
-                    lines.append(f"- auto-login msg: `{al_msg[:240]}`")
-                if pid:
-                    lines.append(f"- last noVNC refresher PID: `{pid}`")
-                if lp:
-                    lines.append(f"- refresher log: `{lp}`")
+                if hv_ts > 0:
+                    ts_str = datetime.utcfromtimestamp(hv_ts).isoformat(timespec="seconds") + "Z"
+                    lines.append(f"- last CDP harvest: {ts_str} (ok={hv_ok})")
+                if hv_msg:
+                    lines.append(f"- harvest msg: `{hv_msg[:240]}`")
                 lines.append(f"- monitor log: `{self._mavely_monitor_log_path()}`")
+                lines.append("- manual login: `oracle_novnc_tunnel.bat` → Mavely → `!rsmavelysync`")
                 await ctx.send("\n".join(lines)[:1900])
             except Exception as e:
                 await ctx.send(f"❌ Failed to read Mavely status: {str(e)[:300]}")
@@ -9215,10 +9030,10 @@ class RSForwarderBot:
                 ("`!rsfetchicon`", "Manually fetch RS Server icon"),
                 ("`!rsstartadminbot`", "Start RSAdminBot remotely on server (admin only)"),
                 ("`!rsrestartadminbot` or `!restart`", "Restart RSAdminBot remotely on server (admin only)"),
-                ("`!rsmavelylogin` or `!refreshtoken`", "Open noVNC + Mavely login browser (admin only; manual login)"),
-                ("`!rsmavelyautologin`", "Run headless Playwright auto-login now (admin only; best-effort)"),
-                ("`!rsmavelycheck`", "Check if Mavely session is valid (safe)"),
-                ("`!rsmavelystatus`", "Show last Mavely auto-login/noVNC status (admin only)"),
+                ("`!rsmavelylogin` or `!refreshtoken`", "DM steps: oracle_novnc_tunnel.bat + log into Mavely in CDP Chrome"),
+                ("`!rsmavelysync`", "Harvest Mavely cookies from CDP Chrome now (admin only)"),
+                ("`!rsmavelycheck`", "Harvest from CDP + Mavely session preflight"),
+                ("`!rsmavelystatus`", "Show Mavely CDP harvest + preflight status (admin only)"),
                 ("`!rsmavelyalertme`", "DM me if Mavely session expires (admin only)"),
                 ("`!rsmavelyalertoff`", "Disable Mavely expiry DMs (admin only)"),
                 ("`!rscommands`", "Show this help message"),

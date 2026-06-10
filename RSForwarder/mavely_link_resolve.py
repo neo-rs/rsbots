@@ -1,8 +1,8 @@
 """
-Canonical Mavely short-link helpers (query-param embeds + headless Chromium when no browser profile).
+Canonical Mavely short-link helpers (query-param embeds + shared CDP Chrome navigation).
 
-Single source of truth for behavior shared with `Mavelytest/mavely_link_tester.py` and
-`Tester/mavely_link_tester_v4.py` (persistent context + anti-automation flags).
+Uses Chromerrunner CDP Chrome (oracle_real_chrome_profile on :9222) — no separate Playwright
+browser launches on the server.
 
 `affiliate_rewriter.py` imports this module only — do not duplicate Branch/query/Playwright paths there.
 """
@@ -125,71 +125,26 @@ def dedupe_redirect_chain(start: str, history_urls: List[str], final: str) -> Li
 
 def playwright_resolve_mavely_to_merchant_url(url: str, timeout_ms: int) -> Optional[str]:
     """
-    Minimal headless Chromium (no persistent profile). Matches the working path in mavely_link_tester:
-    domcontentloaded + wait + poll until the address bar leaves Mavely bridge hosts.
+    Navigate via shared CDP Chrome; poll until the address bar leaves Mavely bridge hosts.
     """
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception:
-        return None
+    from RSForwarder.mavely_cdp_session import cdp_is_up, resolve_chrome_cdp_url, resolve_url_via_cdp
+
     u = (url or "").strip()
     if not u.startswith("http"):
         return None
-    t_ms = max(3_000, min(int(timeout_ms), 120_000))
-    launch_args = ["--disable-dev-shm-usage"]
-    if sys.platform.startswith("linux") or (
-        (os.getenv("MAVELY_PLAYWRIGHT_NO_SANDBOX", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-    ):
-        launch_args.append("--no-sandbox")
-    ua = (os.getenv("MAVELY_USER_AGENT", "") or "").strip() or DEFAULT_PLAYWRIGHT_UA
-    extra: dict = {}
-    ck = (os.getenv("MAVELY_COOKIES", "") or "").strip()
-    if ck:
-        extra["Cookie"] = ck
-    budget_s = max(8.0, min(t_ms / 1000.0, 55.0))
-    deadline = time.perf_counter() + budget_s
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=launch_args)
-            try:
-                ctx = browser.new_context(viewport={"width": 1280, "height": 720}, user_agent=ua)
-                page = ctx.new_page()
-                if extra:
-                    page.set_extra_http_headers(extra)
-                page.goto(u, wait_until="domcontentloaded", timeout=t_ms)
-                try:
-                    page.wait_for_timeout(5_000)
-                except Exception:
-                    pass
-                while time.perf_counter() < deadline:
-                    try:
-                        cur = (page.url or "").strip()
-                    except Exception:
-                        cur = ""
-                    if cur.startswith("http") and (not url_is_mavely_bridge_surface(cur)):
-                        return cur
-                    try:
-                        loc = page.evaluate("() => String(location && location.href ? location.href : '')")
-                        if (
-                            isinstance(loc, str)
-                            and loc.startswith("http")
-                            and (not url_is_mavely_bridge_surface(loc.strip()))
-                        ):
-                            return loc.strip()
-                    except Exception:
-                        pass
-                    try:
-                        page.wait_for_timeout(500)
-                    except Exception:
-                        break
-            finally:
-                try:
-                    browser.close()
-                except Exception:
-                    pass
-    except Exception:
+    cdp = resolve_chrome_cdp_url()
+    if not cdp_is_up(cdp):
         return None
-    return None
+    t_ms = max(3_000, min(int(timeout_ms), 120_000))
+    poll_s = max(8.0, min(t_ms / 1000.0, 55.0))
+    return resolve_url_via_cdp(
+        u,
+        cdp_url=cdp,
+        timeout_ms=t_ms,
+        accept_url=lambda cur: cur.startswith("http") and (not url_is_mavely_bridge_surface(cur)),
+        settle_ms=5_000,
+        poll_s=poll_s,
+    )
 
 
 def _strip_trailing_junk(url: str) -> str:
@@ -229,102 +184,60 @@ def playwright_resolve_outbound_persistent_sync(
     accept_merchant: Callable[[str], bool],
 ) -> Optional[str]:
     """
-    Generic persistent Chromium (parity with Tester/mavely_link_tester_v4.py):
-    launch_persistent_context, domcontentloaded, settle, poll address bar, then scan HTML for https URLs.
-
-    `accept_merchant` is supplied by affiliate_rewriter (scores outbound URLs; not host-allowlist-only).
+    Navigate via shared CDP Chrome (oracle_real_chrome_profile). profile_dir/headed are ignored —
+    kept for call-site compatibility with affiliate_rewriter.
     """
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception:
-        return None
+    from RSForwarder.mavely_cdp_session import cdp_is_up, resolve_chrome_cdp_url, resolve_url_via_cdp
+
     u = (url or "").strip()
     if not u.startswith("http"):
+        return None
+    cdp = resolve_chrome_cdp_url()
+    if not cdp_is_up(cdp):
         return None
     t_ms = max(5_000, min(int(timeout_ms), 180_000))
     settle_ms = max(500, min(int(settle_ms), 60_000))
     poll_s = max(1.0, min(float(poll_s), 60.0))
-    prof = Path(profile_dir).expanduser()
+    out = resolve_url_via_cdp(
+        u,
+        cdp_url=cdp,
+        timeout_ms=t_ms,
+        accept_url=accept_merchant,
+        settle_ms=settle_ms,
+        poll_s=poll_s,
+    )
+    if out:
+        return out
+
+    # Scan page HTML when address bar did not land on an acceptable merchant URL.
+    p = None
     try:
-        prof.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-    launch_args = [
-        "--disable-dev-shm-usage",
-        "--disable-blink-features=AutomationControlled",
-        "--disable-http2",
-    ]
-    if sys.platform.startswith("linux") or (
-        (os.getenv("MAVELY_PLAYWRIGHT_NO_SANDBOX", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-    ):
-        launch_args.append("--no-sandbox")
-    ua = (os.getenv("MAVELY_USER_AGENT", "") or "").strip() or DEFAULT_PLAYWRIGHT_UA
-    extra: dict = {}
-    ck = (os.getenv("MAVELY_COOKIES", "") or "").strip()
-    if ck:
-        extra["Cookie"] = ck
-    try:
-        with sync_playwright() as p:
-            ctx = p.chromium.launch_persistent_context(
-                user_data_dir=str(prof.resolve()),
-                headless=not headed,
-                args=launch_args,
-                user_agent=ua,
-                viewport={"width": 1400, "height": 900},
-            )
-            try:
-                page = ctx.new_page()
-                if extra:
-                    try:
-                        page.set_extra_http_headers(extra)
-                    except Exception:
-                        pass
-                page.goto(u, wait_until="domcontentloaded", timeout=t_ms)
-                try:
-                    page.wait_for_timeout(int(settle_ms))
-                except Exception:
-                    pass
-                final_url = (page.url or "").strip()
-                content = ""
-                poll_end = time.time() + poll_s
-                while time.time() < poll_end:
-                    try:
-                        cur = (page.url or "").strip()
-                    except Exception:
-                        cur = ""
-                    if cur.startswith("http") and accept_merchant(cur):
-                        return cur
-                    try:
-                        page.wait_for_timeout(1_000)
-                    except Exception:
-                        break
-                    try:
-                        final_url = (page.url or "").strip()
-                        content = page.content() or ""
-                    except Exception:
-                        content = ""
-                if final_url.startswith("http") and accept_merchant(final_url):
-                    return final_url
-                if not content:
-                    try:
-                        content = page.content() or ""
-                    except Exception:
-                        content = ""
-                best: Optional[str] = None
-                best_len = -1
-                for cand in collect_https_urls_from_html(content):
-                    if not accept_merchant(cand):
-                        continue
-                    ln = len(cand)
-                    if ln > best_len:
-                        best_len = ln
-                        best = cand
-                return best
-            finally:
-                try:
-                    ctx.close()
-                except Exception:
-                    pass
+        from RSForwarder.mavely_cdp_session import playwright_page_via_cdp
+
+        p, _browser, page = playwright_page_via_cdp(cdp)
+        try:
+            page.goto(u, wait_until="domcontentloaded", timeout=t_ms)
+        except Exception:
+            pass
+        try:
+            content = page.content() or ""
+        except Exception:
+            content = ""
+        best: Optional[str] = None
+        best_len = -1
+        for cand in collect_https_urls_from_html(content):
+            if not accept_merchant(cand):
+                continue
+            ln = len(cand)
+            if ln > best_len:
+                best_len = ln
+                best = cand
+        return best
     except Exception:
         return None
-    return None
+    finally:
+        if p is not None:
+            try:
+                p.stop()
+            except Exception:
+                pass

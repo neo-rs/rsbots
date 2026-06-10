@@ -643,18 +643,10 @@ def _fetch_html_via_curl(url: str, headers: Dict[str, str], timeout_s: int) -> T
 
 
 def resolve_mavely_profile_dir() -> Optional[Path]:
-    """
-    Persistent Chromium user-data dir used by mavely_cookie_refresher (MAVELY_PROFILE_DIR).
-    Mavely URL unwrap uses headless `mavely_link_resolve` only (same as the local tester), not this profile.
-    """
-    repo_root = Path(__file__).resolve().parents[1]
-    profile_raw = (os.getenv("MAVELY_PROFILE_DIR", "") or "").strip()
-    if profile_raw:
-        p = Path(profile_raw)
-        if not p.is_absolute():
-            p = repo_root / p
-    else:
-        p = Path(__file__).resolve().parent / ".mavely_profile"
+    """Shared Chromerrunner CDP Chrome profile (oracle_real_chrome_profile)."""
+    from RSForwarder.mavely_cdp_session import resolve_chrome_profile_dir
+
+    p = resolve_chrome_profile_dir()
     return p if p.is_dir() else None
 
 
@@ -683,14 +675,12 @@ def _mavely_graphql_bridge_fallback_enabled() -> bool:
 
 def mavely_bridge_playwright_startup_hint() -> str:
     """Short status string for optional startup logging (see MAVELY_STARTUP_BRIDGE_HINT)."""
-    try:
-        import playwright.sync_api  # noqa: F401
-    except Exception:
-        return "Mavely: Playwright not installed (pip install playwright && playwright install chromium)"
-    return (
-        "Mavely: headless unwrap via mavely_link_resolve.py; optional persistent fallback "
-        "(outbound_playwright_persistent_enabled / OUTBOUND_PLAYWRIGHT_PERSISTENT=1)"
-    )
+    from RSForwarder.mavely_cdp_session import cdp_is_up, resolve_chrome_cdp_url
+
+    cdp = resolve_chrome_cdp_url()
+    if cdp_is_up(cdp):
+        return f"Mavely: CDP Chrome OK ({cdp}); unwrap + cookies via shared oracle_real_chrome_profile"
+    return f"Mavely: CDP Chrome offline ({cdp}); start mirror-world-instorebotforwarder-chrome-cdp.service"
 
 
 def _affiliate_merchant_resolution_acceptable(url: str) -> bool:
@@ -773,6 +763,8 @@ def _outbound_playwright_navigation_timeout_ms(cfg: Optional[dict], hub_html_tim
 
 
 def _outbound_playwright_profile_dir_resolved(cfg: Optional[dict]) -> str:
+    from RSForwarder.mavely_cdp_session import resolve_chrome_profile_dir
+
     repo_root = Path(__file__).resolve().parents[1]
     raw = str((cfg or {}).get("outbound_playwright_profile_dir") or "").strip()
     if raw:
@@ -786,10 +778,7 @@ def _outbound_playwright_profile_dir_resolved(cfg: Optional[dict]) -> str:
         if not p.is_absolute():
             p = repo_root / p
         return str(p.resolve())
-    pd = resolve_mavely_profile_dir()
-    if pd:
-        return str(pd.resolve())
-    return str((Path(__file__).resolve().parent / ".mavely_profile").resolve())
+    return str(resolve_chrome_profile_dir(cfg).resolve())
 
 
 _mavely_playwright_last_error: str = ""
@@ -2058,7 +2047,7 @@ def _mavely_auto_refresh_cooldown_s() -> int:
     return max(60, min(v, 24 * 3600))
 
 
-async def _maybe_refresh_mavely_cookies(reason: str) -> bool:
+async def _maybe_refresh_mavely_cookies(reason: str, *, cfg: Optional[dict] = None) -> bool:
     if not _mavely_auto_refresh_enabled():
         return False
     cooldown = _mavely_auto_refresh_cooldown_s()
@@ -2066,18 +2055,17 @@ async def _maybe_refresh_mavely_cookies(reason: str) -> bool:
         return False
     if _reload_mavely_cookies_from_file(force=True):
         return True
-    script = Path(__file__).parent / "mavely_cookie_refresher.py"
-    if not script.exists():
-        return False
-
-    def _run() -> int:
+    def _run() -> bool:
         try:
-            return subprocess.call([sys.executable, str(script)], cwd=str(Path(__file__).parent))
-        except Exception:
-            return 1
+            from RSForwarder.mavely_cdp_session import harvest_mavely_cookies_from_cdp
 
-    code = await asyncio.to_thread(_run)
-    if code != 0:
+            ok, _msg = harvest_mavely_cookies_from_cdp(cfg=cfg if isinstance(cfg, dict) else None, wait_login_s=0)
+            return bool(ok)
+        except Exception:
+            return False
+
+    ok = await asyncio.to_thread(_run)
+    if not ok:
         return False
     return _reload_mavely_cookies_from_file(force=True)
 
@@ -2110,7 +2098,8 @@ def _apply_env_from_cfg(cfg: dict) -> None:
             "mavely_cookies_file": "MAVELY_COOKIES_FILE",
             "mavely_auto_refresh_on_fail": "MAVELY_AUTO_REFRESH_ON_FAIL",
             "mavely_auto_refresh_cooldown_s": "MAVELY_AUTO_REFRESH_COOLDOWN_S",
-            "mavely_profile_dir": "MAVELY_PROFILE_DIR",
+            "chrome_cdp_url": "CHROME_CDP_URL",
+            "chrome_profile_dir": "CHROME_PROFILE_DIR",
 
             "mavely_id_token": "MAVELY_ID_TOKEN",
             "mavely_base_url": "MAVELY_BASE_URL",
@@ -2194,7 +2183,7 @@ async def mavely_create_link(cfg: dict, url: str) -> Tuple[Optional[str], Option
     err_l = (err or "").lower()
     auth_fail = ("token expired" in err_l) or ("not logged in" in err_l) or ("unauthorized" in err_l) or (status == 401)
     if auth_fail:
-        if await _maybe_refresh_mavely_cookies(reason=err or "auth"):
+        if await _maybe_refresh_mavely_cookies(reason=err or "auth", cfg=cfg):
             link2, err2, status2 = await asyncio.to_thread(_do)
             if link2:
                 return link2, None
@@ -2205,7 +2194,7 @@ async def mavely_create_link(cfg: dict, url: str) -> Tuple[Optional[str], Option
                 pass
 
     if status == 401:
-        hint = " (need server login: run RSForwarder/mavely_cookie_refresher.py --interactive on Oracle once)"
+        hint = " (log into Mavely in CDP Chrome via oracle_novnc_tunnel.bat, then !rsmavelysync)"
     else:
         hint = ""
     err_out = f"{err} (status={status}){hint}"

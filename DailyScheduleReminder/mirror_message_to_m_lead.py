@@ -1183,7 +1183,151 @@ _TEMPO_UPDATE_BLOB_NEEDLES = (
     "stock checker updated",
     "tempo monitors",
     "tempo assistant",
+    "reselling secrets assistant",
+    "next update may take a little longer",
+    "running some extra checks",
 )
+
+
+def _stop_at_next_own_m_command(
+    ordered: list[dict],
+    *,
+    after_message_id: int,
+    command_message_id: str,
+    stop_on_command_author_id: str,
+) -> int | None:
+    cmd_id = str(command_message_id or "").strip()
+    stop_author = str(stop_on_command_author_id or "").strip()
+    for m in ordered:
+        mid = int(str(m.get("id") or 0))
+        if mid <= after_message_id:
+            continue
+        if cmd_id and str(mid) == cmd_id:
+            continue
+        content = str(m.get("content") or "").strip()
+        if _M_COMMAND_STOP_RE.match(content):
+            if stop_author and _message_author_user_id(m) != stop_author:
+                continue
+            return mid
+    return None
+
+
+def _iter_messages_in_command_window(
+    messages: list[dict],
+    *,
+    after_message_id: int,
+    command_message_id: str,
+    stop_on_command_author_id: str = "",
+) -> Iterator[dict]:
+    ordered = sorted(
+        (m for m in messages if isinstance(m, dict) and m.get("id")),
+        key=lambda m: int(str(m.get("id") or 0)),
+    )
+    stop_at = _stop_at_next_own_m_command(
+        ordered,
+        after_message_id=after_message_id,
+        command_message_id=command_message_id,
+        stop_on_command_author_id=stop_on_command_author_id,
+    )
+    for m in ordered:
+        mid = int(str(m.get("id") or 0))
+        if mid <= after_message_id:
+            continue
+        if stop_at is not None and mid >= stop_at:
+            break
+        yield m
+
+
+def _maintenance_extend_seconds_from_blob(blob: str, default_seconds: float) -> float:
+    """Parse 'will be back in ~10 minutes' style text; fall back to config default."""
+    b = (blob or "").lower()
+    for pat in (
+        r"will be back in\s*~?\s*(\d+)\s*minutes?",
+        r"back in\s*~?\s*(\d+)\s*minutes?",
+    ):
+        m = re.search(pat, b)
+        if m:
+            return max(default_seconds, float(m.group(1)) * 60.0 + 90.0)
+    return default_seconds
+
+
+def _extend_deadline_for_tempo_maintenance(
+    blob: str,
+    *,
+    maint_start: list[str],
+    maint_done: list[str],
+    maint_extend: float,
+    post_done_grace: float,
+    deadline: float,
+    now: float,
+) -> tuple[float, str]:
+    """
+    Extend wait deadline when Tempo posts update/maintenance banners.
+    Returns (new_deadline, status_label).
+    """
+    if not _message_is_tempo_maintenance_or_update(blob, maint_start=maint_start, maint_done=maint_done):
+        return deadline, ""
+    if maint_start and any(x in blob for x in maint_start):
+        extend_by = _maintenance_extend_seconds_from_blob(blob, maint_extend)
+        return max(deadline, now + extend_by), f"maintenance_started (+{extend_by:.0f}s)"
+    if maint_done and any(x in blob for x in maint_done):
+        return max(deadline, now + post_done_grace), f"maintenance_done_grace (+{post_done_grace:.0f}s)"
+    return max(deadline, now + post_done_grace), f"update_notice (+{post_done_grace:.0f}s)"
+
+
+def _scan_command_window_for_new_maintenance(
+    messages: list[dict],
+    *,
+    after_message_id: int,
+    command_message_id: str,
+    stop_on_command_author_id: str,
+    maint_start: list[str],
+    maint_done: list[str],
+    maint_extend: float,
+    post_done_grace: float,
+    deadline: float,
+    seen_message_ids: set[str],
+    on_status: Callable[[str], None] | None = None,
+) -> tuple[float, bool]:
+    """
+    Tempo update banners may come from Reselling Secrets Assistant (not the monitor bot).
+    Scan every message in our command window — any author — and extend the wait budget.
+    """
+    extended = False
+    now = time.monotonic()
+    for m in _iter_messages_in_command_window(
+        messages,
+        after_message_id=after_message_id,
+        command_message_id=command_message_id,
+        stop_on_command_author_id=stop_on_command_author_id,
+    ):
+        mid_str = str(m.get("id") or "").strip()
+        if not mid_str or mid_str in seen_message_ids:
+            continue
+        blob = _message_text_blob(m)
+        new_deadline, label = _extend_deadline_for_tempo_maintenance(
+            blob,
+            maint_start=maint_start,
+            maint_done=maint_done,
+            maint_extend=maint_extend,
+            post_done_grace=post_done_grace,
+            deadline=deadline,
+            now=now,
+        )
+        if not label:
+            continue
+        seen_message_ids.add(mid_str)
+        deadline = new_deadline
+        extended = True
+        author = _message_author_user_id(m)
+        if on_status:
+            on_status(
+                f"Tempo update/maintenance ({label}); "
+                f"message from author {author or '?'} — extended wait "
+                f"(total budget ~{deadline - now:.0f}s from now)"
+            )
+    return deadline, extended
+
 
 _discord_user_id_cache: dict[str, str] = {}
 
@@ -1245,20 +1389,12 @@ def _hdnation_session_monitor_messages(
         (m for m in messages if isinstance(m, dict) and m.get("id")),
         key=lambda m: int(str(m.get("id") or 0)),
     )
-    stop_at: int | None = None
-    for m in ordered:
-        mid = int(str(m.get("id") or 0))
-        if mid <= after_message_id:
-            continue
-        if cmd_id and str(mid) == cmd_id:
-            continue
-        content = str(m.get("content") or "").strip()
-        if _M_COMMAND_STOP_RE.match(content):
-            stop_author = str(stop_on_command_author_id or "").strip()
-            if stop_author and _message_author_user_id(m) != stop_author:
-                continue
-            stop_at = mid
-            break
+    stop_at = _stop_at_next_own_m_command(
+        ordered,
+        after_message_id=after_message_id,
+        command_message_id=cmd_id,
+        stop_on_command_author_id=stop_on_command_author_id,
+    )
     session: list[dict] = []
     for m in ordered:
         mid = int(str(m.get("id") or 0))
@@ -1269,6 +1405,169 @@ def _hdnation_session_monitor_messages(
         if _message_author_user_id(m) == monitor_author_id:
             session.append(m)
     return session
+
+
+_TEMPO_MONITOR_BUSY_NEEDLES = (
+    "please wait for the previous command to finish",
+    "previous command to finish executing",
+)
+
+# Backwards-compatible alias
+_HDNATION_BUSY_NEEDLES = _TEMPO_MONITOR_BUSY_NEEDLES
+
+_HDNATION_STRONG_SUCCESS_NEEDLES = (
+    "home depot nationwide stock check",
+    "lowest store price",
+    "lowest online price",
+    "percentage of stores on sale",
+)
+
+
+def _tempo_monitor_message_is_busy(blob: str) -> bool:
+    b = (blob or "").lower()
+    return any(n in b for n in _TEMPO_MONITOR_BUSY_NEEDLES)
+
+
+def _hdnation_message_is_busy(blob: str) -> bool:
+    return _tempo_monitor_message_is_busy(blob)
+
+
+def _hdnation_session_stock_check_complete(
+    session_blob: str,
+    sku: str,
+    *,
+    exclude_blobs: list[str] | None = None,
+) -> tuple[bool, str]:
+    """
+    True when the monitor session has the final Home Depot Nationwide Stock Check embed
+    for this command (matches the live Tempo output the operator expects).
+
+    Requires the embed title + Lowest Store Price field. SKU must appear in the session
+    (usually the CSV attachment filename like 326434279_12345.csv) so we do not treat
+    another command's stock-check embed as ours when commands overlap.
+    """
+    parts = [session_blob or ""]
+    if exclude_blobs:
+        parts.extend(exclude_blobs)
+    b = "\n".join(parts).lower()
+    sku_n = (sku or "").strip()
+    if "home depot nationwide stock check" not in b:
+        return False, "waiting for Home Depot Nationwide Stock Check embed title"
+    if "lowest store price" not in b:
+        return False, "waiting for Lowest Store Price field in stock-check embed"
+    if sku_n and sku_n not in b:
+        return False, f"waiting for session to include sku {sku_n} (embed or CSV filename)"
+    return True, ""
+
+
+def _hdnation_stock_check_session_blob(
+    session: list[dict],
+    *,
+    maint_start: list[str],
+    maint_done: list[str],
+) -> str:
+    """Build session text for stock-check matching, skipping update/lead/busy noise."""
+    parts: list[str] = []
+    for m in session:
+        blob = _message_text_blob(m)
+        if _message_is_tempo_maintenance_or_update(blob, maint_start=maint_start, maint_done=maint_done):
+            continue
+        if _tempo_monitor_message_is_busy(blob):
+            continue
+        if "lead posted" in blob and "home depot nationwide stock check" not in blob:
+            continue
+        parts.append(blob)
+    return "\n".join(parts)
+
+
+def _lead_posted_session_blob(
+    session: list[dict],
+    *,
+    maint_start: list[str],
+    maint_done: list[str],
+) -> str:
+    """Monitor session text for !m lead confirmation, skipping update/stock-check noise."""
+    parts: list[str] = []
+    for m in session:
+        blob = _message_text_blob(m)
+        if _message_is_tempo_maintenance_or_update(blob, maint_start=maint_start, maint_done=maint_done):
+            continue
+        if _tempo_monitor_message_is_busy(blob):
+            continue
+        if "home depot nationwide stock check" in blob:
+            continue
+        if "nationwide stock check started" in blob:
+            continue
+        parts.append(blob)
+    return "\n".join(parts)
+
+
+def _lead_session_posted_complete(session_blob: str) -> tuple[bool, str]:
+    """True when Tempo posted the Lead posted confirmation embed for this !m lead command."""
+    b = (session_blob or "").lower()
+    if "lead posted" not in b:
+        return False, "waiting for Lead posted confirmation embed"
+    if "home depot nationwide stock check" in b:
+        return False, "stock-check embed in session, not lead confirmation"
+    return True, ""
+
+
+_HDNATION_COMMAND_RE = re.compile(r"!m\s+hdnation\s+(\d+)\b", re.IGNORECASE)
+_LEAD_COMMAND_RE = re.compile(r"!m\s+lead\s+", re.IGNORECASE)
+
+
+def parse_lead_product_id_from_command_line(line: str) -> str:
+    """Best-effort UPC/TCIN/SKU from !m lead line (digit token immediately before image URL)."""
+    text = str(line or "")
+    m = _LEAD_COMMAND_RE.search(text)
+    if not m:
+        return ""
+    rest = text[m.end() :]
+    url_m = re.search(r"https?://", rest, re.IGNORECASE)
+    if not url_m:
+        return ""
+    before_url = rest[: url_m.start()].strip()
+    for tok in reversed(before_url.split()):
+        if re.fullmatch(r"\d{5,15}", tok):
+            return tok
+    return ""
+
+
+def parse_hdnation_sku_from_command_line(line: str) -> str:
+    m = _HDNATION_COMMAND_RE.search(str(line or ""))
+    return m.group(1) if m else ""
+
+
+def hdnation_monitor_needles_from_post_confirmation(pc: dict) -> tuple[list[str], list[str], float]:
+    """Canonical failure needles + hdnation timeout for wait_for_hdnation_stock_check."""
+    fails = [str(x).strip().lower() for x in pc.get("failure_substrings") or [] if str(x).strip()]
+    try:
+        timeout = float(pc.get("timeout_seconds_hdnation", 360))
+    except (TypeError, ValueError):
+        timeout = 360.0
+    return list(_HDNATION_STRONG_SUCCESS_NEEDLES), fails, timeout
+
+
+def lead_monitor_needles_from_post_confirmation(pc: dict) -> tuple[list[str], list[str], float]:
+    """Canonical failure needles + lead timeout for wait_for_lead_posted."""
+    primary = (pc.get("text_substring") or "Lead posted").strip().lower() or "lead posted"
+    fails = [str(x).strip().lower() for x in pc.get("failure_substrings") or [] if str(x).strip()]
+    try:
+        timeout = float(pc.get("timeout_seconds", 120))
+    except (TypeError, ValueError):
+        timeout = 120.0
+    return [primary], fails, timeout
+
+
+def _monitor_wait_deadline(timeout_seconds: float, started_at: float) -> float:
+    """0 or negative timeout = poll until result (no time limit); else safety cap."""
+    try:
+        t = float(timeout_seconds)
+    except (TypeError, ValueError):
+        t = 360.0
+    if t <= 0:
+        return float("inf")
+    return started_at + max(1.0, t)
 
 
 def wait_for_m_command_monitor_session(
@@ -1321,11 +1620,12 @@ def wait_for_m_command_monitor_session(
     poll = max(0.4, float(poll_interval_seconds))
     maint_extend = max(0.0, float(maintenance_extend_seconds))
     post_done_grace = max(30.0, float(maintenance_post_done_grace_seconds))
-    deadline = time.monotonic() + timeout
     started_at = time.monotonic()
+    deadline = _monitor_wait_deadline(timeout_seconds, started_at)
     base = f"https://discord.com/api/v10/channels/{observation_channel_id.strip()}/messages"
     after_i = int(after)
     seen_monitor_ids: set[str] = set()
+    seen_window_ids: set[str] = set()
     maintenance_extended = False
 
     def _status(msg: str) -> None:
@@ -1342,6 +1642,21 @@ def wait_for_m_command_monitor_session(
         if not isinstance(data, list):
             time.sleep(poll)
             continue
+        deadline, ext = _scan_command_window_for_new_maintenance(
+            data,
+            after_message_id=after_i,
+            command_message_id=after,
+            stop_on_command_author_id=cmd_author,
+            maint_start=maint_start,
+            maint_done=maint_done,
+            maint_extend=maint_extend,
+            post_done_grace=post_done_grace,
+            deadline=deadline,
+            seen_message_ids=seen_window_ids,
+            on_status=_status,
+        )
+        if ext:
+            maintenance_extended = True
         session = _hdnation_session_monitor_messages(
             data,
             after_message_id=after_i,
@@ -1357,25 +1672,6 @@ def wait_for_m_command_monitor_session(
             is_new = mid_str not in seen_monitor_ids
             if is_new:
                 seen_monitor_ids.add(mid_str)
-            if _message_is_tempo_maintenance_or_update(
-                blob, maint_start=maint_start, maint_done=maint_done
-            ):
-                if is_new:
-                    now = time.monotonic()
-                    if maint_start and any(x in blob for x in maint_start):
-                        deadline = max(deadline, now + maint_extend)
-                        maintenance_extended = True
-                        _status(
-                            f"monitor maintenance started; extended wait "
-                            f"(total budget ~{deadline - started_at:.0f}s)"
-                        )
-                    else:
-                        deadline = max(deadline, now + post_done_grace)
-                        maintenance_extended = True
-                        _status(
-                            f"monitor update notice; extended wait by {post_done_grace:.0f}s"
-                        )
-                continue
             for fneedle in fail:
                 if fneedle in blob:
                     return "fail", f"monitor: matched {fneedle!r}"
@@ -1389,8 +1685,331 @@ def wait_for_m_command_monitor_session(
     return "timeout", f"timeout after {timeout:.0f}s waiting for monitor{extra}"
 
 
-# Backwards-compatible alias (hdnation_bulk_sender).
-wait_for_hdnation_stock_check = wait_for_m_command_monitor_session
+def wait_for_hdnation_stock_check(
+    observation_channel_id: str,
+    command_message_id: str,
+    token: str,
+    *,
+    author_user_id: str,
+    success_needles: list[str],
+    failure_needles: list[str],
+    correlate_sku: str = "",
+    maintenance_start_needles: list[str] | None = None,
+    maintenance_done_needles: list[str] | None = None,
+    maintenance_extend_seconds: float = 600.0,
+    maintenance_post_done_grace_seconds: float = 180.0,
+    timeout_seconds: float,
+    poll_interval_seconds: float = 2.0,
+    command_author_user_id: str = "",
+    on_status: Callable[[str], None] | None = None,
+    on_trace: Callable[[dict], None] | None = None,
+) -> tuple[str, str]:
+    """
+    Wait for Tempo hdnation stock-check completion (Processing → embed → CSV).
+
+    Unlike wait_for_m_command_monitor_session (used for !m lead), this:
+    - Requires strong stock-check needles on the combined session blob, not footer-only matches
+    - Requires correlate_sku in session (embed text or CSV attachment filename)
+    - Treats \"previous command still running\" as transient busy (keep waiting), not fail
+    """
+    aid = str(author_user_id or "").strip()
+    after = str(command_message_id or "").strip()
+    cmd_author = str(command_author_user_id or "").strip()
+    sku = str(correlate_sku or "").strip()
+    fail = [
+        s.strip().lower()
+        for s in failure_needles
+        if (s or "").strip() and s.strip().lower() not in _HDNATION_BUSY_NEEDLES
+    ]
+    maint_start = [
+        s.strip().lower()
+        for s in (maintenance_start_needles or [])
+        if (s or "").strip()
+    ]
+    maint_done = [
+        s.strip().lower()
+        for s in (maintenance_done_needles or [])
+        if (s or "").strip()
+    ]
+    if not aid or not after.isdigit():
+        return "error", "missing author_user_id or command_message_id"
+    if not sku:
+        return "error", "missing correlate_sku for hdnation wait"
+    poll = max(0.4, float(poll_interval_seconds))
+    maint_extend = max(0.0, float(maintenance_extend_seconds))
+    post_done_grace = max(30.0, float(maintenance_post_done_grace_seconds))
+    busy_extend = max(60.0, poll * 30)
+    started_at = time.monotonic()
+    deadline = _monitor_wait_deadline(timeout_seconds, started_at)
+    try:
+        timeout_display = float(timeout_seconds)
+    except (TypeError, ValueError):
+        timeout_display = 360.0
+    base = f"https://discord.com/api/v10/channels/{observation_channel_id.strip()}/messages"
+    after_i = int(after)
+    seen_monitor_ids: set[str] = set()
+    seen_window_ids: set[str] = set()
+    maintenance_extended = False
+    busy_seen = False
+
+    def _status(msg: str) -> None:
+        if on_status:
+            on_status(msg)
+
+    def _trace(event: str, *, detail: str = "", session: list[dict] | None = None) -> None:
+        if not on_trace:
+            return
+        sess = session or []
+        snippets: list[dict] = []
+        for m in sess[-8:]:
+            mid = str(m.get("id") or "")
+            blob = _message_text_blob(m)
+            snippets.append({"id": mid, "blob_head": blob[:280]})
+        session_blob = "\n".join(_message_text_blob(m) for m in sess)
+        on_trace(
+            {
+                "event": event,
+                "sku": sku,
+                "command_message_id": after,
+                "session_message_count": len(sess),
+                "session_message_ids": [str(m.get("id") or "") for m in sess],
+                "message_snippets": snippets,
+                "session_blob_head": session_blob[:500],
+                "decision": event,
+                "detail": detail,
+                "busy_seen": busy_seen,
+                "maintenance_extended": maintenance_extended,
+                "elapsed_s": round(time.monotonic() - started_at, 1),
+            }
+        )
+
+    _trace(
+        "wait_start",
+        detail=(
+            "no time limit; poll until stock check"
+            if timeout_display <= 0
+            else f"safety limit {timeout_display:.0f}s; poll until stock check"
+        ),
+    )
+
+    last_session: list[dict] = []
+    while time.monotonic() < deadline:
+        url = f"{base}?after={after}&limit=100"
+        r = discord_get(url, token)
+        if r.status_code != 200:
+            _trace("poll_http_error", detail=f"status={r.status_code}")
+            time.sleep(poll)
+            continue
+        data = r.json()
+        if not isinstance(data, list):
+            time.sleep(poll)
+            continue
+        deadline, ext = _scan_command_window_for_new_maintenance(
+            data,
+            after_message_id=after_i,
+            command_message_id=after,
+            stop_on_command_author_id=cmd_author,
+            maint_start=maint_start,
+            maint_done=maint_done,
+            maint_extend=maint_extend,
+            post_done_grace=post_done_grace,
+            deadline=deadline,
+            seen_message_ids=seen_window_ids,
+            on_status=_status,
+        )
+        if ext:
+            maintenance_extended = True
+            _trace("maintenance", detail="channel update/maintenance banner", session=last_session)
+        session = _hdnation_session_monitor_messages(
+            data,
+            after_message_id=after_i,
+            command_message_id=after,
+            monitor_author_id=aid,
+            stop_on_command_author_id=cmd_author,
+        )
+        last_session = session
+        new_ids: list[str] = []
+        for m in session:
+            mid_str = str(m.get("id") or "").strip()
+            if not mid_str:
+                continue
+            blob = _message_text_blob(m)
+            is_new = mid_str not in seen_monitor_ids
+            if is_new:
+                seen_monitor_ids.add(mid_str)
+                new_ids.append(mid_str)
+            if _hdnation_message_is_busy(blob):
+                if is_new:
+                    busy_seen = True
+                    now = time.monotonic()
+                    deadline = max(deadline, now + busy_extend)
+                    _status(
+                        "monitor busy (previous command still running); waiting for it to finish…"
+                    )
+                    _trace("busy", detail=blob[:200], session=session)
+                continue
+            for fneedle in fail:
+                if fneedle in blob:
+                    _trace("fail", detail=f"matched {fneedle!r}", session=session)
+                    return "fail", f"monitor: matched {fneedle!r}"
+        session_blob = _hdnation_stock_check_session_blob(
+            session, maint_start=maint_start, maint_done=maint_done
+        )
+        ok, pending_reason = _hdnation_session_stock_check_complete(session_blob, sku)
+        if ok:
+            _trace("success", detail="stock check complete", session=session)
+            return "ok", ""
+        if new_ids:
+            _trace(
+                "poll",
+                detail=pending_reason or "waiting for stock-check completion",
+                session=session,
+            )
+        time.sleep(poll)
+    extra = ""
+    if maintenance_extended:
+        extra = f" (maintenance extended; waited ~{deadline - started_at:.0f}s total)"
+    if busy_seen:
+        extra += " (saw monitor-busy messages)"
+    _trace("timeout", detail=extra.strip(), session=last_session)
+    cap = "no time limit" if timeout_display <= 0 else f"{timeout_display:.0f}s safety cap"
+    return "timeout", f"timed out waiting for hdnation stock check ({cap}){extra}"
+
+
+def wait_for_lead_posted(
+    observation_channel_id: str,
+    command_message_id: str,
+    token: str,
+    *,
+    author_user_id: str,
+    success_needles: list[str],
+    failure_needles: list[str],
+    maintenance_start_needles: list[str] | None = None,
+    maintenance_done_needles: list[str] | None = None,
+    maintenance_extend_seconds: float = 600.0,
+    maintenance_post_done_grace_seconds: float = 180.0,
+    timeout_seconds: float,
+    poll_interval_seconds: float = 2.0,
+    command_author_user_id: str = "",
+    on_status: Callable[[str], None] | None = None,
+) -> tuple[str, str]:
+    """
+    Wait for Tempo !m lead confirmation (Lead posted embed).
+
+    Polls until the Lead posted embed appears in the monitor session after our command.
+    Ignores update banners, hdnation stock-check output, and busy messages from the same bot.
+    """
+    aid = str(author_user_id or "").strip()
+    after = str(command_message_id or "").strip()
+    cmd_author = str(command_author_user_id or "").strip()
+    fail = [
+        s.strip().lower()
+        for s in failure_needles
+        if (s or "").strip() and s.strip().lower() not in _TEMPO_MONITOR_BUSY_NEEDLES
+    ]
+    maint_start = [
+        s.strip().lower()
+        for s in (maintenance_start_needles or [])
+        if (s or "").strip()
+    ]
+    maint_done = [
+        s.strip().lower()
+        for s in (maintenance_done_needles or [])
+        if (s or "").strip()
+    ]
+    if not aid or not after.isdigit():
+        return "error", "missing author_user_id or command_message_id"
+    poll = max(0.4, float(poll_interval_seconds))
+    maint_extend = max(0.0, float(maintenance_extend_seconds))
+    post_done_grace = max(30.0, float(maintenance_post_done_grace_seconds))
+    busy_extend = max(60.0, poll * 30)
+    started_at = time.monotonic()
+    deadline = _monitor_wait_deadline(timeout_seconds, started_at)
+    try:
+        timeout_display = float(timeout_seconds)
+    except (TypeError, ValueError):
+        timeout_display = 120.0
+    base = f"https://discord.com/api/v10/channels/{observation_channel_id.strip()}/messages"
+    after_i = int(after)
+    seen_monitor_ids: set[str] = set()
+    seen_window_ids: set[str] = set()
+    maintenance_extended = False
+    busy_seen = False
+
+    def _status(msg: str) -> None:
+        if on_status:
+            on_status(msg)
+
+    while time.monotonic() < deadline:
+        url = f"{base}?after={after}&limit=100"
+        r = discord_get(url, token)
+        if r.status_code != 200:
+            time.sleep(poll)
+            continue
+        data = r.json()
+        if not isinstance(data, list):
+            time.sleep(poll)
+            continue
+        deadline, ext = _scan_command_window_for_new_maintenance(
+            data,
+            after_message_id=after_i,
+            command_message_id=after,
+            stop_on_command_author_id=cmd_author,
+            maint_start=maint_start,
+            maint_done=maint_done,
+            maint_extend=maint_extend,
+            post_done_grace=post_done_grace,
+            deadline=deadline,
+            seen_message_ids=seen_window_ids,
+            on_status=_status,
+        )
+        if ext:
+            maintenance_extended = True
+        session = _hdnation_session_monitor_messages(
+            data,
+            after_message_id=after_i,
+            command_message_id=after,
+            monitor_author_id=aid,
+            stop_on_command_author_id=cmd_author,
+        )
+        new_activity = False
+        for m in session:
+            mid_str = str(m.get("id") or "").strip()
+            if not mid_str:
+                continue
+            blob = _message_text_blob(m)
+            is_new = mid_str not in seen_monitor_ids
+            if is_new:
+                seen_monitor_ids.add(mid_str)
+                new_activity = True
+            if _tempo_monitor_message_is_busy(blob):
+                if is_new:
+                    busy_seen = True
+                    now = time.monotonic()
+                    deadline = max(deadline, now + busy_extend)
+                    _status(
+                        "monitor busy (previous command still running); waiting for it to finish…"
+                    )
+                continue
+            for fneedle in fail:
+                if fneedle in blob:
+                    return "fail", f"monitor: matched {fneedle!r}"
+        session_blob = _lead_posted_session_blob(
+            session, maint_start=maint_start, maint_done=maint_done
+        )
+        ok, pending_reason = _lead_session_posted_complete(session_blob)
+        if ok:
+            return "ok", ""
+        if new_activity and on_status:
+            _status(pending_reason or "waiting for Lead posted confirmation")
+        time.sleep(poll)
+    extra = ""
+    if maintenance_extended:
+        extra = f" (maintenance extended; waited ~{deadline - started_at:.0f}s total)"
+    if busy_seen:
+        extra += " (saw monitor-busy messages)"
+    cap = "no time limit" if timeout_display <= 0 else f"{timeout_display:.0f}s safety cap"
+    return "timeout", f"timed out waiting for Lead posted ({cap}){extra}"
 
 
 def wait_for_monitor_outcome(

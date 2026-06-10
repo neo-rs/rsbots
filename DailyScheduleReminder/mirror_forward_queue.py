@@ -8,10 +8,11 @@ each route's destination_channel_id. React on the Mirror World source after send
 optionally sleep (--delay seconds, or --delay-random-minutes / m_lead_routes forward_delay) before
 the next message.
 
-For !m hdnation, the monitor can take several minutes; use post_confirmation.timeout_seconds_hdnation
-and optional success_substrings / failure_substrings in m_lead_routes.json. If the monitor reports
-a stock fetch failure (matched failure_substrings), the script reacts with an X on the Mirror source
-message, appends a line to mirror_forward_hdnation_failures.jsonl for a later retry run, and
+For !m lead (clearance / all-stores), poll until the Lead posted confirmation embed appears
+(post_confirmation.timeout_seconds; 0 = no time limit). For !m hdnation, use
+post_confirmation.timeout_seconds_hdnation. If the monitor reports a stock fetch failure
+(matched failure_substrings), the script reacts with an X on the Mirror source message,
+appends a line to mirror_forward_hdnation_failures.jsonl for a later retry run, and
 continues to the next Mirror message without advancing the checkpoint.
 
 When post_confirmation is enabled, monitor waits use a session window: monitor-bot messages after
@@ -54,6 +55,11 @@ for _p in (_REPO_ROOT, _BOT_DIR):
         sys.path.insert(0, s)
 
 import mirror_message_to_m_lead as mm  # noqa: E402
+from run_notify import (  # noqa: E402
+    notify_batch_finished,
+    notify_enabled_by_default,
+    notify_run_error,
+)
 import reminder_bot as _rb  # noqa: E402
 
 CHECKPOINT_PATH = Path(__file__).resolve().parent / "mirror_forward_checkpoint.json"
@@ -598,8 +604,8 @@ def _parse_post_confirmation_settings(raw: object) -> dict | None:
     return {
         "author_user_id": aid,
         "text_substring": sub,
-        "timeout_seconds": max(1.0, timeout_s),
-        "timeout_seconds_hdnation": max(1.0, timeout_hd),
+        "timeout_seconds": max(0.0, timeout_s),
+        "timeout_seconds_hdnation": max(0.0, timeout_hd),
         "poll_interval_seconds": max(0.4, poll_s),
         "success_substrings_extra": success_extra,
         "failure_substrings": failure_subs,
@@ -611,36 +617,10 @@ def _parse_post_confirmation_settings(raw: object) -> dict | None:
 
 
 def _monitor_needles_for_command(cmd: str, pc: dict) -> tuple[list[str], list[str], float]:
-    """(success_needles, failure_needles, timeout_seconds) for wait_for_monitor_outcome."""
-    primary = (pc.get("text_substring") or "Lead posted").strip().lower()
-    timeout = float(pc["timeout_seconds"])
+    """(success_needles, failure_needles, timeout_seconds) for monitor wait."""
     if cmd == "hdnation":
-        seen: dict[str, None] = {}
-        success: list[str] = []
-        for s in [primary, *[x.strip().lower() for x in pc.get("success_substrings_extra") or []]]:
-            if s and s not in seen:
-                seen[s] = None
-                success.append(s)
-        timeout = float(pc.get("timeout_seconds_hdnation") or pc["timeout_seconds"])
-        for extra in (
-            "home depot nationwide stock check",
-            "lowest store price",
-            "lowest online price",
-            "powered by tempomonitors",
-        ):
-            if extra not in seen:
-                seen[extra] = None
-                success.append(extra)
-        fails = pc.get("failure_substrings") or []
-        if not fails:
-            fails = [
-                "could not fetch stock",
-                "check you have entered the correct sku",
-            ]
-        fail_norm = [str(x).strip().lower() for x in fails if str(x).strip()]
-        return success, fail_norm, max(1.0, timeout)
-    # !m lead: only "Lead posted" — not hdnation/stock-check phrases or update banners.
-    return [primary] if primary else ["lead posted"], [], max(1.0, timeout)
+        return mm.hdnation_monitor_needles_from_post_confirmation(pc)
+    return mm.lead_monitor_needles_from_post_confirmation(pc)
 
 
 def _append_hdnation_failure_record(
@@ -704,6 +684,15 @@ class ForwardBatchResult:
     fail_n: int = 0
     messages_processed: int = 0
     aborted: bool = False
+
+
+def _notify_forward_abort(args: argparse.Namespace, store_label: str, detail: str) -> None:
+    notify_run_error(
+        "Clearance all-stores",
+        f"{store_label}: {detail}",
+        enabled=getattr(args, "notify", True),
+        dry_run=args.dry_run,
+    )
 
 
 def _run_forward_batch(
@@ -806,6 +795,7 @@ def _run_forward_batch(
             print(f"  SEND FAIL: {err_txt}", file=sys.stderr)
             res.fail_n += 1
             res.aborted = True
+            _notify_forward_abort(args, store_label, f"SEND FAIL: {err_txt}")
             break
 
         print("  sent OK")
@@ -819,33 +809,73 @@ def _run_forward_batch(
                 )
                 res.fail_n += 1
                 res.aborted = True
+                _notify_forward_abort(args, store_label, "POST returned no message id")
                 break
             succ_needles, fail_needles, mon_timeout = _monitor_needles_for_command(
                 route_cmd, post_confirm
             )
             wait_label = "hdnation stock-check" if route_cmd == "hdnation" else "lead posted"
+            if route_cmd == "hdnation":
+                hdnation_sku = mm.parse_hdnation_sku_from_command_line(line)
+                if mon_timeout <= 0:
+                    wait_note = "poll until Home Depot Nationwide Stock Check (no time limit)"
+                else:
+                    wait_note = (
+                        f"poll until stock-check (safety limit {mon_timeout:.0f}s)"
+                    )
+            elif mon_timeout <= 0:
+                wait_note = f"poll until {wait_label} (no time limit)"
+            else:
+                wait_note = f"poll until {wait_label} (safety limit {mon_timeout:.0f}s)"
             print(
-                f"  waiting for {wait_label} (author {post_confirm['author_user_id']!r}, "
-                f"timeout {mon_timeout:.0f}s, session until our next !m)…"
+                f"  waiting: {wait_note} — monitor author {post_confirm['author_user_id']!r}, "
+                f"session until our next !m"
             )
-            outcome, mon_detail = mm.wait_for_m_command_monitor_session(
-                post_ch,
-                posted_mid,
-                token,
-                author_user_id=post_confirm["author_user_id"],
-                success_needles=succ_needles,
-                failure_needles=fail_needles,
-                maintenance_start_needles=post_confirm.get("maintenance_start_substrings") or [],
-                maintenance_done_needles=post_confirm.get("maintenance_done_substrings") or [],
-                maintenance_extend_seconds=float(post_confirm.get("maintenance_extend_seconds") or 0.0),
-                maintenance_post_done_grace_seconds=float(
-                    post_confirm.get("maintenance_post_done_grace_seconds") or 180.0
-                ),
-                timeout_seconds=mon_timeout,
-                poll_interval_seconds=post_confirm["poll_interval_seconds"],
-                command_author_user_id=command_author_id,
-                on_status=lambda msg: print(f"  {msg}"),
-            )
+            if route_cmd == "hdnation":
+                if not hdnation_sku:
+                    print("  CONFIRM FAIL: could not parse SKU from !m hdnation line", file=sys.stderr)
+                    res.fail_n += 1
+                    res.aborted = True
+                    _notify_forward_abort(args, store_label, "could not parse SKU from !m hdnation line")
+                    break
+                outcome, mon_detail = mm.wait_for_hdnation_stock_check(
+                    post_ch,
+                    posted_mid,
+                    token,
+                    author_user_id=post_confirm["author_user_id"],
+                    success_needles=succ_needles,
+                    failure_needles=fail_needles,
+                    correlate_sku=hdnation_sku,
+                    maintenance_start_needles=post_confirm.get("maintenance_start_substrings") or [],
+                    maintenance_done_needles=post_confirm.get("maintenance_done_substrings") or [],
+                    maintenance_extend_seconds=float(post_confirm.get("maintenance_extend_seconds") or 0.0),
+                    maintenance_post_done_grace_seconds=float(
+                        post_confirm.get("maintenance_post_done_grace_seconds") or 180.0
+                    ),
+                    timeout_seconds=mon_timeout,
+                    poll_interval_seconds=post_confirm["poll_interval_seconds"],
+                    command_author_user_id=command_author_id,
+                    on_status=lambda msg: print(f"  {msg}"),
+                )
+            else:
+                outcome, mon_detail = mm.wait_for_lead_posted(
+                    post_ch,
+                    posted_mid,
+                    token,
+                    author_user_id=post_confirm["author_user_id"],
+                    success_needles=succ_needles,
+                    failure_needles=fail_needles,
+                    maintenance_start_needles=post_confirm.get("maintenance_start_substrings") or [],
+                    maintenance_done_needles=post_confirm.get("maintenance_done_substrings") or [],
+                    maintenance_extend_seconds=float(post_confirm.get("maintenance_extend_seconds") or 0.0),
+                    maintenance_post_done_grace_seconds=float(
+                        post_confirm.get("maintenance_post_done_grace_seconds") or 180.0
+                    ),
+                    timeout_seconds=mon_timeout,
+                    poll_interval_seconds=post_confirm["poll_interval_seconds"],
+                    command_author_user_id=command_author_id,
+                    on_status=lambda msg: print(f"  {msg}"),
+                )
             if outcome == "ok":
                 print("  monitor confirmed")
             elif outcome == "fail":
@@ -877,6 +907,7 @@ def _run_forward_batch(
                 print(f"  CONFIRM FAIL: {confirm_note}", file=sys.stderr)
                 res.fail_n += 1
                 res.aborted = True
+                _notify_forward_abort(args, store_label, confirm_note)
                 break
 
         mirror_react_ok = True
@@ -1159,6 +1190,17 @@ def _run_all_stores(
         f"skipped_dedupe={agg.dedupe_n}  hdnation_monitor_fail={agg.hdnation_monitor_fail_n}  "
         f"failed={agg.fail_n}  dry_run={args.dry_run}"
     )
+    notify_batch_finished(
+        "Clearance all-stores",
+        (
+            f"forwarded_ok={agg.ok_n}  failed={agg.fail_n}  "
+            f"hdnation_monitor_fail={agg.hdnation_monitor_fail_n}  "
+            f"skipped_dedupe={agg.dedupe_n}"
+        ),
+        had_errors=agg.fail_n > 0 or agg.hdnation_monitor_fail_n > 0,
+        enabled=getattr(args, "notify", True),
+        dry_run=args.dry_run,
+    )
     return 0 if agg.fail_n == 0 else 2
 
 
@@ -1255,6 +1297,12 @@ def main() -> int:
         "from checkpoint or --from-date. Per-store errors do not stop later stores. "
         "--max counts messages across all stores. Requires --yes unless --dry-run. "
         "Incompatible with --store, --url, --dest, and --no-checkpoint.",
+    )
+    ap.add_argument(
+        "--notify",
+        action=argparse.BooleanOptionalAction,
+        default=notify_enabled_by_default(),
+        help="Windows desktop alert on finish or hard error (default on Windows).",
     )
     args = ap.parse_args()
 
@@ -1531,6 +1579,16 @@ def main() -> int:
         f"skipped_dedupe={batch.dedupe_n}  "
         f"hdnation_monitor_fail={batch.hdnation_monitor_fail_n}  failed={batch.fail_n}  "
         f"dry_run={args.dry_run}"
+    )
+    notify_batch_finished(
+        f"Clearance forward ({store_label})",
+        (
+            f"forwarded_ok={batch.ok_n}  failed={batch.fail_n}  "
+            f"hdnation_monitor_fail={batch.hdnation_monitor_fail_n}"
+        ),
+        had_errors=batch.fail_n > 0 or batch.hdnation_monitor_fail_n > 0,
+        enabled=getattr(args, "notify", True),
+        dry_run=args.dry_run,
     )
     return 0 if batch.fail_n == 0 else 2
 

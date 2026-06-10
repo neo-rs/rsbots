@@ -186,51 +186,33 @@ RSForwarder is a standalone bot for forwarding messages from RS Server channels 
 
 ## Optional: Mavely auto-auth (affiliate rewriting)
 
-RSForwarder can generate Mavely affiliate links and auto-recover when tokens expire.
+RSForwarder generates Mavely affiliate links using cookies harvested from the **shared Chromerrunner CDP Chrome** (`oracle_real_chrome_profile` on `http://127.0.0.1:9222`) — the same browser Instorebotforwarder uses and that `oracle_novnc_tunnel.bat` opens for manual login.
 
-- **Cookies (recommended)**: use `RSForwarder/mavely_cookie_refresher.py` to keep a logged-in browser profile and write cookies to a file.
-  - `MAVELY_COOKIES_FILE`: path to cookie header text file (default in RSForwarder folder)
-  - `MAVELY_BASE_URL`: usually `https://creators.joinmavely.com`
+- **Config** (`RSForwarder/config.json`):
+  - `chrome_cdp_url`: default `http://127.0.0.1:9222`
+  - `chrome_profile_dir`: default `Chromerrunner/oracle_real_chrome_profile`
+  - `mavely_cdp_harvest_on_fail`: when true, monitor loop re-harvests cookies from CDP on preflight failure
+  - `mavely_cdp_harvest_cooldown_s`: minimum seconds between automatic harvest attempts
 
-- **OAuth refresh (optional, for hands-off token renewal)**:
-  - `MAVELY_ENABLE_OAUTH_REFRESH=1`: allow refreshing access tokens when Mavely returns auth failures
-  - `MAVELY_REFRESH_TOKEN_FILE`: file path where the bot can store the latest refresh token (handles rotation)
-  - `MAVELY_TOKEN_ENDPOINT`: default is `https://auth.mave.ly/oauth/token`
-  - `MAVELY_CLIENT_ID`: optional (can often be inferred from session/idToken)
+- **Cookie file**: `RSForwarder/mavely_cookies.txt` (written by CDP harvest; read by GraphQL client)
 
-If Mavely forces a real re-login (logout / Cloudflare / MFA), you may still need to refresh cookies manually.
+- **OAuth refresh (optional)**:
+  - `MAVELY_ENABLE_OAUTH_REFRESH=1`, `MAVELY_REFRESH_TOKEN_FILE`, etc. (unchanged)
 
-### Manual re-login via noVNC (server desktop)
+### Manual login (canonical)
 
-If RSForwarder runs on the Oracle Linux host, you can trigger an interactive Mavely login flow without SSHing into the shell:
+1. On your PC: run `oracle_novnc_tunnel.bat` from the mirror-world repo root.
+2. Open `http://127.0.0.1:6080/vnc.html` and log into `https://creators.joinmavely.com` in the CDP Chrome window.
+3. In Discord: `!rsmavelysync` then `!rsmavelycheck`.
 
 #### `!rsmavelylogin` / `!refreshtoken` (admin only)
-- **Description**: Starts (or reuses) a localhost-only noVNC desktop on the server and launches the Mavely browser login flow.
-- **Usage**:
-  - `!rsmavelylogin`
-  - `!rsmavelylogin 900` (wait up to 900s for login)
-- **What you do**:
-  - Open the SSH tunnel command the bot prints
-  - Open the noVNC URL the bot prints
-  - Log into Mavely in the Chromium window
-- **Security**: noVNC binds to `127.0.0.1` only (requires SSH tunnel; not exposed publicly).
+- **Description**: DMs the CDP Chrome / `oracle_novnc_tunnel.bat` login steps (does not start a second browser).
+
+#### `!rsmavelysync` (admin only; aliases include legacy `!rsmavelyautologin`)
+- **Description**: Harvests Mavely cookies from the running CDP Chrome into `mavely_cookies.txt`, then reports preflight status.
 
 #### `!rsmavelycheck`
-- **Description**: Runs a non-mutating session preflight check (safe). Useful to confirm login succeeded.
+- **Description**: Harvests from CDP (on Oracle) + runs non-mutating session preflight.
 
-### Headless Playwright auto-login (best-effort)
-
-If you have Mavely email/password credentials available on the server, RSForwarder can attempt a headless auto-login using Playwright.
-
-- **Enable on failure (automatic)**:
-  - Set `mavely_autologin_on_fail=true` in `RSForwarder/config.json` (or set `MAVELY_AUTOLOGIN_ON_FAIL=1` in the environment).
-  - Provide credentials server-side via `RSForwarder/config.secrets.json`:
-    - `mavely_login_email`
-    - `mavely_login_password`
-
-#### `!rsmavelyautologin` (admin only)
-- **Description**: Triggers headless Playwright auto-login immediately (no noVNC). Useful when you get a DM about session expiry and want the bot to try recovering without manual login.
-- **Usage**:
-  - `!rsmavelyautologin`
-  - `!rsmavelyautologin 180` (wait up to 180s)
-- **Afterwards**: run `!rsmavelycheck` to confirm the session is valid.
+#### `!rsmavelystatus` (admin only)
+- **Description**: CDP up/down, profile path, last harvest, preflight status.
