@@ -525,6 +525,9 @@ class MavelyClient:
             except Exception:
                 data = _parse_json_best_effort(resp.text or "")
             if _is_empty_session_json(data):
+                if self.auth_token:
+                    self.log.debug("Preflight: session JSON empty but bearer token available (OAuth refresh)")
+                    return MavelyResult(ok=True, status_code=200, error=None)
                 return MavelyResult(
                     ok=False,
                     status_code=200,

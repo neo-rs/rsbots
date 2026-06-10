@@ -2018,10 +2018,9 @@ def _mavely_cookie_file_path() -> Path:
     return Path(__file__).parent / "mavely_cookies.txt"
 
 
-def _reload_mavely_cookies_from_file(force: bool = False) -> bool:
+def sync_mavely_cookies_from_file() -> bool:
+    """Load mavely_cookies.txt into MAVELY_COOKIES (always; used after CDP harvest + preflight)."""
     try:
-        if (not force) and (os.getenv("MAVELY_COOKIES", "") or "").strip():
-            return False
         path = _mavely_cookie_file_path()
         if not path.exists():
             return False
@@ -2030,6 +2029,15 @@ def _reload_mavely_cookies_from_file(force: bool = False) -> bool:
             return False
         os.environ["MAVELY_COOKIES"] = raw
         return True
+    except Exception:
+        return False
+
+
+def _reload_mavely_cookies_from_file(force: bool = False) -> bool:
+    try:
+        if (not force) and (os.getenv("MAVELY_COOKIES", "") or "").strip():
+            return False
+        return sync_mavely_cookies_from_file()
     except Exception:
         return False
 
@@ -2053,7 +2061,7 @@ async def _maybe_refresh_mavely_cookies(reason: str, *, cfg: Optional[dict] = No
     cooldown = _mavely_auto_refresh_cooldown_s()
     if not _log_once(f"mavely_cookie_refresh:{reason}", seconds=cooldown):
         return False
-    if _reload_mavely_cookies_from_file(force=True):
+    if sync_mavely_cookies_from_file():
         return True
     def _run() -> bool:
         try:
@@ -2071,7 +2079,7 @@ async def _maybe_refresh_mavely_cookies(reason: str, *, cfg: Optional[dict] = No
     ok = await asyncio.to_thread(_run)
     if not ok:
         return False
-    return _reload_mavely_cookies_from_file(force=True)
+    return sync_mavely_cookies_from_file()
 
 
 def _import_mavely_client():
@@ -2134,12 +2142,8 @@ async def mavely_create_link(cfg: dict, url: str) -> Tuple[Optional[str], Option
         return None, "Mavely client not available."
 
     _apply_env_from_cfg(cfg)
-
+    sync_mavely_cookies_from_file()
     session_token = (os.getenv("MAVELY_COOKIES", "") or "").strip()
-    if not session_token:
-        # try cookie file
-        _reload_mavely_cookies_from_file(force=True)
-        session_token = (os.getenv("MAVELY_COOKIES", "") or "").strip()
     auth_token = _cfg_or_env_str(cfg, "mavely_auth_token", "MAVELY_AUTH_TOKEN")
     graphql_endpoint = _cfg_or_env_str(cfg, "mavely_graphql_endpoint", "MAVELY_GRAPHQL_ENDPOINT")
     if not session_token and not auth_token:
@@ -2230,11 +2234,8 @@ async def mavely_preflight(cfg: dict) -> Tuple[bool, int, Optional[str]]:
         return False, 0, "Mavely client not available."
 
     _apply_env_from_cfg(cfg)
-
+    sync_mavely_cookies_from_file()
     session_token = (os.getenv("MAVELY_COOKIES", "") or "").strip()
-    if not session_token:
-        _reload_mavely_cookies_from_file(force=True)
-        session_token = (os.getenv("MAVELY_COOKIES", "") or "").strip()
 
     auth_token = _cfg_or_env_str(cfg, "mavely_auth_token", "MAVELY_AUTH_TOKEN")
     graphql_endpoint = _cfg_or_env_str(cfg, "mavely_graphql_endpoint", "MAVELY_GRAPHQL_ENDPOINT")
@@ -2459,7 +2460,7 @@ async def compute_affiliate_rewrites(cfg: dict, urls: List[str]) -> Tuple[Dict[s
 
     if expand_enabled:
         _apply_env_from_cfg(cfg)
-        _reload_mavely_cookies_from_file(force=False)
+        sync_mavely_cookies_from_file()
         async with aiohttp.ClientSession() as session:
             for u in candidates:
                 start_u = (resolved.get(u) or u).strip()

@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -94,6 +96,97 @@ def cdp_is_up(cdp_url: Optional[str] = None, *, timeout_s: float = 3.0) -> bool:
         return False
 
 
+def cdp_auto_start_enabled(cfg: Optional[dict] = None) -> bool:
+    raw = (cfg or {}).get("mavely_cdp_auto_start_chrome")
+    if raw is None:
+        raw = os.getenv("MAVELY_CDP_AUTO_START_CHROME", "")
+    if isinstance(raw, str):
+        return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(raw) if raw is not None else True
+
+
+def ensure_cdp_chrome_running(
+    cfg: Optional[dict] = None,
+    *,
+    cdp_url: Optional[str] = None,
+    wait_s: float = 20.0,
+) -> Tuple[bool, str]:
+    """
+    Ensure the shared CDP Chrome (:9222) is up. Starts systemd unit if down.
+
+    Does NOT stop Chrome when done — Instore/eBay/Amazon share this process.
+    Bot flows only open ephemeral tabs and close them (same as Instore scraper).
+    """
+    cdp = (cdp_url or resolve_chrome_cdp_url(cfg)).strip()
+    if cdp_is_up(cdp):
+        return True, "CDP Chrome already listening"
+
+    if not cdp_auto_start_enabled(cfg):
+        return (
+            False,
+            f"CDP Chrome is not running on {cdp} (mavely_cdp_auto_start_chrome=false). "
+            "Start mirror-world-instorebotforwarder-chrome-cdp.service manually.",
+        )
+
+    unit = "mirror-world-instorebotforwarder-chrome-cdp.service"
+    try:
+        subprocess.run(
+            ["systemctl", "start", unit],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception as exc:
+        return False, f"systemctl start {unit} failed: {type(exc).__name__}"
+
+    deadline = time.time() + max(5.0, float(wait_s))
+    while time.time() < deadline:
+        if cdp_is_up(cdp):
+            return True, f"CDP Chrome started via {unit}"
+        time.sleep(1.0)
+
+    script = repo_root() / "Chromerrunner" / "start_chrome_oracle_cdp.sh"
+    if script.is_file() and sys.platform.startswith("linux"):
+        try:
+            subprocess.Popen(  # noqa: S603
+                ["bash", str(script), "--with-xvfb"],
+                cwd=str(repo_root()),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception:
+            pass
+        while time.time() < deadline + 15.0:
+            if cdp_is_up(cdp):
+                return True, "CDP Chrome started via start_chrome_oracle_cdp.sh"
+            time.sleep(1.0)
+
+    return (
+        False,
+        f"CDP Chrome still down on {cdp} after trying {unit}. "
+        "Check: systemctl status mirror-world-instorebotforwarder-chrome-cdp",
+    )
+
+
+def _connect_playwright_over_cdp(browser_type: Any, cdp_url: str) -> Any:
+    """Attach Playwright to CDP Chrome (no_defaults avoids Browser.setDownloadBehavior errors)."""
+    url = (cdp_url or DEFAULT_CDP_URL).strip()
+    try:
+        return browser_type.connect_over_cdp(url, no_defaults=True)
+    except TypeError:
+        prev = os.environ.get("PW_CHROMIUM_DISABLE_DOWNLOAD_BEHAVIOR")
+        os.environ["PW_CHROMIUM_DISABLE_DOWNLOAD_BEHAVIOR"] = "1"
+        try:
+            return browser_type.connect_over_cdp(url)
+        finally:
+            if prev is None:
+                os.environ.pop("PW_CHROMIUM_DISABLE_DOWNLOAD_BEHAVIOR", None)
+            else:
+                os.environ["PW_CHROMIUM_DISABLE_DOWNLOAD_BEHAVIOR"] = prev
+
+
 def cookie_header_from_cookies(cookies: List[dict]) -> str:
     parts: List[str] = []
     for c in cookies or []:
@@ -136,11 +229,11 @@ def session_ok(base_url: str, cookie_header: str, *, timeout_s: float = 20.0) ->
 
 @contextmanager
 def connect_cdp(cdp_url: str) -> Iterator[Any]:
-    """Attach Playwright to the shared CDP Chrome (does not launch or close Chrome)."""
+    """Attach Playwright to the shared CDP Chrome (disconnect only; Chrome process stays up)."""
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp((cdp_url or DEFAULT_CDP_URL).strip())
+        browser = _connect_playwright_over_cdp(p.chromium, cdp_url)
         try:
             yield browser
         finally:
@@ -264,6 +357,8 @@ def _write_cookie_header(cookies_path: Path, header: str) -> None:
     tmp = cookies_path.with_suffix(cookies_path.suffix + ".tmp")
     tmp.write_text(header, encoding="utf-8")
     os.replace(str(tmp), str(cookies_path))
+    if (header or "").strip():
+        os.environ["MAVELY_COOKIES"] = header.strip()
 
 
 def harvest_mavely_cookies_from_cdp(
@@ -287,12 +382,13 @@ def harvest_mavely_cookies_from_cdp(
     profile = resolve_chrome_profile_dir(cfg)
 
     if not cdp_is_up(cdp):
-        return (
-            False,
-            "CDP Chrome is not running on "
-            f"{cdp}. Start mirror-world-instorebotforwarder-chrome-cdp.service "
-            "or run oracle_novnc_tunnel.bat, then log into Mavely in that browser.",
-        )
+        ok_cdp, cdp_msg = ensure_cdp_chrome_running(cfg, cdp_url=cdp)
+        if not ok_cdp:
+            return (
+                False,
+                f"{cdp_msg} Closing noVNC on your PC does not stop Oracle Chrome; "
+                "the CDP service should keep it running.",
+            )
 
     cookies_path.parent.mkdir(parents=True, exist_ok=True)
     deadline = None if int(wait_login_s or 0) <= 0 else (time.time() + max(15, int(wait_login_s)))
@@ -314,22 +410,17 @@ def harvest_mavely_cookies_from_cdp(
                     email, password = resolve_mavely_login_creds(cfg)
                     if email and password:
                         autologin_tried = True
-                        page = _browser_pick_page(browser, prefer_url_contains="joinmavely")
-                        ephemeral_login_tab = False
-                        if page is None:
-                            page = _browser_new_page(browser)
-                            ephemeral_login_tab = True
+                        page = _browser_new_page(browser)
                         try:
                             attempt_cdp_auto_login(
                                 page, base_url=base, email=email, password=password, timeout_s=60
                             )
                             time.sleep(2)
                         finally:
-                            if ephemeral_login_tab:
-                                try:
-                                    page.close()
-                                except Exception:
-                                    pass
+                            try:
+                                page.close()
+                            except Exception:
+                                pass
                         continue
 
                 if deadline is None or time.time() >= deadline:
@@ -373,7 +464,7 @@ def playwright_page_via_cdp(
     from playwright.sync_api import sync_playwright
 
     p = sync_playwright().start()
-    browser = p.chromium.connect_over_cdp(cdp_url.strip())
+    browser = _connect_playwright_over_cdp(p.chromium, cdp_url)
     if ephemeral:
         ctx = browser.contexts[0] if browser.contexts else browser.new_context()
         return p, browser, ctx.new_page(), True
@@ -413,6 +504,8 @@ def resolve_url_via_cdp(
     if not u.startswith("http"):
         return None
     cdp = (cdp_url or resolve_chrome_cdp_url()).strip()
+    if not cdp_is_up(cdp):
+        ensure_cdp_chrome_running(cdp_url=cdp)
     if not cdp_is_up(cdp):
         return None
 

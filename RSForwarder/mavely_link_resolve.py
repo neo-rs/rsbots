@@ -127,12 +127,19 @@ def playwright_resolve_mavely_to_merchant_url(url: str, timeout_ms: int) -> Opti
     """
     Navigate via shared CDP Chrome; poll until the address bar leaves Mavely bridge hosts.
     """
-    from RSForwarder.mavely_cdp_session import cdp_is_up, resolve_chrome_cdp_url, resolve_url_via_cdp
+    from RSForwarder.mavely_cdp_session import (
+        cdp_is_up,
+        ensure_cdp_chrome_running,
+        resolve_chrome_cdp_url,
+        resolve_url_via_cdp,
+    )
 
     u = (url or "").strip()
     if not u.startswith("http"):
         return None
     cdp = resolve_chrome_cdp_url()
+    if not cdp_is_up(cdp):
+        ensure_cdp_chrome_running(cdp_url=cdp)
     if not cdp_is_up(cdp):
         return None
     t_ms = max(3_000, min(int(timeout_ms), 120_000))
@@ -187,12 +194,19 @@ def playwright_resolve_outbound_persistent_sync(
     Navigate via shared CDP Chrome (oracle_real_chrome_profile). profile_dir/headed are ignored —
     kept for call-site compatibility with affiliate_rewriter.
     """
-    from RSForwarder.mavely_cdp_session import cdp_is_up, resolve_chrome_cdp_url, resolve_url_via_cdp
+    from RSForwarder.mavely_cdp_session import (
+        cdp_is_up,
+        ensure_cdp_chrome_running,
+        resolve_chrome_cdp_url,
+        resolve_url_via_cdp,
+    )
 
     u = (url or "").strip()
     if not u.startswith("http"):
         return None
     cdp = resolve_chrome_cdp_url()
+    if not cdp_is_up(cdp):
+        ensure_cdp_chrome_running(cdp_url=cdp)
     if not cdp_is_up(cdp):
         return None
     t_ms = max(5_000, min(int(timeout_ms), 180_000))

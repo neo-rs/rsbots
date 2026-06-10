@@ -1398,11 +1398,17 @@ class RSForwarderBot:
         return mavely_cdp_session.resolve_mavely_login_creds(self.config)
 
     def _mavely_harvest_cookies_sync(self, *, wait_login_s: int = 0, try_autologin: bool = False) -> Tuple[bool, str]:
-        return mavely_cdp_session.harvest_mavely_cookies_from_cdp(
+        ok, msg = mavely_cdp_session.harvest_mavely_cookies_from_cdp(
             cfg=self.config,
             wait_login_s=int(wait_login_s or 0),
             try_autologin=bool(try_autologin),
         )
+        if ok:
+            try:
+                affiliate_rewriter.sync_mavely_cookies_from_file()
+            except Exception:
+                pass
+        return ok, msg
 
     def _rsfs_auto_write_current_list(self) -> bool:
         try:
@@ -2356,7 +2362,10 @@ class RSForwarderBot:
             f"`{base}` in the Chrome window if needed.\n"
             f"3) Profile: `{profile}`\n"
             "4) Back in Discord, run `!rsmavelysync` then `!rsmavelycheck`.\n\n"
-            "Cookies stay in that one Chrome profile for all CDP-attached bots."
+            "Cookies stay in that one Chrome profile for all CDP-attached bots.\n\n"
+            "**Note:** Closing noVNC on your PC does **not** stop Chrome on Oracle — "
+            "`mirror-world-instorebotforwarder-chrome-cdp.service` keeps it running. "
+            "Bots only open short-lived tabs and close them (they do not quit Chrome)."
         )
 
     async def _mavely_monitor_loop(self):
@@ -2515,6 +2524,13 @@ class RSForwarderBot:
                     print(f"{Colors.RED}[Config] ERROR: Missing destination webhook(s) for source_channel_id(s): {', '.join(missing_hooks[:5])}{Colors.RESET}")
                     print(f"{Colors.RED}[Config] Add them to config.secrets.json under destination_webhooks{{...}}{Colors.RESET}")
                     sys.exit(1)
+
+                try:
+                    affiliate_rewriter._apply_env_from_cfg(self.config)
+                    if affiliate_rewriter.sync_mavely_cookies_from_file():
+                        print(f"{Colors.GREEN}[Config] Loaded Mavely cookies from mavely_cookies.txt{Colors.RESET}")
+                except Exception:
+                    pass
 
                 # Refresh optional subsystems that depend on config
                 try:
@@ -5342,46 +5358,32 @@ class RSForwarderBot:
                     except Exception as e:
                         print(f"{Colors.RED}[Affiliate] ❌ Amazon FAIL{Colors.RESET} ({e})")
 
-                    # Mavely startup check (NON-mutating). Stdout is opt-in — set RS_MAVELY_STARTUP_LOG=1 to print OK/FAIL.
+                    # Mavely startup self-test (same block as Amazon): sync cookies + preflight; harvest on Oracle if needed.
                     try:
-                        mavely_startup_log = (os.getenv("RS_MAVELY_STARTUP_LOG", "") or "").strip().lower() in {
-                            "1",
-                            "true",
-                            "yes",
-                            "y",
-                            "on",
-                        }
+                        affiliate_rewriter.sync_mavely_cookies_from_file()
                         ok, status, err = await affiliate_rewriter.mavely_preflight(self.config)
+                        if (not ok) and self._is_local_exec():
+                            try:
+                                ok_h, _ = await asyncio.to_thread(
+                                    self._mavely_harvest_cookies_sync, wait_login_s=0
+                                )
+                                if ok_h:
+                                    ok, status, err = await affiliate_rewriter.mavely_preflight(self.config)
+                            except Exception:
+                                pass
+                        self._mavely_last_preflight_ok = bool(ok)
+                        self._mavely_last_preflight_status = int(status or 0)
+                        self._mavely_last_preflight_err = (err or "").strip() if not ok else ""
+                        self._mavely_write_status()
                         if ok:
-                            if mavely_startup_log:
-                                print(f"{Colors.GREEN}[Affiliate] ✅ Mavely preflight OK{Colors.RESET} (status={status})")
-                                if (os.getenv("MAVELY_STARTUP_BRIDGE_HINT", "") or "").strip().lower() in {
-                                    "1",
-                                    "true",
-                                    "yes",
-                                    "y",
-                                    "on",
-                                }:
-                                    bh = affiliate_rewriter.mavely_bridge_playwright_startup_hint()
-                                    if "ready" in bh.lower():
-                                        print(f"{Colors.GREEN}[Affiliate] ✅ {bh}{Colors.RESET}")
-                                    else:
-                                        print(f"{Colors.YELLOW}[Affiliate] ⚠️  {bh}{Colors.RESET}")
+                            print(f"{Colors.GREEN}[Affiliate] ✅ Mavely PASS{Colors.RESET} (preflight status={status})")
                         else:
                             msg = (err or "unknown error").replace("\n", " ").strip()
                             if len(msg) > 180:
                                 msg = msg[:180] + "..."
-                            if mavely_startup_log:
-                                print(f"{Colors.RED}[Affiliate] ❌ Mavely preflight FAIL{Colors.RESET} (status={status}) {msg}")
+                            print(f"{Colors.RED}[Affiliate] ❌ Mavely FAIL{Colors.RESET} (status={status}) {msg}")
                     except Exception as e:
-                        if (os.getenv("RS_MAVELY_STARTUP_LOG", "") or "").strip().lower() in {
-                            "1",
-                            "true",
-                            "yes",
-                            "y",
-                            "on",
-                        }:
-                            print(f"{Colors.RED}[Affiliate] ❌ Mavely preflight FAIL{Colors.RESET} ({e})")
+                        print(f"{Colors.RED}[Affiliate] ❌ Mavely FAIL{Colors.RESET} ({e})")
             except Exception:
                 pass
 
@@ -8988,14 +8990,25 @@ class RSForwarderBot:
         @self.bot.command(name="rsmavelycheck", aliases=["mavelycheck"])
         async def mavely_check(ctx):
             """Harvest cookies from CDP Chrome (if on Oracle), then run Mavely preflight."""
+            if not self._is_mavely_admin_ctx(ctx):
+                await ctx.send("❌ You don't have permission to use this command.")
+                return
             try:
                 if self._is_local_exec():
                     await ctx.send("🔄 Syncing Mavely cookies from CDP Chrome, then checking session...")
-                    ok_h, _out = await asyncio.to_thread(self._mavely_harvest_cookies_sync, wait_login_s=0)
+                    try:
+                        ok_h, out_h = await asyncio.wait_for(
+                            asyncio.to_thread(self._mavely_harvest_cookies_sync, wait_login_s=0),
+                            timeout=90.0,
+                        )
+                    except asyncio.TimeoutError:
+                        ok_h, out_h = False, "CDP harvest timed out after 90s (Chrome/CDP may be busy)."
                     self._mavely_last_harvest_ok = bool(ok_h)
-                    self._mavely_last_harvest_msg = (_out or "").strip()
+                    self._mavely_last_harvest_msg = (out_h or "").strip()
                     self._mavely_last_harvest_ts = time.time()
                     self._mavely_write_status()
+                else:
+                    affiliate_rewriter.sync_mavely_cookies_from_file()
                 ok, status, err = await affiliate_rewriter.mavely_preflight(self.config)
                 self._mavely_last_preflight_ok = bool(ok)
                 self._mavely_last_preflight_status = int(status or 0)
