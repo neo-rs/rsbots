@@ -193,6 +193,7 @@ RSForwarder generates Mavely affiliate links using cookies harvested from the **
   - `chrome_profile_dir`: default `Chromerrunner/oracle_real_chrome_profile`
   - `mavely_cdp_harvest_on_fail`: when true, monitor loop re-harvests cookies from CDP on preflight failure
   - `mavely_cdp_harvest_cooldown_s`: minimum seconds between automatic harvest attempts
+  - `mavely_cdp_autologin_on_fail`: when true, monitor tries CDP auto-fill login (server creds) if harvest alone fails
 
 - **Cookie file**: `RSForwarder/mavely_cookies.txt` (written by CDP harvest; read by GraphQL client)
 
@@ -208,8 +209,11 @@ RSForwarder generates Mavely affiliate links using cookies harvested from the **
 #### `!rsmavelylogin` / `!refreshtoken` (admin only)
 - **Description**: DMs the CDP Chrome / `oracle_novnc_tunnel.bat` login steps (does not start a second browser).
 
-#### `!rsmavelysync` (admin only; aliases include legacy `!rsmavelyautologin`)
+#### `!rsmavelysync` (admin only)
 - **Description**: Harvests Mavely cookies from the running CDP Chrome into `mavely_cookies.txt`, then reports preflight status.
+
+#### `!rsmavelyautologin` (admin only)
+- **Description**: Auto-fills email/password in the **shared CDP Chrome** (real profile, not a headless bot browser), harvests cookies, then preflight. Requires `mavely_login_email` / `mavely_login_password` in `config.secrets.json`. Monitor uses this automatically when `mavely_cdp_autologin_on_fail=true`.
 
 #### `!rsmavelycheck`
 - **Description**: Harvests from CDP (on Oracle) + runs non-mutating session preflight.

@@ -210,11 +210,13 @@ def playwright_resolve_outbound_persistent_sync(
         return out
 
     # Scan page HTML when address bar did not land on an acceptable merchant URL.
-    p = None
-    try:
-        from RSForwarder.mavely_cdp_session import playwright_page_via_cdp
+    from RSForwarder.mavely_cdp_session import _close_cdp_page, playwright_page_via_cdp
 
-        p, _browser, page = playwright_page_via_cdp(cdp)
+    p = None
+    page = None
+    created = False
+    try:
+        p, _browser, page, created = playwright_page_via_cdp(cdp, ephemeral=True)
         try:
             page.goto(u, wait_until="domcontentloaded", timeout=t_ms)
         except Exception:
@@ -237,7 +239,4 @@ def playwright_resolve_outbound_persistent_sync(
         return None
     finally:
         if p is not None:
-            try:
-                p.stop()
-            except Exception:
-                pass
+            _close_cdp_page(p, page, created)

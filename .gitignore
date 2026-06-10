@@ -278,6 +278,7 @@ discord_slash_tool/_data/
 !Chromerrunner/*.ps1
 !Chromerrunner/*.sh
 !Chromerrunner/requirements.txt
+!Chromerrunner/cdp_chrome_config.json
 
 # Chromerrunner runtime outputs (never commit)
 Chromerrunner/generic_results/

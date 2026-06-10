@@ -130,6 +130,7 @@
   "chrome_profile_dir": "Chromerrunner/oracle_real_chrome_profile",
   "mavely_cdp_harvest_on_fail": true,
   "mavely_cdp_harvest_cooldown_s": 300,
+  "mavely_cdp_autologin_on_fail": true,
   "mavely_alert_dm_enabled": false,
   "_notes_rs_fs_sheet": "RS - Full Send List sheet sync (Zephyr release feed -> Google Sheet). Secrets go in config.secrets.json.",
   "rs_fs_sheet_enabled": true,

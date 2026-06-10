@@ -10,6 +10,7 @@ set -euo pipefail
 #   need a GUI session (noVNC/X11) once to solve the challenge and persist cookies in this profile.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROFILE_DIR="$SCRIPT_DIR/oracle_real_chrome_profile"
 mkdir -p "$PROFILE_DIR"
 
@@ -137,6 +138,22 @@ if is_chrome_for_testing "$CHROME_BIN"; then
 fi
 $CHROME_BIN --version || true
 echo "Profile: $PROFILE_DIR"
+
+# Always launch into the canonical signed-in profile (Neo Secrets / Work), never the picker.
+PROFILE_SUBDIR="Default"
+PATCH_PY=""
+if command -v python3 >/dev/null 2>&1; then
+  PATCH_PY="python3"
+elif [[ -x "$REPO_ROOT/.venv/bin/python" ]]; then
+  PATCH_PY="$REPO_ROOT/.venv/bin/python"
+fi
+if [[ -n "$PATCH_PY" ]] && [[ -f "$SCRIPT_DIR/cdp_chrome_profile.py" ]]; then
+  PROFILE_SUBDIR="$("$PATCH_PY" "$SCRIPT_DIR/cdp_chrome_profile.py" patch "$PROFILE_DIR" 2>/dev/null || echo Default)"
+fi
+if [[ -z "${PROFILE_SUBDIR:-}" ]]; then
+  PROFILE_SUBDIR="Default"
+fi
+echo "Profile subdirectory: $PROFILE_SUBDIR"
 echo "CDP: http://127.0.0.1:9222"
 
 cdp_listening() {
@@ -215,9 +232,11 @@ $CHROME_BIN \
   --remote-debugging-address=127.0.0.1 \
   --remote-debugging-port=9222 \
   --user-data-dir="$PROFILE_DIR" \
+  --profile-directory="$PROFILE_SUBDIR" \
   --no-first-run \
   --no-default-browser-check \
   --disable-dev-shm-usage \
+  --disable-session-crashed-bubble \
   --no-sandbox \
   "${NAV_ARGS[@]}"
 

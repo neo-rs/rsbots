@@ -2057,9 +2057,13 @@ async def _maybe_refresh_mavely_cookies(reason: str, *, cfg: Optional[dict] = No
         return True
     def _run() -> bool:
         try:
-            from RSForwarder.mavely_cdp_session import harvest_mavely_cookies_from_cdp
+            from RSForwarder.mavely_cdp_session import cdp_autologin_enabled, harvest_mavely_cookies_from_cdp
 
-            ok, _msg = harvest_mavely_cookies_from_cdp(cfg=cfg if isinstance(cfg, dict) else None, wait_login_s=0)
+            ok, _msg = harvest_mavely_cookies_from_cdp(
+                cfg=cfg if isinstance(cfg, dict) else None,
+                wait_login_s=0,
+                try_autologin=cdp_autologin_enabled(cfg if isinstance(cfg, dict) else None),
+            )
             return bool(ok)
         except Exception:
             return False

@@ -1391,10 +1391,17 @@ class RSForwarderBot:
         except Exception:
             return True
 
-    def _mavely_harvest_cookies_sync(self, *, wait_login_s: int = 0) -> Tuple[bool, str]:
+    def _mavely_cdp_autologin_enabled(self) -> bool:
+        return mavely_cdp_session.cdp_autologin_enabled(self.config)
+
+    def _mavely_login_creds(self) -> Tuple[str, str]:
+        return mavely_cdp_session.resolve_mavely_login_creds(self.config)
+
+    def _mavely_harvest_cookies_sync(self, *, wait_login_s: int = 0, try_autologin: bool = False) -> Tuple[bool, str]:
         return mavely_cdp_session.harvest_mavely_cookies_from_cdp(
             cfg=self.config,
             wait_login_s=int(wait_login_s or 0),
+            try_autologin=bool(try_autologin),
         )
 
     def _rsfs_auto_write_current_list(self) -> bool:
@@ -2404,6 +2411,12 @@ class RSForwarderBot:
                         self._mavely_append_log("preflight FAIL -> harvesting Mavely cookies from CDP Chrome")
                         ok_run, out = await asyncio.to_thread(self._mavely_harvest_cookies_sync, wait_login_s=0)
                         out_s = (out or "").strip()
+                        if (not ok_run) and self._mavely_cdp_autologin_enabled() and all(self._mavely_login_creds()):
+                            self._mavely_append_log("preflight FAIL -> CDP auto-fill login in shared Chrome")
+                            ok_run, out = await asyncio.to_thread(
+                                self._mavely_harvest_cookies_sync, wait_login_s=120, try_autologin=True
+                            )
+                            out_s = (out or "").strip()
                         if len(out_s) > 4000:
                             out_s = out_s[:4000] + "\n... (truncated)"
                         self._mavely_last_harvest_ok = bool(ok_run)
@@ -8869,7 +8882,7 @@ class RSForwarderBot:
             else:
                 await ctx.send(msg)
 
-        @self.bot.command(name="rsmavelysync", aliases=["mavelysync", "mavelyharvest", "rsmavelyautologin", "mavelyautologin"])
+        @self.bot.command(name="rsmavelysync", aliases=["mavelysync", "mavelyharvest"])
         async def mavely_sync(ctx):
             """Harvest Mavely cookies from the shared CDP Chrome into mavely_cookies.txt (admin only)."""
             if not self._is_mavely_admin_ctx(ctx):
@@ -8902,6 +8915,43 @@ class RSForwarderBot:
                 msg = msg[:220] + "..."
             await ctx.send(
                 f"⚠️ Harvest/preflight: harvest={'✅' if ok_run else '❌'} preflight={'✅' if ok2 else '❌'} (status={status2}) {msg}\n\n"
+                + self._build_cdp_novnc_instructions()
+            )
+
+        @self.bot.command(name="rsmavelyautologin", aliases=["mavelyautologin", "mavelyheadless", "headlesslogin"])
+        async def mavely_autologin(ctx):
+            """CDP auto-fill login in shared Chrome using server creds, then harvest cookies (admin only)."""
+            if not self._is_mavely_admin_ctx(ctx):
+                await ctx.send("❌ You don't have permission to use this command.")
+                return
+            if not self._is_local_exec():
+                await ctx.send("❌ This command only works when RSForwarder is running on the Linux host (Oracle).")
+                return
+            email, password = self._mavely_login_creds()
+            if not (email and password):
+                await ctx.send("❌ Missing Mavely creds in RSForwarder/config.secrets.json (`mavely_login_email` / `mavely_login_password`).")
+                return
+
+            await ctx.send("🔄 Auto-filling Mavely login in shared CDP Chrome (real profile, ~30–90s)...")
+            now = time.time()
+            self._mavely_last_harvest_ts = now
+            ok_run, out = await asyncio.to_thread(self._mavely_harvest_cookies_sync, wait_login_s=120, try_autologin=True)
+            self._mavely_last_harvest_ok = bool(ok_run)
+            self._mavely_last_harvest_msg = (out or "").strip()
+            self._mavely_write_status()
+
+            ok2, status2, err2 = await affiliate_rewriter.mavely_preflight(self.config)
+            self._mavely_last_preflight_ok = bool(ok2)
+            self._mavely_last_preflight_status = int(status2 or 0)
+            self._mavely_last_preflight_err = (err2 or "").strip() if not ok2 else ""
+            self._mavely_write_status()
+
+            if ok_run and ok2:
+                await ctx.send(f"✅ CDP auto-login + harvest OK (preflight status={status2}).")
+                return
+            msg = (str(err2 or out or "")).replace("\n", " ").strip()[:220]
+            await ctx.send(
+                f"⚠️ CDP auto-login did not fully recover session. preflight={'✅' if ok2 else '❌'} (status={status2}) {msg}\n\n"
                 + self._build_cdp_novnc_instructions()
             )
 
@@ -9032,6 +9082,7 @@ class RSForwarderBot:
                 ("`!rsrestartadminbot` or `!restart`", "Restart RSAdminBot remotely on server (admin only)"),
                 ("`!rsmavelylogin` or `!refreshtoken`", "DM steps: oracle_novnc_tunnel.bat + log into Mavely in CDP Chrome"),
                 ("`!rsmavelysync`", "Harvest Mavely cookies from CDP Chrome now (admin only)"),
+                ("`!rsmavelyautologin`", "CDP auto-fill login + harvest using server creds (admin only)"),
                 ("`!rsmavelycheck`", "Harvest from CDP + Mavely session preflight"),
                 ("`!rsmavelystatus`", "Show Mavely CDP harvest + preflight status (admin only)"),
                 ("`!rsmavelyalertme`", "DM me if Mavely session expires (admin only)"),
